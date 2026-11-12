@@ -244,32 +244,39 @@ fn a_deposition_rolls_back_held_rows_and_keeps_the_shipped_ones() {
 /// dependent is rolled back and queued for replay, the unrecoverable
 /// pending row goes, and nothing is held any more.
 #[test]
-fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
+fn drop_held_turns_the_seed_into_a_conflict_copy_and_keeps_the_rest() {
     let s = setup(1);
     let rows = batch(&s.meta);
     ship(&s.meta, &rows, 1);
     let dropped = s.meta.drop_held(s.broken, 1234).unwrap();
     assert_eq!(
-        (dropped.dropped, dropped.requeued, dropped.pending_removed),
-        (1, 1, 1)
+        (
+            dropped.dropped,
+            dropped.requeued,
+            dropped.redone,
+            dropped.pending_removed
+        ),
+        (1, 0, 1, 1),
+        "the chmod needs no byte of the lost chunk: kept, not requeued"
     );
+    assert!(dropped.follow_ups == 0);
     assert_eq!(
         s.meta.journal_len().unwrap(),
-        2,
-        "the drop's DropHeld record and the dropped op's refusal wait to ship"
+        3,
+        "the chmod stays; the drop's DropHeld record and the dropped op's refusal join it"
     );
     assert!(s.meta.pending_uploads().unwrap().is_empty());
     assert!(s.meta.unrecoverable_chunks().unwrap().is_empty());
     assert_eq!(s.meta.held_summary().transactions, 0);
     assert_eq!(
         mode_of(&s.meta, s.broken),
-        0o644,
-        "the chmod was rolled back"
+        0o600,
+        "the chmod was redone in place"
     );
     assert!(s.meta.manifest(s.broken).unwrap().is_none());
 
     let queued = s.meta.pending_replays().unwrap();
-    assert_eq!(queued.len(), 2, "{queued:?}");
+    assert_eq!(queued.len(), 1, "{queued:?}");
     let seed = &queued[0];
     let refusal = seed.refused.as_ref().expect("the seed is refused");
     assert!(refusal.reason.contains("drop-held"), "{refusal:?}");
@@ -282,28 +289,31 @@ fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
     let kept = Manifest::decode(manifest).unwrap();
     assert_eq!(kept.file_len, 19);
     assert_eq!(kept.chunks, ChunkInfo::Inline(BTreeMap::new()));
-    let dependent = &queued[1];
-    assert!(dependent.refused.is_none());
-    // Written through `MetaStore::setattr` (no `execute`, so no op of its
-    // own): replayed from its records.
-    assert!(
-        matches!(&dependent.op, MutateOp::Records { records } if records
+    // The seed's acknowledged write is the one loss, and it is listed.
+    assert_eq!(
+        dropped
+            .acked_lost
             .iter()
-            .any(|r| matches!(r, LogRecord::Setattr { mode: Some(0o600), .. }))),
-        "{:?}",
-        dependent.op
+            .map(|(r, _)| *r)
+            .collect::<Vec<_>>(),
+        vec![seed.rid],
+        "{dropped:?}"
     );
+    assert_eq!(s.meta.held_summary().acked_lost_total, 1);
     // Nothing is held any more: the next plan ships everything — the
-    // dropped op's outcome (fix "capture under an epoch hold": a
-    // requester's shadow of it rolls back on it).
+    // chmod, and the dropped op's outcome (fix "capture under an epoch
+    // hold": a requester's shadow of it rolls back on it).
     let recs = records(&batch(&s.meta));
     assert!(
         matches!(
             recs.as_slice(),
-            [LogRecord::DropHeld { rolled_back: idents, .. }, LogRecord::Refused { rid, code: Code::Io }]
-                if *rid == seed.rid && idents.len() == 2
+            [
+                LogRecord::Setattr { mode: Some(0o600), .. },
+                LogRecord::DropHeld { rolled_back: idents, .. },
+                LogRecord::Refused { rid, code: Code::Io }
+            ] if *rid == seed.rid && idents.len() == 1
         ),
-        "the record of what was rolled back ahead of the refusal: {recs:?}"
+        "the chmod, then the record of what was rolled back ahead of the refusal: {recs:?}"
     );
     assert!(
         s.meta.drop_held(s.broken, 1).is_err(),
@@ -360,21 +370,26 @@ fn drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk() {
 
     let dropped = meta.drop_held_remote(file, 4321).unwrap();
     assert_eq!(
-        (dropped.dropped, dropped.requeued, dropped.pending_removed),
-        (1, 1, 1)
+        (
+            dropped.dropped,
+            dropped.requeued,
+            dropped.redone,
+            dropped.pending_removed
+        ),
+        (1, 0, 1, 1)
     );
     assert_eq!(
         meta.journal_len().unwrap(),
-        2,
-        "the DropHeld record and the refusal wait to ship"
+        3,
+        "the chmod stays; the DropHeld record and the refusal wait to ship"
     );
     assert!(meta.pending_uploads().unwrap().is_empty());
     assert!(meta.remote_chunks().unwrap().is_empty());
     assert!(meta.unrecoverable_chunks().unwrap().is_empty());
-    assert_eq!(mode_of(&meta, file), 0o644, "the chmod was rolled back");
+    assert_eq!(mode_of(&meta, file), 0o600, "the chmod was redone in place");
     assert!(meta.manifest(file).unwrap().is_none());
     let queued = meta.pending_replays().unwrap();
-    assert_eq!(queued.len(), 2, "{queued:?}");
+    assert_eq!(queued.len(), 1, "{queued:?}");
     let refusal = queued[0].refused.as_ref().expect("the seed is refused");
     assert!(refusal.reason.contains("drop-held"), "{refusal:?}");
     assert_eq!(refusal.ts_unix, 4321);
@@ -385,15 +400,17 @@ fn drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk() {
     let kept = Manifest::decode(manifest).unwrap();
     assert_eq!(kept.file_len, 19);
     assert_eq!(kept.chunks, ChunkInfo::Inline(BTreeMap::new()), "a hole");
-    assert!(queued[1].refused.is_none(), "the dependent replays");
     // The dropped op's outcome is in the journal, to ship: a requester's
     // shadow of it is rolled back by it, and a retry by rid is refused.
     let recs = records(&batch(&meta));
     assert!(
         matches!(
             recs.as_slice(),
-            [LogRecord::DropHeld { rolled_back: idents, .. }, LogRecord::Refused { rid, code: Code::Io }]
-                if *rid == queued[0].rid && idents.len() == 2
+            [
+                LogRecord::Setattr { mode: Some(0o600), .. },
+                LogRecord::DropHeld { rolled_back: idents, .. },
+                LogRecord::Refused { rid, code: Code::Io }
+            ] if *rid == queued[0].rid && idents.len() == 1
         ),
         "the record of what was rolled back ahead of the refusal: {recs:?}"
     );
@@ -853,6 +870,20 @@ fn chmod(ino: Ino, mode: u32) -> MutateOp {
     }
 }
 
+/// A size change: a write of the file's content (what a drop of its lost
+/// chunk undoes, unlike a `chmod`).
+fn truncate(ino: Ino, size: u64) -> MutateOp {
+    MutateOp::Setattr {
+        ino,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(size),
+        atime_ns: None,
+        mtime_ns: None,
+    }
+}
+
 /// Execute `op` as `rid`, journaled under `class` (what the core sets
 /// around its call).
 fn exec_as(
@@ -908,11 +939,11 @@ fn drop_held_marks_remote_rows_await_retry() {
     let (meta, broken) = node_one_with_a_seed();
     // Another node's unanswered rows: gated by the archive, which a held
     // (unshipped) row never reaches.
-    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
+    exec_as(&meta, Archive, rid_of(7, 1), &truncate(broken, 3));
     // Another node's row its group held: answered, perhaps.
-    exec_as(&meta, RootGroup, rid_of(8, 1), &chmod(broken, 0o640));
+    exec_as(&meta, RootGroup, rid_of(8, 1), &truncate(broken, 4));
     // This node's own client.
-    exec_as(&meta, Lone, rid_of(1, 5), &chmod(broken, 0o660));
+    exec_as(&meta, Lone, rid_of(1, 5), &truncate(broken, 5));
     // Another node's row on keys nothing held touches: ships, not dropped.
     let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
     exec_as(&meta, Archive, rid_of(7, 2), &chmod(other, 0o600));
@@ -950,26 +981,14 @@ fn drop_held_marks_remote_rows_await_retry() {
     let g = by(rid_of(8, 1));
     assert!(g.await_retry.is_none(), "{g:?}");
     assert!(
-        matches!(
-            &g.op,
-            MutateOp::Setattr {
-                mode: Some(0o640),
-                ..
-            }
-        ),
+        matches!(&g.op, MutateOp::Setattr { size: Some(4), .. }),
         "{g:?}"
     );
     assert_eq!(g.class, RootGroup);
     let own = by(rid_of(1, 5));
     assert!(own.await_retry.is_none(), "{own:?}");
     assert!(
-        matches!(
-            &own.op,
-            MutateOp::Setattr {
-                mode: Some(0o660),
-                ..
-            }
-        ),
+        matches!(&own.op, MutateOp::Setattr { size: Some(5), .. }),
         "{own:?}"
     );
     // The seed is still the refused replay of its conflict copy.
@@ -983,11 +1002,14 @@ fn drop_held_marks_remote_rows_await_retry() {
     assert_eq!(queue.len(), 4, "{queue:?}");
 }
 
-/// R1: the queue keeps every rolled-back row in journal order — the
-/// placeholders among the executable entries — so the drain can run the
-/// dependents of a remote row behind it.
+/// ADR-59: a drop rolls back only what needs the lost content. A chmod of
+/// the damaged file, a rename of it and creates next to it depend on the
+/// seed by key (they write the file's inode, its name or its directory),
+/// but need none of its bytes: they ship once the seed is gone, in journal
+/// order, with their answers and their `completed` rows as they were, and
+/// nothing of them is queued for a replay.
 #[test]
-fn drop_held_keeps_dependents_in_journal_order() {
+fn drop_held_keeps_the_rows_that_do_not_need_the_lost_content() {
     use constellation_meta::RowCommit;
     #[allow(non_upper_case_globals)]
     const Archive: RowCommit = RowCommit::ARCHIVE;
@@ -1017,11 +1039,89 @@ fn drop_held_keeps_dependents_in_journal_order() {
     exec_as(&meta, Lone, rid_of(1, 6), &create("x", 1 << 40));
     exec_as(&meta, Archive, rid_of(8, 1), &create("y", (1 << 40) + 1));
     exec_as(&meta, Lone, rid_of(1, 7), &chmod(broken, 0o640));
+    // The creates are not held at all: they merge the directory the held
+    // rename merges, and name other dentries.
+    let shipped = records(&batch(&meta));
+    let held = meta.held_summary();
+    assert_eq!(held.transactions, 4, "seed, chmod, rename, chmod: {held:?}");
+    let created: Vec<&str> = shipped
+        .iter()
+        .filter_map(|r| match r {
+            LogRecord::Create { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(created, vec!["x", "y"], "{shipped:?}");
 
-    // (ADR-59: the two creates merge the directory the held rename merges
-    // and name other dentries: they ship, they are not rolled back.)
     let dropped = meta.drop_held(broken, 1).unwrap();
-    assert_eq!((dropped.dropped, dropped.requeued), (1, 3), "{dropped:?}");
+    assert_eq!(
+        (dropped.dropped, dropped.requeued, dropped.redone),
+        (1, 0, 3),
+        "{dropped:?}"
+    );
+    assert_eq!(dropped.follow_ups, 0);
+    let queue = meta.pending_replays().unwrap();
+    assert_eq!(queue.len(), 1, "only the seed's refused entry: {queue:?}");
+    assert!(queue[0].refused.is_some());
+    // The renamed file resolves, with the last chmod.
+    let moved = meta.lookup(ROOT_INO, "moved").unwrap().expect("renamed");
+    assert_eq!(moved.ino, broken);
+    assert_eq!(mode_of(&meta, broken), 0o640);
+    assert!(meta.lookup(ROOT_INO, "broken").unwrap().is_none());
+    // The rename's rid still has its outcome: a retry by rid meets it.
+    assert!(
+        meta.completed_outcome(rid_of(7, 1)).unwrap().is_some(),
+        "the redone rename keeps its completed row"
+    );
+    // Nothing is held now: the redone rows ship, in journal order, ahead
+    // of the drop's own records.
+    assert_eq!(meta.held_summary().transactions, 0);
+    let recs = records(&batch(&meta));
+    let kinds: Vec<&str> = recs
+        .iter()
+        .map(|r| match r {
+            LogRecord::Setattr { .. } => "setattr",
+            LogRecord::Rename { .. } => "rename",
+            LogRecord::Completed { .. } => "completed",
+            LogRecord::DropHeld { .. } => "dropheld",
+            LogRecord::Refused { .. } => "refused",
+            _ => "other",
+        })
+        .collect();
+    let at = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
+    assert!(
+        at("setattr") < at("rename") && at("rename") < at("dropheld"),
+        "{kinds:?}"
+    );
+}
+
+/// R1 with ADR-59: the queue keeps every rolled-back row in journal order
+/// — the placeholders among the executable entries — so the drain can run
+/// the dependents of a remote row behind it. The rows are the ones that
+/// need the lost content: writes of the damaged file.
+#[test]
+fn drop_held_keeps_the_rows_that_need_the_content_in_journal_order() {
+    use constellation_meta::RowCommit;
+    #[allow(non_upper_case_globals)]
+    const Archive: RowCommit = RowCommit::ARCHIVE;
+    #[allow(non_upper_case_globals)]
+    const Lone: RowCommit = RowCommit::LONE;
+    let (meta, broken) = node_one_with_a_seed();
+    // seed, an own truncate, a remote truncate (rid 7/1), an own one, a
+    // remote one (rid 8/1), and an unrelated chmod of the damaged file in
+    // the middle, which is kept.
+    exec_as(&meta, Lone, rid_of(1, 5), &truncate(broken, 10));
+    exec_as(&meta, Archive, rid_of(7, 1), &truncate(broken, 9));
+    exec_as(&meta, Lone, rid_of(1, 6), &chmod(broken, 0o600));
+    exec_as(&meta, Lone, rid_of(1, 7), &truncate(broken, 8));
+    exec_as(&meta, Archive, rid_of(8, 1), &truncate(broken, 7));
+
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    assert_eq!(
+        (dropped.dropped, dropped.requeued, dropped.redone),
+        (1, 4, 1),
+        "{dropped:?}"
+    );
     let queue = meta.pending_replays().unwrap();
     let order: Vec<_> = queue
         .iter()
@@ -1043,6 +1143,7 @@ fn drop_held_keeps_dependents_in_journal_order() {
             (1, 5, false, false),
             (7, 1, true, false),
             (1, 7, false, false),
+            (8, 1, true, false),
         ],
         "journal order, the placeholders in their place: {queue:?}"
     );
@@ -1050,25 +1151,33 @@ fn drop_held_keeps_dependents_in_journal_order() {
         queue.windows(2).all(|w| w[0].queue_seq < w[1].queue_seq),
         "queue order is the journal's"
     );
-    // The rename's placeholder names both dentries and the directory.
-    let keys = &queue[2].await_retry.as_ref().expect("placeholder").keys;
-    assert!(keys.dentries.contains(&(ROOT_INO, "broken".to_string())));
-    assert!(keys.dentries.contains(&(ROOT_INO, "moved".to_string())));
-    assert!(keys.shared.contains(&ROOT_INO));
+    // The acknowledged ones are listed: the seed and the own rows (the
+    // remote archive rows are placeholders, never answered).
+    let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
+    assert!(
+        lost.contains(&seed) && lost.contains(&rid_of(1, 5)),
+        "{lost:?}"
+    );
+    assert!(
+        !lost.contains(&rid_of(7, 1)) && !lost.contains(&rid_of(8, 1)),
+        "{lost:?}"
+    );
+    // The chmod was kept.
+    assert_eq!(mode_of(&meta, broken), 0o600);
     // A read of a name only a placeholder stands for waits like a read of
     // a queued replay's: the requester's retry writes it again.
     use constellation_meta::ReadKey;
-    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "moved".into())]));
+    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "broken".into())]));
     assert!(!meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "unrelated".into())]));
 }
 
-/// ADR-59: the drop names which of the rows it rolled back depend on the
-/// damaged inode's own keys (`rolled_back_on_inode`): an exclusive write of
-/// the file or of a name it took. A row that depends on the seed only
-/// through a merged directory attribute (here, an explicit utimes of the
-/// directory the held rename merged) is rolled back too, and is not listed:
-/// the sim's oracle fails an acknowledged one. The conservative control
-/// attributes nothing to the inode.
+/// ADR-59 (part B): a row that depends on the seed by key but needs none of
+/// the lost content (a chmod, a rename of the file, a utimes of the directory
+/// the held rename merged, a later chmod of the renamed file) is not rolled
+/// back: it is redone in place, and the drop lists its rid in `redone_rids`.
+/// Under the conservative control (and for a dropper that was not the
+/// sequencer) every dependent is rolled back, as before the ADR, and the
+/// drop names those that depend on the damaged inode's own keys.
 #[test]
 fn drop_held_names_the_rolled_back_rows_that_depend_on_the_damaged_inode() {
     use constellation_meta::RowCommit;
@@ -1100,20 +1209,43 @@ fn drop_held_names_the_rolled_back_rows_that_depend_on_the_damaged_inode() {
     };
     let (meta, broken) = build();
     let dropped = meta.drop_held(broken, 1).unwrap();
-    let mut rolled = dropped.rolled_back.clone();
-    rolled.sort();
     for seq in [5, 6, 7, 8] {
-        assert!(rolled.contains(&rid_of(1, seq)), "{seq}: {dropped:?}");
+        assert!(
+            dropped.redone_rids.contains(&rid_of(1, seq)),
+            "{seq}: {dropped:?}"
+        );
+        assert!(
+            !dropped.rolled_back.contains(&rid_of(1, seq)),
+            "{dropped:?}"
+        );
     }
-    let mut on_inode = dropped.rolled_back_on_inode.clone();
+    assert_eq!(dropped.redone, 4, "{dropped:?}");
+    assert!(!dropped.non_sequencer && !dropped.strand_all);
+    // The all-rolled-back form: a dropper that is not the sequencer.
+    let (meta, broken) = build();
+    let decided = meta
+        .drop_held_knowing_now(
+            broken,
+            1,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+    let mut on_inode = decided.rolled_back_on_inode.clone();
     on_inode.sort();
-    assert!(!dropped.non_sequencer);
-    assert!(on_inode.contains(&rid_of(1, 5)), "{dropped:?}");
-    assert!(on_inode.contains(&rid_of(1, 6)), "{dropped:?}");
-    assert!(on_inode.contains(&rid_of(1, 8)), "{dropped:?}");
+    for seq in [5, 6, 7, 8] {
+        assert!(decided.rolled_back.contains(&rid_of(1, seq)), "{decided:?}");
+    }
+    assert!(decided.non_sequencer && decided.strand_all);
+    assert!(on_inode.contains(&rid_of(1, 5)), "{decided:?}");
+    assert!(on_inode.contains(&rid_of(1, 6)), "{decided:?}");
+    assert!(on_inode.contains(&rid_of(1, 8)), "{decided:?}");
     assert!(
         !on_inode.contains(&rid_of(1, 7)),
-        "the directory's utimes depends on the seed through a merge only: {dropped:?}"
+        "the directory's utimes depends on the seed through a merge only: {decided:?}"
     );
     // The control: nothing but the seed is attributed to the inode.
     let (meta, broken) = build();
@@ -1139,7 +1271,7 @@ fn the_queue_snapshot_is_cached_and_every_change_invalidates_it() {
     use std::sync::Arc;
     let (meta, broken) = node_one_with_a_seed();
     assert!(meta.queue_snapshot().unwrap().is_empty());
-    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
+    exec_as(&meta, Archive, rid_of(7, 1), &truncate(broken, 3));
     meta.drop_held(broken, 5).unwrap();
     let first = meta.queue_snapshot().unwrap();
     assert_eq!(first.entries.len(), 2);
@@ -1188,7 +1320,7 @@ fn the_fast_path_refuses_an_op_on_keys_the_queue_holds() {
     const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
     let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
-    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
+    exec_as(&meta, Archive, rid_of(7, 1), &truncate(broken, 3));
     assert!(
         meta.root_fast_path(&chmod(broken, 0o700)).is_some(),
         "empty queue"
@@ -1201,70 +1333,46 @@ fn the_fast_path_refuses_an_op_on_keys_the_queue_holds() {
     assert!(meta.root_fast_path(&chmod(other, 0o700)).is_some());
 }
 
-/// Review MUST 1 (b): a read waits for a placeholder's names and its
-/// directory's listing, not for the shared parent's attributes or for a
-/// sibling name.
+/// Review MUST 1 (b): a read waits for a placeholder's names, not for a
+/// sibling name or the parent's own attributes.
 #[test]
-fn a_read_of_a_sibling_under_a_placeholders_shared_parent_is_not_blocked() {
+fn a_read_of_a_sibling_of_a_placeholders_name_is_not_blocked() {
     use constellation_meta::ReadKey;
     use constellation_meta::RowCommit;
     #[allow(non_upper_case_globals)]
     const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
-    let rename = MutateOp::Rename {
-        parent: ROOT_INO,
-        name: "broken".into(),
-        new_parent: ROOT_INO,
-        new_name: "moved".into(),
-        noreplace: false,
-    };
-    exec_as(&meta, Archive, rid_of(7, 1), &rename);
-    let create = MutateOp::Create {
-        parent: ROOT_INO,
-        name: "y".into(),
-        ino: 1 << 40,
-        mode: 0o644,
-        uid: 0,
-        gid: 0,
-    };
-    exec_as(&meta, Archive, rid_of(8, 1), &create);
+    exec_as(&meta, Archive, rid_of(7, 1), &truncate(broken, 3));
     meta.drop_held(broken, 1).unwrap();
     let queue = meta.pending_replays().unwrap();
     assert_eq!(
         queue.iter().filter(|q| q.is_await_retry()).count(),
         1,
-        "the create of y merges the directory the rename merges: it is not held: {queue:?}"
+        "{queue:?}"
     );
-    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "moved".into())]));
-    assert!(
-        meta.replay_touches(&[ReadKey::Dir(ROOT_INO)]),
-        "the listing changes"
-    );
+    assert!(meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "broken".into())]));
+    assert!(meta.replay_touches(&[ReadKey::Ino(broken)]));
     assert!(
         !meta.replay_touches(&[ReadKey::Dentry(ROOT_INO, "sibling".into())]),
         "a sibling name"
     );
     assert!(
         !meta.replay_touches(&[ReadKey::Ino(ROOT_INO)]),
-        "the shared parent's own attributes"
+        "the parent's own attributes"
     );
 }
 
 /// Review item 9: a placeholder holds the planner's keys — what its row
-/// wrote, not only what its records name: an unlink names a dentry and its
-/// directory, but writes the inode it takes a name from too, and a later
-/// `chmod` of that inode waits behind it.
+/// wrote, not only what its records name: a write of the file's content
+/// names an inode, but writes the attribute copy its name carries too, and
+/// a later `chmod` of that inode waits behind it.
 #[test]
 fn a_placeholder_holds_the_keys_its_row_wrote_not_only_the_ones_it_names() {
     use constellation_meta::RowCommit;
     #[allow(non_upper_case_globals)]
     const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
-    let unlink = MutateOp::Unlink {
-        parent: ROOT_INO,
-        name: "broken".into(),
-    };
-    exec_as(&meta, Archive, rid_of(7, 1), &unlink);
+    exec_as(&meta, Archive, rid_of(7, 1), &truncate(broken, 3));
     meta.drop_held(broken, 1).unwrap();
     let queue = meta.pending_replays().unwrap();
     let keys = &queue
@@ -1273,11 +1381,10 @@ fn a_placeholder_holds_the_keys_its_row_wrote_not_only_the_ones_it_names() {
         .and_then(|q| q.await_retry.as_ref())
         .expect("a placeholder")
         .keys;
-    assert!(keys.dentries.contains(&(ROOT_INO, "broken".to_string())));
-    assert!(keys.shared.contains(&ROOT_INO));
+    assert!(keys.inos.contains(&broken));
     assert!(
-        keys.inos.contains(&broken),
-        "the inode the unlink wrote is missing: {keys:?}"
+        keys.dentries.contains(&(ROOT_INO, "broken".to_string())),
+        "the attribute copy the row wrote is missing: {keys:?}"
     );
 }
 
@@ -1290,8 +1397,8 @@ fn a_remote_row_the_log_completed_is_not_a_placeholder() {
     #[allow(non_upper_case_globals)]
     const Archive: RowCommit = RowCommit::ARCHIVE;
     let (meta, broken) = node_one_with_a_seed();
-    exec_as(&meta, Archive, rid_of(7, 1), &chmod(broken, 0o600));
-    exec_as(&meta, Archive, rid_of(7, 2), &chmod(broken, 0o640));
+    exec_as(&meta, Archive, rid_of(7, 1), &truncate(broken, 3));
+    exec_as(&meta, Archive, rid_of(7, 2), &truncate(broken, 4));
     // The log carries the first one's completion (a late segment).
     meta.apply_segment(
         1,
@@ -1350,7 +1457,7 @@ fn a_drop_keeps_the_pending_row_of_a_lost_chunk_a_live_op_names() {
     let (meta, file, lost) = lost_chunk_before_its_manifest();
     let live = rid_of(1, 14);
     let dropped = meta
-        .drop_held_knowing(
+        .drop_held_knowing_now(
             file,
             1234,
             false,
@@ -1383,7 +1490,7 @@ fn a_drop_keeps_the_pending_row_of_a_lost_chunk_a_live_op_names() {
 fn a_drop_removes_the_row_of_a_lost_chunk_no_op_names() {
     let (meta, file, lost) = lost_chunk_before_its_manifest();
     let dropped = meta
-        .drop_held_knowing(
+        .drop_held_knowing_now(
             file,
             1,
             false,
@@ -1417,7 +1524,7 @@ fn a_drop_keeps_the_pending_row_of_a_chunk_a_write_session_names() {
     ] {
         let (meta, file, lost) = lost_chunk_before_its_manifest();
         let dropped = meta
-            .drop_held_knowing(file, 1, false, &|_| false, &|_| Vec::new(), &sessions, true)
+            .drop_held_knowing_now(file, 1, false, &|_| false, &|_| Vec::new(), &sessions, true)
             .unwrap();
         assert_eq!(dropped.pending_removed, 0, "{dropped:?}");
         assert_eq!(dropped.kept_pending, vec![lost]);
@@ -1461,7 +1568,7 @@ fn an_op_the_drop_rolled_back_does_not_keep_its_chunk() {
     // The core still lists the executed op among its clients (it awaits
     // its reply): the drop's own seed, not a reason to keep the chunk.
     let dropped = meta
-        .drop_held_knowing(
+        .drop_held_knowing_now(
             file,
             1,
             false,
@@ -1511,7 +1618,7 @@ fn an_op_the_drop_rolled_back_keeps_its_chunk_when_the_refusal_will_not_ship() {
         meta.note_unrecoverable_chunks(&[(lost, file)], true)
             .unwrap();
         let dropped = meta
-            .drop_held_knowing(
+            .drop_held_knowing_now(
                 file,
                 1,
                 false,
@@ -1685,4 +1792,91 @@ fn a_create_of_the_renamed_away_name_waits() {
         "the name the held rename took away: {recs:?}"
     );
     assert_eq!(meta.held_summary().transactions, 3);
+}
+
+#[test]
+fn a_drop_strands_a_later_write_of_the_lost_file_and_lists_it() {
+    use constellation_meta::RowCommit;
+    let (meta, broken) = node_one_with_a_seed();
+    let other = ChunkHash::of(b"an overwrite");
+    // An acknowledged overwrite of the damaged file, classed Group: its
+    // answer may have left.
+    exec_as(
+        &meta,
+        RowCommit::ROOT_GROUP,
+        rid_of(1, 9),
+        &MutateOp::SetManifest {
+            ino: broken,
+            base_manifest: None,
+            manifest: manifest_naming(other, 5),
+            size: 5,
+            mtime_ns: None,
+            ctime_ns: None,
+        },
+    );
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    assert_eq!(
+        (dropped.dropped, dropped.requeued, dropped.redone),
+        (1, 1, 0)
+    );
+    let queue = meta.pending_replays().unwrap();
+    let seed = queue.iter().find(|q| q.refused.is_some()).unwrap().rid;
+    let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
+    assert_eq!(lost.len(), 2, "{dropped:?}");
+    assert!(
+        lost.contains(&seed) && lost.contains(&rid_of(1, 9)),
+        "{lost:?}"
+    );
+    assert_eq!(meta.held_summary().acked_lost_total, 2);
+    assert!(dropped.describe().contains("acked_lost"));
+}
+
+/// A row classed for the archive alone is no proof its answer never left:
+/// a configuration that formed after it was journaled (an epoch's hold) can
+/// release the answer before the row ships (flex-crash+durability seed
+/// 26). Only an answer the core still holds parked has certainly not left.
+#[test]
+fn a_drop_lists_an_archive_classed_row_unless_its_answer_is_known_parked() {
+    use constellation_meta::RowCommit;
+    let (meta, broken) = node_one_with_a_seed();
+    let other = ChunkHash::of(b"an overwrite");
+    let overwrite = MutateOp::SetManifest {
+        ino: broken,
+        base_manifest: None,
+        manifest: manifest_naming(other, 5),
+        size: 5,
+        mtime_ns: None,
+        ctime_ns: None,
+    };
+    exec_as(&meta, RowCommit::ARCHIVE, rid_of(1, 9), &overwrite);
+    // The core knows nothing of it being parked: its answer may have left.
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
+    assert!(lost.contains(&rid_of(1, 9)), "{dropped:?}");
+
+    // The same with the core holding the answer parked: not listed.
+    let (meta, broken) = node_one_with_a_seed();
+    let overwrite = MutateOp::SetManifest {
+        ino: broken,
+        base_manifest: None,
+        manifest: manifest_naming(other, 5),
+        size: 5,
+        mtime_ns: None,
+        ctime_ns: None,
+    };
+    exec_as(&meta, RowCommit::ARCHIVE, rid_of(1, 9), &overwrite);
+    let parked = |rid| rid == rid_of(1, 9);
+    let dropped = meta
+        .drop_held_knowing_now(
+            broken,
+            1,
+            false,
+            &parked,
+            &|_| Vec::new(),
+            &constellation_meta::LiveSessions::default(),
+            true,
+        )
+        .unwrap();
+    let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
+    assert!(!lost.contains(&rid_of(1, 9)), "{dropped:?}");
 }

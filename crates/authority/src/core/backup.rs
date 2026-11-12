@@ -2112,6 +2112,12 @@ impl Core {
         shipped: u64,
         replica: &dyn Replica,
     ) -> bool {
+        // ADR-59 part B (D4): the drop's effect waits for the log, whatever
+        // the answer rule of the node is.
+        if let super::readindex::ParkedWhat::DropApply { epoch, .. } = what {
+            // (A restarted dropper reads its record's place from the log.)
+            return self.archive_covers(jseq, shipped) || replica.row_in_log(*epoch, jseq);
+        }
         if !self.park_durable(jseq, what.to_remote(self.cfg.node_id), shipped) {
             return false;
         }

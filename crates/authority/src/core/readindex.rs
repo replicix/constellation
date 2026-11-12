@@ -161,6 +161,20 @@ pub(crate) enum ParkedWhat {
     },
     /// A FUSE fast-path write (`Control::Recall`).
     Control { op: OpId },
+    /// ADR-59 part B (D4): `repair drop-held` decided the drop of `ino` (its
+    /// `DropHeld` record is journaled at `jseq`, `durable`); the drop's effect
+    /// runs when the archive covers the record, and only then answers the
+    /// control op. Aborted when the lease is lost first (the record is
+    /// fenced: nothing was dropped).
+    DropApply {
+        /// `None`: a decision of an earlier incarnation, with no operator
+        /// waiting (`Core::drop_plans_start`).
+        op: Option<OpId>,
+        ino: Ino,
+        /// The record's place in the log: `(epoch, jseq = durable)`.
+        epoch: u64,
+        sessions: constellation_meta::LiveSessions,
+    },
     /// A release CAS.
     Release,
     /// An inbox op halted before executing: poll its requester again.
@@ -1219,6 +1233,135 @@ impl Core {
         })
     }
 
+    /// ADR-59 part B (D4): the log carries the `DropHeld` record of the drop
+    /// of `ino`; run its effect, settle the answers it refuses (D3: no
+    /// client waits for a retry to learn it), answer the control op.
+    fn apply_drop(
+        &mut self,
+        now: Now,
+        op: Option<OpId>,
+        ino: Ino,
+        sessions: constellation_meta::LiveSessions,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let live = self.ops_naming_manifests_of(ino);
+        let live_ops = |hash: &replicix_chunkfmt::ChunkHash| -> Vec<Rid> {
+            live.iter()
+                .filter(|(_, manifest)| constellation_meta::manifest_names(manifest, hash))
+                .map(|(rid, _)| *rid)
+                .collect()
+        };
+        let unanswered = |rid: Rid| self.answer_parked(rid).is_some();
+        // The `Refused` rows the apply journals are the archive's, at the
+        // configuration this tenure's journal is in (plan 46 M1.1 step 4).
+        let _class = constellation_meta::PendingClass::set(constellation_meta::RowCommit::group(
+            self.root_config_version(),
+            constellation_meta::GroupOn::Archive,
+        ));
+        let applied =
+            replica.drop_held_apply(ino, now.wall.0 / 1000, &unanswered, &live_ops, &sessions);
+        match applied {
+            Ok(dropped) => {
+                if let Some(jseq) = dropped.pending {
+                    // A follow-up decision: the effect waits for it too.
+                    self.park(
+                        now,
+                        (BTreeSet::new(), None),
+                        Some(jseq),
+                        ParkedWhat::DropApply {
+                            op,
+                            ino,
+                            epoch: dropped.pending_epoch,
+                            sessions,
+                        },
+                    );
+                    return;
+                }
+                self.stats.drops_applied += 1;
+                self.stats.drop_follow_ups += dropped.follow_ups as u64;
+                for rid in dropped.placeholders.clone() {
+                    self.abort_parked_answer_of(now, rid, replica, out);
+                }
+                if let Some(op) = op {
+                    out.push(Action::ControlDone {
+                        op,
+                        result: Ok(ControlOk::DroppedHeld(dropped)),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, ino, "a decided drop could not be applied");
+                if let Some(op) = op {
+                    out.push(Action::ControlDone {
+                        op,
+                        result: Err(e.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    /// A decided drop whose record never reached the log (D2): the plan
+    /// goes, the operator is told nothing was dropped.
+    fn cancel_drop(
+        &mut self,
+        op: Option<OpId>,
+        ino: Ino,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Err(error) = replica.drop_held_cancel(ino) {
+            tracing::warn!(%error, ino, "a decided drop could not be cancelled");
+        }
+        self.stats.drops_unapplied += 1;
+        if let Some(op) = op {
+            out.push(Action::ControlDone {
+                op,
+                result: Err(
+                    "the lease was lost before the drop was in the log; nothing was dropped"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    /// ADR-59 part B: the drops a previous incarnation decided and did not
+    /// apply: one whose record the log carries is applied now, before this
+    /// node serves; one whose record is not in the log waits for it (shipped
+    /// by this tenure) or, the lease lost, is cancelled with the park.
+    pub(crate) fn drop_plans_start(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Ok(plans) = replica.drop_plans() else {
+            return;
+        };
+        for (ino, jseq, epoch) in plans {
+            // A restarted dropper does not know what its previous incarnation
+            // shipped: the log tells (`row_in_log`), and the park waits for
+            // it, or for the log to move past the tenure without the record
+            // (fenced, `complete_ready`).
+            if jseq != 0 && !replica.row_in_log(epoch, jseq) {
+                self.park(
+                    now,
+                    (BTreeSet::new(), None),
+                    Some(jseq),
+                    ParkedWhat::DropApply {
+                        op: None,
+                        ino,
+                        epoch,
+                        sessions: Default::default(),
+                    },
+                );
+            } else {
+                self.apply_drop(now, None, ino, Default::default(), replica, out);
+            }
+        }
+    }
+
     /// The park of `rid`'s executed answer, waiting for durability: the
     /// answer has certainly not left this node (plan 46 M0.2 review: what
     /// makes a group row's drop a placeholder).
@@ -1693,6 +1836,20 @@ impl Core {
                             },
                         });
                     }
+                }
+                ParkedWhat::DropApply {
+                    op, ino, sessions, ..
+                } => {
+                    // The record reached the log before the lease went: the
+                    // decision stands, and so does its apply.
+                    let shipped = replica.journal_acked_seq().unwrap_or(0);
+                    if p.durable.is_some_and(|j| self.archive_covers(j, shipped)) {
+                        self.apply_drop(now, op, ino, sessions, replica, out);
+                        continue;
+                    }
+                    // The lease went before the record was in the log: the
+                    // record is fenced, nothing was dropped (D2).
+                    self.cancel_drop(op, ino, replica, out);
                 }
                 ParkedWhat::Finish { rid, class, .. } => {
                     // Executed here but never acknowledged: in doubt, and
@@ -2387,6 +2544,33 @@ impl Core {
         // past its lease; the acknowledgement it was parked for was
         // never released, and its client heard `EIO` at the deadline).
         let shipped = replica.journal_acked_seq().unwrap_or(0);
+        // ADR-59 part B (D2): a decided drop whose record the log passed by:
+        // the log is at a higher epoch than the tenure that journaled the
+        // record, and does not carry it. Its dropper lost the lease before
+        // the record shipped; the drop never happened.
+        let fenced: Vec<u64> = self
+            .rd
+            .parked
+            .iter()
+            .filter(|(_, p)| match (&p.what, p.durable) {
+                (ParkedWhat::DropApply { epoch, .. }, Some(j)) => {
+                    !self.archive_covers(j, shipped)
+                        && !replica.row_in_log(*epoch, j)
+                        && replica.applied_epoch() > *epoch
+                }
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in fenced {
+            if let Some(Parked {
+                what: ParkedWhat::DropApply { op, ino, .. },
+                ..
+            }) = self.rd.parked.remove(&id)
+            {
+                self.cancel_drop(op, ino, replica, out);
+            }
+        }
         // The log's index of each generation is read at most once for all
         // of them.
         let mut cache = super::delegate::StreamCache::default();
@@ -2712,6 +2896,9 @@ impl Core {
                     op,
                     result: Ok(ControlOk::Done),
                 }),
+                ParkedWhat::DropApply {
+                    op, ino, sessions, ..
+                } => self.apply_drop(now, op, ino, sessions, replica, out),
                 ParkedWhat::Release => self.release_after_recalls(now, replica, out),
                 ParkedWhat::InboxRepoll { node } => self.inbox_repoll(now, node, out),
                 ParkedWhat::ExecuteReply {

@@ -151,8 +151,9 @@ use crate::error::MetaError;
 use crate::mutate::MutateOp;
 use crate::record::LogRecord;
 use crate::store::{
-    adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, journal, local, spec, Meta,
-    UsageTracker, KV_DROP_HELD_UNSHIPPED, KV_POISONED_COUNT,
+    adjust_usage_tx, counter_add_get_tx, counter_add_tx, counter_get, counter_set_tx, journal,
+    local, spec, Meta, UsageTracker, KV_ACKED_LOST_TOTAL, KV_DROP_HELD_UNSHIPPED,
+    KV_POISONED_COUNT,
 };
 use constellation_fs_core::{ChunkInfo, Ino, Manifest};
 use fjall::Readable;
@@ -348,6 +349,9 @@ pub struct HeldSummary {
     /// Shared, so that cloning the summary (`Meta::held`) costs nothing per
     /// rid.
     pub rids: std::sync::Arc<BTreeSet<crate::rid::Rid>>,
+    /// ADR-59: acknowledged operations `repair drop-held` rolled back for
+    /// good on this node, ever (`DroppedHeld::acked_lost`).
+    pub acked_lost_total: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -392,6 +396,35 @@ pub struct DroppedHeld {
     /// Empty of dependents under the conservative control (nothing is
     /// attributed to the inode).
     pub rolled_back_on_inode: Vec<crate::rid::Rid>,
+    /// ADR-59: held transactions that depend on a seed but need none of the
+    /// lost content (a rename, chmod or unlink of the damaged file, a create
+    /// or unlink in its directory): redone in place with their journal rows,
+    /// rids and answers, not rolled back.
+    pub redone: usize,
+    /// The rids of the `redone` rows that have one. A redone row told in
+    /// doubt (parked Archive/Group answer, settle window ended) lands when
+    /// the operator's drop releases it, as a queued replay lands when the
+    /// drain runs it: the sim's late-landing check exempts it. A redone row
+    /// without a rid (a placeholder-less remote row) is in `redone` only.
+    pub redone_rids: Vec<crate::rid::Rid>,
+    /// ADR-59: every dependent was rolled back (the conservative control, or
+    /// a dropper that was not the sequencer in force).
+    pub strand_all: bool,
+    /// ADR-59: the rows the drop rolled back whose answer may have left (the
+    /// I1 loss it cannot avoid: an acknowledged write of bytes that are gone,
+    /// or an acknowledged op that needs them), with why. Listed, counted and
+    /// warned of, never excused silently.
+    pub acked_lost: Vec<(crate::rid::Rid, String)>,
+    /// ADR-59 part B: the decision is journaled (`DropHeld` at this journal
+    /// seq) and takes effect when the log carries it ([`Meta::drop_held_apply`]);
+    /// `None` on the final result.
+    pub pending: Option<u64>,
+    /// The epoch of the tenure that journaled the `pending` record: its
+    /// place in the log is `(pending_epoch, pending)`.
+    pub pending_epoch: u64,
+    /// ADR-59 part B: follow-up decisions an apply needed (a redone row did
+    /// not apply as it did). Expected 0.
+    pub follow_ups: usize,
     /// The dropper was not the sequencer in force: what it rolled back is a
     /// deposed node's strand, whose refusals are fenced.
     pub non_sequencer: bool,
@@ -485,6 +518,46 @@ impl DroppedHeld {
             self.queued_dropped,
             self.pending_removed
         );
+        if let Some(jseq) = self.pending {
+            text = format!(
+                "inode {}: drop decided (journal seq {jseq}): {} held transaction(s) will become a                  conflict copy under {}/ and {} dependent transaction(s) roll back when the log                  carries the decision; {} other held transaction(s) did not need the lost content                  and are kept",
+                self.ino,
+                self.dropped,
+                crate::CONFLICT_DIR,
+                self.requeued,
+                self.redone
+            );
+        } else if self.redone > 0 {
+            text.push_str(&format!(
+                "; {} other held transaction(s) did not need the lost content and were kept \
+                 as they were",
+                self.redone
+            ));
+        }
+        if self.non_sequencer && !self.rolled_back.is_empty() {
+            text.push_str(
+                "; this node is not the sequencer in force, so everything that depended on the \
+                 seed was rolled back and replayed, as at a deposition",
+            );
+        }
+        if self.follow_ups > 0 {
+            text.push_str(&format!(
+                "; {} follow-up decision(s): a transaction kept as it was did not replay as it \
+                 had run and was rolled back too",
+                self.follow_ups
+            ));
+        }
+        if !self.acked_lost.is_empty() {
+            text.push_str(&format!(
+                "; {} acknowledged operation(s) were lost with the data (acked_lost: {})",
+                self.acked_lost.len(),
+                self.acked_lost
+                    .iter()
+                    .map(|(rid, why)| format!("{rid:?} {why}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if self.unidentified > 0 {
             text.push_str(&format!(
                 "; {} rolled-back transaction(s) could not be named to the members, which keep their copies",
@@ -1339,6 +1412,7 @@ fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
         inodes,
         opaque: plan.opaque,
         deferred: plan.deferred.len() as u64,
+        acked_lost_total: 0,
         rids: std::sync::Arc::new(plan.held_rids.iter().copied().collect()),
     }
 }
@@ -1546,7 +1620,10 @@ impl Meta {
     }
 
     pub fn held_summary(&self) -> HeldSummary {
-        self.held.lock().unwrap().clone()
+        HeldSummary {
+            acked_lost_total: self.acked_lost.load(Ordering::Relaxed),
+            ..self.held.lock().unwrap().clone()
+        }
     }
 
     /// ADR-58 C3: whether the last ship plan *holds* `rid`'s transaction
@@ -1563,15 +1640,22 @@ impl Meta {
     /// `constellation repair drop-held <ino>` (see the module doc's
     /// "Dropping"). `now_unix` stamps the conflict copies' names.
     pub fn drop_held(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
-        self.drop_held_knowing(
-            ino,
-            now_unix,
-            false,
-            &|_| false,
-            &|_| Vec::new(),
-            &LiveSessions::default(),
-            true,
-        )
+        self.drop_held_at_once(ino, now_unix, false)
+    }
+
+    /// The offline forms (`drop_held`, `drop_held_remote`) have no log to
+    /// wait for (ADR-59 part B, D4): they decide and apply in one go.
+    fn drop_held_at_once(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        remote: bool,
+    ) -> Result<DroppedHeld, MetaError> {
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        self.drop_held_knowing(ino, now_unix, remote, &none, &no_ops, &sessions, true)?;
+        self.drop_held_apply(ino, now_unix, &none, &no_ops, &sessions)
     }
 
     /// `constellation repair drop-held <ino> --remote`: the same for a
@@ -1586,15 +1670,7 @@ impl Meta {
     /// rows go. Nothing is dropped silently: the requester's op is a
     /// refusal or a conflict copy, never lost.
     pub fn drop_held_remote(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
-        self.drop_held_knowing(
-            ino,
-            now_unix,
-            true,
-            &|_| false,
-            &|_| Vec::new(),
-            &LiveSessions::default(),
-            true,
-        )
+        self.drop_held_at_once(ino, now_unix, true)
     }
 
     /// `drop_held` / `drop_held_remote` with what only the core knows
@@ -1605,15 +1681,11 @@ impl Meta {
     /// above know nothing: such a row keeps its op, the only copy that can
     /// execute if the answer left.
     ///
-    /// `live_ops(hash)`: the rids of the ops in flight on this node (not
-    /// journaled yet, or not executed) whose manifest of `ino` names
-    /// `hash`; `sessions`: the chunks the node's open write sessions of
-    /// `ino` have sealed. A lost chunk either names keeps its pending row,
-    /// poison mark and remote mark (see "Dropping" in the module doc): no
-    /// row means *durable* to every ship plan, forward list and manifest
-    /// composition, so dropping it under such an op would let the op's
-    /// manifest ship naming a chunk S3 never received. The offline forms
-    /// have no op in flight.
+    /// ADR-59 part B (D1): this is the *decision*. It journals one
+    /// `LogRecord::DropHeld` naming what the drop rolls back and persists the
+    /// [`DropPlan`]; it changes no other state. [`Meta::drop_held_apply`] is
+    /// the effect, run when the log carries the record (D4). `live_ops` and
+    /// `sessions` are read by the apply.
     #[allow(clippy::too_many_arguments)]
     pub fn drop_held_knowing(
         &self,
@@ -1625,15 +1697,20 @@ impl Meta {
         sessions: &LiveSessions,
         exclude_rolled_back: bool,
     ) -> Result<DroppedHeld, MetaError> {
-        // The `Refused` records the drop journals are answered by the log
-        // alone — nobody is told of them, and a retry meets the record —
-        // so they are `Archive` rows, the class the core's check wants set.
-        // (A caller that holds a configuration sets its own: the core's drop
-        // is the archive's rule at the tenure's version.)
+        let _ = now_unix;
+        // The `DropHeld` record is answered by the log alone — nobody is
+        // told of it — so it is an `Archive` row, the class the core's check
+        // wants set. (A caller that holds a configuration sets its own: the
+        // core's drop is the archive's rule at the tenure's version.)
         let _class = super::journal::PendingClass::current()
             .is_none()
             .then(|| super::journal::PendingClass::set(super::local::RowCommit::ARCHIVE));
         let mut tx = self.db.write_tx();
+        if tx.get(&self.local, drop_plan_key(ino))?.is_some() {
+            return Err(MetaError::Invalid(format!(
+                "a drop of inode {ino} is decided and waits for the log to carry it"
+            )));
+        }
         if remote {
             // The inode's remote-pending chunks are unrecoverable from
             // here on: marked in the same transaction, so the plan below
@@ -1663,91 +1740,233 @@ impl Meta {
                  `--remote`)"
             )));
         };
-        let held = plan(&tx, self, &poisoned, &PoisonMap::new(), None)?;
-        // The inode's seeds, and every held transaction that depends on
-        // them (key overlap, transitively, in journal order).
-        let mut tainted = Taint::default();
-        let mut seeds: Vec<(Tx, u64, u64)> = Vec::new(); // (tx, spec_seq, origin)
-                                                         // (spec_seq, origin, the keys a placeholder of it holds)
-                                                         // (the last: whether it depends on the damaged inode's own keys)
-        let mut dependents: Vec<(u64, u64, crate::replay::TouchSet, bool)> = Vec::new();
-        let mut rolled_back: Vec<crate::rid::Rid> = Vec::new();
-        let mut on_inode: Vec<crate::rid::Rid> = Vec::new();
-        // The exclusive keys of the seeds and of what depends on them through
-        // such keys (`DroppedHeld::rolled_back_on_inode`). The conservative
-        // control folds merges into exclusive keys, which would attribute a
-        // directory's siblings to the inode: it attributes nothing.
-        let mut own: HashSet<Vec<u8>> = HashSet::new();
-        let attribute = !self.parent_taint_conservative.load(Ordering::Relaxed);
-        let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
-        // The identity of every transaction the drop rolls back, as a
-        // member keys it (`LogRecord::DropHeld`).
-        let mut idents: Vec<((u64, u64), Option<crate::rid::Rid>)> = Vec::new();
-        let mut unidentified = 0usize;
-        for (t, seed_inos, keys) in held.held {
-            let is_seed = seed_inos.contains(&ino);
-            let depends = keys.as_ref().is_some_and(|keys| tainted.hit(keys, &[]));
-            if !is_seed && !depends {
-                continue;
-            }
-            let (Some(spec_seq), Some(keys)) = (t.spec_seq, keys) else {
-                return Err(MetaError::Invalid(format!(
-                    "held transaction at journal seq {} was journaled without before-images, \
-                     so it cannot be rolled back; rebuild this replica",
-                    t.first
-                )));
-            };
-            let placeholder = placeholder_keys(&t, &keys);
-            let records: Vec<LogRecord> = t.rows.iter().map(|(_, rec)| rec.clone()).collect();
-            let head_epoch =
-                super::local::get_journal_tx_head(&tx, self, t.first)?.map(|head| head.epoch);
-            match rolled_back_ident(head_epoch, t.first, &records) {
-                Some(ident) => {
-                    let row = local::get_journal_tx(&tx, self, t.first)?;
-                    idents.push((ident, tx_rid(&t, row.as_ref())));
-                }
-                // A captured transaction (it has before-images) has its
-                // head; one without cannot be named to the members, which
-                // keep their copy of it. Said, counted, never silent.
-                None => {
-                    unidentified += 1;
-                    tracing::warn!(
-                        first = t.first,
-                        "a transaction the drop rolls back has no journal head: \
-                         members cannot be told to retract it"
-                    );
-                }
-            }
-            let on_this_inode = attribute && (is_seed || keys.excl.iter().any(|k| own.contains(k)));
-            if on_this_inode {
-                own.extend(keys.excl.iter().cloned());
-            }
-            tainted.add(&keys);
-            let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
-                .map(|row| row.origin)
-                .unwrap_or(spec_seq);
-            if is_seed {
-                seeds.push((t, spec_seq, origin));
-            } else {
-                dependents.push((spec_seq, origin, placeholder, on_this_inode));
-            }
+        // A dropper that is not the sequencer in force (suspended past its
+        // lease, deposed meanwhile) cannot ship what it would keep: a keeper
+        // of rows acknowledged by a group has no one to re-ship them. Everything
+        // that depends on a seed is then rolled back and replayed by rid, as a
+        // deposition does.
+        let strand_all =
+            self.parent_taint_conservative.load(Ordering::Relaxed) || !exclude_rolled_back;
+        let walked = walk_drop(
+            &tx,
+            self,
+            ino,
+            &missing,
+            &poisoned,
+            DropMode::Decide { strand_all },
+        )?;
+        let mut plan = DropPlan {
+            jseq: 0,
+            epoch: 0,
+            remote,
+            sequencer: exclude_rolled_back,
+            strand_all,
+            missing: missing.iter().copied().collect(),
+            seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
+            s_deps: walked
+                .dependents
+                .iter()
+                .map(|(seq, _, _, _)| *seq)
+                .collect(),
+            redone: walked.redone.iter().map(|(seq, _)| *seq).collect(),
+            redone_rids: walked.redone.iter().filter_map(|(_, rid)| *rid).collect(),
+            follow_ups: 0,
+        };
+        if walked.seeds.is_empty() || !exclude_rolled_back {
+            // Nothing to carry in the log: either a run after an earlier drop
+            // kept a lost chunk's rows because an op or a write session still
+            // named it (no transaction is left to roll back; the marks and
+            // pending rows of the chunks no longer named go now), or the
+            // dropper is not the sequencer in force. Such a drop journals no
+            // record and decides nothing: it is the node's own stranding, as
+            // at a deposition (its rolled-back acknowledged rows re-ship from
+            // the copies, its parked answers abort by D3).
+            tx.insert(
+                &self.local,
+                drop_plan_key(ino),
+                postcard::to_allocvec(&plan)?,
+            );
+            tx.commit()?;
+            return self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions);
         }
-        let mut seqs: HashSet<u64> = dependents.iter().map(|(seq, _, _, _)| *seq).collect();
-        seqs.extend(seeds.iter().map(|(_, seq, _)| *seq));
+        let local = self.begin_local(&tx)?;
+        let jseq = journal::append_tx(
+            &mut tx,
+            &self.journal_ks,
+            &self.local,
+            &self.completed,
+            &LogRecord::DropHeld {
+                ino,
+                chunks: missing.iter().copied().collect(),
+                rolled_back: walked.idents.clone(),
+            },
+        )?;
+        counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
+        self.finish_local(&mut tx, local)?;
+        plan.jseq = jseq;
+        plan.epoch = super::local::get_journal_tx_head(&tx, self, jseq)?.map_or(0, |h| h.epoch);
+        tx.insert(
+            &self.local,
+            drop_plan_key(ino),
+            postcard::to_allocvec(&plan)?,
+        );
+        tx.commit()?;
+        tracing::warn!(
+            ino,
+            jseq,
+            dropped = walked.seeds.len(),
+            requeued = walked.dependents.len(),
+            redone = walked.redone.len(),
+            "drop-held decided: a DropHeld record is journaled; the drop takes effect when the \
+             log carries it"
+        );
+        Ok(DroppedHeld {
+            ino,
+            dropped: walked.seeds.len(),
+            requeued: walked.dependents.len(),
+            redone: walked.redone.len(),
+            redone_rids: plan.redone_rids.clone(),
+            strand_all,
+            non_sequencer: !exclude_rolled_back,
+            missing,
+            unidentified: walked.unidentified,
+            pending: Some(jseq),
+            pending_epoch: plan.epoch,
+            ..DroppedHeld::default()
+        })
+    }
+
+    /// Tests only: decide and apply at once (no log to wait for).
+    #[cfg(any(test, feature = "test-util"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn drop_held_knowing_now(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        remote: bool,
+        unanswered: &dyn Fn(crate::rid::Rid) -> bool,
+        live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
+        sessions: &LiveSessions,
+        exclude_rolled_back: bool,
+    ) -> Result<DroppedHeld, MetaError> {
+        let decided = self.drop_held_knowing(
+            ino,
+            now_unix,
+            remote,
+            unanswered,
+            live_ops,
+            sessions,
+            exclude_rolled_back,
+        )?;
+        if decided.pending.is_none() {
+            return Ok(decided);
+        }
+        self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions)
+    }
+
+    /// The drops decided and not yet applied: `(inode, journal seq of the
+    /// `DropHeld` record, epoch of the tenure that journaled it)`.
+    pub fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64)>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for guard in r.prefix(&self.local, DROP_PLAN_PREFIX) {
+            let (k, v) = guard.into_inner()?;
+            let ino = Ino::from_be_bytes(k[DROP_PLAN_PREFIX.len()..].try_into().map_err(|_| {
+                MetaError::Invalid("a drop plan key is not an inode number".to_string())
+            })?);
+            let plan: DropPlan = postcard::from_bytes(&v)?;
+            out.push((ino, plan.jseq, plan.epoch));
+        }
+        Ok(out)
+    }
+
+    /// The decided drop of `ino` never happened (its record is fenced: the
+    /// dropper lost the lease before the record shipped): the plan goes.
+    pub fn drop_held_cancel(&self, ino: Ino) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        if tx.get(&self.local, drop_plan_key(ino))?.is_some() {
+            tx.remove(&self.local, drop_plan_key(ino));
+            // The record never ships from here.
+            counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, -1)?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// ADR-59 part B (D4): the effect of the drop of `ino` decided by
+    /// [`Meta::drop_held_knowing`], run when the log carries its record. The
+    /// plan's seeds and the rows that need the lost content are stranded
+    /// (their queued replays refused or made placeholders), the rest is
+    /// redone in place; the `Refused` rows and `completed` entries, the
+    /// pending rows and marks go. A redo that skips a record commits only a
+    /// follow-up `DropHeld` naming it (`pending` is returned again).
+    #[allow(clippy::too_many_arguments)]
+    pub fn drop_held_apply(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        unanswered: &dyn Fn(crate::rid::Rid) -> bool,
+        live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
+        sessions: &LiveSessions,
+    ) -> Result<DroppedHeld, MetaError> {
+        let _class = super::journal::PendingClass::current()
+            .is_none()
+            .then(|| super::journal::PendingClass::set(super::local::RowCommit::ARCHIVE));
+        let mut tx = self.db.write_tx();
+        let Some(raw) = tx.get(&self.local, drop_plan_key(ino))? else {
+            return Err(MetaError::Invalid(format!(
+                "no decided drop of inode {ino} is waiting"
+            )));
+        };
+        let plan: DropPlan = postcard::from_bytes(&raw)?;
+        let missing: BTreeSet<ChunkHash> = plan.missing.iter().copied().collect();
+        let exclude_rolled_back = plan.sequencer;
+        let poisoned = read_poisoned(&tx, self)?;
+        let walked = walk_drop(&tx, self, ino, &missing, &poisoned, DropMode::Apply(&plan))?;
+        let mut seqs: HashSet<u64> = walked
+            .dependents
+            .iter()
+            .map(|(seq, _, _, _)| *seq)
+            .collect();
+        seqs.extend(walked.seeds.iter().map(|(_, seq, _)| *seq));
         let staged = UsageTracker::staging();
-        spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
+        let (_, redo_skipped) = spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
+        if !redo_skipped.is_empty() {
+            // A row redone in place did not apply as it did: it is rolled
+            // back with the others, by a follow-up decision (the loop of
+            // round 2, moved into the log). Nothing of this attempt stands.
+            drop(tx);
+            return self.drop_held_follow_up(ino, &redo_skipped);
+        }
+        let mut rolled_back: Vec<crate::rid::Rid> = Vec::new();
+        let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
+        let mut on_inode: Vec<crate::rid::Rid> = Vec::new();
+        // The rows of `S` whose answer may have left (the I1 loss the drop
+        // cannot avoid: an acknowledged write of bytes that are gone, or an
+        // acknowledged op that needs them). Listed, counted and warned of,
+        // never excused silently. (Only a parked answer certainly has not
+        // left. A row whose class waits for the archive alone is no
+        // exception: a configuration that formed after it was journaled, an
+        // epoch's hold, can release its answer before it ships, and the row's
+        // class keeps the rule it was journaled under; flex-crash+durability
+        // seed 26.)
+        let mut acked_lost: Vec<(crate::rid::Rid, String)> = Vec::new();
+        let may_have_left = |rid: crate::rid::Rid, class: super::local::RowCommit| {
+            !(class.gated() && unanswered(rid))
+        };
         // Plan 46 M0.2 (R1): another node's dependent whose answer was
         // never given is no copy of its op any more, but a placeholder in
         // its place: its requester's retry is the one copy that executes.
         let mut await_retry = 0;
-        for (_, origin, keys, on_this_inode) in &dependents {
-            if let Some(rid) = spec::queued_at(&tx, self, *origin)?.map(|(rid, _)| rid) {
+        for (_, origin, keys, on_this_inode) in &walked.dependents {
+            let queued = spec::queued_class_at(&tx, self, *origin)?;
+            if let Some((rid, _)) = queued {
                 rolled_back.push(rid);
                 if *on_this_inode {
                     on_inode.push(rid);
                 }
             }
-            if let Some(rid) = spec::mark_await_retry_tx(
+            match spec::mark_await_retry_tx(
                 &mut tx,
                 self,
                 *origin,
@@ -1755,8 +1974,20 @@ impl Meta {
                 now_unix.saturating_mul(1000),
                 unanswered,
             )? {
-                await_retry += 1;
-                placeholders.push(rid);
+                Some(rid) => {
+                    await_retry += 1;
+                    placeholders.push(rid);
+                }
+                None => {
+                    if let Some((rid, _)) =
+                        queued.filter(|(rid, class)| may_have_left(*rid, *class))
+                    {
+                        acked_lost.push((
+                            rid,
+                            format!("needs the content of inode {ino}, whose chunk(s) are gone"),
+                        ));
+                    }
+                }
             }
         }
         // The rids whose ops are dropped: their outcome goes in the log
@@ -1777,7 +2008,7 @@ impl Meta {
         // Each seed: its queued replay becomes a refused one carrying the
         // manifest with the lost chunks as holes, so the drain makes the
         // conflict copy and never re-executes the seed.
-        for (t, _, origin) in &seeds {
+        for (t, _, origin) in &walked.seeds {
             let Some((manifest, size)) = t.rows.iter().rev().find_map(|(_, rec)| match rec {
                 LogRecord::WriteManifest {
                     ino: m,
@@ -1789,10 +2020,15 @@ impl Meta {
             }) else {
                 continue;
             };
-            let rid = match spec::queued_at(&tx, self, *origin)? {
+            let queued = spec::queued_class_at(&tx, self, *origin)?;
+            let rid = match queued {
                 Some((rid, _)) => rid,
                 None => spec::replay_rid_for(&tx, self, t.first)?,
             };
+            // (A seed with no queued replay cannot be told: listed.)
+            if queued.is_none_or(|(rid, class)| may_have_left(rid, class)) {
+                acked_lost.push((rid, format!("wrote chunk(s) of inode {ino} that are gone")));
+            }
             let op = MutateOp::SetManifest {
                 ino,
                 base_manifest: None,
@@ -1839,6 +2075,12 @@ impl Meta {
                 mtime_ns: None,
                 ctime_ns: None,
             };
+            if may_have_left(queued.rid, queued.class) {
+                acked_lost.push((
+                    queued.rid,
+                    format!("a queued replay of a write of inode {ino} whose chunk(s) are gone"),
+                ));
+            }
             spec::refuse_queued_tx(
                 &mut tx,
                 self,
@@ -1854,32 +2096,17 @@ impl Meta {
             queued_dropped += 1;
         }
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
-        // the log. Before this the requester of a dropped op (a member
-        // whose epoch write the owner dropped, or a deposed owner that
-        // replayed it) kept its shadow for good: no `Completed` was ever
-        // coming, and only a takeover would have stranded it.
-        if !refused_rids.is_empty() || !idents.is_empty() {
+        // the log. The `DropHeld` record is in the log already (this apply
+        // runs when it is); its `Refused` rows follow.
+        // (A dropper that is not the sequencer in force decides nothing: its
+        // refusals would be fenced, and a `Refused` outcome here would make
+        // the takeover skip, as an outcome already here, the very copies
+        // that re-ship the rolled-back rows. Its refused queue entries settle
+        // the rid through the sequencer in force before they make their
+        // conflict copy.)
+        if !refused_rids.is_empty() && exclude_rolled_back {
             let local = self.begin_local(&tx)?;
             let now_ms = now_unix.saturating_mul(1000);
-            // The members' and the backups' copies of what was rolled back
-            // are retracted by this record (defect B): the first record of
-            // the transaction, ahead of every refusal. Its place in the
-            // journal is what makes a holder's death mid-drop safe: a
-            // successor has the record or none of the drop's effects.
-            if !idents.is_empty() {
-                journal::append_tx(
-                    &mut tx,
-                    &self.journal_ks,
-                    &self.local,
-                    &self.completed,
-                    &LogRecord::DropHeld {
-                        ino,
-                        chunks: missing.iter().copied().collect(),
-                        rolled_back: idents.clone(),
-                    },
-                )?;
-                counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
-            }
             for rid in &refused_rids {
                 let position = journal::append_tx(
                     &mut tx,
@@ -1945,39 +2172,356 @@ impl Meta {
         }
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        let lost_total = counter_add_get_tx(
+            &mut tx,
+            &self.local,
+            KV_ACKED_LOST_TOTAL,
+            acked_lost.len() as i64,
+        )?;
+        tx.remove(&self.local, drop_plan_key(ino));
         tx.commit()?;
+        self.acked_lost.store(lost_total, Ordering::Relaxed);
         self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
         *self.held.lock().unwrap() = HeldSummary::default();
         tracing::warn!(
             ino,
-            dropped = seeds.len(),
-            requeued = dependents.len(),
+            dropped = walked.seeds.len(),
+            requeued = walked.dependents.len(),
+            redone = plan.redone.len(),
             await_retry,
             queued_dropped,
             pending_removed,
             kept = kept_pending.len(),
+            acked_lost = acked_lost.len(),
             "held records dropped into conflict copies"
         );
+        for (rid, why) in &acked_lost {
+            tracing::warn!(
+                ino,
+                ?rid,
+                why,
+                "drop-held rolled back an operation whose answer may have left: \
+                 the lost data is the conflict copy (acked_lost)"
+            );
+        }
         kept_for.sort();
         kept_for.dedup();
-        Ok(DroppedHeld {
+        let done = DroppedHeld {
             ino,
-            dropped: seeds.len(),
-            requeued: dependents.len(),
+            dropped: walked.seeds.len(),
+            requeued: walked.dependents.len(),
+            redone: plan.redone.len(),
+            redone_rids: plan.redone_rids.clone(),
+            strand_all: plan.strand_all,
+            non_sequencer: !exclude_rolled_back,
+            acked_lost,
             await_retry,
             pending_removed,
             queued_dropped,
             rolled_back,
             placeholders,
             rolled_back_on_inode: on_inode,
-            non_sequencer: !exclude_rolled_back,
             missing,
             kept_pending,
             kept_for,
-            unidentified,
+            unidentified: walked.unidentified,
+            pending: None,
+            pending_epoch: 0,
+            follow_ups: plan.follow_ups as usize,
+        };
+        {
+            let mut sink = self.applied_drops.lock().unwrap();
+            if sink.len() >= 64 {
+                sink.remove(0);
+            }
+            sink.push(done.clone());
+        }
+        Ok(done)
+    }
+
+    /// Tests and the simulation: the drops applied since the last call, in
+    /// order (bounded).
+    pub fn take_applied_drops(&self) -> Vec<DroppedHeld> {
+        std::mem::take(&mut *self.applied_drops.lock().unwrap())
+    }
+
+    /// A redo at the apply skipped a record of the rows `skipped` (their
+    /// `spec_seq`s): they join the rolled-back set by a follow-up
+    /// `DropHeld` naming them, and the plan waits for that record too
+    /// (expected never; counted `follow_ups`).
+    fn drop_held_follow_up(&self, ino: Ino, skipped: &[u64]) -> Result<DroppedHeld, MetaError> {
+        let _class = super::journal::PendingClass::current()
+            .is_none()
+            .then(|| super::journal::PendingClass::set(super::local::RowCommit::ARCHIVE));
+        let mut tx = self.db.write_tx();
+        let Some(raw) = tx.get(&self.local, drop_plan_key(ino))? else {
+            return Err(MetaError::Invalid(format!(
+                "no decided drop of inode {ino} is waiting"
+            )));
+        };
+        let mut plan: DropPlan = postcard::from_bytes(&raw)?;
+        let moved: HashSet<u64> = skipped.iter().copied().collect();
+        let missing: BTreeSet<ChunkHash> = plan.missing.iter().copied().collect();
+        let poisoned = read_poisoned(&tx, self)?;
+        let walked = walk_drop(
+            &tx,
+            self,
+            ino,
+            &missing,
+            &poisoned,
+            DropMode::Follow(&plan, &moved),
+        )?;
+        if walked.idents.is_empty() {
+            return Err(MetaError::Invalid(format!(
+                "drop-held {ino}: a redone transaction diverged and cannot be named"
+            )));
+        }
+        let local = self.begin_local(&tx)?;
+        let jseq = journal::append_tx(
+            &mut tx,
+            &self.journal_ks,
+            &self.local,
+            &self.completed,
+            &LogRecord::DropHeld {
+                ino,
+                chunks: Vec::new(),
+                rolled_back: walked.idents.clone(),
+            },
+        )?;
+        counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
+        self.finish_local(&mut tx, local)?;
+        plan.redone.retain(|s| !moved.contains(s));
+        plan.s_deps.extend(moved.iter().copied());
+        plan.jseq = jseq;
+        plan.epoch = super::local::get_journal_tx_head(&tx, self, jseq)?.map_or(0, |h| h.epoch);
+        plan.follow_ups += 1;
+        tx.insert(
+            &self.local,
+            drop_plan_key(ino),
+            postcard::to_allocvec(&plan)?,
+        );
+        tx.commit()?;
+        tracing::warn!(
+            ino,
+            jseq,
+            rows = skipped.len(),
+            "drop-held: a transaction redone in place did not apply as it did (a record \
+             skipped): a follow-up DropHeld rolls it back with the others"
+        );
+        Ok(DroppedHeld {
+            ino,
+            pending: Some(jseq),
+            pending_epoch: plan.epoch,
+            follow_ups: plan.follow_ups as usize,
+            ..DroppedHeld::default()
         })
     }
+}
+
+/// ADR-59 part B: what a decided drop persists (`local["drop_plan:{ino}"]`)
+/// until its record is in the log and the apply has run: the set of rows the
+/// record names, so the apply rolls back exactly those whatever was held
+/// since.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct DropPlan {
+    /// The journal seq of the (latest) `DropHeld` record, and the epoch of
+    /// the tenure that journaled it (its place in the log is
+    /// `(epoch, jseq)`).
+    jseq: u64,
+    epoch: u64,
+    remote: bool,
+    /// The dropper was the sequencer in force when it decided.
+    sequencer: bool,
+    strand_all: bool,
+    missing: Vec<ChunkHash>,
+    /// `spec_seq`s of the seed transactions.
+    seeds: Vec<u64>,
+    /// `spec_seq`s of the dependents rolled back with them.
+    s_deps: Vec<u64>,
+    /// `spec_seq`s of the dependents redone in place.
+    redone: Vec<u64>,
+    redone_rids: Vec<crate::rid::Rid>,
+    follow_ups: u32,
+}
+
+const DROP_PLAN_PREFIX: &[u8] = b"drop_plan:";
+
+fn drop_plan_key(ino: Ino) -> Vec<u8> {
+    let mut k = DROP_PLAN_PREFIX.to_vec();
+    k.extend_from_slice(&ino.to_be_bytes());
+    k
+}
+
+/// How [`walk_drop`] picks the rows.
+enum DropMode<'a> {
+    /// The decision: the seeds, and what depends on them; of those only the
+    /// rows that need the lost content (or all of them, `strand_all`) are
+    /// rolled back.
+    Decide { strand_all: bool },
+    /// The apply: exactly the plan's rows.
+    Apply(&'a DropPlan),
+    /// A follow-up: only the `moved` rows of the plan's redone set, named.
+    Follow(&'a DropPlan, &'a HashSet<u64>),
+}
+
+/// What [`walk_drop`] found.
+struct Walked {
+    /// (transaction, spec_seq, origin)
+    seeds: Vec<(Tx, u64, u64)>,
+    /// (spec_seq, origin, the keys a placeholder of it holds, whether it
+    /// depends on the damaged inode's own keys)
+    dependents: Vec<(u64, u64, crate::replay::TouchSet, bool)>,
+    /// (spec_seq, rid) of the rows redone in place.
+    redone: Vec<(u64, Option<crate::rid::Rid>)>,
+    /// The identity of every transaction the drop rolls back, as a member
+    /// keys it, and the rid it completes.
+    idents: Vec<((u64, u64), Option<crate::rid::Rid>)>,
+    unidentified: usize,
+}
+
+/// The inode's seeds, and every held transaction that depends on them (key
+/// overlap, `conflicts`, transitively, in journal order), sorted into the
+/// ones rolled back and the ones redone in place.
+fn walk_drop(
+    tx: &fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+    missing: &BTreeSet<ChunkHash>,
+    poisoned: &PoisonMap,
+    mode: DropMode<'_>,
+) -> Result<Walked, MetaError> {
+    let held = plan(tx, meta, poisoned, &PoisonMap::new(), None)?;
+    let mut chain = Taint::default();
+    // The inodes whose content the loss reaches: the damaged file, and any
+    // file a later write of it was copied into.
+    let mut lost: HashSet<Ino> = HashSet::from([ino]);
+    // The exclusive keys of the seeds and of what depends on them through
+    // such keys (`DroppedHeld::rolled_back_on_inode`). The conservative
+    // control folds merges into exclusive keys, which would attribute a
+    // directory's siblings to the inode: it attributes nothing.
+    let mut own: HashSet<Vec<u8>> = HashSet::new();
+    let attribute = !meta.parent_taint_conservative.load(Ordering::Relaxed);
+    let mut out = Walked {
+        seeds: Vec::new(),
+        dependents: Vec::new(),
+        redone: Vec::new(),
+        idents: Vec::new(),
+        unidentified: 0,
+    };
+    for (t, seed_inos, keys) in held.held {
+        let is_seed;
+        let in_s;
+        match &mode {
+            DropMode::Decide { strand_all } => {
+                is_seed = seed_inos.contains(&ino);
+                let depends = keys.as_ref().is_some_and(|keys| chain.hit(keys, &[]));
+                if !is_seed && !depends {
+                    continue;
+                }
+                in_s = is_seed || *strand_all || needs_lost_content(&t, &mut lost, missing);
+            }
+            DropMode::Apply(plan) => {
+                let Some(seq) = t.spec_seq else { continue };
+                is_seed = plan.seeds.contains(&seq);
+                in_s = is_seed || plan.s_deps.contains(&seq);
+                if !in_s && !plan.redone.contains(&seq) {
+                    continue;
+                }
+            }
+            DropMode::Follow(plan, moved) => {
+                let Some(seq) = t.spec_seq else { continue };
+                is_seed = false;
+                in_s = moved.contains(&seq) && plan.redone.contains(&seq);
+                if !in_s {
+                    continue;
+                }
+            }
+        }
+        let (Some(spec_seq), Some(keys)) = (t.spec_seq, keys) else {
+            return Err(MetaError::Invalid(format!(
+                "held transaction at journal seq {} was journaled without before-images, \
+                 so it cannot be rolled back; rebuild this replica",
+                t.first
+            )));
+        };
+        let row = local::get_journal_tx(tx, meta, t.first)?;
+        let rid = tx_rid(&t, row.as_ref());
+        chain.add(&keys);
+        if !in_s {
+            out.redone.push((spec_seq, rid));
+            continue;
+        }
+        let placeholder = placeholder_keys(&t, &keys);
+        let records: Vec<LogRecord> = t.rows.iter().map(|(_, rec)| rec.clone()).collect();
+        let head_epoch = super::local::get_journal_tx_head(tx, meta, t.first)?.map(|h| h.epoch);
+        match rolled_back_ident(head_epoch, t.first, &records) {
+            Some(ident) => out.idents.push((ident, rid)),
+            // A captured transaction (it has before-images) has its head;
+            // one without cannot be named to the members, which keep their
+            // copy of it. Said, counted, never silent.
+            None => {
+                out.unidentified += 1;
+                tracing::warn!(
+                    first = t.first,
+                    "a transaction the drop rolls back has no journal head: \
+                     members cannot be told to retract it"
+                );
+            }
+        }
+        let on_this_inode = attribute && (is_seed || keys.excl.iter().any(|k| own.contains(k)));
+        if on_this_inode {
+            own.extend(keys.excl.iter().cloned());
+        }
+        let origin = spec::row_keys_and_origin(tx, meta, spec_seq)?
+            .map(|row| row.origin)
+            .unwrap_or(spec_seq);
+        if is_seed {
+            out.seeds.push((t, spec_seq, origin));
+        } else {
+            out.dependents
+                .push((spec_seq, origin, placeholder, on_this_inode));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `tx` writes or reads the content of an inode of `lost` (the
+/// damaged file, and any file a write of it was copied into): a manifest of
+/// it whatever the manifest says (these are data ops on the damaged file;
+/// narrowing them to the chunks they name is a later refinement), or a
+/// size change of it. A write naming a lost chunk of another inode copies
+/// the damage there: that inode joins `lost`.
+///
+/// A row this does not select is redone in place: its journal row, `completed`
+/// row, rid and answer are kept, so it can have been acknowledged and stays
+/// so. If it was told in doubt and lands when the drop releases it, that is
+/// the operator's action, as a queued replay's landing is (`redone_rids`
+/// exempts it from the late-landing check). A kept in-doubt create keeps its
+/// inode allocated: a requester's retry under a new rid allocates afresh.
+fn needs_lost_content(tx: &Tx, lost: &mut HashSet<Ino>, missing: &BTreeSet<ChunkHash>) -> bool {
+    let mut needs = false;
+    for (_, rec) in &tx.rows {
+        match rec {
+            LogRecord::WriteManifest { ino, manifest, .. } => {
+                if lost.contains(ino) {
+                    needs = true;
+                } else if matches!(
+                    Manifest::decode(manifest),
+                    Ok(Manifest { chunks: ChunkInfo::Inline(chunks), .. })
+                        if chunks.values().any(|h| missing.contains(h))
+                ) {
+                    lost.insert(*ino);
+                    needs = true;
+                }
+            }
+            LogRecord::Setattr {
+                ino, size: Some(_), ..
+            } if lost.contains(ino) => needs = true,
+            _ => {}
+        }
+    }
+    needs
 }
 
 #[cfg(test)]

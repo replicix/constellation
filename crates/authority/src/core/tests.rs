@@ -62655,8 +62655,9 @@ mod await_retry {
         })
     }
 
-    /// `repair drop-held` as the core runs it.
-    fn drop_held_via_core(h: &mut Harness, ino: Ino) -> Vec<Action> {
+    /// `repair drop-held` as the core runs it: the decision (ADR-59 part B,
+    /// D1), which journals the `DropHeld` record and waits for the log.
+    pub(super) fn drop_held_decide_via_core(h: &mut Harness, ino: Ino) -> Vec<Action> {
         h.step(Event::Control {
             op: OpId(900),
             req: Control::DropHeld {
@@ -62667,75 +62668,133 @@ mod await_retry {
         })
     }
 
-    /// Defect B: the drop journals one `DropHeld` record naming the
-    /// identity of every transaction it rolled back — the seed and its
-    /// dependent — as the first record of the transaction that carries the
-    /// drop's `Refused` rows: ahead of every refusal, so a holder that dies
-    /// mid-drop leaves a successor with the record or none of the drop's
-    /// effects.
+    /// The journal rows ship (the archive carries the decision) and the core
+    /// is told: what its parks see on the next round. The shipped rows.
+    pub(super) fn ship_round(
+        h: &mut Harness,
+        segment: u64,
+        out: &mut Vec<Action>,
+    ) -> Vec<LogRecord> {
+        let rows: Vec<(u64, LogRecord)> = h
+            .meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .collect();
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        if !seqs.is_empty() {
+            let through = h.meta.journal_through_after(&seqs).unwrap();
+            h.meta.ack_journal_rows_at(&seqs, segment).unwrap();
+            h.core.note_shipped(&seqs, through);
+        }
+        h.core.complete_ready(h.clk(), &h.meta, out);
+        rows.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// `repair drop-held` as the core runs it, to its end: decided, the
+    /// record shipped, applied.
+    fn drop_held_via_core(h: &mut Harness, ino: Ino) -> Vec<Action> {
+        let mut out = drop_held_decide_via_core(h, ino);
+        let shipped = ship_round(h, 99, &mut out);
+        let _ = shipped;
+        out
+    }
+
+    /// ADR-59 part B (D1, D4), B3 (iii): the drop decides nothing locally. The
+    /// decision transaction carries one `DropHeld` record, alone, naming the
+    /// seed (the chmod needs none of the lost content: it is redone, not
+    /// named); nothing else changes and no operator is answered until the
+    /// log carries it; the `Refused` rows and the answer come with the apply.
+    /// A second drop of the inode meanwhile is refused.
     #[test]
-    fn drop_held_journals_rolled_back_ahead_of_its_refusals() {
+    fn drop_held_decides_in_one_record_and_applies_when_the_log_carries_it() {
         let (mut h, broken) = holder_with_a_seed();
+        h.meta.set_parent_taint_conservative(false);
         let own = rid_of(1, 6);
         exec_as(&h, RowCommit::LONE, own, &chmod(broken, 0o600));
         let txs = h.meta.journal_txs_from(0, usize::MAX).unwrap();
-        let first_of = |pred: fn(&LogRecord) -> bool| {
-            txs.iter()
-                .find(|t| t.records.iter().any(pred))
-                .map(|t| t.first)
-                .expect("a transaction")
-        };
-        let seed = first_of(|r| matches!(r, LogRecord::WriteManifest { .. }));
-        let dependent = first_of(|r| matches!(r, LogRecord::Setattr { .. }));
-        let out = drop_held_via_core(&mut h, broken);
-        assert!(
-            out.iter().any(|a| matches!(
-                a,
-                Action::ControlDone {
-                    result: Ok(ControlOk::DroppedHeld(_)),
-                    ..
-                }
-            )),
-            "{out:?}"
-        );
-        let after = h.meta.journal_txs_from(0, usize::MAX).unwrap();
-        let drop_tx = after
+        let seed = txs
             .iter()
             .find(|t| {
                 t.records
                     .iter()
+                    .any(|r| matches!(r, LogRecord::WriteManifest { .. }))
+            })
+            .map(|t| t.first)
+            .expect("the seed");
+        let done = |out: &[Action]| {
+            out.iter().find_map(|a| match a {
+                Action::ControlDone { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+        };
+        let held_before = h.meta.held_summary().transactions;
+        let out = drop_held_decide_via_core(&mut h, broken);
+        assert!(
+            done(&out).is_none(),
+            "no answer before the log carries it: {out:?}"
+        );
+        let after = h.meta.journal_txs_from(0, usize::MAX).unwrap();
+        let record_txs: Vec<_> = after
+            .iter()
+            .filter(|t| {
+                t.records
+                    .iter()
                     .any(|r| matches!(r, LogRecord::DropHeld { .. }))
             })
-            .unwrap_or_else(|| panic!("no DropHeld journaled: {after:?}"));
-        let LogRecord::DropHeld { rolled_back, .. } = &drop_tx.records[0] else {
-            panic!("DropHeld is not first: {:?}", drop_tx.records)
+            .collect();
+        assert_eq!(record_txs.len(), 1, "{after:?}");
+        let LogRecord::DropHeld { rolled_back, .. } = &record_txs[0].records[0] else {
+            panic!("{:?}", record_txs[0].records)
         };
-        let mut idents: Vec<(u64, u64)> = rolled_back.iter().map(|(i, _)| *i).collect();
-        idents.sort();
-        assert_eq!(idents, vec![(1, seed), (1, dependent)]);
+        assert_eq!(record_txs[0].records.len(), 1, "the record alone");
+        let idents: Vec<(u64, u64)> = rolled_back.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idents, vec![(1, seed)]);
         assert!(
-            out.iter().any(|a| matches!(
-                a,
-                Action::ControlDone {
-                    result: Ok(ControlOk::DroppedHeld(d)),
-                    ..
-                } if d.unidentified == 0
-            )),
-            "every rolled-back transaction was named"
-        );
-        assert!(
-            drop_tx.records[1..]
+            !after
                 .iter()
-                .all(|r| matches!(r, LogRecord::Refused { .. }))
-                && drop_tx.records.len() >= 2,
-            "the refusals follow in the same transaction: {:?}",
-            drop_tx.records
+                .flat_map(|t| &t.records)
+                .any(|r| matches!(r, LogRecord::Refused { .. })),
+            "the refusals wait for the apply"
         );
-        // (And nothing of the dropped rows is left to ship around it.)
-        assert!(!after.iter().any(|t| t.records.iter().any(|r| matches!(
-            r,
-            LogRecord::WriteManifest { .. } | LogRecord::Setattr { .. }
-        ))));
+        assert_eq!(
+            h.meta.held_summary().transactions,
+            held_before,
+            "nothing is stranded yet"
+        );
+        assert!(h.meta.pending_replays().unwrap().is_empty());
+        // A second drop of the inode meanwhile is refused.
+        let again = h.step(Event::Control {
+            op: OpId(901),
+            req: Control::DropHeld {
+                ino: broken,
+                remote: false,
+                sessions: Default::default(),
+            },
+        });
+        assert!(
+            matches!(done(&again), Some(Err(_))),
+            "a decided drop is pending: {again:?}"
+        );
+        // The log carries the record: the effect and the answer.
+        let mut out = Vec::new();
+        ship_round(&mut h, 99, &mut out);
+        let Some(Ok(ControlOk::DroppedHeld(d))) = done(&out) else {
+            panic!("{out:?}")
+        };
+        assert_eq!(d.pending, None);
+        assert!(d.redone_rids.contains(&own), "{d:?}");
+        let refused = h
+            .meta
+            .journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .iter()
+            .flat_map(|t| t.records.clone())
+            .filter(|r| matches!(r, LogRecord::Refused { .. }))
+            .count();
+        assert_eq!(refused, 1, "the seed's refusal comes with the apply");
+        assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
     }
 
     /// Defect A, the exclusion of an op the drop rolled back: it keeps its
@@ -66133,6 +66192,69 @@ mod kept_fetch {
         let mut got = reshipped(&h);
         got.sort();
         assert_eq!(got, vec![(1, txs[1].first), (1, txs[2].first)], "once each");
+    }
+
+    /// B3 (i), 1529's tail shape: the dropper decided and was deposed before
+    /// the record shipped; its sealed tail is its journal as the drop left
+    /// it, the members' copies are the rows as they were. Under D4 the two
+    /// differ by the unshipped record alone: not a divergence; the gate
+    /// fences it (the drop never happened) and re-ships the held rows once
+    /// each. Fail before: the drop had already stranded the journal, the
+    /// tail disagreed with the copies and the claim stalled (`kept_diverged`).
+    #[test]
+    fn a_deposed_droppers_undecided_record_is_fenced_not_a_divergence() {
+        let (mut dropper, broken) = await_retry::holder_with_a_seed();
+        dropper.meta.set_parent_taint_conservative(false);
+        await_retry::exec_as(
+            &dropper,
+            RowCommit::LONE,
+            Rid {
+                node: 1,
+                incarnation: 1,
+                seq: 6,
+            },
+            &await_retry::chmod(broken, 0o600),
+        );
+        // (The fixture shipped its first rows: the journal is read from the
+        // first one it still holds, renumbered to start at 1, as a sealed
+        // tail of an epoch does.)
+        let rows_of = |m: &Meta| -> Vec<BackupTx> {
+            let txs: Vec<BackupTx> = m
+                .journal_txs_from(0, usize::MAX)
+                .unwrap()
+                .into_iter()
+                .filter(|t| !t.records.is_empty())
+                .collect();
+            let shift = txs.first().map_or(0, |t| t.first - 1);
+            txs.into_iter()
+                .map(|t| BackupTx {
+                    first: t.first - shift,
+                    last: t.last - shift,
+                    ..t
+                })
+                .collect()
+        };
+        let copies = rows_of(&dropper.meta);
+        assert!(copies.len() >= 2, "{copies:?}");
+        let _ = await_retry::drop_held_decide_via_core(&mut dropper, broken);
+        let tail = rows_of(&dropper.meta);
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3, 4], 1, false);
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let out = answer_all(&mut h, &a, 2, 1, tail, vec![vec![1, 2, 4]]);
+        assert!(cas(&win(&mut h, out, &fenced())).is_none());
+        let out = answer_all(&mut h, &a, 4, 1, copies.clone(), vec![vec![1, 2, 4]]);
+        let written = finish(&mut h, out, &fenced());
+        assert!(written.is_some(), "the claim completes");
+        assert_eq!(h.core.stats.kept_diverged, 0);
+        assert_eq!(h.core.stats.tail_drop_fenced, 1);
+        let mut got = reshipped(&h);
+        got.sort();
+        assert_eq!(
+            got,
+            copies.iter().map(|t| (1, t.first)).collect::<Vec<_>>(),
+            "each held row once"
+        );
     }
 
     // ---- ADR-59, T9 ----

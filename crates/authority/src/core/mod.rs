@@ -2196,6 +2196,22 @@ pub struct Stats {
     /// ADR-51: tail transactions whose identity an earlier epoch's tail of
     /// the same takeover re-shipped already (normal; not `tail_done_skipped`).
     pub tail_dedup: u64,
+    /// ADR-59 part B (D3): parked answers released as the refusal the store
+    /// held for their rid at the release (a drop refused it meanwhile).
+    pub answers_refused_at_release: u64,
+    /// ADR-59 part B: `repair drop-held` decisions journaled.
+    pub drops_decided: u64,
+    /// ADR-59 part B: `repair drop-held` decisions applied (the log carried
+    /// the record).
+    pub drops_applied: u64,
+    /// ADR-59 part B: decisions never applied here: the lease was lost before
+    /// the record was in the log (fenced), or the applier died with the
+    /// record in the log (`drop_decided_unapplied`, counted by the successor's
+    /// gate as `tail_retired`; the maintainer accepts it, see the ADR).
+    pub drops_unapplied: u64,
+    /// ADR-59 part B: follow-up decisions (a row kept as it was did not
+    /// replay as it had run). Expected 0.
+    pub drop_follow_ups: u64,
     /// ADR-59 part B: tail transactions a `DropHeld` of the log retired (the
     /// drop rolled them back; a member's late copy), skipped. Normal after a
     /// drop.
@@ -3097,6 +3113,7 @@ impl Core {
         self.deleg_restart_start(now, replica, out);
         self.locks_start(now, replica);
         self.backup_start(now, replica, out);
+        self.drop_plans_start(now, replica, out);
         self.promise_start(now, replica, out);
         // EC2 campaign 8 A-1: learn who holds the lease now, not at the
         // first forward a peer sends here. A restarted holder whose

@@ -4167,6 +4167,13 @@
     "HeldStatus": {
       "description": "Plan 30 §M4: records held back behind unrecoverable pending chunks.",
       "properties": {
+        "acked_lost_total": {
+          "default": 0,
+          "description": "ADR-59: acknowledged operations `repair drop-held` rolled back for\ngood on this node since it was created (a seed's own acknowledged\nwrite and the later writes that needed its bytes): the double fault of\na lost chunk plus an acknowledged operation that needs it. The command\nlists each (`acked_lost`) and the node warns once per request id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "awaiting": {
           "default": [],
           "description": "Plan 46 M0.2: rows of other nodes that `repair drop-held` rolled back\nwhose answer was never given: each keeps its place in this node's\nreplay queue as a placeholder, waiting for its requester's retry\n(which executes it again in the dropped row's place) and holding\nwhat depends on it behind it. After `drop_held_await_ms` (default\nthe client deadline minus two settle windows, 60 s at the default\nTTL) the sequencer in force settles the rid as\nabandoned (`ack.await_retry_settled`).",

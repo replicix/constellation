@@ -268,6 +268,21 @@ pub trait Replica {
         sessions: &constellation_meta::LiveSessions,
         exclude_rolled_back: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
+    /// ADR-59 part B (D4): the effect of the drop `drop_held` decided for
+    /// `ino`, run when the log carries its record.
+    fn drop_held_apply(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        unanswered: &dyn Fn(Rid) -> bool,
+        live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
+        sessions: &constellation_meta::LiveSessions,
+    ) -> Result<constellation_meta::DroppedHeld, MetaError>;
+    /// The decided drop of `ino` never happened (its record is fenced).
+    fn drop_held_cancel(&self, ino: Ino) -> Result<(), MetaError>;
+    /// Drops decided and not applied: `(inode, journal seq of the record,
+    /// epoch it was journaled under)`.
+    fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64)>, MetaError>;
     /// The replay queue decoded once per generation of the queue, with
     /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
     fn queue_snapshot(
@@ -1226,6 +1241,25 @@ impl Replica for Meta {
             sessions,
             exclude_rolled_back,
         )
+    }
+
+    fn drop_held_apply(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        unanswered: &dyn Fn(Rid) -> bool,
+        live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
+        sessions: &constellation_meta::LiveSessions,
+    ) -> Result<constellation_meta::DroppedHeld, MetaError> {
+        Meta::drop_held_apply(self, ino, now_unix, unanswered, live_ops, sessions)
+    }
+
+    fn drop_held_cancel(&self, ino: Ino) -> Result<(), MetaError> {
+        Meta::drop_held_cancel(self, ino)
+    }
+
+    fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64)>, MetaError> {
+        Meta::drop_plans(self)
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {

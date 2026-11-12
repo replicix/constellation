@@ -2341,6 +2341,13 @@ pub struct HeldStatus {
     /// abandoned (`ack.await_retry_settled`).
     #[serde(default)]
     pub awaiting: Vec<AwaitingRetryStatus>,
+    /// ADR-59: acknowledged operations `repair drop-held` rolled back for
+    /// good on this node since it was created (a seed's own acknowledged
+    /// write and the later writes that needed its bytes): the double fault of
+    /// a lost chunk plus an acknowledged operation that needs it. The command
+    /// lists each (`acked_lost`) and the node warns once per request id.
+    #[serde(default)]
+    pub acked_lost_total: u64,
 }
 
 /// One dropped row of another node, waiting for its requester's retry.
