@@ -123,6 +123,21 @@ pub fn stream_rows_held() -> bool {
     .is_some_and(|p| p.exists())
 }
 
+/// `CONSTELLATION_FAULT_SHIP_DELAY_MS=N`: every log segment this node ships
+/// waits `N` ms before its PUT, so rows journaled meanwhile stay unshipped
+/// for at least that long and a commit published right after a segment
+/// (the segment-count cadence) is planned while they are (the
+/// `holder-publishes-log-prefix` scenario). Unset or 0: no delay.
+pub fn ship_delay() -> Option<std::time::Duration> {
+    static DELAY: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *DELAY.get_or_init(|| {
+        env_duration(
+            "CONSTELLATION_FAULT_SHIP_DELAY_MS",
+            std::time::Duration::from_millis,
+        )
+    })
+}
+
 /// A duration from `var` in `unit`s (`None`: unset, unparseable or 0).
 fn env_duration(var: &str, unit: fn(u64) -> std::time::Duration) -> Option<std::time::Duration> {
     std::env::var(var)

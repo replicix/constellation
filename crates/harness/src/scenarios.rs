@@ -12158,6 +12158,12 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
     if !backup {
         b = b.with_env("CONSTELLATION_P2P", "off");
+        // Ship lag: each segment waits before its PUT, so the commit the
+        // 32-segment cadence publishes right after a segment is planned
+        // over rows still unshipped (~100 of them at the paced rate) and
+        // lands before the next segment does. A commit that carried them
+        // would show on the fresh D and not on B, which tails the log.
+        a = a.with_env("CONSTELLATION_FAULT_SHIP_DELAY_MS", "500");
     }
     a.fs_create()?;
     a.mount()?;
