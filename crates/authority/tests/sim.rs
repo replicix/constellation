@@ -17827,6 +17827,29 @@ fn regression_locks_unlinked_delegated_dcrash_pause_seed_558() {
     });
 }
 
+/// `locks-unlinked-delegated-dcrash-pause` seeds 3808 and 4016 (plan 46
+/// M1.2 step 10, two exclusive holders): node 3, `d1`'s delegate, releases
+/// the subtree and the root grants it to the same generation again after a
+/// cross-subtree op, with the lock grants the release handed back. In 3808
+/// the stream releases `d1` a second time and the root took that hand-back
+/// of node 3's own grant on `lk0` for a copy of the first and dropped it
+/// (`LockState::returned` is per generation); in 4016 the root's renewal
+/// answer handed node 1's grant on `lk1` back before node 3 applied the
+/// re-delegation row, so `lk1` resolved to the root there and the next
+/// batch carried the grant out as leaving the subtree. Either way neither
+/// table served the grant, and node 3 granted the inode over it.
+#[test]
+fn regression_locks_unlinked_delegated_dcrash_pause_seeds_3808_and_4016() {
+    for seed in [3808, 4016] {
+        run_seed(seed, locks_unlinked_dcrash_pause_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-unlinked-delegated-dcrash-pause seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dcrash-pause"
+            )
+        });
+    }
+}
+
 /// unlinked-exclusion-7455: the root outwaited and ended `d1`'s
 /// generation while its delegate (node 2) was paused; awake, the delegate
 /// answered the recall it found queued with grants that had lapsed during

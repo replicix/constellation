@@ -33582,6 +33582,214 @@ mod locks {
         assert_eq!(r.core.stats.lock_returned_duplicates, 2);
     }
 
+    /// Plan 46 M1.2 step 10 (sim `locks-unlinked-delegated-dcrash-pause`
+    /// seed 3808): a stream releases its subtree, the root hands it the
+    /// subtree again under the same generation with the grants the release
+    /// handed back, and the stream releases it again: the second hand-back
+    /// is not a copy of the first. Fails before: the root dropped it as a
+    /// duplicate, neither table had the grant, and the delegate granted the
+    /// inode over its own holder's.
+    #[test]
+    fn a_grant_handed_back_twice_by_one_generation_comes_back_twice() {
+        let (mut d, dir, f, _) = carry_delegate(5_000);
+        delegation_left(&mut d, 60_000);
+        let g = unused_grant(&mut d, f);
+        d.advance(1_000);
+        let back = recall_answer(&mut d, dir, OpId(5));
+        assert_eq!(back.grants.len(), 1, "{back:?}");
+        let (mut r, _, _, _recall) = recalling_root(5_000);
+        r.now = d.now;
+        release_note_only(&mut r, 3, 7, back.clone());
+        assert!(r.meta.locks().get(g).is_some(), "handed back");
+        assert_eq!(r.core.stats.lock_moved, 1);
+        // The subtree goes to generation 7 again, its grant with it.
+        r.advance(10);
+        r.core.lock_on_delegated(7, &r.meta);
+        assert!(r.meta.locks().get(g).is_none(), "moved to the handoff");
+        let now = r.clk();
+        let (grants, _) = r.core.lock_take_handoff(now, 7);
+        assert_eq!(grants.iter().map(|w| w.id).collect::<Vec<_>>(), vec![g]);
+        // The second release hands the same grant back.
+        r.advance(10);
+        release_note_only(&mut r, 3, 7, back);
+        assert!(
+            r.meta.locks().get(g).is_some(),
+            "the second hand-back was dropped as a duplicate"
+        );
+        assert_eq!(r.core.stats.lock_moved, 2);
+        assert_eq!(r.core.stats.lock_returned_duplicates, 0);
+    }
+
+    /// Plan 46 M1.2 step 10 (sim `locks-unlinked-delegated-dcrash-pause`
+    /// seed 4016): the root's handoff of a subtree it granted the stream
+    /// again reaches the delegate before the row does. The grant waits for
+    /// a re-send that finds the inode the generation's here. Fails before:
+    /// installed at once on an inode that resolved to the root, it went
+    /// back with the next batch as having left the subtree, and the
+    /// delegate served the subtree without it.
+    #[test]
+    fn a_handoff_ahead_of_its_subtree_row_waits_for_the_row() {
+        let (mut d, _dir, _f, req) = carry_delegate(5_000);
+        // `e/e.lock`: the root's, not yet granted to the stream here.
+        let e = d.meta.allocate_ino(ROOT_INO).unwrap();
+        let ef = d.meta.allocate_ino(e).unwrap();
+        crate::replica::Replica::apply_segment(
+            &d.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "e".into(),
+                    ino: e,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 3,
+                },
+                LogRecord::Create {
+                    parent: e,
+                    name: "e.lock".into(),
+                    ino: ef,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 4,
+                },
+            ],
+        )
+        .unwrap();
+        let id = GrantId { node: 1, seq: 9 };
+        let wire = constellation_meta::locks::GrantWire {
+            id,
+            node: 2,
+            ino: ef,
+            mode: X,
+            until_ms: d.now.0 + 3_000,
+            recalled: false,
+            gen: 0,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: true,
+            lapsed: false,
+        };
+        handoff_to(&mut d, req, vec![wire], vec![(id, 3_000)]);
+        assert!(d.core.deleg_mine_until(7).is_some(), "serving");
+        assert!(
+            d.meta.locks().get(id).is_none(),
+            "installed on an inode that is not the generation's here"
+        );
+        assert!(
+            d.core.deleg_leaving_grants(d.clk(), 7, &d.meta).is_empty(),
+            "handed back as having left the subtree"
+        );
+        assert_eq!(d.core.stats.lock_handoff_deferred, 1);
+        // The row arrives; the next re-send installs it.
+        crate::replica::Replica::apply_segment(
+            &d.meta,
+            3,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::delegate_one(
+                3,
+                7,
+                e,
+                constellation_meta::SubtreeKind::Placed,
+            )],
+        )
+        .unwrap();
+        d.advance(100);
+        let now = d.clk();
+        d.core
+            .lock_install_moved(now, 7, vec![wire], &[(id, 2_900)], &d.meta);
+        assert!(d.meta.locks().get(id).is_some(), "installed with the row");
+        assert!(d.core.deleg_leaving_grants(d.clk(), 7, &d.meta).is_empty());
+    }
+
+    /// Plan 46 M1.2 step 10 (sim `locks-unlinked-delegated-dcrash-pause`
+    /// seed 3808, the delegate's half): a stream that holds `d` and `e`
+    /// releases `d` with a grant the root had handed it, and the root grants
+    /// it `d` again with that grant. The second handoff is a move of its
+    /// own. Fails before: taken for a re-send of the first, it was skipped,
+    /// and the delegate served `d` without the grant.
+    #[test]
+    fn a_grant_handed_to_one_generation_twice_is_installed_twice() {
+        let (mut d, dir, f, req) = carry_delegate(5_000);
+        let e = d.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &d.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "e".into(),
+                    ino: e,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 3,
+                },
+                LogRecord::delegate_one(3, 7, e, constellation_meta::SubtreeKind::Placed),
+            ],
+        )
+        .unwrap();
+        let id = GrantId { node: 1, seq: 9 };
+        let wire = constellation_meta::locks::GrantWire {
+            id,
+            node: 2,
+            ino: f,
+            mode: X,
+            until_ms: d.now.0 + 3_000,
+            recalled: false,
+            gen: 0,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: true,
+            lapsed: false,
+        };
+        handoff_to(&mut d, req, vec![wire], vec![(id, 3_000)]);
+        assert!(d.meta.locks().get(id).is_some(), "the first handoff");
+        d.advance(100);
+        let back = recall_answer(&mut d, dir, OpId(5));
+        assert_eq!(
+            back.grants.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert!(d.meta.locks().get(id).is_none(), "handed back");
+        assert!(d.core.deleg_mine_until(7).is_some(), "the stream lives on");
+        // The root grants `d` to the stream again, the grant with it.
+        crate::replica::Replica::apply_segment(
+            &d.meta,
+            3,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::delegate_one(
+                3,
+                7,
+                dir,
+                constellation_meta::SubtreeKind::Placed,
+            )],
+        )
+        .unwrap();
+        d.advance(100);
+        let now = d.clk();
+        d.core
+            .lock_install_moved(now, 7, vec![wire], &[(id, 2_800)], &d.meta);
+        assert!(
+            d.meta.locks().get(id).is_some(),
+            "the second handoff was skipped as a re-send"
+        );
+    }
+
     /// L3 (b): a recall sent again (its answer was lost) is answered with
     /// the same lock hand-back: the grants the first answer took out of the
     /// table come back with it, with what is left of them at the second

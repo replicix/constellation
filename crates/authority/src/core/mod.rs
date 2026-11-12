@@ -1593,6 +1593,9 @@ pub struct Stats {
     /// Plan 43 C7-F follow-up (H1): grants of a delegate's recall answer
     /// that an earlier copy of the answer had handed back already (dropped).
     pub lock_returned_duplicates: u64,
+    /// Plan 46 M1.2 step 10: grants of a root's handoff a delegate left for a
+    /// later re-send, their inode not yet the generation's in its replica.
+    pub lock_handoff_deferred: u64,
     /// Answers that grant and extend nothing and went ahead of a held
     /// answer to the same peer (they used to queue behind it), and answers
     /// that waited for the order of the answers to their peer alone.
