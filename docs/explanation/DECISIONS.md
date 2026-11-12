@@ -622,7 +622,7 @@ format).
 [Durability and failover](../reference/features/durability-and-failover.md);
 [`crates/authority/src/core/backup.rs`](../../crates/authority/src/core/backup.rs),
 [`crates/meta/src/store/backup.rs`](../../crates/meta/src/store/backup.rs),
-[`crates/store-s3/src/lease.rs`](../../crates/store-s3/src/lease.rs)
+`lease.rs` of `replicix-objcas`
 (`AckPolicy`); model `crates/model/src/backup.rs`.
 
 ## ADR-22: Flexible-quorum continuation epochs with promises
@@ -4099,7 +4099,7 @@ the retired node's streamed rows.
 seeds, pin it.
 
 See: `crates/authority/src/core/kept.rs`, `core/seal_tail.rs`,
-`crates/meta/src/store/spec.rs` (`stranded_by_abandon`), `crates/store-s3/src/lease.rs` (`fenced_for_retirement`),
+`crates/meta/src/store/spec.rs` (`stranded_by_abandon`), `lease.rs` of `replicix-objcas` (`fenced_for_retirement`),
 [durability and failover](../reference/features/durability-and-failover.md).
 
 ## ADR-53: A row keeps its configuration's rule across its holder's own tenure gap

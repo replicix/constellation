@@ -1722,7 +1722,7 @@ Expected: an `S3` lease is never carried into a continuation epoch
   [ADR-22](../../explanation/DECISIONS.md#adr-22-flexible-quorum-continuation-epochs-with-promises)
 - [`crates/authority/src/core/backup.rs`](../../../crates/authority/src/core/backup.rs),
   [`crates/authority/src/core/promise.rs`](../../../crates/authority/src/core/promise.rs),
-  [`crates/store-s3/src/lease.rs`](../../../crates/store-s3/src/lease.rs),
+  `lease.rs` of `replicix-objcas`,
   [`crates/store-s3/src/heartbeat.rs`](../../../crates/store-s3/src/heartbeat.rs),
   [`crates/meta/src/store/backup.rs`](../../../crates/meta/src/store/backup.rs)
 - Models: `crates/model/src/backup.rs`, `crates/model/src/flex.rs`;

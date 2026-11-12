@@ -66,7 +66,7 @@ object has a structural size bound:
 - **Chunk objects** carry a declared length: output is capped at exactly that
   length, and the declared length itself must be under a memory-safety
   ceiling (`codec::max_decompressed_len`, default 1 GiB, env
-  `CONSTELLATION_MAX_DECOMPRESSED_BYTES`).
+  `REPLICIX_MAX_DECOMPRESSED_BYTES`).
 - **Log segments and inbox batches** have no length header and no structural
   bound, so they decompress to that same ceiling (`decompress_to_ceiling`).
   A first version of this fix capped them at 64 MiB and 16 MiB from design-doc
@@ -292,7 +292,7 @@ timeout.
 | `meta_blobs` | 9.1M | 10382 | clean |
 
 Reproduce: `cd fuzz && cargo +nightly fuzz run <target>`. The store targets pin
-`CONSTELLATION_MAX_DECOMPRESSED_BYTES` to 64 MiB at startup so libFuzzer's
+`REPLICIX_MAX_DECOMPRESSED_BYTES` to 64 MiB at startup so libFuzzer's
 malloc limit still flags any allocation past the ceiling.
 
 ## Dependency posture

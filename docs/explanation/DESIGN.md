@@ -67,6 +67,21 @@ record stays, so the node remains write-eligible and may return with S3.
 registry record, so the node no longer counts toward a continuation
 epoch's quorum (§5.3). Heartbeats and missed pings never drop a member.
 
+Shared code. The conditional-write layer (CAS semantics, the error
+classifier, S3 client construction, leases, probes, preflight), the CCH1 chunk
+format with its codec registry and E2E key hierarchy, the advisory file locks
+and filesystem primitives, the CSI bindings and parameter helpers, and the
+upload concurrency controller live in
+[replicix-core](https://github.com/replicix/replicix-core), pinned by commit
+in the workspace `Cargo.toml`. Constellation supplies what is specific to it
+through small adapters in `constellation-store-s3`: the two E2E derivation
+labels (`ConstellationDomain`; they decide every derived key of every existing
+filesystem and never change), the `StoreError` conversions and classifier
+table, and the protocol clock behind lease stamps. Its overrides are read from
+`REPLICIX_LEASE_TTL_MS`, `REPLICIX_CAS_BUSY_RETRIES`,
+`REPLICIX_S3_MAX_RETRIES`, `REPLICIX_S3_RETRY_TIMEOUT_MS` and
+`REPLICIX_MAX_DECOMPRESSED_BYTES`.
+
 ### Hard constraints
 
 Five constraints bind every mechanism below (plan 30 §2). A mechanism

@@ -171,7 +171,7 @@ Every configuration runs at **both** 0 ms and 20 ms one-way injected S3
 latency (plan 28 §P4's "same-region" assumption), and **both** `create`
 (`O_CREAT`+close, no data) and `write4k` (`O_CREAT`+write 4096B+close,
 one data-chunk PUT) are measured for every multi-node row. P2P-off rows
-use `CONSTELLATION_LEASE_TTL_MS=5000` (down from the 60 s default) and
+use `REPLICIX_LEASE_TTL_MS=5000` (down from the 60 s default) and
 4× fewer ops/node — the default TTL's sticky-lease dwell/notice-at-renewal
 worst case makes a single P2P-off config take tens of minutes, the same
 reason `create-storm-s3-only` (`crates/harness/src/scenarios.rs`) uses a

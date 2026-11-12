@@ -42,7 +42,7 @@ Every CAS site handles the answers distinctly:
 | Answer | Meaning | What Constellation does |
 |---|---|---|
 | success | the write landed | done |
-| `409 Conflict` | another conditional write on the key is in flight; this one did not happen | retries the *same* attempt (same body, same precondition), up to `CONSTELLATION_CAS_BUSY_RETRIES` times (default 5, 50 ms doubling to 1 s) |
+| `409 Conflict` | another conditional write on the key is in flight; this one did not happen | retries the *same* attempt (same body, same precondition), up to `REPLICIX_CAS_BUSY_RETRIES` times (default 5, 50 ms doubling to 1 s) |
 | `412 Precondition Failed` | the key exists (create) or moved (swap): a lost race | reads the object back; if it is byte for byte the body just written, the write is ours (an earlier attempt landed behind a retried 5xx or a lost reply), otherwise the race is lost and the caller re-reads |
 | `404` on `If-Match` | the object the swap expected is gone | same as a lost race: re-read |
 | 5xx after retries, timeout | unknown | an error: the caller retries later; a lease renewal never concludes it was deposed from one |
@@ -357,7 +357,7 @@ read-back covers.
 ## References
 
 - `docs/plans/v1/done/30-write-path-resilience-and-scale-out.md` §M4
-- `crates/store-s3/src/cas.rs`, `crates/store-s3/src/probe.rs`
+- `cas.rs` and `probe.rs` of `replicix-objcas`
 - `crates/meta/src/store/held.rs`
 - `crates/cli/src/mtree_publish.rs` (`TreePublisher::follow_head`)
 - `crates/net/src/paths.rs`

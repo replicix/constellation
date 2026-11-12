@@ -404,7 +404,7 @@ injector: `fio-latency` (crc32c-verified random writes under 80 ms S3
 latency), `fio-blips` (fio verify while S3 is cut for 800 ms every
 ~4 s — since plan 39 `fsync` waits out the blips itself instead of
 leaning on the per-request retry budget, which the harness keeps tight at
-`CONSTELLATION_S3_MAX_RETRIES=2`), and `stress-ng-flap`
+`REPLICIX_S3_MAX_RETRIES=2`), and `stress-ng-flap`
 (metadata churn during S3 flapping; the mount must stay healthy and
 the spool drain afterwards). Both flap from their first instruction, so
 they first write and wait until the node holds the lease: a node without
@@ -634,7 +634,7 @@ sudo env HOME=/root PATH=$PATH TMPDIR=/var/tmp \
     target/release/harness run --results-json root.json
 ```
 
-`sudo` drops the environment, so every `CONSTELLATION_*` and `CHAOS_*`
+`sudo` drops the environment, so every `CONSTELLATION_*`, `REPLICIX_*` and `CHAOS_*`
 variable the run needs is named after `env` (a missing `CONSTELLATION_BIN`
 makes the first mount fail with `ENOENT`). An unprivileged run is the
 reference: `nightly.yml` runs the lanes that way, and a scenario that
@@ -1811,7 +1811,7 @@ panics.
 
 ### `forward-timeout-reexec` (plan 30 M2, exactly-once forwarding)
 
-Two nodes, `CONSTELLATION_LEASE_TTL_MS=10000` and
+Two nodes, `REPLICIX_LEASE_TTL_MS=10000` and
 `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS=1500` (over the 500 ms
 default forward timeout) on both. Five rounds alternate which node
 holds the lease and exercise `O_EXCL` create, `mkdir`, `unlink`,

@@ -29,7 +29,7 @@ and §5 "Write Authority: the One Rule":
   the lease (lazy acquire on first mutation, reads never acquire),
   bounded wait (~2x TTL) then EIO.
 - `crates/cli/src/main.rs` — lease keeper wired into the sync task;
-  TTL env `CONSTELLATION_LEASE_TTL_MS` (default 60000).
+  TTL env `REPLICIX_LEASE_TTL_MS` (default 60000).
 - `crates/api` — `StatusReport.lease: {held, holder, epoch,
   expires_in_ms, lost}`.
 - `crates/harness` — `Client::pause()/resume()` (SIGSTOP/SIGCONT); new
