@@ -10994,6 +10994,28 @@ fn regression_an_open_root_answers_no_inbox_op_from_its_unshipped_journal_seed_3
     });
 }
 
+/// Oracle false positive, pinned: `long-delegated-late-answers` seed 5005
+/// (no knob). Node 1, the root of epoch 1 with node 3 its listed backup
+/// (version 4), appended node 3's delegate rows of `d2` (gen 1:4, idx 2..4,
+/// journal seqs 58..62); node 3's backup tail held them and the root
+/// acknowledged the batch committed. Node 1 crashed and its restart
+/// re-adopted its own lease at epoch 1 (the same tenure goes on), Local,
+/// no backup, with an inherited tail of epoch 1 naming nodes 1 and 3
+/// through seq 69; node 3, answering the late acknowledgement, told its
+/// clients. The oracle took epoch 1's configuration from the re-adoption's
+/// lease (no backup) and read the rows as a lone root's; it now judges a
+/// row the re-adoption's tail covers by the copies of the members it names
+/// (node 3's tail held all three).
+#[test]
+fn regression_a_readopted_epochs_tail_commits_its_group_rows_seed_5005() {
+    run_seed(5005, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 5005: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
+        )
+    });
+}
+
 /// The same class in `strict-isolated-reader-long` (30 s read delegations,
 /// the reader isolated for 40 s): 12 of 2 000 seeds from 300000 failed
 /// close-to-open before `ReadDelegations::reset_for_restart`, each with the

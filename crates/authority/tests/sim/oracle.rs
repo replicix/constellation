@@ -34,6 +34,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// `epoch -> (members other than the holder, through)` of a same-epoch
+/// re-adoption's inherited tail (`Oracles::epoch_tails`).
+pub type EpochTails = BTreeMap<u64, (Vec<NodeId>, u64)>;
+
 /// `(epoch, backups, epoch hold)` of the tenure that appended a delegate's row.
 pub type AppendTenure = (u64, Vec<NodeId>, bool);
 
@@ -176,6 +180,13 @@ pub struct Oracles {
     /// the rows it appended by that backup's copy (the core counts the
     /// configuration as it is, not as it was at the append).
     pub epoch_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>>,
+    /// The group a same-epoch re-adoption's lease still names (`epoch ->
+    /// (members other than the holder, through)`, from an inherited tail of
+    /// the lease's own epoch, `Core::own_group_tail`): a restarted holder
+    /// keeps its epoch and lists no backup, and the tail names the members
+    /// whose copies of the epoch's journal through `through` a claimant
+    /// collects. Dropped by a lease of the epoch that names no such tail.
+    pub epoch_tails: Arc<Mutex<EpochTails>>,
     /// Plan 46 M1.1 step 5: the backup set of every lease version that
     /// landed (`config_version -> backups`; a version names one landing:
     /// every tenure starts above its predecessor's). A row keeps the rule of
@@ -421,6 +432,8 @@ impl Oracles {
         let reach = bucket.reach();
         let epoch_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>> = Arc::default();
         let epoch_backups_hook = epoch_backups.clone();
+        let epoch_tails: Arc<Mutex<EpochTails>> = Arc::default();
+        let epoch_tails_hook = epoch_tails.clone();
         let version_backups: Arc<Mutex<BTreeMap<u64, Vec<NodeId>>>> = Arc::default();
         let version_backups_hook = version_backups.clone();
         let row_versions: Arc<Mutex<RowVersions>> = Arc::default();
@@ -429,6 +442,23 @@ impl Oracles {
             let leases = leases.clone();
             let reach = reach.clone();
             bucket.set_lease_hook(Arc::new(move |node, prev, new| {
+                {
+                    let mut tails = epoch_tails_hook.lock().unwrap();
+                    match new.inherited_tail.as_ref().filter(|t| t.epoch == new.epoch) {
+                        Some(t) => {
+                            let members: Vec<NodeId> = t
+                                .members
+                                .iter()
+                                .copied()
+                                .filter(|m| *m != new.holder)
+                                .collect();
+                            tails.insert(new.epoch, (members, t.through));
+                        }
+                        None => {
+                            tails.remove(&new.epoch);
+                        }
+                    }
+                }
                 epoch_backups_hook
                     .lock()
                     .unwrap()
@@ -481,6 +511,7 @@ impl Oracles {
             claim_violations: Mutex::new(Vec::new()),
             appended: Mutex::new(HashMap::new()),
             epoch_backups,
+            epoch_tails,
             version_backups,
             epoch_holds: Mutex::new(BTreeSet::new()),
             streamed_seen: Mutex::new(BTreeMap::new()),
@@ -2040,6 +2071,30 @@ fn deleg_group(
                      and the delegate {n}, a member, holds the row in its own journal"
                 ));
             }
+        }
+        // A restarted holder re-adopts its own lease at the same epoch and
+        // lists no backup (`LeaseKeeper::granted_lease`: the same tenure goes
+        // on); its lease names the epoch's group in an inherited tail of that
+        // epoch, which a claimant collects (`Core::own_group_tail`). A row
+        // the tail covers is committed by the copies of those members, judged
+        // as a listed backup's are (`long-delegated-late-answers` seed 5005:
+        // the backup-acked rows of epoch 1, answered after the root's restart
+        // re-adopted epoch 1 with no backup and a tail naming node 3, which
+        // held them).
+        let tail = o.epoch_tails.lock().unwrap().get(&e).cloned();
+        if let Some((members, _)) =
+            tail.filter(|(m, t)| bs.is_empty() && !m.is_empty() && ht.last <= *t)
+        {
+            return match backups_hold(o, e, &members, ht, lease.map(|l| (l.holder, holder_txs))) {
+                Ok(()) => Ok(format!(
+                    "no backup recorded; the root journal holds ({g},{i}) and the epoch {e} \
+                     group its re-adoption's tail names holds it: every member {members:?}"
+                )),
+                Err(w) => Err(format!(
+                    "no backup recorded; the root journal holds ({g},{i}) but the epoch {e} \
+                     group its re-adoption's tail names does not: {w}"
+                )),
+            };
         }
         if bs.is_empty() {
             return Err(format!(
