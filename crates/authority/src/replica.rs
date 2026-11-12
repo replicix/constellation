@@ -282,7 +282,10 @@ pub trait Replica {
     fn drop_held_cancel(&self, ino: Ino) -> Result<(), MetaError>;
     /// Drops decided and not applied: `(inode, journal seq of the record,
     /// epoch it was journaled under)`.
-    fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64)>, MetaError>;
+    fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64, bool)>, MetaError>;
+    /// Whether the decided drop of `ino` has its record shipped from this
+    /// node (persisted by the acknowledgement of its row).
+    fn drop_plan_shipped(&self, ino: Ino) -> bool;
     /// The replay queue decoded once per generation of the queue, with
     /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
     fn queue_snapshot(
@@ -1251,8 +1254,12 @@ impl Replica for Meta {
         Meta::drop_held_cancel(self, ino)
     }
 
-    fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64)>, MetaError> {
+    fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64, bool)>, MetaError> {
         Meta::drop_plans(self)
+    }
+
+    fn drop_plan_shipped(&self, ino: Ino) -> bool {
+        Meta::drop_plan_shipped(self, ino)
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {

@@ -1348,12 +1348,19 @@ impl Core {
         let Ok(plans) = replica.drop_plans() else {
             return;
         };
-        for (ino, jseq, epoch) in plans {
-            // A restarted dropper does not know what its previous incarnation
-            // shipped: the log tells (`row_in_log`), and the park waits for
-            // it, or for the log to move past the tenure without the record
-            // (fenced, `complete_ready`).
-            if jseq != 0 && !replica.row_in_log(epoch, jseq) {
+        for (ino, jseq, epoch, shipped) in plans {
+            // The record is in the log exactly when this node shipped it (the
+            // plan says so, persisted by the acknowledgement of its row).
+            // Else the park waits for the shipment, or for the log to move
+            // past the tenure without the record (fenced, `complete_ready`):
+            // the drop never happened. (Not `row_in_log`: for a closed epoch
+            // it is a coverage test, true for a record that never shipped once
+            // a successor sealed the tenure past its seq. Nor the journal's
+            // acknowledged watermark, which stops below the held rows the
+            // record was journaled above.)
+            if jseq != 0 && !shipped && replica.applied_epoch() > epoch {
+                self.cancel_drop(None, ino, replica, out);
+            } else if jseq != 0 && !shipped {
                 self.park(
                     now,
                     (BTreeSet::new(), None),
@@ -2575,9 +2582,9 @@ impl Core {
             .parked
             .iter()
             .filter(|(_, p)| match (&p.what, p.durable) {
-                (ParkedWhat::DropApply { epoch, .. }, Some(j)) => {
+                (ParkedWhat::DropApply { epoch, ino, .. }, Some(j)) => {
                     !self.archive_covers(j, shipped)
-                        && !replica.row_in_log(*epoch, j)
+                        && !replica.drop_plan_shipped(*ino)
                         && replica.applied_epoch() > *epoch
                 }
                 _ => false,

@@ -2114,9 +2114,17 @@ impl Core {
     ) -> bool {
         // ADR-59 part B (D4): the drop's effect waits for the log, whatever
         // the answer rule of the node is.
-        if let super::readindex::ParkedWhat::DropApply { epoch, .. } = what {
-            // (A restarted dropper reads its record's place from the log.)
-            return self.archive_covers(jseq, shipped) || replica.row_in_log(*epoch, jseq);
+        if let super::readindex::ParkedWhat::DropApply { ino, .. } = what {
+            // "In the log" is "shipped by this node": only the dropper ever
+            // ships its record (every copy of it is fenced at the gate), so
+            // the log carries it exactly when the archive covers its seq (the
+            // core's own account of the rows it shipped) or the plan says it
+            // shipped (the persisted account: a segment found again by a tail
+            // after a restart is acknowledged without the core shipping it).
+            // (Not `row_in_log`: for a closed epoch that is a coverage test,
+            // true for a record that never shipped once a successor sealed
+            // the tenure past its seq.)
+            return self.archive_covers(jseq, shipped) || replica.drop_plan_shipped(*ino);
         }
         if !self.park_durable(jseq, what.to_remote(self.cfg.node_id), shipped) {
             return false;

@@ -232,7 +232,10 @@ successor re-ships their copies. A node deposed (or dead)
 before the record shipped leaves a sealed tail that differs from the members'
 copies by that record alone: the successor's takeover skips it (`tail_drop_fenced`,
 warned) and re-ships the rows it named as the acknowledged rows they are; the
-command answers that the lease was lost and nothing was dropped. A node that
+command answers that the lease was lost and nothing was dropped. "In the log"
+means "shipped by this node": the plan records it when the record's row is
+acknowledged, so a restarted dropper applies a record that shipped at startup
+and cancels one that did not once the log has closed its tenure. A node that
 dies after the record shipped but before it applied the drop (the one
 residual) leaves the seed's rows retired (nothing lands) and no conflict copy
 and no `Refused` row for them: the lost write's surviving bytes are not

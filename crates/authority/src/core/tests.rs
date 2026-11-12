@@ -62701,6 +62701,119 @@ mod await_retry {
         out
     }
 
+    /// A new process of `h`'s node over the same disk, started.
+    fn restarted(h: Harness) -> Harness {
+        let mut r = Harness {
+            core: Core::new(h.core.cfg.clone()),
+            meta: h.meta,
+            now: h.now.plus(500),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+            cold_horizon: false,
+        };
+        let mut out = Vec::new();
+        r.core.start(r.clk(), &r.meta, &mut out);
+        r
+    }
+
+    /// ADR-59 part B (D4), fail-before 1547: a dropper restarted after it
+    /// decided and before the record shipped, whose tenure the log has closed
+    /// past the record's seq (a successor sealed it), must not apply the
+    /// drop: the record is not in the log (it never shipped; every copy of it
+    /// is fenced), and the successor re-ships the rows it named. Before,
+    /// `row_in_log` (a coverage test for a closed epoch) said "in the log"
+    /// and the restart stranded and redid the journal.
+    #[test]
+    fn a_restarted_droppers_record_that_never_shipped_is_cancelled_not_applied() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.meta.set_parent_taint_conservative(false);
+        exec_as(&h, RowCommit::LONE, rid_of(1, 6), &chmod(broken, 0o600));
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        let plans = h.meta.drop_plans().unwrap();
+        assert_eq!(plans.len(), 1);
+        let (jseq, epoch) = (plans[0].1, plans[0].2);
+        let held_before = h.meta.held_summary().transactions;
+        // The log carries a segment of the dropper's tenure (epoch 1) past the
+        // record's seq (the successor re-shipped its rows under the tail's
+        // identities), then the successor's own of epoch 2: the tenure is
+        // closed, and `row_in_log` covers the record's seq without the record.
+        // (Applied by another process of the node, while this one is down.)
+        let now = h.clk();
+        let mut other = Core::new(h.core.cfg.clone());
+        let ours = crate::segment::encode(1, 1, 1_000, &[], &[], &[]).unwrap();
+        other
+            .apply_incoming(now, 1, &ours, &h.meta, &mut Vec::new())
+            .unwrap();
+        let theirs = crate::segment::encode(2, 2, 1_000, &[], &[], &[]).unwrap();
+        other
+            .apply_incoming(now, 2, &theirs, &h.meta, &mut Vec::new())
+            .unwrap();
+        assert!(
+            Replica::row_in_log(&h.meta, epoch, jseq),
+            "the closed tenure's coverage says the record is in the log"
+        );
+        assert_eq!(Replica::applied_epoch(&h.meta), 2);
+        let r = restarted(h);
+        assert_eq!(
+            r.core.stats.drops_applied, 0,
+            "the drop must not be applied"
+        );
+        assert_eq!(r.core.stats.drops_unapplied, 1);
+        assert!(r.meta.drop_plans().unwrap().is_empty(), "the plan is gone");
+        assert_eq!(
+            r.meta.held_summary().transactions,
+            held_before,
+            "nothing was stranded"
+        );
+        assert!(
+            r.meta
+                .pending_replays()
+                .unwrap()
+                .iter()
+                .all(|q| q.refused.is_none()),
+            "nothing was refused"
+        );
+        assert!(
+            !r.meta.pending_uploads().unwrap().is_empty(),
+            "the seed is still held"
+        );
+    }
+
+    /// ADR-59 part B (D4): a dropper restarted after the record shipped
+    /// applies the drop at startup (the record is in the log: its seq is at or
+    /// below the journal's acknowledged one), with no operator waiting.
+    #[test]
+    fn a_restarted_droppers_record_that_shipped_is_applied_at_startup() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.meta.set_parent_taint_conservative(false);
+        exec_as(&h, RowCommit::LONE, rid_of(1, 6), &chmod(broken, 0o600));
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        assert_eq!(h.meta.drop_plans().unwrap().len(), 1);
+        // The record ships (the archive acknowledges its rows), and the node
+        // dies before the park releases.
+        let rows: Vec<(u64, LogRecord)> = h
+            .meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .collect();
+        assert!(rows
+            .iter()
+            .any(|(_, r)| matches!(r, LogRecord::DropHeld { .. })));
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        h.meta.ack_journal_rows_at(&seqs, 99).unwrap();
+        let r = restarted(h);
+        assert_eq!(r.core.stats.drops_applied, 1);
+        assert_eq!(r.core.stats.drops_unapplied, 0);
+        assert!(r.meta.drop_plans().unwrap().is_empty());
+        assert!(
+            r.meta.pending_uploads().unwrap().is_empty(),
+            "the drop took effect"
+        );
+    }
+
     /// ADR-59 part B (D3), B4, 1529's answer shape: an own gated write of the
     /// damaged file waits for its group; the drop refuses its rid; then the
     /// group (and the log) cover its journal seq. The client is never told
@@ -63508,7 +63621,8 @@ mod await_retry {
         });
         let refused = refused.unwrap_or_else(|| panic!("the drop was not refused: {out:?}"));
         assert!(
-            refused.contains("not the sequencer in force") && refused.contains("nothing was dropped"),
+            refused.contains("not the sequencer in force")
+                && refused.contains("nothing was dropped"),
             "{refused}"
         );
         assert_eq!(
@@ -63516,7 +63630,10 @@ mod await_retry {
             journal_before,
             "nothing journaled"
         );
-        assert!(h.meta.pending_replays().unwrap().is_empty(), "no queue entry");
+        assert!(
+            h.meta.pending_replays().unwrap().is_empty(),
+            "no queue entry"
+        );
         assert_eq!(h.meta.pending_uploads().unwrap(), uploads_before);
         assert!(h.meta.take_applied_drops().is_empty());
         assert_eq!(h.core.stats.drops_decided, 0);
