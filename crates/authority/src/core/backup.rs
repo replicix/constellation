@@ -2049,7 +2049,14 @@ impl Core {
         if self.durable_jseq() == u64::MAX {
             return None;
         }
-        let jseq = position.pending.map(|p| p.jseq)?;
+        self.ack_need_at(position.pending.map(|p| p.jseq)?)
+    }
+
+    /// [`Self::ack_need`] for an answer resting on journal seq `jseq`.
+    pub(crate) fn ack_need_at(&self, jseq: u64) -> Option<u64> {
+        if self.durable_jseq() == u64::MAX {
+            return None;
+        }
         (!self.durable_covers(jseq)).then_some(jseq)
     }
 

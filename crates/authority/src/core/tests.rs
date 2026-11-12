@@ -11589,6 +11589,50 @@ mod epoch_rules {
         h
     }
 
+    /// ADR-59 part A: a completed rid's answer waits for its own row, not
+    /// the journal tip: a later row shipped ahead of it (rows ship ahead of
+    /// a held one) is durable by itself and says nothing of the rid's row.
+    /// Fails before: the answer rested on the tip, which the shipped-ahead
+    /// row covered, and left with its own row unshipped and unbacked
+    /// (drop-held-chain-backed seed 592 under the I1 pin).
+    #[test]
+    fn a_completed_rids_answer_waits_for_its_own_row_not_a_row_shipped_ahead() {
+        let mut h = holder_with(AckPolicy::Backup, vec![3]);
+        let mut rows = Vec::new();
+        for (i, name) in ["a", "b"].iter().enumerate() {
+            let rid = h.rid(i as u64 + 1);
+            let op = h.create(name);
+            h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            let (first, _) = Replica::journal_class_of_rid(&h.meta, rid).expect("journaled");
+            rows.push((rid, first));
+        }
+        assert_ne!(h.core.durable_jseq(), u64::MAX, "the backup gates");
+        let tip = Replica::journal_tip(&h.meta);
+        assert!(rows[0].1 < rows[1].1 && rows[1].1 <= tip);
+        // The second ships ahead; the first stays held.
+        h.core
+            .note_shipped(&(rows[1].1..=tip).collect::<Vec<_>>(), 0);
+        let position = constellation_meta::Position {
+            seq: 0,
+            pending: Some(constellation_meta::JournalPos {
+                epoch: 1,
+                jseq: tip,
+            }),
+            streams: Default::default(),
+        };
+        assert_eq!(
+            h.core.answer_need_of(rows[0].0, &position, &h.meta),
+            Some(rows[0].1),
+            "the held row's answer waits for it"
+        );
+        assert_eq!(h.core.answer_need_of(rows[1].0, &position, &h.meta), None);
+    }
+
     /// `epoch-member-lost`: the activation carrying this node's lease can
     /// arrive after the lease entered its expiry margin (the claim was
     /// usable when acked). The hold is adopted anyway — before, it was

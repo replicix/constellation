@@ -5370,6 +5370,19 @@ impl Core {
             let shipped = replica.journal_acked_seq().unwrap_or(0);
             return (!self.park_durable(first, false, shipped)).then_some(first);
         }
+        // ADR-59 part A: the rid's own row, not the tip, when the journal
+        // still has it. A row is durable by itself once it ships (rows ship
+        // ahead of a held one, `durable_covers`), so a later row shipped
+        // ahead says nothing of this one: an answer waiting on the tip left
+        // with its own row still held behind a lost chunk (the I1 pin's
+        // drop-held-chain-backed seed 592, a takeover's re-shipped tail).
+        // The rid's latest row (`journal_class_of_rid`): a rid has one live
+        // row; a re-execution after a rollback journals anew only once the
+        // earlier row is gone from the journal, so no earlier row of it is
+        // left to wait for.
+        if let Some(first) = first {
+            return self.ack_need_at(first);
+        }
         self.ack_need(position)
     }
 
