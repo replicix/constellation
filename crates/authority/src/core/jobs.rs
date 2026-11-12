@@ -1707,6 +1707,17 @@ impl Core {
                     proof
                 }
             };
+            // The records this claim's marker carries: the claimant never
+            // applies it as a segment, so its own member copies are judged
+            // by it in this strand's transaction.
+            let marker = marker_records(
+                &gate,
+                self.bk
+                    .gate_abandoned
+                    .map(|e| (e, self.bk.gate_abandoned_through)),
+                &Self::marker_tails(&self.bk, &gate),
+                self.bk.gate_names_tail,
+            );
             match replica.reship_epochs_at_takeover(
                 Some(constellation_meta::StrandArgs {
                     epoch: gate.epoch,
@@ -1714,6 +1725,7 @@ impl Core {
                     abandoned: self.bk.gate_abandoned,
                     carried: &carried,
                     proof: &proof,
+                    marker: &marker,
                 }),
                 &tails,
             ) {

@@ -33,6 +33,13 @@
 //!    its `rows`, or at or below its `through`).
 //! 2. `TailFollowsThrough { prev_epoch, through }`: rows past `through` were
 //!    never committed (the sealer's contiguous hold did not reach them).
+//!    A claim that carries no tail at all (every `TailFollowsThrough` of its
+//!    marker says `through: 0`, nothing else follows, no abandon) settles the
+//!    older epochs too: the epochs below the ones it names are rows no claim
+//!    will carry either (the lease it took over named no tail, and its
+//!    predecessor's marker may never have landed), so those rows go as well.
+//!    The claimant applies the same rules to its own copies at its gate
+//!    ([`super::StrandArgs`]), as it never applies its own marker.
 //! 3. `GroupAbandoned { epoch, gen: 0 }`: the operator gave the group up; the
 //!    rows that are not the lone branch's go to the replay queue (the only
 //!    way a committed row is re-executed).
@@ -1343,6 +1350,7 @@ pub(crate) fn member_rules_tx(
     let mut tail_ids: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut through_of: std::collections::BTreeMap<u64, u64> = Default::default();
     let mut follows: BTreeSet<u64> = BTreeSet::new();
+    let mut plain_follows = false;
     let mut abandoned: std::collections::BTreeMap<u64, u64> = Default::default();
     for rec in f.records {
         match rec {
@@ -1358,6 +1366,7 @@ pub(crate) fn member_rules_tx(
             }
             LogRecord::TailFollows { prev_epoch } => {
                 follows.insert(*prev_epoch);
+                plain_follows = true;
             }
             LogRecord::GroupAbandoned {
                 epoch,
@@ -1369,6 +1378,12 @@ pub(crate) fn member_rules_tx(
             _ => {}
         }
     }
+    // A claim that carries no tail: its marker names only empty tails.
+    let carries_no_tail = !through_of.is_empty()
+        && through_of.values().all(|t| *t == 0)
+        && !plain_follows
+        && abandoned.is_empty()
+        && tail_ids.is_empty();
     for e in epochs_in(&*tx, meta)? {
         let mut left = 0usize;
         for row in rows_in(&*tx, meta, e)? {
@@ -1411,7 +1426,9 @@ pub(crate) fn member_rules_tx(
                 meta.release_abandoned_row_tx(tx, member_epoch(e), first);
                 continue;
             }
-            if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th) {
+            if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th)
+                || (carries_no_tail && ident.0 < f.epoch && !through_of.contains_key(&ident.0))
+            {
                 tx.remove(&meta.backup_tail, key);
                 meta.release_row_tx(tx, member_epoch(e), first);
                 out.dropped += 1;

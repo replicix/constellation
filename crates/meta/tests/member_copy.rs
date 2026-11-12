@@ -1283,6 +1283,118 @@ fn tail_follows_drops_member_rows_past_through() {
     assert_eq!(rows.iter().map(|r| r.tx.first).collect::<Vec<_>>(), [1, 2]);
 }
 
+/// A deposed holder's two committed rows, rolled back into the member copy of
+/// epoch 1 with a read hold each (`strand_below_epoch`).
+fn deposed_with_two_rows(meta: &Meta) -> [Vec<ReadKey>; 2] {
+    meta.set_holder_epoch(1);
+    holder_create(meta, RowCommit::ROOT_GROUP, "a", 1, 1);
+    holder_create(meta, RowCommit::ROOT_GROUP, "b", 2, 2);
+    meta.set_holder_epoch(0);
+    assert_eq!(meta.strand_below_epoch(2).unwrap().member_copied, 2);
+    let keys = [
+        vec![ReadKey::Dentry(ROOT_INO, "a".into())],
+        vec![ReadKey::Dentry(ROOT_INO, "b".into())],
+    ];
+    assert!(meta.member_copy_touches(&keys[0]) && meta.member_copy_touches(&keys[1]));
+    keys
+}
+
+/// A claim of epoch 3 over an epoch 2 whose marker never landed carries no
+/// tail (`TailFollowsThrough { 2, 0 }`): the rows epoch 1's deposed holder
+/// kept are no one's to re-ship. Their copies go with their read holds, or
+/// the holds outlive the run and reads of the keys fail at the bound.
+/// (Fails before: only the epoch the marker names was settled, and a
+/// group-committed row of an older one stayed for good.)
+#[test]
+fn a_claim_without_a_tail_drops_the_older_epochs_copies_and_holds() {
+    let meta = Meta::open_in_memory().unwrap();
+    let keys = deposed_with_two_rows(&meta);
+    // A marker that names a tail it carries leaves the copies to it.
+    let named = vec![LogRecord::TailFollowsThrough {
+        prev_epoch: 2,
+        through: 9,
+    }];
+    apply_rows(&meta, 1, 3, 0, &[], &named);
+    assert_eq!(meta.member_copy_rows(1).unwrap().unwrap().1.len(), 2);
+    assert!(meta.member_copy_touches(&keys[0]));
+    let none = vec![LogRecord::TailFollowsThrough {
+        prev_epoch: 2,
+        through: 0,
+    }];
+    let applied = meta
+        .apply_segment_rows(2, 4, 0, &[], &[], &none, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.member.dropped, 2);
+    assert_eq!(meta.member_copy(1).unwrap(), None);
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+    assert!(!meta.member_copy_touches(&keys[0]) && !meta.member_copy_touches(&keys[1]));
+}
+
+fn takeover_with_marker(meta: &Meta, epoch: u64, marker: &[LogRecord]) {
+    let carried = Default::default();
+    let proof = Default::default();
+    meta.reship_at_takeover(
+        Some(constellation_meta::StrandArgs {
+            epoch,
+            own_gens: &[],
+            abandoned: None,
+            carried: &carried,
+            proof: &proof,
+            marker,
+        }),
+        None,
+    )
+    .unwrap();
+}
+
+/// The claimant never applies its own marker as a segment: its own copies of
+/// rows past a sealed `through` (or of the epochs a claim without a tail
+/// settles) go at its gate, with their holds. (Fails before: the claimant's
+/// copy and hold of an epoch-1 row nobody re-ships stayed for good,
+/// `locks-unlinked-delegated-dcrash-pause` seeds 651, 5767.)
+#[test]
+fn the_claimant_applies_its_own_markers_drops_to_its_copies_and_holds() {
+    // No tail at all: both rows go.
+    let meta = Meta::open_in_memory().unwrap();
+    let keys = deposed_with_two_rows(&meta);
+    takeover_with_marker(
+        &meta,
+        3,
+        &[LogRecord::TailFollowsThrough {
+            prev_epoch: 2,
+            through: 0,
+        }],
+    );
+    assert_eq!(meta.member_copy(1).unwrap(), None);
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+    assert!(!meta.member_copy_touches(&keys[0]) && !meta.member_copy_touches(&keys[1]));
+    // A tail of epoch 1 that reaches the first row only: the second row,
+    // past `through`, goes; the first stays held until its re-ship.
+    let meta = Meta::open_in_memory().unwrap();
+    let keys = deposed_with_two_rows(&meta);
+    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
+    let through = rows[0].tx.last;
+    takeover_with_marker(
+        &meta,
+        2,
+        &[LogRecord::TailFollowsThrough {
+            prev_epoch: 1,
+            through,
+        }],
+    );
+    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        meta.member_copy_touches(&keys[0]),
+        "the carried row stays held"
+    );
+    assert!(
+        !meta.member_copy_touches(&keys[1]),
+        "the row past through is dropped"
+    );
+    assert_eq!(meta.read_holds().len(), 1);
+}
+
 /// A marker of a later epoch that announces no tail of this epoch drops the
 /// rows nobody was told were committed; a group-committed row stays until
 /// coverage (it may be another tenure's inherited tail).

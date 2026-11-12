@@ -17511,6 +17511,31 @@ fn regression_locks_unlinked_delegated_dbackup_random_seed_5681() {
     });
 }
 
+/// `locks-unlinked-delegated-dcrash-pause` seeds 651, 3994, 5767 (ADR-57,
+/// `read_holds_gone`): the root's deposition kept its unshipped committed rows
+/// as a member copy of epoch 1 with a read hold each. The backup that sealed
+/// epoch 1 claimed epoch 2 with no tail and was paused before its marker
+/// reached the log; the claim of epoch 3 carried no tail either, and its
+/// marker named only epoch 2. The row the sealer never reached (a forwarded
+/// op executed as the seal was answered, never acknowledged) stayed in the
+/// copy of epoch 1, and its hold with it: reads of its keys failed at the
+/// bound, for good. The marker of a claim without a tail now settles the older
+/// epochs' copies too, and the claimant applies it to its own copies at its
+/// gate (it never applies its own marker as a segment): in 3994 another node
+/// is the claimant and the deposed root applies the marker, in 651 and 5767
+/// the deposed root claims epoch 3 itself.
+#[test]
+fn regression_dcrash_pause_leaked_read_holds_seeds_651_3994_5767() {
+    for seed in [651, 3994, 5767] {
+        run_seed(seed, locks_unlinked_dcrash_pause_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-unlinked-delegated-dcrash-pause seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dcrash-pause"
+            )
+        });
+    }
+}
+
 /// `locks-unlinked-delegated-dcrash-pause` seed 558: the root holder was
 /// paused while node 2 (its backup, `d1`'s delegate) took the lease and
 /// crashed; woken

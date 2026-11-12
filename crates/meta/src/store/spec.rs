@@ -710,6 +710,13 @@ pub struct StrandArgs<'a> {
     pub abandoned: Option<u64>,
     pub carried: &'a HashSet<Rid>,
     pub proof: &'a OrphanProof,
+    /// The records of the claim's own marker (`TailFollowsThrough` and the
+    /// rest). The claimant never applies its own marker as a segment, so the
+    /// member-copy rules every other replica runs there run here, in the
+    /// re-ship's transaction ([`member_rules_tx`](super::member)): the copies
+    /// of rows past a sealed `through`, and of the epochs a claim that carries
+    /// no tail settles, neither stay nor hold their readers.
+    pub marker: &'a [LogRecord],
 }
 
 /// The tail half of [`Meta::reship_at_takeover`]: the sealed tail of
@@ -6031,6 +6038,7 @@ impl Meta {
                     abandoned,
                     carried,
                     proof,
+                    marker: &[],
                 }),
                 None,
             )?
@@ -6305,7 +6313,29 @@ impl Meta {
         for gen in &part.ended {
             local::settle_deleg_idx_at_log_tx(&mut tx, &self.local, *gen)?;
         }
-        if !part.work && tails.is_empty() {
+        // The claimant never applies its own marker as a segment: the rules
+        // every other replica runs on its member copies there (rows past a
+        // sealed `through`, the epochs a claim without a tail settles) run
+        // here, after the strand and the tail, in the same transaction. A
+        // copy this strand just made of a row past `through` goes with its
+        // hold; none outlives the gate with nothing to release it.
+        let mut member = super::member::MemberOutcome::default();
+        if let Some(args) = strand.filter(|a| !a.marker.is_empty()) {
+            super::member::note_log_tail_tx(&mut tx, self, args.epoch, args.marker, None)?;
+            member = super::member::member_rules_tx(
+                &mut tx,
+                self,
+                &super::member::Facts {
+                    epoch: args.epoch,
+                    through: 0,
+                    rows: &[],
+                    records: args.marker,
+                    first_of_epoch: true,
+                    own: false,
+                },
+            )?;
+        }
+        if !part.work && tails.is_empty() && member == Default::default() {
             // Nothing to strand and no tail: nothing to commit.
             return Ok(report);
         }
@@ -6314,6 +6344,9 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        if member != Default::default() {
+            let _ = self.refresh_member_copy_flag();
+        }
         report.hold_ms = u64::try_from(held_since.elapsed().as_millis()).unwrap_or(u64::MAX);
         for (gen, cut) in part.orphan_cuts {
             tracing::info!(
@@ -6392,6 +6425,7 @@ impl Meta {
             abandoned,
             carried,
             proof,
+            marker: _,
         } = args;
         let listed_before = if proof.is_empty() {
             Default::default()
