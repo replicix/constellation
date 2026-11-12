@@ -743,6 +743,24 @@ and node, and evaluates it every tenth of the window:
   SC'15): move metadata to its dominant writer rather than spreading it.
 - **Grant a far writer a sticky subtree**: see the far-writer paragraph
   above. Placement never recalls a sticky grant.
+- **Grant the root itself a sticky subtree** ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)): while the
+  root's own ops commit by the archive (it has a write-eligible peer and no
+  backup), the same rule proposes the root for a subtree it dominates, never
+  `/`. The root is then the holder of its own stream: its ops in the subtree
+  are answered `Final` at local speed after one archive wait for the grant
+  record (the first op parks for it; `status.ack.classes.final` counts the
+  rest), and its messages to itself are delivered in the same step. Ops in `/`
+  and in other nodes' subtrees still wait for the archive. The root releases
+  its own grant only as the holder: after the long dwell below the floor, at an
+  unmount or suspension, by `undelegate`, `repair abandon` or an op across its
+  boundary (which releases it and runs on the root's keys instead of `EXDEV`).
+  `CONSTELLATION_DELEGATION_ROOT_STICKY=off` keeps the archive wait. A root
+  that is deposed but alive keeps the grant and streams it to the next root; one
+  that dies for good blocks its own sticky subtrees (`EROFS`, `EXDEV`) until it
+  returns or the operator runs `constellation repair abandon --node N`
+  (see Troubleshooting). A writer that reaches the root only through the
+  inbox, during a partition, gets `EROFS` in the root's stream where fence rule
+  C9 applies (`holder_inbox_refusals`).
 - **Recall** a placed delegation when, for a whole dwell
   (`CONSTELLATION_DELEGATION_DWELL_MS`, 5 minutes), the delegate's share
   stayed below `CONSTELLATION_DELEGATION_LEAVE` (50%) or the subtree's
@@ -1217,6 +1235,7 @@ dies: no acknowledged write is lost) and the causal-cut oracle.
 | `CONSTELLATION_DELEGATION_LEAVE` | `50` | percent below which a placed delegation is recalled |
 | `CONSTELLATION_DELEGATION_DWELL_MS` | `300000` | recall dwell |
 | `CONSTELLATION_DELEGATION_STICKY_PLACEMENT` | on | a dominant far writer is granted a sticky subtree |
+| `CONSTELLATION_DELEGATION_ROOT_STICKY` | on | the root itself is granted a sticky subtree it dominates while its own ops commit by the archive ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)); off: its own ops wait for the archive. Needs sticky placement |
 | `CONSTELLATION_DELEGATION_FAR_RTT_MS` | `20` | a link is far when every round trip of the far dwell is at least this |
 | `CONSTELLATION_DELEGATION_FAR_DWELL_MS` | `30000` | how long a link must measure far |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | cool-down after a recall |
@@ -1234,8 +1253,9 @@ A root answers its own node's clients from its disk alone only when its
 ([ADR-50](../../explanation/DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)).
 A root with any registered write-eligible peer, however far, unlinked or
 unmounted, waits for the archive (or its backup's copy) for every op of its
-own, the ops under its own subtrees included, until plan 46 M1.3 step 9
-lets it answer those by delegation. A node that is registered and will not be
+own, except the ops under the subtrees it holds as its own sticky grant
+([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)), which it answers `Final` at local speed.
+A node that is registered and will not be
 mounted again is retired with `leave`: until then the root stays off the
 singleton path (`constellation status` shows `roster.write_eligible`,
 `roster.heard`, whether the read is `complete` and the verdict
@@ -1274,7 +1294,12 @@ root's own answers off its stuck core, and why it declined), `off_core_answers_a
 node's whole process was frozen) and `lapses_root_silent` with
 `last_silent_gen` (a renewal sent in time was never answered by the root)
 are classified: see "Grants, renewal and expiry",
-`redelegated`, `deps_overflow_to_root`, `refused_designated`, and the
+`redelegated`, `deps_overflow_to_root`, `refused_designated`, `root_own`
+(the root's own sticky grants, ADR-55: `granted`, `released_by_dwell`,
+`released_for_cross`, `answers` in its own stream, `holds` by its root path,
+`commit_waits` and the longest in `commit_wait_ms_max`, `resumed_rows` streamed
+to a later root after a deposition, `self_sends` delivered inline, `skipped`
+candidates and `inbox_refusals`), and the
 placement's `place_evaluations`, `place_delegated`, `place_recalled`,
 `place_skipped_cooldown`,
 `place_skipped_unreachable` and `place_skipped_designated` (a node that holds
@@ -1308,6 +1333,17 @@ delegate is unreachable, the rename waits for its grant to expire
 The subtree is designated offline to another node that is unreachable
 (`EROFS`), or the op crosses into a designated subtree (`EXDEV`). See
 `constellation designations`.
+
+### The root's own subtree blocks after the root died
+
+The root held a sticky grant on the subtree ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)) and died for good
+(or stays unreachable): the other nodes get `EROFS` in it, and `EXDEV` for an
+op across its boundary, as for any sticky holder that is gone. Its rows are
+final on its disk and are not rolled back; wait for it to return (it streams
+them to the next root), or, once you are sure it will not, run
+`constellation repair abandon --node N` on the root (`--force` when the node
+is confirmed down): the rows past the stream's cut are replayed by rid or
+become conflict copies, the operator's accepted cost.
 
 ### A generation is `waiting_for_group`
 
