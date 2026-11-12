@@ -2406,7 +2406,12 @@ impl Meta {
             // chunk: its row and marks stay. (An op this drop rolled back
             // is not in flight any more: its row is a seed, refused above.)
             let mut live = live_ops(hash);
-            live.retain(|rid| !rolled_back.contains(rid));
+            // (Only while this node is the sequencer: a deposed dropper's
+            // refusals were not journaled, so the op's retry by rid reaches the
+            // successor with no outcome and names the chunk like any other op.)
+            if sequencer {
+                live.retain(|rid| !rolled_back.contains(rid));
+            }
             if !live.is_empty() || sessions.names(hash) {
                 kept_pending.push(*hash);
                 kept_for.extend(live);
