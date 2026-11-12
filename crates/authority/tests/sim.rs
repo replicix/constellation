@@ -303,6 +303,8 @@ fn replay_seed() {
         Ok("acks3") => ack_s3_config(),
         Ok("backup-far") | Ok("far") => far_config(),
         Ok("far-root-writes") => far_root_writes_config(),
+        Ok("far-root-writes-paused") => far_root_writes_paused_config(),
+        Ok("far-root-writes-shared") => far_root_writes_shared_config(),
         Ok("far-placement") => far_placement_config(),
         Ok("far-placement-release") => far_placement_release_config(),
         Ok("sticky-idle-release") => sticky_idle_release_config(),
@@ -1941,6 +1943,10 @@ fn far_placement_config() -> SimConfig {
 /// own beyond `far`'s.
 fn far_root_writes_config() -> SimConfig {
     SimConfig {
+        // Plan 46 M1.3 step 9 (ADR-55): the placement is on; the root writes
+        // `d1` dominantly and takes it as its own sticky grant (it has
+        // peers, no group within the budget, and `d1` is not `/`).
+        core: std::sync::Arc::new(sim::run::placement_backup_core_config),
         nodes: 3,
         clients_per_node: 2,
         ops_per_client: 12,
@@ -1957,6 +1963,61 @@ fn far_root_writes_config() -> SimConfig {
             },
         }],
         ..far_config()
+    }
+}
+
+/// Plan 46 M1.3 step 9 (ADR-55): `far-root-writes`, the root cut from S3 and
+/// from both peers for longer than the lease TTL (6 s here) at 3 s, back at
+/// 12 s: deposed but alive. It cannot ship or renew; a peer takes the lease
+/// after the TTL. The root keeps its own sticky grant on `d1` and goes on
+/// answering `Final` in it meanwhile; when it is back it learns the new
+/// holder, its stream rows are neither stranded nor member-copied, and it
+/// streams them to the new root (the witness: `root_own_resumed`); nothing of
+/// the stream is rolled back (I5 strict). The harness's `root-own-sticky` does
+/// the same with a SIGSTOP.
+fn far_root_writes_paused_config() -> SimConfig {
+    SimConfig {
+        faults: vec![
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::CutS3 {
+                    node: 1,
+                    for_ms: 9_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 9_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 3,
+                    for_ms: 9_000,
+                },
+            },
+        ],
+        ..far_root_writes_config()
+    }
+}
+
+/// Plan 46 M1.3 step 9 (ADR-55): one shared directory the root writes first and
+/// dominates; nodes 2 and 3 join at 1.7 s, just after the grant, so their forwards meet the root's
+/// own stream (fence, routed forwards, the stream's single order). The
+/// control `root_executes_under_own_grant` runs the root's own ops beside it.
+fn far_root_writes_shared_config() -> SimConfig {
+    SimConfig {
+        dirs: vec!["shared".into()],
+        shared_dir: true,
+        sticky_delegations: Vec::new(),
+        ops_per_client: 30,
+        client_plan: vec![(2, 1_700, 8), (3, 1_700, 8)],
+        ..far_root_writes_config()
     }
 }
 
@@ -1981,6 +2042,8 @@ fn sticky_idle_release_config() -> SimConfig {
         sticky_idle_ms: Some(1_200),
         faults: Vec::new(),
         cut_mode: sim::cut::CutMode::Strict,
+        // (As before step 9: no placement; the holders are preset.)
+        core: std::sync::Arc::new(sim::run::backup_core_config),
         ..far_root_writes_config()
     }
 }
@@ -7289,6 +7352,8 @@ fn base_config(label: &str) -> SimConfig {
         "acks3" => ack_s3_config(),
         "far" | "backup-far" => far_config(),
         "far-root-writes" => far_root_writes_config(),
+        "far-root-writes-paused" => far_root_writes_paused_config(),
+        "far-root-writes-shared" => far_root_writes_shared_config(),
         "far-placement" => far_placement_config(),
         "far-placement-release" => far_placement_release_config(),
         "sticky-idle-release" => sticky_idle_release_config(),
@@ -20568,6 +20633,10 @@ fn with_lone_delegates(config: SimConfig) -> SimConfig {
         core: std::sync::Arc::new(move |node, inc| {
             let mut c = inner(node, inc);
             c.lone_delegate = true;
+            // (The seeds of the control are pinned from a root that grants
+            // itself nothing; the root's own grants are another matter,
+            // ADR-55.)
+            c.placement_root_sticky = false;
             c
         }),
         ..config
@@ -20763,6 +20832,93 @@ fn placement_recalling_sticky_fails_the_oracle() {
         }
     }
     assert!(failed > 0, "no seed took a sticky grant back");
+}
+
+/// Plan 46 M1.3 step 9 (ADR-55): the root's own sticky grants are made, answer
+/// in their own stream and stream after a deposition, with no violation
+/// (`far-root-writes` and `far-root-writes-paused`, strict).
+#[test]
+fn the_root_takes_its_own_grants_and_keeps_them_across_a_deposition() {
+    let (mut granted, mut answers, mut resumed) = (0, 0, 0);
+    for seed in 0..40 {
+        for config in [far_root_writes_config(), far_root_writes_paused_config()] {
+            let r = run_seed(seed, config).unwrap_or_else(|e| {
+                panic!(
+                    "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=far-root-writes[-paused]"
+                )
+            });
+            granted += r.root_own_core[0];
+            answers += r.root_own_core[1];
+            resumed += r.root_own_core[8];
+        }
+    }
+    assert!(granted > 0, "the root was granted nothing");
+    assert!(answers > 0, "the root answered nothing in its own stream");
+    assert!(resumed > 0, "no deposed root streamed its own stream");
+}
+
+/// Plan 46 M1.3 step 9, the negative controls (test 19): each fault fails the
+/// oracle it is written for.
+/// - `root_sticky_on_slash`: `no_grant_on_root_dir`.
+/// - (`deposed_root_strands_own_stream` is pinned at the meta level, the
+///   store test `a_deposed_roots_own_stream_rows_are_neither_stranded_nor_member_copied`:
+///   the strand rolls the rows back and the by-rid replay completes them
+///   again, so no simulation oracle names it; an open gap, ADR-55.)
+/// - `root_executes_under_own_grant`: the root's own path runs a key of its
+///   live stream in its own journal beside the stream's.
+#[test]
+fn the_root_own_controls_fail_the_oracles() {
+    let controls: [(&str, SimConfig, &[&str]); 2] = [
+        (
+            "root_sticky_on_slash",
+            SimConfig {
+                root_sticky_on_slash: true,
+                // (Nodes 2 and 3 only read: the root dominates `/`.)
+                reader_nodes: vec![2, 3],
+                client_plan: vec![(2, 500, 12), (3, 500, 12)],
+                sticky_delegations: Vec::new(),
+                ..far_root_writes_config()
+            },
+            &["no_grant_on_root_dir", "no_grant_on_root_dir", ""],
+        ),
+        (
+            "root_executes_under_own_grant",
+            SimConfig {
+                root_executes_under_own_grant: true,
+                ..far_root_writes_shared_config()
+            },
+            &[
+                "root_path_executes_own_stream",
+                "root_path_executes_own_stream",
+                "I2",
+                "I1",
+            ],
+        ),
+    ];
+    for (name, config, expect) in controls {
+        let (mut failed, mut named) = (0, 0);
+        for seed in 0..250 {
+            if let Err(e) = run_seed(seed, config.clone()) {
+                assert!(
+                    expect.iter().any(|x| e.contains(x)),
+                    "{name} seed {seed} failed something else: {e}"
+                );
+                failed += 1;
+                // (The first oracle named is the one the fault is written for;
+                // for the loss of an answered row, any of its forms.)
+                named += usize::from(e.contains(expect[0]) || e.contains(expect[1]));
+            }
+        }
+        assert!(failed > 0, "{name}: no seed failed an oracle");
+        // (A grant on `/` breaks the run in more than one way and the end-of-run
+        // check of the table is not the first to speak: that control is
+        // required to fail, the strict `no_grant_on_root_dir` is its name.)
+        assert!(
+            named > 0 || name == "root_sticky_on_slash",
+            "{name}: no seed failed {}",
+            expect[0]
+        );
+    }
 }
 
 /// Plan 46 M1.3 step 0: `far-root-writes` and the `sticky-*` stubs run in
