@@ -59,6 +59,7 @@ use crate::action::{Action, AnswerSource, ControlOk};
 use crate::event::{PeerMsg, ReleaseWhy};
 use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
+use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
@@ -102,6 +103,17 @@ pub enum RecallPhase {
     /// Phase 2b: the delegate is silent; its backup was asked to seal
     /// and drain.
     Sealing,
+}
+
+/// Who asks for a grant (plan 46 M1.3 step 9, ADR-55): the root's own
+/// sticky grant is made only by the placement or a handover, never by an
+/// operator's `delegate` (open question 6 of the step 9 spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantSource {
+    Operator,
+    Placement,
+    #[allow(dead_code)] // step 8 C4: the handover's grant
+    Handover,
 }
 
 /// Why a generation exists (phase 2b).
@@ -1269,6 +1281,19 @@ pub(crate) struct DelegationState {
     /// when. Not installed, so nothing executes and no renewal goes out,
     /// until the log carries the record (the archive, for a lone root).
     pub(crate) commit_waiting: BTreeMap<u64, WaitMs>,
+    /// Plan 46 M1.3 step 9 (ADR-55, R-I3): the journal seq of the last
+    /// `DelegateNode` record of each of the root's own sticky streams. The
+    /// root executes under its own grant once the archive carries that row
+    /// ([`Core::own_grant_pending`]): its configuration commits the record
+    /// (the root has no group, or the grant would not be made).
+    pub(crate) own_grant_rows: BTreeMap<u64, u64>,
+    /// The streams this node granted itself while it was the root (a deposed
+    /// root keeps streaming them: `Stats::root_own_resumed`).
+    pub(crate) own_minted: BTreeSet<u64>,
+    /// ADR-55: this process installed a stream under a restart quarantine
+    /// (it held delegations before it restarted): a stream of its own it holds
+    /// waits for its claim of the lease instead of executing in the gate.
+    pub(crate) restarted_holder: bool,
     /// Tests only: honour a grant the root has not committed, as before step
     /// 8b, to pin what the orphan rule does for a delegate that executed
     /// under one (the rule stays as the defence behind the honour rule).
@@ -1580,6 +1605,7 @@ impl Core {
                     // admitted by the engine's fast path: the op goes to
                     // the core and parks.
                     d.stopped
+                        || self.own_grant_pending(d.gen)
                         || d.restart_q
                             .as_ref()
                             .is_some_and(|q| q.timer.is_some() && !q.voided),
@@ -1714,6 +1740,135 @@ impl Core {
             .cached_holder
             .or(self.lease.last_seen.as_ref().map(|l| l.holder))
             .filter(|h| *h != 0 && *h != self.cfg.node_id)
+    }
+
+    /// The node a holder streams to and renews with: [`Self::root_node`], or
+    /// this node itself while it holds the lease and a sticky stream of its
+    /// own is live in its tenure (ADR-55: the root is the holder of its own
+    /// stream; its messages to itself are delivered inline).
+    pub(crate) fn holder_root(&self) -> Option<NodeId> {
+        self.root_node().or_else(|| {
+            let me = self.cfg.node_id;
+            (self.lease.held.is_some()
+                && !self.lease.lost
+                && self
+                    .dl
+                    .gens
+                    .values()
+                    .any(|g| !g.ended && g.node == me && g.non_stealable()))
+            .then_some(me)
+        })
+    }
+
+    /// ADR-55: whether this node's own row `idx` of stream `gen` has left its
+    /// journal (the segment that carried it was acknowledged by the archive).
+    fn own_row_shipped(replica: &dyn Replica, gen: u64, idx: u64) -> bool {
+        replica
+            .delegate_txs_from(gen, idx, 1)
+            .first()
+            .is_none_or(|t| t.idx > idx)
+    }
+
+    /// ADR-55: a release of the root's own stream completes once its row has
+    /// shipped (see `on_delegate_stream_ack`); checked on every event while one
+    /// is pending.
+    fn own_release_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let me = self.cfg.node_id;
+        let pending: Vec<u64> = self
+            .dl
+            .mine
+            .iter()
+            .filter(|(g, d)| {
+                d.release
+                    .as_ref()
+                    .is_some_and(|r| !r.held && r.row.is_some())
+                    && (self.dl.gens.get(g).is_some_and(|s| s.node == me)
+                        || self.dl.own_minted.contains(g))
+            })
+            .map(|(g, _)| *g)
+            .collect();
+        let mut done = false;
+        for gen in pending {
+            let row = self
+                .dl
+                .mine
+                .get(&gen)
+                .and_then(|d| d.release.as_ref())
+                .and_then(|r| r.row)
+                .expect("pending");
+            let streamed = self.dl.mine[&gen].streamed_through;
+            if streamed >= row && Self::own_row_shipped(replica, gen, row) {
+                let d = self.dl.mine.get_mut(&gen).expect("present");
+                d.release_acked |= d.release.as_ref().is_some_and(|r| r.ends);
+                d.release = None;
+                done = true;
+            }
+        }
+        if done {
+            self.delegation_sync(now, replica, out);
+        }
+    }
+
+    /// ADR-55 (R-I4), audited in the simulation only (`track_fence_audit`):
+    /// the root's own path is about to execute `op`; none of its keys may be
+    /// under the root's own live sticky stream.
+    pub(crate) fn audit_root_path_execution(&mut self, op: &MutateOp, replica: &dyn Replica) {
+        if !self.track_fence_audit {
+            return;
+        }
+        if let Ownership::Delegated(d) =
+            replica.resolve_ownership(&super::holder::keys_of_op_in(op, replica))
+        {
+            if self
+                .dl
+                .gens
+                .get(&d.gen)
+                .is_some_and(|g| !g.ended && g.node == self.cfg.node_id && g.non_stealable())
+            {
+                self.stats.root_path_own_stream_executions += 1;
+            }
+        }
+    }
+
+    /// ADR-55: this node is about to be the root again and holds a stream of its
+    /// own: it is inside its takeover gate, or it has restarted and the lease
+    /// object still names it (its previous process's tenure, which its first
+    /// forward re-adopts). The claim ends its own streams when it opens;
+    /// whatever it executed as their holder meanwhile would be stranded with
+    /// the rest of its tail.
+    pub(crate) fn own_claim_pending(&self) -> bool {
+        // (Only a process that restarted holding delegations: a node that is
+        // the designee of a stream and claims the lease by a handoff executes
+        // in its gate as it always did.)
+        self.dl.restarted_holder
+            && (self.lease.gate.is_some()
+                || (self.lease.held.is_none()
+                // (A deposed node has learned the new holder: it is a holder,
+                // not a claimant.)
+                && self.root_node().is_none()
+                && self
+                    .lease
+                    .last_seen
+                    .as_ref()
+                    .is_some_and(|l| l.holder == self.cfg.node_id && !l.released)))
+    }
+
+    /// Whether `deps` are reached for an op the holder of stream `gen`
+    /// executes. The root's own stream (ADR-55) is a root that holds its own
+    /// journal: its tenure's journal positions are its own (the root's check,
+    /// [`Replica::reaches_streams`]); a delegate waits for the segments that
+    /// carry them.
+    pub(crate) fn holder_reaches(&self, gen: u64, deps: &Position, replica: &dyn Replica) -> bool {
+        if self
+            .dl
+            .gens
+            .get(&gen)
+            .is_some_and(|g| !g.ended && g.node == self.cfg.node_id)
+        {
+            replica.reaches_streams(deps)
+        } else {
+            replica.reaches(deps)
+        }
     }
 
     /// This node holds the root lease usably (may append, recall, grant).
@@ -1947,7 +2102,12 @@ impl Core {
                     .release
                     .as_ref()
                     .is_some_and(|r| r.row.is_none_or(|row| replica.log_stream_idx(**g) < row));
-                !((d.non_stealable || d.remnant) && unlogged && streams_mine.contains(g))
+                // ADR-55: the root's own stream ended at its inline append
+                // (the table forgot it) but its release row has not shipped:
+                // the state stays to stream it to the next root.
+                !((d.non_stealable || d.remnant)
+                    && unlogged
+                    && (streams_mine.contains(g) || self.dl.own_minted.contains(g)))
             })
             .map(|(g, _)| *g)
             .collect();
@@ -2128,6 +2288,9 @@ impl Core {
                         voided: false,
                     }
                 });
+            if restart_q.is_some() {
+                self.dl.restarted_holder = true;
+            }
             self.dl.mine.insert(
                 d.gen,
                 DelegateState {
@@ -2143,7 +2306,7 @@ impl Core {
                         held: false,
                         holds: 0,
                         left_at: now.wait,
-                        to: self.root_node().unwrap_or(0),
+                        to: self.holder_root().unwrap_or(0),
                         ends: true,
                     }),
                     release_acked: false,
@@ -2185,8 +2348,8 @@ impl Core {
                     last_own_op: BTreeMap::new(),
                     non_stealable: d.non_stealable(),
                     remnant,
-                    last_root: self.root_node(),
-                    known_root: self.root_node(),
+                    last_root: self.holder_root(),
+                    known_root: self.holder_root(),
                     backup: None,
                     backup_acked: 0,
                     backup_sent_through: 0,
@@ -2421,7 +2584,16 @@ impl Core {
                 // forwarded op's reply raised `stream_applied` past what
                 // the predecessor appended; the delegate re-streams the
                 // rest from here).
-                let cursor = replica.log_stream_idx(d.gen);
+                let mut cursor = replica.log_stream_idx(d.gen);
+                // ADR-55: a stream this node holds itself (it was the root and
+                // its own holder, and claims the lease again): every row it
+                // assigned is in its own journal, which is the root's, and
+                // ships in its segments. The cut it ends the stream at
+                // is what it assigned, not the log's index alone: a lower one
+                // would void answers it gave `Final`.
+                if d.node == me {
+                    cursor = cursor.max(replica.delegate_idx(d.gen));
+                }
                 tracing::info!(
                     node = me,
                     gen = %constellation_meta::delegation::GenLabel::of(d.gen),
@@ -2798,7 +2970,7 @@ impl Core {
         if let Some((req, _)) = d.ask {
             self.dl.by_req.remove(&req);
         }
-        let root = self.root_node().unwrap_or(0);
+        let root = self.holder_root().unwrap_or(0);
         for p in d.parked {
             self.answer_not_owner(now, p, root, replica, out);
         }
@@ -2908,6 +3080,15 @@ impl Core {
         }
         match replica.resolve_ownership(keys) {
             Ownership::Delegated(d) if d.node == self.me() => {
+                // ADR-55: a node inside its own takeover gate is claiming the
+                // lease; the gate ends the streams it holds when it opens
+                // (the claim path), and a row journaled in one meanwhile would
+                // be stranded with the rest of its tail, an answer it gave
+                // (a refusal included) void. Its ops wait for the gate
+                // (`Held` to a forward, the gate's queue to its own).
+                if self.own_claim_pending() {
+                    return None;
+                }
                 let s = self.dl.mine.get(&d.gen)?;
                 // Plan 46 M1.2 step 9: a subtree the stream grew by and this
                 // node does not honour yet (its record not committed, or the
@@ -2992,6 +3173,19 @@ impl Core {
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;
         };
+        // The fault `root_executes_under_own_grant` (ADR-55, R-I4): the root's
+        // own path runs this node's own ops beside the stream that runs the
+        // forwards routed by it.
+        if from == 0
+            && self.cfg.root_executes_under_own_grant
+            && self
+                .dl
+                .gens
+                .get(&gen)
+                .is_some_and(|g| !g.ended && g.node == self.cfg.node_id)
+        {
+            return false;
+        }
         // ADR-47 (the inbox rule): a rid whose batch is still in the holder's
         // inbox is not run here. Its batches are withdrawn first (the
         // tombstone; liveness): a drain read that predates it is halted, not
@@ -3034,7 +3228,8 @@ impl Core {
             .dl
             .mine
             .get(&gen)
-            .is_some_and(|d| now.honour < d.until || d.non_stealable);
+            .is_some_and(|d| now.honour < d.until || d.non_stealable)
+            && !self.own_grant_pending(gen);
         // ADR-46: a restarted holder executes nothing while the read grants
         // its previous process made may be live. A settle passes: its
         // refusal has no effect a reader sees.
@@ -3073,7 +3268,8 @@ impl Core {
             }
         }
         // The model's rule 1: the delegate waits for `deps` too.
-        let reaches = settle_like || self.cfg.skip_deleg_dep_wait || replica.reaches(&deps);
+        let reaches =
+            settle_like || self.cfg.skip_deleg_dep_wait || self.holder_reaches(gen, &deps, replica);
         // Phase 2b (M8): the read delegations this delegate granted on
         // what the op touches are recalled first.
         let recalling = !settle_like
@@ -3466,6 +3662,16 @@ impl Core {
             if self.record_delegate_refusal(rid, code, gen, none, replica) {
                 if refuse_in_stream {
                     self.stats.holder_inbox_refusals += 1;
+                    // ADR-55 (Q4): counted apart when the stream is the
+                    // root's own.
+                    if self
+                        .dl
+                        .gens
+                        .get(&gen)
+                        .is_some_and(|g| g.node == self.cfg.node_id)
+                    {
+                        self.stats.holder_inbox_refusals_own_root += 1;
+                    }
                 } else {
                     self.stats.settles_refused += 1;
                 }
@@ -3482,6 +3688,14 @@ impl Core {
                         replica.note_foreign_executed(&records);
                     }
                     self.stats.deleg_executed += 1;
+                    if self
+                        .dl
+                        .gens
+                        .get(&gen)
+                        .is_some_and(|g| g.node == self.cfg.node_id)
+                    {
+                        self.stats.root_own_answers += 1;
+                    }
                     if from == 0 {
                         self.handover_note_own_op(now, gen, op, replica);
                     }
@@ -5189,9 +5403,34 @@ impl Core {
             self.root_progress(now, replica, out);
         }
         self.deleg_forget_ended(now, replica);
+        // A record the archive carries stays committed (a lease loss resets
+        // what this core counts as shipped; the log does not forget).
+        let acked = replica.journal_acked_seq().unwrap_or(0);
+        let mut kept: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut committed: Vec<u64> = Vec::new();
+        for (g, j) in &self.dl.own_grant_rows {
+            if !(self.dl.mine.contains_key(g) || self.dl.gens.contains_key(g)) {
+                continue;
+            }
+            if *j == u64::MAX || !self.archive_covers(*j, acked) {
+                kept.insert(*g, *j);
+            } else {
+                committed.push(*g);
+            }
+        }
+        for g in committed {
+            if let Some(s) = self.dl.gens.get(&g).filter(|s| !s.ended) {
+                let ms = now.wait.since(s.grown_at.unwrap_or(s.granted)).max(0) as u64;
+                self.stats.root_own_commit_waits += 1;
+                self.stats.root_own_commit_wait_ms_max =
+                    self.stats.root_own_commit_wait_ms_max.max(ms);
+            }
+        }
+        self.dl.own_grant_rows = kept;
         self.deleg_leave_progress(now, replica, out);
         self.handover_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
+        self.own_release_progress(now, replica, out);
         self.abandon_progress(now, replica, out);
         self.deleg_restart_void_round(now, replica, out);
         // Plan 43 C2e (D8): a strict member's sealed tail that the drain
@@ -5237,7 +5476,7 @@ impl Core {
         // depend on each other never send at all (git-under-flock-faults
         // fault #14: rows 19.. of gen 4 behind (6, 2), row 2 of gen 6
         // behind (4, 18); every op parked on the new root for 120 s).
-        let root = self.root_node();
+        let root = self.holder_root();
         let mut stale_reqs = Vec::new();
         let mut renew_again = Vec::new();
         let rounds: BTreeMap<u64, u64> = self
@@ -5334,7 +5573,7 @@ impl Core {
             if d.parked.is_empty() {
                 continue;
             }
-            let honoured = now.honour < d.until && !d.stopped;
+            let honoured = now.honour < d.until && !d.stopped && !self.own_grant_pending(gen);
             if !honoured {
                 continue;
             }
@@ -5347,7 +5586,7 @@ impl Core {
                 .filter(|(_, p)| {
                     p.settle
                         || (!quarantined
-                            && replica.reaches(&p.deps)
+                            && self.holder_reaches(gen, &p.deps, replica)
                             && !self.gated_by_queue(p.from, p.rid, &p.op, replica)
                             && !(p.held
                                 && self.sticky_holds(
@@ -5496,7 +5735,7 @@ impl Core {
         let timeout = self.deleg_request_timeout_ms() as i64;
         let resend = self.deleg_resend_ms().min(timeout);
         let tick = self.cfg.delegation_stream_tick_ms.max(1);
-        let root = self.root_node();
+        let root = self.holder_root();
         let mut late = Vec::new();
         let mut given_up = Vec::new();
         let mut asks_given_up = Vec::new();
@@ -5871,7 +6110,7 @@ impl Core {
         for gen in self.deleg_expire_inflight(now) {
             self.deleg_renew_now(now, gen, out);
         }
-        let Some(root) = self.root_node() else {
+        let Some(root) = self.holder_root() else {
             // Learn the holder; the tick streams.
             self.deleg_learn_root(now, out);
             self.arm_stream_tick(now, out);
@@ -5959,7 +6198,9 @@ impl Core {
             // The sync is a full flush of the store: off the core
             // (`Action::SyncDelegStream`), the rows it covers sent once it
             // is done (`Core::on_deleg_stream_synced`).
-            if d.non_stealable {
+            // (The root's own stream is appended to the journal the rows are
+            // in: there is no second copy to keep ahead of a power loss.)
+            if d.non_stealable && root != self.cfg.node_id {
                 if last > d.synced_through && d.sync_inflight.is_none() {
                     let through = replica.delegate_idx(gen);
                     self.stats.deleg_designee_syncs += 1;
@@ -5979,6 +6220,12 @@ impl Core {
             let req = self.op_id();
             self.dl.by_req.insert(req, (gen, ReqKind::Stream));
             self.stats.deleg_streamed_txs += txs.len() as u64;
+            // ADR-55: rows of a stream this node was granted as the root,
+            // streamed to a root that is another node (it was deposed and
+            // lives on as the holder): the witness of breakdown Q4.
+            if root != self.cfg.node_id && gen >> 32 != 0 && self.minted_by_me(gen) {
+                self.stats.root_own_resumed += txs.len() as u64;
+            }
             let d = self.dl.mine.get_mut(&gen).expect("present");
             let round = d.stream_round;
             d.inflight = Some((req, last));
@@ -6062,7 +6309,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let root = self.root_node();
+        let root = self.holder_root();
         if gen == LEAVE_NOTE_GEN {
             self.on_leave_note_ack(from, req, refused);
             return;
@@ -6169,13 +6416,27 @@ impl Core {
         // Plan 46 M1.2 step 10: the root appended the release row (its batch
         // carried the note, which it handled before the rows), or
         // acknowledged the batch of a release that journaled none.
-        if d.release.as_ref().is_some_and(|r| {
-            !r.held
-                && match r.row {
-                    Some(row) => through >= row,
-                    None => answers_inflight,
-                }
-        }) {
+        // ADR-55: the release row's append to the root's own journal (this
+        // node is the root) is no copy beyond this disk until the segment that
+        // carries it is acknowledged: a root deposed before that, with the
+        // stream dropped here, would leave the row in its journal for good and
+        // the new root holding the stream live. The state stays until the row
+        // has shipped.
+        let own_row_pending = from == self.cfg.node_id
+            && d.release.as_ref().is_some_and(|r| {
+                r.row
+                    .is_some_and(|row| !Self::own_row_shipped(replica, gen, row))
+            });
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        if !own_row_pending
+            && d.release.as_ref().is_some_and(|r| {
+                !r.held
+                    && match r.row {
+                        Some(row) => through >= row,
+                        None => answers_inflight,
+                    }
+            })
+        {
             // (Only a release of the whole stream counts as the stream
             // released: a stream a refused renewal, a backup's seal, lost
             // dependencies, a held note that failed or an epoch stopped is
@@ -6451,7 +6712,7 @@ impl Core {
     }
 
     pub(crate) fn deleg_renew_now(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
-        let Some(root) = self.root_node() else {
+        let Some(root) = self.holder_root() else {
             // Learn the holder, and try again after a tick: the first
             // renewal of a grant installed from an S3 tail (no P2P
             // exchange with the root yet) must not be the last
@@ -7121,7 +7382,7 @@ impl Core {
             node = self.me(),
             gen = %constellation_meta::delegation::GenLabel::of(gen),
             dirs = ?dirs,
-            root = self.root_node().unwrap_or(0),
+            root = self.holder_root().unwrap_or(0),
             until_ms,
             frozen,
             root_silent,
@@ -7132,7 +7393,7 @@ impl Core {
         let d = self.dl.mine.get_mut(&gen).expect("present");
         d.lapsed = true;
         let parked = std::mem::take(&mut d.parked);
-        let root = self.root_node().unwrap_or(0);
+        let root = self.holder_root().unwrap_or(0);
         for p in parked {
             self.answer_not_owner(now, p, root, replica, out);
         }
@@ -7162,7 +7423,7 @@ impl Core {
     /// timeout; a link not measured, the whole timeout).
     pub(crate) fn deleg_end_due(&self, d: &DelegateState) -> HonourMs {
         let rtt = self
-            .root_node()
+            .holder_root()
             .and_then(|r| self.roster.links().get(&r))
             .and_then(|l| l.rtt_ms);
         let lapse = self.deleg_lapse_at(d).0;
@@ -7259,7 +7520,7 @@ impl Core {
     }
 
     fn deleg_renew_cert_iter(&self) -> impl Iterator<Item = DelegRenewCert> + '_ {
-        let root = self.root_node();
+        let root = self.holder_root();
         let timeout = self.deleg_request_timeout_ms();
         self.dl
             .mine
@@ -7371,7 +7632,7 @@ impl Core {
             return (false, false);
         }
         let horizon = self.reclaim_horizon_ms() as i64;
-        let root = self.root_node();
+        let root = self.holder_root();
         let pending = d.renew.map(|(_, sent)| sent).into_iter().chain(
             self.dl
                 .late
@@ -7444,7 +7705,7 @@ impl Core {
         req: OpId,
         sent: HonourMs,
     ) {
-        if self.root_node() != Some(to) {
+        if self.holder_root() != Some(to) {
             return;
         }
         let Some(d) = self.dl.mine.get_mut(&gen) else {
@@ -7530,7 +7791,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
-        let root = self.root_node();
+        let root = self.holder_root();
         tracing::debug!(
             node = self.cfg.node_id,
             from,
@@ -7646,7 +7907,7 @@ impl Core {
         let d = self.dl.mine.get_mut(&gen).expect("present");
         d.stopped = true;
         let parked = std::mem::take(&mut d.parked);
-        let root = self.root_node().unwrap_or(0);
+        let root = self.holder_root().unwrap_or(0);
         for p in parked {
             self.answer_not_owner(now, p, root, replica, out);
         }
@@ -7786,7 +8047,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let root = self.root_node();
+        let root = self.holder_root();
         let serving = self.deleg_mine_until(gen).is_some();
         let sent = match self.dl.mine.get(&gen) {
             Some(d)
@@ -7856,7 +8117,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let root = self.root_node();
+        let root = self.holder_root();
         let Some(late) = self.deleg_take_late(req, ReqKind::Renew, gen, None) else {
             return;
         };
@@ -11071,7 +11332,11 @@ impl Core {
         // The record is journaled here, not applied from a segment: a
         // generation this node held itself (inherited by a successor
         // that was the delegate) ends on the delegate side too.
-        if self.dl.mine.contains_key(&gen) {
+        // (ADR-55: not while the release of the root's own stream has not
+        // shipped: this node, deposed, streams the row to the next root.)
+        let own_release_unshipped = self.dl.own_minted.contains(&gen)
+            && self.dl.mine.get(&gen).is_some_and(|d| d.release.is_some());
+        if self.dl.mine.contains_key(&gen) && !own_release_unshipped {
             self.drop_delegate_state(now, gen, replica, out);
         }
     }
@@ -11364,7 +11629,18 @@ impl Core {
                 );
                 break;
             }
-            let applied = replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps);
+            // ADR-55: this node's own stream: the holder's row is in this
+            // journal already, with its origin `(gen, idx)`, and ships in
+            // this node's segment (a release row has no rid to dedup by, so
+            // nothing is applied a second time). The log's index of the
+            // stream is the log's: it rises when a segment that carries the
+            // row is applied, here or at the next root, which a re-stream
+            // after a deposition starts from.
+            let applied = if from == self.me() {
+                Ok(false)
+            } else {
+                replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps)
+            };
             self.stats.deleg_append_skipped += replica.take_deleg_append_skipped();
             self.stats.deleg_append_uncompleted += replica.take_deleg_append_uncompleted();
             match applied {
@@ -11526,6 +11802,26 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, String> {
+        self.delegate_dir_from(GrantSource::Operator, now, dir, node, kind, replica, out)
+    }
+
+    /// [`Self::delegate_dir`] for a grant asked by `source`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn delegate_dir_from(
+        &mut self,
+        source: GrantSource,
+        now: Now,
+        dir: Ino,
+        node: NodeId,
+        kind: DelegKind,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Result<u64, String> {
+        // ADR-55 R-I1: the root directory is the root sequencer's, whoever
+        // asks and whatever the kind.
+        if dir == ROOT_INO && !self.cfg.root_sticky_on_slash {
+            return Err("the root directory is never delegated".into());
+        }
         if !self.cfg.delegation {
             return Err("delegation is off (CONSTELLATION_DELEGATION)".into());
         }
@@ -11538,10 +11834,13 @@ impl Core {
         if self.dl.epoch_active || self.epoch.open {
             return Err("no delegation while a continuation epoch is open".into());
         }
-        if node == self.me() {
+        // ADR-55: the root holds its own sticky grant (placement or
+        // handover); never an operator's, and never another kind.
+        let own = node == self.me();
+        if own && (kind != DelegKind::Sticky || source == GrantSource::Operator) {
             return Err("cannot delegate to the root itself".into());
         }
-        if self.is_leaving(now, node) {
+        if !own && self.is_leaving(now, node) {
             return Err(format!("node {node} is leaving; nothing is granted to it"));
         }
         // Plan 46 M1.2 step 13: no lone delegate. A stealable grant goes
@@ -11637,7 +11936,9 @@ impl Core {
         // The delegate is another node: a root that still counts itself
         // alone starts the kernel drain now, so the first renewal (and a
         // designation) waits for it with the rest of the quarantine.
-        self.note_foreign(now, replica, out);
+        if !own {
+            self.note_foreign(now, replica, out);
+        }
         let table = replica.delegation_table();
         if let Some(d) = table.covering(replica.namespace(), dir) {
             return Err(format!(
@@ -11724,7 +12025,12 @@ impl Core {
             self.dl.designating.remove(&dir);
         }
         if let Some(gen) = live_stream {
-            return self.grow_generation(now, gen, dir, kind, replica, out);
+            let grown = self.grow_generation(now, gen, dir, kind, replica, out);
+            if own && grown.is_ok() {
+                // The holder side learns its own growth at once.
+                self.delegation_sync(now, replica, out);
+            }
+            return grown;
         }
         // ADR-43: a generation is a stream's identity, minted by one
         // tenure in its own epoch's block (`epoch << 32 | n`), the epoch of
@@ -11742,12 +12048,17 @@ impl Core {
             .next_delegation_gen(epoch, highest + 1)
             .map_err(|e| e.to_string())?;
         let _class = self.journal_class();
+        constellation_meta::clear_last_journaled();
         replica
             .apply_records_journaled(
                 &[LogRecord::delegate_one(node, gen, dir, kind.subtree_kind())],
                 None,
             )
             .map_err(|e| e.to_string())?;
+        if own {
+            self.note_own_grant_row(gen);
+            self.dl.own_minted.insert(gen);
+        }
         let read_recalls = self
             .start_recalls(now, read_grants, out)
             .map(|(ids, _)| ids)
@@ -11836,7 +12147,42 @@ impl Core {
             ?kind,
             "delegated"
         );
+        if own {
+            // ADR-55: the holder side is this node: it installs the stream
+            // now (honoured once the record is archived, R-I3).
+            self.stats.place_root_own_granted += 1;
+            self.delegation_sync(now, replica, out);
+        }
         Ok(gen)
+    }
+
+    /// Whether stream `gen` is one this node's own tenure granted itself (its
+    /// number is minted in an epoch block of a lease this node held): the
+    /// node was the root when it was made.
+    fn minted_by_me(&self, gen: u64) -> bool {
+        self.dl.own_minted.contains(&gen)
+    }
+
+    /// ADR-55: remember the journal seq of the record `delegate_dir` just
+    /// journaled for the root's own stream `gen`.
+    fn note_own_grant_row(&mut self, gen: u64) {
+        if let Some(row) = constellation_meta::take_last_journaled() {
+            self.dl.own_grant_rows.insert(gen, row.last);
+        } else {
+            // (No row was reported: wait for everything journaled so far.)
+            self.dl.own_grant_rows.insert(gen, u64::MAX);
+        }
+    }
+
+    /// ADR-55 (R-I3): whether the root's own stream `gen` waits for the
+    /// archive to carry its `DelegateNode` record. Its ops park (the
+    /// stream's `commit_waiting`) and the fast path does not admit under it
+    /// until then.
+    pub(crate) fn own_grant_pending(&self, gen: u64) -> bool {
+        self.dl
+            .own_grant_rows
+            .get(&gen)
+            .is_some_and(|jseq| *jseq == u64::MAX || !self.archive_covers(*jseq, 0))
     }
 
     /// Plan 46 M1.2 step 9: grant `dir` to the node that holds stream `gen`:
@@ -11859,12 +12205,16 @@ impl Core {
     ) -> Result<u64, String> {
         let node = self.dl.gens[&gen].node;
         let _class = self.journal_class();
+        constellation_meta::clear_last_journaled();
         replica
             .apply_records_journaled(
                 &[LogRecord::delegate_one(node, gen, dir, kind.subtree_kind())],
                 None,
             )
             .map_err(|e| e.to_string())?;
+        if node == self.me() {
+            self.note_own_grant_row(gen);
+        }
         let g = self.dl.gens.get_mut(&gen).expect("present");
         g.dirs.insert(dir, kind);
         g.grown_at = Some(now.wait);
@@ -12572,7 +12922,7 @@ impl Core {
             d.refused,
             d.streamed_through,
         );
-        let root = d.last_root.or_else(|| self.root_node());
+        let root = d.last_root.or_else(|| self.holder_root());
         let idx = replica.delegate_idx(gen);
         // A stream that cannot release by a row (a lost dependency, rows its
         // tenure has not committed) would end whole at a cut: never for a
@@ -13520,6 +13870,11 @@ pub(crate) enum RecallPlan {
     /// nothing, so the op waits for the gate to open (a `Busy` retry, an
     /// inbox batch left for the poll after it).
     Gated,
+    /// ADR-55: the keys are under the root's own live sticky stream and the
+    /// core's executor did not take the op (the grant is not honoured yet, or
+    /// the stream is stopped for a moment): the root never refuses its own
+    /// stream, nor executes under it; the asker retries (`Held`).
+    Hold(u64),
 }
 
 /// The kind a subtree was granted as, from the table's.

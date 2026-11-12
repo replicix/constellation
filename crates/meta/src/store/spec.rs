@@ -6104,6 +6104,15 @@ impl Meta {
     /// of a backup-less generation reads this copy. This node's own rows as a
     /// delegate are not appended rows: left alone (its live stream).
     pub fn strand_deposed(&self, floor: u64) -> Result<Stranded, MetaError> {
+        self.strand_deposed_with(floor, false)
+    }
+
+    /// [`Self::strand_deposed`]. `own_stream` is the simulation's negative
+    /// control (`Config::deposed_root_strands_own_stream`, ADR-55 R-I5): the
+    /// rows this node journaled as the holder of its own stream (`Final`,
+    /// answered) are rolled back with the root's rows. Never set by the
+    /// daemon.
+    pub fn strand_deposed_with(&self, floor: u64, own_stream: bool) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         let stranded = strand_tx(
@@ -6117,6 +6126,12 @@ impl Meta {
                         LiveEntry::Local { epoch, gen, appended: true, .. }
                             if *gen != 0 && *epoch < floor
                     )
+                    || (own_stream
+                        && matches!(
+                            entry,
+                            LiveEntry::Local { epoch, gen, appended: false, .. }
+                                if *gen != 0 && *epoch != 0 && *epoch < floor
+                        ))
             },
             true,
             false,

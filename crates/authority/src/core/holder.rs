@@ -281,6 +281,12 @@ impl Core {
                 if d.node == self.cfg.node_id
                     && !self.dl.mine.get(&d.gen).is_some_and(|m| m.stopped)
                 {
+                    // ADR-55: a restarted root whose lease object still names
+                    // it claims it again on its first forward (it does not
+                    // acquire on its own); its own stream waits for the claim.
+                    if self.own_claim_pending() {
+                        let _ = self.readopt_own_lease_for_forward(now, replica, out);
+                    }
                     self.stats.deleg_not_owner += 1;
                     out.push(Action::Send {
                         to: from,
@@ -568,6 +574,31 @@ impl Core {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(_) if has_outcome => Default::default(),
+                    // ADR-55: the root's own stream is not refused, nor run,
+                    // by the root's path: the requester asks again.
+                    super::delegate::RecallPlan::Hold(gen) => {
+                        if req != OpId(0) {
+                            out.push(Action::Send {
+                                to: from,
+                                msg: PeerMsg::MutateReply {
+                                    req,
+                                    outcome: MutateOutcome::Held {
+                                        retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                                        outwait_ms: None,
+                                        lost_chunk: false,
+                                    },
+                                    base: None,
+                                    position: Position::ZERO,
+                                    // A delegate's: no lease holder to cache.
+                                    gen,
+                                    own_chunks: OwnChunks::None,
+                                    own_rows: None,
+                                    committed: false,
+                                },
+                            });
+                        }
+                        return;
+                    }
                     // The gate recalls nothing (ADR-42): the requester retries.
                     super::delegate::RecallPlan::Gated => {
                         if req != OpId(0) {
@@ -1250,6 +1281,7 @@ impl Core {
             self.nudge_for_remote_refusal(now, &outcome, asker, out);
             return (outcome, None);
         }
+        self.audit_root_path_execution(op, replica);
         tracing::debug!(
             node = self.cfg.node_id,
             ?rid,
