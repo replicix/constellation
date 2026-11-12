@@ -77,6 +77,9 @@ pub(crate) struct HeldCopy {
     pub(crate) slot: u64,
     pub(crate) first: u64,
     pub(crate) keys: crate::KeySet,
+    /// The rid of the row: completed here (the log carries it, or this node
+    /// ran it again), the row's effect is back ([`Meta::member_copy_touches`]).
+    pub(crate) rid: Option<Rid>,
     /// [`Meta::held_copy_now_ms`] when it was held (or loaded at open).
     pub(crate) since_ms: i64,
 }
@@ -572,7 +575,63 @@ impl Meta {
             return false;
         }
         let held = self.held_copies.lock().unwrap();
-        held.iter().any(|h| keys.iter().any(|k| h.keys.touches(k)))
+        let mut snap = None;
+        held.iter()
+            .any(|h| keys.iter().any(|k| h.keys.touches(k)) && !self.hold_row_is_back(&mut snap, h))
+    }
+
+    /// The row a hold is for is back: its rid is completed here, by the log
+    /// (a re-ship under any identity, or the client's retry run by the
+    /// successor) or by this node running it again as the holder. A
+    /// strand takes the `completed` row of an unshipped transaction out with
+    /// it, so a row that is there after the strand is the log's or a new
+    /// execution's (`locks-unlinked-delegated-dcrash-pause` seeds 651, 1687:
+    /// the re-elected holder ran the retry itself and kept the old copy).
+    /// The hold is reaped ([`Self::reap_completed_holds`]).
+    fn hold_row_is_back(&self, snap: &mut Option<fjall::Snapshot>, h: &HeldCopy) -> bool {
+        let Some(rid) = h.rid else {
+            return false;
+        };
+        let snap = snap.get_or_insert_with(|| self.db.read_tx());
+        let back = matches!(snap.get(&self.completed, rid.to_key()), Ok(Some(_)));
+        if back {
+            self.reap_needed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        back
+    }
+
+    /// Take the holds of rows that are back out of the persisted set and the
+    /// index (the lazy check of [`Self::member_copy_touches`] found them).
+    pub(crate) fn reap_completed_holds(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.reap_needed.swap(false, Relaxed) {
+            return;
+        }
+        let back: Vec<(u64, u64)> = {
+            let held = self.held_copies.lock().unwrap();
+            let mut snap = None;
+            held.iter()
+                .filter(|h| self.hold_row_is_back(&mut snap, h))
+                .map(|h| (h.slot, h.first))
+                .collect()
+        };
+        self.reap_needed.store(false, Relaxed);
+        if back.is_empty() {
+            return;
+        }
+        let mut tx = self.db.write_tx();
+        for (slot, first) in &back {
+            tx.remove(&self.local, read_hold_key(*slot, *first));
+        }
+        if tx.commit().is_err() {
+            return;
+        }
+        let mut held = self.held_copies.lock().unwrap();
+        held.retain(|h| !back.contains(&(h.slot, h.first)));
+        self.any_held_copy.store(!held.is_empty(), Relaxed);
+        drop(held);
+        self.session.wake();
     }
 
     /// [`Self::member_copy_touches`] as the admission a read gets
@@ -683,6 +742,7 @@ impl Meta {
         slot: u64,
         first: u64,
         keys: crate::KeySet,
+        rid: Option<Rid>,
     ) -> Result<(), MetaError> {
         // A row that changes no name and no inode (an epoch marker) has
         // nothing for a read to miss.
@@ -705,7 +765,7 @@ impl Meta {
                 "a delegate row is held while the generation's log index reaches it"
             );
         }
-        tx.insert(&self.local, read_hold_key(slot, first), keys.encode()?);
+        tx.insert(&self.local, read_hold_key(slot, first), keys.encode(rid)?);
         let mut held = self.held_copies.lock().unwrap();
         held.retain(|h| (h.slot, h.first) != (slot, first));
         let since_ms = self.held_copy_now_ms();
@@ -713,6 +773,7 @@ impl Meta {
             slot,
             first,
             keys,
+            rid,
             since_ms,
         });
         self.any_held_copy
@@ -790,6 +851,7 @@ impl Meta {
                 dentries: vec![(constellation_fs_core::types::ROOT_INO, name.into())],
                 inos: Vec::new(),
             },
+            None,
         )?;
         drop(tx);
         Ok(())
@@ -812,6 +874,7 @@ impl Meta {
                 dentries: Vec::new(),
                 inos: vec![ino],
             },
+            None,
         )?;
         drop(tx);
         Ok(())
@@ -859,10 +922,12 @@ impl Meta {
                 ended.push(k.to_vec());
                 continue;
             }
+            let (keys, rid) = crate::KeySet::decode(&v)?;
             held.push(HeldCopy {
                 slot,
                 first,
-                keys: crate::KeySet::decode(&v)?,
+                keys,
+                rid,
                 since_ms,
             });
         }
@@ -883,10 +948,10 @@ impl Meta {
     /// The `(slot, first)` of every acknowledged row this node holds reads of
     /// (ADR-57): empty at quiescence.
     pub fn read_holds(&self) -> Vec<(u64, u64)> {
-        self.held_copies
-            .lock()
-            .unwrap()
-            .iter()
+        let held = self.held_copies.lock().unwrap();
+        let mut snap = None;
+        held.iter()
+            .filter(|h| !self.hold_row_is_back(&mut snap, h))
             .map(|h| (h.slot, h.first))
             .collect()
     }
@@ -956,43 +1021,6 @@ impl Meta {
             let ident = tail_identity(&row.tx.records).unwrap_or((slot - MEMBER_COPY_BASE, first));
             if idents.contains(&ident) {
                 self.release_row_tx(tx, slot, first);
-            }
-        }
-        Ok(())
-    }
-
-    /// The rows of delegate generations whose rid the log carries leave the
-    /// holds, in the caller's transaction (a segment's apply): the
-    /// successor landed the row, under its own origin or another one
-    /// (`(gen, idx)` reaching the generation's log index releases the
-    /// re-ship under the same origin, [`super::local::bump_log_idx_tx`]). A
-    /// row this root appended whose group never committed was never
-    /// acknowledged and may never come back under its `(gen, idx)`: its
-    /// rid's outcome in the log is what ends the wait for it.
-    pub(crate) fn release_carried_deleg_tx(
-        &self,
-        tx: &mut SingleWriterWriteTx,
-    ) -> Result<(), MetaError> {
-        if !self.any_held() {
-            return Ok(());
-        }
-        let rows: Vec<(u64, u64)> = self
-            .held_copies
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|h| super::backup::gen_of_deleg_slot(h.slot).is_some())
-            .map(|h| (h.slot, h.first))
-            .collect();
-        for (slot, first) in rows {
-            let Some(v) = tx.get(&self.backup_tail, tail_key(slot, first))? else {
-                continue;
-            };
-            let row: super::DelegateTx = postcard::from_bytes(&v)?;
-            if let Some(rid) = row.rid {
-                if super::spec::log_carries(&*tx, self, &rid)? {
-                    self.release_row_tx(tx, slot, first);
-                }
             }
         }
         Ok(())
@@ -1141,6 +1169,7 @@ impl Meta {
         drop(held);
         // The readers waiting on a hold look again.
         self.session.wake();
+        self.reap_completed_holds();
     }
 
     /// Forget the member copy of `epoch` (its rows are in the log, or the
@@ -1555,7 +1584,7 @@ mod release_tests {
         let slot = member_epoch(3);
         let mut tx = meta.db.write_tx();
         assert!(put_row_tx(&mut tx, &meta, 3, &row(5)).unwrap());
-        meta.hold_row_tx(&mut tx, slot, 5, keys()).unwrap();
+        meta.hold_row_tx(&mut tx, slot, 5, keys(), None).unwrap();
         tx.commit().unwrap();
         assert!(meta.member_copy_touches(&key));
 
@@ -1604,7 +1633,7 @@ mod release_tests {
         }]);
         let slot = super::super::backup::deleg_epoch(9);
         let mut tx = meta.db.write_tx();
-        meta.hold_row_tx(&mut tx, slot, 4, keys).unwrap();
+        meta.hold_row_tx(&mut tx, slot, 4, keys, None).unwrap();
         tx.commit().unwrap();
         assert!(meta.member_copy_touches(&key));
         meta.stage_release(StagedRelease::Slot(slot));

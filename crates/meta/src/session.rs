@@ -287,13 +287,16 @@ pub struct KeySet {
 
 impl KeySet {
     /// The persisted form of a read hold (`read_hold:` keys).
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, crate::MetaError> {
-        Ok(postcard::to_allocvec(&(&self.dentries, &self.inos))?)
+    /// With the rid of the row it is held for: the hold ends when the rid
+    /// is completed here (`Meta::member_copy_touches`).
+    pub(crate) fn encode(&self, rid: Option<crate::Rid>) -> Result<Vec<u8>, crate::MetaError> {
+        Ok(postcard::to_allocvec(&(&self.dentries, &self.inos, rid))?)
     }
 
-    pub(crate) fn decode(b: &[u8]) -> Result<Self, crate::MetaError> {
-        let (dentries, inos): (Vec<(u64, String)>, Vec<u64>) = postcard::from_bytes(b)?;
-        Ok(Self { dentries, inos })
+    pub(crate) fn decode(b: &[u8]) -> Result<(Self, Option<crate::Rid>), crate::MetaError> {
+        let (dentries, inos, rid): (Vec<(u64, String)>, Vec<u64>, Option<crate::Rid>) =
+            postcard::from_bytes(b)?;
+        Ok((Self { dentries, inos }, rid))
     }
 
     ///
@@ -2092,7 +2095,7 @@ impl crate::store::Meta {
             reconcile: &reconcile,
             cancelled,
         });
-        self.session.wait_with_holds(
+        let waited = self.session.wait_with_holds(
             keys,
             floor,
             || {
@@ -2105,7 +2108,10 @@ impl crate::store::Meta {
             },
             || self.held_any.load(Ordering::Relaxed),
             phase.as_ref(),
-        )
+        );
+        // Holds of rows that came back, seen by the check above.
+        self.reap_completed_holds();
+        waited
     }
 
     /// Plan 30 §M9: this holder acknowledges only what is durable on its

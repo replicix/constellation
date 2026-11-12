@@ -6780,7 +6780,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                                 format!(
                                     "epoch {e} {info:?}: {:?}",
                                     rows.iter()
-                                        .map(|m| (m.tx.first, m.tx.last, m.tx.origin, m.rid))
+                                        .map(|m| (
+                                            m.tx.first,
+                                            m.tx.last,
+                                            m.tx.origin,
+                                            m.rid,
+                                            // Where the log has the rid (position 0: carried).
+                                            m.rid.map(|r| n
+                                                .meta
+                                                .completed_position(r)
+                                                .ok()
+                                                .flatten()),
+                                        ))
                                         .collect::<Vec<_>>()
                                 )
                             })

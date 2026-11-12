@@ -799,6 +799,9 @@ pub struct Meta {
     /// Bumped whenever a hold is indexed: a read that waited and read
     /// compares it ([`Meta::hold_raced`]).
     pub(crate) hold_epoch: AtomicU64,
+    /// A hold whose row is back (its rid is completed here) was seen and not
+    /// reaped yet ([`Meta::reap_completed_holds`]).
+    pub(crate) reap_needed: std::sync::atomic::AtomicBool,
     /// Tests only: where the age (ms, the node's wait clock) of each hold at
     /// its release is noted ([`Meta::set_hold_lifetime_sink`]).
     #[cfg(any(test, feature = "test-util"))]
@@ -1368,6 +1371,7 @@ impl Meta {
             staged_releases: std::sync::Mutex::new(Vec::new()),
             staged_holds: std::sync::Mutex::new(Vec::new()),
             hold_epoch: AtomicU64::new(0),
+            reap_needed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             hold_lifetime_sink: std::sync::Mutex::new(None),
             inode_reads: AtomicU64::new(0),
