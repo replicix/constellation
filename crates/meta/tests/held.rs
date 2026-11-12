@@ -2233,3 +2233,54 @@ fn a_drop_of_a_re_shipped_tail_row_leaves_nothing_of_its_identity_to_ship() {
         "the redo ships: {redone:?}"
     );
 }
+
+/// ADR-59 part B (D2), review F5: a replay of a re-shipped row (its records led
+/// by the `TailOf` of the first journaling) that runs after the log retired
+/// that identity is a fresh execution. Before: it journaled the retired
+/// identity, which the ship plan holds for good (nothing names it, nothing
+/// strands it): it never shipped.
+#[test]
+fn a_replay_of_a_re_shipped_row_whose_identity_was_retired_journals_without_it() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(2).unwrap();
+    meta.apply_segment_rows(
+        1,
+        1,
+        0,
+        &[9],
+        &[(0, 0)],
+        &[LogRecord::DropHeld {
+            ino: 9,
+            chunks: Vec::new(),
+            rolled_back: vec![((1, 3), None)],
+        }],
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(meta.row_retired(1, 3));
+    meta.set_holder_epoch(2);
+    meta.apply_records_journaled(&[
+        LogRecord::TailOf { epoch: 1, jseq: 3 },
+        LogRecord::Create {
+            parent: ROOT_INO,
+            name: "redo".into(),
+            ino: (1 << 40) | 5,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 10,
+        },
+    ])
+    .unwrap();
+    assert!(meta
+        .journal_txs_from(0, usize::MAX)
+        .unwrap()
+        .iter()
+        .all(|t| !matches!(t.records.first(), Some(LogRecord::TailOf { .. }))));
+    let rows = batch(&meta);
+    assert!(
+        rows.iter()
+            .any(|(_, r)| matches!(r, LogRecord::Create { .. })),
+        "the redo ships: {rows:?}"
+    );
+}

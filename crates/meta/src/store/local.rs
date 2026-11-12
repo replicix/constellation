@@ -2057,6 +2057,24 @@ impl Meta {
         how: Journaled,
     ) -> Result<JournaledTx, MetaError> {
         let adopted = matches!(how, Journaled::Adopted | Journaled::Tail);
+        // ADR-59 part B (D2): a replay or an adoption of a re-shipped row whose
+        // `TailOf` identity a `DropHeld` of the log retired (the drop rolled it
+        // back and this is its redo, or the record came after it was queued)
+        // is a fresh execution: it does not journal the retired identity, which
+        // the ship plan would hold for good. (A verbatim tail re-ship is
+        // checked against the retired set by the gate, before it gets here.)
+        let fresh;
+        let records = match records.first() {
+            Some(LogRecord::TailOf { epoch, jseq })
+                if matches!(how, Journaled::Plain | Journaled::Adopted)
+                    && self.any_retired.load(std::sync::atomic::Ordering::Relaxed)
+                    && self.row_retired_tx(&*tx, *epoch, *jseq)? =>
+            {
+                fresh = records[1..].to_vec();
+                &fresh[..]
+            }
+            _ => records,
+        };
         // With a rid, the transaction is that op's (plan 30 §M9): a
         // stranding replays it *by rid* — where `completed` dedups —
         // never as anonymous records under a derived rid, which would

@@ -2159,6 +2159,15 @@ impl Meta {
             )));
         };
         let plan: DropPlan = postcard::from_bytes(&raw)?;
+        // A plan applied from the log had its record's ship counted (the ack of
+        // its row, or the reader meeting its segment, took it off the count of
+        // unshipped records): with no other plan waiting, the count is nil.
+        debug_assert!(
+            !plan.shipped
+                || tx.prefix(&self.local, DROP_PLAN_PREFIX).count() > 1
+                || counter_get(&tx, &self.local, KV_DROP_HELD_UNSHIPPED)? == 0,
+            "the drop of inode {ino} is applied from the log with its record still counted unshipped"
+        );
         let missing: BTreeSet<ChunkHash> = plan.missing.iter().copied().collect();
         let poisoned = read_poisoned(&tx, self)?;
         let walked = walk_drop(&tx, self, ino, &missing, &poisoned, DropMode::Apply(&plan))?;
@@ -2176,7 +2185,13 @@ impl Meta {
         // D1: nothing the record names stays in the journal: the planner
         // holds a named transaction, so what is left here is a copy the
         // spec_seq match did not reach (a rewind re-captured it).
-        let leftovers = strand_named_leftovers(&mut tx, self, &staged, &plan.idents)?;
+        let (leftovers, leftover_skipped) =
+            strand_named_leftovers(&mut tx, self, &staged, &plan.idents)?;
+        if !leftover_skipped.is_empty() {
+            // The same for a redo the leftovers' strand skipped.
+            drop(tx);
+            return self.drop_held_follow_up(ino, &leftover_skipped);
+        }
         debug_assert!(
             leftovers == 0,
             "the apply of the drop of inode {ino} left {leftovers} journal transaction(s) the \
@@ -2588,9 +2603,9 @@ fn strand_named_leftovers(
     meta: &Meta,
     staged: &UsageTracker,
     idents: &[(u64, u64)],
-) -> Result<usize, MetaError> {
+) -> Result<(usize, Vec<u64>), MetaError> {
     if idents.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
     let named: HashSet<(u64, u64)> = idents.iter().copied().collect();
     let mut left: Vec<u64> = Vec::new();
@@ -2603,10 +2618,13 @@ fn strand_named_leftovers(
         }
     }
     if left.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
+    // (A redo that skipped a record is the caller's follow-up decision, as for
+    // the rows the plan names.)
+    let mut redo_skipped = Vec::new();
     if !seqs.is_empty() {
-        spec::strand_seqs_tx(tx, meta, staged, &seqs)?;
+        redo_skipped = spec::strand_seqs_tx(tx, meta, staged, &seqs)?.1;
     }
     for first in &left {
         let Some(row) = local::get_journal_tx(&*tx, meta, *first)? else {
@@ -2619,6 +2637,17 @@ fn strand_named_leftovers(
             }
             continue;
         };
+        // A live spec entry the strand did not take (not a `Local` one) still
+        // stands for these rows: they stay, never a spec entry without them.
+        if row
+            .spec_seq
+            .map(|seq| spec::row_keys_and_origin(&*tx, meta, seq))
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            continue;
+        }
         for seq in *first..=row.last {
             tx.remove(&meta.journal_ks, journal::seq_key(seq));
         }
@@ -2631,7 +2660,7 @@ fn strand_named_leftovers(
         };
         counter_add_tx(tx, &meta.local, count, -1)?;
     }
-    Ok(left.len())
+    Ok((left.len(), redo_skipped))
 }
 
 /// ADR-59 part B: what a decided drop persists (`local["drop_plan:{ino}"]`)
