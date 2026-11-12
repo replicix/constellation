@@ -1334,6 +1334,11 @@ impl Meta {
         // stream's origin.
         if let [LogRecord::Refused { rid: r, code }] = records {
             if self.completed_position(*r)?.is_some() {
+                // The row is skipped, not lost: its index is appended all
+                // the same (plan 46 M1.3 step 9: a root that is the holder
+                // of its own stream finds its own refusal here already,
+                // and its cursor would stall at it).
+                self.note_log_idx(gen, idx)?;
                 return Ok(false);
             }
             // Plan 45 §12 M2: a live shadow of the refused rid (the root

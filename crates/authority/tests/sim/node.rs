@@ -519,6 +519,12 @@ pub struct NodeEnv {
     pub ttl_reclaims_sticky: bool,
     /// See `SimConfig::placement_recalls_sticky`.
     pub placement_recalls_sticky: bool,
+    /// See `SimConfig::root_sticky_on_slash`.
+    pub root_sticky_on_slash: bool,
+    /// See `SimConfig::deposed_root_strands_own_stream`.
+    pub deposed_root_strands_own_stream: bool,
+    /// See `SimConfig::root_executes_under_own_grant`.
+    pub root_executes_under_own_grant: bool,
     /// See `SimConfig::kept_fetch_skipped`.
     pub kept_fetch_skipped: bool,
     /// See `SimConfig::parent_taint_conservative`.
@@ -876,6 +882,9 @@ impl NodeHandle {
         cfg.skip_deleg_dep_wait = env.skip_deleg_dep_wait;
         cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
         cfg.placement_recalls_sticky = env.placement_recalls_sticky;
+        cfg.root_sticky_on_slash = env.root_sticky_on_slash;
+        cfg.deposed_root_strands_own_stream = env.deposed_root_strands_own_stream;
+        cfg.root_executes_under_own_grant = env.root_executes_under_own_grant;
         cfg.kept_fetch_skipped = env.kept_fetch_skipped;
         cfg.restart_skips_write_quarantine = env.restart_skips_write_quarantine;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
@@ -4005,6 +4014,14 @@ impl Driver {
     }
 
     fn dispatch(&mut self, actions: Vec<Action>) {
+        // ADR-55: a release the root's holder side sent to its root side is
+        // a release by the holder like any other.
+        for (gen, whole, dirs) in self.core.take_self_releases() {
+            let mut sent = self.oracles.sticky_released.lock().unwrap();
+            let e = sent.entry(gen).or_default();
+            e.whole |= whole;
+            e.dirs.extend(dirs);
+        }
         for action in actions {
             match action {
                 Action::Reply { rid, reply, source } => {

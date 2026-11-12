@@ -1346,6 +1346,28 @@ impl PeerMsg {
         }
     }
 
+    /// Plan 46 M1.3 step 9 (ADR-55): a message of the delegate family: the
+    /// stream, its acknowledgement, renewals and their answers, release
+    /// requests, seals, recalls and read-grant voids. The root is the holder of
+    /// its own stream, so these may be addressed to the sending node itself;
+    /// the core delivers them in the step that makes them
+    /// (`Core::handle`), and no driver ever carries one.
+    pub fn is_delegate_family(&self) -> bool {
+        matches!(
+            self,
+            PeerMsg::DelegateStream { .. }
+                | PeerMsg::DelegateStreamAck { .. }
+                | PeerMsg::DelegRenew { .. }
+                | PeerMsg::DelegRenewed { .. }
+                | PeerMsg::ReleaseRequest { .. }
+                | PeerMsg::DelegSeal { .. }
+                | PeerMsg::DelegSealed { .. }
+                | PeerMsg::DelegationRecall { .. }
+                | PeerMsg::DelegationRecalled { .. }
+                | PeerMsg::DelegReadVoid { .. }
+        )
+    }
+
     /// The correlation id this message carries as a *request*, when it
     /// expects a reply (the driver reports `Event::PeerFailed` for it).
     pub fn requests(&self) -> Option<OpId> {

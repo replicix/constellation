@@ -9559,6 +9559,7 @@ struct OracleTotals {
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
     sticky_core: [u64; 16],
+    root_own_core: [u64; 10],
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
@@ -9947,6 +9948,19 @@ impl OracleTotals {
         for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
             *t += c;
         }
+        for (i, (t, c)) in self
+            .root_own_core
+            .iter_mut()
+            .zip(r.root_own_core)
+            .enumerate()
+        {
+            // (Index 3 is the longest wait: a maximum.)
+            if i == 3 {
+                *t = (*t).max(c);
+            } else {
+                *t += c;
+            }
+        }
         for (t, c) in self.quarantine_core.iter_mut().zip(r.quarantine_core) {
             *t += c;
         }
@@ -10151,6 +10165,21 @@ impl OracleTotals {
             self.i5_operator.0,
             self.i5_operator.1,
             self.i5_after_end
+        );
+        eprintln!(
+            "ROOT-OWN-TOTALS {label} seeds {}/{seeds}: the root's own grants made {}, answers in its own stream {}, held by its root path {}, \
+             longest commit wait {} ms, messages to itself delivered inline {} (cut off {}), candidates skipped for the root {}, released by its dwell {}, rows streamed after its deposition {}, inbox-only forwards refused in its stream {}",
+            self.seeds,
+            self.root_own_core[0],
+            self.root_own_core[1],
+            self.root_own_core[2],
+            self.root_own_core[3],
+            self.root_own_core[4],
+            self.root_own_core[7],
+            self.root_own_core[5],
+            self.root_own_core[6],
+            self.root_own_core[8],
+            self.root_own_core[9]
         );
         eprintln!(
             "QUARANTINE-TOTALS {label} seeds {}/{seeds}: restart quarantines {}, own writes parked {}, forwards answered Held {}, \
