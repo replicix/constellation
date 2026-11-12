@@ -1739,22 +1739,55 @@ pub(crate) fn member_rules_tx(
     Ok(out)
 }
 
-/// The identities a record list retracts (`LogRecord::RolledBack`).
+/// The identities a record list retracts (`LogRecord::DropHeld`).
 pub(crate) fn rolled_back_idents<'a>(
     records: impl IntoIterator<Item = &'a LogRecord>,
 ) -> BTreeSet<(u64, u64)> {
     records
         .into_iter()
         .filter_map(|rec| match rec {
-            LogRecord::RolledBack { idents } => Some(idents.iter().copied()),
+            LogRecord::DropHeld { rolled_back, .. } => {
+                Some(rolled_back.iter().map(|(ident, _)| *ident))
+            }
             _ => None,
         })
         .flatten()
         .collect()
 }
 
+/// ADR-59 part B (D2): the key of a retired identity.
+fn retired_key(epoch: u64, jseq: u64) -> Vec<u8> {
+    format!("retired:{epoch}:{jseq}").into_bytes()
+}
+
+impl Meta {
+    /// ADR-59 part B (D2): the identities a `DropHeld` applied from the log
+    /// (or shipped by this node) retired: no path may put such a row into
+    /// the log. Never forgotten (a few bytes per rolled-back transaction).
+    pub(crate) fn retire_rolled_back_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        idents: &BTreeSet<(u64, u64)>,
+    ) {
+        for (epoch, jseq) in idents {
+            tx.insert(&self.local, retired_key(*epoch, *jseq), Vec::new());
+        }
+    }
+
+    /// Whether the transaction `(epoch, jseq)` (by the identity a member
+    /// keys it by) was retired by a `DropHeld` in the log.
+    pub fn row_retired(&self, epoch: u64, jseq: u64) -> bool {
+        self.db
+            .read_tx()
+            .get(&self.local, retired_key(epoch, jseq))
+            .ok()
+            .flatten()
+            .is_some()
+    }
+}
+
 /// Plan 46 M0.2 follow-up (defect B): the member-copy rows of the
-/// transactions `idents` names (`LogRecord::RolledBack`: the holder's
+/// transactions `idents` names (`LogRecord::DropHeld`: the holder's
 /// `repair drop-held` rolled them back) become holes, in the caller's
 /// transaction: a hole spans the same journal seqs and carries nothing, so
 /// the copy stays contiguous for the claimant that seals it and no

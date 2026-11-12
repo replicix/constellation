@@ -233,6 +233,8 @@ pub(crate) const KV_JOURNAL_ACKED: &str = "journal_acked";
 /// poisoned?" is one point read, not a range scan of a keyspace every
 /// journaled write rewrites.
 pub(crate) const KV_POISONED_COUNT: &str = "poisoned_count";
+/// ADR-59 part B: `DropHeld` records journaled and not yet shipped.
+pub(crate) const KV_DROP_HELD_UNSHIPPED: &str = "drop_held_unshipped";
 /// Set once `pending_upload_by_ino` mirrors every `pending_upload` row
 /// (`Meta::build_pending_by_ino`).
 pub(crate) const KV_PENDING_BY_INO: &str = "pending_upload_by_ino_built";

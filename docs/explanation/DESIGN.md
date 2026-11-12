@@ -737,7 +737,7 @@ delegations over the one log instead, below.)
   how far its hold reached; `TailFollows` in older logs), `TailOf` (the
   identity of a re-shipped transaction: the journal that first held it,
   the first record of the re-shipped transaction, kept through any number of
-  re-ships), `GroupAbandoned` (an operator gave a group's rows up; §9) and `RolledBack` (the transactions an operator's `repair drop-held` rolled back, which members and backups retract; §9). The set is an append-only registry, like the manifest
+  re-ships), `GroupAbandoned` (an operator gave a group's rows up; §9) and `DropHeld` (the decision of an operator's `repair drop-held`: the transactions it rolled back, which members and backups retract and no replica lets into the log; §9). The set is an append-only registry, like the manifest
   entry types.
 - **The commit chain** (plan 28,
   [28-s3-native-metadata-store.md](../plans/v1/done/28-s3-native-metadata-store.md))
@@ -2132,7 +2132,7 @@ Three more rules close the drop on a backed root. A lost chunk that an op of
 the node not yet journaled, or an open write session, still names keeps its
 pending row and marks (no row means durable to every manifest composition),
 or its manifest would ship naming a chunk S3 never received. The drop journals
-`RolledBack { idents }` ahead of its refusals, naming each transaction it
+`DropHeld { ino, chunks, rolled_back }` ahead of its refusals, naming each transaction it
 rolled back as a member keys it; a member that was streamed those as committed
 rolls its copy back without a replay, and backups' tails and member copies
 turn the transactions into holes (the tail stays contiguous). And a drop run

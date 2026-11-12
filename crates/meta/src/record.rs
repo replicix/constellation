@@ -334,28 +334,34 @@ pub enum LogRecord {
     /// on; `TailFollows` stays decodable and keeps its meaning for logs
     /// written before (`through` unknown: nothing is dropped by it).
     TailFollowsThrough { prev_epoch: u64, through: u64 },
-    /// Plan 46 M0.2 follow-up (defect B): `repair drop-held` rolled back
-    /// the holder's journal transactions `idents` — each the identity a
-    /// member keys a transaction by ([`LogRecord::TailOf`]'s pair if the
-    /// transaction began with one, else its tenure's `(epoch, first journal
-    /// seq)`): the seeds that name a lost chunk, the transactions that
-    /// depended on them, the queued replays the drop refused. They were
-    /// held back and never shipped, but a member that was streamed them as
-    /// committed (and a backup that held them) still carries them: the
-    /// copy is retracted here, from the record, rather than inferred from
-    /// the rids around it. A member that applies it rolls back its live
-    /// `Streamed` entry of each identity (gated or not) without queueing a
-    /// replay — the holder's queue owns the replay or the refusal — and
-    /// replaces its member-copy row and its backup-tail transaction of it
-    /// with a hole, so that no successor re-ships a dropped row. Journaled
-    /// ahead of the drop's `Refused` rows (the first record of their
-    /// transaction), so a holder that dies mid-drop leaves a successor
-    /// that has either the record or none of the drop's effects. Touches
-    /// nothing; an identity nobody holds is a no-op.
+    /// ADR-59 part B (D1): the decision of `repair drop-held` for inode `ino`,
+    /// whose lost `chunks` made the held transactions of `rolled_back`
+    /// undeliverable: each is named by the identity a member keys a
+    /// transaction by ([`LogRecord::TailOf`]'s pair if it began with one,
+    /// else its tenure's `(epoch, first journal seq)`) and by the rid it
+    /// completes, if it completes one. The drop decides nothing locally: it
+    /// journals this record (an Archive-class row with no keys, which ships
+    /// ahead of everything the seed holds) and changes no other state; every
+    /// effect is the consequence of the record being in the log, the
+    /// dropper's own included (it applies the drop when the archive covers
+    /// the record).
+    ///
+    /// A replica that applies it from the log records the identities as
+    /// *retired* (no path puts a retired row into the log: the reship gate
+    /// and the kept merge skip it), replaces its member-copy row and its
+    /// backup-tail transaction of each with a hole so that no successor
+    /// re-ships a dropped row, and (from a committed stream) rolls back what
+    /// it was streamed of them without queueing a replay: the dropper's
+    /// queue owns the refusal or the replay. Touches nothing; an identity
+    /// nobody holds is a no-op.
     ///
     /// Appended at the end of the enum, as the postcard ordering comment on
     /// this type requires.
-    RolledBack { idents: Vec<(u64, u64)> },
+    DropHeld {
+        ino: Ino,
+        chunks: Vec<replicix_chunkfmt::ChunkHash>,
+        rolled_back: Vec<((u64, u64), Option<Rid>)>,
+    },
     /// Plan 46 M1.2 step 8a (§5.2): the root grants `node` the subtrees
     /// `dirs` under generation `gen`: the generation opens with its first
     /// record, and a later record of the same `(node, gen)` *grows* the

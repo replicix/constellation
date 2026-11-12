@@ -1759,7 +1759,7 @@ fn a_member_copy_is_ruled_after_a_restart() {
 // ------------------------------------------- a holder's drop retracts its copies
 
 /// The copies a member holds of a transaction the holder's `repair
-/// drop-held` rolled back (`RolledBack`): a successor re-appended node 2's
+/// drop-held` rolled back (`DropHeld`): a successor re-appended node 2's
 /// op as `TailOf { 1, 3 }` and streamed it to the forwarder as committed;
 /// the drop rolled it back and the forwarder applies the record in the
 /// segment that carries it. The streamed entry is rolled back and not
@@ -1802,9 +1802,7 @@ fn a_streamed_committed_row_named_by_rolled_back_is_retracted() {
 
     // The successor's segment: the record, then its later rows.
     let seg = vec![
-        LogRecord::RolledBack {
-            idents: vec![(1, 3), (9, 9)],
-        },
+        drop_held_rec(vec![(1, 3), (9, 9)]),
         create("b", ino(2), 11),
         completed(rid(2)),
     ];
@@ -1840,6 +1838,55 @@ fn a_streamed_committed_row_named_by_rolled_back_is_retracted() {
     assert!(meta.member_copy_carries(rid(7)).unwrap());
 }
 
+/// ADR-59 part B (D2), fail-before (new API: `Meta::row_retired`): a segment
+/// that carries a `DropHeld` retires the identities it names, whether or not
+/// this replica holds a copy of them, and a member-copy row of one becomes a
+/// hole; an identity it does not name stays.
+#[test]
+fn a_drop_held_applied_from_the_log_retires_the_identities_it_names() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.member_copy_put_rows(
+        1,
+        1,
+        &[
+            mtx(
+                3,
+                3,
+                RowCommit::ROOT_GROUP,
+                vec![create("a", ino(1), 10), completed(rid(1))],
+            ),
+            mtx(
+                4,
+                4,
+                RowCommit::ROOT_GROUP,
+                vec![create("k", ino(7), 13), completed(rid(7))],
+            ),
+        ],
+    )
+    .unwrap();
+    assert!(!meta.row_retired(1, 3));
+    let seg = vec![
+        drop_held_rec(vec![(1, 3), (9, 9)]),
+        create("b", ino(2), 11),
+        completed(rid(2)),
+    ];
+    apply_rows(&meta, 1, 2, 6, &[4, 5, 6], &seg);
+    assert!(meta.row_retired(1, 3), "named: retired");
+    assert!(meta.row_retired(9, 9), "named without a copy: retired too");
+    assert!(!meta.row_retired(1, 4), "not named: not retired");
+    let (_, rows) = meta.member_copy_rows(1).unwrap().expect("a copy is left");
+    assert!(
+        rows.iter()
+            .all(|m| m.tx.first != 3 || m.tx.records.is_empty()),
+        "the copy at 3 is a hole: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|m| m.tx.first == 4 && !m.tx.records.is_empty()),
+        "the copy at 4 stays: {rows:?}"
+    );
+}
+
 /// The same record, streamed (the transaction that carries the drop's
 /// `Refused` rows reaches the forwarder before any segment does): the
 /// committed entry is retracted at the install, an own op's entry included,
@@ -1870,9 +1917,7 @@ fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
     assert!(meta.has_outstanding_speculation());
 
     let drop_tx = vec![
-        LogRecord::RolledBack {
-            idents: vec![(1, 1), (1, 3), (1, 5)],
-        },
+        drop_held_rec(vec![(1, 1), (1, 3), (1, 5)]),
         LogRecord::Refused {
             rid: rid(9),
             code: constellation_types::Code::Io,
@@ -1929,9 +1974,7 @@ fn an_appended_rolled_back_record_turns_the_tail_transactions_into_holes() {
             7,
             8,
             vec![
-                LogRecord::RolledBack {
-                    idents: vec![(2, 1), (1, 7)],
-                },
+                drop_held_rec(vec![(2, 1), (1, 7)]),
                 LogRecord::Refused {
                     rid: rid(9),
                     code: constellation_types::Code::Io,
@@ -1950,7 +1993,7 @@ fn an_appended_rolled_back_record_turns_the_tail_transactions_into_holes() {
     assert_eq!(meta.backup_acked(2).unwrap(), 8, "contiguous still");
 }
 
-/// A `RolledBack` record that reaches a member on an uncommitted stream (an
+/// A `DropHeld` record that reaches a member on an uncommitted stream (an
 /// epoch hold's tip, a lone tenure's) retracts nothing: the dropping holder
 /// may be deposed or dead before the transaction commits, and the member's
 /// copy alone may carry the row (its client was told it is committed). The
@@ -1978,9 +2021,7 @@ fn an_uncommitted_rolled_back_record_retracts_nothing_until_the_log_carries_it()
     )
     .unwrap();
     let drop_tx = vec![
-        LogRecord::RolledBack {
-            idents: vec![(1, 3)],
-        },
+        drop_held_rec(vec![(1, 3)]),
         LogRecord::Refused {
             rid: rid(9),
             code: constellation_types::Code::Io,
@@ -2087,4 +2128,13 @@ fn a_reship_does_not_wait_for_a_copy_past_the_sealed_prefix() {
     let queued = meta.pending_replays().unwrap();
     assert_eq!(queued.len(), 1, "{queued:?}");
     assert_eq!(queued[0].rid, rid(2));
+}
+
+/// A `DropHeld` record naming `idents` (ADR-59 part B), with no rids.
+fn drop_held_rec(idents: Vec<(u64, u64)>) -> LogRecord {
+    LogRecord::DropHeld {
+        ino: 0,
+        chunks: Vec::new(),
+        rolled_back: idents.into_iter().map(|i| (i, None)).collect(),
+    }
 }

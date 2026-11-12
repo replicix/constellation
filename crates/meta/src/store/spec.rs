@@ -5163,7 +5163,7 @@ impl Meta {
 
     /// Plan 46 M0.2 follow-up (defect B): the holder's `repair drop-held`
     /// rolled back the journal transactions `idents` names
-    /// (`LogRecord::RolledBack`). What this replica holds of them is
+    /// (`LogRecord::DropHeld`). What this replica holds of them is
     /// retracted, in the caller's transaction: its live `Streamed` entry of
     /// each identity — committed (`gated`) or not, `own` or not — is rolled
     /// back from its before-images, and not queued for replay (the holder's
@@ -5188,6 +5188,7 @@ impl Meta {
             None,
             |_| true,
         )?;
+        meta.retire_rolled_back_tx(tx, idents);
         super::member::hole_rolled_back_tx(tx, meta, idents)?;
         super::backup::hole_tail_rolled_back_tx(tx, meta, idents)?;
         Ok(stranded)
@@ -5340,7 +5341,7 @@ impl Meta {
         // segment carries (`TailOf`), and the groups it says the operator
         // abandoned.
         // Defect B: the transactions the holder's `repair drop-held` says it
-        // rolled back (`RolledBack`).
+        // rolled back (`DropHeld`).
         let rolled = super::member::rolled_back_idents(records);
         let tail_ids: HashSet<(u64, u64)> = records
             .iter()
@@ -6005,6 +6006,7 @@ impl Meta {
         // Plan 43 C1-4: what the log delivered tells the member copies
         // (coverage, `TailFollowsThrough`, an abandon, a newer marker).
         super::member::note_log_tail_tx(&mut tx, self, epoch, records, prev_applied)?;
+        self.retire_rolled_back_tx(&mut tx, &rolled);
         super::member::hole_rolled_back_tx(&mut tx, self, &rolled)?;
         super::backup::hole_tail_rolled_back_tx(&mut tx, self, &rolled)?;
         let member = super::member::member_rules_tx(
