@@ -19361,6 +19361,7 @@ mod locks {
                 grants: vec![lapsed],
                 floor: Position::ZERO,
                 barrier: 0,
+                rows: Vec::new(),
             },
         );
         assert!(
@@ -19437,6 +19438,7 @@ mod locks {
                 grants: vec![live],
                 floor: Position::ZERO,
                 barrier: 0,
+                rows: Vec::new(),
             },
         );
         assert!(
@@ -19537,6 +19539,7 @@ mod locks {
                 grants: vec![grant],
                 floor: Position::ZERO,
                 barrier: 0,
+                rows: Vec::new(),
             },
         );
         assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
@@ -33609,15 +33612,60 @@ mod locks {
         let now = r.clk();
         let (grants, _) = r.core.lock_take_handoff(now, 7);
         assert_eq!(grants.iter().map(|w| w.id).collect::<Vec<_>>(), vec![g]);
-        // The second release hands the same grant back.
+        // The second release hands the same grant back, under its own row.
+        let row = back.rows.iter().find(|(id, _)| *id == g).expect("a row").1;
+        let mut second = back.clone();
+        second.rows = vec![(g, row + 2)];
         r.advance(10);
-        release_note_only(&mut r, 3, 7, back);
+        release_note_only(&mut r, 3, 7, second);
         assert!(
             r.meta.locks().get(g).is_some(),
             "the second hand-back was dropped as a duplicate"
         );
         assert_eq!(r.core.stats.lock_moved, 2);
         assert_eq!(r.core.stats.lock_returned_duplicates, 0);
+    }
+
+    /// Plan 46 M1.2 step 10, review M1: the first release's note is re-sent
+    /// (its acknowledgement was lost) after the root granted the subtree to
+    /// the stream again, the grant with it. The copy repeats the first
+    /// release's row and stays out. Fails before (with the hand-back
+    /// filter keyed on the grant alone and forgotten at the re-grant): the
+    /// root installed the copy in a table that does not serve the inode, and
+    /// took the grant out of the generation's handed copies, so later
+    /// renewals no longer carried it to the delegate.
+    #[test]
+    fn a_resent_release_note_after_the_subtree_came_back_installs_nothing() {
+        let (mut d, dir, f, _) = carry_delegate(5_000);
+        delegation_left(&mut d, 60_000);
+        let g = unused_grant(&mut d, f);
+        d.advance(1_000);
+        let back = recall_answer(&mut d, dir, OpId(5));
+        assert_eq!(back.rows.len(), 1, "{back:?}");
+        let (mut r, _, _, _recall) = recalling_root(5_000);
+        r.now = d.now;
+        release_note_only(&mut r, 3, 7, back.clone());
+        assert!(r.meta.locks().get(g).is_some(), "handed back");
+        r.advance(10);
+        r.core.lock_on_delegated(7, &r.meta);
+        let now = r.clk();
+        let (grants, _) = r.core.lock_take_handoff(now, 7);
+        assert_eq!(grants.iter().map(|w| w.id).collect::<Vec<_>>(), vec![g]);
+        // The re-sent batch, with the first note.
+        r.advance(10);
+        release_note_only(&mut r, 3, 7, back);
+        assert!(
+            r.meta.locks().get(g).is_none(),
+            "a re-sent copy of the first note installed the grant at the root"
+        );
+        assert_eq!(r.core.stats.lock_returned_duplicates, 1);
+        let now = r.clk();
+        let (grants, _) = r.core.lock_take_handoff(now, 7);
+        assert_eq!(
+            grants.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![g],
+            "no longer handed to the generation"
+        );
     }
 
     /// Plan 46 M1.2 step 10 (sim `locks-unlinked-delegated-dcrash-pause`
@@ -33702,11 +33750,18 @@ mod locks {
             )],
         )
         .unwrap();
+        // Installed with the row (review S3: a non-stealable stream honours
+        // a grown subtree at its commit, with no renewal to carry it again).
+        let mut out = Vec::new();
+        let now = d.clk();
+        d.core.delegation_sync(now, &d.meta, &mut out);
+        assert!(d.meta.locks().get(id).is_some(), "installed with the row");
+        // A re-send is a re-send.
         d.advance(100);
         let now = d.clk();
         d.core
-            .lock_install_moved(now, 7, vec![wire], &[(id, 2_900)], &d.meta);
-        assert!(d.meta.locks().get(id).is_some(), "installed with the row");
+            .lock_install_moved(now, 7, vec![wire], &[(id, 2_900)], None, &d.meta);
+        assert_eq!(d.core.stats.lock_moved, 1);
         assert!(d.core.deleg_leaving_grants(d.clk(), 7, &d.meta).is_empty());
     }
 
@@ -33757,6 +33812,8 @@ mod locks {
         handoff_to(&mut d, req, vec![wire], vec![(id, 3_000)]);
         assert!(d.meta.locks().get(id).is_some(), "the first handoff");
         d.advance(100);
+        let before = d.clk().honour;
+        d.advance(10);
         let back = recall_answer(&mut d, dir, OpId(5));
         assert_eq!(
             back.grants.iter().map(|w| w.id).collect::<Vec<_>>(),
@@ -33781,9 +33838,25 @@ mod locks {
         )
         .unwrap();
         d.advance(100);
+        // Review S4: the answer to a renewal sent before the hand-back (late,
+        // or computed before the root had it) carries the copy from before.
         let now = d.clk();
         d.core
-            .lock_install_moved(now, 7, vec![wire], &[(id, 2_800)], &d.meta);
+            .lock_install_moved(now, 7, vec![wire], &[(id, 2_800)], Some(before), &d.meta);
+        assert!(
+            d.meta.locks().get(id).is_none(),
+            "a stale answer installed it"
+        );
+        assert_eq!(d.core.stats.lock_handoff_stale, 1);
+        let now = d.clk();
+        d.core.lock_install_moved(
+            now,
+            7,
+            vec![wire],
+            &[(id, 2_800)],
+            Some(now.honour),
+            &d.meta,
+        );
         assert!(
             d.meta.locks().get(id).is_some(),
             "the second handoff was skipped as a re-send"
@@ -33958,6 +34031,7 @@ mod locks {
             carry: carry.map(|l| (id, l)).into_iter().collect(),
             floor: Position::ZERO,
             barrier: 0,
+            rows: Vec::new(),
         }
     }
 
@@ -34064,7 +34138,7 @@ mod locks {
         assert_eq!(first, t1.0 + (until - t1.0) + margin);
         d.now = r.now;
         d.core
-            .lock_install_moved(d.clk(), 7, grants2, &carry2, &d.meta);
+            .lock_install_moved(d.clk(), 7, grants2, &carry2, None, &d.meta);
         assert_eq!(record_end(&d, g), first, "installed twice");
         assert_eq!(d.core.stats.lock_moved_carried, 1);
         // A copy that is gone from the root's table and from its
@@ -70200,6 +70274,7 @@ mod step9_one_stream_per_node {
                     carry: vec![(id, left)],
                     floor: Default::default(),
                     barrier: 0,
+                    rows: Vec::new(),
                 },
                 leaving: false,
                 seal: false,

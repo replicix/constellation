@@ -520,6 +520,14 @@ pub struct LockHandback {
     /// (`Core::lock_install_moved`). A grant not listed is restamped.
     /// Durations only: no clock's absolute crosses nodes.
     pub carry: Vec<(GrantId, u64)>,
+    /// Plan 46 M1.2 step 10: the stream index of the release row that
+    /// handed each grant of `grants` back (the cut for a release without
+    /// one). A stream that releases a subtree, is granted it again and
+    /// releases it again hands the same grant back under a later row; a
+    /// re-sent copy of the earlier note repeats the earlier row, and the
+    /// root installs each grant once per row (`Core::lock_install_returned`).
+    #[serde(default)]
+    pub rows: Vec<(GrantId, u64)>,
     pub floor: Position,
     /// The latest outwait barrier under the subtree that no cut has
     /// settled yet (the delegate's clock; 0: none): the root's grants
