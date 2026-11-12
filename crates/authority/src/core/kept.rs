@@ -891,7 +891,15 @@ impl Core {
                             continue;
                         }
                     }
-                    Some(_) if first > 0 && replica.row_in_log(*e, first - 1) => {}
+                    // (The log carries the union an earlier claim inherited
+                    // through `carried_through` under the `TailOf` identity,
+                    // which `row_in_log` does not show either: a seq between
+                    // two copies that lies within it is covered, as a first
+                    // row's predecessor is.)
+                    Some(_)
+                        if first > 0
+                            && (replica.row_in_log(*e, first - 1)
+                                || first - 1 <= carried_through(*e)) => {}
                     Some(_) => {
                         gap = true;
                         past_gap += 1;

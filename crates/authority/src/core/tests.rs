@@ -66575,6 +66575,59 @@ mod kept_fetch {
         assert_eq!(s1_gap(true), (0, 0, true));
     }
 
+    /// The tenure inherited a kept union of epoch 1 (carried through its
+    /// fourth transaction, in the log under the `TailOf` identity, which
+    /// `row_in_log` does not show). The member that answers kept the
+    /// transactions but the second one: a seq between two copies that lies
+    /// within the union is covered by the log, not a gap in what the sources
+    /// cover (before: the merge counted the copies past it as past a gap, a
+    /// debug build panicked in `kept_install`: `drop-held-chain-backed` seeds
+    /// 9, 22, 89 and 175, `metered-shared+links` 44 and 101). With
+    /// `through_txs` below the hole the seq is not covered. Returns the rows
+    /// carried and the rows counted past a gap.
+    fn hole_in_union(through_txs: usize) -> (u64, u64) {
+        let txs = named_rows("u", 4);
+        let mut lease = lease_of(6, 3, 0);
+        lease.inherited_tail = Some(Box::new(InheritedTail {
+            epoch: 1,
+            config_version: 1,
+            members: vec![2, 6],
+            through: txs[through_txs - 1].last,
+            kept: true,
+            holder: 1,
+        }));
+        let (mut h, out) = start(5, &lease, &[2, 5, 6], 1, false);
+        let a = asks(&out);
+        let _ = win(&mut h, out, &lease);
+        let mut copies = txs.clone();
+        copies.remove(1);
+        let out = answer_all(&mut h, &a, 2, 1, copies, vec![vec![2, 5, 6]]);
+        let out = answer_all(&mut h, &a, 6, 1, Vec::new(), Vec::new())
+            .into_iter()
+            .chain(out)
+            .collect::<Vec<_>>();
+        let _ = win(&mut h, out, &lease);
+        (h.core.stats.kept_rows_carried, h.core.stats.kept_past_gap)
+    }
+
+    #[test]
+    fn a_seq_between_two_copies_within_the_carried_union_is_not_a_gap() {
+        assert_eq!(hole_in_union(4), (3, 0));
+    }
+
+    /// A seq the union does not reach and no copy covers is a gap still: the
+    /// assertion stands in a debug build; a release build carries the copies
+    /// before it and counts the others past it.
+    #[test]
+    fn a_seq_between_two_copies_past_the_carried_union_is_still_a_gap() {
+        let r = std::panic::catch_unwind(|| hole_in_union(1));
+        if cfg!(debug_assertions) {
+            assert!(r.is_err(), "the assertion fires: {r:?}");
+        } else {
+            assert_eq!(r.unwrap(), (1, 2));
+        }
+    }
+
     /// Another claimant won the lease while this one collected the kept
     /// rows: its takeover marker, at the epoch this claim would write, is in
     /// the tail to head. The log has moved on from the tenure's epochs, so

@@ -5946,6 +5946,48 @@ fn regression_a_claim_racing_a_rival_during_its_kept_fetch_finds_no_gap() {
     }
 }
 
+/// Kept-rows installs over a seq between two copies (ADR-51):
+/// `drop-held-chain-backed` seeds 9, 22, 89 and 175, `metered-shared+links`
+/// 44 and 101 hit `kept_install`'s "a kept copy lies past a gap" assertion in
+/// a debug build. A claim of a later epoch inherited a tenure that had
+/// inherited a kept union of epoch 1 (carried through N, in the log under the
+/// `TailOf` identity, which `row_in_log` does not show once the log is at
+/// epoch 2); the members' copies of epoch 1 have a hole at a seq below N (a
+/// row the log carried natively when the union was formed: a union is
+/// contiguous across the log's rows only), and the merge counted the copies
+/// past the hole as past a gap. Not a gap: the seq is within the union.
+/// Seeds 9, 22 and 175 now end in the benign `tail_done_skipped` overlap that
+/// strict identity fails on (the rows the union carried are in the log
+/// already), so they are not pinned here; 89, 44 and 101 are clean. Fails
+/// before: the assertion in a debug build; in release `kept_past_gap` is
+/// above 0.
+#[test]
+fn regression_a_seq_between_kept_copies_within_the_carried_union_is_no_gap() {
+    for (seed, cfg, alias) in [
+        (
+            89u64,
+            drop_held_chain_backed_config(),
+            "drop-held-chain-backed",
+        ),
+        (
+            44,
+            strict(metered_shared_config(), "links"),
+            "metered-shared+links",
+        ),
+        (
+            101,
+            strict(metered_shared_config(), "links"),
+            "metered-shared+links",
+        ),
+    ] {
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
+        });
+        let past: u64 = r.stats.values().map(|s| s.kept_past_gap).sum();
+        assert_eq!(past, 0, "seed {seed}: kept copies were counted past a gap");
+    }
+}
+
 /// `backup-crash-slow+commit` seed 64 (`member_copies_drained`): a holder
 /// that claimed its own lease (epoch 2) after its backups refused its epoch-1
 /// tail kept the member copy of two unshipped `Archive` rows of epoch 1 for
