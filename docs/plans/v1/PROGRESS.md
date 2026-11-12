@@ -69646,8 +69646,8 @@ model's chunk 14 (a deposed root keeps its grant) was already on main. ADR numbe
   - **SHOULD/NIT**: S1 the self-inbox follows `sync_cfg_spans` (and the hooks' idempotence is stated); S2 the claim cut with rows
     is pinned (`a_claim_ends_the_own_stream_at_what_the_root_assigned`; the gate-with-a-backup-tail case is step 12's, in
     `delegations.md`); S3 `restarted_holder` is cleared when the claim lands or no stream is left
-    (`a_restarted_holders_wait_for_its_claim_ends_with_the_claim`); S4 `deadlines.rs` entries `own_first_op_wait` (`F + k`, D16)
-    and `own_cross_release_wait` (`5000 + F + 2k`, D17), `root_own_released_for_cross` split own client / forwarded, the root
+    (`a_restarted_holders_wait_for_its_claim_ends_with_the_claim`); S4 `deadlines.rs` entries `own_first_op_wait` (`F + k`, D17)
+    and `own_cross_release_wait` (`5000 + F + 2k`, D18), `root_own_released_for_cross` split own client / forwarded, the root
     path's archive waits counted apart (`archive_waits_elsewhere`), the partition phase of `root-own-sticky`, spec test 13, the
     `far-root-writes-cross` config (`cross_ratio` 0.1); S5 the release-drain rule is judged for the lease holder too (against what
     it journaled of the stream); S6 the answer-time classifier's widening is documented and cannot reach a root row; S7 the
