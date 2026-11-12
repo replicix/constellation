@@ -1466,7 +1466,7 @@ fn root_takes_own_grant(a: &Client, a_id: u64) -> Result<Vec<String>> {
 /// forwarded to `a` and final.
 pub fn root_own_sticky(_seed: u64) -> Result<()> {
     const NAME: &str = "root-own-sticky";
-    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b"], ROOT_OWN_ENV, 0)?;
+    let (_env, root, mut clients, _) = cluster(NAME, &["a", "b"], ROOT_OWN_ENV, 0)?;
     let result = (|| -> Result<()> {
         let a_id = node_id(&clients[0])?;
         std::fs::create_dir(clients[0].mnt.join("r"))?;
@@ -1505,8 +1505,100 @@ pub fn root_own_sticky(_seed: u64) -> Result<()> {
                 > 0,
             "a answered nothing in its own stream"
         );
-        // Deposed but alive: stopped past the TTL, b claims the lease.
         let b_id = node_id(&clients[1])?;
+        // A partition phase (fence C9.2, the inbox rule): b has no P2P path
+        // to the root, and its writes into `/r` go through the inbox. The root
+        // is the holder of `/r`: it refuses a rid that was ever in an inbox
+        // in its own stream (`EROFS`, final), never runs it. A write that
+        // came back `EROFS` left no file; one that went through is on a.
+        // Writes after the heal are forwarded routed by the grant and final.
+        std::fs::write(
+            deny_path(root.path(), &clients[0].name),
+            format!("{b_id}\n"),
+        )?;
+        std::fs::write(
+            deny_path(root.path(), &clients[1].name),
+            format!("{a_id}\n"),
+        )?;
+        let refusals_before = n(&deleg_of(&clients[0])?["root_own"], "inbox_refusals");
+        let (mut erofs, mut through) = (Vec::new(), Vec::new());
+        {
+            let b_mnt = clients[1].mnt.clone();
+            let writer = std::thread::spawn(move || -> Vec<(String, std::io::Result<()>)> {
+                (0..4)
+                    .map(|i| {
+                        let name = format!("r/b-cut-{i}");
+                        let r = std::fs::write(b_mnt.join(&name), name.as_bytes());
+                        (name, r)
+                    })
+                    .collect()
+            });
+            // (The writer is given time to meet the cut and the inbox's poll.)
+            let t = Instant::now();
+            while !writer.is_finished() && t.elapsed() < Duration::from_secs(45) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let _ = std::fs::remove_file(deny_path(root.path(), &clients[0].name));
+            let _ = std::fs::remove_file(deny_path(root.path(), &clients[1].name));
+            for (name, r) in writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("b's partition writer panicked"))?
+            {
+                match r {
+                    Ok(()) => through.push(name),
+                    Err(e) if e.raw_os_error() == Some(libc::EROFS) => erofs.push(name),
+                    Err(e) => anyhow::bail!("b's write of {name} in the cut failed with {e}"),
+                }
+            }
+        }
+        for name in &through {
+            eventually("a reads what went through", Duration::from_secs(60), || {
+                anyhow::ensure!(std::fs::read(clients[0].mnt.join(name))? == name.as_bytes());
+                Ok(())
+            })?;
+        }
+        for name in &erofs {
+            anyhow::ensure!(
+                !clients[0].mnt.join(name).exists(),
+                "{name} came back EROFS and exists"
+            );
+        }
+        let refusals = n(&deleg_of(&clients[0])?["root_own"], "inbox_refusals") - refusals_before;
+        let mut healed = Vec::new();
+        eventually(
+            "b writes /r after the heal",
+            Duration::from_secs(60),
+            || {
+                for i in 0..5 {
+                    let name = format!("r/b-heal-{i}");
+                    if !healed.contains(&name) {
+                        std::fs::write(clients[1].mnt.join(&name), name.as_bytes())?;
+                        healed.push(name);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        eventually(
+            "a reads b's rows after the heal",
+            Duration::from_secs(60),
+            || {
+                for name in &healed {
+                    anyhow::ensure!(std::fs::read(clients[0].mnt.join(name))? == name.as_bytes());
+                }
+                Ok(())
+            },
+        )?;
+        eprintln!(
+            "    {NAME}: partition phase: b's inbox writes into /r: {} through, {} EROFS; the \
+             root refused {refusals} in its stream; {} writes after the heal, all final",
+            through.len(),
+            erofs.len(),
+            healed.len()
+        );
+        acked.extend(through);
+        acked.extend(healed);
+        // Deposed but alive: stopped past the TTL, b claims the lease.
         clients[0].pause().context("SIGSTOP a")?;
         let stopped = Instant::now();
         // b wants the lease (a write in `/`, which only the root sequences):
