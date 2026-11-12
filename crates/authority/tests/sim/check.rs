@@ -440,3 +440,94 @@ pub fn no_late_landing(
     }
     (late.len(), late)
 }
+
+/// ADR-59 part B (B0), `inode_numbers_unique`: no two creating records of the
+/// log (a `Create`, `Mkdir`, `Symlink` or `Mknod`) carry one inode number.
+/// `segments` are the applied (unfenced) segments' records, by seq. Strict:
+/// an allocator that hands one number to two creates (295) is a defect of its
+/// own, whatever else it explains. The failure names the rid each create
+/// completed under (the `Completed` of its transaction), or the record place.
+pub fn inode_numbers_unique<'a>(
+    segments: impl IntoIterator<Item = (u64, &'a [LogRecord])>,
+) -> Result<(), String> {
+    let mut seen: HashMap<u64, (u64, usize)> = HashMap::new();
+    let mut all: Vec<(u64, &[LogRecord])> = Vec::new();
+    for (seq, records) in segments {
+        all.push((seq, records));
+    }
+    let rid_near = |seq: u64, idx: usize| -> String {
+        let records = all.iter().find(|(s, _)| *s == seq).map(|(_, r)| *r);
+        let Some(records) = records else {
+            return format!("segment {seq} #{idx}");
+        };
+        // The create's `Completed` follows it in the transaction (an adopted
+        // tail's is just before it): the nearest one.
+        let found = (idx..records.len())
+            .chain((0..idx).rev())
+            .find_map(|i| match &records[i] {
+                LogRecord::Completed { rid } => Some(*rid),
+                _ => None,
+            });
+        match found {
+            Some(rid) => format!("rid {rid:?} (segment {seq} #{idx})"),
+            None => format!("segment {seq} #{idx}"),
+        }
+    };
+    for (seq, records) in &all {
+        for (idx, rec) in records.iter().enumerate() {
+            let ino = match rec {
+                LogRecord::Create { ino, .. }
+                | LogRecord::Mkdir { ino, .. }
+                | LogRecord::Symlink { ino, .. }
+                | LogRecord::Mknod { ino, .. } => *ino,
+                _ => continue,
+            };
+            if let Some((s0, i0)) = seen.insert(ino, (*seq, idx)) {
+                return Err(format!(
+                    "inode_numbers_unique: inode {ino:#x} was created twice: by {} and by {}",
+                    rid_near(s0, i0),
+                    rid_near(*seq, idx)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod inode_unique_tests {
+    use super::*;
+
+    fn create(ino: u64, name: &str) -> LogRecord {
+        LogRecord::Create {
+            parent: 1,
+            name: name.into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 0,
+        }
+    }
+    fn done(seq: u64) -> LogRecord {
+        LogRecord::Completed {
+            rid: Rid {
+                node: 3,
+                incarnation: 1,
+                seq,
+            },
+        }
+    }
+
+    /// B0 fail-before (295's shape): two creates of one number fail the run,
+    /// both rids named; distinct numbers pass.
+    #[test]
+    fn two_creates_of_one_inode_number_fail() {
+        let ok = [create(10, "a"), done(1), create(11, "b"), done(2)];
+        assert!(inode_numbers_unique([(1u64, &ok[..])]).is_ok());
+        let first = [create(10, "a"), done(14)];
+        let second = [create(10, "b"), done(17)];
+        let err = inode_numbers_unique([(1u64, &first[..]), (2u64, &second[..])]).unwrap_err();
+        assert!(err.contains("seq: 14") && err.contains("seq: 17"), "{err}");
+    }
+}
