@@ -923,7 +923,8 @@ following it
 ([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)).
 A singleton (its roster lists no write-eligible peer) answers from its disk;
 any root with a write-eligible peer, near or far, linked or not, mounted or
-not, answers under a group, a sticky non-stealable grant, or the archive
+not, answers under a group, a sticky non-stealable grant (its own, in the
+subtrees it dominates: [ADR-55](DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)), or the archive
 ([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)). `Backup` and `S3` are unchanged. This text changes with
 the code.*
 
@@ -1134,7 +1135,12 @@ lease and one log
   subtree instead, which placement never recalls: it ends by its holder's
   release or the operator
   ([ADR-54](DECISIONS.md#adr-54-placement-grants-a-far-dominant-writer-a-sticky-subtree-and-recalls-placed-grants-only-after-a-long-dwell),
-  plan 46 §5.3).
+  plan 46 §5.3). The root itself is a candidate by the same rule while its own
+  ops commit by the archive (a write-eligible peer, no group): it takes a
+  sticky grant on the topmost subtree it dominates, never `/`, becomes the
+  holder of its own stream and answers its ops there `Final` at local speed;
+  a deposed root that is alive keeps the grant and streams it to the next root
+  ([ADR-55](DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)).
 - **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
   clock stamps (a peer's stamp more than `CONSTELLATION_HLC_SKEW_TOLERANCE_S`
   ahead is applied but not followed by the clock) merged by `max` and
@@ -1913,7 +1919,7 @@ per-topology table.*
 | Topology | Policy | Added acknowledgement latency | Holder crashes and returns before a takeover | Holder away past a takeover | Failover |
 |---|---|---|---|---|---|
 | Single node | `Local` | none | nothing lost | n/a | n/a |
-| Only distant peers (no backup in budget) | the archive ([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)) | one S3 commit per write, the holder's own included (until plan 46 M1.3 step 9) | nothing lost | nothing lost | lease TTL (60 s) + margin |
+| Only distant peers (no backup in budget) | the archive ([ADR-50](DECISIONS.md#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)); `Final` in the holder's own sticky subtrees ([ADR-55](DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)) | one S3 commit per write in `/` and in other nodes' subtrees; none in the subtrees the holder dominates, after one commit per grant | nothing lost | nothing lost | lease TTL (60 s) + margin; the root's own sticky subtrees block if it dies for good, until it returns or `repair abandon` |
 | A peer within the RTT budget | `Backup` (Layer B) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS: ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 ([RESULTS](../../bench/remote/RESULTS.md#failover-time)) |
 | `fs create --ack-policy s3` | `S3` (Layer C) | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS with P2P; the TTL without |
 

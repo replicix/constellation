@@ -2399,7 +2399,9 @@ See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lo
 stages of [plan 46](../plans/v1/wip/46-committed-or-final.md). Each stage
 amends this record with what landed.
 D3 (a root answers alone only as a singleton) is implemented by
-[ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer).
+[ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer);
+D3(b), the root's own sticky grants, is
+[ADR-55](#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant).
 
 **Context**: six weeks after ADR-33, the acknowledgement and
 ordering-node-change area had produced 55 bug rows (41 integrity), 239
@@ -3960,10 +3962,12 @@ quarantine and abandon audience, status) asks the object.
   plus delivery, and ends at the joiner's first message to the root.
 - **Interim cost (Q1)**: a root with any registered write-eligible peer,
   unmounted ones included, waits for the archive for all its own ops, not
-  only those in `/`, until plan 46 M1.3 step 9 lets it answer its own
-  subtrees by delegation. The remedy for a node that will not be mounted again
-  is `leave`. The FUSE fast path answers alone only from a singleton's
-  `lone_ok`, so a delegating root takes its own ops through the core meanwhile.
+  only those in `/`, unless [ADR-55](#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)
+  (plan 46 M1.3 step 9) lets it answer its own subtrees by delegation: done
+  for the subtrees it dominates; `/` and other nodes' subtrees keep the wait.
+  The remedy for a node that will not be mounted again is `leave`. The FUSE
+  fast path answers alone only from a singleton's `lone_ok`, so a delegating
+  root takes its own ops through the core meanwhile.
 - No roster freshness bound (Q2): a root cut from S3 cannot renew its lease,
   and the lease's TTL bounds that case; a bound would cost an offline single
   node its local answers.
@@ -4260,6 +4264,11 @@ it pins nothing here. The fail-before configuration is `singleton-stall-takeover
 (a lone root stalled at its next own `Submit` across a joining peer's claim;
 `+nohold` is `Config::stale_lease_hold_off`, the parent's behavior, and must
 fail I1).
+
+A `Final` answer of the root's own sticky grant
+([ADR-55](#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant))
+is not a singleton answer: it depends on no lease (the grant is non-stealable
+and survives a deposition), so the stale-lease hold does not apply to it.
 
 See: `crates/authority/src/core/backup.rs` (`emission_hold_of`),
 `crates/authority/src/core/readindex.rs` (`park_stale_lease`,
@@ -4788,3 +4797,100 @@ pin part A.
 See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
 `crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),
 [write-path hygiene](../reference/features/write-path-hygiene.md).
+
+## ADR-55: A root with peers and no group writes the subtrees it dominates under its own sticky grant
+
+**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.3 step 9, D3(b);
+the order 7, 9, 8). The numbering follows the landing order (ADR-54 is step 7,
+ADR-56 step 8).
+
+**Context**: after [ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer)
+a root with any write-eligible peer and no backup acknowledges its own ops at the
+archive (an S3 PUT each). The root that writes most of the data paid that on
+every op; its own subtrees are exactly the ones a sticky grant makes local.
+
+**Decision**:
+
+- **Placement proposes the root.** The walk that proposes a sticky subtree to a
+  far dominant writer also considers the root itself, by the same dominance
+  rule, and only while the root's own ops commit by the archive
+  (`Core::root_commits_by_archive`: it holds the lease, its roster lists a
+  write-eligible peer, the lease lists no backup, no epoch or takeover gate is
+  open, the ack policy is not `s3`). Never `/` (R-I1: `delegate_dir` refuses any
+  grant on the root directory, whoever asks); never beside a designation; not
+  inside the quarantine of a release the root made itself. An operator's
+  `delegate` never names the root.
+- **The root is the holder of its own stream.** The grant is the usual
+  `DelegateNode { node: root, gen, [(dir, Sticky)] }`, committed by the archive.
+  The root executes under it once the archive carries the record (R-I3): its
+  first op in the subtree parks (`own_grant_pending`), the engine's fast path
+  does not admit under it, and the next ops are answered `Final` at local speed
+  (`root_own_answers`). The root's own path never executes a key of its live own
+  stream and never refuses one (R-I4): an op the delegate executor did not take
+  is held (`Held`, `root_own_holds`). Forwards are fenced as at any holder
+  (ADR-47 rule 1, no exception for the lease holder).
+- **Messages to itself are delivered inline.** The holder side of the stream
+  and the root side are one node: every message the core would send to its own
+  node is delivered in the same step (`Core::handle`, `self_sends`); no driver
+  ever sees one (a debug assertion in both). The root's append of its own
+  stream is not an append: the holder's row is in the journal already, with its
+  origin `(gen, idx)`, and ships in the root's segment; only the root's cursor
+  advances. The log's index of the stream stays the log's (it rises when a
+  segment that carries the row is applied), which is where a re-stream after a
+  deposition starts from. `Meta::apply_delegate_tx` also notes the index of a
+  `Refused` row it skips because the rid is completed here (the cursor would
+  have stalled at it).
+- **A deposed root keeps the grant.** The stream's rows are holder rows
+  (`gen != 0`, not appended): the deposition strands the root's rows of older
+  epochs and leaves them (R-I5); the node goes on as an ordinary holder and
+  streams them to the next root (`root_own_resumed`). A root that is dead blocks
+  its subtrees (`EROFS`, `EXDEV` across their boundary) until it returns or the
+  operator runs `repair abandon`; that is D3's accepted cost.
+- **Restart and claim.** A process that restarted holding a stream, and claims
+  the lease again, does not execute as the holder before the claim (the lease
+  object still naming it re-adopts it at the first forward); the claim ends its
+  own stream at what it assigned. A grant record the archive has not carried is
+  not honoured, also after a deposition. The root's release of its own stream
+  is complete when its row has shipped; until then the holder state stays, to
+  stream the row to the next root. The loop-back is for the delegate family
+  (stream, acknowledgement, renewal, release request, seal, recall, read-grant
+  void); lock messages keep the driver's path.
+- **The root releases its own grant only as its holder** (R-I6): after the long
+  dwell without its share or rate (`place_root_own_released`), at an unmount or
+  suspension (step 7's release), by `undelegate`, `repair abandon`, the epoch's
+  recall or Leave. Never by the placement as root, never by a TTL.
+- **Cross-subtree ops (Q3).** An op across the boundary of the root's own sticky
+  subtree releases the grant, as the holder, and runs on the root's keys after
+  the release row, instead of `EXDEV` (`root_own_released_for_cross`). Another
+  node's non-stealable boundary stays `EXDEV`.
+- **Inbox-only writers (Q4).** A rid enqueued while its requester had no P2P path
+  to the root is refused `EROFS` in the stream of a non-stealable grant (fence
+  C9), the root's own included; rids after the heal are forwarded routed by the
+  grant and run. Counted (`holder_inbox_refusals`). If the count is non-zero
+  outside partitions in the harness smoke, the alternative (the root releases
+  its grant and runs the op) is implemented; no wire or record change.
+- **Settings.** `CONSTELLATION_DELEGATION_ROOT_STICKY` (on whenever sticky
+  placement is; `off` restores the archive wait). Test-only faults:
+  `root_sticky_on_slash`, `deposed_root_strands_own_stream`,
+  `root_executes_under_own_grant`.
+
+**Consequences**: the root's own ops in its subtrees run at local speed after one
+archive wait per grant (the record); ops in `/` and in other nodes' subtrees
+still wait for the archive; a root's death blocks its own sticky subtrees (they
+are no longer rolled back as replays); inbox-only writers into them get `EROFS`;
+cross-subtree ops at the root's boundary release the grant first. ADR-50's
+interim cost is gone for the subtrees the root writes. A `Final` answer of the
+root's own grant is not a singleton answer (ADR-52): it depends on no lease.
+
+**Rejected**: a `Final` class for root rows in a subtree without a stream
+(rolled back at a deposition: it breaks I5); first-write grants (the placement's
+dominance rule decides); a root-side TTL on its own grant (the grant would be
+stealable).
+
+**May revert**: yes, by `CONSTELLATION_DELEGATION_ROOT_STICKY=off`.
+
+See: `crates/authority/src/core/delegate.rs` (`delegate_dir_from`,
+`own_grant_pending`, `holder_root`, `own_sticky_release`, `deleg_recall_plan`),
+`crates/authority/src/core/placement.rs` (`place_kind_for_root`),
+`crates/authority/src/core/mod.rs` (`handle`, `take_self_sends`),
+`crates/model` chunk 14.

@@ -1078,6 +1078,23 @@ freshness bound), Q3 (a live foreign generation ends the singleton), Q4 (the
 ADR-41 amendment lands in step 10), Q5 (ADR-50) and Q6 (read-only nodes do
 not end the singleton) are accepted as recommended.
 
+### M1.3 step 9: the root's own sticky grants (the maintainer, 2026-11-11)
+
+Step 9 (D3(b); ADR-55) lands after step 7 and before step 8 (the order 7, 9,
+8). The root is a candidate of placement's walk by the same dominance rule,
+while its own ops commit by the archive (a write-eligible peer, no backup),
+never on `/`; it becomes the holder of its own stream, answers its ops there
+`Final`, delivers its messages to itself in the same step, keeps the grant
+across its own deposition and streams it to the next root. Step 10's interim
+cost (Q1) is gone for the subtrees the root writes; `/` and other nodes'
+subtrees keep the archive wait. Decisions taken as recommended: the root's own
+grants default on with the unmount release (Q2), an op across the root's own
+boundary releases the grant instead of `EXDEV` (Q3), inbox-only writers into
+it get `EROFS` and are counted (Q4), a root that gains a backup keeps its
+grants until they go idle (Q5), `constellation delegate` never names the root
+(Q6), the model's chunk 14 came first (Q7), and a dead root blocks its own
+subtrees until `abandon` (Q8).
+
 ### M1.0 answers, chunk C11 (the maintainer, 2026-11-06)
 
 Three decisions the combined topologies and their review forced:
