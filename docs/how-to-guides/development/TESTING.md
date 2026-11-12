@@ -1071,8 +1071,9 @@ pausing, since a stopped daemon cannot answer it.
 Plan 43 C7b (commit 9): two scenarios for the lease's observation rule on
 real daemons (`crates/harness/src/scenarios/leaseclaim.rs`; the 20 s lease
 TTL of the M9 cluster). `lease-claimant-ahead`: three nodes, no backup,
-node b's clock 90 s ahead (`load::set_scenario_clock_offset`, so it needs no
-profile), a and b writing under the ledger (b forwards to a): for 1.5 TTL a
+node b's clock 90 s ahead (`load::set_scenario_clock_offset`), a and b writing under the ledger (b forwards to a; b and c run
+`CONSTELLATION_PROFILE_LEASES=forward-only`, so a forward that host load
+makes late does not end in b asking a for the lease, which a hands over): for 1.5 TTL a
 keeps its lease at one epoch and b and c never hold it (before C7b, once b
 read the lease it saw an expiry 90 s in its past and claimed); then a is killed, and a claim comes not earlier than half a TTL
 after the kill (a renews every half TTL, and a claimant has to watch the key
@@ -1143,7 +1144,9 @@ stranded-branch recovery:
 Phase-4c scenarios prove permanent leave (and that unmount alone is
 not leave):
 
-- `node-leave` mounts three write-eligible peers. With C merely
+- `node-leave` mounts three write-eligible peers (the admin leave runs
+  on whichever of A and B holds the lease after the cut, the root alone
+  ending a retired node's delegations). With C merely
   **unmounted**, cutting S3 on A+B must **not** open a continuation
   epoch (C still counts on the roster). Admin `leave --node-id C`
   from A then shrinks the roster; after a refresh, A+B **can** open an
@@ -2299,9 +2302,11 @@ relay of its own so requests can be attributed per role):
     reconfiguration (lease PUTs beyond the renewals) and the write
     latency before and during it.
   - `no-peer-in-budget`: `CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`: the
-    local policy, no backup or candidate, the fast path open, nothing
-    waited; the holder killed, the second node's write waits for the
-    lease to expire (seconds; no seal, no fast takeover).
+    local policy, no backup or candidate; the roster lists peers, so the
+    fast path is gated and answers come from the archive (ADR-50), and
+    the only lease CASes are the singleton flag's; the holder killed, the
+    second node's write waits for the lease to expire (seconds; no seal,
+    no fast takeover).
   - `ack-s3-failover`: a filesystem created with `ack_policy = s3`
     (`CONSTELLATION_ACK=s3` in `fs create`'s environment): the fast
     path is gated and every acknowledgement waited for the log (a
@@ -4468,7 +4473,8 @@ a shell), in `crates/harness/src/scenarios/lifecycle.rs`:
   locally; resumed, it catches up (the renamed/deleted names gone), rejoins
   P2P and writes again, visible everywhere.
 - `lifecycle-metered-uploads`: two nodes, the holder with
-  `CONSTELLATION_PROFILE_UPLOADS=unmetered-only`; after
+  `CONSTELLATION_PROFILE_UPLOADS=unmetered-only` and b already its backup
+  (before that its closes wait for the archive and upload); after
   `NetworkChanged{metered: true}`, eight plain closes upload no chunk (the
   status `s3.by_area` `PUT chunks` counter stands still, `writeback.
   pending_uploads` ≥ 8, the peer sees none of the content), an `fsync`'d

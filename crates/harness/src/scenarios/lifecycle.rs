@@ -412,6 +412,11 @@ pub fn lifecycle_resume_rejoin(seed: u64) -> Result<()> {
 
 /// The node's chunk PUTs so far (its `s3.by_area` `PUT chunks…` rows).
 fn chunk_puts(c: &Client) -> Result<u64> {
+    Ok(chunk_put_areas(c)?.iter().map(|(_, n)| n).sum())
+}
+
+/// The rows [`chunk_puts`] adds up.
+fn chunk_put_areas(c: &Client) -> Result<Vec<(String, u64)>> {
     let status = c.control_status()?;
     let areas = status["s3"]["by_area"]
         .as_object()
@@ -419,8 +424,8 @@ fn chunk_puts(c: &Client) -> Result<u64> {
     Ok(areas
         .iter()
         .filter(|(k, _)| k.starts_with("PUT chunk"))
-        .map(|(_, v)| v.as_u64().unwrap_or(0))
-        .sum())
+        .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0)))
+        .collect())
 }
 
 pub fn lifecycle_metered_uploads(seed: u64) -> Result<()> {
@@ -439,6 +444,19 @@ pub fn lifecycle_metered_uploads(seed: u64) -> Result<()> {
             "profile not applied: {}",
             status["lifecycle"]
         );
+        // The closes below are acknowledged by the backup's stream. While
+        // b is on the roster and not yet a backup (its first seconds), a
+        // close waits for the archive, which ships a record only once its
+        // chunks are up, so that wait uploads them whatever the network.
+        eventually("b is a's backup", Duration::from_secs(30), || {
+            let ack = super::m9::ack_of(a)?;
+            anyhow::ensure!(
+                ack["backups"].as_array().is_some_and(|b| !b.is_empty())
+                    && ack["candidate"].is_null(),
+                "{ack}"
+            );
+            Ok(())
+        })?;
         let report = lifecycle(
             a,
             json!({ "NetworkChanged": { "reachable": true, "metered": true } }),
@@ -451,6 +469,7 @@ pub fn lifecycle_metered_uploads(seed: u64) -> Result<()> {
         // Let a round that started before the event finish.
         std::thread::sleep(Duration::from_secs(1));
         let puts_before = chunk_puts(a)?;
+        let areas_before = chunk_put_areas(a)?;
         // Plain closes: journaled locally, their chunks wait.
         let mut files = Vec::new();
         for i in 0..8 {
@@ -472,9 +491,18 @@ pub fn lifecycle_metered_uploads(seed: u64) -> Result<()> {
              deferrals {}",
             held["lifecycle"]["upload_deferrals"]
         );
+        if puts_held != puts_before {
+            eprintln!(
+                "    {NAME}: writeback {} lifecycle {}",
+                held["writeback"], held["lifecycle"]
+            );
+        }
         anyhow::ensure!(
             puts_held == puts_before,
-            "chunk uploads ran on a metered network ({puts_before} -> {puts_held})"
+            "chunk uploads ran on a metered network ({puts_before} -> {puts_held}): \
+             {areas_before:?} -> {:?}; a's acknowledgement path: {}",
+            chunk_put_areas(a)?,
+            super::m9::ack_of(a)?
         );
         anyhow::ensure!(
             pending >= 8,

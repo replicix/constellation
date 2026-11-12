@@ -427,6 +427,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "singleton_bumps": {
+          "description": "The part of `reconfig_cas` that only moved the singleton flag (the\nbackup set unchanged; ADR-50).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "stale_liveness_refusals": {
           "format": "uint64",
           "minimum": 0,
@@ -547,6 +553,7 @@
         "backups_added",
         "backups_removed",
         "reconfig_cas",
+        "singleton_bumps",
         "backup_appends",
         "backup_acks",
         "backup_ack_timeouts",

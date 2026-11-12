@@ -2476,6 +2476,9 @@ pub struct AckStatus {
     pub backups_added: u64,
     pub backups_removed: u64,
     pub reconfig_cas: u64,
+    /// The part of `reconfig_cas` that only moved the singleton flag (the
+    /// backup set unchanged; ADR-50).
+    pub singleton_bumps: u64,
     pub backup_appends: u64,
     pub backup_acks: u64,
     pub backup_ack_timeouts: u64,

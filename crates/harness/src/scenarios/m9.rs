@@ -498,8 +498,11 @@ pub fn backup_departs(_seed: u64) -> Result<()> {
 }
 
 /// No peer within the RTT budget (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`):
-/// today's behaviour — local acknowledgements, no backup, no seal, and a
-/// dead holder is replaced only when its lease expires.
+/// no backup, no seal, and a dead holder is replaced only when its lease
+/// expires. The budget no longer decides who answers alone (ADR-50): the
+/// roster lists B and C, so A's acknowledgements wait for the archive
+/// (the fast path stays gated) and the one CAS A spends on its lease is
+/// the singleton flag's bump, never a backup's listing.
 pub fn no_peer_in_budget(_seed: u64) -> Result<()> {
     const NAME: &str = "no-peer-in-budget";
     let (_env, _root, mut clients, _) = cluster(
@@ -531,11 +534,16 @@ pub fn no_peer_in_budget(_seed: u64) -> Result<()> {
             a["backups"].as_array().is_some_and(|b| b.is_empty()) && a["candidate"].is_null(),
             "A has a backup or candidate with a 0 ms budget: {a}"
         );
+        // Every CAS on the lease moved the singleton flag (the node was
+        // alone until the roster listed its peers), none listed a backup.
         anyhow::ensure!(
-            n(&a, "backups_added") == 0 && n(&a, "reconfig_cas") == 0,
+            n(&a, "backups_added") == 0
+                && n(&a, "backups_removed") == 0
+                && n(&a, "reconfig_cas") == n(&a, "singleton_bumps"),
             "{a}"
         );
-        anyhow::ensure!(a["gated"] == false, "A's fast path is gated: {a}");
+        // Peers on the roster and no backup: the archive carries the rows.
+        anyhow::ensure!(a["gated"] == true, "A's fast path is open: {a}");
         anyhow::ensure!(n(&a, "acks_waited") == 0, "acknowledgements waited: {a}");
         all_visible(&clients[1], &names, Duration::from_secs(30))?;
         // A dies: B's write waits for the lease to expire (no seal, no
