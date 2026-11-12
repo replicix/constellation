@@ -1992,7 +1992,8 @@ impl Core {
         if self.dl.own_grants.is_empty() {
             return;
         }
-        let acked = replica.journal_acked_seq().unwrap_or(0);
+        // (Read once, and only for a grant not honoured yet.)
+        let mut acked: Option<u64> = None;
         let gens: Vec<u64> = self.dl.own_grants.keys().copied().collect();
         let mut release: Vec<u64> = Vec::new();
         for g in gens {
@@ -2004,6 +2005,7 @@ impl Core {
             if og.honoured {
                 continue;
             }
+            let acked = *acked.get_or_insert_with(|| replica.journal_acked_seq().unwrap_or(0));
             // A record the archive carries stays committed (a lease loss
             // resets what this core counts as shipped; the log does not
             // forget).
