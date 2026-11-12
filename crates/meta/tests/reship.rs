@@ -1037,3 +1037,60 @@ fn a_drop_held_the_log_lacks_is_fenced() {
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
     assert!(!meta.row_retired(EPOCH_PREV, 1));
 }
+
+/// ADR-59 part B, 846's shape (one hole writer for the backup tail): the
+/// holder resent a hole over rows its journal no longer has, which merged two
+/// transactions' spans; its next resend streams the first span as a narrower
+/// hole again, and a late copy of the second transaction. The wider hole stays
+/// (no span of the tail shrinks) and the late copy is not kept. A drop of the
+/// log then retires the first transaction's identity; a late copy of it is no
+/// copy either. Fail before: the narrower hole was stored over the wider one
+/// (a debug build stopped at `backup_append`'s assertion "a stored span ...
+/// keyed inside 77..=78 ends past it"; a release build stored the narrow hole
+/// and kept the late copy of 79..=80 beside it).
+#[test]
+fn a_narrower_hole_resent_over_a_wider_one_leaves_the_wider_and_no_late_copy() {
+    let meta = Meta::open_in_memory().unwrap();
+    let live = |first: u64, last: u64, name: &str, n: u64| {
+        tx(
+            first,
+            last,
+            vec![
+                create(ROOT_INO, name, ino(n)),
+                LogRecord::Completed { rid: rid(2, n) },
+            ],
+        )
+    };
+    let hole = |first: u64, last: u64| tx(first, last, Vec::new());
+    meta.backup_append(EPOCH_PREV, &[live(77, 78, "a", 1), live(79, 80, "b", 2)])
+        .unwrap();
+    // One hole over both (rows the journal no longer has).
+    meta.backup_append(EPOCH_PREV, &[hole(77, 80)]).unwrap();
+    let spans = |meta: &Meta| -> Vec<(u64, u64, usize)> {
+        meta.backup_tail(EPOCH_PREV)
+            .unwrap()
+            .iter()
+            .map(|t| (t.first, t.last, t.records.len()))
+            .collect()
+    };
+    assert_eq!(spans(&meta), vec![(77, 80, 0)]);
+    // The resend: the first span as a narrower hole, the second as a copy.
+    meta.backup_append(EPOCH_PREV, &[hole(77, 78), live(79, 80, "b", 2)])
+        .unwrap();
+    assert_eq!(spans(&meta), vec![(77, 80, 0)], "one hole, no copy");
+    // A drop of the log retires the first transaction's identity; a late copy
+    // of it lands on the hole and is not kept.
+    meta.apply_segment_rows(
+        1,
+        EPOCH_PREV,
+        0,
+        &[9],
+        &[(0, 0)],
+        &[drop_held(&[(EPOCH_PREV, 77)])],
+        &Default::default(),
+    )
+    .unwrap();
+    meta.backup_append(EPOCH_PREV, &[live(77, 78, "a", 1)])
+        .unwrap();
+    assert_eq!(spans(&meta), vec![(77, 80, 0)], "no copy of a retired row");
+}
