@@ -55,6 +55,9 @@ pub struct StickyEnds {
     /// Generation -> its records in the order the log gives them (for the
     /// violation's message).
     trail: BTreeMap<u64, Vec<String>>,
+    /// ADR-55 (R-I1): `DelegateNode` records that name `/`: `(gen, node,
+    /// kind)`, any kind.
+    root_grants: Vec<(u64, u64, String)>,
 }
 
 /// What [`StickyEnds::judge`] found.
@@ -94,6 +97,12 @@ impl StickyEnds {
             }
             match r {
                 LogRecord::DelegateNode { node, gen, dirs } => {
+                    for g in dirs
+                        .iter()
+                        .filter(|g| g.dir == constellation_fs_core::types::ROOT_INO)
+                    {
+                        s.root_grants.push((*gen, *node, format!("{:?}", g.kind)));
+                    }
                     for g in dirs.iter().filter(|g| g.kind == SubtreeKind::Sticky) {
                         s.granted.entry(*gen).or_default().insert(g.dir);
                         s.holder.insert(*gen, *node);
@@ -130,6 +139,13 @@ impl StickyEnds {
             granted: self.granted.len(),
             ..Default::default()
         };
+        // ADR-55, `no_grant_on_root_dir` (strict): `/` is the root
+        // sequencer's, whatever the kind and whoever the holder.
+        for (gen, node, kind) in &self.root_grants {
+            f.violations.push(format!(
+                "no_grant_on_root_dir: generation {gen} grants `/` ({kind}) to node {node}"
+            ));
+        }
         for (gen, dirs) in &self.granted {
             let Some(ender) = self.ended.get(gen) else {
                 continue;

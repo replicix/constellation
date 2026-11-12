@@ -1081,6 +1081,9 @@ pub fn placement_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.placement_cooldown_ms = 1_000;
     // Plan 46 M1.3 step 7: the far test scaled to the short workload.
     c.placement_sticky = true;
+    // ADR-55: the root takes its own sticky grants (`AUTHORITY_SIM_ROOT_STICKY=off`
+    // is the comparison run of a failing seed against the parent's behaviour).
+    c.placement_root_sticky = std::env::var("AUTHORITY_SIM_ROOT_STICKY").as_deref() != Ok("off");
     c.placement_far_rtt_ms = 20;
     c.placement_far_dwell_ms = 1_000;
     c
@@ -1949,7 +1952,11 @@ impl Cluster {
                     old.shared
                         .ungated_shadows_before
                         .load(std::sync::atomic::Ordering::Relaxed)
-                        + old.view().stats.ungated_shadows,
+                        + old.view().stats.ungated_shadows
+                        - old
+                            .shared
+                            .ungated_excused
+                            .load(std::sync::atomic::Ordering::Relaxed),
                     // (A kept meta is the same object: counted once, at the end.)
                     old.shared
                         .unjustified_ships_before
@@ -7556,6 +7563,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .values()
         .map(|s| s.ungated_shadows)
         .sum::<u64>()
+        - cluster
+            .ids()
+            .into_iter()
+            .map(|id| {
+                cluster
+                    .get(id)
+                    .shared
+                    .ungated_excused
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum::<u64>()
         + cluster
             .ids()
             .into_iter()

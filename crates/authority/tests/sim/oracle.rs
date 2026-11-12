@@ -589,6 +589,25 @@ impl Oracles {
         t.push((at, holder, Arc::new(table)));
     }
 
+    /// The non-stealable generations (sticky grants, designations) the root's
+    /// table ever named for `node`: the generations whose rows are `Final`
+    /// whether or not the stream still stands (a released stream's rows keep
+    /// the rule they were journaled by; ADR-55: the root's own too).
+    pub fn ever_non_stealable(&self, node: NodeId) -> BTreeSet<u64> {
+        self.tables
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, _, table)| {
+                table
+                    .iter()
+                    .filter(|d| d.node == node && d.non_stealable())
+                    .map(|d| d.gen)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Whether the last table kept names a delegation.
     pub fn tables_nonempty(&self) -> bool {
         self.tables
@@ -818,9 +837,18 @@ impl Oracles {
                 .map(|m| Replica::log_stream_idx(&**m, gen))
                 .max()
                 .unwrap_or(0);
+            // ADR-55: the node that holds the lease and the stream is the
+            // root of its own stream: its rows are in the journal the root
+            // appends to, before the release row and in order, and the log's
+            // index of the stream rises only when its segment lands. The
+            // drain rule is about a root that is another node.
+            let own_root = self
+                .bucket
+                .peek_lease()
+                .is_some_and(|l| l.holder == node && !l.released);
             let mut seen = self.release_drain.lock().unwrap();
             seen.checked.insert((node, gen), top);
-            for idx in releases.into_iter().filter(|_| judge) {
+            for idx in releases.into_iter().filter(|_| judge && !own_root) {
                 seen.rows += 1;
                 if appended + 1 < idx {
                     seen.violations.push(format!(
