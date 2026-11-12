@@ -305,6 +305,7 @@ fn replay_seed() {
         Ok("far-root-writes") => far_root_writes_config(),
         Ok("far-root-writes-paused") => far_root_writes_paused_config(),
         Ok("far-root-writes-shared") => far_root_writes_shared_config(),
+        Ok("far-root-writes-cross") => far_root_writes_cross_config(),
         Ok("far-placement") => far_placement_config(),
         Ok("far-placement-release") => far_placement_release_config(),
         Ok("sticky-idle-release") => sticky_idle_release_config(),
@@ -1962,6 +1963,9 @@ fn far_root_writes_config() -> SimConfig {
                 keep_journal: true,
             },
         }],
+        // ADR-55 (R-I5, M4): a `Final` row of the root's own stream is never
+        // rolled back: I5 is strict here, in every variant.
+        strict_lone: true,
         ..far_config()
     }
 }
@@ -2002,6 +2006,18 @@ fn far_root_writes_paused_config() -> SimConfig {
                 },
             },
         ],
+        ..far_root_writes_config()
+    }
+}
+
+/// Plan 46 M1.3 step 9 (ADR-55, Q3): `far-root-writes` with a tenth of the ops
+/// crossing subtrees (a rename or a link between directories): the ones that
+/// meet the boundary of the root's own sticky subtree release the grant, as its
+/// holder, and run on the root's keys after the release row, instead of `EXDEV`
+/// (`root_own_released_for_cross_own`).
+fn far_root_writes_cross_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.1,
         ..far_root_writes_config()
     }
 }
@@ -7354,6 +7370,7 @@ fn base_config(label: &str) -> SimConfig {
         "far-root-writes" => far_root_writes_config(),
         "far-root-writes-paused" => far_root_writes_paused_config(),
         "far-root-writes-shared" => far_root_writes_shared_config(),
+        "far-root-writes-cross" => far_root_writes_cross_config(),
         "far-placement" => far_placement_config(),
         "far-placement-release" => far_placement_release_config(),
         "sticky-idle-release" => sticky_idle_release_config(),
@@ -8256,7 +8273,14 @@ fn sweep_config() {
                     }
                 }
                 Err(e) => {
-                    let head: String = e.lines().take(3).collect::<Vec<_>>().join(" | ");
+                    // (`AUTHORITY_SIM_FULL_FAIL=1`: the whole message, the faults, the
+                    // history and the log of a failing seed.)
+                    let lines = if std::env::var_os("AUTHORITY_SIM_FULL_FAIL").is_some() {
+                        usize::MAX
+                    } else {
+                        3
+                    };
+                    let head: String = e.lines().take(lines).collect::<Vec<_>>().join(" | ");
                     eprintln!("SWEEP-FAIL {label} seed {seed}: {head}");
                     failures.lock().unwrap().push(seed);
                 }
@@ -9624,7 +9648,7 @@ struct OracleTotals {
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
     sticky_core: [u64; 16],
-    root_own_core: [u64; 10],
+    root_own_core: [u64; 13],
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
@@ -10233,7 +10257,8 @@ impl OracleTotals {
         );
         eprintln!(
             "ROOT-OWN-TOTALS {label} seeds {}/{seeds}: the root's own grants made {}, answers in its own stream {}, held by its root path {}, \
-             longest commit wait {} ms, messages to itself delivered inline {} (cut off {}), candidates skipped for the root {}, released by its dwell {}, rows streamed after its deposition {}, inbox-only forwards refused in its stream {}",
+             longest commit wait {} ms, messages to itself delivered inline {} (cut off {}), candidates skipped for the root {}, released by its dwell {}, rows streamed after its deposition {}, inbox-only forwards refused in its stream {}, \
+             released by an op across its boundary (own client {}, forwarded {}), root-path answers that waited for the archive meanwhile {}",
             self.seeds,
             self.root_own_core[0],
             self.root_own_core[1],
@@ -10244,7 +10269,10 @@ impl OracleTotals {
             self.root_own_core[5],
             self.root_own_core[6],
             self.root_own_core[8],
-            self.root_own_core[9]
+            self.root_own_core[9],
+            self.root_own_core[10],
+            self.root_own_core[11],
+            self.root_own_core[12]
         );
         eprintln!(
             "QUARANTINE-TOTALS {label} seeds {}/{seeds}: restart quarantines {}, own writes parked {}, forwards answered Held {}, \
@@ -20860,15 +20888,16 @@ fn the_root_takes_its_own_grants_and_keeps_them_across_a_deposition() {
 /// Plan 46 M1.3 step 9, the negative controls (test 19): each fault fails the
 /// oracle it is written for.
 /// - `root_sticky_on_slash`: `no_grant_on_root_dir`.
-/// - (`deposed_root_strands_own_stream` is pinned at the meta level, the
-///   store test `a_deposed_roots_own_stream_rows_are_neither_stranded_nor_member_copied`:
-///   the strand rolls the rows back and the by-rid replay completes them
-///   again, so no simulation oracle names it; an open gap, ADR-55.)
+/// - `deposed_root_strands_own_stream`: a deposed root's takeover strands the
+///   rows of its own stream; I5 keys a rolled-back `Final` row on its origin
+///   `(gen, idx)` of the root's own generation, replayed by rid or not (the
+///   meta-level store test `a_deposed_roots_own_stream_rows_are_neither_stranded_nor_member_copied`
+///   pins the same fault at the store).
 /// - `root_executes_under_own_grant`: the root's own path runs a key of its
 ///   live stream in its own journal beside the stream's.
 #[test]
 fn the_root_own_controls_fail_the_oracles() {
-    let controls: [(&str, SimConfig, &[&str]); 2] = [
+    let controls: [(&str, SimConfig, &[&str]); 3] = [
         (
             "root_sticky_on_slash",
             SimConfig {
@@ -20879,7 +20908,18 @@ fn the_root_own_controls_fail_the_oracles() {
                 sticky_delegations: Vec::new(),
                 ..far_root_writes_config()
             },
-            &["no_grant_on_root_dir", "no_grant_on_root_dir", ""],
+            &["no_grant_on_root_dir", "no_grant_on_root_dir"],
+        ),
+        (
+            "deposed_root_strands_own_stream",
+            SimConfig {
+                deposed_root_strands_own_stream: true,
+                ..far_root_writes_paused_config()
+            },
+            &[
+                "deposed_root_strands_own_stream",
+                "deposed_root_strands_own_stream",
+            ],
         ),
         (
             "root_executes_under_own_grant",
@@ -20910,14 +20950,7 @@ fn the_root_own_controls_fail_the_oracles() {
             }
         }
         assert!(failed > 0, "{name}: no seed failed an oracle");
-        // (A grant on `/` breaks the run in more than one way and the end-of-run
-        // check of the table is not the first to speak: that control is
-        // required to fail, the strict `no_grant_on_root_dir` is its name.)
-        assert!(
-            named > 0 || name == "root_sticky_on_slash",
-            "{name}: no seed failed {}",
-            expect[0]
-        );
+        assert!(named > 0, "{name}: no seed failed {}", expect[0]);
     }
 }
 
