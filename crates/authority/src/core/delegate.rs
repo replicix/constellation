@@ -3151,7 +3151,7 @@ impl Core {
 
     /// Plan 30 §M9's journaled refusal, as a delegate: a transaction of
     /// the stream (the root appends it; a retry by rid anywhere finds it).
-    fn record_delegate_refusal(
+    pub(crate) fn record_delegate_refusal(
         &mut self,
         rid: Rid,
         code: Code,

@@ -1850,11 +1850,45 @@ impl Core {
                             );
                             return Err(Halt::Recall);
                         }
+                        // ADR-55 (Q4, fence C9.2): the keys are under the
+                        // root's own sticky stream, which this node holds. An
+                        // op that was ever in an inbox is refused there, as
+                        // any non-stealable holder refuses one: `EROFS`, a row
+                        // of the stream (final, the root's segment carries
+                        // it), and the position acknowledged with it; a settle
+                        // of the rid, which has no outcome here (above), is
+                        // refused as a settle is. Halting would leave the
+                        // requester's op unanswered until its deadline.
+                        super::delegate::RecallPlan::Hold(gen) => {
+                            let settle = batch.ops[i].settle;
+                            let code = if settle {
+                                super::client::settle_code(rid, decoded.as_ref().ok())
+                            } else {
+                                Code::ReadOnly
+                            };
+                            if !self.record_delegate_refusal(
+                                rid,
+                                code,
+                                gen,
+                                constellation_meta::Position::ZERO,
+                                replica,
+                            ) {
+                                return Err(Halt::Recall);
+                            }
+                            replica.journal_inbox_ack(ack)?;
+                            if settle {
+                                self.stats.settles_refused += 1;
+                            } else {
+                                self.stats.holder_inbox_refusals += 1;
+                                self.stats.holder_inbox_refusals_own_root += 1;
+                            }
+                            self.recall_unblock(now, &touched);
+                            continue;
+                        }
                         // Unreachable in the takeover gate (the `!admitted`
                         // halt above recalls on demand, ADR-44); kept for
                         // the plan's exhaustiveness.
-                        super::delegate::RecallPlan::Gated
-                        | super::delegate::RecallPlan::Hold(_) => {
+                        super::delegate::RecallPlan::Gated => {
                             return Err(Halt::Recall);
                         }
                         super::delegate::RecallPlan::Refuse(code)
