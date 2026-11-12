@@ -760,7 +760,19 @@ and node, and evaluates it every tenth of the window:
   returns or the operator runs `constellation repair abandon --node N`
   (see Troubleshooting). A writer that reaches the root only through the
   inbox, during a partition, gets `EROFS` in the root's stream where fence rule
-  C9 applies (`holder_inbox_refusals`).
+  C9 applies (`holder_inbox_refusals`, apart for the root's own stream as
+  `root_own.inbox_refusals`). An op in the stream rests on the root's own rows
+  (the ones in `/` and in other subtrees, journaled and not yet in the log) as
+  a far holder's does: it waits until the archive carries those its position
+  names, because a deposition rolls them back while the stream's rows stay; the
+  stream's own rows are no such premise. A restarted root that claims its lease
+  again ends its own stream at what it assigned (its rows stay in the journal and
+  ship in the new tenure's first segment); a takeover gate that finds a
+  predecessor's backup tail ends the stream at the log and replays the halted
+  rows by rid (step 12). The lease is not released over a release row of the
+  root's own stream that has not shipped: when S3 is unreachable the flush
+  before the release fails and the release does not happen, and the subtree
+  stays blocked at the successor until the row ships (the cost D3 accepts).
 - **Recall** a placed delegation when, for a whole dwell
   (`CONSTELLATION_DELEGATION_DWELL_MS`, 5 minutes), the delegate's share
   stayed below `CONSTELLATION_DELEGATION_LEAVE` (50%) or the subtree's
@@ -1296,7 +1308,11 @@ node's whole process was frozen) and `lapses_root_silent` with
 are classified: see "Grants, renewal and expiry",
 `redelegated`, `deps_overflow_to_root`, `refused_designated`, `root_own`
 (the root's own sticky grants, ADR-55: `granted`, `released_by_dwell`,
-`released_for_cross`, `answers` in its own stream, `holds` by its root path,
+`released_for_cross_own` and `released_for_cross_forwarded` (ops across a
+boundary that released the grant, by the root's own client or another node),
+`answers` in its own stream, `holds` by its root path, `archive_waits_elsewhere`
+(the root's own client ops in `/` or in other nodes' subtrees that waited for
+the archive),
 `commit_waits` and the longest in `commit_wait_ms_max`, `resumed_rows` streamed
 to a later root after a deposition, `self_sends` delivered inline, `skipped`
 candidates and `inbox_refusals`), and the
