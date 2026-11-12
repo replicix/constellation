@@ -1873,28 +1873,6 @@ impl Meta {
         Ok(out)
     }
 
-    /// The highest retired identity `(epoch, j)` with `j <= jseq`: the start
-    /// of the retired transaction that covers `jseq` if no other transaction
-    /// starts in between (the kept merge's gap rule, which knows the starts
-    /// of the copies it holds but not the span of a retired one).
-    pub fn retired_at_or_below(&self, epoch: u64, jseq: u64) -> Option<u64> {
-        let r = self.db.read_tx();
-        let mut last = None;
-        for guard in r
-            .range(
-                &self.local,
-                retired_key(epoch, 0)..=retired_key(epoch, jseq),
-            )
-            .rev()
-            .take(1)
-        {
-            let (k, _) = guard.into_inner().ok()?;
-            let n = k.len();
-            last = Some(u64::from_be_bytes(k[n - 8..].try_into().ok()?));
-        }
-        last
-    }
-
     /// [`Self::row_retired`] in the caller's transaction.
     pub(crate) fn row_retired_tx(
         &self,
