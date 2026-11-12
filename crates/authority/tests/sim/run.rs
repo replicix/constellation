@@ -649,6 +649,8 @@ pub struct SimConfig {
     /// probability the client writes the file — one fresh chunk, dirty on
     /// its node until its upload pass (`chunks.rs`).
     pub chunk_writes: f64,
+    /// The nodes whose clients write (`chunk_writes`); empty: every node's.
+    pub chunk_write_nodes: Vec<NodeId>,
     /// Plan 46 M0.3 (`tloss-two-node`, the 2026-10-16 trace): the clients'
     /// workload is `Create`s of the node's names only, and after each, with
     /// this probability, the client overwrites the file as an `O_TRUNC`
@@ -1205,6 +1207,7 @@ impl Default for SimConfig {
             epoch_slack: 0,
             join_fresh: true,
             chunk_writes: 0.0,
+            chunk_write_nodes: Vec::new(),
             trunc_commit_ratio: 0.0,
             drop_held_after_ms: 20_000,
             link_ratio: 0.0,
@@ -1597,7 +1600,7 @@ pub struct Report {
     /// stream, holds by its root path, the longest commit wait of a grant
     /// (ms), self-delivered messages, candidates the walk skipped for the
     /// root, the root's own long-dwell releases, deliveries cut off.
-    pub root_own_core: [u64; 13],
+    pub root_own_core: [u64; 15],
     /// Late-landing cores' counters, summed over the nodes (`SWEEP-LL-STATS`):
     /// settles withdrawn first, ops resubmitted by a tombstone, stale reads
     /// discarded, stale relists, stale parks dropped, unacked replay settles,
@@ -5473,7 +5476,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 with_reads(&mut read_rng, ops, cfg.names, cfg.read_ratio)
             };
             let mut write_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0xc4a1);
-            let steps = with_writes(&mut write_rng, steps, cfg.chunk_writes);
+            let writes =
+                if cfg.chunk_write_nodes.is_empty() || cfg.chunk_write_nodes.contains(&node) {
+                    cfg.chunk_writes
+                } else {
+                    0.0
+                };
+            let steps = with_writes(&mut write_rng, steps, writes);
             let mut trunc_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x7c0a);
             let steps = with_trunc_commits(&mut trunc_rng, steps, cfg.trunc_commit_ratio);
             let mut link_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x11c4);
@@ -7446,6 +7455,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.root_own_core[10] += s.root_own_released_for_cross_own;
         report.root_own_core[11] += s.root_own_released_for_cross_forwarded;
         report.root_own_core[12] += s.root_own_archive_waits_elsewhere;
+        report.root_own_core[13] = report.root_own_core[13].max(s.root_own_honour_wait_ms_max);
+        report.root_own_core[14] += s.root_own_released_unhonoured;
         report.sticky_core[0] += s.deleg_sticky;
         report.sticky_core[1] += s.deleg_sticky_ended_released;
         report.sticky_core[2] += s.deleg_sticky_ended_abandoned;

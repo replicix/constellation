@@ -1618,9 +1618,10 @@ pub struct Stats {
     pub root_own_answers: u64,
     pub root_own_commit_waits: u64,
     pub root_own_commit_wait_ms_max: u64,
-    /// ADR-55 (R-H): the longest from a grant's record being journaled to
-    /// the stream being honoured (the record archived and no root row of its
-    /// keys unshipped), and the grants the root released as the holder
+    /// ADR-55 (R-H): the longest from the archive's carrying a grant's record
+    /// to the stream being honoured (no root row of its keys unshipped): the
+    /// wait R-H (b) adds to the record's own, 0 when no such row was
+    /// unshipped. And the grants the root released as the holder
     /// because such a row (held, poisoned) outlasted the bound.
     pub root_own_honour_wait_ms_max: u64,
     pub root_own_released_unhonoured: u64,

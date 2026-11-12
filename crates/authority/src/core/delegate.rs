@@ -1219,9 +1219,9 @@ pub(crate) struct OwnGrant {
     pub scan_to: u64,
     /// The decision: see [`DelegationState::own_grants`].
     pub honoured: bool,
-    /// When the record was journaled: what `Stats::root_own_honour_wait_ms_max`
-    /// and `root_own_commit_wait_ms_max` measure from (a growth that follows
-    /// before the archive carries the first record does not restart it).
+    /// When the record was journaled: what `Stats::root_own_commit_wait_ms_max`
+    /// measures from (a growth that follows before the archive carries the
+    /// first record does not restart it).
     pub since: WaitMs,
     /// When this core first saw the archive carry the record, and so when
     /// an unshipped root row of the stream's keys started to be waited for
@@ -2034,7 +2034,10 @@ impl Core {
                 self.dl.own_grants.get_mut(&g).expect("present").covered_at = Some(covered_at);
                 continue;
             }
-            let ms = now.wait.since(og.since).max(0) as u64;
+            // (From the archive's carrying the record: the wait for a root
+            // row of the stream's keys beyond the record's own, zero when
+            // none was unshipped.)
+            let ms = now.wait.since(covered_at).max(0) as u64;
             self.stats.root_own_honour_wait_ms_max = self.stats.root_own_honour_wait_ms_max.max(ms);
             let og = self.dl.own_grants.get_mut(&g).expect("present");
             og.honoured = true;
