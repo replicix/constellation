@@ -152,7 +152,7 @@ use crate::mutate::MutateOp;
 use crate::record::LogRecord;
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, journal, local, spec, Meta,
-    UsageTracker, KV_POISONED_COUNT,
+    UsageTracker, KV_DROP_HELD_UNSHIPPED, KV_POISONED_COUNT,
 };
 use constellation_fs_core::{ChunkInfo, Ino, Manifest};
 use fjall::Readable;
@@ -409,7 +409,7 @@ pub struct DroppedHeld {
 }
 
 /// The identity a member keys a rolled-back transaction by
-/// (`LogRecord::RolledBack`): its `TailOf` pair if it began with one, else
+/// (`LogRecord::DropHeld`): its `TailOf` pair if it began with one, else
 /// `(its tenure's epoch, first journal seq)`. `None` without the journal
 /// head that says the epoch.
 fn rolled_back_ident(
@@ -1681,8 +1681,8 @@ impl Meta {
         let attribute = !self.parent_taint_conservative.load(Ordering::Relaxed);
         let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
         // The identity of every transaction the drop rolls back, as a
-        // member keys it (`LogRecord::RolledBack`).
-        let mut idents: Vec<(u64, u64)> = Vec::new();
+        // member keys it (`LogRecord::DropHeld`).
+        let mut idents: Vec<((u64, u64), Option<crate::rid::Rid>)> = Vec::new();
         let mut unidentified = 0usize;
         for (t, seed_inos, keys) in held.held {
             let is_seed = seed_inos.contains(&ino);
@@ -1702,7 +1702,10 @@ impl Meta {
             let head_epoch =
                 super::local::get_journal_tx_head(&tx, self, t.first)?.map(|head| head.epoch);
             match rolled_back_ident(head_epoch, t.first, &records) {
-                Some(ident) => idents.push(ident),
+                Some(ident) => {
+                    let row = local::get_journal_tx(&tx, self, t.first)?;
+                    idents.push((ident, tx_rid(&t, row.as_ref())));
+                }
                 // A captured transaction (it has before-images) has its
                 // head; one without cannot be named to the members, which
                 // keep their copy of it. Said, counted, never silent.
@@ -1869,10 +1872,13 @@ impl Meta {
                     &self.journal_ks,
                     &self.local,
                     &self.completed,
-                    &LogRecord::RolledBack {
-                        idents: idents.clone(),
+                    &LogRecord::DropHeld {
+                        ino,
+                        chunks: missing.iter().copied().collect(),
+                        rolled_back: idents.clone(),
                     },
                 )?;
+                counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
             }
             for rid in &refused_rids {
                 let position = journal::append_tx(

@@ -120,6 +120,31 @@ impl Meta {
         // Plan 43 C1-4: rows of this node's own tenure that shipped cover
         // member copies (a re-shipped transaction names the one it carries).
         self.member_cover_shipped_tx(tx, journal_seqs)?;
+        // ADR-59 part B (D2): a `DropHeld` this node shipped retires what it
+        // names, as it does on every replica that applies it from the log.
+        // The drop's decision counts the record as unshipped; a ship that carries no such
+        // record (every ship but one) pays this one read.
+        if crate::store::counter_get(tx, &self.local, crate::store::KV_DROP_HELD_UNSHIPPED)? > 0 {
+            let mut retired = std::collections::BTreeSet::new();
+            let mut shipped = 0i64;
+            for seq in journal_seqs {
+                if let Some(v) = tx.get(&self.journal_ks, crate::store::journal::seq_key(*seq))? {
+                    if let LogRecord::DropHeld { rolled_back, .. } = LogRecord::from_postcard(&v)? {
+                        retired.extend(rolled_back.iter().map(|(ident, _)| *ident));
+                        shipped += 1;
+                    }
+                }
+            }
+            if shipped > 0 {
+                self.retire_rolled_back_tx(tx, &retired);
+                crate::store::counter_add_tx(
+                    tx,
+                    &self.local,
+                    crate::store::KV_DROP_HELD_UNSHIPPED,
+                    -shipped,
+                )?;
+            }
+        }
         // Plan 30 §M11: the root's own ops forwarded to a delegate are
         // shadows here (§M6) that no segment apply completes: the
         // completions this ship carries retire them, as the segment

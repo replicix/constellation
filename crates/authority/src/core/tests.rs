@@ -62667,7 +62667,7 @@ mod await_retry {
         })
     }
 
-    /// Defect B: the drop journals one `RolledBack` record naming the
+    /// Defect B: the drop journals one `DropHeld` record naming the
     /// identity of every transaction it rolled back — the seed and its
     /// dependent — as the first record of the transaction that carries the
     /// drop's `Refused` rows: ahead of every refusal, so a holder that dies
@@ -62704,13 +62704,13 @@ mod await_retry {
             .find(|t| {
                 t.records
                     .iter()
-                    .any(|r| matches!(r, LogRecord::RolledBack { .. }))
+                    .any(|r| matches!(r, LogRecord::DropHeld { .. }))
             })
-            .unwrap_or_else(|| panic!("no RolledBack journaled: {after:?}"));
-        let LogRecord::RolledBack { idents } = &drop_tx.records[0] else {
-            panic!("RolledBack is not first: {:?}", drop_tx.records)
+            .unwrap_or_else(|| panic!("no DropHeld journaled: {after:?}"));
+        let LogRecord::DropHeld { rolled_back, .. } = &drop_tx.records[0] else {
+            panic!("DropHeld is not first: {:?}", drop_tx.records)
         };
-        let mut idents = idents.clone();
+        let mut idents: Vec<(u64, u64)> = rolled_back.iter().map(|(i, _)| *i).collect();
         idents.sort();
         assert_eq!(idents, vec![(1, seed), (1, dependent)]);
         assert!(
@@ -66142,7 +66142,7 @@ mod kept_fetch {
         assert!(
             records
                 .iter()
-                .all(|r| !matches!(r, LogRecord::RolledBack { .. })),
+                .all(|r| !matches!(r, LogRecord::DropHeld { .. })),
             "nothing is rolled back: {records:?}"
         );
     }
