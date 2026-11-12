@@ -1959,7 +1959,8 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
 /// TTL): the waiter behind it waited for that. Now it moves with what is left
 /// of its record (`Core::carried_until`): the waiter is granted within a
 /// delegate's capped grant (2 to 3 s), the margins of the moves and the slack
-/// below, judged against the host-lag probe. The next hold starts once the
+/// below, judged against the host-lag probe; the median handoff is within a
+/// second (the ghost's grant is let go as it lands). The next hold starts once the
 /// delegate serves again. Prints each gap and the nodes' `recalls_expired`
 /// and `moved_carried`.
 pub fn lock_contention_delegated_moves(_seed: u64) -> Result<()> {
@@ -1967,6 +1968,12 @@ pub fn lock_contention_delegated_moves(_seed: u64) -> Result<()> {
     const DELEG_TTL_MS: u64 = 5_000;
     const ROUNDS: usize = 6;
     const HOLD: Duration = Duration::from_secs(4);
+    // The ghost's grant is let go as it lands (a waiter killed as the lock
+    // was let go: its request ended before the grant, which the node gave
+    // up only after the 4 s first-use budget on a file system fast enough
+    // for the unlock to win the race: tmpfs, 4.3 s a handoff; 30 ms on ext4,
+    // xfs and btrfs). The median is the protocol's own cost.
+    const MEDIAN_GAP: Duration = Duration::from_millis(1_000);
     // A grant capped at 3 s and its margin, two moves' margins, and the
     // handoff itself; a restamp is 21 s per move.
     const MAX_GAP: Duration = Duration::from_millis(9_000);
@@ -2117,6 +2124,15 @@ pub fn lock_contention_delegated_moves(_seed: u64) -> Result<()> {
                 "counter {got}, expected {expected} (lost or doubled increments)"
             );
             anyhow::ensure!(moved >= ROUNDS, "{moved} moves in {ROUNDS} rounds");
+            let mut sorted = gaps.clone();
+            sorted.sort();
+            crate::hostlag::latency_bound_over(
+                &format!("{NAME}: the median handoff gap"),
+                (started, Instant::now()),
+                sorted[sorted.len() / 2],
+                Duration::from_millis(100),
+                MEDIAN_GAP,
+            )?;
             crate::hostlag::latency_bound_over(
                 &format!("{NAME}: the longest handoff gap"),
                 (started, Instant::now()),

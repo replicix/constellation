@@ -1477,7 +1477,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "lock-contention-delegated-moves",
-        desc: "a delegation move carries what is left of an unused lock grant: lock-contention-delegated with a recall and a new delegation of the subtree (two moves of its lock table) 0.5 s after every unlock, and a ghost contender (a flock(1) killed as the holder lets go) queued first; the count exact, every handoff within 9 s (a restamp is 21 s per move), judged against the host-lag probe; prints the gaps, recalls_expired and moved_carried per node",
+        desc: "a delegation move carries what is left of an unused lock grant: lock-contention-delegated with a recall and a new delegation of the subtree (two moves of its lock table) 0.5 s after every unlock, and a ghost contender (a flock(1) killed as the holder lets go) queued first; the count exact, the median handoff within 1 s and every one within 9 s (a restamp is 21 s per move), judged against the host-lag probe; prints the gaps, recalls_expired and moved_carried per node",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::lock_contention_delegated_moves,
