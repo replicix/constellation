@@ -79960,7 +79960,8 @@ mod root_own_sticky {
     /// T1 and T1b (M1', R-H, R-X): a stream op on the keys of a root row
     /// that is not in the log waits for it, and a deposition does not let it
     /// go: the row is rolled back and replayed by rid, as a row of the
-    /// stream, and the op lands after it. Fails on the parent: the op ran at
+    /// stream, and the op lands after it (the successor's first segment
+    /// passes the root's position: then it runs). Fails on the parent: the op ran at
     /// the first step after the deposition (the lease epoch it waited under
     /// was gone), a stream row ahead of the replay of the root row.
     #[test]
@@ -80009,6 +80010,40 @@ mod root_own_sticky {
                 );
                 assert!(Replica::outcome_row(&h.meta, a_rid).is_none());
             }
+            // The successor's first segment passes the root's position
+            // `(1, tip)` that `a` waits for as any holder does (a deposed
+            // root is judged by the full position, not its own stream): the
+            // parked op runs, after the rows the root had journaled. (The
+            // stranded row `r` is a gated one, kept as a member copy of the
+            // group and not queued for replay: its requester's retry and the
+            // successor's segment carry it. The node's lease is gone, so `a`
+            // is executed by the node's own path, not in the stream. A far
+            // `a` is a forward the new root's node answers itself, not this
+            // core's to run: only the root's own client is checked here.)
+            Replica::apply_segment(&h.meta, 2, 2, 0, &[], &[], &[]).unwrap();
+            if far {
+                continue;
+            }
+            for _ in 0..40 {
+                if Replica::outcome_row(&h.meta, a_rid).is_some() {
+                    break;
+                }
+                h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+                h.hold(1, None);
+                if let Some(id) = h.core.dl.stream_timer {
+                    h.step(Event::Timer { id });
+                }
+                activity(&mut h);
+            }
+            assert!(
+                Replica::outcome_row(&h.meta, a_rid).is_some(),
+                "the parked op never ran after the successor's segment: rows {:?}",
+                h.meta.delegate_rows_for_audit(d.gen).unwrap()
+            );
+            // (It lands after the rows the root journaled before the
+            // deposition, `r`'s place among them.)
+            let landed = Replica::outcome_row(&h.meta, a_rid).expect("ran").jseq;
+            assert!(landed > tip, "landed at {landed}, tip was {tip}");
         }
     }
 
