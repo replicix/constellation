@@ -66077,6 +66077,64 @@ mod kept_fetch {
         assert_eq!(h.core.stats.kept_fetches, 0);
     }
 
+    // ---- ADR-59 part B, B2 ----
+
+    /// The claimant's log carries a `DropHeld` that retired the first of
+    /// `rows(3)`'s transactions (its journal row 7 shipped ahead).
+    fn claimant_with_a_retired_first_row() -> (Harness, Vec<Action>, Vec<BackupTx>) {
+        let (h, out) = start(3, &fenced(), &[1, 2, 3], 1, false);
+        let txs = rows(3);
+        h.meta
+            .apply_segment_rows(
+                1,
+                1,
+                0,
+                &[7],
+                &[(0, 0)],
+                &[LogRecord::DropHeld {
+                    ino: 5,
+                    chunks: Vec::new(),
+                    rolled_back: vec![((1, txs[0].first), None)],
+                }],
+                &Default::default(),
+            )
+            .unwrap();
+        (h, out, txs)
+    }
+
+    /// B2 (D2), 1818's shape: the sources serve the rows above a transaction
+    /// the log retired, and none serves it. Fail before: the first row above
+    /// it read as past a gap at the retired seqs and was not carried.
+    #[test]
+    fn a_row_above_a_retired_one_is_not_past_a_gap() {
+        let (mut h, out, txs) = claimant_with_a_retired_first_row();
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let out = answer_all(&mut h, &a, 2, 1, txs[1..].to_vec(), vec![vec![1, 2]]);
+        let written = finish(&mut h, out, &fenced());
+        assert!(written.is_some(), "the claim is made");
+        assert_eq!(h.core.stats.kept_past_gap, 0);
+        let mut got = reshipped(&h);
+        got.sort();
+        assert_eq!(got, vec![(1, txs[1].first), (1, txs[2].first)], "once each");
+    }
+
+    /// B2 (D2), 1714's shape at the merge: a source that missed the record
+    /// serves the retired transaction's copy; it is dropped, the rows above
+    /// it are carried once. Fail before: the retired copy was re-shipped.
+    #[test]
+    fn a_retired_copy_a_source_serves_is_not_carried() {
+        let (mut h, out, txs) = claimant_with_a_retired_first_row();
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let out = answer_all(&mut h, &a, 2, 1, txs.clone(), vec![vec![1, 2]]);
+        let written = finish(&mut h, out, &fenced());
+        assert!(written.is_some(), "the claim is made");
+        let mut got = reshipped(&h);
+        got.sort();
+        assert_eq!(got, vec![(1, txs[1].first), (1, txs[2].first)], "once each");
+    }
+
     // ---- ADR-59, T9 ----
 
     /// An epoch owner's journal as a member kept it: a directory, a file in

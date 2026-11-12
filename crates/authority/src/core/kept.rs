@@ -822,6 +822,20 @@ impl Core {
                         keepers.entry(*e).or_default().insert(*node);
                     }
                     for tx in &a.txs {
+                        // ADR-59 part B (D2): a copy of a transaction a
+                        // `DropHeld` of the log retired is dropped before the
+                        // sources are compared (a member that missed the
+                        // record serves it, a member that applied it holes
+                        // it): the sources do not disagree about a row that
+                        // was never to land, and the row above it is not
+                        // past a gap (`present` below).
+                        if !tx.records.is_empty() {
+                            let ident = constellation_meta::tail_identity(&tx.records)
+                                .unwrap_or((*e, tx.first));
+                            if replica.row_retired(ident.0, ident.1) {
+                                continue;
+                            }
+                        }
                         match all.get(&tx.first) {
                             Some(old)
                                 if old.last != tx.last
@@ -864,6 +878,19 @@ impl Core {
             let mut merged: Vec<BackupTx> = Vec::new();
             let mut next: Option<u64> = None;
             let mut gap = false;
+            // Seq `s` is present for the gap rule: in the log, or retired by
+            // a `DropHeld` (it will never be in the log, and no row above it
+            // waits for it).
+            // (A retired transaction covers `s` if it starts at or below it
+            // and no copy starts in between: its span is not known, its
+            // successors' starts are.)
+            let starts: BTreeSet<u64> = all.keys().copied().collect();
+            let present = |s: u64| -> bool {
+                replica.row_in_log(*e, s)
+                    || replica
+                        .retired_at_or_below(*e, s)
+                        .is_some_and(|a| starts.range(a + 1..=s).next().is_none())
+            };
             for (first, tx) in all {
                 if gap {
                     past_gap += 1;
@@ -879,7 +906,7 @@ impl Core {
                     // the one that is down, and a copy past that gap would
                     // make the marker name a hold the log does not reach.
                     None if first == 1
-                        || replica.row_in_log(*e, first - 1)
+                        || present(first - 1)
                         || first - 1 <= carried_through(*e) => {}
                     None => {
                         gap = true;
@@ -898,8 +925,7 @@ impl Core {
                     // row's predecessor is.)
                     Some(_)
                         if first > 0
-                            && (replica.row_in_log(*e, first - 1)
-                                || first - 1 <= carried_through(*e)) => {}
+                            && (present(first - 1) || first - 1 <= carried_through(*e)) => {}
                     Some(_) => {
                         gap = true;
                         past_gap += 1;

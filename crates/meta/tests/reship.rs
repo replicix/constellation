@@ -864,3 +864,118 @@ fn the_gate_holds_a_rolled_back_acknowledged_row_until_its_tail_re_applies_it() 
     assert!(meta.lookup(ROOT_INO, "held").unwrap().is_some());
     assert!(!meta.member_copy_touches(&key), "released by the tail");
 }
+
+// ---------------------------------------------------- ADR-59 part B (B2)
+
+fn drop_held(idents: &[(u64, u64)]) -> LogRecord {
+    LogRecord::DropHeld {
+        ino: 9,
+        chunks: Vec::new(),
+        rolled_back: idents.iter().map(|i| (*i, None)).collect(),
+    }
+}
+
+/// B2, 1714's shape (D2): a member's copy of a row the drop rolled back
+/// reaches the successor's gate after the log carried the `DropHeld`. Fail
+/// before: the row lands as `Completed`, behind its own refusal.
+#[test]
+fn a_tail_row_a_drop_held_of_the_log_retired_is_not_reshipped() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment_rows(
+        1,
+        EPOCH_PREV,
+        0,
+        &[9],
+        &[(0, 0)],
+        &[
+            drop_held(&[(EPOCH_PREV, 1)]),
+            LogRecord::Refused {
+                rid: rid(2, 1),
+                code: Code::Io,
+            },
+        ],
+        &Default::default(),
+    )
+    .unwrap();
+    let seed = vec![
+        create(ROOT_INO, "x", ino(7)),
+        LogRecord::Completed { rid: rid(2, 1) },
+    ];
+    let other = vec![
+        create(ROOT_INO, "y", ino(8)),
+        LogRecord::Completed { rid: rid(2, 2) },
+    ];
+    let report = reship(&meta, &[tx(1, 2, seed), tx(3, 4, other)]).unwrap();
+    assert_eq!(
+        (report.tail_retired, report.tail_applied, report.tail_done),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_none());
+    assert!(
+        meta.lookup(ROOT_INO, "y").unwrap().is_some(),
+        "each other row once"
+    );
+}
+
+/// B2 (MUST-B2): a tail row whose rid has *any* outcome here is done, a
+/// `Refused` one included. Fail before: only an `Executed` outcome counted.
+#[test]
+fn a_tail_row_whose_rid_was_refused_here_is_done() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment_rows(
+        1,
+        EPOCH_PREV,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Refused {
+            rid: rid(2, 1),
+            code: Code::Io,
+        }],
+        &Default::default(),
+    )
+    .unwrap();
+    let seed = vec![
+        create(ROOT_INO, "x", ino(7)),
+        LogRecord::Completed { rid: rid(2, 1) },
+    ];
+    let report = reship(&meta, &[tx(1, 2, seed)]).unwrap();
+    assert_eq!(
+        (report.tail_done, report.tail_applied),
+        (1, 0),
+        "{report:?}"
+    );
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_none());
+}
+
+/// B2 (D2): a `DropHeld` in the sealed tail that the log does not carry is
+/// its deposed dropper's undecided drop: fenced, and what it names is not
+/// retired (the rows re-ship as the acknowledged rows they are).
+#[test]
+fn a_drop_held_the_log_lacks_is_fenced() {
+    let meta = Meta::open_in_memory().unwrap();
+    let seed = vec![
+        create(ROOT_INO, "x", ino(7)),
+        LogRecord::Completed { rid: rid(2, 1) },
+    ];
+    let report = reship(
+        &meta,
+        &[
+            tx(1, 2, seed),
+            tx(3, 3, vec![drop_held(&[(EPOCH_PREV, 1)])]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            report.tail_drop_fenced,
+            report.tail_applied,
+            report.tail_retired
+        ),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+    assert!(!meta.row_retired(EPOCH_PREV, 1));
+}

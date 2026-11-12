@@ -6912,6 +6912,8 @@ impl Core {
         self.stats.tail_beyond_gap_dropped += report.tail_beyond_gap as u64;
         self.stats.tail_done_skipped += report.tail_done as u64;
         self.stats.tail_dedup += report.tail_dedup as u64;
+        self.stats.tail_retired += report.tail_retired as u64;
+        self.stats.tail_drop_fenced += report.tail_drop_fenced as u64;
         self.stats.tail_same_row += report.tail_same_row as u64;
         self.stats.tail_in_log += report.tail_in_log as u64;
         self.stats.reship_sync_failed += u64::from(report.sync_failed);

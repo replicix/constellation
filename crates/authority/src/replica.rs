@@ -292,6 +292,13 @@ pub trait Replica {
     /// Plan 43 C1-4: row `jseq` of `epoch`'s tenure is in the log this
     /// replica applied (`SessionState::row_in_log`).
     fn row_in_log(&self, epoch: Epoch, jseq: u64) -> bool;
+    /// ADR-59 part B (D2): the transaction `(epoch, jseq)` (by its identity)
+    /// was retired by a `DropHeld` this replica applied from the log: it
+    /// never lands.
+    fn row_retired(&self, epoch: Epoch, jseq: u64) -> bool;
+    /// The highest retired identity `(epoch, j)` with `j <= jseq`
+    /// ([`Self::row_retired`]).
+    fn retired_at_or_below(&self, epoch: Epoch, jseq: u64) -> Option<u64>;
     /// The journal seq of epoch `epoch`'s tenure this replica has applied
     /// the log through (0: none, or the log's last applied segment is of
     /// another epoch).
@@ -1254,6 +1261,14 @@ impl Replica for Meta {
 
     fn row_in_log(&self, epoch: Epoch, jseq: u64) -> bool {
         self.session().row_in_log(epoch, jseq)
+    }
+
+    fn row_retired(&self, epoch: Epoch, jseq: u64) -> bool {
+        Meta::row_retired(self, epoch, jseq)
+    }
+
+    fn retired_at_or_below(&self, epoch: Epoch, jseq: u64) -> Option<u64> {
+        Meta::retired_at_or_below(self, epoch, jseq)
     }
 
     fn applied_jseq_of(&self, epoch: Epoch) -> u64 {

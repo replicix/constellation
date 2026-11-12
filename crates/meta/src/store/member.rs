@@ -1757,7 +1757,10 @@ pub(crate) fn rolled_back_idents<'a>(
 
 /// ADR-59 part B (D2): the key of a retired identity.
 fn retired_key(epoch: u64, jseq: u64) -> Vec<u8> {
-    format!("retired:{epoch}:{jseq}").into_bytes()
+    let mut k = b"retired:".to_vec();
+    k.extend_from_slice(&epoch.to_be_bytes());
+    k.extend_from_slice(&jseq.to_be_bytes());
+    k
 }
 
 impl Meta {
@@ -1772,6 +1775,38 @@ impl Meta {
         for (epoch, jseq) in idents {
             tx.insert(&self.local, retired_key(*epoch, *jseq), Vec::new());
         }
+    }
+
+    /// The highest retired identity `(epoch, j)` with `j <= jseq`: the start
+    /// of the retired transaction that covers `jseq` if no other transaction
+    /// starts in between (the kept merge's gap rule, which knows the starts
+    /// of the copies it holds but not the span of a retired one).
+    pub fn retired_at_or_below(&self, epoch: u64, jseq: u64) -> Option<u64> {
+        let r = self.db.read_tx();
+        let mut last = None;
+        for guard in r
+            .range(
+                &self.local,
+                retired_key(epoch, 0)..=retired_key(epoch, jseq),
+            )
+            .rev()
+            .take(1)
+        {
+            let (k, _) = guard.into_inner().ok()?;
+            let n = k.len();
+            last = Some(u64::from_be_bytes(k[n - 8..].try_into().ok()?));
+        }
+        last
+    }
+
+    /// [`Self::row_retired`] in the caller's transaction.
+    pub(crate) fn row_retired_tx(
+        &self,
+        tx: &impl Readable,
+        epoch: u64,
+        jseq: u64,
+    ) -> Result<bool, MetaError> {
+        Ok(tx.get(&self.local, retired_key(epoch, jseq))?.is_some())
     }
 
     /// Whether the transaction `(epoch, jseq)` (by the identity a member
