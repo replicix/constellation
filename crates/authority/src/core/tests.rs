@@ -66382,14 +66382,21 @@ mod kept_fetch {
     }
 
     /// B2 (D2), 1818's shape: the sources serve the rows above a transaction
-    /// the log retired, and none serves it. Fail before: the first row above
+    /// the log retired, and the member that applied the record serves the
+    /// retired one as a hole (a retired copy is a hole wherever it is served;
+    /// the merge knows its span from it). Fail before: the first row above
     /// it read as past a gap at the retired seqs and was not carried.
     #[test]
     fn a_row_above_a_retired_one_is_not_past_a_gap() {
         let (mut h, out, txs) = claimant_with_a_retired_first_row();
         let a = asks(&out);
         let _ = win(&mut h, out, &fenced());
-        let out = answer_all(&mut h, &a, 2, 1, txs[1..].to_vec(), vec![vec![1, 2]]);
+        let mut served = vec![BackupTx {
+            records: Vec::new(),
+            ..txs[0].clone()
+        }];
+        served.extend(txs[1..].iter().cloned());
+        let out = answer_all(&mut h, &a, 2, 1, served, vec![vec![1, 2]]);
         let written = finish(&mut h, out, &fenced());
         assert!(written.is_some(), "the claim is made");
         assert_eq!(h.core.stats.kept_past_gap, 0);
@@ -67145,6 +67152,61 @@ mod kept_fetch {
     #[test]
     fn two_members_kept_prefixes_are_journaled_once() {
         assert_eq!(t4(false), 5);
+    }
+
+    /// ADR-59 part B (D2), 1526's shape: the first unshipped transaction of a
+    /// tenure's kept copies is a copy of a row another epoch's `DropHeld` of
+    /// the log retired (a re-shipped `TailOf` identity of epoch 7, kept under
+    /// epoch 1). It is served as a hole, a record-less span among the copies:
+    /// the rows above it are not past a gap. Fail before: the retired copy
+    /// was dropped from the merge and the gap rule, which looked for a
+    /// retired identity of the kept epoch, found none: every row above was
+    /// "past a gap" and not carried (`kept_past_gap`; `debug_assert` in
+    /// debug builds).
+    #[test]
+    fn a_retired_copy_of_another_epoch_is_served_as_a_hole_and_no_row_is_past_a_gap() {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3, 4], 1, false);
+        let a = asks(&out);
+        let _ = win(&mut h, out, &fenced());
+        let mut txs = rows(5);
+        // The log carries a `DropHeld` that retired (7, 40).
+        h.meta
+            .apply_segment_rows(
+                1,
+                7,
+                0,
+                &[9],
+                &[(0, 0)],
+                &[LogRecord::DropHeld {
+                    ino: 9,
+                    chunks: Vec::new(),
+                    rolled_back: vec![((7, 40), None)],
+                }],
+                &Default::default(),
+            )
+            .unwrap();
+        assert!(h.meta.row_retired(7, 40));
+        txs[0]
+            .records
+            .insert(0, LogRecord::TailOf { epoch: 7, jseq: 40 });
+        answer_all(&mut h, &a, 2, 1, txs.clone(), vec![vec![1, 2, 4]]);
+        let out = answer_all(&mut h, &a, 4, 1, txs, vec![vec![1, 2, 4]]);
+        let landed = finish(&mut h, out, &fenced());
+        // (Before, the rows above the retired copy were past a gap and, the
+        // log being at a newer epoch, the attempt ended: `kept_overtaken`.)
+        assert_eq!(h.core.stats.kept_overtaken, 0, "the attempt ends on a gap");
+        assert_eq!(h.core.stats.kept_past_gap, 0, "no row is past a gap");
+        assert!(landed.is_some(), "the claim lands");
+        assert_eq!(h.core.stats.kept_diverged, 0);
+        assert_eq!(
+            h.core.stats.tail_retired, 0,
+            "the hole is not a retired row"
+        );
+        assert_eq!(
+            reshipped(&h).len(),
+            4,
+            "each row above the hole is carried once, the retired one not at all"
+        );
     }
 
     #[test]

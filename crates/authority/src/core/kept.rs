@@ -808,7 +808,7 @@ impl Core {
         let mut past_gap = 0usize;
         let mut forced = false;
         for e in &epochs {
-            let mut all: BTreeMap<u64, &BackupTx> = BTreeMap::new();
+            let mut all: BTreeMap<u64, std::borrow::Cow<'_, BackupTx>> = BTreeMap::new();
             for (ti, t) in u.targets.iter().enumerate() {
                 if !t.epochs().contains(e) {
                     continue;
@@ -823,19 +823,29 @@ impl Core {
                     }
                     for tx in &a.txs {
                         // ADR-59 part B (D2): a copy of a transaction a
-                        // `DropHeld` of the log retired is dropped before the
-                        // sources are compared (a member that missed the
-                        // record serves it, a member that applied it holes
-                        // it): the sources do not disagree about a row that
-                        // was never to land, and the row above it is not
-                        // past a gap (`present` below).
-                        if !tx.records.is_empty() {
+                        // `DropHeld` of the log retired is served as a hole,
+                        // as a member that applied the record serves it (a
+                        // copy is a hole wherever it is served): the sources
+                        // do not disagree about a row that was never to
+                        // land, and its span, which a retired identity of
+                        // another epoch (`TailOf`) does not show to the gap
+                        // rule, is present as the record-less span it is.
+                        let tx = if tx.records.is_empty() {
+                            std::borrow::Cow::Borrowed(tx)
+                        } else {
                             let ident = constellation_meta::tail_identity(&tx.records)
                                 .unwrap_or((*e, tx.first));
                             if replica.row_retired(ident.0, ident.1) {
-                                continue;
+                                std::borrow::Cow::Owned(BackupTx {
+                                    first: tx.first,
+                                    last: tx.last,
+                                    records: Vec::new(),
+                                    origin: tx.origin,
+                                })
+                            } else {
+                                std::borrow::Cow::Borrowed(tx)
                             }
-                        }
+                        };
                         match all.get(&tx.first) {
                             // Two record-less spans from one seq (a sealed
                             // tail's journal gap, a member copy's hole of one
@@ -914,19 +924,10 @@ impl Core {
             let mut merged: Vec<BackupTx> = Vec::new();
             let mut next: Option<u64> = None;
             let mut gap = false;
-            // Seq `s` is present for the gap rule: in the log, or retired by
-            // a `DropHeld` (it will never be in the log, and no row above it
-            // waits for it).
-            // (A retired transaction covers `s` if it starts at or below it
-            // and no copy starts in between: its span is not known, its
-            // successors' starts are.)
-            let starts: BTreeSet<u64> = all.keys().copied().collect();
-            let present = |s: u64| -> bool {
-                replica.row_in_log(*e, s)
-                    || replica
-                        .retired_at_or_below(*e, s)
-                        .is_some_and(|a| starts.range(a + 1..=s).next().is_none())
-            };
+            // Seq `s` is present for the gap rule when the log carries it (a
+            // retired copy is a record-less span among the copies: it covers
+            // its seqs there).
+            let present = |s: u64| -> bool { replica.row_in_log(*e, s) };
             for (first, tx) in all {
                 if gap {
                     past_gap += 1;
@@ -969,7 +970,7 @@ impl Core {
                     }
                 }
                 next = Some(tx.last + 1);
-                merged.push(tx.clone());
+                merged.push(tx.into_owned());
             }
             merged_by_epoch.insert(*e, merged);
         }
