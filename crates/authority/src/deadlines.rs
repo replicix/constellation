@@ -127,6 +127,17 @@ pub struct Deadlines {
     /// ADR-55 (plan 46 M1.3 step 9): the first op under the root's own sticky
     /// grant waits for the grant record's archive PUT and the stream tick
     /// that runs it: `F + k`. Below the attempts window (D17).
+    ///
+    /// Second use, the liveness bound of R-H (b): once the archive carries
+    /// the record, the stream waits at most this long for a root row of its
+    /// keys still unshipped (a held, poisoned row), then the root releases
+    /// the grant unhonoured. The same quantity: an archive PUT and the tick
+    /// that ships a recoverable row. The worst case for an op is the two
+    /// waits in sequence, the record's (`F + k`) and the bound (`F + k`):
+    /// `2(F + k)`. D17 does not relate that to `attempts`; a poisoned row
+    /// costs the op one more `F + k`, accepted: the op is parked, not
+    /// refused, and a client's retry (`attempts`) finds the grant released
+    /// by then or the stream honoured.
     pub own_first_op_wait: u64,
     /// ADR-55 (step 9, Q3): an op across the boundary of the root's own
     /// sticky subtree waits for the release of the grant: the drain at most
@@ -691,6 +702,7 @@ impl Deadlines {
             ("release_seal_window", self.release_seal_window, "max(T, F)"),
             ("release_stream_window", self.release_stream_window, "F"),
             ("archive_put", self.archive_put, "F"),
+            // (Also the liveness bound of R-H (b); worst case 2(F + k).)
             ("own_first_op_wait", self.own_first_op_wait, "F + k"),
             (
                 "own_cross_release_wait",
