@@ -4626,8 +4626,11 @@ impl Driver {
                     let sync_tx = self.sync_tx.clone();
                     let bulk = self.bulk_pass.clone();
                     let wait = self.round_upload_wait;
+                    let runtime = self.deps.upload.clone();
                     tokio::spawn(async move {
-                        if round && crate::fault::sync_held() {
+                        if round
+                            && (crate::fault::sync_held() || runtime.hold.round_skipped_by_pause())
+                        {
                             let _ = tx.send(Internal::Event(Event::UploadsDone {
                                 op,
                                 result: UploadResult::Skip,

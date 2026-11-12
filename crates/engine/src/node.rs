@@ -3571,6 +3571,22 @@ mod tests {
             .open_view(ViewSpec::new("/"), caps.clone(), DeferredEvents::new())
             .unwrap();
         let node_id = old.node_id();
+        // The sync rounds are paused from here on, so the journal is
+        // unshipped when the stop comes whatever the machine's load: a
+        // round that raced the test's own steps used to ship the closed
+        // file's records first (the stop then found nothing to leave).
+        // A round counted at the pause started after it, so none is still
+        // in flight with the journal in hand.
+        old.upload().hold.pause_rounds(true);
+        let _ = old.sync_tx.send(crate::sync::SyncRequest::Nudge);
+        let paused_since = std::time::Instant::now();
+        while old.upload().hold.rounds_skipped() == 0 {
+            assert!(
+                paused_since.elapsed() < Duration::from_secs(60),
+                "no sync round met the pause"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // The bucket refuses new chunks from here on (packs too).
         let refuse = |mode: u32| {
             for dir in ["chunks", "packs"] {
