@@ -183,6 +183,11 @@ pub(crate) struct ClientOp {
     /// behind a lost chunk: its unsettled `EIO` is labelled
     /// `held-behind-lost-chunk` (`take_unsettled_lost_chunk`).
     pub lost_chunk_held: bool,
+    /// The sequencer's last answer was a `Held` that says the op is this
+    /// node's own to run (`MutateOutcome::Held::yours`). An op sent to the
+    /// sequencer without that word may have run there, and a delegation that
+    /// installs on its keys meanwhile does not run it again.
+    pub sequencer_says_mine: bool,
     /// A delegate executed the op and said so (`Accepted` with its
     /// generation): what the op still lacks is the commit of the delegate's
     /// rows through the root (it awaits the log). The sim judges its
@@ -843,6 +848,7 @@ impl Core {
                 gate_recall_wait: false,
                 designation_held: false,
                 lost_chunk_held: false,
+                sequencer_says_mine: false,
                 accepted_by_delegate: false,
                 settle_withdraw_failed: false,
                 withdraw: None,
@@ -1839,6 +1845,9 @@ impl Core {
             "forward reply"
         );
         if !matches!(&outcome, MutateOutcome::Held { .. }) {
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.sequencer_says_mine = false;
+            }
             // ADR-58 C3: only a `Held` that says so labels a settle.
             if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
                 c.lost_chunk_held = false;
@@ -2077,7 +2086,13 @@ impl Core {
                 retry_ms,
                 outwait_ms,
                 lost_chunk,
+                yours,
             } => {
+                // The last `Held`'s word on whose the op is
+                // (`MutateOutcome::Held::yours`).
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.sequencer_says_mine = yours;
+                }
                 // (The last `Held`'s word: a later `Held` that does not say
                 // it, or any other answer, takes the label back.)
                 if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.settle) {
@@ -2419,6 +2434,7 @@ impl Core {
             let own = self
                 .clients
                 .get(&rid)
+                .filter(|c| !c.forwarded || c.sequencer_says_mine)
                 .map(|c| (c.op.clone(), c.deps, c.settle));
             if let Some((op, deps, settle)) = own {
                 let tag = self
@@ -3187,6 +3203,7 @@ impl Core {
                 retry_ms: 0,
                 outwait_ms: None,
                 lost_chunk: false,
+                yours: false,
             };
         }
         self.execute_local(now, rid, epoch, replica, out)
