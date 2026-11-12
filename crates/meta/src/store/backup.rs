@@ -272,14 +272,19 @@ impl Meta {
         };
         let mut top = *self.backup_tail_top.lock().unwrap();
         let mut tx = self.db.write_tx();
-        for t in txs {
+        // ADR-59 part B (D2): what a `DropHeld` retired is stored as a hole,
+        // where it lands on no stored span (the gate's `tail_retired` rule
+        // covers the rest).
+        let holed = self.holes_for_retired_tx(&tx, epoch, txs)?;
+        let hole_of = |i: usize| holed.as_ref().map(|h| &h[i]);
+        for (i, t) in txs.iter().enumerate() {
             // Past every stored span of the epoch (an append's steady
             // state): nothing to supersede, nothing that spans it.
             if top.is_some_and(|(e, last)| e == epoch && last < t.first) {
                 tx.insert(
                     &self.backup_tail,
                     tail_key(epoch, t.first),
-                    postcard::to_allocvec(t)?,
+                    postcard::to_allocvec(hole_of(i).unwrap_or(t))?,
                 );
                 top = Some((epoch, t.last));
                 continue;
@@ -383,12 +388,17 @@ impl Meta {
                 t.first,
                 t.last
             );
+            let stored = if inside.is_empty() && reaches.is_none() {
+                hole_of(i).unwrap_or(t)
+            } else {
+                t
+            };
             for (k, _) in inside {
                 if k != at {
                     tx.remove(&self.backup_tail, k);
                 }
             }
-            tx.insert(&self.backup_tail, at, postcard::to_allocvec(t)?);
+            tx.insert(&self.backup_tail, at, postcard::to_allocvec(stored)?);
             top = None;
         }
         // Where the epoch's highest stored span ends (spans do not overlap,

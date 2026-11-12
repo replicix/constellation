@@ -5215,9 +5215,7 @@ impl Meta {
             None,
             |_| true,
         )?;
-        meta.retire_rolled_back_tx(tx, idents);
-        super::member::hole_rolled_back_tx(tx, meta, idents)?;
-        super::backup::hole_tail_rolled_back_tx(tx, meta, idents)?;
+        meta.retire_and_hole_tx(tx, idents)?;
         Ok(stranded)
     }
 
@@ -6033,9 +6031,7 @@ impl Meta {
         // Plan 43 C1-4: what the log delivered tells the member copies
         // (coverage, `TailFollowsThrough`, an abandon, a newer marker).
         super::member::note_log_tail_tx(&mut tx, self, epoch, records, prev_applied)?;
-        self.retire_rolled_back_tx(&mut tx, &rolled);
-        super::member::hole_rolled_back_tx(&mut tx, self, &rolled)?;
-        super::backup::hole_tail_rolled_back_tx(&mut tx, self, &rolled)?;
+        self.retire_and_hole_tx(&mut tx, &rolled)?;
         let member = super::member::member_rules_tx(
             &mut tx,
             self,

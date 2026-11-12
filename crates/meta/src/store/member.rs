@@ -1550,6 +1550,22 @@ pub(crate) fn put_row_tx(
         rid = ?row.rid,
         "member copy row kept"
     );
+    // D2: a retired transaction is stored as a hole (and not held).
+    let hole;
+    let (row, retired) =
+        match meta.holes_for_retired_tx(&*tx, epoch, std::slice::from_ref(&row.tx))? {
+            Some(mut holes) => {
+                hole = MemberTx {
+                    tx: holes.remove(0),
+                    class: row.class,
+                    rid: None,
+                    op: None,
+                    lock_tag: LockTag::NONE,
+                };
+                (&hole, true)
+            }
+            None => (row, false),
+        };
     let key = tail_key(member_epoch(epoch), row.tx.first);
     let keep = match tx.get(&meta.backup_tail, &key)? {
         Some(v) => Some(crate::record::from_bytes_exact::<MemberTx>(&v)?),
@@ -1565,7 +1581,7 @@ pub(crate) fn put_row_tx(
     tx.insert(&meta.backup_tail, key, postcard::to_allocvec(&row)?);
     set_info_tx(tx, epoch, meta, None, row.tx.last)?;
     meta.note_member_copies(true);
-    Ok(true)
+    Ok(!retired)
 }
 
 fn drop_epoch_tx(tx: &mut SingleWriterWriteTx, meta: &Meta, epoch: u64) -> Result<(), MetaError> {
@@ -1654,7 +1670,15 @@ pub(crate) fn member_rules_tx(
                 continue;
             }
             if f.own {
-                left += 1;
+                // (A hole of this epoch's copy goes with the rows it lay
+                // below: a dropper that is the holder never applies a foreign
+                // segment to sweep it.)
+                if row.tx.records.is_empty() {
+                    retire_holes.push((key, first));
+                } else {
+                    live_above = live_above.max(Some(first));
+                    left += 1;
+                }
                 continue;
             }
             if let Some(known) = abandoned.get(&e) {
@@ -1775,6 +1799,78 @@ impl Meta {
         for (epoch, jseq) in idents {
             tx.insert(&self.local, retired_key(*epoch, *jseq), Vec::new());
         }
+        if !idents.is_empty() {
+            self.any_retired
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Retire `idents` and hole this node's copies of them (member copies
+    /// and backup tail): the one step every path that learns of a `DropHeld`
+    /// takes (a segment applied, the committed stream, this node's own ship
+    /// of the record; the shipper never applies its own segment).
+    pub(crate) fn retire_and_hole_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        idents: &BTreeSet<(u64, u64)>,
+    ) -> Result<(), MetaError> {
+        self.retire_rolled_back_tx(tx, idents);
+        hole_rolled_back_tx(tx, self, idents)?;
+        super::backup::hole_tail_rolled_back_tx(tx, self, idents)?;
+        Ok(())
+    }
+
+    /// Recompute the retired flag from the store (open).
+    pub(crate) fn refresh_retired_flag(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        let any = r
+            .range(
+                &self.local,
+                retired_key(0, 0)..=retired_key(u64::MAX, u64::MAX),
+            )
+            .next()
+            .is_some();
+        self.any_retired
+            .store(any, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Whether the transaction `ident` was retired by a `DropHeld`.
+    fn is_retired_tx(
+        &self,
+        tx: &SingleWriterWriteTx,
+        ident: (u64, u64),
+    ) -> Result<bool, MetaError> {
+        Ok(tx
+            .get(&self.local, retired_key(ident.0, ident.1))?
+            .is_some())
+    }
+
+    /// D2: a copy store never keeps what a `DropHeld` retired. `txs`, as
+    /// streamed for `epoch`, with each transaction whose identity is retired
+    /// replaced by a hole of the same span (the copy stays contiguous);
+    /// `None` when none is (or nothing is retired at all: one atomic read).
+    pub(crate) fn holes_for_retired_tx(
+        &self,
+        tx: &SingleWriterWriteTx,
+        epoch: u64,
+        txs: &[BackupTx],
+    ) -> Result<Option<Vec<BackupTx>>, MetaError> {
+        if !self.any_retired.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let mut out: Option<Vec<BackupTx>> = None;
+        for (i, t) in txs.iter().enumerate() {
+            if t.records.is_empty() {
+                continue;
+            }
+            let ident = tail_identity(&t.records).unwrap_or((epoch, t.first));
+            if self.is_retired_tx(tx, ident)? {
+                let v = out.get_or_insert_with(|| txs.to_vec());
+                v[i].records = Vec::new();
+            }
+        }
+        Ok(out)
     }
 
     /// The highest retired identity `(epoch, j)` with `j <= jseq`: the start
