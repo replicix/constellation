@@ -2202,7 +2202,9 @@ impl Core {
         // Plan 46 M1.2 step 7 (c3-spec §6.2): the delegates' rows this node
         // appended as the root go to the member copy of their generation
         // (`JournalTx::appended`); its own rows as a delegate stay.
-        let stranded = replica.strand_deposed(floor).map_err(|e| e.to_string())?;
+        let stranded = replica
+            .strand_deposed(floor, self.cfg.deposed_root_strands_own_stream)
+            .map_err(|e| e.to_string())?;
         rolled += (stranded.locals + stranded.member_copied + stranded.deleg_member_copied) as u64;
         self.stats.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
         self.note_committed_stranded(&stranded);

@@ -648,6 +648,68 @@ mod tests {
         );
     }
 
+    /// Plan 46 M1.3 step 9 (ADR-55), test 17: the root's own sticky grant is
+    /// an entry of the same view as any holder's: its fast path admits an op
+    /// the stream owns at local speed once the core publishes the stream as
+    /// not stopped (honoured: the record is archived), and admits nothing
+    /// while the core publishes it stopped (the record is not carried yet:
+    /// the op goes through the core, which parks it). The root's own fast
+    /// path (`root_fast_path`) never executes a name the stream owns.
+    #[test]
+    fn the_root_fast_path_uses_the_delegate_entry_for_its_own_grant() {
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::{LogRecord, Meta, MutateOp};
+        let meta = Meta::open_in_memory().unwrap();
+        // (Node 1 is this node, the root, and the stream's holder.)
+        meta.set_node_prefix(1).unwrap();
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        meta.apply_records(&[
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino: dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::delegate_one(1, 7, dir, constellation_meta::SubtreeKind::Sticky),
+        ])
+        .unwrap();
+        let create = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let view = DelegateView::default();
+        let now = Now::same(0);
+        let publish = |stopped: bool| {
+            view.mirror(&constellation_authority::core::DelegView {
+                mine: vec![(vec![dir], 7, i64::MAX / 2, stopped, 0, 0, 0, String::new())],
+                ..Default::default()
+            })
+        };
+        publish(true);
+        assert!(
+            view.admit_for(&meta, &create, now).is_none(),
+            "admitted under a grant whose record the archive has not carried"
+        );
+        publish(false);
+        assert_eq!(
+            view.admit_for(&meta, &create, now).map(|a| a.gen),
+            Some(7),
+            "the root's own grant is not an entry of the delegate view"
+        );
+        // And the root's own fast path leaves the name to the stream.
+        assert!(
+            meta.root_fast_path(&create).is_none(),
+            "the root's fast path executes a name its own stream owns"
+        );
+    }
+
     /// ADR-56: the engine does not stop the fast path on a handover request
     /// (nor ask the caller to wait for it); a recall does.
     #[test]

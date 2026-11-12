@@ -4194,6 +4194,160 @@ mod verbatim_append_tests {
         assert_eq!(r.is_err(), cfg!(debug_assertions));
         assert_eq!(meta.take_deleg_append_uncompleted(), 1);
     }
+
+    /// Plan 46 M1.3 step 9 (ADR-55), test 15: a `Refused` row of a stream
+    /// whose rid is completed in this journal already (the root is the holder
+    /// of its own stream and the rid ran; or the holder's refusal came after
+    /// an earlier execution) is skipped, not lost: the log's index of the
+    /// stream still advances (fail-before: the `Refused` branch returned
+    /// before noting it, and the stream's cursor stalled at the row).
+    #[test]
+    fn a_self_appended_refusal_advances_the_log_index() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        crate::mutate::execute(
+            &meta,
+            &crate::mutate::MutateOp::Create {
+                parent: ROOT_INO,
+                name: "a".into(),
+                ino: meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(rid(1)),
+        )
+        .unwrap();
+        assert_eq!(meta.log_stream_idx(gen).unwrap(), 0);
+        let refusal = vec![LogRecord::Refused {
+            rid: rid(1),
+            code: constellation_types::Code::NotFound,
+        }];
+        // The stream's row is skipped (the rid is completed here): its index
+        // is appended all the same.
+        assert!(!meta
+            .apply_delegate_tx(&refusal, None, gen, 1, Default::default())
+            .unwrap());
+        assert_eq!(
+            meta.log_stream_idx(gen).unwrap(),
+            1,
+            "a skipped refusal left the log's index behind"
+        );
+        assert_eq!(journal(&meta).len(), 1, "the row was journaled twice");
+    }
+
+    /// Test 14: a deposed root's own stream rows are holder rows: the
+    /// deposition strands the root's rows of the older epoch and leaves the
+    /// stream's (neither rolled back nor member-copied).
+    #[test]
+    fn a_deposed_roots_own_stream_rows_are_neither_stranded_nor_member_copied() {
+        let gen = 9;
+        let run = |own_stream_knob: bool| {
+            let meta = Meta::open_in_memory().unwrap();
+            meta.set_holder_epoch(1);
+            crate::mutate::execute(
+                &meta,
+                &crate::mutate::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "root-row".into(),
+                    ino: meta.allocate_ino(ROOT_INO).unwrap(),
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(rid(1)),
+            )
+            .unwrap();
+            for n in 2..=3u64 {
+                meta.delegate_execute(
+                    &crate::mutate::MutateOp::Create {
+                        parent: ROOT_INO,
+                        name: format!("s{n}"),
+                        ino: meta.allocate_ino(ROOT_INO).unwrap(),
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                    },
+                    Some(rid(n)),
+                    gen,
+                    Default::default(),
+                    &Default::default(),
+                    constellation_types::clock::Now::same(0),
+                )
+                .unwrap();
+            }
+            assert_eq!(journal(&meta).len(), 3);
+            let stranded = meta.strand_deposed_with(2, own_stream_knob).unwrap();
+            (meta, stranded)
+        };
+        let (meta, stranded) = run(false);
+        assert_eq!(stranded.locals, 1, "only the root's row is rolled back");
+        assert_eq!(stranded.member_copied + stranded.deleg_member_copied, 0);
+        let rows = journal(&meta);
+        assert_eq!(rows.len(), 2, "the stream's rows left the journal");
+        assert!(rows.iter().all(|(h, _)| h.gen == gen));
+        assert_eq!(meta.delegate_idx(gen).unwrap(), 2);
+        // The negative control: the knob strands them with the root's.
+        let (meta, stranded) = run(true);
+        assert_eq!(stranded.locals, 3, "the control did not strand the stream");
+        assert!(journal(&meta).is_empty());
+    }
+
+    /// Test 16: a root that is the holder of its own stream ships the stream's
+    /// rows in its own segment under their origin: the shipper's guard is
+    /// silent while the table lists the generation.
+    #[test]
+    fn a_root_holders_row_ships_with_its_origin_and_retires() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        meta.apply_records_journaled(&[LogRecord::delegate_one(
+            1,
+            gen,
+            ROOT_INO,
+            crate::SubtreeKind::Sticky,
+        )])
+        .unwrap();
+        let (_, idx) = meta
+            .delegate_execute(
+                &crate::mutate::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "s".into(),
+                    ino: meta.allocate_ino(ROOT_INO).unwrap(),
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(rid(2)),
+                gen,
+                Default::default(),
+                &Default::default(),
+                constellation_types::clock::Now::same(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+        let seqs: Vec<u64> = {
+            let r = meta.db.read_tx();
+            read_journal_txs(&r, &meta)
+                .unwrap()
+                .into_iter()
+                .map(|(first, _)| first)
+                .collect()
+        };
+        let origins = meta.journal_origins(&seqs).unwrap();
+        assert!(origins.contains(&(gen, 1)), "{origins:?}");
+        let batch: Vec<(u64, LogRecord)> = {
+            let r = meta.db.read_tx();
+            read_journal_txs(&r, &meta)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(first, row)| journal_records(&r, &meta, first, row.last).unwrap())
+                .collect()
+        };
+        meta.check_shippable_origins(&batch).unwrap();
+        assert_eq!(meta.unjustified_ships(), 0);
+    }
 }
 
 #[cfg(test)]

@@ -1853,7 +1853,8 @@ impl Core {
                         // Unreachable in the takeover gate (the `!admitted`
                         // halt above recalls on demand, ADR-44); kept for
                         // the plan's exhaustiveness.
-                        super::delegate::RecallPlan::Gated => {
+                        super::delegate::RecallPlan::Gated
+                        | super::delegate::RecallPlan::Hold(_) => {
                             return Err(Halt::Recall);
                         }
                         super::delegate::RecallPlan::Refuse(code)

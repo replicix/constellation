@@ -3293,6 +3293,9 @@ impl Core {
                     }
                     // The gate recalls nothing (ADR-42): retried once it opens.
                     super::delegate::RecallPlan::Gated => return MutateOutcome::Busy,
+                    // ADR-55: the root's own stream; the delegate executor
+                    // takes the op once it is honoured.
+                    super::delegate::RecallPlan::Hold(_) => return MutateOutcome::Busy,
                 }
             };
             let deps_wait = (!settle && !replica.reaches_streams(&deps)).then_some(deps);
@@ -3341,6 +3344,9 @@ impl Core {
                 self.park_exec_local(now, wait, None, rid, false);
                 return MutateOutcome::Busy;
             }
+        }
+        if !settle {
+            self.audit_root_path_execution(&op, replica);
         }
         if self.cfg.placement && self.cfg.delegation {
             let dirs = Core::dirs_of_keys(&super::holder::keys_of_op(&op), replica);
