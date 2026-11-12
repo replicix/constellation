@@ -6287,6 +6287,20 @@ impl Core {
         });
         if !moved.is_empty() {
             self.lk.mirror_dirty = true;
+            // Plan 46 M1.2 step 10: a stream that released a subtree is
+            // granted it again under the same generation (`re-delegated
+            // after a cross-subtree op`), and the grants its release handed
+            // back go to it again: they are its own once more, and its next
+            // release hands them back for real. Left in `returned`, that
+            // answer was taken for a copy of the first and dropped: neither
+            // table had the grant any more, and the delegate granted the
+            // inode over its own holder's (sim
+            // `locks-unlinked-delegated-dcrash-pause` seed 3808).
+            if let Some(seen) = self.lk.returned.get_mut(&gen) {
+                for g in &moved {
+                    seen.remove(&g.id);
+                }
+            }
             self.lk.handoff.entry(gen).or_default().extend(moved);
             self.dw.unsettle(gen);
         }
@@ -6783,9 +6797,22 @@ impl Core {
         let grants = if whole {
             self.lock_take_generation(gen, replica)
         } else {
-            replica
+            let taken = replica
                 .locks()
-                .take_where_outside(|ino| dirs.iter().any(|dir| replica.is_under(ino, *dir)))
+                .take_where_outside(|ino| dirs.iter().any(|dir| replica.is_under(ino, *dir)));
+            // Plan 46 M1.2 step 10: the stream lives on, and the root may
+            // grant it a released subtree again with these very grants: that
+            // handoff is a move of its own, not a re-send of the one that
+            // brought them here first (sim
+            // `locks-unlinked-delegated-dcrash-pause` seed 3808: skipped as
+            // one, the delegate served the subtree without its own holder's
+            // grant).
+            if let Some(seen) = self.lk.moved_seen.get_mut(&gen) {
+                for g in &taken {
+                    seen.remove(&g.id);
+                }
+            }
+            taken
         };
         // What is left of each record is a duration on this node's wait
         // clock (plan 43 C7-H1): the wire carries no absolute.
@@ -7084,6 +7111,27 @@ impl Core {
                 // A re-sent handoff: each id once, and never over a
                 // newer grant of the same node, or next to a conflicting
                 // one, here.
+                //
+                // Plan 46 M1.2 step 10: nor on an inode this replica does
+                // not show as the generation's yet (the root granted the
+                // stream a subtree again, and the renewal answer came
+                // before the row). Installed, the grant sat on an inode that
+                // resolves to the root, so the next batch handed it over as
+                // having left the subtree (`deleg_leaving_grants`): the root
+                // kept it in a table that does not serve the inode, and
+                // this node granted the inode over it once it honoured the
+                // subtree (sim `locks-unlinked-delegated-dcrash-pause` seed
+                // 4016). Every granting renewal re-sends the live ones, and
+                // a grown subtree is honoured only with the answer to a
+                // renewal sent after its row was committed here
+                // (`deleg_unpark_grown`), which carries them again.
+                if !matches!(
+                    replica.resolve_ownership(&Self::read_keys(g.ino, None)),
+                    constellation_meta::delegation::Ownership::Delegated(d) if d.gen == gen
+                ) {
+                    self.stats.lock_handoff_deferred += 1;
+                    continue;
+                }
                 if !self.lk.moved_seen.entry(gen).or_default().insert(g.id) {
                     continue;
                 }

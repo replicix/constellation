@@ -3513,7 +3513,14 @@ rebuilds, and takes the root over again; seeds 558 (unclocked) and 2383
 (`regression_locks_unlinked_delegated_dcrash_pause_seed_558`: the rows the
 rebuild dropped stayed counted in the generation's index, and the new root
 inherited the generation past them; in 2383 the skipped row is a delegate's
-refusal, whose speculation then never settles). The configuration runs
+refusal, whose speculation then never settles). Seeds 3808 and 4016 had two
+exclusive holders after the delegate released `d1` and the root granted it
+to the same generation again with the lock grants the release handed back
+(`regression_locks_unlinked_delegated_dcrash_pause_seeds_3808_and_4016`): a
+second release's hand-back was dropped as a copy of the first, the
+re-handed grant was skipped as a re-send of the first move, or a handoff
+that came before the re-delegation row was carried back out as leaving the
+subtree. The configuration runs
 without the clock-fault mix; `-dcrash` itself runs it. Load review F1, the token at the write, has
 two faults of its own. `StallStep` makes a node's next step take its
 `now`, then wait, then decide with it. `WriterLockHold` makes the lease
