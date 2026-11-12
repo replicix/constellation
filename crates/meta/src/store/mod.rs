@@ -687,6 +687,12 @@ pub struct Meta {
     /// `None`: unknown (fresh open, or cleared), the next trim scans
     /// from the start and establishes it.
     pub(crate) backup_tail_floor: std::sync::Mutex<Option<(u64, u64)>>,
+    /// ADR-59 review 3 (S1): an upper bound `(epoch, last)` on where every
+    /// live `backup_tail` span of `epoch` ends, so an append past it (the
+    /// steady state) skips the overlap probes (`Meta::backup_append`).
+    /// `None`: unknown (fresh open, or cleared), the next append of a
+    /// span that overlaps nothing it knows of probes and establishes it.
+    pub(crate) backup_tail_top: std::sync::Mutex<Option<(u64, u64)>>,
     /// Plan 43 C1-4: this node holds a member copy (`store::member`); the
     /// segment path reads it before looking for one.
     pub(crate) any_member_copy: std::sync::atomic::AtomicBool,
@@ -1355,6 +1361,7 @@ impl Meta {
             unshipped_seqs: std::sync::Mutex::new(UnshippedSeqs::default()),
             deleg_rows: std::sync::Mutex::new(spec::DelegRows::default()),
             backup_tail_floor: std::sync::Mutex::new(None),
+            backup_tail_top: std::sync::Mutex::new(None),
             any_member_copy: std::sync::atomic::AtomicBool::new(false),
             held_copies: std::sync::Mutex::new(Vec::new()),
             any_held_copy: std::sync::atomic::AtomicBool::new(false),

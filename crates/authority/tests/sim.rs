@@ -6597,6 +6597,26 @@ fn the_conservative_parent_taint_control_fails_them() {
     }
 }
 
+/// ADR-59 part A: `metered-shared+links` seed 1479. A successor re-shipped
+/// its predecessor's acknowledged rows behind a lost chunk, shipped the
+/// refusals among them ahead, and restarted; its resend to the backup from
+/// the first boundary carried the shipped rows as holes, which left the
+/// first send's copies keyed inside them. The backup's contiguous hold
+/// ended at the first such hole, and the next takeover dropped every row
+/// past it as never acknowledged: an acknowledged `Unlink f0` was lost and
+/// a later rename of `f0` answered ENOENT. A resent hole now supersedes the
+/// copies it spans (`Meta::backup_append`).
+#[test]
+fn a_backups_resent_hole_keeps_the_acknowledged_rows_past_it() {
+    let seed = 1479;
+    run_seed(seed, config_variant(metered_shared_config(), "links")).unwrap_or_else(|e| {
+        panic!(
+            "metered-shared+links seed {seed}: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=metered-shared+links"
+        )
+    });
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and

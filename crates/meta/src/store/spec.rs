@@ -6569,6 +6569,7 @@ impl Meta {
         staged.drain_into(self.usage_tracker());
         if !tails.is_empty() {
             *self.backup_tail_floor.lock().unwrap() = None;
+            *self.backup_tail_top.lock().unwrap() = None;
             for ((gen, idx), one) in journaled {
                 one.staged.drain_into(self.usage_tracker());
                 one.moved.drain_into(self.usage_tracker());

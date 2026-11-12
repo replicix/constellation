@@ -4768,7 +4768,10 @@ takeover's identity dedup (a later epoch's tail carrying the re-ship of an
 earlier epoch's row) is counted apart from a done rid (`tail_dedup`,
 `tail_done`). A hole (the record-less span a backup is streamed for rows the
 holder shipped ahead of a held one) is retired by the marker that follows its
-epoch: nothing else carries it.
+epoch: nothing else carries it. A resend from the first boundary (a holder
+that restarted) carries as one hole rows an earlier send had as transactions;
+the backup's hole supersedes the copies it spans, or its contiguous hold would
+end there and a successor drop the acknowledged rows past it.
 
 **Rejected**: removing `named.shared` from the planner alone (the captured
 before-images re-enter the same keys); treating a seed that changes the mode
