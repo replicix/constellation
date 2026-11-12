@@ -9648,7 +9648,7 @@ struct OracleTotals {
     /// reason: released, abandoned, other).
     sticky: [u64; 5],
     sticky_core: [u64; 16],
-    root_own_core: [u64; 13],
+    root_own_core: [u64; 15],
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
@@ -10043,8 +10043,8 @@ impl OracleTotals {
             .zip(r.root_own_core)
             .enumerate()
         {
-            // (Index 3 is the longest wait: a maximum.)
-            if i == 3 {
+            // (Indexes 3 and 13 are the longest waits: maxima.)
+            if i == 3 || i == 13 {
                 *t = (*t).max(c);
             } else {
                 *t += c;
@@ -10258,7 +10258,8 @@ impl OracleTotals {
         eprintln!(
             "ROOT-OWN-TOTALS {label} seeds {}/{seeds}: the root's own grants made {}, answers in its own stream {}, held by its root path {}, \
              longest commit wait {} ms, messages to itself delivered inline {} (cut off {}), candidates skipped for the root {}, released by its dwell {}, rows streamed after its deposition {}, inbox-only forwards refused in its stream {}, \
-             released by an op across its boundary (own client {}, forwarded {}), root-path answers that waited for the archive meanwhile {}",
+             released by an op across its boundary (own client {}, forwarded {}), root-path answers that waited for the archive meanwhile {}, \
+             R-H (b): longest wait of an own stream for a root row after its record was archived {} ms (`root_own_honour_wait_ms_max`), grants released unhonoured {}",
             self.seeds,
             self.root_own_core[0],
             self.root_own_core[1],
@@ -10272,7 +10273,9 @@ impl OracleTotals {
             self.root_own_core[9],
             self.root_own_core[10],
             self.root_own_core[11],
-            self.root_own_core[12]
+            self.root_own_core[12],
+            self.root_own_core[13],
+            self.root_own_core[14]
         );
         eprintln!(
             "QUARANTINE-TOTALS {label} seeds {}/{seeds}: restart quarantines {}, own writes parked {}, forwards answered Held {}, \
@@ -14324,6 +14327,38 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         // ADR-59's negative control (`Meta::set_parent_taint_conservative`).
         "parent-taint-conservative" => SimConfig {
             parent_taint_conservative: true,
+            ..cfg
+        },
+        // Plan 46 M1.3 step 9 (ADR-55, R-H (b)): a far client's chunk write
+        // under the root's `d1` is held for 3 s (`upload_hold_ms`), well past
+        // the grant (~1.6 s) and the archive PUT that carries its record: the
+        // root row is deferred behind the record, so the stream is honoured
+        // only once the row ships (`root_own_honour_wait_ms_max`, or a
+        // release past the bound). The root's own ops on the same names
+        // follow the record. Use it on `far-root-writes-paused`. Only node 2's
+        // clients write, as `far-placement` and the other far configurations
+        // with held chunks fail to reach quiescence on some seeds of their
+        // own.
+        "deferred" => SimConfig {
+            chunk_writes: 0.6,
+            chunk_write_nodes: vec![2],
+            upload_hold_ms: 3_000,
+            ..cfg
+        },
+        // The same through a lost chunk: node 1's own client's write under
+        // `d1` is poisoned (held) at 1.2 s, shortly before the root dominates
+        // `d1`; the liveness bound releases the grant if the row never ships.
+        "lost-chunk" => SimConfig {
+            chunk_writes: 0.6,
+            chunk_write_nodes: vec![1],
+            faults: {
+                let mut f = cfg.faults.clone();
+                f.push(ScheduledFault {
+                    at_ms: 1_200,
+                    kind: FaultKind::LoseDirtyChunks { node: 1 },
+                });
+                f
+            },
             ..cfg
         },
         // Plan 46 M1.4 step 0: the durability oracle strict (`+durability`).
