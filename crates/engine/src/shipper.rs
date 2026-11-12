@@ -222,9 +222,9 @@ mod tests {
     use super::*;
     use crate::authority_driver::Standalone;
     use constellation_meta::MetaStore;
-    use constellation_store_s3::LeaseMode;
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
+    use replicix_objcas::LeaseMode;
     use std::sync::Arc as StdArc;
 
     /// A writing node for these tests: the real core over a real `Meta`,
@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(fresh.applied_seq().unwrap(), a.meta.applied_seq().unwrap());
         assert!(fresh.child_ino(d.ino, "late").unwrap().is_some());
         assert!(fresh
-            .chunk_ref_exists(&constellation_fs_core::ChunkHash([0; 32]))
+            .chunk_ref_exists(&replicix_chunkfmt::ChunkHash([0; 32]))
             .is_ok());
     }
 
@@ -445,7 +445,7 @@ mod tests {
             &backend,
             None,
             &config,
-            constellation_store_s3::lease::now_unix_ms(),
+            replicix_objcas::lease::now_unix_ms(),
         )
         .await
         .unwrap();
@@ -523,9 +523,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rebuild_keeps_the_orphans_a_view_has_open() {
         use constellation_fs_core::manifest::{ChunkInfo, Manifest};
-        use constellation_fs_core::{ChunkHash, ChunkLayout};
-        use constellation_store_s3::{ChunkStore, CompressionSetting};
+        use constellation_store_s3::ChunkStore;
         use object_store::ObjectStoreExt;
+        use replicix_chunkfmt::CompressionSetting;
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
         use std::sync::Mutex;
 
         struct Opens(Mutex<Vec<constellation_fs_core::Ino>>);
@@ -610,7 +611,7 @@ mod tests {
             &backend,
             None,
             &config,
-            constellation_store_s3::lease::now_unix_ms(),
+            replicix_objcas::lease::now_unix_ms(),
         )
         .await
         .unwrap()
@@ -629,12 +630,9 @@ mod tests {
         assert_eq!(b.meta.manifest(open.ino).unwrap(), Some(manifest));
         assert_eq!(b.meta.getattr(open.ino).unwrap().unwrap().nlink, 0);
         holds.refresh_once().await.unwrap();
-        let roots = crate::gc::hold_roots(
-            backend.clone(),
-            constellation_store_s3::lease::now_unix_ms(),
-        )
-        .await
-        .unwrap();
+        let roots = crate::gc::hold_roots(backend.clone(), replicix_objcas::lease::now_unix_ms())
+            .await
+            .unwrap();
         assert!(roots.contains(&hash));
         view.0.lock().unwrap().clear();
         holds.refresh_once().await.unwrap();
@@ -747,9 +745,9 @@ mod root_owner_tests {
     use super::*;
     use crate::authority_driver::Standalone;
     use constellation_meta::MetaStore;
-    use constellation_store_s3::LeaseMode;
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
+    use replicix_objcas::LeaseMode;
     use std::sync::Arc as StdArc;
 
     fn node(store: &StdArc<InMemory>, id: u64) -> (Arc<Meta>, Standalone, tempfile::TempDir) {

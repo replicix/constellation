@@ -55,6 +55,7 @@ ureq = { version = "2", features = ["json"] }
 zstd.workspace = true
 
 [dev-dependencies]
+replicix-objcas.workspace = true
 # `tests/s3_cut_heal.rs`: the daemons' own S3 client (`constellation-store-s3`,
 # a regular dependency above) through the counting relay, across a cut and a
 # heal.

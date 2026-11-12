@@ -188,10 +188,10 @@ fn an_unlinked_last_name_is_reported_from_before_the_unlink() {
 fn with_data() -> Vec<u8> {
     use constellation_fs_core::manifest::{ChunkInfo, Manifest};
     Manifest {
-        layout: constellation_fs_core::ChunkLayout::new(4096),
+        layout: replicix_chunkfmt::ChunkLayout::new(4096),
         file_len: 4,
         chunks: ChunkInfo::Inline(
-            [(0u64, constellation_fs_core::ChunkHash::of(b"data"))]
+            [(0u64, replicix_chunkfmt::ChunkHash::of(b"data"))]
                 .into_iter()
                 .collect(),
         ),

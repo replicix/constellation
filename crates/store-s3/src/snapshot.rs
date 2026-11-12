@@ -119,17 +119,17 @@ impl SnapshotStore {
         let body = serde_json::to_vec_pretty(record)?;
         // Plan 30 §M4 item 1: a 409 retries; our own create that landed
         // behind a 412 is ours, not "already exists".
-        match crate::cas::put_conditional(
+        match replicix_objcas::cas::put_conditional(
             self.store.as_ref(),
             &layout::snapshot(&record.id()),
             body.into(),
             PutMode::Create,
-            crate::cas::Verify::Body,
+            replicix_objcas::cas::Verify::Body,
         )
         .await?
         {
-            crate::cas::CasPut::Won(_) => Ok(()),
-            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => {
+            replicix_objcas::cas::CasPut::Won(_) => Ok(()),
+            replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
                 Err(StoreError::AlreadyExists)
             }
         }

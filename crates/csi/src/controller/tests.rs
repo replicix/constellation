@@ -1,8 +1,10 @@
 use super::*;
 use crate::control_client::{InMemoryControl, InMemoryEngines, SizeIndex};
-use crate::proto::csi::v1::volume_capability::{AccessMode, BlockVolume, MountVolume};
 use constellation_control::proto::types::{
     CloneParams, FsCreateParams, SnapshotCreateParams, SnapshotHoldParams,
+};
+use replicix_csi_common::proto::csi::v1::volume_capability::{
+    AccessMode, BlockVolume, MountVolume,
 };
 use tonic::Code as GrpcCode;
 
@@ -1445,9 +1447,12 @@ async fn cross_pool_and_cross_shard_sources_are_refused() {
     let name = (0..)
         .map(|i| format!("pvc-s4-{i}"))
         .find(|n| {
-            crate::params::ClassParams::parse(&src4.parameters)
-                .unwrap()
-                .shard_for(n)
+            replicix_csi_common::params::ClassParams::parse(
+                &src4.parameters,
+                crate::params::DEFAULT_PREFIX,
+            )
+            .unwrap()
+            .shard_for(n)
                 == 3
         })
         .unwrap();

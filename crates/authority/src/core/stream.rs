@@ -238,7 +238,7 @@ impl Core {
     /// read the holder's silence off this stream (plan 30 §M9).
     fn stream_heartbeat_every(&self) -> u64 {
         let every = self.cfg.stream_heartbeat_ms.max(1);
-        if self.lease.ack_policy() == constellation_store_s3::AckPolicy::S3 {
+        if self.lease.ack_policy() == replicix_objcas::AckPolicy::S3 {
             every.min((self.cfg.backup_takeover_ms / 3).max(1))
         } else {
             every

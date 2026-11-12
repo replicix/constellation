@@ -4,7 +4,6 @@ description = "Kubernetes CSI driver: Identity/Controller/Node gRPC services ove
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-build = "build.rs"
 
 [lib]
 name = "constellation_csi"
@@ -15,6 +14,8 @@ name = "constellation-csi"
 path = "src/main.rs"
 
 [dependencies]
+replicix-platform-lite.workspace = true
+replicix-csi-common.workspace = true
 constellation-control.workspace = true
 constellation-types.workspace = true
 # `fuse_mount_fd`, the node plugin's staging mount (plan 37 K3).
@@ -29,8 +30,6 @@ tokio-stream = { version = "0.1", features = ["net"] }
 clap.workspace = true
 async-trait = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport"] }
-tonic-prost = "0.14"
-prost = "0.14"
 prost-types = "0.14"
 blake3.workspace = true
 futures.workspace = true
@@ -48,11 +47,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
-[build-dependencies]
-tonic-prost-build = "0.14"
-protoc-bin-vendored = "3"
-
 [dev-dependencies]
+replicix-csi-common = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 # Paused time for the rotation-retry backoff test.
 tokio = { workspace = true, features = ["test-util"] }

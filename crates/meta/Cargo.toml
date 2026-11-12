@@ -13,6 +13,7 @@ license.workspace = true
 test-util = []
 
 [dependencies]
+replicix-chunkfmt.workspace = true
 constellation-fs-core.workspace = true
 constellation-mtree.workspace = true
 constellation-types.workspace = true

@@ -10,7 +10,7 @@ use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
     LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, OwnChunks, Rid, RowCommit,
 };
-use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
+use replicix_objcas::{Lease, LeaseMode, LeaseStore};
 
 /// The next registry read number: every read of a test is newer than the
 /// ones before it (the driver numbers them in the order it issues them).
@@ -409,7 +409,7 @@ impl Harness {
             wanted_by: Vec::new(),
             backups: Vec::new(),
             config_version: 1,
-            ack_policy: constellation_store_s3::AckPolicy::Local,
+            ack_policy: replicix_objcas::AckPolicy::Local,
             // A tenure that serves strict reads (plan 30 §M9: the flag is
             // set by one CAS before the first answer; `a_tenure_marks_
             // itself_before_its_first_strict_answer` covers that).
@@ -463,7 +463,7 @@ fn settle_singleton(h: &mut Harness) -> Vec<Action> {
     all
 }
 
-fn tag() -> constellation_store_s3::LeaseTag {
+fn tag() -> replicix_objcas::LeaseTag {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -1752,12 +1752,12 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
     h.hold(1, None);
     submit_create(&mut h, 1, "f");
     let ino = h.meta.child_ino(ROOT_INO, "f").unwrap().unwrap();
-    let away = constellation_fs_core::ChunkHash::of(b"only node 2 has it");
+    let away = replicix_chunkfmt::ChunkHash::of(b"only node 2 has it");
     // Node 2 forwarded the file's manifest with its chunk still pending
     // there; enrolled before the op executes, as the driver does.
     h.meta.enroll_remote_chunks(ino, &[away], 2).unwrap();
     let manifest = constellation_fs_core::Manifest {
-        layout: constellation_fs_core::ChunkLayout::new(4096),
+        layout: replicix_chunkfmt::ChunkLayout::new(4096),
         file_len: 7,
         chunks: constellation_fs_core::ChunkInfo::Inline(std::collections::BTreeMap::from([(
             0u64, away,
@@ -2755,10 +2755,10 @@ fn a_handoff_is_declined_while_the_journal_cannot_drain() {
     h.hold(1, None);
     submit_create(&mut h, 1, "f");
     let ino = h.meta.child_ino(ROOT_INO, "f").unwrap().unwrap();
-    let away = constellation_fs_core::ChunkHash::of(b"only node 2 has it");
+    let away = replicix_chunkfmt::ChunkHash::of(b"only node 2 has it");
     h.meta.enroll_remote_chunks(ino, &[away], 2).unwrap();
     let manifest = constellation_fs_core::Manifest {
-        layout: constellation_fs_core::ChunkLayout::new(4096),
+        layout: replicix_chunkfmt::ChunkLayout::new(4096),
         file_len: 7,
         chunks: constellation_fs_core::ChunkInfo::Inline(std::collections::BTreeMap::from([(
             0u64, away,
@@ -3022,7 +3022,7 @@ fn lose_renewal_with_a_create_of_class(
         wanted_by: Vec::new(),
         backups: Vec::new(),
         config_version: 2,
-        ack_policy: constellation_store_s3::AckPolicy::Local,
+        ack_policy: replicix_objcas::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
@@ -4302,7 +4302,8 @@ fn a_refusal_raises_observed_until_the_segment_lands() {
 /// truncated B's winner to nothing.
 #[test]
 fn the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit() {
-    use constellation_fs_core::{ChunkHash, Manifest};
+    use constellation_fs_core::Manifest;
+    use replicix_chunkfmt::ChunkHash;
     let mut h = Harness::new(1);
     let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
     let manifest = |bytes: &[u8]| {
@@ -4393,7 +4394,8 @@ fn content(meta: &Meta, ino: constellation_fs_core::Ino) -> (Option<Vec<u8>>, u6
 
 /// A `bytes`-long manifest of one chunk, and the commit of it over `base`.
 fn manifest_of(bytes: &[u8]) -> Vec<u8> {
-    use constellation_fs_core::{ChunkHash, Manifest};
+    use constellation_fs_core::Manifest;
+    use replicix_chunkfmt::ChunkHash;
     let chunks = [(0u64, ChunkHash::of(bytes))].into_iter().collect();
     Manifest::from_sparse_chunks(4096, bytes.len() as u64, chunks, 64, ChunkHash::of)
         .0
@@ -5436,7 +5438,8 @@ fn a_deposed_holders_adopted_manifest_commit_is_not_replayed() {
     // told is committed); gated rows of a deposed holder are kept as a member
     // copy instead (`member_copy` tests).
     let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
-    use constellation_fs_core::{ChunkHash, Manifest};
+    use constellation_fs_core::Manifest;
+    use replicix_chunkfmt::ChunkHash;
     let mut h = Harness::new(1);
     let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
     // Everything so far is in the log.
@@ -6063,8 +6066,9 @@ fn an_awaiting_log_forward_under_the_held_epoch_or_a_continuation_hold_keeps_wai
 /// stream that stalls.
 mod own_chunks {
     use super::*;
-    use constellation_fs_core::{ChunkHash, Manifest};
-    use constellation_store_s3::AckPolicy;
+    use constellation_fs_core::Manifest;
+    use replicix_chunkfmt::ChunkHash;
+    use replicix_objcas::AckPolicy;
 
     fn uploads_awaited(actions: &[Action]) -> Vec<u64> {
         actions
@@ -8052,7 +8056,8 @@ fn stream_ahead_after_a_lost_transaction_resumes_once_the_log_closes_the_gap() {
 /// to nobody else until the chunk is reported up.
 #[test]
 fn stream_ahead_gives_a_pending_manifest_only_to_its_forwarder() {
-    use constellation_fs_core::{ChunkHash, Manifest};
+    use constellation_fs_core::Manifest;
+    use replicix_chunkfmt::ChunkHash;
     let (mut holder, _sub2, _) = stream_pair();
     // A second subscriber, node 3.
     let served = holder.step(Event::Peer {
@@ -10498,8 +10503,7 @@ mod cto {
         let (mut h, ino) = holder_with_file();
         let before = mode_of(&h, ino);
         grant_of(&ask(&mut h, 2, 7, ino));
-        h.core.lease.held.as_mut().expect("held").0.ack_policy =
-            constellation_store_s3::AckPolicy::S3;
+        h.core.lease.held.as_mut().expect("held").0.ack_policy = replicix_objcas::AckPolicy::S3;
         let rid = h.rid(1);
         let out = h.step(Event::Submit {
             policy: Policy::Client,
@@ -10898,7 +10902,7 @@ mod cto {
 /// member backup's watch.
 mod epoch_rules {
     use super::*;
-    use constellation_store_s3::AckPolicy;
+    use replicix_objcas::AckPolicy;
 
     /// A carrier-less activation (the claim resolution carried no lease)
     /// or a freeze of an epoch `members` are in.
@@ -11590,7 +11594,7 @@ mod epoch_rules {
             let t0 = h.now;
             if read {
                 let mut lease = root_lease(1, 1, t0.plus(30_000));
-                lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                lease.ack_policy = replicix_objcas::AckPolicy::Backup;
                 lease.backups = vec![2];
                 lease.ttl_ms = 30_000;
                 // Read just now: its end, as this node knows it, is one
@@ -11642,7 +11646,7 @@ mod epoch_rules {
             let expires = t0.plus(2_000);
             if by_read {
                 let mut lease = root_lease(1, 1, expires);
-                lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                lease.ack_policy = replicix_objcas::AckPolicy::Backup;
                 lease.backups = vec![2];
                 lease.ttl_ms = 2_000;
                 h.core.lease.observe(h.clk(), Some(&(lease.clone(), tag())));
@@ -11691,7 +11695,7 @@ mod epoch_rules {
             );
             h.advance(30);
             let mut lease = root_lease(1, 1, if renewed { t0.plus(62_000) } else { expires });
-            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+            lease.ack_policy = replicix_objcas::AckPolicy::Backup;
             lease.backups = vec![2];
             lease.config_version = 2; // (the role's: an older read is ignored)
             lease.ttl_ms = 2_000;
@@ -11770,7 +11774,7 @@ mod epoch_rules {
         );
         h.advance(30);
         let mut lease = root_lease(1, 1, expires);
-        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         lease.backups = vec![2];
         lease.config_version = 2; // (the role's: an older read is ignored)
         let out = answer_job_read(&mut h, &out, lease);
@@ -11957,7 +11961,7 @@ mod epoch_rules {
     fn an_acks3_holder_that_beats_is_not_taken_over() {
         let (_holder, mut sub, _req) = stream_pair();
         let mut lease = root_lease(1, 1, sub.now.plus(60_000));
-        lease.ack_policy = constellation_store_s3::AckPolicy::S3;
+        lease.ack_policy = replicix_objcas::AckPolicy::S3;
         sub.core.lease.note_object(&lease);
         sub.watch(&lease);
         let poke = |h: &mut Harness| {
@@ -12016,7 +12020,7 @@ mod epoch_rules {
     fn an_unobserved_acks3_lease_is_read_once_per_renewal_cadence() {
         let (_holder, mut sub, _req) = stream_pair();
         let mut lease = root_lease(1, 1, sub.now.plus(60_000));
-        lease.ack_policy = constellation_store_s3::AckPolicy::S3;
+        lease.ack_policy = replicix_objcas::AckPolicy::S3;
         lease.ttl_ms = 10_000;
         sub.core.lease.note_object(&lease);
         assert!(sub.core.lease.obs.is_none());
@@ -12190,7 +12194,7 @@ mod epoch_rules {
                 expires
             };
             let mut lease = root_lease(1, 1, obj_expires);
-            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+            lease.ack_policy = replicix_objcas::AckPolicy::Backup;
             lease.backups = vec![2];
             let out = answer_job_read(&mut h, &out, lease);
             assert_eq!(
@@ -12231,7 +12235,7 @@ mod epoch_rules {
                 );
                 h.advance(30);
                 let mut lease = root_lease(1, 1, expires);
-                lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                lease.ack_policy = replicix_objcas::AckPolicy::Backup;
                 lease.backups = vec![2];
                 lease.config_version = 2; // (the role's: an older read is ignored)
                 let out = answer_job_read(&mut h, &out, lease);
@@ -12431,7 +12435,7 @@ mod epoch_rules {
         // sealed there, not eight seconds later.
         let end = h.clk().wait.0;
         let mut lease = root_lease(1, 1, Ms(end));
-        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         lease.backups = vec![2];
         lease.config_version = 2; // (the role's: an older read is ignored)
         lease.ttl_ms = 10_000;
@@ -12463,7 +12467,7 @@ mod epoch_rules {
             "{out:?}"
         );
         let mut lease = root_lease(1, 1, Ms(named + 5_000));
-        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         lease.backups = vec![2];
         lease.ttl_ms = 10_000;
         let out = answer_job_read(&mut h, &out, lease);
@@ -12495,7 +12499,7 @@ mod epoch_rules {
         // alive) shows its expiry as past.
         h.step_wall(8_000);
         let mut lease = root_lease(1, 1, t0.plus(5_000));
-        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         lease.backups = vec![2];
         lease.ttl_ms = 10_000;
         h.core.lease.observe(h.clk(), Some(&(lease.clone(), tag())));
@@ -13541,7 +13545,7 @@ mod m10 {
             wanted_by: Vec::new(),
             backups: Vec::new(),
             config_version: 1,
-            ack_policy: constellation_store_s3::AckPolicy::Local,
+            ack_policy: replicix_objcas::AckPolicy::Local,
             granted_delegations: false,
             retired: Vec::new(),
             inherited_tail: None,
@@ -14533,7 +14537,7 @@ fn lease_of(holder: NodeId, epoch: Epoch, expires_unix_ms: i64) -> Lease {
         wanted_by: Vec::new(),
         backups: Vec::new(),
         config_version: 1,
-        ack_policy: constellation_store_s3::AckPolicy::Local,
+        ack_policy: replicix_objcas::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
@@ -14809,7 +14813,7 @@ fn a_permitted_claim_before_the_observation_ran_out_skips_the_promise_check() {
     h.core.cfg.takeover_promise_check = true;
     let prev = Lease {
         ttl_ms: 10_000,
-        ack_policy: constellation_store_s3::AckPolicy::Backup,
+        ack_policy: replicix_objcas::AckPolicy::Backup,
         backups: vec![1],
         ..lease_of(2, 1, 0)
     };
@@ -15138,7 +15142,7 @@ mod retention_gap {
 /// Plan 30 §M9 fixes from the backup-crash sweeps (`fix-backup-crash`).
 mod backup_crash {
     use super::*;
-    use constellation_store_s3::AckPolicy;
+    use replicix_objcas::AckPolicy;
 
     /// The job S3 request matching `pred` in `out` (heartbeat reads and
     /// other traffic aside).
@@ -15503,7 +15507,7 @@ mod backup_crash {
         {
             let lease = &mut h.core.lease.held.as_mut().unwrap().0;
             lease.backups = vec![2];
-            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+            lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         }
         let v = h.core.lease.held.as_ref().unwrap().0.config_version;
         for asker in [Asker::Own, Asker::Remote] {
@@ -17676,7 +17680,7 @@ mod locks {
     }
 
     /// The lease this node holds after `Harness::hold`.
-    fn held_lease(h: &Harness) -> constellation_store_s3::Lease {
+    fn held_lease(h: &Harness) -> replicix_objcas::Lease {
         h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap()
     }
 
@@ -21517,7 +21521,7 @@ mod locks {
         {
             let lease = &mut h1.core.lease.held.as_mut().unwrap().0;
             lease.backups = vec![2];
-            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+            lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         }
         // (Answered `Busy` without fresh S3 liveness; the mirror of the
         // table as it stands goes out after the event either way.)
@@ -26444,7 +26448,7 @@ mod locks {
     ) -> Lease {
         Lease {
             backups,
-            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            ack_policy: replicix_objcas::AckPolicy::Backup,
             config_version: 2,
             ..lease_of(holder, epoch, expires)
         }
@@ -27276,7 +27280,7 @@ mod locks {
         // holds it (a role for the holder's epoch); the permitted claimant
         // sealed it.
         if !permitted
-            && prev.ack_policy == constellation_store_s3::AckPolicy::Backup
+            && prev.ack_policy == replicix_objcas::AckPolicy::Backup
             && prev.backups.contains(&h.core.node_id())
         {
             h.core.bk.role = Some(constellation_meta::BackupRole {
@@ -27368,7 +27372,7 @@ mod locks {
         // Not a seal: an expired lease (a TTL takeover) waits for nothing.
         let mut h = Harness::new(2);
         let mut expired = backup_lease_of(1, 1, h.now.0 - 1, vec![]);
-        expired.ack_policy = constellation_store_s3::AckPolicy::Local;
+        expired.ack_policy = replicix_objcas::AckPolicy::Local;
         expired.granted_delegations = true;
         let claimed = claim_over(&mut h, &expired, false);
         assert!(!claimed.granted_delegations);
@@ -27774,10 +27778,10 @@ mod locks {
             claim_over(&mut h, &prev, false)
         };
         let marked = claim(true);
-        assert_eq!(marked.ack_policy, constellation_store_s3::AckPolicy::S3);
+        assert_eq!(marked.ack_policy, replicix_objcas::AckPolicy::S3);
         assert!(marked.granted_delegations, "a duty live: unmarked");
         let unmarked = claim(false);
-        assert_eq!(unmarked.ack_policy, constellation_store_s3::AckPolicy::S3);
+        assert_eq!(unmarked.ack_policy, replicix_objcas::AckPolicy::S3);
         assert!(!unmarked.granted_delegations, "nothing live: marked");
     }
 
@@ -27845,8 +27849,7 @@ mod locks {
         let mut h = sealed_tenure(false);
         let marked = h.core.lease.held.as_ref().unwrap().0.clone();
         // A sealer of the marked lease arms a floor: what the clear is for.
-        let listing =
-            |l: &Lease| l.reconfigured(vec![3], constellation_store_s3::AckPolicy::Backup);
+        let listing = |l: &Lease| l.reconfigured(vec![3], replicix_objcas::AckPolicy::Backup);
         let mut sealer = Harness::new(3);
         claim_over(&mut sealer, &listing(&marked), true);
         assert!(sealer.core.ack.pending_floor, "the marked lease armed none");
@@ -30526,7 +30529,7 @@ mod locks {
         let (mut h, ino) = holder_with_file();
         {
             let lease = &mut h.core.lease.held.as_mut().unwrap().0;
-            lease.ack_policy = constellation_store_s3::AckPolicy::S3;
+            lease.ack_policy = replicix_objcas::AckPolicy::S3;
             lease.singleton = false;
         }
         let rid = h.rid(1);
@@ -30577,7 +30580,7 @@ mod locks {
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         {
             let lease = &mut h.core.lease.held.as_mut().unwrap().0;
-            lease.ack_policy = constellation_store_s3::AckPolicy::Local;
+            lease.ack_policy = replicix_objcas::AckPolicy::Local;
             lease.singleton = true;
         }
         h.core.ack.cfg_seen = None;
@@ -32194,7 +32197,7 @@ mod locks {
     fn hold_fast(h: &mut Harness) {
         h.hold(1, None);
         let (mut lease, tag) = h.core.lease.held.clone().expect("held");
-        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         lease.backups = vec![4];
         h.core.lease.adopt(h.clk(), lease, tag, None);
         h.core.ack.last_s3_fresh = h.honour();
@@ -34066,7 +34069,7 @@ mod locks {
         {
             let lease = &mut h.core.lease.held.as_mut().unwrap().0;
             lease.backups = vec![2];
-            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+            lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         }
         let key = h.core.lock_lease_key().expect("holds its lease");
         let g3 = h
@@ -37233,7 +37236,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
         wanted_by: Vec::new(),
         backups: Vec::new(),
         config_version: 1,
-        ack_policy: constellation_store_s3::AckPolicy::Local,
+        ack_policy: replicix_objcas::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
@@ -38905,10 +38908,10 @@ fn a_barrier_behind_a_held_back_row_fails_after_bounded_rounds() {
     h.hold(1, None);
     submit_create(&mut h, 1, "f");
     let ino = h.meta.child_ino(ROOT_INO, "f").unwrap().unwrap();
-    let away = constellation_fs_core::ChunkHash::of(b"only node 2 has it");
+    let away = replicix_chunkfmt::ChunkHash::of(b"only node 2 has it");
     h.meta.enroll_remote_chunks(ino, &[away], 2).unwrap();
     let manifest = constellation_fs_core::Manifest {
-        layout: constellation_fs_core::ChunkLayout::new(4096),
+        layout: replicix_chunkfmt::ChunkLayout::new(4096),
         file_len: 7,
         chunks: constellation_fs_core::ChunkInfo::Inline(std::collections::BTreeMap::from([(
             0u64, away,
@@ -39046,7 +39049,7 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
         wanted_by: Vec::new(),
         backups: Vec::new(),
         config_version: 2,
-        ack_policy: constellation_store_s3::AckPolicy::Local,
+        ack_policy: replicix_objcas::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
@@ -41779,7 +41782,7 @@ fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {
         wanted_by: Vec::new(),
         backups: Vec::new(),
         config_version: 1,
-        ack_policy: constellation_store_s3::AckPolicy::Local,
+        ack_policy: replicix_objcas::AckPolicy::Local,
         granted_delegations: false,
         retired: Vec::new(),
         inherited_tail: None,
@@ -41944,7 +41947,7 @@ fn a_dead_root_takeover_leaves_a_backup_lease_in_its_claim_grace_alone() {
     let (mut h, _rid, _) = awaiting_log_forward("drg");
     let out = dead_root_acquisition(&mut h);
     let mut lease = root_lease(1, 1, Ms(h.now.0 - 1));
-    lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+    lease.ack_policy = replicix_objcas::AckPolicy::Backup;
     lease.backups = vec![3];
     // Plan 43 C7b: watched since one TTL before the expiry, so that the TTL
     // ended just now and only the backups' grace is left.
@@ -42005,7 +42008,7 @@ fn the_dead_root_check_reads_a_slow_live_roots_lease_once_per_renewal() {
 /// `Backup` lease at epoch 1 that lists node 2 (this backup).
 fn answer_takeover_read(h: &mut Harness, out: &[Action]) -> Vec<Action> {
     let mut lease = root_lease(1, 1, h.now.plus(5_000));
-    lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+    lease.ack_policy = replicix_objcas::AckPolicy::Backup;
     lease.backups = vec![2];
     // What S3 holds now is never older than the role the appends gave this
     // node (a read older than the role is ignored: I1 class 1).
@@ -42139,7 +42142,7 @@ fn a_holder_heard_while_its_expired_lease_is_read_is_sealed() {
     h.step(append(8));
     h.advance(100);
     let mut lease = root_lease(1, 1, Ms(h.now.0 - 300));
-    lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+    lease.ack_policy = replicix_objcas::AckPolicy::Backup;
     lease.backups = vec![2];
     lease.config_version = 2; // (the role's: an older read is ignored)
     let out = answer_job_read(&mut h, &read, lease);
@@ -42350,8 +42353,8 @@ fn a_stalled_s3_does_not_forward_a_deposed_nodes_op_ahead_of_its_own_write() {
 #[test]
 fn the_deposed_barrier_refusal_is_transient() {
     assert_eq!(
-        constellation_store_s3::classify_message(&Core::barrier_refused_deposed()),
-        constellation_store_s3::ErrorClass::Transient
+        replicix_objcas::classify_message(&Core::barrier_refused_deposed()),
+        replicix_objcas::ErrorClass::Transient
     );
 }
 
@@ -43559,7 +43562,7 @@ fn evicting_an_in_doubt_rid_drops_its_inbox_batches() {
 mod beat_cap {
     use super::*;
     use crate::core::lease::PendingGate;
-    use constellation_store_s3::AckPolicy;
+    use replicix_objcas::AckPolicy;
 
     const HOLDER: NodeId = 1;
 
@@ -48218,7 +48221,7 @@ mod deleg_group {
         h.core.cfg.delegation_ttl_ms = 1_000;
         h.hold(1, None);
         let lease = Lease {
-            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            ack_policy: replicix_objcas::AckPolicy::Backup,
             backups: vec![2],
             config_version: 2,
             ..lease_of(1, 1, h.now.plus(10_000).0)
@@ -48405,7 +48408,7 @@ mod deleg_group {
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         // The bump that records the singleton landed and is committed.
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
-        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = replicix_objcas::AckPolicy::Local;
         h.core.ack.cfg_seen = None;
         h.core.ack.spans.clear();
         h.core.sync_cfg_spans(&h.meta);
@@ -48568,7 +48571,7 @@ mod deleg_group {
     fn list_a_second_backup(h: &mut Harness) {
         let before = h.core.durable_jseq();
         let lease = Lease {
-            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            ack_policy: replicix_objcas::AckPolicy::Backup,
             backups: vec![2, 4],
             config_version: 3,
             ..lease_of(1, 1, h.now.plus(10_000).0)
@@ -49109,7 +49112,7 @@ mod deleg_group {
         h.hold(1, None);
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
-        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = replicix_objcas::AckPolicy::Local;
         h.core.ack.cfg_seen = None;
         h.core.ack.spans.clear();
         h.core.sync_cfg_spans(&h.meta);
@@ -50009,7 +50012,7 @@ mod designee_stream {
 mod c1_counted {
     use super::*;
     use constellation_meta::{JournalPos, Position};
-    use constellation_store_s3::AckPolicy;
+    use replicix_objcas::AckPolicy;
 
     pub(super) fn pos(jseq: u64) -> Position {
         Position {
@@ -50439,7 +50442,7 @@ mod c1_counted {
         let mut listed = before.clone();
         listed.config_version = 2;
         listed.backups = vec![2];
-        listed.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        listed.ack_policy = replicix_objcas::AckPolicy::Backup;
         let seen_at = h.clk();
         h.core
             .lease
@@ -50649,7 +50652,7 @@ mod c1_counted {
         let mut before = root_lease(1, 1, Ms(h.now.0 - 1));
         before.config_version = 2;
         before.backups = vec![2];
-        before.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        before.ack_policy = replicix_objcas::AckPolicy::Backup;
         let out = answer_job_read(&mut h, &read, before);
         assert_eq!(
             h.core.stats.seals, 0,
@@ -50674,7 +50677,7 @@ mod c1_counted {
         let mut newer = root_lease(3, 2, h.now.plus(50_000));
         newer.config_version = 2;
         newer.backups = vec![2];
-        newer.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        newer.ack_policy = replicix_objcas::AckPolicy::Backup;
         let seen_at = h.clk();
         h.core.lease.observe(seen_at, Some(&(newer.clone(), tag())));
         h.advance(100);
@@ -50735,7 +50738,7 @@ mod c1_counted {
         let mut lease = root_lease(1, 2, Ms(h.now.0 - 1));
         lease.config_version = 3;
         lease.backups = vec![2];
-        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.ack_policy = replicix_objcas::AckPolicy::Backup;
         answer_job_read(&mut h, &out, lease);
         assert_eq!(
             h.core.stats.seals, 1,
@@ -53032,7 +53035,7 @@ mod lock_lane_core_tests {
         // expires; its freshness is the core's last proof of liveness.
         let mut lease = h.core.lease.held.clone().unwrap();
         lease.0.backups = vec![2];
-        lease.0.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.0.ack_policy = replicix_objcas::AckPolicy::Backup;
         h.core.lease.held = Some(lease);
         roster(&mut h);
         let v = view(&h);
@@ -53049,7 +53052,7 @@ mod lock_lane_core_tests {
         let mut h = root();
         let mut lease = h.core.lease.held.clone().unwrap();
         lease.0.backups = vec![4];
-        lease.0.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.0.ack_policy = replicix_objcas::AckPolicy::Backup;
         let epoch = lease.0.epoch;
         h.core.lease.held = Some(lease);
         h.core.ack.last_s3_fresh = hm(h.now.minus(10_000));
@@ -53182,7 +53185,7 @@ mod c1_tail_fetch {
     use super::c1_counted::listed_holder;
     use super::*;
     use constellation_meta::BackupTx;
-    use constellation_store_s3::{AckPolicy, InheritedTail};
+    use replicix_objcas::{AckPolicy, InheritedTail};
 
     fn find_s3(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
         s3_ops(out)
@@ -53307,7 +53310,7 @@ mod c1_tail_fetch {
         epoch: Epoch,
         cv: u64,
         at: u64,
-        key: constellation_store_s3::RenewalKey,
+        key: replicix_objcas::RenewalKey,
     ) -> Vec<Action> {
         h.step(Event::Peer {
             from,
@@ -54213,7 +54216,7 @@ mod c1_tail_fetch {
         // Its own lease, expired: no backup listed, the tail of an older
         // group inherited.
         let lease = Lease {
-            inherited_tail: Some(Box::new(constellation_store_s3::InheritedTail {
+            inherited_tail: Some(Box::new(replicix_objcas::InheritedTail {
                 epoch: 0,
                 config_version: 1,
                 members: vec![3, 4],
@@ -54269,7 +54272,7 @@ mod c1_tail_fetch {
         // Its own lease, expired: no backup listed, the tail of an older
         // group inherited.
         let lease = Lease {
-            inherited_tail: Some(Box::new(constellation_store_s3::InheritedTail {
+            inherited_tail: Some(Box::new(replicix_objcas::InheritedTail {
                 epoch: 1,
                 config_version: 1,
                 members: vec![1, 3, 4],
@@ -55269,7 +55272,7 @@ mod c1_class {
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         // The bump that records the singleton landed and is committed.
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
-        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = replicix_objcas::AckPolicy::Local;
         h.core.ack.cfg_seen = None;
         h.core.ack.spans.clear();
         h.core.sync_cfg_spans(&h.meta);
@@ -56002,7 +56005,7 @@ mod c1_member_copy {
 // read to the op that still waits for it ----
 
 /// The tag of the second version of a lease object (`tag()` is the first).
-fn tag2() -> constellation_store_s3::LeaseTag {
+fn tag2() -> replicix_objcas::LeaseTag {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -56597,7 +56600,7 @@ mod c2f_lone_root {
         h.core.roster.make_singleton_for_test(h.core.cfg.node_id);
         // The bump that records the singleton landed and is committed.
         h.core.lease.held.as_mut().unwrap().0.singleton = true;
-        h.core.lease.held.as_mut().unwrap().0.ack_policy = constellation_store_s3::AckPolicy::Local;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = replicix_objcas::AckPolicy::Local;
         h.core.ack.cfg_seen = None;
         h.core.ack.spans.clear();
         h.core.sync_cfg_spans(&h.meta);
@@ -60386,8 +60389,9 @@ fn a_delegates_held_answer_is_not_the_roots() {
 mod await_retry {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
-    use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Ino, Manifest};
+    use constellation_fs_core::{ChunkInfo, Ino, Manifest};
     use constellation_meta::RowCommit;
+    use replicix_chunkfmt::{ChunkHash, ChunkLayout};
 
     pub(super) fn rid_of(node: NodeId, seq: u64) -> Rid {
         Rid {
@@ -61013,7 +61017,7 @@ mod await_retry {
     fn backed_holder_with_a_seed(group_has: u64) -> (Harness, Ino) {
         let (mut h, broken) = holder_with_a_seed();
         let lease = Lease {
-            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            ack_policy: replicix_objcas::AckPolicy::Backup,
             backups: vec![3],
             config_version: 2,
             ..lease_of(1, 1, h.now.plus(10_000).0)
@@ -63090,7 +63094,7 @@ mod m11_step5 {
             config_version: held.config_version + 2,
             backups: Vec::new(),
             singleton: true,
-            ack_policy: constellation_store_s3::AckPolicy::Local,
+            ack_policy: replicix_objcas::AckPolicy::Local,
             ..held
         };
         let gate = None;
@@ -63152,7 +63156,7 @@ mod m11_step5 {
             config_version: held.config_version + 2,
             backups: Vec::new(),
             singleton: true,
-            ack_policy: constellation_store_s3::AckPolicy::Local,
+            ack_policy: replicix_objcas::AckPolicy::Local,
             ..held
         };
         // (The new core has read no roster yet: it is no singleton by its own
@@ -64010,7 +64014,7 @@ mod hold_ack {
             {
                 let (l, _) = h.core.lease.held.as_mut().expect("held");
                 l.backups = vec![2];
-                l.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                l.ack_policy = replicix_objcas::AckPolicy::Backup;
                 l.singleton = false;
             }
             let (now, mut out) = (h.clk(), Vec::new());
@@ -64091,7 +64095,7 @@ mod kept_fetch {
     use super::*;
     use crate::event::Carrier;
     use constellation_meta::BackupTx;
-    use constellation_store_s3::InheritedTail;
+    use replicix_objcas::InheritedTail;
 
     /// `n` transactions of node 1's epoch 1.
     fn rows(n: u64) -> Vec<BackupTx> {
@@ -65499,7 +65503,7 @@ mod kept_member {
         from: NodeId,
         epoch: Epoch,
         tenure: (NodeId, Epoch),
-        key: constellation_store_s3::RenewalKey,
+        key: replicix_objcas::RenewalKey,
     ) -> Vec<Action> {
         kept_seal_from(h, from, epoch, tenure, key, false)
     }
@@ -65510,7 +65514,7 @@ mod kept_member {
         from: NodeId,
         epoch: Epoch,
         tenure: (NodeId, Epoch),
-        key: constellation_store_s3::RenewalKey,
+        key: replicix_objcas::RenewalKey,
         closed_hold: bool,
     ) -> Vec<Action> {
         h.step(Event::Peer {

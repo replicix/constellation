@@ -2770,7 +2770,7 @@ mod tests {
         let mut tx = meta.db.write_tx();
         tx.remove(&meta.local, b"poisoned/garbage".to_vec());
         tx.commit().unwrap();
-        let lost = constellation_fs_core::ChunkHash::of(b"gone");
+        let lost = replicix_chunkfmt::ChunkHash::of(b"gone");
         let ino = (3 << 40) | 1;
         meta.set_manifest_dirty(ino, None, b"not a manifest", 4, None, None, &[lost])
             .unwrap();

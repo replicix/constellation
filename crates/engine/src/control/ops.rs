@@ -768,7 +768,7 @@ pub(super) mod tests {
     #[test]
     fn the_chunk_memory_cache_is_reported() {
         use constellation_fs_core::cache::ChunkState;
-        use constellation_fs_core::ChunkHash;
+        use replicix_chunkfmt::ChunkHash;
         let f = fixture(&[&[]]);
         let data = vec![0x5a; 64 * 1024];
         let hash = ChunkHash::of(&data);

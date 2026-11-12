@@ -10,9 +10,10 @@
 //! conflict copy plus replays.
 
 use constellation_fs_core::types::ROOT_INO;
-use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Ino, Manifest};
+use constellation_fs_core::{ChunkInfo, Ino, Manifest};
 use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, PublishBasis, TouchSet};
 use constellation_types::Code;
+use replicix_chunkfmt::{ChunkHash, ChunkLayout};
 use std::collections::BTreeMap;
 
 fn manifest_naming(hash: ChunkHash, len: u64) -> Vec<u8> {

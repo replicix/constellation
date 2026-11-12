@@ -60,10 +60,11 @@
 
 use anyhow::{Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, Ino};
+use constellation_fs_core::Ino;
 use constellation_meta::{Meta, MetaStore};
 use constellation_store_s3::{layout, ChunkStore};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use replicix_chunkfmt::ChunkHash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -425,7 +426,7 @@ impl Holds {
             }
             return Ok(());
         }
-        let now = constellation_store_s3::lease::now_unix_ms();
+        let now = replicix_objcas::lease::now_unix_ms();
         let body = HoldBody {
             v: HOLD_VERSION,
             node: self.node_id,
@@ -495,8 +496,8 @@ mod tests {
     use super::*;
     use constellation_fs_core::manifest::{ChunkInfo, Manifest};
     use constellation_fs_core::types::ROOT_INO;
-    use constellation_fs_core::ChunkLayout;
     use object_store::memory::InMemory;
+    use replicix_chunkfmt::ChunkLayout;
 
     struct Opens(Mutex<Vec<Ino>>);
 
@@ -577,9 +578,9 @@ mod tests {
         meta.unlink(ROOT_INO, "open").unwrap();
         meta.unlink(ROOT_INO, "closed").unwrap();
         assert_eq!(meta.orphans().unwrap().len(), 2);
-        let before = constellation_store_s3::lease::now_unix_ms();
+        let before = replicix_objcas::lease::now_unix_ms();
         holds.refresh_once().await.unwrap();
-        let after = constellation_store_s3::lease::now_unix_ms();
+        let after = replicix_objcas::lease::now_unix_ms();
         let body: HoldBody = serde_json::from_slice(
             &store
                 .get(&layout::hold(7))

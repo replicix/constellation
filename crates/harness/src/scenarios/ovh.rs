@@ -826,9 +826,9 @@ fn op_latency(name: &'static str, delegated: bool) -> Result<()> {
 /// client, which is not what the EC2 runs measured).
 const PRODUCT_DEFAULTS: [(&str, &str); 4] = [
     ("CONSTELLATION_SYNC_INTERVAL_MS", "500"),
-    ("CONSTELLATION_LEASE_TTL_MS", "60000"),
-    ("CONSTELLATION_S3_MAX_RETRIES", "\u{0}unset"),
-    ("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "\u{0}unset"),
+    ("REPLICIX_LEASE_TTL_MS", "60000"),
+    ("REPLICIX_S3_MAX_RETRIES", "\u{0}unset"),
+    ("REPLICIX_S3_RETRY_TIMEOUT_MS", "\u{0}unset"),
 ];
 
 /// One paced write+`fsync`+close of `v<i>` holding `"<tag>:<i>"` (a

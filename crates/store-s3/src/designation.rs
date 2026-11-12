@@ -3,7 +3,7 @@
 //!
 //! A designation is one small JSON object,
 //! `designations/<hash-of-path>.json`, using the same CAS idioms as
-//! [`crate::lease`]: `If-None-Match` claims a fresh path, `If-Match`
+//! [`replicix_objcas::lease`]: `If-None-Match` claims a fresh path, `If-Match`
 //! releases or transfers it. Unlike a lease it has no TTL — the
 //! designee's claim is non-stealable by design (DESIGN.md: "no
 //! TTL-steal on the designee's claim"); it ends only by an explicit
@@ -55,7 +55,7 @@ impl Designation {
             v: DESIGNATION_VERSION,
             path: path.to_string(),
             designee,
-            created_unix_ms: crate::lease::now_unix_ms(),
+            created_unix_ms: replicix_objcas::lease::now_unix_ms(),
             read_only,
             released: false,
         }
@@ -100,7 +100,7 @@ pub fn path_hash(path: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesignationTag(UpdateVersion);
 
-/// Whether the backend can enforce the CAS (see `crate::lease::LeaseMode`
+/// Whether the backend can enforce the CAS (see `replicix_objcas::lease::LeaseMode`
 /// for the identical trade-off and its rationale).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesignationMode {
@@ -132,7 +132,7 @@ impl DesignationStore {
         // Torn bodies are re-read (`crate::control`).
         let path = layout::designation(hash);
         let Some((d, meta)) =
-            crate::control::get_json::<Designation>(self.store.as_ref(), &path).await?
+            replicix_objcas::control::get_json::<Designation>(self.store.as_ref(), &path).await?
         else {
             return Ok(None);
         };
@@ -158,7 +158,8 @@ impl DesignationStore {
             // overlap check: re-read it (`crate::control`); only an
             // object that stays unreadable is skipped, as before.
             if let Ok(Some((d, _))) =
-                crate::control::get_json::<Designation>(self.store.as_ref(), &m.location).await
+                replicix_objcas::control::get_json::<Designation>(self.store.as_ref(), &m.location)
+                    .await
             {
                 // A claim is only reachable — and releasable — at the key
                 // its path hashes to (`get`/`release`). One stored anywhere
@@ -259,24 +260,26 @@ impl DesignationStore {
     }
 
     /// One conditional write under plan 30 §M4's error-code rules
-    /// (`crate::cas`, and `crate::lease::LeaseStore::put` for the same
+    /// (`replicix_objcas::cas`, and `replicix_objcas::lease::LeaseStore::put` for the same
     /// reasoning): 409 retries the attempt; 412 or a 404 on `If-Match` is
     /// [`StoreError::CasConflict`] unless the object is this designation
     /// byte for byte (path, designee and a millisecond creation time make
     /// the body unique to this attempt).
     async fn put(&self, d: &Designation, mode: PutMode) -> Result<DesignationTag, StoreError> {
         let body = serde_json::to_vec(d)?;
-        match crate::cas::put_conditional(
+        match replicix_objcas::cas::put_conditional(
             self.store.as_ref(),
             &layout::designation(&path_hash(&d.path)),
             body.into(),
             mode,
-            crate::cas::Verify::Body,
+            replicix_objcas::cas::Verify::Body,
         )
         .await?
         {
-            crate::cas::CasPut::Won(version) => Ok(DesignationTag(version)),
-            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
+            replicix_objcas::cas::CasPut::Won(version) => Ok(DesignationTag(version)),
+            replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
+                Err(StoreError::CasConflict)
+            }
         }
     }
 }

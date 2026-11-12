@@ -2,9 +2,10 @@
 
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::SparseChunks;
-use constellation_fs_core::{ChunkHash, Ino};
+use constellation_fs_core::Ino;
 use constellation_store_s3::{ChunkStore, DecodePriority};
-use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate};
+use replicix_chunkfmt::ChunkHash;
+use replicix_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

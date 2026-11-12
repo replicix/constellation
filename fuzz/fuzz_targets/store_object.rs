@@ -10,11 +10,11 @@ fuzz_target!(
         // allocation past it is a real finding rather than a legitimate
         // ceiling-sized decode (the default ceiling is 1 GiB).
         std::env::set_var(
-            constellation_store_s3::codec::MAX_DECOMPRESSED_ENV,
+            replicix_chunkfmt::codec::MAX_DECOMPRESSED_ENV,
             (64u64 << 20).to_string(),
         );
     },
     |data: &[u8]| {
-        let _ = constellation_store_s3::format::decode_object(data);
+        let _ = replicix_chunkfmt::format::decode_object(data);
     }
 );

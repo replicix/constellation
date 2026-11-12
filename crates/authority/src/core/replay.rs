@@ -752,7 +752,7 @@ impl Core {
         // stays the sequencer (its retry meets the shipped refusal): a
         // deposed dropper's refusals are fenced (`drop_held_knowing`).
         let sequencer = self.lease.epoch_held() || self.lease.ship_epoch(now, &self.cfg).is_some();
-        let live_ops = |hash: &constellation_fs_core::ChunkHash| -> Vec<Rid> {
+        let live_ops = |hash: &replicix_chunkfmt::ChunkHash| -> Vec<Rid> {
             live.iter()
                 .filter(|(_, manifest)| constellation_meta::manifest_names(manifest, hash))
                 .map(|(rid, _)| *rid)

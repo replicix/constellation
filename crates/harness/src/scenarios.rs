@@ -3008,7 +3008,7 @@ fn gc_lifecycle(_seed: u64) -> Result<()> {
     let prefix = format!("gc-life-{}", ts());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut client = Client::new(root.path(), "gc", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "200")
+        .with_env("REPLICIX_LEASE_TTL_MS", "200")
         .with_env("CONSTELLATION_GC_HORIZON_S", "0");
     client.fs_create()?;
     client.mount()?;
@@ -3063,7 +3063,7 @@ fn gc_dedup_race(_seed: u64) -> Result<()> {
     let prefix = format!("gc-race-{}", ts());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut client = Client::new(root.path(), "race", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "1000")
+        .with_env("REPLICIX_LEASE_TTL_MS", "1000")
         .with_env("CONSTELLATION_GC_HORIZON_S", "0");
     client.fs_create()?;
     client.mount()?;
@@ -3166,7 +3166,7 @@ fn gc_open_orphan_hold(_seed: u64) -> Result<()> {
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mk = |name: &str| -> Result<Client> {
         Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "1000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "1000")
             .with_env("CONSTELLATION_GC_HORIZON_S", "0")
             .with_env("CONSTELLATION_HOLD_REFRESH_MS", "300")
             .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000"))
@@ -3294,7 +3294,7 @@ fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mk = |name: &str| -> Result<Client> {
         Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "1000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "1000")
             .with_env("CONSTELLATION_LOG_RETENTION_SEGMENTS", "2")
             .with_env("CONSTELLATION_COMPLETION_RETENTION_S", "0")
             .with_env("CONSTELLATION_GC_HORIZON_S", "0")
@@ -3512,7 +3512,7 @@ fn fsck_repair(_seed: u64) -> Result<()> {
     let prefix = format!("fsck-{}", ts());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut client = Client::new(root.path(), "fsck", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "200")
+        .with_env("REPLICIX_LEASE_TTL_MS", "200")
         .with_env("CONSTELLATION_GC_HORIZON_S", "0");
     client.fs_create()?;
     client.mount()?;
@@ -4842,8 +4842,8 @@ fn s3_retry(_seed: u64) -> Result<()> {
     let proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/s3retry-{}", ts());
     let mut c = Client::new(root.path(), "retry", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_S3_MAX_RETRIES", "0")
-        .with_env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "500");
+        .with_env("REPLICIX_S3_MAX_RETRIES", "0")
+        .with_env("REPLICIX_S3_RETRY_TIMEOUT_MS", "500");
     c.fs_create()?;
     c.mount()?;
     let (data, expected) = blob(4);
@@ -5344,7 +5344,7 @@ fn lease_handover(seed: u64) -> Result<()> {
     // A holder learns of a waiter at its next renew, half a TTL away:
     // 10 s keeps the handover inside `HANDOVER` without touching the
     // dwell/grace rules being exercised.
-    let tune = |c: Client| c.with_env("CONSTELLATION_LEASE_TTL_MS", "10000");
+    let tune = |c: Client| c.with_env("REPLICIX_LEASE_TTL_MS", "10000");
     let mut c0 = tune(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
     let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
     c0.fs_create()?;
@@ -5460,7 +5460,7 @@ fn lease_fencing(_seed: u64) -> Result<()> {
     // Short TTL so expiry is observable inside a test.
     let ttl_ms = 5_000u64;
     let short = |c: Client| {
-        c.with_env("CONSTELLATION_LEASE_TTL_MS", &ttl_ms.to_string())
+        c.with_env("REPLICIX_LEASE_TTL_MS", &ttl_ms.to_string())
             // Long enough that A never releases voluntarily here.
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
     };
@@ -5624,7 +5624,7 @@ fn epoch_clients(env: &S3Env, root: &std::path::Path, backend: &str) -> Result<(
             // fell just before a renewal the epoch formed carrying nothing,
             // and `epoch-member-lost`'s write after the resume failed.
             // 20 s leaves at least 9 s, as the M10 scenarios have it.
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "20000")
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
     };
@@ -5881,7 +5881,7 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
             // Pinned (plan 46 M1.3 step 7): a budget of 0 would let placement
             // grant sticky subtrees; this scenario is about the deposition.
             .with_env("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "off")
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "5000")
             // Keep B holding for a while after its takeover write, so
             // resumed A's renewal finds B's lease (the deposition path
             // under test) and its replay drain forwards to a live holder.
@@ -6110,7 +6110,7 @@ fn deposed_reintegration_backup(_seed: u64) -> Result<()> {
     let tune = |client: Client| {
         client
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "20000")
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
             .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
     };
@@ -6342,7 +6342,7 @@ fn backup_takeover_held_chunks(name: &str, returns: bool) -> Result<()> {
     let tune = |client: Client| {
         client
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "20000")
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
             .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
     };
@@ -6591,7 +6591,7 @@ fn epoch_peer_reaching_s3_declines(_seed: u64) -> Result<()> {
     let tune = |client: Client| {
         client
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "20000")
             .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
     };
     let mut c0 = tune(Client::new(root.path(), "c0", &a_s3.endpoint(), &backend)?);
@@ -6843,7 +6843,7 @@ fn node_leave(_seed: u64) -> Result<()> {
     let tune = |client: Client, key: &str| {
         client
             .with_env("CONSTELLATION_NODE_KEY", key)
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "5000")
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
     };
@@ -9359,7 +9359,7 @@ fn create_storm_s3_only(seed: u64) -> Result<()> {
     let mk = |c: Client| {
         c.with_own_node_key()
             .with_env("CONSTELLATION_P2P", "off")
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &ttl_ms.to_string())
+            .with_env("REPLICIX_LEASE_TTL_MS", &ttl_ms.to_string())
     };
     let mut c0 = mk(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
     let mut c1 = mk(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
@@ -10048,8 +10048,8 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
             .env("CONSTELLATION_REGISTRY", &registry)
             .env("XDG_DATA_HOME", &data_home)
             .env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
-            .env("CONSTELLATION_S3_MAX_RETRIES", "2")
-            .env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "2000");
+            .env("REPLICIX_S3_MAX_RETRIES", "2")
+            .env("REPLICIX_S3_RETRY_TIMEOUT_MS", "2000");
         c
     };
 
@@ -10325,7 +10325,7 @@ fn mtree_gc_plateau(seed: u64) -> Result<()> {
     let prefix = format!("mtree-gc-{}", ts());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let gc_env = [
-        ("CONSTELLATION_LEASE_TTL_MS", "200"),
+        ("REPLICIX_LEASE_TTL_MS", "200"),
         ("CONSTELLATION_GC_HORIZON_S", "0"),
         ("CONSTELLATION_COMMIT_RETENTION", "2"),
         ("CONSTELLATION_COMMIT_RETENTION_S", "0"),
@@ -10460,7 +10460,7 @@ fn idle_cluster_is_quiet(_seed: u64) -> Result<()> {
             .with_own_node_key()
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", &INTERVAL_MS.to_string())
             .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", &IDLE_MAX_MS.to_string())
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string()))
+            .with_env("REPLICIX_LEASE_TTL_MS", &TTL_MS.to_string()))
     };
     let mut a = mk("quiet-a", &counters[0].endpoint())?;
     let mut b = mk("quiet-b", &counters[1].endpoint())?;
@@ -10754,7 +10754,7 @@ fn sticky_lease_handoff_over_s3(_seed: u64) -> Result<()> {
             // without any handoff; this scenario is about the S3-only
             // lease handoff itself, so it runs with the inbox off.
             .with_env("CONSTELLATION_INBOX", "off")
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
+            .with_env("REPLICIX_LEASE_TTL_MS", &TTL_MS.to_string())
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "1000"))
     };
     let mut a = mk("sticky-a")?;
@@ -11157,7 +11157,7 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
     let backend = format!("s3://{BUCKET}/forward-timeout-{}", ts());
     let tune = |c: Client| {
         c.with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "10000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "10000")
             .with_env("CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS", "1500")
     };
     let mut a = tune(Client::new(root.path(), "a", &env.endpoint, &backend)?);
@@ -11493,7 +11493,7 @@ fn phantom_setup_c(
     let tune = |c: Client| {
         let mut c = c
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "6000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "6000")
             .with_env("CONSTELLATION_BACKUPS", "0");
         for (key, value) in extra {
             c = c.with_env(key, value);
@@ -11652,7 +11652,7 @@ fn speculation_of(c: &Client) -> Result<serde_json::Value> {
 fn fresh_node(env: &S3Env, root: &std::path::Path, backend: &str, expect: &[u8]) -> Result<Client> {
     let mut d = Client::new(root, "d", &env.endpoint, backend)?
         .with_own_node_key()
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "6000");
+        .with_env("REPLICIX_LEASE_TTL_MS", "6000");
     d.mount()?;
     eventually(
         "D sees the post-takeover write",
@@ -12415,7 +12415,7 @@ fn inbox_cluster(
         Ok(Client::new(root.path(), name, endpoint, &backend)?
             .with_own_node_key()
             .with_env("CONSTELLATION_P2P", "off")
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &ttl_ms.to_string())
+            .with_env("REPLICIX_LEASE_TTL_MS", &ttl_ms.to_string())
             // The holder must keep the lease across the whole run: the
             // point of the inbox is that nobody needs to pull it away.
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000"))

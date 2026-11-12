@@ -11,7 +11,8 @@ name = "uploadbench"
 path = "src/main.rs"
 
 [dependencies]
-constellation-upload-concurrency.workspace = true
+replicix-objcas.workspace = true
+replicix-upload-concurrency.workspace = true
 constellation-store-s3.workspace = true
 object_store.workspace = true
 tokio.workspace = true

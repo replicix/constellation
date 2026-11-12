@@ -3,9 +3,9 @@
 //! bind mount.
 //!
 //! **`NodeStageVolume`** (settled decision 5): the `volume_id` names the
-//! filesystem and subtree ([`crate::volume_id`]), the `volume_context` names
+//! filesystem and subtree ([`replicix_csi_common::volume_id`]), the `volume_context` names
 //! where the filesystem lives (the class parameters the controller put
-//! there, [`crate::params::volume_context`], or a static PV's
+//! there, [`replicix_csi_common::params::volume_context`], or a static PV's
 //! `volumeAttributes`). From those the plugin
 //!
 //! 1. brings up this node's engine pod of that pool filesystem
@@ -81,18 +81,8 @@ pub mod state;
 
 use crate::control_client::PoolRef;
 use crate::controller::{read_record, status, VolumeLocks, X_NAMESPACE, X_PV, X_PVC};
-use crate::credentials::{is_awaiting_unlock, unlock_params, Refresher, Secrets};
+use crate::credentials::{is_awaiting_unlock, unlock_params};
 use crate::engine_pods::pool_label;
-use crate::params::{ClassParams, CredentialMode, SecretRef, SHARD_KEY};
-use crate::proto::csi::v1::node_server::Node as NodeRpc;
-use crate::proto::csi::v1::node_service_capability::rpc::Type as RpcType;
-use crate::proto::csi::v1::node_service_capability::{Rpc, Type as CapabilityType};
-use crate::proto::csi::v1::volume_capability::access_mode::Mode;
-use crate::proto::csi::v1::volume_capability::AccessType;
-use crate::proto::csi::v1::volume_health::VolumeHealthEntry;
-use crate::proto::csi::v1::volume_usage::Unit;
-use crate::proto::csi::v1::*;
-use crate::volume_id::VolumeId;
 use constellation_control::proto::types::{
     MountSource, MountViewOpts, ViewListParams, ViewMountParams, ViewStatsParams, ViewUnmountParams,
 };
@@ -101,6 +91,17 @@ pub use engines::{
     Drain, Drift, InMemoryNodeEngines, NodeEngine, NodeEngines, Replacement, UnitPod,
 };
 pub use mounter::{FakeMounter, FuseMountOptions, LinuxMounter, MountState, Mounter};
+use replicix_csi_common::credentials::{Refresher, Secrets};
+use replicix_csi_common::params::{ClassParams, CredentialMode, SecretRef, SHARD_KEY};
+use replicix_csi_common::proto::csi::v1::node_server::Node as NodeRpc;
+use replicix_csi_common::proto::csi::v1::node_service_capability::rpc::Type as RpcType;
+use replicix_csi_common::proto::csi::v1::node_service_capability::{Rpc, Type as CapabilityType};
+use replicix_csi_common::proto::csi::v1::volume_capability::access_mode::Mode;
+use replicix_csi_common::proto::csi::v1::volume_capability::AccessType;
+use replicix_csi_common::proto::csi::v1::volume_health::VolumeHealthEntry;
+use replicix_csi_common::proto::csi::v1::volume_usage::Unit;
+use replicix_csi_common::proto::csi::v1::*;
+use replicix_csi_common::volume_id::VolumeId;
 use state::{StateStore, VolumeRecord};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -740,7 +741,7 @@ fn location(
         .filter(|(k, _)| k.as_str() != SHARD_KEY && !k.contains('/'))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let class = ClassParams::parse(&params).map_err(|e| {
+    let class = ClassParams::parse(&params, crate::params::DEFAULT_PREFIX).map_err(|e| {
         Status::invalid_argument(format!(
             "the volume context does not locate a pool filesystem ({e}); a statically \
              provisioned PersistentVolume names its pool in volumeAttributes (bucket, prefix, \

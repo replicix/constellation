@@ -10,15 +10,16 @@
 //! batch is fenced on it (`run_chunks`'s doc has the argument).
 
 use anyhow::{Context, Result};
-use constellation_fs_core::ChunkHash;
 use constellation_meta::Meta;
 use constellation_store_s3::{
-    append_journal, publish_condemned, GcJournalEntry, LeaseMode, LogStore, SnapshotRecord,
-    SnapshotStore, StoreError,
+    append_journal, publish_condemned, GcJournalEntry, LogStore, SnapshotRecord, SnapshotStore,
+    StoreError,
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
+use replicix_chunkfmt::ChunkHash;
+use replicix_objcas::LeaseMode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -128,7 +129,7 @@ impl GcConfig {
                 "CONSTELLATION_LOG_RETENTION_SEGMENTS",
                 DEFAULT_LOG_RETENTION_SEGMENTS,
             ),
-            lease_ttl_ms: constellation_store_s3::lease::lease_ttl_ms(),
+            lease_ttl_ms: replicix_objcas::lease::lease_ttl_ms(),
             completion_retention_ms: seconds(
                 "CONSTELLATION_COMPLETION_RETENTION_S",
                 DEFAULT_COMPLETION_RETENTION_S,
@@ -379,7 +380,7 @@ async fn mark_chunks(
     let snaps = reconcile_snapshots(store, meta, lease_mode, config, verify_only, tail, lease)
         .await
         .context("reconciling snaps/ objects with snapshot rows")?;
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = replicix_objcas::lease::now_unix_ms();
     let live = live_roots(chunks, meta).await?;
     let snapshots =
         snapshot_roots_kept(config.snap_walk, chunks, store.clone(), meta, &snaps.kept).await?;
@@ -480,8 +481,7 @@ async fn sweep_chunks(
     // Holds are re-read too: a node that applied an unlink of a file it
     // has open publishes its hold asynchronously (`cli::holds`), and the
     // wait above is the window it gets before this round's deletes.
-    let refreshed_holds =
-        hold_roots(store.clone(), constellation_store_s3::lease::now_unix_ms()).await?;
+    let refreshed_holds = hold_roots(store.clone(), replicix_objcas::lease::now_unix_ms()).await?;
     let mut deleted = Vec::new();
     for mark in &candidates {
         if let Some(hash) = mark.hash {
@@ -523,7 +523,7 @@ async fn sweep_chunks(
                 key: mark.key.clone(),
                 rule: mark.rule.clone(),
                 evidence: json!({"mark":mark.evidence,"condemned_epoch":condemned.epoch}),
-                ts: constellation_store_s3::lease::now_unix_ms(),
+                ts: replicix_objcas::lease::now_unix_ms(),
             },
         )
         .await?;
@@ -628,7 +628,7 @@ async fn reconcile_snapshots(
         .into_iter()
         .map(|record| (record.id(), record))
         .collect();
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = replicix_objcas::lease::now_unix_ms();
     let floor_ms = config.horizon_ms.max(config.lease_ttl_ms as i64);
     let mut found = SnapFindings::default();
 
@@ -669,7 +669,7 @@ async fn reconcile_snapshots(
                     key: key.clone(),
                     rule: mark.rule.clone(),
                     evidence: mark.evidence.clone(),
-                    ts: constellation_store_s3::lease::now_unix_ms(),
+                    ts: replicix_objcas::lease::now_unix_ms(),
                 },
             )
             .await?;
@@ -760,7 +760,7 @@ async fn reconcile_snapshots(
                 key: mark.key.clone(),
                 rule: mark.rule.clone(),
                 evidence: mark.evidence.clone(),
-                ts: constellation_store_s3::lease::now_unix_ms(),
+                ts: replicix_objcas::lease::now_unix_ms(),
             },
         )
         .await?;
@@ -1123,8 +1123,8 @@ mod tests {
     fn replica_with_live(node: u64, hash: Option<ChunkHash>) -> Arc<Meta> {
         use constellation_fs_core::manifest::{ChunkInfo, Manifest};
         use constellation_fs_core::types::ROOT_INO;
-        use constellation_fs_core::ChunkLayout;
         use constellation_meta::MetaStore;
+        use replicix_chunkfmt::ChunkLayout;
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         meta.set_node_prefix(node).unwrap();
         if let Some(hash) = hash {
@@ -1149,7 +1149,8 @@ mod tests {
     /// round was deleting.)
     #[tokio::test]
     async fn a_round_carries_the_previous_rounds_undeleted_candidates() {
-        use constellation_store_s3::{read_condemned, CompressionSetting};
+        use constellation_store_s3::read_condemned;
+        use replicix_chunkfmt::CompressionSetting;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let chunks = Arc::new(ChunkStore::new(store.clone()));
         let old = ChunkHash::of(b"condemned by the previous round");
@@ -1205,7 +1206,7 @@ mod tests {
     /// listed it, the dangle the writer-side argument excludes.
     #[tokio::test]
     async fn a_paused_round_deletes_nothing_once_another_round_took_the_lease() {
-        use constellation_store_s3::CompressionSetting;
+        use replicix_chunkfmt::CompressionSetting;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let chunks = Arc::new(ChunkStore::new(store.clone()));
         let x = ChunkHash::of(b"unreferenced everywhere");
@@ -1331,15 +1332,12 @@ mod tests {
             completion_retention_ms: 0,
             snap_walk: SnapWalkMode::Diff,
         };
-        assert!(metadata_candidates(
-            &store,
-            None,
-            &config,
-            constellation_store_s3::lease::now_unix_ms()
-        )
-        .await
-        .unwrap()
-        .is_empty());
+        assert!(
+            metadata_candidates(&store, None, &config, replicix_objcas::lease::now_unix_ms())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Plan 28: once a commit exists, retention floors on the head
@@ -1386,23 +1384,19 @@ mod tests {
             completion_retention_ms: 0,
             snap_walk: SnapWalkMode::Diff,
         };
-        let marked: Vec<u64> = metadata_candidates(
-            &store,
-            None,
-            &config,
-            constellation_store_s3::lease::now_unix_ms(),
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|mark| mark.rule == "log-retention")
-        .map(|mark| {
-            assert!(mark.key.starts_with("log/p0/"), "{}", mark.key);
-            assert_eq!(mark.evidence["commit"], 1);
-            let name = mark.key.rsplit('/').next().unwrap();
-            u64::from_str_radix(name.trim_end_matches(".zst"), 16).unwrap()
-        })
-        .collect();
+        let marked: Vec<u64> =
+            metadata_candidates(&store, None, &config, replicix_objcas::lease::now_unix_ms())
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|mark| mark.rule == "log-retention")
+                .map(|mark| {
+                    assert!(mark.key.starts_with("log/p0/"), "{}", mark.key);
+                    assert_eq!(mark.evidence["commit"], 1);
+                    let name = mark.key.rsplit('/').next().unwrap();
+                    u64::from_str_radix(name.trim_end_matches(".zst"), 16).unwrap()
+                })
+                .collect();
         // Floor 250 - 128 = 122: segments 1..=121.
         assert_eq!(marked.len(), 121);
         assert_eq!(marked.iter().max(), Some(&121));
@@ -1444,7 +1438,7 @@ mod tests {
     async fn a_chunk_held_open_on_another_node_survives_gc() {
         use constellation_fs_core::types::ROOT_INO;
         use constellation_meta::MetaStore;
-        use constellation_store_s3::CompressionSetting;
+        use replicix_chunkfmt::CompressionSetting;
         use std::sync::Mutex;
 
         struct Opens(Mutex<Vec<constellation_fs_core::Ino>>);
@@ -1570,10 +1564,11 @@ mod tests {
     async fn gc_tails_a_lagging_replica_before_marking_a_deduplicated_chunk() {
         use constellation_fs_core::manifest::{ChunkInfo, Manifest};
         use constellation_fs_core::types::ROOT_INO;
-        use constellation_fs_core::{ChunkHash, ChunkLayout};
         use constellation_meta::MetaStore;
-        use constellation_store_s3::{ChunkStore, CompressionSetting, LogStore};
+        use constellation_store_s3::{ChunkStore, LogStore};
         use object_store::memory::InMemory;
+        use replicix_chunkfmt::CompressionSetting;
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
 
         fn manifest_of(hash: ChunkHash, file_len: u64) -> Vec<u8> {
             Manifest {
@@ -1694,7 +1689,7 @@ mod tests {
         use constellation_fs_core::manifest::Manifest;
         use constellation_fs_core::types::ROOT_INO;
         use constellation_meta::MetaStore;
-        use constellation_store_s3::CompressionSetting;
+        use replicix_chunkfmt::CompressionSetting;
         const CS: u32 = 4096;
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1860,7 +1855,7 @@ mod tests {
         use constellation_fs_core::manifest::Manifest;
         use constellation_fs_core::types::ROOT_INO;
         use constellation_meta::MetaStore;
-        use constellation_store_s3::CompressionSetting;
+        use replicix_chunkfmt::CompressionSetting;
         const CS: u32 = 4096;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let chunks = Arc::new(ChunkStore::new(store.clone()));
@@ -2226,7 +2221,7 @@ mod tests {
         use constellation_fs_core::manifest::Manifest;
         use constellation_fs_core::types::ROOT_INO;
         use constellation_meta::MetaStore;
-        use constellation_store_s3::CompressionSetting;
+        use replicix_chunkfmt::CompressionSetting;
         use std::time::{Duration, Instant};
         const CS: u32 = 4096;
         const PER_DIR: usize = 100;

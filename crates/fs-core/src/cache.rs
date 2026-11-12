@@ -35,10 +35,10 @@
 //! same state-lock hold, and a load is admitted only if its disk entry is
 //! still there.
 
-use crate::chunk::ChunkHash;
 use crate::error::CoreError;
 use crate::memcache::{MemCache, MemCacheStats};
 use bytes::Bytes;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, Write};

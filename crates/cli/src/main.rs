@@ -26,8 +26,9 @@ use clap::{Parser, Subcommand};
 use constellation_control::methods as cm;
 use constellation_control::proto::types as api;
 use constellation_meta::Meta;
-use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
+use constellation_store_s3::{ChunkStore, FsMeta};
 use constellation_types::Code;
+use replicix_chunkfmt::CompressionSetting;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -1214,7 +1215,7 @@ fn daemon_socket_is_live(state_dir: &Path) -> bool {
 /// `serve --create`); the manager refuses a backend whose required
 /// operations failed (e.g. Backblaze B2 rejecting the conditional-write
 /// headers) with the list.
-fn print_preflight(checks: &[constellation_store_s3::PreflightCheck]) {
+fn print_preflight(checks: &[replicix_objcas::PreflightCheck]) {
     for c in checks {
         let status = match &c.outcome {
             Ok(()) => "ok".to_string(),
@@ -1232,7 +1233,7 @@ fn print_preflight(checks: &[constellation_store_s3::PreflightCheck]) {
 struct CliCreate;
 
 impl manager::CreateHooks for CliCreate {
-    fn preflight(&mut self, checks: &[constellation_store_s3::PreflightCheck]) {
+    fn preflight(&mut self, checks: &[replicix_objcas::PreflightCheck]) {
         print_preflight(checks);
     }
 
@@ -1394,6 +1395,7 @@ fn daemon_from_the_first_line(command: &Command) -> bool {
 }
 
 fn main() -> std::process::ExitCode {
+    constellation_store_s3::adapters::install();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => exit_with_error(&error),
@@ -2899,7 +2901,7 @@ enum LockOutcome {
 /// [`HeldStateDir`]), used instead of taking it again.
 fn take_state_dir_lock(
     state_dir: &Path,
-    held: Option<constellation_platform::LockGuard>,
+    held: Option<replicix_platform_lite::LockGuard>,
 ) -> Result<LockOutcome> {
     let guard = match held {
         Some(guard) => Some(guard),
@@ -2924,12 +2926,11 @@ fn take_state_dir_lock(
 
 /// `daemon.lock` of `state_dir` (created with the dir if need be), if no
 /// other process holds it.
-fn try_lock_state_dir(state_dir: &Path) -> Result<Option<constellation_platform::LockGuard>> {
+fn try_lock_state_dir(state_dir: &Path) -> Result<Option<replicix_platform_lite::LockGuard>> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
-    let lock_file =
-        constellation_platform::lock::open_lock_file(&state_dir.join(daemon_lock::LOCK_NAME))
-            .context("opening daemon.lock")?;
+    let lock_file = replicix_platform_lite::open_lock_file(&state_dir.join(daemon_lock::LOCK_NAME))
+        .context("opening daemon.lock")?;
     constellation_platform::native()
         .file_lock
         .try_lock(lock_file)
@@ -2945,7 +2946,7 @@ fn try_lock_state_dir(state_dir: &Path) -> Result<Option<constellation_platform:
 /// the state dir when it made it (an empty dir it created, left behind,
 /// would no longer be "new or empty" for `--state-dir`).
 struct HeldStateDir {
-    guard: Option<constellation_platform::LockGuard>,
+    guard: Option<replicix_platform_lite::LockGuard>,
     created: Option<PathBuf>,
 }
 
@@ -2957,7 +2958,7 @@ impl HeldStateDir {
     }
 
     /// Hand the lock on to the daemon (`take_state_dir_lock`).
-    fn into_guard(mut self) -> Option<constellation_platform::LockGuard> {
+    fn into_guard(mut self) -> Option<replicix_platform_lite::LockGuard> {
         self.created = None;
         self.guard.take()
     }
@@ -3002,7 +3003,7 @@ fn cmd_mount_body(
     views: Vec<ViewSpec>,
     passphrase: Option<Zeroizing<String>>,
     pin_target: e2e_pin::PinTarget,
-    mut held: Option<constellation_platform::LockGuard>,
+    mut held: Option<replicix_platform_lite::LockGuard>,
     verdict: Option<daemonize::Verdict>,
 ) -> Result<()> {
     // After the daemonizer's fork (the writer thread must not exist at it).
@@ -3848,9 +3849,9 @@ async fn run_gc_cli(
     let meta = std::sync::Arc::new(Meta::open(db)?);
     let caps = chunks.probe_conditional_writes().await?;
     let mode = if caps.etag_cas {
-        constellation_store_s3::LeaseMode::Cas
+        replicix_objcas::LeaseMode::Cas
     } else {
-        constellation_store_s3::LeaseMode::SingleWriter
+        replicix_objcas::LeaseMode::SingleWriter
     };
     let tail = gc::GcTail::standalone(logs, &meta)?;
     gc::run(backend, chunks, meta, mode, verify_only, None, &tail).await
@@ -3913,9 +3914,9 @@ async fn run_fsck_cli(
     let meta = std::sync::Arc::new(Meta::open(db)?);
     let caps = chunks.probe_conditional_writes().await?;
     let mode = if caps.etag_cas {
-        constellation_store_s3::LeaseMode::Cas
+        replicix_objcas::LeaseMode::Cas
     } else {
-        constellation_store_s3::LeaseMode::SingleWriter
+        replicix_objcas::LeaseMode::SingleWriter
     };
     let compression: CompressionSetting = fsmeta
         .compression
@@ -4326,7 +4327,7 @@ fn run_snapshot_policy_command(
                 constellation_engine::control::snapsched::check_expression(
                     &expr,
                     simulate_ms,
-                    constellation_store_s3::lease::now_unix_ms(),
+                    replicix_objcas::lease::now_unix_ms(),
                 )
             };
             let result = match against {

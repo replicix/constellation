@@ -14,8 +14,8 @@
 use super::encoding::*;
 use super::{Result, Run, SnapAcct, SnapAcctError, OPEN};
 use crate::snapwalk::Delta;
-use constellation_fs_core::ChunkHash;
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
+use replicix_chunkfmt::ChunkHash;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

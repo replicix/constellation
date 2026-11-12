@@ -441,18 +441,16 @@ impl EngineControl {
                 .load_fs()
                 .await
                 .map(drop)
-                .map_err(
-                    |e| match constellation_store_s3::classify(&e).is_transient() {
-                        true => (
-                            ErrorKind::Unavailable,
-                            format!("S3 could not be asked (reading meta.json: {e})"),
-                        ),
-                        false => (
-                            ErrorKind::Denied,
-                            format!("reading meta.json with them: {e}"),
-                        ),
-                    },
-                )
+                .map_err(|e| match replicix_objcas::classify(&e).is_transient() {
+                    true => (
+                        ErrorKind::Unavailable,
+                        format!("S3 could not be asked (reading meta.json: {e})"),
+                    ),
+                    false => (
+                        ErrorKind::Denied,
+                        format!("reading meta.json with them: {e}"),
+                    ),
+                })
         };
         let (kind, why) = match tokio::time::timeout(Duration::from_secs(30), checked).await {
             Ok(Ok(())) => return Ok(()),

@@ -22,7 +22,7 @@
 //! service's build cursor and live-refresh root), wiped with the index.
 
 use super::{Run, SnapAcctError, OPEN};
-use constellation_fs_core::ChunkHash;
+use replicix_chunkfmt::ChunkHash;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 

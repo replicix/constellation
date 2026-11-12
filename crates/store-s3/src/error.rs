@@ -59,3 +59,30 @@ pub enum StoreError {
     #[error("parallel execution: {0}")]
     Parallel(String),
 }
+
+impl From<replicix_chunkfmt::Error> for StoreError {
+    fn from(e: replicix_chunkfmt::Error) -> Self {
+        use replicix_chunkfmt::Error as E;
+        match e {
+            E::CorruptObject(s) => StoreError::CorruptObject(s),
+            E::UnknownCodec(id) => StoreError::UnknownCodec(id),
+            E::Compression(s) => StoreError::Compression(s),
+            E::Keyring(s) => StoreError::Meta(s),
+            E::Io(e) => StoreError::Io(e),
+        }
+    }
+}
+
+impl From<replicix_objcas::Error> for StoreError {
+    fn from(e: replicix_objcas::Error) -> Self {
+        use replicix_objcas::Error as E;
+        match e {
+            E::ObjectStore(e) => StoreError::ObjectStore(e),
+            E::CasConflict => StoreError::CasConflict,
+            E::Meta(s) => StoreError::Meta(s),
+            E::Json(e) => StoreError::Json(e),
+            E::Io(e) => StoreError::Io(e),
+            E::AwsCredentials(s) => StoreError::AwsCredentials(s),
+        }
+    }
+}

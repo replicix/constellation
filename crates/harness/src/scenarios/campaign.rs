@@ -595,7 +595,7 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
             .max()
             .map_or(Duration::ZERO, Duration::from_millis);
         let timings = crate::timings::Timings::from_pairs(&{
-            let mut env = vec![("CONSTELLATION_LEASE_TTL_MS", super::m9::TTL_MS.to_string())];
+            let mut env = vec![("REPLICIX_LEASE_TTL_MS", super::m9::TTL_MS.to_string())];
             env.extend(extra.iter().cloned());
             env
         });
@@ -737,7 +737,7 @@ mod tests {
     /// 5000 (so the delegation TTL is 5 s too).
     fn cell() -> Timings {
         Timings::from_pairs(&[
-            ("CONSTELLATION_LEASE_TTL_MS", "20000"),
+            ("REPLICIX_LEASE_TTL_MS", "20000"),
             ("CONSTELLATION_LOCK_TTL_MS", "5000"),
         ])
     }

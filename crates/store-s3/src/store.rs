@@ -1,15 +1,19 @@
 //! Chunk store over any `object_store` backend, plus filesystem metadata
 //! (`meta.json`) lifecycle with conditional-create.
 
-use crate::codec::CompressionSetting;
 use crate::decode_gate::{DecodeGate, Priority as DecodePriority};
-use crate::e2e::{decrypt_object, encrypt_object, KeyringBlock, SharedE2eKeys};
+use crate::e2e::SharedE2eKeys;
 use crate::error::StoreError;
-use crate::{format, layout};
+use crate::layout;
 use constellation_fs_core::cache::SpillFile;
-use constellation_fs_core::{ChunkHash, DEFAULT_CHUNK_SIZE};
+use constellation_fs_core::DEFAULT_CHUNK_SIZE;
 use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use replicix_chunkfmt::codec::CompressionSetting;
+use replicix_chunkfmt::e2e::{decrypt_object, encrypt_object, KeyringBlock};
+use replicix_chunkfmt::format;
+use replicix_chunkfmt::ChunkHash;
+use replicix_objcas::{Capabilities, PreflightCheck};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::Arc;
@@ -65,22 +69,6 @@ impl std::fmt::Display for MissingFs {
             MissingFs::Unknown(e) => write!(f, "listing the prefix failed too: {e}"),
         }
     }
-}
-
-/// Whether a `LIST` error says the bucket is absent: `object_store` keeps
-/// a `LIST`'s status only in the error text (S3's `NoSuchBucket` code, or
-/// a 404 status; a `LIST` cannot 404 for any other reason).
-fn is_missing_bucket(e: &object_store::Error) -> bool {
-    if matches!(e, object_store::Error::NotFound { .. }) {
-        return true;
-    }
-    let mut text = e.to_string();
-    let mut source = std::error::Error::source(e);
-    while let Some(s) = source {
-        text.push_str(&s.to_string());
-        source = s.source();
-    }
-    text.contains("NoSuchBucket") || text.contains("status code: 404")
 }
 
 /// `meta.json`: filesystem identity and settings (DESIGN.md §2).
@@ -244,10 +232,12 @@ pub struct ChunkPutResult {
 
 impl ChunkStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        crate::adapters::install();
         Self::with_encode_concurrency(store, None, encode_concurrency())
     }
 
     pub fn new_e2e(store: Arc<dyn ObjectStore>, keys: SharedE2eKeys) -> Self {
+        crate::adapters::install();
         Self::with_encode_concurrency(store, Some(keys), encode_concurrency())
     }
 
@@ -321,14 +311,14 @@ impl ChunkStore {
     /// plaintext on the application stream.
     pub fn protect_peer_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<Vec<u8>, StoreError> {
         match &self.e2e {
-            Some(keys) => encrypt_object(&keys.dek("p0"), &hash.0, data),
+            Some(keys) => encrypt_object(&keys.dek("p0"), &hash.0, data).map_err(StoreError::from),
             None => Ok(data.to_vec()),
         }
     }
 
     pub fn open_peer_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<Vec<u8>, StoreError> {
         match &self.e2e {
-            Some(keys) => decrypt_object(&keys.dek("p0"), &hash.0, data),
+            Some(keys) => decrypt_object(&keys.dek("p0"), &hash.0, data).map_err(StoreError::from),
             None => Ok(data.to_vec()),
         }
     }
@@ -339,17 +329,17 @@ impl ChunkStore {
         let body = serde_json::to_vec_pretty(meta)?;
         // Plan 30 §M4 item 1: a 409 retries; our own create that landed
         // behind a 412 is ours (the body carries a fresh uuid).
-        match crate::cas::put_conditional(
+        match replicix_objcas::cas::put_conditional(
             self.store.as_ref(),
             &layout::meta_json(),
             body.into(),
             PutMode::Create,
-            crate::cas::Verify::Body,
+            replicix_objcas::cas::Verify::Body,
         )
         .await?
         {
-            crate::cas::CasPut::Won(_) => Ok(()),
-            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => {
+            replicix_objcas::cas::CasPut::Won(_) => Ok(()),
+            replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
                 Err(StoreError::AlreadyExists)
             }
         }
@@ -405,7 +395,7 @@ impl ChunkStore {
     /// A `HEAD` that S3 refuses (401, 403) cannot say why: its answer has
     /// no body, so no `<Code>` (`InvalidAccessKeyId`,
     /// `SignatureDoesNotMatch`, `AccessDenied`, ...), the one part of an
-    /// error body [`crate::aws_auth::redacted_error_body`] keeps. The
+    /// error body [`replicix_objcas::aws_auth::redacted_error_body`] keeps. The
     /// refusal is then asked for again by a `GET` and that error is the
     /// answer: `fs.unlock`'s gate must name a revoked key pair. The `GET`
     /// goes to a key the same credentials were just refused, never one
@@ -445,7 +435,9 @@ impl ChunkStore {
             Some(Ok(object)) => MissingFs::NoMeta {
                 sample: object.location.to_string(),
             },
-            Some(Err(e)) if is_missing_bucket(&e) => MissingFs::NoBucket,
+            Some(Err(e)) if replicix_objcas::preflight::is_missing_bucket(&e) => {
+                MissingFs::NoBucket
+            }
             Some(Err(e)) => MissingFs::Unknown(e.to_string()),
         }
     }
@@ -523,7 +515,7 @@ impl ChunkStore {
     /// [`StoreError::CasConflict`], and nothing is written.
     pub async fn change_passphrase(
         &self,
-        expected: &crate::e2e::KeyringBlock,
+        expected: &replicix_chunkfmt::e2e::KeyringBlock,
         old: &str,
         new: &str,
     ) -> Result<(), StoreError> {
@@ -544,7 +536,7 @@ impl ChunkStore {
         if serde_json::to_value(block)? != serde_json::to_value(expected)? {
             return Err(StoreError::CasConflict);
         }
-        meta.keyring = Some(crate::e2e::rewrap_master(block, old, new)?);
+        meta.keyring = Some(replicix_chunkfmt::e2e::rewrap_master(block, old, new)?);
         self.store
             .put_opts(
                 &key,
@@ -574,17 +566,19 @@ impl ChunkStore {
             let mut meta: FsMeta = serde_json::from_slice(&object.bytes().await?)?;
             let previous = meta.epoch_slack();
             meta.epoch_slack = (epoch_slack > 0).then_some(epoch_slack);
-            match crate::cas::put_conditional(
+            match replicix_objcas::cas::put_conditional(
                 self.store.as_ref(),
                 &key,
                 serde_json::to_vec_pretty(&meta)?.into(),
                 PutMode::Update(version),
-                crate::cas::Verify::Body,
+                replicix_objcas::cas::Verify::Body,
             )
             .await?
             {
-                crate::cas::CasPut::Won(_) => return Ok(previous),
-                crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => continue,
+                replicix_objcas::cas::CasPut::Won(_) => return Ok(previous),
+                replicix_objcas::cas::CasPut::Lost | replicix_objcas::cas::CasPut::Missing => {
+                    continue
+                }
             }
         }
         Err(StoreError::CasConflict)
@@ -659,7 +653,9 @@ impl ChunkStore {
         let obj = Self::run_encoder(encode_permit, move || {
             let encoded = format::encode_object(&owned, setting)?;
             match e2e {
-                Some(keys) => encrypt_object(&keys.dek("p0"), &aad, &encoded),
+                Some(keys) => {
+                    encrypt_object(&keys.dek("p0"), &aad, &encoded).map_err(StoreError::from)
+                }
                 None => Ok(encoded),
             }
         })
@@ -667,10 +663,13 @@ impl ChunkStore {
         let obj = bytes::Bytes::from(obj);
         if mode == ChunkPutMode::Create {
             // Plan 30 §M4 item 1: a 409 is retried, never a dedup hit
-            // (`crate::cas::create_content_addressed`).
-            let existed =
-                crate::cas::create_content_addressed(self.store.as_ref(), &key, obj.clone())
-                    .await?;
+            // (`replicix_objcas::cas::create_content_addressed`).
+            let existed = replicix_objcas::cas::create_content_addressed(
+                self.store.as_ref(),
+                &key,
+                obj.clone(),
+            )
+            .await?;
             if !existed {
                 return Ok(ChunkPutResult { existed: false });
             }
@@ -903,245 +902,14 @@ impl ChunkStore {
     /// Every check runs even when an earlier one fails, so the report
     /// lists all problems at once. Cleanup is best-effort.
     pub async fn preflight(&self) -> Vec<PreflightCheck> {
-        let key = object_store::path::Path::from(format!(".preflight/{}", Uuid::new_v4()));
-        let mut checks = Vec::new();
-
-        // Unconditional write: connectivity, credentials, bucket/prefix
-        // write permission. Its version feeds the etag-CAS check below.
-        let write = self
-            .store
-            .put_opts(
-                &key,
-                PutPayload::from_static(b"preflight"),
-                PutOptions::from(PutMode::Overwrite),
-            )
-            .await;
-        let written = match &write {
-            Ok(r) => Some(UpdateVersion {
-                e_tag: r.e_tag.clone(),
-                version: r.version.clone(),
-            }),
-            Err(_) => None,
-        };
-        checks.push(PreflightCheck::new(
-            "write object (PUT)",
-            true,
-            write.map(|_| ()).map_err(|e| concise_os_error(&e)),
-        ));
-
-        // Read back.
-        let read = match self.store.get(&key).await {
-            Ok(r) => r.bytes().await.map(|_| ()),
-            Err(e) => Err(e),
-        };
-        checks.push(PreflightCheck::new(
-            "read object (GET)",
-            true,
-            read.map_err(|e| concise_os_error(&e)),
-        ));
-
-        // List the prefix (GC and node discovery walk object listings).
-        let list = self
-            .store
-            .list(Some(&object_store::path::Path::from(".preflight")))
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>();
-        checks.push(PreflightCheck::new(
-            "list objects (LIST)",
-            true,
-            list.map(|_| ()).map_err(|e| concise_os_error(&e)),
-        ));
-
-        // Create-if-absent (`If-None-Match: *`): load-bearing from phase 1.
-        let cia_key = object_store::path::Path::from(format!(".preflight/{}", Uuid::new_v4()));
-        let create_if_absent = match self
-            .store
-            .put_opts(
-                &cia_key,
-                PutPayload::from_static(b"a"),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
-        {
-            Ok(_) => match self
-                .store
-                .put_opts(
-                    &cia_key,
-                    PutPayload::from_static(b"b"),
-                    PutOptions::from(PutMode::Create),
-                )
-                .await
-            {
-                Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
-                Ok(_) => Err("backend accepted a second create over an existing object; \
-                              create-if-absent is not enforced"
-                    .to_string()),
-                Err(e) => Err(concise_os_error(&e)),
-            },
-            Err(e) => Err(concise_os_error(&e)),
-        };
-        let _ = self.store.delete(&cia_key).await;
-        checks.push(PreflightCheck::new(
-            "create-if-absent (If-None-Match)",
-            true,
-            create_if_absent,
-        ));
-
-        // Etag CAS (`If-Match`): required for lease renew/takeover, and so
-        // for multi-node mounts. Single-node mounts degrade without it, so
-        // it is reported but not treated as fatal for `fs create`.
-        let etag_cas = match &written {
-            Some(v) => match self
-                .store
-                .put_opts(
-                    &key,
-                    PutPayload::from_static(b"cas"),
-                    PutOptions::from(PutMode::Update(v.clone())),
-                )
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(e) => Err(concise_os_error(&e)),
-            },
-            None => Err("skipped (initial write failed)".to_string()),
-        };
-        checks.push(PreflightCheck::new("etag CAS (If-Match)", false, etag_cas));
-
-        // Delete: cleanup uses it everywhere (GC, lease release).
-        let delete = self.store.delete(&key).await;
-        checks.push(PreflightCheck::new(
-            "delete object (DELETE)",
-            true,
-            delete.map_err(|e| concise_os_error(&e)),
-        ));
-
-        checks
+        replicix_objcas::preflight::preflight(self.store.as_ref()).await
     }
 
     /// `doctor` probe: verify which conditional-write primitives the
     /// backend supports. Create-if-absent is required from phase 1;
     /// etag CAS becomes load-bearing with leases (phase 3).
     pub async fn probe_conditional_writes(&self) -> Result<Capabilities, StoreError> {
-        let key = object_store::path::Path::from(format!(".doctor/{}", Uuid::new_v4()));
-        // Create-if-absent.
-        let first = self
-            .store
-            .put_opts(
-                &key,
-                PutPayload::from_static(b"a"),
-                PutOptions::from(PutMode::Create),
-            )
-            .await?;
-        let create_if_absent = match self
-            .store
-            .put_opts(
-                &key,
-                PutPayload::from_static(b"b"),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
-        {
-            Err(object_store::Error::AlreadyExists { .. }) => true,
-            Ok(_) => false,
-            Err(e) => {
-                let _ = self.store.delete(&key).await;
-                return Err(e.into());
-            }
-        };
-        // CAS with the correct etag must succeed; with a stale etag it must fail.
-        let update = PutOptions::from(PutMode::Update(object_store::UpdateVersion {
-            e_tag: first.e_tag.clone(),
-            version: first.version.clone(),
-        }));
-        let etag_cas = match self
-            .store
-            .put_opts(&key, PutPayload::from_static(b"c"), update)
-            .await
-        {
-            Ok(_) => {
-                let stale = PutOptions::from(PutMode::Update(object_store::UpdateVersion {
-                    e_tag: first.e_tag,
-                    version: first.version,
-                }));
-                matches!(
-                    self.store
-                        .put_opts(&key, PutPayload::from_static(b"d"), stale)
-                        .await,
-                    Err(object_store::Error::Precondition { .. })
-                )
-            }
-            Err(object_store::Error::NotImplemented { .. }) => false,
-            Err(e) => {
-                let _ = self.store.delete(&key).await;
-                return Err(e.into());
-            }
-        };
-        let _ = self.store.delete(&key).await;
-        Ok(Capabilities {
-            create_if_absent,
-            etag_cas,
-        })
-    }
-}
-
-/// Conditional-write support reported by [`ChunkStore::probe_conditional_writes`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Capabilities {
-    pub create_if_absent: bool,
-    pub etag_cas: bool,
-}
-
-/// One operation exercised by [`ChunkStore::preflight`].
-#[derive(Debug, Clone)]
-pub struct PreflightCheck {
-    /// Human-readable operation name (e.g. `"create-if-absent (If-None-Match)"`).
-    pub name: &'static str,
-    /// Whether a filesystem cannot be created without this operation.
-    pub required: bool,
-    /// `Ok(())` when the operation worked, `Err(reason)` with a concise
-    /// explanation otherwise.
-    pub outcome: Result<(), String>,
-}
-
-impl PreflightCheck {
-    fn new(name: &'static str, required: bool, outcome: Result<(), String>) -> Self {
-        Self {
-            name,
-            required,
-            outcome,
-        }
-    }
-}
-
-/// Collapse a verbose `object_store` error (which embeds the full S3 XML
-/// body) into a one-line reason suitable for a preflight report.
-fn concise_os_error(e: &object_store::Error) -> String {
-    match e {
-        object_store::Error::NotImplemented { .. } => {
-            "not supported by this S3 backend (server returned 501 Not Implemented)".to_string()
-        }
-        object_store::Error::NotFound { .. } => "object not found".to_string(),
-        object_store::Error::Precondition { .. } => "precondition failed".to_string(),
-        object_store::Error::AlreadyExists { .. } => "object already exists".to_string(),
-        object_store::Error::Generic { source, .. } => {
-            // Generic S3 errors wrap the transport error; some backends
-            // report an unimplemented conditional header this way.
-            let msg = source.to_string();
-            if msg.contains("501") || msg.contains("NotImplemented") {
-                "not supported by this S3 backend (server returned 501 Not Implemented)".to_string()
-            } else {
-                // Keep just the first line; the rest is an XML dump.
-                msg.lines().next().unwrap_or("request failed").to_string()
-            }
-        }
-        other => other
-            .to_string()
-            .lines()
-            .next()
-            .unwrap_or("request failed")
-            .to_string(),
+        Ok(replicix_objcas::preflight::probe_conditional_writes(self.store.as_ref()).await?)
     }
 }
 

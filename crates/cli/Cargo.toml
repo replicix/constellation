@@ -11,6 +11,9 @@ name = "constellation"
 path = "src/main.rs"
 
 [dependencies]
+replicix-objcas.workspace = true
+replicix-chunkfmt.workspace = true
+replicix-platform-lite.workspace = true
 constellation-engine.workspace = true
 constellation-vfs.workspace = true
 constellation-frontend-fuse.workspace = true

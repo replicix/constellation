@@ -658,7 +658,7 @@ impl Config {
     /// Production defaults (the `CONSTELLATION_*` defaults of the code the
     /// core replaces), for `node_id` at `incarnation`.
     pub fn defaults(node_id: NodeId, incarnation: u32) -> Self {
-        let ttl_ms = constellation_store_s3::lease::DEFAULT_LEASE_TTL_MS;
+        let ttl_ms = replicix_objcas::lease::DEFAULT_LEASE_TTL_MS;
         Self {
             node_id,
             incarnation,

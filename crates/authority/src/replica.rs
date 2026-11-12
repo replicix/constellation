@@ -249,7 +249,7 @@ pub trait Replica {
         now_unix: i64,
         remote: bool,
         unanswered: &dyn Fn(Rid) -> bool,
-        live_ops: &dyn Fn(&constellation_fs_core::ChunkHash) -> Vec<Rid>,
+        live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
         exclude_rolled_back: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
@@ -1154,7 +1154,7 @@ impl Replica for Meta {
         now_unix: i64,
         remote: bool,
         unanswered: &dyn Fn(Rid) -> bool,
-        live_ops: &dyn Fn(&constellation_fs_core::ChunkHash) -> Vec<Rid>,
+        live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
         exclude_rolled_back: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError> {

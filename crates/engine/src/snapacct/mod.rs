@@ -139,9 +139,9 @@ pub use service::{
 };
 
 use crate::snapwalk::{Delta, Occurrences};
-use constellation_fs_core::ChunkHash;
 use encoding::*;
 use fjall::{KeyspaceCreateOptions, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

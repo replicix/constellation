@@ -5,8 +5,10 @@ use crate::e2e_pin::{self, PinTarget};
 use crate::registry::{self, FsEntry, FsOverrides, Registry};
 use constellation_control::proto::ControlError;
 use constellation_platform::CredentialSource;
-use constellation_store_s3::{CompressionSetting, FsMeta, PreflightCheck, StoreError};
+use constellation_store_s3::{FsMeta, StoreError};
 use constellation_types::Code;
+use replicix_chunkfmt::CompressionSetting;
+use replicix_objcas::PreflightCheck;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -222,7 +224,7 @@ impl Manager {
                     return Err(ControlError::invalid("passphrase must not be empty"));
                 }
                 meta.keyring = Some(
-                    constellation_store_s3::create_keyring_block(&passphrase)
+                    replicix_chunkfmt::create_keyring_block(&passphrase)
                         .map_err(|e| failed(format!("creating E2E keyring: {e}")))?,
                 );
             }

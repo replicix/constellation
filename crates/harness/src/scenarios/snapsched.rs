@@ -92,7 +92,7 @@ const POLICY_XATTR: &str = "user.constellation.snapshots";
 /// The policies' finest tier: one snapshot per bucket.
 const BUCKET_MS: i64 = 10_000;
 const TICK_MS: i64 = 1_000;
-/// `CONSTELLATION_LEASE_TTL_MS` for `snapsched`: both the root lease and
+/// `REPLICIX_LEASE_TTL_MS` for `snapsched`: both the root lease and
 /// the scheduler's `_snapsched` lease (which is at least three ticks).
 /// Shortened from the 60 s default so a takeover fits the scenario.
 const TTL_MS: i64 = 10_000;
@@ -141,7 +141,7 @@ pub(super) fn tuned(c: Client, ttl_ms: Option<i64>, grace_s: u64, expire_every_s
             &expire_every_s.to_string(),
         );
     match ttl_ms {
-        Some(ttl) => c.with_env("CONSTELLATION_LEASE_TTL_MS", &ttl.to_string()),
+        Some(ttl) => c.with_env("REPLICIX_LEASE_TTL_MS", &ttl.to_string()),
         None => c,
     }
 }
@@ -1027,7 +1027,7 @@ pub fn snapshot_takeover_idle(seed: u64) -> Result<()> {
             // cadence: shorten it so it falls inside the scenario.
             .with_env("CONSTELLATION_PUBLISH_IDLE_S", "2")
             .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "2000")
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
+            .with_env("REPLICIX_LEASE_TTL_MS", &TTL_MS.to_string())
             .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             .with_env("RUST_LOG", "info,constellation_engine::mtree_publish=debug"))

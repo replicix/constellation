@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::control_client::{ControlClient, InMemoryControl, SubtreeQuotaParams};
-use crate::proto::csi::v1::volume_capability::{AccessMode, MountVolume};
 use constellation_control::proto::types::{XattrOp, XattrParams};
+use replicix_csi_common::proto::csi::v1::volume_capability::{AccessMode, MountVolume};
 
 const UUID: &str = "4f9c1e2a-0b1c-4d5e-8f90-1a2b3c4d5e6f";
 
@@ -180,7 +180,7 @@ fn pool(shard: u32) -> PoolRef {
     let mut class = context();
     class.retain(|k, _| !k.contains('/'));
     PoolRef {
-        class: ClassParams::parse(&class).unwrap(),
+        class: ClassParams::parse(&class, crate::params::DEFAULT_PREFIX).unwrap(),
         shard,
         secrets: Default::default(),
     }
@@ -730,7 +730,7 @@ async fn static_and_dedicated_ids_stage_their_own_subtree() {
     ctx.insert("layout".into(), "dedicated".into());
     ctx.remove("shards");
     let dedicated = PoolRef {
-        class: ClassParams::parse(&ctx).unwrap(),
+        class: ClassParams::parse(&ctx, crate::params::DEFAULT_PREFIX).unwrap(),
         shard: 0,
         secrets: Default::default(),
     };
@@ -873,7 +873,7 @@ async fn an_aws_default_chain_engine_is_never_unlocked() {
     let mut class = ctx.clone();
     class.retain(|k, _| !k.contains('/'));
     let chain = PoolRef {
-        class: ClassParams::parse(&class).unwrap(),
+        class: ClassParams::parse(&class, crate::params::DEFAULT_PREFIX).unwrap(),
         shard: 1,
         secrets: Default::default(),
     };
@@ -894,7 +894,7 @@ async fn an_aws_default_chain_engine_is_never_unlocked() {
 /// crashed pod's replacement gets.
 #[tokio::test]
 async fn a_refreshing_class_pushes_each_rotation_to_the_running_engine() {
-    use crate::credentials::fake::FakeSecrets;
+    use replicix_csi_common::credentials::fake::FakeSecrets;
     let secret = |id: &str| -> Secrets {
         [("aws_access_key_id", id), ("aws_secret_access_key", "k")]
             .into_iter()
@@ -924,7 +924,7 @@ async fn a_refreshing_class_pushes_each_rotation_to_the_running_engine() {
     let mut class = ctx.clone();
     class.retain(|k, _| !k.contains('/'));
     let refreshing = PoolRef {
-        class: ClassParams::parse(&class).unwrap(),
+        class: ClassParams::parse(&class, crate::params::DEFAULT_PREFIX).unwrap(),
         shard: 1,
         secrets: Default::default(),
     };
@@ -1318,7 +1318,7 @@ async fn a_restarted_plugin_hands_over_an_engine_it_holds_no_credentials_for() {
 /// rather than on the one being retired.
 #[tokio::test]
 async fn a_rotation_waits_for_a_running_handoff() {
-    use crate::credentials::fake::FakeSecrets;
+    use replicix_csi_common::credentials::fake::FakeSecrets;
     let secret = |id: &str| -> Secrets {
         [("aws_access_key_id", id), ("aws_secret_access_key", "k")]
             .into_iter()
@@ -1348,7 +1348,7 @@ async fn a_rotation_waits_for_a_running_handoff() {
     let mut class = ctx.clone();
     class.retain(|k, _| !k.contains('/'));
     let refreshing = PoolRef {
-        class: ClassParams::parse(&class).unwrap(),
+        class: ClassParams::parse(&class, crate::params::DEFAULT_PREFIX).unwrap(),
         shard: 1,
         secrets: Default::default(),
     };

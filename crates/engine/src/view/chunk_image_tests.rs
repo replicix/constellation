@@ -54,7 +54,7 @@ fn view_on(
     staging: &str,
     chunk: u32,
     staging_budget: u64,
-    fs: Arc<dyn constellation_platform::FsPrimitives>,
+    fs: Arc<dyn replicix_platform_lite::FsPrimitives>,
 ) -> View {
     // Every slot staging hands out on this thread reads as junk until
     // written: a read of anything staging was not given since shows.
@@ -813,7 +813,7 @@ struct CountingFs {
     punches: std::sync::atomic::AtomicU64,
 }
 
-impl constellation_platform::FsPrimitives for CountingFs {
+impl replicix_platform_lite::FsPrimitives for CountingFs {
     fn punch_hole(&self, file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
         self.punches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

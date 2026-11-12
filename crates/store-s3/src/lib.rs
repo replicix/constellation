@@ -1,35 +1,33 @@
 //! S3 backend: bucket layout, conditional writes (CAS), self-describing
 //! chunk objects, the pluggable compression codec registry.
 //!
+//! The conditional-write primitives, leases, probes, the chunk format and
+//! the codec registry live in the shared `replicix-objcas` and
+//! `replicix-chunkfmt` crates; [`adapters`] plugs Constellation's error
+//! table and protocol clock into the former.
+//!
 //! See docs/explanation/DESIGN.md §2 (bucket layout) and §3 (data plane).
 
-pub mod aws_auth;
+pub mod adapters;
 pub mod blobs;
-pub mod cas;
-pub mod classify;
-pub mod codec;
 pub mod commits;
 pub mod compact;
-pub mod control;
 pub mod decode_gate;
 pub mod designation;
 pub mod e2e;
 pub mod error;
 #[cfg(test)]
 pub(crate) mod faulty;
-pub mod format;
 pub mod gc;
 pub mod heartbeat;
 pub mod inbox;
 pub mod layout;
-pub mod lease;
 pub mod log;
 pub mod mark;
 pub mod node_cache;
 pub mod nodes;
 pub mod packs;
 pub mod parallel;
-pub mod probe;
 pub(crate) mod run;
 #[cfg(test)]
 pub(crate) mod scripted_http;
@@ -37,21 +35,12 @@ pub mod snapsched;
 pub mod snapshot;
 pub mod store;
 
-pub use aws_auth::{
-    amazon_s3_builder, amazon_s3_builder_resolved, amazon_s3_builder_resolved_with,
-    configure_s3_client, S3Resolution, SuppliedCredentials,
-};
-
 pub use blobs::BlobStore;
-pub use classify::{classify, classify_chain, classify_message, ErrorClass};
-pub use codec::{Codec, CompressionSetting};
 pub use commits::{vector_covers, Commit, CommitAgg, CommitChain, CommitPayload, Intent, SHARD0};
 pub use compact::{CompactionPacer, Compactor, PackFate, PackVerdict, Reclaim, Sweep, Unpaced};
 pub use decode_gate::{DecodeGate, DecodeGatePermit, Priority as DecodePriority};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
-pub use e2e::{
-    create_keyring_block, unlock, Argon2Params, E2eKeys, KeyringBlock, SharedE2eKeys, TreeSealing,
-};
+pub use e2e::{unlock, ConstellationDomain, E2eKeys, SharedE2eKeys, TreeSealing};
 pub use error::StoreError;
 pub use gc::{
     append_journal, publish_condemned, publish_condemned_blobs, publish_condemned_packs,
@@ -63,10 +52,6 @@ pub use heartbeat::{HeartbeatStore, Promise, PromiseConfig, TakeoverCheck};
 pub use inbox::{
     gc_keep_newest, InboxBatch, InboxKey, InboxOp, InboxPoller, InboxRid, InboxStore,
     InboxSubmitter, PollBackoff, PutBatch, INBOX_VERSION,
-};
-pub use lease::{
-    fence_retired, live_leases_held_by, AckPolicy, InheritedTail, Lease, LeaseMode, LeaseStore,
-    LeaseTag, RenewalKey,
 };
 pub use log::LogStore;
 pub use mark::{live_set, mark, CatalogPack, LiveSet, Mark, PackCatalog};
@@ -80,8 +65,5 @@ pub use packs::{
     PackStore,
 };
 pub use parallel::{effective_threads, gc_threads};
-pub use probe::{probe_cas_semantics, CasProbe, CasProbeReport, Versioning};
 pub use snapshot::{snapshot_id, SnapshotRecord, SnapshotStore, SnapshotTreeRoot};
-pub use store::{
-    Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta, MissingFs, PreflightCheck,
-};
+pub use store::{ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta, MissingFs};

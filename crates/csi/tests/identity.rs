@@ -7,11 +7,11 @@
 use constellation_csi::identity::{IdentityService, DRIVER_NAME};
 use constellation_csi::node::state::StateStore;
 use constellation_csi::node::{FakeMounter, NodeService};
-use constellation_csi::proto::csi::v1::identity_client::IdentityClient;
-use constellation_csi::proto::csi::v1::identity_server::IdentityServer;
-use constellation_csi::proto::csi::v1::node_server::NodeServer;
-use constellation_csi::proto::csi::v1::{GetPluginInfoRequest, ProbeRequest};
 use hyper_util::rt::TokioIo;
+use replicix_csi_common::proto::csi::v1::identity_client::IdentityClient;
+use replicix_csi_common::proto::csi::v1::identity_server::IdentityServer;
+use replicix_csi_common::proto::csi::v1::node_server::NodeServer;
+use replicix_csi_common::proto::csi::v1::{GetPluginInfoRequest, ProbeRequest};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};

@@ -23,8 +23,8 @@
 //! mode.
 
 use anyhow::{Context, Result};
-use constellation_store_s3::{Lease, LeaseMode, LeaseStore, LeaseTag, StoreError};
 use object_store::ObjectStore;
+use replicix_objcas::{Lease, LeaseMode, LeaseStore, LeaseTag};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,7 +67,7 @@ impl SingletonLease {
         name: &'static str,
         mode: LeaseMode,
     ) -> Result<Self> {
-        let ttl = constellation_store_s3::lease::lease_ttl_ms();
+        let ttl = replicix_objcas::lease::lease_ttl_ms();
         Self::acquire_with_ttl(store, name, mode, ttl).await
     }
 
@@ -79,7 +79,7 @@ impl SingletonLease {
         ttl_ms: u64,
     ) -> Result<Self> {
         let leases = LeaseStore::new(store, name, mode);
-        let now = constellation_store_s3::lease::now_unix_ms();
+        let now = replicix_objcas::lease::now_unix_ms();
         // Holder id: pid in the high half, a low-entropy nonce in the low
         // half, matching the GC lease's construction.
         let holder = (std::process::id() as u64) << 32 | now as u64 & 0xffff_ffff;
@@ -143,7 +143,7 @@ impl SingletonLease {
                 self.tag = tag;
                 Ok(())
             }
-            Err(StoreError::CasConflict) => Err(Fenced { name: self.name }.into()),
+            Err(replicix_objcas::Error::CasConflict) => Err(Fenced { name: self.name }.into()),
             Err(error) => Err(error).with_context(|| format!("renewing the {} lease", self.name)),
         }
     }

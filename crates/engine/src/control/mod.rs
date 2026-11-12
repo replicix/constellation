@@ -210,11 +210,11 @@ pub struct EngineControl {
     pub(crate) atime: Arc<crate::atime::AtimeAccumulator>,
     pub(crate) prune_stats: Arc<crate::prune::PruneStats>,
     pub(crate) snapsched_stats: Arc<crate::snapsched::SnapSchedStats>,
-    pub(crate) lease_mode: constellation_store_s3::LeaseMode,
+    pub(crate) lease_mode: replicix_objcas::LeaseMode,
     pub(crate) read_only_member: bool,
     pub(crate) last_sync_ms: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) state_dir: PathBuf,
-    pub(crate) compression: constellation_store_s3::CompressionSetting,
+    pub(crate) compression: replicix_chunkfmt::CompressionSetting,
     /// The whole-filesystem view `browse.*` goes through, opened on first
     /// use and kept for the engine's life.
     browse: Mutex<Option<Arc<View>>>,

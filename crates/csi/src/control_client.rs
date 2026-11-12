@@ -12,7 +12,6 @@
 //! [`InMemoryControl`], an in-process fake used by unit tests and by
 //! `csi-sanity` so the sanity suite never touches real S3.
 
-use crate::params::ClassParams;
 use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::proto::types::{
@@ -24,6 +23,7 @@ use constellation_control::proto::types::{
     ViewUnmountParams, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
+use replicix_csi_common::params::ClassParams;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -226,7 +226,7 @@ pub trait Engines: Send + Sync {
     async fn filesystem(
         &self,
         fs_uuid: &str,
-        secrets: &crate::credentials::Secrets,
+        secrets: &replicix_csi_common::credentials::Secrets,
     ) -> Result<Arc<dyn ControlClient>, ControlError>;
 
     /// An engine pod serving `fs_uuid` **only if one is up already**: never
@@ -239,7 +239,7 @@ pub trait Engines: Send + Sync {
     async fn running(
         &self,
         fs_uuid: &str,
-        secrets: &crate::credentials::Secrets,
+        secrets: &replicix_csi_common::credentials::Secrets,
     ) -> Result<Option<Arc<dyn ControlClient>>, ControlError>;
 
     /// Whether the CO still has an object naming `handle`: a

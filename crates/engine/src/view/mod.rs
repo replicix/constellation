@@ -193,14 +193,16 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use constellation_fs_core::cache::{CacheVerify, ChunkState, DiskCache, OpenPin};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
-use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
+use constellation_fs_core::{FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
 use constellation_meta::{Meta, MetaError, MetaStore, ReadKey};
-use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
+use constellation_store_s3::{ChunkStore, DecodePriority};
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, Caller, Durability, Entry, FallocateMode, FileKind, FrontendCaps, OpWatch, OpenFlags,
     OpenUnlinked, PassthroughChunk, PolicyStack, ReadData, Renamed, SeekWhence,
 };
+use replicix_chunkfmt::ChunkHash;
+use replicix_chunkfmt::CompressionSetting;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
 use std::path::PathBuf;

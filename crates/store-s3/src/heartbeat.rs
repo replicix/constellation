@@ -36,9 +36,9 @@
 
 use crate::error::StoreError;
 use crate::layout;
-use crate::lease::RenewalKey;
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use replicix_objcas::lease::RenewalKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -403,9 +403,12 @@ mod tests {
 
     #[test]
     fn default_ttl_is_a_quarter_of_the_lease() {
-        let cfg = PromiseConfig::new(crate::lease::DEFAULT_LEASE_TTL_MS / 4);
+        let cfg = PromiseConfig::new(replicix_objcas::lease::DEFAULT_LEASE_TTL_MS / 4);
         assert_eq!(cfg.ttl_ms, 15_000);
-        assert_eq!(cfg.validate(crate::lease::DEFAULT_LEASE_TTL_MS), Ok(()));
+        assert_eq!(
+            cfg.validate(replicix_objcas::lease::DEFAULT_LEASE_TTL_MS),
+            Ok(())
+        );
     }
 
     #[test]

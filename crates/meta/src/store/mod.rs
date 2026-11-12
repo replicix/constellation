@@ -1459,7 +1459,7 @@ impl Meta {
             if k.len() != 40 {
                 return Err(MetaError::Invalid("pending_upload key length".into()));
             }
-            let hash = constellation_fs_core::ChunkHash(k[..32].try_into().expect("32 bytes"));
+            let hash = replicix_chunkfmt::ChunkHash(k[..32].try_into().expect("32 bytes"));
             let ino = u64::from_be_bytes(k[32..].try_into().expect("8 bytes"));
             tx.insert(
                 &self.pending_upload_by_ino,
@@ -2510,7 +2510,8 @@ mod tests {
     /// cut bytes back.
     #[test]
     fn a_truncate_cuts_the_manifest_everywhere() {
-        use constellation_fs_core::{ChunkHash, ChunkInfo, Manifest};
+        use constellation_fs_core::{ChunkInfo, Manifest};
+        use replicix_chunkfmt::ChunkHash;
         let chunks = [(0u64, ChunkHash::of(b"a")), (1, ChunkHash::of(b"b"))]
             .into_iter()
             .collect();

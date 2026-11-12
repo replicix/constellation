@@ -1080,7 +1080,7 @@ impl View {
         // seed 34, a truncate to 32 of a ten-chunk file).
         let mut old_hashes = self.chunk_list(base)?;
         old_hashes.retain(|index, _| *index * cs < base.file_len);
-        let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
+        let layout = replicix_chunkfmt::ChunkLayout::new(self.chunk_size);
         let n_chunks = layout.chunk_count(file_len);
         let floor = ws.base_floor(base.file_len);
         let mut new_hashes: SparseChunks = old_hashes

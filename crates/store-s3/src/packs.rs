@@ -358,7 +358,8 @@ fn frame(node: &PackNode, key: Option<&[u8; 32]>) -> Result<Vec<u8>, StoreError>
     let compressed = zstd::encode_all(&node.bytes[..], ZSTD_LEVEL)
         .map_err(|e| StoreError::Compression(e.to_string()))?;
     match key {
-        Some(key) => crate::e2e::encrypt_object(key, &node.hash.0, &compressed),
+        Some(key) => replicix_chunkfmt::e2e::encrypt_object(key, &node.hash.0, &compressed)
+            .map_err(StoreError::from),
         None => Ok(compressed),
     }
 }
@@ -611,12 +612,13 @@ impl PackStore {
         let compressed;
         let frame = match self.node_key() {
             Some(key) => {
-                compressed = crate::e2e::decrypt_object(key, &node.0, frame)?;
+                compressed = replicix_chunkfmt::e2e::decrypt_object(key, &node.0, frame)?;
                 &compressed[..]
             }
             None => frame,
         };
-        crate::codec::decompress_bounded(frame, MAX_NODE_BYTES)
+        replicix_chunkfmt::codec::decompress_bounded(frame, MAX_NODE_BYTES)
+            .map_err(StoreError::from)
     }
 
     /// Override the fill target. For tests that need several packs out
@@ -654,9 +656,11 @@ impl PackStore {
             .await?;
         let key = layout::pack_index(&hex);
         let index = match self.node_key() {
-            Some(seal) => {
-                crate::e2e::encrypt_object(seal, key.as_ref().as_bytes(), &pack.index.encode())?
-            }
+            Some(seal) => replicix_chunkfmt::e2e::encrypt_object(
+                seal,
+                key.as_ref().as_bytes(),
+                &pack.index.encode(),
+            )?,
             None => pack.index.encode(),
         };
         self.put_created(&key, index).await
@@ -669,7 +673,8 @@ impl PackStore {
     ) -> Result<(), StoreError> {
         // Content-addressed; plan 30 §M4 item 1: a 409 retries rather than
         // passing for "already there".
-        crate::cas::create_content_addressed(self.store.as_ref(), key, body.into()).await?;
+        replicix_objcas::cas::create_content_addressed(self.store.as_ref(), key, body.into())
+            .await?;
         Ok(())
     }
 
@@ -677,7 +682,7 @@ impl PackStore {
         let key = layout::pack_index(&hash.to_hex());
         let body = self.store.get(&key).await?.bytes().await?;
         match self.node_key() {
-            Some(seal) => PackIndex::decode(&crate::e2e::decrypt_object(
+            Some(seal) => PackIndex::decode(&replicix_chunkfmt::e2e::decrypt_object(
                 seal,
                 key.as_ref().as_bytes(),
                 &body,

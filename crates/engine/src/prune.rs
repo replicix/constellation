@@ -16,9 +16,9 @@ use anyhow::Result;
 use constellation_fs_core::{Ino, InodeKind};
 use constellation_meta::prune::{Candidate, EntryFacts, Of, Policy, Verdict, Watermark};
 use constellation_meta::{Meta, MetaStore, MutateOp, MutateOutcome};
-use constellation_store_s3::LeaseMode;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use replicix_objcas::LeaseMode;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -797,7 +797,7 @@ fn now_ns() -> i64 {
 /// offset), as the snapshot paths and the scheduler compare it with
 /// lease and batch windows.
 pub fn now_unix_ms() -> u64 {
-    constellation_store_s3::lease::now_unix_ms().max(0) as u64
+    replicix_objcas::lease::now_unix_ms().max(0) as u64
 }
 
 /// This node's wait clock (`ProtocolClock::wait`) in ms: what an interval

@@ -92,7 +92,7 @@ pub(super) const TTL_MS: u64 = 20_000;
 
 /// The client op deadline of [`cluster`]'s daemons (twice the lease TTL).
 pub(super) fn client_deadline() -> Duration {
-    crate::timings::Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", TTL_MS.to_string())])
+    crate::timings::Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", TTL_MS.to_string())])
         .client_deadline()
 }
 
@@ -149,7 +149,7 @@ pub(super) fn cluster_mounted(
             .unwrap_or_else(|| env.direct_endpoint.clone());
         let mut c = Client::new(root.path(), name, &endpoint, &backend)?
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", &ttl)
+            .with_env("REPLICIX_LEASE_TTL_MS", &ttl)
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
             .with_env(
@@ -190,7 +190,7 @@ pub(super) fn cluster_mounted(
 
 /// The timings [`cluster`]'s daemons run with (scenario extras aside).
 fn cluster_timings() -> crate::timings::Timings {
-    crate::timings::Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", TTL_MS.to_string())])
+    crate::timings::Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", TTL_MS.to_string())])
 }
 
 /// The P2P deny file of `name` (`fault::p2p_denied`): peers listed in it

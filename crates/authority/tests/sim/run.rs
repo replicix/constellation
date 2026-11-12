@@ -12,12 +12,12 @@ use super::node::{read_lease, CommitRecord, NodeEnv, NodeHandle, PEERS_TICK_MS};
 use super::store::{Bucket, Fault, OpKind, Rule, When};
 use constellation_authority::{ClientReply, Config, NodeId, Stats};
 use constellation_fs_core::types::ROOT_INO;
-use constellation_fs_core::ChunkHash;
 use constellation_meta::{LogRecord, Meta, MutateOp, MutateOutcome, Rid};
 use constellation_types::Code;
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{Rng, SeedableRng};
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1836,7 +1836,7 @@ impl Cluster {
         let expires_true = lease.expires_unix_ms - honour_error;
         // Nobody else may claim a `Backup` lease before its expiry plus
         // the backups' grace (`LeaseState::classify`).
-        let claimable_by_others = if lease.ack_policy == constellation_store_s3::AckPolicy::Backup
+        let claimable_by_others = if lease.ack_policy == replicix_objcas::AckPolicy::Backup
             && !lease.backups.is_empty()
         {
             expires_true
@@ -4836,6 +4836,7 @@ fn count_unsettled(
 
 /// Run one seed. `Err` carries the failure and the replay command.
 pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
+    constellation_store_s3::adapters::install();
     // Plan 46 M1.1 step 7: every delegated configuration judges I1, the
     // answer's claim and the rows' versions, unless it carries a documented
     // exception.

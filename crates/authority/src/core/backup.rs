@@ -7,7 +7,7 @@
 //! A holder answers a mutation (accepted *or refused*: a refusal was
 //! evaluated against the same unshipped state) only once the journal
 //! position it was evaluated at is *durable* under the lease's
-//! `ack_policy` (`constellation_store_s3::AckPolicy`):
+//! `ack_policy` (`replicix_objcas::AckPolicy`):
 //! - `Local`: at once (today; plan 30 §3's Layer A).
 //! - `Backup`: once every backup listed in the *committed* lease object
 //!   has persisted the journal through that position (Layer B). The
@@ -367,7 +367,7 @@ use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 pub use constellation_meta::GroupOn;
 use constellation_meta::{BackupRole, BackupTx, MutateOutcome, Rid};
-use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
+use replicix_objcas::{AckPolicy, Lease, LeaseTag};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// How many times a reconfiguration CAS is retried against a re-read
@@ -833,7 +833,7 @@ pub(crate) struct BackupState {
     /// claimant's CAS is conditioned on the key it read, so a lease that
     /// moved off every one of them can no longer be claimed by a sealer
     /// (`LeaseState::sealer_doomed`).
-    pub sealer_keys: Vec<constellation_store_s3::RenewalKey>,
+    pub sealer_keys: Vec<replicix_objcas::RenewalKey>,
     /// The wait-clock instant the last such seal was answered.
     pub sealer_at: WaitMs,
     /// The persisted seal could not be read at start: `sealed` is not
@@ -934,13 +934,13 @@ pub(crate) struct BackupState {
     /// operator's `--force` for a divergence.
     pub(crate) kept: Option<super::kept::KeptFetch>,
     pub(crate) kept_union: Option<super::kept::KeptUnion>,
-    pub(crate) kept_ready: Option<constellation_store_s3::RenewalKey>,
+    pub(crate) kept_ready: Option<replicix_objcas::RenewalKey>,
     pub(crate) kept_seen: Option<(Epoch, WaitMs)>,
     /// ADR-51 (S3): the claim waits for a roster read issued after
     /// `kept_seen` (`Action::RefreshRoster` is out): the lease it claims and
     /// the timer that ends the wait. [`Core::kept_roster_arrived`] resumes
     /// the phase when the read is installed.
-    pub(crate) kept_roster_wait: Option<(constellation_store_s3::Lease, TimerId)>,
+    pub(crate) kept_roster_wait: Option<(replicix_objcas::Lease, TimerId)>,
     pub(crate) kept_force: bool,
     pub(crate) kept_force_wanted: Option<Epoch>,
     /// The `through_known` of an abandon this claim made after partial

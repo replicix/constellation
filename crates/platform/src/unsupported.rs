@@ -14,13 +14,13 @@ use std::sync::Arc;
 
 use crate::daemon::{Daemon, Detached};
 use crate::dirs::Dirs;
-use crate::fs::FsPrimitives;
 use crate::lifecycle::ManualLifecycle;
-use crate::lock::{FileLock, LockGuard};
 use crate::mounts::{MountEntry, MountTable, UnmountMode};
 use crate::process::{Process, ProcessFacts, ThreadRef};
 use crate::secrets::{Secret, SecretStore, Update};
 use crate::{unsupported, HostServices};
+use replicix_platform_lite::FsPrimitives;
+use replicix_platform_lite::{FileLock, LockGuard};
 
 pub(crate) struct Unsupported;
 

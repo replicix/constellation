@@ -494,7 +494,7 @@ struct Kept {
     file: File,
     chunk_size: u64,
     /// The host's hole punching (a slot given up gives its blocks back).
-    fs: Arc<dyn constellation_platform::FsPrimitives>,
+    fs: Arc<dyn replicix_platform_lite::FsPrimitives>,
     /// The session's budget: a kept slot's reservation is released
     /// through it.
     budget: Arc<StagingBudget>,
@@ -583,7 +583,7 @@ impl Staging {
         gen: u64,
         chunk_size: u32,
         budget: Arc<StagingBudget>,
-        fs: Arc<dyn constellation_platform::FsPrimitives>,
+        fs: Arc<dyn replicix_platform_lite::FsPrimitives>,
     ) -> Result<Self, StagingError> {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{ino}.{gen}"));
@@ -980,14 +980,14 @@ impl GenCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use constellation_fs_core::ChunkLayout;
+    use replicix_chunkfmt::ChunkLayout;
     use tempfile::TempDir;
 
     fn budget(n: u64) -> Arc<StagingBudget> {
         StagingBudget::new(n)
     }
 
-    fn host_fs() -> Arc<dyn constellation_platform::FsPrimitives> {
+    fn host_fs() -> Arc<dyn replicix_platform_lite::FsPrimitives> {
         constellation_platform::HostServices::native().fs
     }
 
@@ -1030,7 +1030,7 @@ mod tests {
         punches: AtomicU64,
     }
 
-    impl constellation_platform::FsPrimitives for CountingFs {
+    impl replicix_platform_lite::FsPrimitives for CountingFs {
         fn punch_hole(&self, file: &File, offset: u64, len: u64) -> io::Result<()> {
             self.punches.fetch_add(1, Ordering::Relaxed);
             host_fs().punch_hole(file, offset, len)
@@ -1488,7 +1488,7 @@ mod tests {
     #[test]
     fn a_failed_punch_still_releases_and_the_slot_is_reused() {
         struct NoPunch;
-        impl constellation_platform::FsPrimitives for NoPunch {
+        impl replicix_platform_lite::FsPrimitives for NoPunch {
             fn punch_hole(&self, _: &File, _: u64, _: u64) -> io::Result<()> {
                 Err(io::ErrorKind::Unsupported.into())
             }

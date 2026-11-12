@@ -1096,9 +1096,9 @@ mod tests {
 mod authority_tests {
     use crate::authority_driver::Standalone;
     use constellation_meta::Meta;
-    use constellation_store_s3::{LeaseMode, LeaseStore};
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
+    use replicix_objcas::{LeaseMode, LeaseStore};
     use std::sync::Arc;
 
     fn node(store: &Arc<InMemory>, id: u64) -> (Arc<Meta>, Standalone) {
@@ -1113,7 +1113,7 @@ mod authority_tests {
         (meta, driver)
     }
 
-    async fn lease(store: &Arc<InMemory>) -> constellation_store_s3::Lease {
+    async fn lease(store: &Arc<InMemory>) -> replicix_objcas::Lease {
         LeaseStore::new(
             store.clone() as Arc<dyn ObjectStore>,
             constellation_store_s3::log::PARTITION,

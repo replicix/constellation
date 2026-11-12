@@ -109,7 +109,7 @@ pub(crate) fn failed(e: impl std::fmt::Display) -> ControlError {
 }
 
 /// A store refusal as the control error it stands for: `Unavailable`
-/// when asking again may answer (`constellation_store_s3::classify`), so
+/// when asking again may answer (`replicix_objcas::classify`), so
 /// a caller — the CSI plugin, `serve`'s credential gate — retries a flaky
 /// S3 and gives up on a refusal.
 pub(crate) fn store_err(e: StoreError) -> ControlError {
@@ -123,7 +123,7 @@ pub(crate) fn store_err(e: StoreError) -> ControlError {
 
 /// `e`, a store failure while `doing`, classified as [`store_err`] does.
 pub(crate) fn store_failed(e: StoreError, doing: Option<&str>) -> ControlError {
-    let transient = constellation_store_s3::classify(&e).is_transient();
+    let transient = replicix_objcas::classify(&e).is_transient();
     let message = match doing {
         Some(doing) => format!("{doing}: {e}"),
         None => e.to_string(),
@@ -303,7 +303,7 @@ impl Manager {
             .await
             .map_err(|e| {
                 let message = format!("opening backend: {e:#}");
-                match constellation_store_s3::classify_chain(e.chain()).is_transient() {
+                match replicix_objcas::classify_chain(e.chain()).is_transient() {
                     true => ControlError::unavailable(message),
                     false => ControlError::failed(message),
                 }

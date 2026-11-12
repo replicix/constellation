@@ -1,7 +1,7 @@
 //! Bucket key layout (DESIGN.md §2).
 
-use constellation_fs_core::ChunkHash;
 use object_store::path::Path;
+use replicix_chunkfmt::ChunkHash;
 
 pub fn meta_json() -> Path {
     Path::from("meta.json")
@@ -79,10 +79,6 @@ pub fn commit(seq: u64) -> Path {
 
 pub fn commits_prefix() -> Path {
     Path::from("commits")
-}
-
-pub fn lease(partition: &str) -> Path {
-    Path::from(format!("leases/{partition}.json"))
 }
 
 /// `designations/<hash-of-path>.json` (DESIGN.md §5.2). Hashed rather

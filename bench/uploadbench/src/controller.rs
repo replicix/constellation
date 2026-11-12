@@ -4,7 +4,7 @@
 //! events — "a request just succeeded, carrying `bytes`" and "a request
 //! just failed after retries" — and returns the concurrency target it
 //! wants next. [`crate::run`] drives the target through a
-//! [`constellation_upload_concurrency::ConcurrencyGate`], the exact
+//! [`replicix_upload_concurrency::ConcurrencyGate`], the exact
 //! primitive `constellation` uses in production, so the comparison is
 //! about the *policy*, not the plumbing.
 
@@ -54,13 +54,13 @@ impl Controller for FixedController {
 /// "This implementation": the exact policy `constellation` ships,
 /// unmodified, imported from `constellation-upload-concurrency`.
 pub struct AimdController {
-    inner: constellation_upload_concurrency::AdaptiveConcurrency,
+    inner: replicix_upload_concurrency::AdaptiveConcurrency,
 }
 
 impl AimdController {
     pub fn new(initial: usize, min: usize, max: usize) -> Self {
         Self {
-            inner: constellation_upload_concurrency::AdaptiveConcurrency::new(initial, min, max),
+            inner: replicix_upload_concurrency::AdaptiveConcurrency::new(initial, min, max),
         }
     }
 }

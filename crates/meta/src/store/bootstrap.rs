@@ -23,10 +23,11 @@
 use crate::error::MetaError;
 use crate::store::local::{DELEG_LOG_IDX_PREFIX, DELEG_VOID_CUT_PREFIX};
 use crate::store::{misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
-use constellation_fs_core::{ChunkHash, Ino};
+use constellation_fs_core::Ino;
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, BlobHash, InodeRecord, Kind, XattrPlacement};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
+use replicix_chunkfmt::ChunkHash;
 
 /// One inode's `0x01` record, re-encoded in this replica's *local*
 /// spill scheme, plus any `0x03` entries the xattr set spilled to — the

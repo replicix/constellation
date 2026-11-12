@@ -12,8 +12,9 @@
 use super::*;
 use constellation_fs_core::cache::CacheVerify;
 use constellation_fs_core::types::ROOT_INO;
-use constellation_store_s3::{create_keyring_block, unlock};
+use constellation_store_s3::unlock;
 use object_store::memory::InMemory;
+use replicix_chunkfmt::create_keyring_block;
 use tempfile::TempDir;
 
 const CHUNK: u32 = 1024 * 1024;

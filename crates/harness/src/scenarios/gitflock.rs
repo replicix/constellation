@@ -517,7 +517,7 @@ fn lease_margin_ms() -> i64 {
     let ttl = std::env::var("GIT_FLOCK_ENV")
         .unwrap_or_default()
         .split([',', ' '])
-        .find_map(|kv| kv.trim().strip_prefix("CONSTELLATION_LEASE_TTL_MS="))
+        .find_map(|kv| kv.trim().strip_prefix("REPLICIX_LEASE_TTL_MS="))
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(60_000);
     (ttl / 4).min(1_000)

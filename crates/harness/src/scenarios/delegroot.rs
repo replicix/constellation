@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 /// lock grant's ttl, 20 s, since c612585: about 11 s of renewal slack, not
 /// the 3.5 s this leaves). The M11 scenarios shorten both further.
 pub(super) const ENV: &[(&str, &str)] = &[
-    ("CONSTELLATION_LEASE_TTL_MS", "60000"),
+    ("REPLICIX_LEASE_TTL_MS", "60000"),
     ("CONSTELLATION_DELEGATION_TTL_MS", "5000"),
     ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50"),
     // `daemon --upgrade` detaches a dev-fuse session only.
@@ -282,7 +282,7 @@ pub(super) fn delegated_pair_with(
         for (k, v) in [
             ("CONSTELLATION_BACKUPS", "0"),
             ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500"),
-            ("CONSTELLATION_LEASE_TTL_MS", "20000"),
+            ("REPLICIX_LEASE_TTL_MS", "20000"),
         ] {
             if !extra.iter().any(|(e, _)| *e == k) {
                 env_vars.push((k, v));
@@ -400,7 +400,7 @@ fn pair_timings(backed: bool) -> Timings {
     if !backed {
         env.push(("CONSTELLATION_BACKUPS", "0"));
         env.push(("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "500"));
-        env.push(("CONSTELLATION_LEASE_TTL_MS", "20000"));
+        env.push(("REPLICIX_LEASE_TTL_MS", "20000"));
     }
     Timings::from_pairs(&env)
 }
@@ -1468,7 +1468,7 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
     if node != StallNode::B {
         // A lease longer than any stall: the cap by the root's lease is not
         // what is judged here.
-        extra.push(("CONSTELLATION_LEASE_TTL_MS", "60000"));
+        extra.push(("REPLICIX_LEASE_TTL_MS", "60000"));
     }
     // `CONSTELLATION_HARNESS_DELEG_DEBUG=1`: the delegation core's renewal
     // lines (sent, answered, late) in the daemons' logs.

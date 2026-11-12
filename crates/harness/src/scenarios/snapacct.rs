@@ -66,7 +66,7 @@ pub(super) fn snapacct(seed: u64) -> Result<()> {
     let mk = |name: &str, acct: &str| -> Result<Client> {
         Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
             .with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "1000")
+            .with_env("REPLICIX_LEASE_TTL_MS", "1000")
             .with_env("CONSTELLATION_GC_HORIZON_S", "0")
             .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
             .with_env("CONSTELLATION_SNAPACCT", acct)

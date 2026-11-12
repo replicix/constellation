@@ -13,8 +13,8 @@
 //! [u8; 32])`. Missing indices are holes. Decoders also accept the legacy
 //! dense `count u32 | count * hash` payload and assign indices in order.
 
-use crate::chunk::{ChunkHash, ChunkLayout};
 use crate::error::CoreError;
+use replicix_chunkfmt::{ChunkHash, ChunkLayout};
 use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 4] = b"CMF1";

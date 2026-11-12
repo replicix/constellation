@@ -107,7 +107,7 @@ fn client(endpoint: &str) -> Arc<dyn ObjectStore> {
         .with_secret_access_key("s");
     // The harness's daemons run with this retry budget
     // (`Client::new`: 2 retries within 2 s); the rest is the product's.
-    let s3 = constellation_store_s3::configure_s3_client(builder)
+    let s3 = replicix_objcas::configure_s3_client(builder)
         .with_retry(object_store::RetryConfig {
             max_retries: 2,
             retry_timeout: Duration::from_secs(2),

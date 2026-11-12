@@ -5,8 +5,9 @@
 //! scheduler, sharing its deduplication, adaptive S3 gate, and cache policy.
 
 use constellation_fs_core::manifest::{ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, Ino, InodeKind};
+use constellation_fs_core::{Ino, InodeKind};
 use constellation_meta::{Meta, MetaStore};
+use replicix_chunkfmt::ChunkHash;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -263,7 +264,8 @@ impl ScanAhead {
 mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
-    use constellation_fs_core::{ChunkHash, DEFAULT_CHUNK_SIZE, INLINE_CHUNKS_MAX};
+    use constellation_fs_core::{DEFAULT_CHUNK_SIZE, INLINE_CHUNKS_MAX};
+    use replicix_chunkfmt::ChunkHash;
 
     fn fixture(files: usize, chunks: usize) -> (Arc<Meta>, Vec<Ino>) {
         let meta = Arc::new(Meta::open_in_memory().unwrap());

@@ -1826,7 +1826,7 @@ pub(crate) mod tests {
         );
 
         let node = start_node(rt.handle(), &backend, root.path().join("state-lost"));
-        let lost = constellation_fs_core::ChunkHash::of(b"never reached the cache");
+        let lost = replicix_chunkfmt::ChunkHash::of(b"never reached the cache");
         node.engine().meta().add_pending_upload(&lost, 42).unwrap();
         let started = Instant::now();
         let error = node

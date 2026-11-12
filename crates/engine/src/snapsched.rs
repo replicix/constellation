@@ -132,8 +132,9 @@ use constellation_store_s3::snapsched::{
     self as snapsched_store, SnapSchedJournalEntry, SnapSchedJournalRoot, SnapSchedJournalSkip,
     SnapSchedJournalSnap, SnapSchedState,
 };
-use constellation_store_s3::{LeaseMode, StoreError};
+use constellation_store_s3::StoreError;
 use object_store::ObjectStore;
+use replicix_objcas::LeaseMode;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -312,7 +313,7 @@ pub struct SchedConfig {
     /// counts `capped_roots`, and shows an error. A guard against
     /// unbounded growth; `last=` and `*` tiers should never reach it.
     pub max_per_root: usize,
-    /// The `_snapsched` lease's TTL: `CONSTELLATION_LEASE_TTL_MS`, as
+    /// The `_snapsched` lease's TTL: `REPLICIX_LEASE_TTL_MS`, as
     /// every lease (default 60 s), and never less than three ticks, so a
     /// leader renewing every tick cannot lapse between two of them.
     pub lease_ttl_ms: u64,
@@ -351,8 +352,7 @@ impl SchedConfig {
             tick,
             max_lag: Duration::from_secs(env_u64("CONSTELLATION_SNAPSCHED_MAX_LAG_S", 300)),
             max_per_root: env_u64("CONSTELLATION_SNAPSCHED_MAX_PER_ROOT", 5000) as usize,
-            lease_ttl_ms: constellation_store_s3::lease::lease_ttl_ms()
-                .max(3 * tick.as_millis() as u64),
+            lease_ttl_ms: replicix_objcas::lease::lease_ttl_ms().max(3 * tick.as_millis() as u64),
             grace: Duration::from_secs(env_u64("CONSTELLATION_SNAPSCHED_GRACE_S", 86_400)),
             expire_every: Duration::from_secs(env_u64(
                 "CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S",
@@ -371,7 +371,7 @@ impl SchedConfig {
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 pub fn wall_clock() -> Clock {
-    Arc::new(constellation_store_s3::lease::now_unix_ms)
+    Arc::new(replicix_objcas::lease::now_unix_ms)
 }
 
 /// Everything the scheduler needs from the node.
@@ -883,6 +883,10 @@ impl Scheduler {
                     || matches!(
                         error.downcast_ref::<StoreError>(),
                         Some(StoreError::CasConflict)
+                    )
+                    || matches!(
+                        error.downcast_ref::<replicix_objcas::Error>(),
+                        Some(replicix_objcas::Error::CasConflict)
                     ) =>
             {
                 stats.leader.store(false, Ordering::Relaxed);
@@ -1997,7 +2001,7 @@ mod tests {
     /// A test clock 10 s past the start of a 10 s bucket in the future:
     /// nothing the holder stamps with the wall clock falls in its buckets.
     fn test_clock() -> Arc<AtomicI64> {
-        let now = constellation_store_s3::lease::now_unix_ms();
+        let now = replicix_objcas::lease::now_unix_ms();
         Arc::new(AtomicI64::new((now / (10 * SEC) + 6) * (10 * SEC) + SEC))
     }
 
@@ -2070,7 +2074,7 @@ mod tests {
 
     /// Whether `leases/_snapsched.json` exists.
     async fn lease_object(store: &Arc<InMemory>) -> bool {
-        constellation_store_s3::LeaseStore::new(
+        replicix_objcas::LeaseStore::new(
             store.clone() as Arc<dyn ObjectStore>,
             LEASE_NAME,
             LeaseMode::Cas,
@@ -2408,7 +2412,7 @@ mod tests {
         assert!(
             !lease_object(&store).await || {
                 // The released lease object stays; it names nobody live.
-                let leases = constellation_store_s3::LeaseStore::new(
+                let leases = replicix_objcas::LeaseStore::new(
                     store.clone() as Arc<dyn ObjectStore>,
                     LEASE_NAME,
                     LeaseMode::Cas,
@@ -2654,7 +2658,7 @@ mod tests {
         let (store, a, b, data, _) = holder_b().await;
         bind(&b, &[&a], data, "1h:1d; skip-empty=no").await;
         // The wall clock, the one the holder stamps rows with.
-        let now = Arc::new(AtomicI64::new(constellation_store_s3::lease::now_unix_ms()));
+        let now = Arc::new(AtomicI64::new(replicix_objcas::lease::now_unix_ms()));
         let first = scheduler(&a, store.clone(), &now, config());
         assert_eq!(outcomes(&first.tick(Run::Periodic).await), ["created"]);
         b.sync().await;
@@ -2718,12 +2722,12 @@ mod tests {
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            if *location == constellation_store_s3::layout::lease(LEASE_NAME)
+            if *location == replicix_objcas::lease::lease_path(LEASE_NAME)
                 && matches!(opts.mode, object_store::PutMode::Create)
                 && !self.raced.swap(true, Ordering::SeqCst)
             {
                 let body: Vec<u8> = payload.iter().flat_map(|c| c.iter().copied()).collect();
-                let mut theirs: constellation_store_s3::lease::Lease =
+                let mut theirs: replicix_objcas::lease::Lease =
                     serde_json::from_slice(&body).unwrap();
                 theirs.holder ^= 1;
                 self.inner
@@ -3575,9 +3579,9 @@ mod tests {
             Box::pin(async move {
                 if index == 1 {
                     let leases =
-                        constellation_store_s3::LeaseStore::new(thief, LEASE_NAME, LeaseMode::Cas);
+                        replicix_objcas::LeaseStore::new(thief, LEASE_NAME, LeaseMode::Cas);
                     let (lease, tag) = leases.get().await.unwrap().unwrap();
-                    let other = constellation_store_s3::Lease::granted(
+                    let other = replicix_objcas::Lease::granted(
                         LEASE_NAME,
                         lease.holder ^ 1,
                         lease.epoch + 1,
@@ -3875,8 +3879,8 @@ mod tests {
 
     use crate::snapacct::{SnapAcctConfig, SnapAcctDeps, SnapAcctMode, SnapAcctParams};
     use constellation_fs_core::manifest::{Manifest, SparseChunks};
-    use constellation_fs_core::ChunkHash;
     use constellation_store_s3::{ChunkStore, CommitChain};
+    use replicix_chunkfmt::ChunkHash;
 
     const MIB: u64 = 1 << 20;
 

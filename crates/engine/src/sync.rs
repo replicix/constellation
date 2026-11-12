@@ -10,7 +10,8 @@
 //! `authority_driver`, `gc`, `locks`, `prune` and `recovery` live in the
 //! engine crate.
 
-use constellation_fs_core::{ChunkHash, Ino};
+use constellation_fs_core::Ino;
+use replicix_chunkfmt::ChunkHash;
 
 /// Outcome of a `SyncRequest::Acquire` attempt (see its doc).
 #[derive(Debug, Clone, Copy, Default)]
@@ -48,14 +49,14 @@ pub struct SyncFailure {
     pub message: String,
 }
 
-pub use constellation_store_s3::ErrorClass;
+pub use replicix_objcas::ErrorClass;
 
 impl SyncFailure {
     /// Classified from the error's chain: content this node lost, or a
     /// local metadata-store failure, is permanent; chunks another node
     /// still has to upload are transient (plan 39b,
     /// `crate::upload::DrainShortfall`); the rest is the store's table
-    /// (`constellation_store_s3::classify`).
+    /// (`replicix_objcas::classify`).
     pub fn from_error(error: &anyhow::Error) -> Self {
         let shortfall = error
             .chain()
@@ -71,7 +72,7 @@ impl SyncFailure {
         } else if local {
             ErrorClass::Permanent
         } else {
-            constellation_store_s3::classify_chain(error.chain())
+            replicix_objcas::classify_chain(error.chain())
         };
         Self {
             class,
@@ -84,7 +85,7 @@ impl SyncFailure {
     pub fn from_text(message: impl Into<String>) -> Self {
         let message = message.into();
         Self {
-            class: constellation_store_s3::classify_message(&message),
+            class: replicix_objcas::classify_message(&message),
             message,
         }
     }
@@ -490,7 +491,7 @@ pub enum SyncRequest {
         epoch: u64,
         config_version: u64,
         from_seq: u64,
-        key: constellation_store_s3::RenewalKey,
+        key: replicix_objcas::RenewalKey,
         kept: bool,
         tenure: (u64, u64),
         closed_hold: bool,
@@ -624,7 +625,7 @@ pub enum SyncRequest {
     /// epoch_slack)`.
     PeerPromiseRequest {
         requester: u64,
-        key: constellation_store_s3::RenewalKey,
+        key: replicix_objcas::RenewalKey,
         reply: tokio::sync::oneshot::Sender<(bool, u32)>,
     },
     /// Plan 30 §M10: `meta.json`'s `epoch_slack` as last read.

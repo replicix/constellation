@@ -239,7 +239,7 @@ mod tests {
         assert!(format!("{err:#}").contains("recreate"), "{err:#}");
 
         // E2E: the master decides; the (absent) seed does not matter.
-        let block = constellation_store_s3::create_keyring_block("pw").unwrap();
+        let block = replicix_chunkfmt::create_keyring_block("pw").unwrap();
         let keys = constellation_store_s3::unlock(&block, "pw").unwrap();
         let e = CookieKey::derive(Some(&keys), &seedless, CookieBits::Wide).unwrap();
         let again = constellation_store_s3::unlock(&block, "pw").unwrap();

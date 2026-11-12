@@ -23,14 +23,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::fs::FsPrimitives;
 use crate::lifecycle::ManualLifecycle;
-use crate::lock::FileLock;
 use crate::mounts::{MountEntry, MountTable, UnmountMode};
 use crate::process::{Process, ProcessFacts, ThreadRef};
 use crate::secrets::FileSecretStore;
-use crate::unix::{ForkDaemon, UnixFileLock, XdgDirs};
+use crate::unix::{ForkDaemon, XdgDirs};
 use crate::{unsupported, HostServices};
+use replicix_platform_lite::FileLock;
+use replicix_platform_lite::FsPrimitives;
 
 pub(crate) fn host_services() -> HostServices {
     let dirs = Arc::new(XdgDirs);
@@ -48,10 +48,7 @@ pub(crate) fn host_services() -> HostServices {
 }
 
 pub(crate) fn file_lock() -> Arc<dyn FileLock> {
-    Arc::new(UnixFileLock {
-        holders: |_| Vec::new(),
-        opened_by: |_, _| false,
-    })
+    Arc::new(replicix_platform_lite::FlockLock::new())
 }
 
 fn off_t(n: u64) -> io::Result<libc::off_t> {

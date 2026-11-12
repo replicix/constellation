@@ -116,10 +116,8 @@
 //! name (the chart's `credentials.watchedSecrets`).
 
 use crate::control_client::{ControlClient, Engines, Handle, PoolRef, SocketControlClient};
-use crate::credentials::{fingerprint, is_awaiting_unlock, unlock_params, Refresher, Secrets};
+use crate::credentials::{is_awaiting_unlock, unlock_params};
 use crate::node::{Drift, NodeEngine, NodeEngines, Replacement};
-use crate::params::{ClassParams, CredentialMode, SecretRef};
-use crate::volume_id::VolumeId;
 use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::methods::FsList;
@@ -145,6 +143,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference}
 use kube::api::{
     Api, AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
 };
+use replicix_csi_common::credentials::{fingerprint, Refresher, Secrets};
+use replicix_csi_common::params::{ClassParams, CredentialMode, SecretRef};
+use replicix_csi_common::volume_id::VolumeId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1312,9 +1313,12 @@ pub fn pool_from_pv(
     shard: u32,
 ) -> Result<(PoolRef, Option<(String, String)>), String> {
     let params = class.parameters.clone().unwrap_or_default();
-    let mut class_params = ClassParams::parse(&params.clone().into_iter().collect())
-        .map_err(|e| format!("StorageClass {:?}: {e}", class.metadata.name))?;
-    if class_params.layout == crate::params::Layout::Dedicated {
+    let mut class_params = ClassParams::parse(
+        &params.clone().into_iter().collect(),
+        crate::params::DEFAULT_PREFIX,
+    )
+    .map_err(|e| format!("StorageClass {:?}: {e}", class.metadata.name))?;
+    if class_params.layout == replicix_csi_common::params::Layout::Dedicated {
         // The volume's own filesystem: the prefix its context recorded,
         // else the one `CreateVolume` derives from the PV's name.
         let recorded = pv
@@ -1485,7 +1489,7 @@ struct Relay {
     client: Arc<SocketControlClient>,
     process: kube::api::AttachedProcess,
     /// The fingerprint of the credentials this process last unlocked the
-    /// incarnation with ([`crate::credentials::fingerprint`]); `None`:
+    /// incarnation with ([`replicix_csi_common::credentials::fingerprint`]); `None`:
     /// not by this process (it may need none, or another controller
     /// process did it).
     unlocked: Mutex<Option<[u8; 32]>>,
@@ -3387,7 +3391,7 @@ impl ControlClient for PoolClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::ClassParams;
+    use replicix_csi_common::params::ClassParams;
 
     fn pool(kv: &[(&str, &str)], shard: u32) -> PoolRef {
         let params: HashMap<String, String> = kv
@@ -3395,7 +3399,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         PoolRef {
-            class: ClassParams::parse(&params).unwrap(),
+            class: ClassParams::parse(&params, crate::params::DEFAULT_PREFIX).unwrap(),
             shard,
             secrets: BTreeMap::new(),
         }

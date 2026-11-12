@@ -9,8 +9,8 @@
 
 use super::Config;
 use crate::ids::{Epoch, HonourMs, NodeId, Now, WaitMs};
-use constellation_store_s3::lease::LEASE_VERSION;
-use constellation_store_s3::{AckPolicy, Lease, LeaseTag, RenewalKey};
+use replicix_objcas::lease::LEASE_VERSION;
+use replicix_objcas::{AckPolicy, Lease, LeaseTag, RenewalKey};
 
 /// Plan 30 §M3b: a won lease whose takeover gate has not completed. While
 /// pending the view is closed to every new mutation and nothing ships.
@@ -1251,11 +1251,8 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let store = std::sync::Arc::new(object_store::memory::InMemory::new());
-            let leases = constellation_store_s3::LeaseStore::new(
-                store,
-                "p0",
-                constellation_store_s3::LeaseMode::Cas,
-            );
+            let leases =
+                replicix_objcas::LeaseStore::new(store, "p0", replicix_objcas::LeaseMode::Cas);
             let first = Lease::granted("p0", 1, 1, 1000);
             let t = leases.try_create(&first).await.unwrap();
             leases.try_swap(&first, &t).await.unwrap()
@@ -1270,11 +1267,8 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let store = std::sync::Arc::new(object_store::memory::InMemory::new());
-            let leases = constellation_store_s3::LeaseStore::new(
-                store,
-                "p0",
-                constellation_store_s3::LeaseMode::Cas,
-            );
+            let leases =
+                replicix_objcas::LeaseStore::new(store, "p0", replicix_objcas::LeaseMode::Cas);
             leases
                 .try_create(&Lease::granted("p0", 1, 1, 1000))
                 .await

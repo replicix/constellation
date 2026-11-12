@@ -20,7 +20,7 @@ pub fn status(meta: &Meta) -> constellation_control::proto::types::HeldStatus {
             }
         }
     }
-    let now_ms = constellation_store_s3::lease::now_unix_ms();
+    let now_ms = replicix_objcas::lease::now_unix_ms();
     let remote = meta
         .remote_chunks()
         .unwrap_or_default()

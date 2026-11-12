@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+replicix-objcas.workspace = true
+replicix-chunkfmt.workspace = true
 constellation-fs-core.workspace = true
 constellation-meta.workspace = true
 constellation-store-s3.workspace = true

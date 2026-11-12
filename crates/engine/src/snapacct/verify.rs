@@ -24,9 +24,10 @@ use super::{Amount, SnapAcct};
 use crate::snapshot::{SnapshotRoot, TreeAccess};
 use anyhow::Result;
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, InodeKind};
+use constellation_fs_core::InodeKind;
 use constellation_meta::Meta;
 use constellation_store_s3::ChunkStore;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// At most this many mismatch lines are kept.

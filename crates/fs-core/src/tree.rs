@@ -10,7 +10,8 @@
 //! and an explicit little-endian layout makes versioning and corruption
 //! checks visible rather than inheriting a serializer's representation.
 
-use crate::{ChunkHash, CoreError, InodeKind};
+use crate::{CoreError, InodeKind};
+use replicix_chunkfmt::ChunkHash;
 
 const MAGIC_V1: &[u8; 4] = b"CTR1";
 const MAGIC_V2: &[u8; 4] = b"CTR2";

@@ -298,7 +298,7 @@ const LOCK_HOLDER_READ_TTL_MS: i64 = 250;
 /// say (`LeaseState::claimable_observed`), never the body's.
 #[derive(Debug, Clone)]
 enum HolderRead {
-    Lease(constellation_store_s3::Lease),
+    Lease(replicix_objcas::Lease),
     Empty,
     Failed,
 }
@@ -4392,9 +4392,7 @@ impl Core {
     /// The lease observation's key and stamps (plan 43 C7b), which a
     /// reused lease read must leave as they are.
     #[cfg(test)]
-    pub(crate) fn lease_obs_stamp(
-        &self,
-    ) -> Option<(constellation_store_s3::RenewalKey, WaitMs, WaitMs)> {
+    pub(crate) fn lease_obs_stamp(&self) -> Option<(replicix_objcas::RenewalKey, WaitMs, WaitMs)> {
         self.lease.obs.as_ref().map(|o| (o.key, o.since, o.read_at))
     }
 

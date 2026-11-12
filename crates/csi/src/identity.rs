@@ -11,11 +11,11 @@
 //!   case, not a failure — see §"Engine-pod lifecycle").
 
 use crate::control_client::ControlClient;
-use crate::proto::csi::v1::identity_server::Identity as IdentityRpc;
-use crate::proto::csi::v1::plugin_capability::{
+use replicix_csi_common::proto::csi::v1::identity_server::Identity as IdentityRpc;
+use replicix_csi_common::proto::csi::v1::plugin_capability::{
     service::Type as ServiceCapability, Service, Type as CapabilityType,
 };
-use crate::proto::csi::v1::{
+use replicix_csi_common::proto::csi::v1::{
     GetPluginCapabilitiesRequest, GetPluginCapabilitiesResponse, GetPluginInfoRequest,
     GetPluginInfoResponse, PluginCapability, ProbeRequest, ProbeResponse,
 };

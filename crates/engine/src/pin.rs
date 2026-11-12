@@ -18,9 +18,10 @@
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, Ino};
+use constellation_fs_core::Ino;
 use constellation_meta::Meta;
 use constellation_store_s3::ChunkStore;
+use replicix_chunkfmt::ChunkHash;
 use std::collections::HashSet;
 use std::sync::Arc;
 

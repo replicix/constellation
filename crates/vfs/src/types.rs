@@ -190,7 +190,7 @@ pub struct PassthroughChunk {
     pub fd: Arc<std::fs::File>,
     /// The chunk file's length, which is the file's whole committed length.
     pub len: u64,
-    /// The chunk's content hash (`constellation_fs_core::ChunkHash`'s
+    /// The chunk's content hash (`replicix_chunkfmt::ChunkHash`'s
     /// bytes), carried for diagnostics and for the frontend's own
     /// per-backing bookkeeping.
     pub hash: [u8; 32],

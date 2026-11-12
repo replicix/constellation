@@ -15,7 +15,7 @@ pub struct BackendInfo {
     /// The URL as given (`s3://bucket/prefix`, or a local path).
     pub url: String,
     /// For `s3://`: the endpoint, region and credentials in use.
-    pub s3: Option<constellation_store_s3::S3Resolution>,
+    pub s3: Option<replicix_objcas::S3Resolution>,
 }
 
 impl BackendInfo {
@@ -39,7 +39,7 @@ impl std::fmt::Display for BackendInfo {
 /// Build an object store scoped to the filesystem prefix from a URL.
 ///
 /// For `s3://`, credentials come from the standard AWS SDK chain via
-/// [`constellation_store_s3::amazon_s3_builder`] — env vars, shared
+/// [`replicix_objcas::amazon_s3_builder`] — env vars, shared
 /// config/credentials files, `AWS_PROFILE`, SSO, IMDS, ECS/IRSA, etc.
 pub async fn open_backend(url: &str) -> Result<Arc<dyn ObjectStore>> {
     Ok(open_backend_described(url).await?.0)
@@ -83,11 +83,11 @@ pub async fn open_backend_described_with(
             bail!("missing bucket in {url:?}");
         }
         let (builder, resolution) =
-            constellation_store_s3::amazon_s3_builder_resolved_with(bucket, supplied)
+            replicix_objcas::amazon_s3_builder_resolved_with(bucket, supplied)
                 .await
                 .with_context(|| format!("resolving AWS credentials for {url:?}"))?;
         tracing::debug!(url, %resolution, "S3 backend resolved");
-        let s3 = constellation_store_s3::configure_s3_client(builder)
+        let s3 = replicix_objcas::configure_s3_client(builder)
             .build()
             .with_context(|| format!("building S3 client for {url:?}"))?;
         let info = BackendInfo {
@@ -864,7 +864,7 @@ mod tests {
     fn aws_default() -> BackendInfo {
         BackendInfo {
             url: "s3://test-bucket/s3fs/x".into(),
-            s3: Some(constellation_store_s3::S3Resolution {
+            s3: Some(replicix_objcas::S3Resolution {
                 endpoint: "https://s3.us-west-2.amazonaws.com".into(),
                 endpoint_configured: false,
                 region: "us-west-2".into(),

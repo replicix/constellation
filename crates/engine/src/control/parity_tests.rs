@@ -748,7 +748,7 @@ fn unix_socket_and_http_dispatch_the_whole_table_identically() {
     // auto snapshot.
     let root_ino = constellation_fs_core::types::ROOT_INO;
     let day = 86_400_000i64;
-    let t0 = constellation_store_s3::lease::now_unix_ms() - 3 * day;
+    let t0 = replicix_objcas::lease::now_unix_ms() - 3 * day;
     let auto = |id: &str, at: i64, policy_ino: u64| constellation_meta::SnapshotRow {
         origin: 1,
         policy_ino,

@@ -27,8 +27,9 @@ use constellation_authority::segment::{self, Segment};
 use constellation_authority::{Event, NodeId, Replica, S3Result, Seq};
 use constellation_meta::RowCommit;
 use constellation_meta::{BackupTx, LogRecord, Meta, MutateOutcome, Rid};
-use constellation_store_s3::{AckPolicy, Lease, LogStore};
+use constellation_store_s3::LogStore;
 use constellation_types::Code;
+use replicix_objcas::{AckPolicy, Lease};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3248,8 +3249,8 @@ mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
     use constellation_meta::{DelegateTx, MutateOp, Position};
-    use constellation_store_s3::{LeaseMode, LeaseStore};
     use constellation_types::clock::Now;
+    use replicix_objcas::{LeaseMode, LeaseStore};
 
     fn rid(n: u64, seq: u64) -> Rid {
         Rid {
@@ -3595,8 +3596,9 @@ mod tests {
     /// it one (review M1, S6).
     #[test]
     fn a_deferred_row_is_not_plan_held_but_a_held_one_is() {
-        use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Manifest};
+        use constellation_fs_core::{ChunkInfo, Manifest};
         use constellation_meta::MetaStore;
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
         let o = Oracles::new(Bucket::new(1, (0, 0)));
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         meta.set_holder_epoch(1);

@@ -1790,7 +1790,7 @@ impl Engines for InMemoryEngines {
     async fn filesystem(
         &self,
         fs_uuid: &str,
-        _secrets: &crate::credentials::Secrets,
+        _secrets: &replicix_csi_common::credentials::Secrets,
     ) -> Result<Arc<dyn ControlClient>, ControlError> {
         if !self.registry.knows_filesystem(fs_uuid) {
             return Err(ControlError::not_found(format!(
@@ -1817,7 +1817,7 @@ impl Engines for InMemoryEngines {
     async fn running(
         &self,
         fs_uuid: &str,
-        _secrets: &crate::credentials::Secrets,
+        _secrets: &replicix_csi_common::credentials::Secrets,
     ) -> Result<Option<Arc<dyn ControlClient>>, ControlError> {
         if !self.is_running(fs_uuid) {
             return Ok(None);

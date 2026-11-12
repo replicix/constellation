@@ -41,10 +41,10 @@ use constellation_meta::{JournalPos, Meta, MutateOp, MutateOutcome, OwnChunks, P
 use constellation_net::{LogEvent, Payload};
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::log::PARTITION;
-use constellation_store_s3::{
-    ChunkStore, CompressionSetting, LeaseMode, LeaseStore, LogStore, StoreError,
-};
+use constellation_store_s3::{ChunkStore, LogStore, StoreError};
 use constellation_types::Code;
+use replicix_chunkfmt::CompressionSetting;
+use replicix_objcas::{LeaseMode, LeaseStore};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -886,14 +886,15 @@ pub(crate) fn wait_now_ms() -> i64 {
     constellation_platform::clock::protocol().wait().0
 }
 
-fn cas_failure(e: StoreError) -> CasFailure {
-    match e {
+fn cas_failure(e: impl Into<StoreError>) -> CasFailure {
+    match e.into() {
         StoreError::CasConflict | StoreError::AlreadyExists => CasFailure::Conflict,
         other => CasFailure::Failed(other.to_string()),
     }
 }
 
-fn s3_failure(e: StoreError) -> S3Failure {
+fn s3_failure(e: impl Into<StoreError>) -> S3Failure {
+    let e = e.into();
     S3Failure(e.to_string())
 }
 
@@ -2689,6 +2690,7 @@ impl Driver {
         sync_tx: mpsc::UnboundedSender<SyncRequest>,
         sync_rx: mpsc::UnboundedReceiver<SyncRequest>,
     ) -> Self {
+        constellation_store_s3::adapters::install();
         let urgent_rx = deps.urgent_rx.take();
         let node_id = deps.config.node_id;
         let core = daemon_core(deps.config.clone(), &deps.off_core);
@@ -7050,7 +7052,7 @@ impl Uploader {
     /// chunks owe (`None`: every report owed).
     async fn send_durable_reports_of(
         &self,
-        only: Option<&std::collections::HashSet<constellation_fs_core::ChunkHash>>,
+        only: Option<&std::collections::HashSet<replicix_chunkfmt::ChunkHash>>,
     ) {
         let Some(peers) = &self.peers else {
             return;
@@ -7448,7 +7450,7 @@ async fn drain_with_handoff(
     });
     // After a successful handoff: the reports its chunks owe (`note_up`
     // queued them), sent now on an `fsync`'s drain.
-    let handed_off = |hashes: Vec<constellation_fs_core::ChunkHash>| {
+    let handed_off = |hashes: Vec<replicix_chunkfmt::ChunkHash>| {
         let reporter = reporter.clone();
         async move {
             if let Some(reporter) = reporter {
@@ -7591,7 +7593,7 @@ impl ChunkHandoff {
     async fn hand_off(
         &self,
         ino: constellation_fs_core::Ino,
-    ) -> Option<Vec<constellation_fs_core::ChunkHash>> {
+    ) -> Option<Vec<replicix_chunkfmt::ChunkHash>> {
         let hashes = self.meta.pending_uploads_for_ino(ino).ok()?;
         self.hand_off_hashes(hashes.clone(), &[], ino)
             .await
@@ -7606,7 +7608,7 @@ impl ChunkHandoff {
     /// nobody could. (`ino` is for the log line; 0 for a round's.)
     async fn hand_off_hashes(
         &self,
-        hashes: Vec<constellation_fs_core::ChunkHash>,
+        hashes: Vec<replicix_chunkfmt::ChunkHash>,
         first: &[u64],
         ino: constellation_fs_core::Ino,
     ) -> bool {
@@ -7614,7 +7616,7 @@ impl ChunkHandoff {
         let Some(coop) = self.upload.coop.clone() else {
             return false;
         };
-        let hashes: Vec<constellation_fs_core::ChunkHash> = hashes
+        let hashes: Vec<replicix_chunkfmt::ChunkHash> = hashes
             .into_iter()
             .filter(|h| self.meta.upload_pending_for_hash(h).unwrap_or(false))
             .collect();
@@ -7640,7 +7642,7 @@ impl ChunkHandoff {
                 targets.push(p.node_id);
             }
         }
-        let req_id = constellation_store_s3::lease::now_unix_ms() as u64;
+        let req_id = replicix_objcas::lease::now_unix_ms() as u64;
         'peer: for peer in targets {
             for batch in hashes.chunks(CHUNK_HANDOFF_BATCH) {
                 let payload = constellation_net::Payload::ChunkHandoff {
@@ -7724,7 +7726,7 @@ impl ChunkHandoff {
     /// A peer that cannot reach S3 handed us `hashes`: fetch each from it,
     /// upload it, and keep a clean copy (a reader here, or one asking us,
     /// is served without S3). `true` once every one is in S3.
-    async fn accept(&self, requester: u64, hashes: Vec<constellation_fs_core::ChunkHash>) -> bool {
+    async fn accept(&self, requester: u64, hashes: Vec<replicix_chunkfmt::ChunkHash>) -> bool {
         use futures::StreamExt;
         let Some(coop) = self.upload.coop.clone() else {
             return false;
@@ -8813,7 +8815,7 @@ mod tests {
     fn both_drivers_give_their_core_a_clock() {
         use super::{daemon_core, OffCore, Standalone};
         use constellation_authority::Config;
-        use constellation_store_s3::LeaseMode;
+        use replicix_objcas::LeaseMode;
         let off = OffCore::new(1_000);
         assert!(daemon_core(Config::defaults(1, 0), &off).has_clock());
         let meta = std::sync::Arc::new(super::Meta::open_in_memory().unwrap());
@@ -8914,7 +8916,7 @@ mod tests {
     /// whose proof of liveness is stale, delegating `d` (generation 7) to
     /// node 3, with the lease object `lease` in an in-memory bucket.
     async fn stuck_fast_root(
-        lease: Option<constellation_store_s3::Lease>,
+        lease: Option<replicix_objcas::Lease>,
     ) -> std::sync::Arc<super::OffCore> {
         stuck_fast_root_reading_in(lease, std::time::Duration::ZERO).await
     }
@@ -8922,7 +8924,7 @@ mod tests {
     /// [`stuck_fast_root`], each read of its lease object taking `get` to
     /// come back.
     async fn stuck_fast_root_reading_in(
-        lease: Option<constellation_store_s3::Lease>,
+        lease: Option<replicix_objcas::Lease>,
         get: std::time::Duration,
     ) -> std::sync::Arc<super::OffCore> {
         use constellation_authority::core::RootLease;
@@ -8977,7 +8979,7 @@ mod tests {
     /// be that much later than the reading before the request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_root_probe_proof_is_dated_before_its_read_leaves() {
-        let lease = constellation_store_s3::Lease::granted(PARTITION, 1, 2, 60_000);
+        let lease = replicix_objcas::Lease::granted(PARTITION, 1, 2, 60_000);
         let get = std::time::Duration::from_millis(600);
         let off = stuck_fast_root_reading_in(Some(lease), get).await;
         let before = constellation_platform::clock::protocol().now().honour;
@@ -9002,7 +9004,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stuck_backed_root_answers_after_reading_its_lease() {
         use std::sync::atomic::Ordering;
-        let lease = constellation_store_s3::Lease::granted(PARTITION, 1, 2, 60_000);
+        let lease = replicix_objcas::Lease::granted(PARTITION, 1, 2, 60_000);
         let off = stuck_fast_root(Some(lease)).await;
         assert_eq!(
             off.answer_root_probing(true, 15_000, 1, 3, 7).await,
@@ -9030,7 +9032,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_core_that_runs_again_during_the_wait_answers_the_renewal_itself() {
         use std::sync::atomic::Ordering;
-        let lease = constellation_store_s3::Lease::granted(PARTITION, 1, 2, 60_000);
+        let lease = replicix_objcas::Lease::granted(PARTITION, 1, 2, 60_000);
         let off =
             stuck_fast_root_reading_in(Some(lease), std::time::Duration::from_millis(600)).await;
         let asking = {
@@ -9081,21 +9083,15 @@ mod tests {
         for (what, lease) in [
             (
                 "another holder",
-                Some(constellation_store_s3::Lease::granted(
-                    PARTITION, 4, 3, 60_000,
-                )),
+                Some(replicix_objcas::Lease::granted(PARTITION, 4, 3, 60_000)),
             ),
             (
                 "another holder, same epoch",
-                Some(constellation_store_s3::Lease::granted(
-                    PARTITION, 4, 2, 60_000,
-                )),
+                Some(replicix_objcas::Lease::granted(PARTITION, 4, 2, 60_000)),
             ),
             (
                 "a later epoch of this node",
-                Some(constellation_store_s3::Lease::granted(
-                    PARTITION, 1, 3, 60_000,
-                )),
+                Some(replicix_objcas::Lease::granted(PARTITION, 1, 3, 60_000)),
             ),
             ("no lease", None),
         ] {
@@ -9809,8 +9805,8 @@ mod tests {
         use constellation_authority::OpId;
         use constellation_fs_core::types::ROOT_INO;
         use constellation_meta::MetaStore;
-        use constellation_store_s3::LeaseMode;
         use object_store::memory::InMemory;
+        use replicix_objcas::LeaseMode;
         use std::sync::Arc;
         use std::sync::Arc as StdArc;
 
@@ -10543,7 +10539,8 @@ mod tests {
         use constellation_fs_core::types::ROOT_INO;
         use constellation_meta::{Meta, MetaStore};
         use constellation_net::{Payload, Peers};
-        use constellation_store_s3::{ChunkStore, CompressionSetting};
+        use constellation_store_s3::ChunkStore;
+        use replicix_chunkfmt::CompressionSetting;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 

@@ -7,12 +7,14 @@
 use crate::gc;
 use anyhow::{Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::ChunkHash;
 use constellation_meta::Meta;
-use constellation_store_s3::{CompressionSetting, GcJournalEntry, LeaseMode, LeaseStore, LogStore};
+use constellation_store_s3::{GcJournalEntry, LogStore};
 use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use replicix_chunkfmt::ChunkHash;
+use replicix_chunkfmt::CompressionSetting;
+use replicix_objcas::{LeaseMode, LeaseStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -550,14 +552,14 @@ async fn check_leases(
     force_release: Option<&str>,
     issues: &mut Vec<FsckIssue>,
 ) -> Result<()> {
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = replicix_objcas::lease::now_unix_ms();
     for object in store
         .list(Some(&Path::from("leases")))
         .try_collect::<Vec<_>>()
         .await?
     {
         let bytes = store.get(&object.location).await?.bytes().await?;
-        let Ok(lease) = serde_json::from_slice::<constellation_store_s3::Lease>(&bytes) else {
+        let Ok(lease) = serde_json::from_slice::<replicix_objcas::Lease>(&bytes) else {
             continue;
         };
         if !lease.released && lease.is_expired(now) {

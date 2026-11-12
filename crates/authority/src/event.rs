@@ -17,7 +17,7 @@ use constellation_meta::locks::LockTag;
 use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
 use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::InboxBatch;
-use constellation_store_s3::{Lease, LeaseTag};
+use replicix_objcas::{Lease, LeaseTag};
 
 /// One input to the core.
 #[derive(Debug)]
@@ -859,7 +859,7 @@ pub enum PeerMsg {
     /// naming the key (unless it is in an open epoch), and answers.
     PromiseRequest {
         req: OpId,
-        key: constellation_store_s3::RenewalKey,
+        key: replicix_objcas::RenewalKey,
     },
     /// Plan 30 §M10: whether the promise was given (`granted: false`:
     /// refused — this node is in an open epoch, retired, or runs with no
@@ -1201,7 +1201,7 @@ pub enum PeerMsg {
         /// it (the claim of that read can still land) and refuses a
         /// seal whose key is older than its own landed renewal (that CAS
         /// can no longer land).
-        key: constellation_store_s3::RenewalKey,
+        key: replicix_objcas::RenewalKey,
         /// ADR-51: the claimant collects the committed rows this node kept
         /// of the hold streams of the tenure `tenure` (see
         /// `Core::seal_kept_hold`): the member seals those streams first and

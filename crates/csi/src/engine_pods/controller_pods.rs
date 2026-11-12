@@ -325,7 +325,7 @@ pub fn pool_volume_of(pv: &PersistentVolume) -> Option<(String, u32)> {
 /// own shard (the record carries it apart).
 pub fn own_parameters(m: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     m.iter()
-        .filter(|(k, _)| !k.contains('/') && k.as_str() != crate::params::SHARD_KEY)
+        .filter(|(k, _)| !k.contains('/') && k.as_str() != replicix_csi_common::params::SHARD_KEY)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -333,7 +333,7 @@ pub fn own_parameters(m: &BTreeMap<String, String>) -> BTreeMap<String, String> 
 impl PoolRecord {
     /// The record of pool volume `pv` (see [`pool_volume_of`]), from the PV
     /// itself so a deleted class loses nothing: the parameters its
-    /// `volumeAttributes` carry ([`crate::params::volume_context`]) and the
+    /// `volumeAttributes` carry ([`replicix_csi_common::params::volume_context`]) and the
     /// deletion secret its annotations name. `class` (its StorageClass, if
     /// it still exists) fills in only what the PV lacks. `Err`: why no
     /// pool can be rebuilt from it.
@@ -383,7 +383,10 @@ impl PoolRecord {
 
     /// The pool (without secrets) and its controller-owned pod's name.
     pub fn pool(&self) -> Result<(PoolRef, String), String> {
-        let class = ClassParams::parse(&self.parameters.clone().into_iter().collect())?;
+        let class = ClassParams::parse(
+            &self.parameters.clone().into_iter().collect(),
+            crate::params::DEFAULT_PREFIX,
+        )?;
         if self.shard >= class.shards {
             return Err(format!(
                 "the class has {} shard(s); the record names shard {}",
@@ -1457,7 +1460,10 @@ impl PurgeBackend for EnginePodManager {
                 }
             }
             let relay = self.attach(name, &marked, &Secrets::default()).await?;
-            for dir in [crate::volume_id::VOLUMES_DIR, crate::volume_id::TRASH_DIR] {
+            for dir in [
+                replicix_csi_common::volume_id::VOLUMES_DIR,
+                replicix_csi_common::volume_id::TRASH_DIR,
+            ] {
                 match relay.client.browse_readdir(dir).await {
                     Ok(listing) if listing.entries.is_empty() => {}
                     Err(e) if crate::purge::not_found(&e) => {}
@@ -1748,7 +1754,7 @@ mod tests {
             ..Default::default()
         };
         let pool_params: HashMap<String, String> = params.clone().into_iter().collect();
-        let class_params = ClassParams::parse(&pool_params).unwrap();
+        let class_params = ClassParams::parse(&pool_params, crate::params::DEFAULT_PREFIX).unwrap();
         let fs = "0190c3b4-0000-7000-8000-000000000001";
         // What a provisioned PV carries: the class parameters minus the
         // CO's keys, and the provisioner's own identity key.
@@ -1872,7 +1878,10 @@ mod tests {
     #[test]
     fn a_pv_carrying_only_its_shard_has_no_own_parameters() {
         let attrs = BTreeMap::from([
-            (crate::params::SHARD_KEY.to_string(), "1".to_string()),
+            (
+                replicix_csi_common::params::SHARD_KEY.to_string(),
+                "1".to_string(),
+            ),
             (
                 "storage.kubernetes.io/csiProvisionerIdentity".to_string(),
                 "1700-csi".to_string(),
@@ -2090,9 +2099,9 @@ mod tests {
             ready_timeout: Duration::from_secs(10),
             service_account: None,
         };
-        let refresher = Refresher::new(Arc::new(crate::credentials::KubeSecrets::new(
-            client.clone(),
-        )));
+        let refresher = Refresher::new(Arc::new(
+            replicix_csi_common::credentials::KubeSecrets::new(client.clone()),
+        ));
         Arc::new_cyclic(|this| EnginePodManager {
             pods: Api::namespaced(client.clone(), &cfg.namespace),
             client,

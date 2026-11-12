@@ -50,7 +50,7 @@ use crate::event::{PeerMsg, SealRefusal};
 use crate::ids::{Epoch, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
-use constellation_store_s3::{AckPolicy, InheritedTail, Lease, LeaseTag, RenewalKey};
+use replicix_objcas::{AckPolicy, InheritedTail, Lease, LeaseTag, RenewalKey};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One attempt of a claim to fetch the group's sealed tail.
@@ -123,7 +123,7 @@ pub(crate) struct GroupWait {
     pub last_attempt: WaitMs,
     /// The lease the wait is for, as the claimant watches it: a read that
     /// shows another key (a renewal, another claim) ends the wait.
-    pub key: constellation_store_s3::lease::RenewalKey,
+    pub key: replicix_objcas::lease::RenewalKey,
     /// ADR-51: the wait is a kept fetch's, for the rows of the tenure of this
     /// epoch (`Control::Abandon` names either).
     pub kept: Option<Epoch>,

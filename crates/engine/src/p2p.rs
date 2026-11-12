@@ -49,10 +49,10 @@ impl P2pBridge {
     /// an epoch's formation, eating into the carried lease's window).
     async fn probe_s3(&self) -> bool {
         !self.epochs.s3_failing() && {
-            let leases = constellation_store_s3::LeaseStore::new(
+            let leases = replicix_objcas::LeaseStore::new(
                 self.store.clone(),
                 constellation_store_s3::log::PARTITION,
-                constellation_store_s3::LeaseMode::Cas,
+                replicix_objcas::LeaseMode::Cas,
             );
             matches!(
                 tokio::time::timeout(EPOCH_MEMBER_S3_PROBE, leases.get()).await,
@@ -325,7 +325,7 @@ impl constellation_net::PeerService for P2pBridge {
                     epoch,
                     config_version,
                     from_seq,
-                    key: constellation_store_s3::RenewalKey {
+                    key: replicix_objcas::RenewalKey {
                         holder: key.holder,
                         epoch: key.epoch,
                         holder_clock: key.holder_clock,
@@ -423,7 +423,7 @@ impl constellation_net::PeerService for P2pBridge {
                 .nudge
                 .send(sync::SyncRequest::PeerPromiseRequest {
                     requester,
-                    key: constellation_store_s3::RenewalKey {
+                    key: replicix_objcas::RenewalKey {
                         holder: key.holder,
                         epoch: key.epoch,
                         holder_clock: key.holder_clock,
@@ -507,7 +507,7 @@ impl constellation_net::PeerService for P2pBridge {
             let (reply, done) = tokio::sync::oneshot::channel();
             let hashes = hashes
                 .into_iter()
-                .map(constellation_fs_core::ChunkHash)
+                .map(replicix_chunkfmt::ChunkHash)
                 .collect();
             if self
                 .nudge
@@ -552,7 +552,7 @@ impl constellation_net::PeerService for P2pBridge {
             let _ = part;
             let pending = pending
                 .into_iter()
-                .map(constellation_fs_core::ChunkHash)
+                .map(replicix_chunkfmt::ChunkHash)
                 .collect();
             let rid = constellation_meta::Rid {
                 node: rid.0,
@@ -863,7 +863,7 @@ impl constellation_net::PeerService for P2pBridge {
                     requester,
                     hashes: hashes
                         .into_iter()
-                        .map(constellation_fs_core::ChunkHash)
+                        .map(replicix_chunkfmt::ChunkHash)
                         .collect(),
                     reply,
                 })

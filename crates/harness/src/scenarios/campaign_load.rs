@@ -410,7 +410,7 @@ pub(super) fn lock_contention_paused_holder(_seed: u64) -> Result<()> {
     let result = (|| -> Result<()> {
         let t = Timings::from_pairs(&[
             ("CONSTELLATION_LOCK_TTL_MS", LOCK_TTL_MS.to_string()),
-            ("CONSTELLATION_LEASE_TTL_MS", super::m9::TTL_MS.to_string()),
+            ("REPLICIX_LEASE_TTL_MS", super::m9::TTL_MS.to_string()),
         ]);
         let lapse_window = t.boundary("lock-lapse").expect("a boundary");
         let durations: Vec<(String, Duration)> = [
@@ -1049,7 +1049,7 @@ pub(super) fn delegate_paused_across_ttl(_seed: u64) -> Result<()> {
         super::m11::wait_installed(b, "/d1", Duration::from_secs(20))?;
         let t = Timings::from_pairs(&[
             ("CONSTELLATION_DELEGATION_TTL_MS", ttl.clone()),
-            ("CONSTELLATION_LEASE_TTL_MS", super::m11::TTL_MS.to_string()),
+            ("REPLICIX_LEASE_TTL_MS", super::m11::TTL_MS.to_string()),
         ]);
         let durations: Vec<(String, Duration)> =
             ["deleg-lapse-500", "deleg-lapse+500", "deleg-outwait+1000"]
@@ -1181,7 +1181,7 @@ mod tests {
         let t = Timings::from_pairs(&[
             ("CONSTELLATION_LOCK_TTL_MS", "3000"),
             ("CONSTELLATION_DELEGATION_TTL_MS", "5000"),
-            ("CONSTELLATION_LEASE_TTL_MS", "20000"),
+            ("REPLICIX_LEASE_TTL_MS", "20000"),
         ]);
         for b in [
             "lock-half",

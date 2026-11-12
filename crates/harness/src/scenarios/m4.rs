@@ -945,8 +945,8 @@ pub(super) fn unmount_with_held_records(seed: u64) -> Result<()> {
     //    harness's fail-fast two) and leave an upload behind: the drain
     //    stalls, and the stall bound ends it.
     let mut a = node("15")?
-        .with_env("CONSTELLATION_S3_MAX_RETRIES", "10")
-        .with_env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "180000");
+        .with_env("REPLICIX_S3_MAX_RETRIES", "10")
+        .with_env("REPLICIX_S3_RETRY_TIMEOUT_MS", "180000");
     a.mount()?;
     eventually(
         "the remount holds the records again",

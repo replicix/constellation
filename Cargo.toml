@@ -15,7 +15,6 @@ members = [
     "crates/control",
     "crates/harness",
     "crates/chaos",
-    "crates/upload-concurrency",
     "crates/model",
     "crates/authority",
     "crates/csi",
@@ -25,7 +24,7 @@ members = [
 # Bare `cargo build`/`cargo test` at the root only touch the product
 # crates, matching the pre-bench-tool build set; `bench/uploadbench` is
 # still a full member (shares the lockfile, reuses the real
-# `constellation-upload-concurrency` crate) but only builds when asked
+# `replicix-upload-concurrency` crate) but only builds when asked
 # for explicitly (`-p uploadbench`, `--workspace`, or `cd` + `cargo run`).
 # `crates/csi` (plan 37): a Kubernetes-only driver binary, not part of
 # every other platform's build; same opt-in-only treatment, also excluded
@@ -45,7 +44,6 @@ default-members = [
     "crates/control",
     "crates/harness",
     "crates/chaos",
-    "crates/upload-concurrency",
     "crates/model",
     "crates/authority",
 ]
@@ -77,10 +75,16 @@ constellation-mtree = { path = "crates/mtree" }
 constellation-store-s3 = { path = "crates/store-s3" }
 constellation-net = { path = "crates/net" }
 constellation-control = { path = "crates/control" }
-constellation-upload-concurrency = { path = "crates/upload-concurrency" }
 constellation-chaos = { path = "crates/chaos" }
 constellation-authority = { path = "crates/authority" }
 constellation-pod-load = { path = "crates/pod-load" }
+
+# Shared crates (github.com/replicix/replicix-core), pinned by commit.
+replicix-upload-concurrency = { git = "https://github.com/replicix/replicix-core", rev = "caa47b4918509d10c1bac23369cf84bbe6883642" }
+replicix-objcas = { git = "https://github.com/replicix/replicix-core", rev = "caa47b4918509d10c1bac23369cf84bbe6883642" }
+replicix-chunkfmt = { git = "https://github.com/replicix/replicix-core", rev = "caa47b4918509d10c1bac23369cf84bbe6883642" }
+replicix-platform-lite = { git = "https://github.com/replicix/replicix-core", rev = "caa47b4918509d10c1bac23369cf84bbe6883642" }
+replicix-csi-common = { git = "https://github.com/replicix/replicix-core", rev = "caa47b4918509d10c1bac23369cf84bbe6883642" }
 
 anyhow = "1"
 thiserror = "2"
@@ -149,6 +153,14 @@ fuser = { git = "https://github.com/replicix/fuser", rev = "9c180f5d6ba6aeca7412
 # of the tasks parked on it, which stalls iroh's endpoint for a minute
 # after a rebind (vendor/netwatch/CONSTELLATION-PATCH.md).
 netwatch = { path = "vendor/netwatch" }
+
+# Local development against a checkout of replicix-core (never commit this enabled):
+# [patch."https://github.com/replicix/replicix-core"]
+# replicix-upload-concurrency = { path = "../replicix-core/crates/upload-concurrency" }
+# replicix-objcas = { path = "../replicix-core/crates/objcas" }
+# replicix-chunkfmt = { path = "../replicix-core/crates/chunkfmt" }
+# replicix-platform-lite = { path = "../replicix-core/crates/platform-lite" }
+# replicix-csi-common = { path = "../replicix-core/crates/csi-common" }
 
 [profile.release]
 lto = "thin"

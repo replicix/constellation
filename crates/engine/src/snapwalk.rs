@@ -93,11 +93,12 @@ use crate::mtree_read::Resolver;
 use crate::snapshot::{SnapshotRoot, TreeAccess};
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, Ino};
+use constellation_fs_core::Ino;
 use constellation_mtree::keys::{self, Key};
 use constellation_mtree::record::{DentryRecord, InodeRecord, Kind};
 use constellation_mtree::{NodeHash, NodeStore, Tree};
 use constellation_store_s3::{ChunkStore, NodeCache};
+use replicix_chunkfmt::ChunkHash;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1093,9 +1094,9 @@ mod tests {
     use constellation_fs_core::types::ROOT_INO;
     use constellation_fs_core::InodeKind;
     use constellation_meta::{Meta, MetaStore};
-    use constellation_store_s3::CompressionSetting;
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
+    use replicix_chunkfmt::CompressionSetting;
     use std::collections::HashSet;
 
     const CS: u32 = 4096;
