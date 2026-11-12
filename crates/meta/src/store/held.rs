@@ -1770,6 +1770,7 @@ impl Meta {
             redone: walked.redone.iter().map(|(seq, _)| *seq).collect(),
             redone_rids: walked.redone.iter().filter_map(|(_, rid)| *rid).collect(),
             follow_ups: 0,
+            shipped: false,
         };
         if walked.seeds.is_empty() {
             // Nothing to carry in the log: a run after an earlier drop kept a
@@ -1860,7 +1861,7 @@ impl Meta {
 
     /// The drops decided and not yet applied: `(inode, journal seq of the
     /// `DropHeld` record, epoch of the tenure that journaled it)`.
-    pub fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64)>, MetaError> {
+    pub fn drop_plans(&self) -> Result<Vec<(Ino, u64, u64, bool)>, MetaError> {
         let r = self.db.read_tx();
         let mut out = Vec::new();
         for guard in r.prefix(&self.local, DROP_PLAN_PREFIX) {
@@ -1869,9 +1870,39 @@ impl Meta {
                 MetaError::Invalid("a drop plan key is not an inode number".to_string())
             })?);
             let plan: DropPlan = postcard::from_bytes(&v)?;
-            out.push((ino, plan.jseq, plan.epoch));
+            out.push((ino, plan.jseq, plan.epoch, plan.shipped));
         }
         Ok(out)
+    }
+
+    /// Whether the decided drop of `ino` has its record shipped from this node.
+    pub fn drop_plan_shipped(&self, ino: Ino) -> bool {
+        let r = self.db.read_tx();
+        r.get(&self.local, drop_plan_key(ino))
+            .ok()
+            .flatten()
+            .and_then(|raw| postcard::from_bytes::<DropPlan>(&raw).ok())
+            .is_some_and(|plan| plan.shipped)
+    }
+
+    /// The `DropHeld` record of `ino` at journal seq `jseq` shipped (the
+    /// caller's transaction acknowledges its row): the plan says so, for a
+    /// restart that has to tell a record in the log from one that never left
+    /// (ADR-59 part B, D4: "in the log" is "shipped by this node").
+    pub(crate) fn note_drop_shipped_tx(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx,
+        ino: Ino,
+        jseq: u64,
+    ) -> Result<(), MetaError> {
+        if let Some(raw) = tx.get(&self.local, drop_plan_key(ino))? {
+            let mut plan: DropPlan = postcard::from_bytes(&raw)?;
+            if plan.jseq == jseq && !plan.shipped {
+                plan.shipped = true;
+                tx.insert(&self.local, drop_plan_key(ino), postcard::to_allocvec(&plan)?);
+            }
+        }
+        Ok(())
     }
 
     /// The decided drop of `ino` never happened (its record is fenced: the
@@ -2279,6 +2310,7 @@ impl Meta {
         plan.redone.retain(|s| !moved.contains(s));
         plan.s_deps.extend(moved.iter().copied());
         plan.jseq = jseq;
+        plan.shipped = false;
         plan.epoch = super::local::get_journal_tx_head(&tx, self, jseq)?.map_or(0, |h| h.epoch);
         plan.follow_ups += 1;
         tx.insert(
@@ -2326,6 +2358,12 @@ struct DropPlan {
     redone: Vec<u64>,
     redone_rids: Vec<crate::rid::Rid>,
     follow_ups: u32,
+    /// The record (at `jseq`) shipped from this node: the archive carries it
+    /// (set in the transaction that acknowledges its row). Persisted, since
+    /// the journal's acknowledged watermark stops below the held rows the
+    /// record was journaled above, and the park's in-memory knowledge of the
+    /// shipped rows does not survive a restart.
+    shipped: bool,
 }
 
 const DROP_PLAN_PREFIX: &[u8] = b"drop_plan:";

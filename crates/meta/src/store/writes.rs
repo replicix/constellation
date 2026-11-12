@@ -129,8 +129,12 @@ impl Meta {
             let mut shipped = 0i64;
             for seq in journal_seqs {
                 if let Some(v) = tx.get(&self.journal_ks, crate::store::journal::seq_key(*seq))? {
-                    if let LogRecord::DropHeld { rolled_back, .. } = LogRecord::from_postcard(&v)? {
+                    if let LogRecord::DropHeld {
+                        ino, rolled_back, ..
+                    } = LogRecord::from_postcard(&v)?
+                    {
                         retired.extend(rolled_back.iter().map(|(ident, _)| *ident));
+                        self.note_drop_shipped_tx(tx, ino, *seq)?;
                         shipped += 1;
                     }
                 }
