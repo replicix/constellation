@@ -1669,6 +1669,17 @@ pub(crate) fn member_rules_tx(
                 meta.release_abandoned_row_tx(tx, member_epoch(e), first);
                 continue;
             }
+            // A hole (rows the holder shipped ahead of a held one, streamed
+            // as a record-less span so the backup's hold reaches the tip)
+            // carries nothing a claim could carry, so nothing retires it on
+            // carry: once a claim follows its epoch, it goes (flex-backup
+            // +durability seeds 51, 187, 352, 447, 1566 and 1818).
+            if row.tx.records.is_empty() && follows.contains(&e) {
+                tx.remove(&meta.backup_tail, key);
+                meta.release_row_tx(tx, member_epoch(e), first);
+                out.dropped += 1;
+                continue;
+            }
             if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th) {
                 tx.remove(&meta.backup_tail, key);
                 meta.release_row_tx(tx, member_epoch(e), first);
