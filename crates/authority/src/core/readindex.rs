@@ -1111,6 +1111,7 @@ impl Core {
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,
+                            non_stealable: false,
                         },
                     });
                 }
@@ -1164,6 +1165,7 @@ impl Core {
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,
+                            non_stealable: false,
                         },
                     });
                 }
@@ -1672,6 +1674,7 @@ impl Core {
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
                                 committed: false,
+                                non_stealable: false,
                             },
                         });
                     }
@@ -1729,6 +1732,7 @@ impl Core {
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
                                 committed: false,
+                                non_stealable: false,
                             },
                         });
                     }
@@ -1942,6 +1946,7 @@ impl Core {
                 own_chunks,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
     }
@@ -2090,6 +2095,7 @@ impl Core {
                     own_chunks,
                     own_rows: None,
                     committed: false,
+                    non_stealable: false,
                 },
             });
         }
@@ -2646,6 +2652,7 @@ impl Core {
                                 own_chunks,
                                 own_rows,
                                 committed: false,
+                                non_stealable: false,
                             },
                             class,
                             class.gated(),
@@ -2723,6 +2730,7 @@ impl Core {
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
                                     committed: false,
+                                    non_stealable: false,
                                 },
                             });
                         }

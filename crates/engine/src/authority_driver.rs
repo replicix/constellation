@@ -67,8 +67,9 @@ pub type MutateReplyParts = (
     Position,
     u64,
     (OwnChunks, Option<constellation_meta::OwnRows>),
-    // Plan 43 C1-2: the answer waited for a group or the archive.
-    bool,
+    // Plan 43 C1-2: the answer waited for a group or the archive; ADR-55:
+    // and whether it is a non-stealable holder's.
+    (bool, bool),
 );
 
 /// How often [`StepProfile`] is logged.
@@ -3631,7 +3632,7 @@ impl Driver {
                             Position::ZERO,
                             0,
                             (OwnChunks::None, None),
-                            false,
+                            (false, false),
                         ));
                         return None;
                     }
@@ -3659,7 +3660,7 @@ impl Driver {
                                 Position::ZERO,
                                 0,
                                 (OwnChunks::None, None),
-                                false,
+                                (false, false),
                             ));
                             return None;
                         }
@@ -4952,6 +4953,7 @@ impl Driver {
                 own_chunks,
                 own_rows,
                 committed,
+                non_stealable,
             } => {
                 tracing::trace!(target: "constellation::fwd", req = req.0, "mutate reply sent");
                 if let Some(tx) = self.mutate_replies.remove(&req) {
@@ -4971,7 +4973,7 @@ impl Driver {
                                 position,
                                 gen,
                                 (own_chunks, own_rows),
-                                committed,
+                                (committed, non_stealable),
                             ));
                         });
                     } else {
@@ -4981,7 +4983,7 @@ impl Driver {
                             position,
                             gen,
                             (own_chunks, own_rows),
-                            committed,
+                            (committed, non_stealable),
                         ));
                     }
                 }
@@ -5749,6 +5751,7 @@ impl Driver {
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
                                 committed: false,
+                                non_stealable: false,
                             },
                         }));
                         return;
@@ -5804,6 +5807,7 @@ impl Driver {
                             own_inos,
                             own_rows,
                             committed,
+                            non_stealable,
                         })) if req_id == req.0 => {
                             let position = Position {
                                 seq: position_seq,
@@ -5840,6 +5844,7 @@ impl Driver {
                                     own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
                                     own_rows: constellation_meta::OwnRows::from_wire(&own_rows),
                                     committed,
+                                    non_stealable,
                                 },
                             }));
                         }
@@ -5856,6 +5861,7 @@ impl Driver {
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
                                     committed: false,
+                                    non_stealable: false,
                                 },
                             }));
                         }

@@ -327,7 +327,13 @@ pub struct WaitingMemberStatus {
 pub struct RootOwnStatus {
     pub granted: u64,
     pub released_by_dwell: u64,
-    pub released_for_cross: u64,
+    /// Ops across a sticky boundary of the root that released the grant,
+    /// the root's own client's and forwarded ones (another node's).
+    pub released_for_cross_own: u64,
+    pub released_for_cross_forwarded: u64,
+    /// The root's own client ops its root path answered with an archive wait
+    /// (in `/` or in other nodes' subtrees) while it held a grant of its own.
+    pub archive_waits_elsewhere: u64,
     pub answers: u64,
     pub holds: u64,
     pub skipped: u64,

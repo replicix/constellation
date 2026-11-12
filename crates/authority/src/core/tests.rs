@@ -3253,6 +3253,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -3939,6 +3940,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -4027,6 +4029,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     let answered: Vec<Rid> = replies(&out).into_iter().map(|(rid, _)| rid).collect();
@@ -4177,6 +4180,7 @@ fn a_dedup_answer_without_records_is_not_installed_as_a_shadow() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert_eq!(h.core.stats.shadows_installed, 0, "a shadow of nothing");
@@ -5780,6 +5784,7 @@ fn awaiting_log_forward(name: &str) -> (Harness, Rid, Vec<LogRecord>) {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert!(replies(&out).is_empty(), "the op waits for the log");
@@ -5946,6 +5951,7 @@ fn a_stranded_replay_is_not_gated_behind_an_op_awaiting_a_dead_epochs_log() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert!(
@@ -6435,6 +6441,7 @@ mod own_chunks {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(uploads_awaited(&out).is_empty());
@@ -6752,6 +6759,7 @@ mod own_chunks {
                 own_chunks: OwnChunks::Streamed(vec![ino]),
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert_eq!(
@@ -7335,6 +7343,7 @@ mod own_chunks {
                     own_chunks: OwnChunks::Streamed(vec![ino]),
                     own_rows: None,
                     committed: false,
+                    non_stealable: false,
                 },
             });
             assert!(requester
@@ -11458,6 +11467,7 @@ mod epoch_rules {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(replies(&out).is_empty(), "{out:?}");
@@ -14885,6 +14895,7 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     let backoff = timers(&out, TimerKind::ForwardBackoff);
@@ -14968,6 +14979,7 @@ fn an_op_held_by_the_root_is_asked_again_there() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     let backoff = timers(&out, TimerKind::ForwardBackoff);
@@ -17134,6 +17146,7 @@ mod backup_crash {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         let r = replies(&out);
@@ -31159,6 +31172,7 @@ mod locks {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(
@@ -38601,6 +38615,7 @@ fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert!(
@@ -39294,6 +39309,7 @@ mod portable_codes {
             own_chunks,
             own_rows,
             committed,
+            non_stealable,
         } = msg
         else {
             panic!("not a mutate reply: {msg:?}")
@@ -39310,6 +39326,7 @@ mod portable_codes {
             own_inos: own_chunks.to_wire().1,
             own_rows: constellation_meta::OwnRows::to_wire(own_rows.as_ref()),
             committed: *committed,
+            non_stealable: *non_stealable,
         };
         let key = iroh::SecretKey::from_bytes(&[7; 32]);
         let frame = Signed::new(&key, &payload).unwrap().encode().unwrap();
@@ -39326,6 +39343,7 @@ mod portable_codes {
             own_inos,
             own_rows,
             committed,
+            non_stealable,
         } = received
         else {
             panic!("the frame decoded to another payload")
@@ -39344,6 +39362,7 @@ mod portable_codes {
             own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
             own_rows: constellation_meta::OwnRows::from_wire(&own_rows),
             committed,
+            non_stealable,
         };
         (decoded, outcome)
     }
@@ -40085,6 +40104,7 @@ fn a_not_holder_reply_does_not_make_its_sender_the_holder() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     };
     let req = forward(&mut h, 1);
@@ -40533,6 +40553,66 @@ fn a_granted_renewal_ends_the_streams_refusal_backoff() {
         batch(&out).is_some(),
         "the rows waited for the back-off after the grant: {out:?}"
     );
+}
+
+/// A root that comes back and refuses the stream (in its takeover gate, or
+/// without the table yet) has answered: it is reachable. The refusal's
+/// back-off starts from a few ticks, not from the bound the transport
+/// failures of the root's absence raised it to (`far-root-writes+unsettled`
+/// seed 1390: a far writer's settle ran out inside a two-second wait after
+/// the root was back). Fails on the parent: the back-off stayed at two seconds.
+#[test]
+fn a_refusal_backs_off_from_a_few_ticks_not_from_what_the_roots_absence_raised() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    h.step(renewed(&h, req, 7, 5_000));
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(1),
+        op: MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        tag: Default::default(),
+    });
+    let sreq = sends(&out)
+        .into_iter()
+        .find_map(|(to, m)| match m {
+            PeerMsg::DelegateStream { req, gen: 7, .. } if to == 1 => Some(*req),
+            _ => None,
+        })
+        .expect("no batch streamed");
+    // The root was away: the transport failures raised the back-off.
+    h.core.dl.mine.get_mut(&7).unwrap().stream_backoff_ms = 2_000;
+    h.advance(50);
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamAck {
+            req: sreq,
+            gen: 7,
+            round: round_of(&h, 7),
+            through: 0,
+            committed: 0,
+            refused: true,
+            archive_bound: false,
+        },
+    });
+    let tick = h.core.cfg.delegation_stream_tick_ms.max(1) as i64;
+    let wait = h.core.dl.mine[&7]
+        .stream_after
+        .expect("no back-off")
+        .since(h.clk().wait);
+    assert!(wait <= 4 * tick, "backed off {wait} ms after a refusal");
 }
 
 /// delegate-stream-acks: a delegate of `/d` (generation 7, root node 1)
@@ -44298,6 +44378,7 @@ fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert_accepted_once(&out);
@@ -44374,6 +44455,7 @@ fn a_replay_of_a_rid_leaves_the_clients_in_doubt_mark_for_its_resubmission() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     let mut out = Vec::new();
@@ -45903,6 +45985,7 @@ mod answer_sources {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert_eq!(sources(&out), vec![(r1, AnswerSource::Relayed { from: 2 })]);
@@ -48696,6 +48779,7 @@ mod deleg_group {
             own_chunks: constellation_meta::OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         };
         h.core.send_answer(
             h.clk(),
@@ -57941,6 +58025,69 @@ mod c2f_lone_root {
         }
     }
 
+    /// ADR-55 (M2): a stream row's answer from a non-stealable holder says so
+    /// itself (`non_stealable`): a requester whose table does not list the
+    /// generation yet (the root's own grant is minted and used before a far
+    /// requester reads its record) counts the shadow apart, not as an answer
+    /// outside the commit rule. An answer that does not say it, for a
+    /// generation the table does not list, is still counted `ungated`. Fails
+    /// on the parent: the requester judged by its own table alone.
+    #[test]
+    fn a_non_stealable_holders_reply_says_it_is_final() {
+        for said in [true, false] {
+            let (mut holder, mut requester) = pair();
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("s"),
+                tag: Default::default(),
+            });
+            let sent = sends(&out);
+            let [(1, request)] = sent.as_slice() else {
+                panic!("expected one forward to node 1: {sent:?}")
+            };
+            let answer = holder.step_archived(Event::Peer {
+                from: 2,
+                msg: (*request).clone(),
+            });
+            let mut reply = sends(&answer)
+                .into_iter()
+                .find(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+                .expect("a reply")
+                .1
+                .clone();
+            if let PeerMsg::MutateReply {
+                committed,
+                gen,
+                non_stealable,
+                ..
+            } = &mut reply
+            {
+                *committed = false;
+                // (A generation the requester's table does not list.)
+                *gen = 0x7700_0001;
+                *non_stealable = said;
+            }
+            assert!(requester
+                .meta
+                .delegation_table()
+                .iter()
+                .all(|d| d.gen != 0x7700_0001));
+            requester.step(Event::Peer {
+                from: 1,
+                msg: reply,
+            });
+            let s = &requester.core.stats;
+            assert_eq!(s.shadows_installed, 1, "said {said}");
+            assert_eq!(
+                (s.ungated_shadows_non_stealable, s.ungated_shadows),
+                if said { (1, 0) } else { (0, 1) },
+                "said {said}"
+            );
+        }
+    }
+
     /// A row of another node's op journaled `Lone` (a lone root before C2)
     /// that another node asks for again is answered from the archive, and
     /// re-tagged `Archive` first so that its strand follows the answer.
@@ -58253,6 +58400,7 @@ mod c2g_settle {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         };
         // 4 s of outwait: the deadline moves to now + 4 s + a window.
@@ -58335,6 +58483,7 @@ mod c2g_settle {
                     own_chunks: OwnChunks::None,
                     own_rows: None,
                     committed: false,
+                    non_stealable: false,
                 },
             });
             let id = requester.core.clients[&rid].deadline;
@@ -58396,6 +58545,7 @@ mod c2g_settle {
                     own_chunks: OwnChunks::None,
                     own_rows: None,
                     committed: false,
+                    non_stealable: false,
                 },
             });
         };
@@ -58518,6 +58668,7 @@ mod c2g_settle {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         let c = &r.core.clients[&rid];
@@ -58814,6 +58965,7 @@ mod c2g_settle {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         };
         let answer = |requester: &mut Harness, from: NodeId, req: OpId, h: NodeId| {
@@ -60484,7 +60636,9 @@ mod c2g_settle {
         assert!(h.core.dl.gens.contains_key(&7));
         let keys = crate::core::holder::keys_of_op_in(&create_in(&h, dir, "r"), &h.meta);
         let mut out = Vec::new();
-        let plan = h.core.deleg_recall_plan(h.clk(), &keys, &h.meta, &mut out);
+        let plan = h
+            .core
+            .deleg_recall_plan(h.clk(), false, &keys, &h.meta, &mut out);
         assert_eq!(plan, crate::core::delegate::RecallPlan::Gated, "{out:?}");
         assert!(out.is_empty(), "{out:?}");
         assert_eq!(h.core.dl.gens[&7].recall, RecallPhase::None);
@@ -60498,7 +60652,9 @@ mod c2g_settle {
         }
         // A rename across generations (cross-subtree) the same.
         h.core.lease.gate = None;
-        let plan = h.core.deleg_recall_plan(h.clk(), &keys, &h.meta, &mut out);
+        let plan = h
+            .core
+            .deleg_recall_plan(h.clk(), false, &keys, &h.meta, &mut out);
         assert!(
             matches!(plan, crate::core::delegate::RecallPlan::Wait(_)),
             "an open root recalls: {plan:?}"
@@ -61534,6 +61690,7 @@ fn a_delegates_held_answer_is_not_the_roots() {
             own_chunks: OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         },
     });
     assert_eq!(
@@ -62493,6 +62650,7 @@ mod await_retry {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert_eq!(replies(&out).len(), 1, "{out:?}");
@@ -62855,6 +63013,7 @@ mod await_retry {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: true,
+                non_stealable: false,
             },
         }
     }
@@ -63089,6 +63248,7 @@ mod await_retry {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: true,
+                non_stealable: false,
             },
         });
         assert!(queue(&h).iter().all(|(n, _, _)| *n != 2), "{:?}", queue(&h));
@@ -63613,6 +63773,7 @@ mod await_retry {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(requester.core.replay.stuck_since.is_none());
@@ -68502,7 +68663,9 @@ mod step9_one_stream_per_node {
             ..Default::default()
         };
         let mut out = Vec::new();
-        let plan = h.core.deleg_recall_plan(h.clk(), &keys, &h.meta, &mut out);
+        let plan = h
+            .core
+            .deleg_recall_plan(h.clk(), false, &keys, &h.meta, &mut out);
         assert!(
             matches!(plan, crate::core::delegate::RecallPlan::Refuse(_)),
             "{plan:?}"
@@ -70568,7 +70731,7 @@ mod step4_sticky {
         let mut out = Vec::new();
         let plan = h
             .core
-            .deleg_recall_plan(h.clk(), &inside, &h.meta, &mut out);
+            .deleg_recall_plan(h.clk(), false, &inside, &h.meta, &mut out);
         assert!(
             matches!(plan, RecallPlan::Refuse(c) if c == constellation_types::Code::ReadOnly),
             "{plan:?}"
@@ -70581,7 +70744,7 @@ mod step4_sticky {
         };
         let plan = h
             .core
-            .deleg_recall_plan(h.clk(), &across, &h.meta, &mut out);
+            .deleg_recall_plan(h.clk(), false, &across, &h.meta, &mut out);
         assert!(
             matches!(plan, RecallPlan::Refuse(c) if c == constellation_types::Code::CrossDevice),
             "{plan:?}"
@@ -72142,6 +72305,7 @@ mod step5_sticky_release {
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,
+                            non_stealable: false,
                         },
                     }));
                 }
@@ -72325,6 +72489,7 @@ mod step5_sticky_release {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(
@@ -72441,6 +72606,7 @@ mod step5_sticky_release {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(
@@ -72546,6 +72712,7 @@ mod step5_sticky_release {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         (h, rid, out)
@@ -72737,6 +72904,7 @@ mod step5_sticky_release {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(
@@ -73601,6 +73769,35 @@ mod step5_sticky_release {
             "not run once the horizon passed"
         );
         assert_eq!(r.core.stats.deleg_restart_q_waited_out, 1);
+    }
+
+    /// ADR-55 (S3): the wait for the claim a restart sets (`restarted_holder`)
+    /// ends when the claim lands, or when the process holds no stream: a
+    /// later gate of that process, as the designee of a handoff, executes as
+    /// it always did. Fails on the parent: the flag was never cleared.
+    #[test]
+    fn a_restarted_holders_wait_for_its_claim_ends_with_the_claim() {
+        let (h, _dirs) = holder_with_a_grant(SubtreeKind::Sticky);
+        let (mut r, _dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        assert!(r.core.dl.restarted_holder);
+        let activity = |r: &mut Harness| {
+            r.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            })
+        };
+        // Still a holder, no claim: the flag stays.
+        activity(&mut r);
+        assert!(r.core.dl.restarted_holder);
+        // The claim lands (the lease held, no gate).
+        r.hold(5, None);
+        activity(&mut r);
+        assert!(!r.core.dl.restarted_holder);
+        // No stream left: cleared too.
+        let (mut r, _dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
+        r.core.dl.mine.clear();
+        activity(&mut r);
+        assert!(!r.core.dl.restarted_holder);
     }
 
     /// Expectation (fail-before: executed and acknowledged at once): a
@@ -75008,6 +75205,7 @@ mod route_fence_wire {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         }
     }
@@ -75166,6 +75364,7 @@ mod route_fence_carriage {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         }
     }
@@ -76028,6 +76227,7 @@ mod route_fence_executor {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         };
         let out = h.step(reply(3, req, MutateOutcome::Fenced { gen: 7 }, 7));
@@ -76118,6 +76318,7 @@ mod route_fence_executor {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         assert!(
@@ -76183,6 +76384,7 @@ mod route_fence_executor {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: false,
+                non_stealable: false,
             },
         });
         let sent = sends(&out).into_iter().find_map(|(to, m)| match m {
@@ -77583,6 +77785,7 @@ mod late_landing_inbox {
                 own_chunks: OwnChunks::None,
                 own_rows: None,
                 committed: true,
+                non_stealable: false,
             },
         });
         assert!(
@@ -78683,6 +78886,7 @@ mod stale_lease {
             own_chunks: constellation_meta::OwnChunks::None,
             own_rows: None,
             committed: false,
+            non_stealable: false,
         };
         let sent = |out: &[Action]| {
             out.iter()
@@ -78907,8 +79111,7 @@ mod root_own_sticky {
         // A group: the lease lists a backup.
         let (mut h, dirs) = root_with_peer(Some(500));
         h.core.lease.held.as_mut().unwrap().0.backups = vec![2];
-        h.core.lease.held.as_mut().unwrap().0.ack_policy =
-            constellation_store_s3::AckPolicy::Backup;
+        h.core.lease.held.as_mut().unwrap().0.ack_policy = replicix_objcas::AckPolicy::Backup;
         root_dominates(&mut h, dirs[0]);
         assert!(own_grant_of(&h, dirs[0]).is_none(), "a grant with a backup");
         // A continuation epoch.
@@ -79156,6 +79359,115 @@ mod root_own_sticky {
         );
     }
 
+    /// Test 13 (after C9, fence C9.2): an op that was ever in an inbox
+    /// (`inbox_ever`) and reaches the root's own stream is refused `EROFS` in
+    /// the stream, as a far sticky holder refuses it: a journaled refusal
+    /// row of the stream, counted apart (`holder_inbox_refusals_own_root`),
+    /// and the op runs nowhere.
+    #[test]
+    fn an_inbox_ever_op_into_the_roots_own_subtree_is_refused_in_its_stream() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        let op = create_in(&h, dirs[0], "ie");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(600),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 60,
+                },
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+                routed_gen: d.gen,
+                touched_gen: d.gen,
+                inbox_ever: true,
+            },
+        });
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.holder_inbox_refusals_own_root, 1);
+        assert_eq!(h.core.stats.holder_inbox_refusals, 1);
+        // The refusal is a row of the stream; the op ran nowhere.
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 1);
+        assert!(
+            constellation_meta::MetaStore::lookup(&h.meta, dirs[0], "ie")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// ADR-55 (M1): a stream op rests on the root's own rows, which a
+    /// deposition rolls back while the stream's rows are kept: the op does
+    /// not run until the root rows its `deps` name are in the log. Rows of
+    /// the stream itself are no such premise. Fails on the parent: the root
+    /// checked the streams part of the dependencies alone, and answered
+    /// `Final` on a root row that was never shipped.
+    #[test]
+    fn an_own_stream_op_waits_for_the_unshipped_root_rows_it_rests_on() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        // A root row, journaled and not in the log.
+        let (rid_root, out) = submit_in(&mut h, 1, ROOT_INO, "r");
+        assert!(!accepted(&out, rid_root), "{out:?}");
+        let tip = h.meta.journal_tip().unwrap();
+        // The stream op is ordered after everything the root journaled.
+        let (rid, out) = submit_in(&mut h, 2, dirs[0], "a");
+        assert!(
+            !accepted(&out, rid),
+            "answered on a root row no archive carries: {out:?}"
+        );
+        assert_eq!(h.meta.journal_tip().unwrap(), tip, "journaled before");
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 0);
+        // The archive carries the root row: the op runs.
+        let out = archive_and_step(&mut h);
+        assert!(accepted(&out, rid), "the parked op did not run: {out:?}");
+        assert!(accepted(&out, rid_root));
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 1);
+        // The stream's own rows are no premise: the next op is final at its
+        // step though the previous one is unshipped.
+        let (rid2, out) = submit_in(&mut h, 3, dirs[0], "b");
+        assert!(accepted(&out, rid2), "{out:?}");
+        let (rid3, out) = submit_in(&mut h, 4, dirs[0], "c");
+        assert!(accepted(&out, rid3), "{out:?}");
+    }
+
+    /// ADR-55 (M1): the root row the parked stream op rests on is rolled back
+    /// by a deposition: the op was never run on it, so the stream the next
+    /// root gets holds no row on a premise the log never had.
+    #[test]
+    fn a_deposition_leaves_no_stream_row_on_a_rolled_back_root_row() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        submit_in(&mut h, 1, ROOT_INO, "r");
+        let (rid, out) = submit_in(&mut h, 2, dirs[0], "a");
+        assert!(!accepted(&out, rid), "{out:?}");
+        depose_to_node_2(&mut h);
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 0, "a stream row ran");
+        let queued: Vec<Rid> = h
+            .meta
+            .pending_replays()
+            .unwrap()
+            .into_iter()
+            .map(|q| q.rid)
+            .collect();
+        assert!(!queued.contains(&rid), "{queued:?}");
+    }
+
     /// A forward into the subtree from node 2, routed by `routed_gen`.
     fn forward_into(
         h: &mut Harness,
@@ -79319,6 +79631,125 @@ mod root_own_sticky {
         );
     }
 
+    /// ADR-55 (M3): a restart over the journal loses the core's note that the
+    /// root's own grant record is not in the archive yet; the stream installed
+    /// again must wait for it as before (else its `Final` answers rest on a
+    /// grant the log never had: `far-root-writes-paused+durability` seeds 917
+    /// and 1854). Fails on the parent: the stream was honoured at once.
+    #[test]
+    fn a_restarted_root_still_waits_for_the_archive_to_carry_its_grant_record() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        assert!(h.core.own_grant_pending(d.gen));
+        let mut out = Vec::new();
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&d.gen), "not installed again");
+        assert!(
+            h.core.own_grant_pending(d.gen),
+            "honoured with the record in the journal only"
+        );
+        // The archive carries the record: honoured from then on.
+        let record = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], record);
+        assert!(!h.core.own_grant_pending(d.gen));
+    }
+
+    /// ADR-55 (S2): the claim cut with rows. The root's own stream rows are in
+    /// its journal above the log's index of the stream (the self-append does
+    /// not raise it); when the process restarts and claims the lease again,
+    /// the stream ends at what it assigned (`cursor.max(delegate_idx)`), not
+    /// at the log's index: a lower cut would void answers it gave `Final`.
+    /// The rows stay in the journal under the stream's origin, ship in the new
+    /// tenure's first segment, and the shipper's guard stays silent.
+    /// (The gate path of a predecessor with a backup tail ends the stream at
+    /// the log and replays the halted rows by rid: step 12's, see
+    /// `delegations.md`.)
+    #[test]
+    fn a_claim_ends_the_own_stream_at_what_the_root_assigned() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        archive_and_step(&mut h);
+        constellation_meta::MetaStore::ack_journal(&h.meta, record).unwrap();
+        for i in 0..2 {
+            let (rid, out) = submit_in(&mut h, 1 + i, dirs[0], &format!("f{i}"));
+            assert!(accepted(&out, rid), "{out:?}");
+        }
+        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 2);
+        assert_eq!(h.meta.log_stream_idx(d.gen).unwrap(), 0);
+        // The process restarts over the same journal and claims the lease
+        // again.
+        let mut out = Vec::new();
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.hold(3, None);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        let g = h.core.dl.gens.get(&d.gen);
+        assert!(g.is_none_or(|g| g.ended), "the claimant keeps the stream");
+        if let Some(g) = g {
+            assert_eq!(g.cursor, 2, "the stream ended below what the root assigned");
+        }
+        let cut = h.meta.void_cut(d.gen).unwrap();
+        assert!(
+            cut.is_none_or(|c| c >= 2),
+            "the void cut {cut:?} is below the rows the root answered"
+        );
+        // Both rows are still in the journal under their origin: they ship.
+        let tip = h.meta.journal_tip().unwrap();
+        let seqs: Vec<u64> = (record + 1..=tip).collect();
+        let origins = Replica::journal_origins(&h.meta, &seqs);
+        assert!(
+            origins.contains(&(d.gen, 1)) && origins.contains(&(d.gen, 2)),
+            "{origins:?}"
+        );
+        assert_eq!(h.meta.unjustified_ships(), 0);
+    }
+
+    /// ADR-55 (S8): the lease is not released over an own release row that is
+    /// still in the journal (the counter is the core-side assertion; the
+    /// lifecycle's flush ships the row first). Fails on the parent: nothing
+    /// looked.
+    #[test]
+    fn the_lease_is_not_released_over_an_unshipped_own_release_row() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        let (rid, out) = submit_in(&mut h, 1, dirs[0], "a");
+        assert!(accepted(&out, rid), "{out:?}");
+        // The root releases its own subtree: the release row is journaled.
+        let mut out = Vec::new();
+        assert!(h.core.own_sticky_release(
+            h.clk(),
+            d.gen,
+            [dirs[0]].into_iter().collect(),
+            &h.meta,
+            &mut out
+        ));
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert!(h.core.dl.mine[&d.gen].release.is_some());
+        assert!(Replica::journal_own_gens(&h.meta).contains(&d.gen));
+        // Nothing has shipped it: the guard sees the row.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.core.check_own_release_shipped(&h.meta);
+        }));
+        assert_eq!(
+            h.core.stats.root_own_release_unshipped_at_lease_release, 1,
+            "{result:?}"
+        );
+    }
+
     /// Test 11 (Q3): an op of the root across the boundary of its own sticky
     /// subtree releases the grant (the holder's decision) and runs on the
     /// root's keys after the release row, instead of `EXDEV`.
@@ -79361,7 +79792,8 @@ mod root_own_sticky {
                 )),
             "EXDEV at the root's own boundary: {out:?}"
         );
-        assert_eq!(h.core.stats.root_own_released_for_cross, 1);
+        assert_eq!(h.core.stats.root_own_released_for_cross_own, 1);
+        assert_eq!(h.core.stats.root_own_released_for_cross_forwarded, 0);
         // The release row is appended inline; the op runs after it.
         let mut all = out;
         for _ in 0..6 {

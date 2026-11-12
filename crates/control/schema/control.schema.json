@@ -2123,13 +2123,15 @@
           "$ref": "#/$defs/RootOwnStatus",
           "default": {
             "answers": 0,
+            "archive_waits_elsewhere": 0,
             "commit_wait_ms_max": 0,
             "commit_waits": 0,
             "granted": 0,
             "holds": 0,
             "inbox_refusals": 0,
             "released_by_dwell": 0,
-            "released_for_cross": 0,
+            "released_for_cross_forwarded": 0,
+            "released_for_cross_own": 0,
             "resumed_rows": 0,
             "self_sends": 0,
             "skipped": 0
@@ -7402,6 +7404,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "archive_waits_elsewhere": {
+          "description": "The root's own client ops its root path answered with an archive wait\n(in `/` or in other nodes' subtrees) while it held a grant of its own.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "commit_wait_ms_max": {
           "format": "uint64",
           "minimum": 0,
@@ -7433,7 +7441,13 @@
           "minimum": 0,
           "type": "integer"
         },
-        "released_for_cross": {
+        "released_for_cross_forwarded": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "released_for_cross_own": {
+          "description": "Ops across a sticky boundary of the root that released the grant,\nthe root's own client's and forwarded ones (another node's).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -7457,7 +7471,9 @@
       "required": [
         "granted",
         "released_by_dwell",
-        "released_for_cross",
+        "released_for_cross_own",
+        "released_for_cross_forwarded",
+        "archive_waits_elsewhere",
         "answers",
         "holds",
         "skipped",

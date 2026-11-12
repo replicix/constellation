@@ -562,43 +562,44 @@ impl constellation_net::PeerService for P2pBridge {
             let (reply, receive) = tokio::sync::oneshot::channel();
             let started = std::time::Instant::now();
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate request queued");
-            let (outcome, base, position, gen, (own_chunks, own_rows), committed) = if self
-                .nudge
-                .send(sync::SyncRequest::Mutate {
-                    requester,
-                    op,
-                    rid,
-                    acked_through,
-                    deps,
-                    pending,
-                    applied,
-                    tag: constellation_meta::locks::LockTag::from_wire(&lock_tag, Some(recv)),
-                    settle,
-                    routed_gen,
-                    touched_gen,
-                    inbox_ever,
-                    reply,
-                })
-                .is_ok()
-            {
-                receive.await.unwrap_or((
-                    constellation_meta::MutateOutcome::Busy,
-                    None,
-                    constellation_meta::Position::ZERO,
-                    0,
-                    (constellation_meta::OwnChunks::None, None),
-                    false,
-                ))
-            } else {
-                (
-                    constellation_meta::MutateOutcome::Busy,
-                    None,
-                    constellation_meta::Position::ZERO,
-                    0,
-                    (constellation_meta::OwnChunks::None, None),
-                    false,
-                )
-            };
+            let (outcome, base, position, gen, (own_chunks, own_rows), (committed, non_stealable)) =
+                if self
+                    .nudge
+                    .send(sync::SyncRequest::Mutate {
+                        requester,
+                        op,
+                        rid,
+                        acked_through,
+                        deps,
+                        pending,
+                        applied,
+                        tag: constellation_meta::locks::LockTag::from_wire(&lock_tag, Some(recv)),
+                        settle,
+                        routed_gen,
+                        touched_gen,
+                        inbox_ever,
+                        reply,
+                    })
+                    .is_ok()
+                {
+                    receive.await.unwrap_or((
+                        constellation_meta::MutateOutcome::Busy,
+                        None,
+                        constellation_meta::Position::ZERO,
+                        0,
+                        (constellation_meta::OwnChunks::None, None),
+                        (false, false),
+                    ))
+                } else {
+                    (
+                        constellation_meta::MutateOutcome::Busy,
+                        None,
+                        constellation_meta::Position::ZERO,
+                        0,
+                        (constellation_meta::OwnChunks::None, None),
+                        (false, false),
+                    )
+                };
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate reply taken");
             tracing::trace!(
                 requester,
@@ -618,6 +619,7 @@ impl constellation_net::PeerService for P2pBridge {
                 own_inos: own_wire.1,
                 own_rows: constellation_meta::OwnRows::to_wire(own_rows.as_ref()),
                 committed,
+                non_stealable,
             }
         })
     }

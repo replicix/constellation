@@ -1838,7 +1838,7 @@ impl Core {
             if self.cfg.delegation && self.deleg_known() {
                 if let Ok(op) = &decoded {
                     let keys = super::holder::keys_of_op_in(op, replica);
-                    match self.deleg_recall_plan(now, &keys, replica, out) {
+                    match self.deleg_recall_plan(now, false, &keys, replica, out) {
                         super::delegate::RecallPlan::None => {}
                         super::delegate::RecallPlan::Wait(wait) => {
                             self.inbox.recall_waiters.insert(batch.node, now.wait);

@@ -370,6 +370,8 @@ pub enum Payload {
         own_rows: Vec<u8>,
         /// Plan 43 C1-2: the answer waited for a group or the archive.
         committed: bool,
+        /// ADR-55: `PeerMsg::MutateReply::non_stealable`.
+        non_stealable: bool,
     },
     /// Plan 30 §M8: a `cto=strict` reader asks the sequencer where the
     /// state of `ino` is (its record; with `dir`, its entries; with

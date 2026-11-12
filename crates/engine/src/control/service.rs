@@ -525,7 +525,9 @@ impl EngineControl {
                     root_own: api::RootOwnStatus {
                         granted: stats.place_root_own_granted,
                         released_by_dwell: stats.place_root_own_released,
-                        released_for_cross: stats.root_own_released_for_cross,
+                        released_for_cross_own: stats.root_own_released_for_cross_own,
+                        released_for_cross_forwarded: stats.root_own_released_for_cross_forwarded,
+                        archive_waits_elsewhere: stats.root_own_archive_waits_elsewhere,
                         answers: stats.root_own_answers,
                         holds: stats.root_own_holds,
                         skipped: stats.place_skipped_root_own,
