@@ -37,6 +37,12 @@
 //!    round trip) and the first `flock`. Runs under net-wan, like 5; off it
 //!    only when `ACK_LATENCY_TOPOLOGIES` names it (a LAN run of the same
 //!    grant path).
+//! 8. `8-wan-root-own`: as 5, with the placement on and the root writing
+//!    `/t8` dominantly with a peer and no backup (plan 46 M1.3 step 9): `a`
+//!    is granted the subtree as its own sticky grant (`root-own`: the holder
+//!    and a local commit, the bound of topology 3's delegate; `first_op`: the
+//!    record's archive wait, once per subtree) and its ops in `/`
+//!    (`root-slash`: the archive wait, documented). Runs under net-wan only.
 //!
 //! One JSON document on stdout:
 //! `{"scenario":"ack-latency","load":…,"results":[{"topology","actor","op","n","p50_us","p90_us","p99_us"}]}`.
@@ -269,6 +275,9 @@ pub fn ack_latency(_seed: u64) -> Result<()> {
         }
         if want(7) {
             all.push(topology_wan_sticky(n)?);
+        }
+        if want(8) {
+            all.push(topology_wan_root_own(n)?);
         }
     } else {
         let runs: [(u32, Topology); 5] = [
@@ -576,6 +585,80 @@ fn topology_wan_sticky(n: usize) -> Result<Rows> {
             &a.mnt.join("t7/lk"),
             n,
         )?;
+        Ok(rows)
+    })();
+    unmount_all(&mut clients);
+    result
+}
+
+fn topology_wan_root_own(n: usize) -> Result<Rows> {
+    const NAME: &str = "ack-latency-8-wan-root-own";
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b"],
+        &[
+            ("CONSTELLATION_DELEGATION_PLACEMENT", ""),
+            ("CONSTELLATION_DELEGATION_MIN_OPS", "10"),
+            ("CONSTELLATION_DELEGATION_WINDOW_MS", "5000"),
+            ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "on"),
+            ("CONSTELLATION_DELEGATION_ROOT_STICKY", "on"),
+            ("CONSTELLATION_BACKUPS", "0"),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<Rows> {
+        let mut rows = Rows::new("8-wan-root-own");
+        let (a, b) = (&clients[0], &clients[1]);
+        let lease = lease_of(a)?;
+        ensure!(
+            lease["held"] == true,
+            "8-wan-root-own: a does not hold the root: {lease}"
+        );
+        std::fs::create_dir_all(a.mnt.join("t8"))?;
+        eventually("t8 visible on b", Duration::from_secs(60), || {
+            ensure!(b.mnt.join("t8").is_dir());
+            Ok(())
+        })?;
+        // The root is the dominant writer of /t8 until the placement grants
+        // it as its own.
+        let started = Instant::now();
+        let mut i = 0usize;
+        loop {
+            std::fs::write(a.mnt.join(format!("t8/warm-{i}")), b"")
+                .with_context(|| "8-wan-root-own: a creating a warm-up file")?;
+            i += 1;
+            if holds_grant(a, "/t8")? {
+                break;
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(180),
+                "8-wan-root-own: a was not granted /t8 within 180 s ({i} creates)"
+            );
+        }
+        let to_own = started.elapsed();
+        eprintln!(
+            "    ack-latency: 8-wan-root-own first_op_to_own_ms={} (after {i} creates)",
+            to_own.as_millis()
+        );
+        // The first op under the grant waits for the record's archive, once.
+        let t = Instant::now();
+        std::fs::write(a.mnt.join("t8/first-under-grant"), b"")?;
+        let first = t.elapsed();
+        eprintln!("    ack-latency: 8-wan-root-own first op under the grant {first:?}");
+        rows.rows.push(json!({
+            "topology": "8-wan-root-own",
+            "actor": "first-op",
+            "op": "first_under_grant",
+            "n": 1,
+            "p50_us": first.as_micros() as u64,
+            "p90_us": first.as_micros() as u64,
+            "p99_us": first.as_micros() as u64,
+        }));
+        std::fs::create_dir_all(a.mnt.join("t8/own"))?;
+        measure_ops(&mut rows, "root-own", &a.mnt.join("t8/own"), n)?;
+        // The root's ops in `/` (not in a subtree it holds) wait for the
+        // archive.
+        measure_ops(&mut rows, "root-slash", &a.mnt, n)?;
         Ok(rows)
     })();
     unmount_all(&mut clients);
