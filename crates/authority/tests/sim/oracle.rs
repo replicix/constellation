@@ -241,6 +241,10 @@ pub struct Oracles {
             Arc<constellation_meta::delegation::DelegationTable>,
         )>,
     >,
+    /// The nodes whose journal or replay queue rolled a rid back (ADR-55,
+    /// I5 on the root's own stream: the row's rollback is the holder's, not
+    /// a requester's shadow of its answer).
+    pub rolled_back_nodes: Mutex<BTreeMap<Rid, BTreeSet<NodeId>>>,
 }
 
 /// The holder's release rows seen, and those journaled before the root had
@@ -495,6 +499,7 @@ impl Oracles {
             causal_cut: Mutex::new(Vec::new()),
             sticky_released: Mutex::new(BTreeMap::new()),
             tables: Mutex::new(Vec::new()),
+            rolled_back_nodes: Mutex::new(BTreeMap::new()),
             bucket,
             stores: Mutex::new(BTreeMap::new()),
             told: Mutex::new(BTreeMap::new()),
@@ -589,10 +594,29 @@ impl Oracles {
         t.push((at, holder, Arc::new(table)));
     }
 
+    /// `node` rolled `rid` back (its replay queue named it, or its journaled
+    /// refusal is gone).
+    pub fn note_rolled_back_at(&self, node: NodeId, rid: Rid) {
+        self.rolled_back_nodes
+            .lock()
+            .unwrap()
+            .entry(rid)
+            .or_default()
+            .insert(node);
+    }
+
     /// The non-stealable generations (sticky grants, designations) the root's
     /// table ever named for `node`: the generations whose rows are `Final`
     /// whether or not the stream still stands (a released stream's rows keep
     /// the rule they were journaled by; ADR-55: the root's own too).
+    ///
+    /// The answer-time classifier (`AnswererState::non_stealable_gens`) takes
+    /// these for every node, not only the root: a released stream's retried
+    /// rows are `Final` whoever held it. It is read for a transaction of
+    /// origin `(gen, idx)` with `gen != 0` only (`judge`'s non-stealable
+    /// branch and `expected_class` are both under `g != 0`, and a generation
+    /// is never 0), so a root row (`origin.0 == 0`) cannot reach `Final`
+    /// through it.
     pub fn ever_non_stealable(&self, node: NodeId) -> BTreeSet<u64> {
         self.tables
             .lock()
@@ -839,21 +863,29 @@ impl Oracles {
                 .unwrap_or(0);
             // ADR-55: the node that holds the lease and the stream is the
             // root of its own stream: its rows are in the journal the root
-            // appends to, before the release row and in order, and the log's
-            // index of the stream rises only when its segment lands. The
-            // drain rule is about a root that is another node.
+            // appends to, before the release row and in order, so what the
+            // "root" has appended is what this node journaled of the stream
+            // (the log's index of it rises only when a segment lands). The
+            // rule is the same check, judged against that: it holds for a
+            // root that journals the stream, and fails if the release row
+            // ever outruns the rows before it.
             let own_root = self
                 .bucket
                 .peek_lease()
                 .is_some_and(|l| l.holder == node && !l.released);
+            let through = if own_root {
+                top.max(appended)
+            } else {
+                appended
+            };
             let mut seen = self.release_drain.lock().unwrap();
             seen.checked.insert((node, gen), top);
-            for idx in releases.into_iter().filter(|_| judge && !own_root) {
+            for idx in releases.into_iter().filter(|_| judge) {
                 seen.rows += 1;
-                if appended + 1 < idx {
+                if through + 1 < idx {
                     seen.violations.push(format!(
                         "node {node} journaled the release row {idx} of stream {gen} while the \
-                         root had appended it only through {appended}"
+                         root had appended it only through {through}"
                     ));
                 }
             }
@@ -3020,6 +3052,23 @@ pub fn end_of_run(
         .iter()
         .flat_map(|(_, _, table)| table.iter().filter(|d| d.non_stealable()).map(|d| d.gen))
         .collect();
+    // ADR-55 (R-I5): the generations the root held as its own (the root's
+    // table named the node it was published by as the holder), and the nodes
+    // that rolled each rid back.
+    let own_root_gens: BTreeMap<u64, NodeId> = o
+        .tables
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, root, table)| {
+            table
+                .iter()
+                .filter(|d| d.non_stealable() && d.node == *root)
+                .map(|d| (d.gen, d.node))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let rolled_by = o.rolled_back_nodes.lock().unwrap().clone();
     for (rid, at) in rolled_back {
         if non_lone_ok.get(rid).is_some_and(|t| t < at) {
             let Some(a) = acks.iter().rev().find(|a| {
@@ -3093,6 +3142,35 @@ pub fn end_of_run(
             // a violation only if the log never completes the rid. A root
             // row judged `Final` (a one-member hold, the knob) is no longer
             // excused.
+            // ADR-55 (R-I5): not the root's own stream. A `Final` row of a
+            // stream the root holds for itself survives a deposition (it is
+            // a holder row, streamed to the next root): one rolled back is
+            // a rollback of an acknowledged final row, whether or not its
+            // replay by rid completes it again. Keyed by the row's origin
+            // `(gen, idx)`.
+            if let Some((gen, idx)) = a
+                .judged
+                .as_ref()
+                .filter(|j| j.class == Some(Judged::Final))
+                .and_then(|j| j.tx.as_ref())
+                .map(|t| t.origin)
+                // (The holder's rollback of the row: a requester's shadow of
+                // its answer rolled back is the shadow's, and the holder's
+                // row stands.)
+                .filter(|(g, _)| {
+                    own_root_gens
+                        .get(g)
+                        .is_some_and(|n| rolled_by.get(rid).is_some_and(|s| s.contains(n)))
+                })
+            {
+                f.i5.push(format!(
+                    "I5 deposed_root_strands_own_stream: rid {rid:?} (row {idx} of generation \
+                     {gen}, the root's own stream) was acknowledged `Final` by node {} at \
+                     t={} ms (tick {}) and rolled back",
+                    a.node, a.at_ms, a.tick
+                ));
+                continue;
+            }
             if a.judged.as_ref().is_some_and(|j| {
                 j.class == Some(Judged::Final)
                     && j.tx.as_ref().is_some_and(|t| {

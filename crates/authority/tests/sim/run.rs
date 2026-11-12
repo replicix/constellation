@@ -1590,7 +1590,7 @@ pub struct Report {
     /// stream, holds by its root path, the longest commit wait of a grant
     /// (ms), self-delivered messages, candidates the walk skipped for the
     /// root, the root's own long-dwell releases, deliveries cut off.
-    pub root_own_core: [u64; 10],
+    pub root_own_core: [u64; 13],
     /// Late-landing cores' counters, summed over the nodes (`SWEEP-LL-STATS`):
     /// settles withdrawn first, ops resubmitted by a tombstone, stale reads
     /// discarded, stale relists, stale parks dropped, unacked replay settles,
@@ -1952,11 +1952,7 @@ impl Cluster {
                     old.shared
                         .ungated_shadows_before
                         .load(std::sync::atomic::Ordering::Relaxed)
-                        + old.view().stats.ungated_shadows
-                        - old
-                            .shared
-                            .ungated_excused
-                            .load(std::sync::atomic::Ordering::Relaxed),
+                        + old.view().stats.ungated_shadows,
                     // (A kept meta is the same object: counted once, at the end.)
                     old.shared
                         .unjustified_ships_before
@@ -6423,6 +6419,24 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let commit_list = commits.lock().unwrap().clone();
     let snapshots: BTreeSet<u64> = commit_list.iter().map(|c| c.applied).collect();
     let oracle = check::replay_log(bucket.raw(), &snapshots).await;
+    // ADR-55: the strict table check (`no_grant_on_root_dir`) speaks first: a
+    // grant on `/` is a violation of the log whatever else it breaks in the
+    // run (a history, a quiescence), and the strict oracle is the one named.
+    {
+        let table: Vec<String> = super::sticky::StickyEnds::of_log(&oracle)
+            .judge(&BTreeMap::new())
+            .violations
+            .into_iter()
+            .filter(|v| v.starts_with("no_grant_on_root_dir"))
+            .collect();
+        if !table.is_empty() {
+            return Err(format!(
+                "sticky_ends_only_by_holder_or_operator: {}\n  faults: {:?}",
+                table.join("; "),
+                report.faults
+            ));
+        }
+    }
     // Plan 43 C1-3 (G4): a claim that still waits for the tail of a group
     // none of whose members answers (no operator abandoned it, or none
     // could): the cluster is not meant to converge. What is owed instead:
@@ -7367,6 +7381,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.root_own_core[7] += s.self_send_overflow;
         report.root_own_core[8] += s.root_own_resumed;
         report.root_own_core[9] += s.holder_inbox_refusals_own_root;
+        report.root_own_core[10] += s.root_own_released_for_cross_own;
+        report.root_own_core[11] += s.root_own_released_for_cross_forwarded;
+        report.root_own_core[12] += s.root_own_archive_waits_elsewhere;
         report.sticky_core[0] += s.deleg_sticky;
         report.sticky_core[1] += s.deleg_sticky_ended_released;
         report.sticky_core[2] += s.deleg_sticky_ended_abandoned;
@@ -7478,6 +7495,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     for (strict, what, list) in [
         (true, "no_read_under_an_abandoned_stream", &read_violations),
+        // Plan 46 M1.3 step 4: strict on every configuration (it judges
+        // nothing without a sticky grant). First: the strict table checks
+        // (`no_grant_on_root_dir`, ADR-55) are the first to speak when a
+        // grant is wrong, whatever else that breaks in the run.
+        (
+            true,
+            "sticky_ends_only_by_holder_or_operator",
+            &found.sticky,
+        ),
         (cfg.strict_commit, "I1", &found.i1),
         (cfg.strict_commit, "class claim", &found.class_claim),
         (cfg.strict_commit, "row version", &found.row_version),
@@ -7500,13 +7526,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             cfg.cut_mode.is_strict(),
             "acked_at_or_below_cut",
             &found.cut,
-        ),
-        // Plan 46 M1.3 step 4: strict on every configuration (it judges
-        // nothing without a sticky grant).
-        (
-            true,
-            "sticky_ends_only_by_holder_or_operator",
-            &found.sticky,
         ),
         // Plan 46 M1.3 step 5: strict on every configuration. A refusal
         // journaled for an op that another sequencer ran (an inbox refusal
@@ -7563,17 +7582,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .values()
         .map(|s| s.ungated_shadows)
         .sum::<u64>()
-        - cluster
-            .ids()
-            .into_iter()
-            .map(|id| {
-                cluster
-                    .get(id)
-                    .shared
-                    .ungated_excused
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            })
-            .sum::<u64>()
         + cluster
             .ids()
             .into_iter()
@@ -7615,6 +7623,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         return Err(format!(
             "I2 root_path_executes_own_stream: the root's own path executed {root_path_own} op(s) \
              on keys of its own live sticky stream\n  {counters}\n  faults: {:?}",
+            report.faults
+        ));
+    }
+    // ADR-55 (S8): the lease was never released over a release row of the
+    // root's own stream that had not shipped.
+    let unshipped_release: u64 = report
+        .stats
+        .values()
+        .map(|s| s.root_own_release_unshipped_at_lease_release)
+        .sum();
+    if unshipped_release > 0 {
+        return Err(format!(
+            "I2 root_own_release_unshipped: the lease was released {unshipped_release} time(s) \
+             over a release row of the root's own stream still in its journal\n  {counters}\n  \
+             faults: {:?}",
             report.faults
         ));
     }

@@ -218,12 +218,6 @@ pub struct Shared {
     pub ungated_shadows_before: AtomicU64,
     /// `Stats::settle_frozen_asks` of this node's earlier incarnations.
     pub settle_asks_before: AtomicU64,
-    /// Of this node's counted shadows, those the oracle excused: the reply
-    /// came from a node that held the named generation as a non-stealable
-    /// grant by the root's own table history (the requester's table did not
-    /// list it yet). ADR-55: the root's own grant is minted and answered
-    /// before a far requester learns it.
-    pub ungated_excused: AtomicU64,
     /// `Meta::unjustified_ships` of this node's earlier incarnations (a meta
     /// that did not survive the restart; plan 46 M0.4).
     pub unjustified_ships_before: AtomicU64,
@@ -719,7 +713,6 @@ impl NodeHandle {
             queued_seen: Mutex::new(BTreeSet::new()),
             ungated_shadows_before: AtomicU64::new(0),
             settle_asks_before: AtomicU64::new(0),
-            ungated_excused: AtomicU64::new(0),
             unjustified_ships_before: AtomicU64::new(0),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
@@ -2462,32 +2455,7 @@ impl Driver {
                 } => Some((*rid, *routed_gen, *inbox_ever)),
                 _ => None,
             };
-            // A reply from `from`'s stream `gen` that said nothing of a
-            // commit and was installed as a shadow by a requester whose table
-            // does not list the generation yet is judged against the root's
-            // table history instead: a non-stealable generation of `from` is
-            // final by design (`Core::note_ungated_shadow`).
-            let shadow_from = match &event {
-                Event::Peer {
-                    from,
-                    msg:
-                        PeerMsg::MutateReply {
-                            gen,
-                            committed: false,
-                            ..
-                        },
-                } if *gen != 0 => Some((*from, *gen, self.core.stats.ungated_shadows)),
-                _ => None,
-            };
             let actions = self.core.handle(now, event, &*self.meta);
-            if let Some((from, gen, before)) = shadow_from {
-                let after = self.core.stats.ungated_shadows;
-                if after > before && self.oracles.ever_non_stealable(from).contains(&gen) {
-                    self.shared
-                        .ungated_excused
-                        .fetch_add(after - before, Ordering::Relaxed);
-                }
-            }
             // ADR-47 (`CutOnAnswer`): the answer of an op that ran from a
             // stale route goes out after the cut, so it is lost; the op ran.
             // The op is a forward of the peer routed by no generation that
@@ -3116,6 +3084,7 @@ impl Driver {
                     );
                 }
                 t.insert(q.rid);
+                self.oracles.note_rolled_back_at(self.id, q.rid);
             }
             let mut seen = self.shared.queued_seen.lock().unwrap();
             for rid in super::oracle::newly_queued(&mut seen, &entries) {
@@ -3157,6 +3126,7 @@ impl Driver {
                             );
                         }
                         t.insert(*rid);
+                        self.oracles.note_rolled_back_at(self.id, *rid);
                         self.shared
                             .rolled_back_at
                             .lock()
