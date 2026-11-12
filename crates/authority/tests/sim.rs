@@ -6617,6 +6617,24 @@ fn a_backups_resent_hole_keeps_the_acknowledged_rows_past_it() {
     });
 }
 
+/// ADR-59 part A: `metered-shared+links` seed 1781. The first holder shipped
+/// rows ahead of a held one and a successor carried the held ones; when the
+/// first holder claimed the lease back, its own kept copy of its tenure
+/// skipped the rows it had shipped ahead, and it read them as missing from
+/// the log once the epoch had moved on: the merge stopped at that gap and
+/// left out an acknowledged `Unlink f1` past it. The holder's own ship now
+/// records the rows it shipped (`Replica::ack_journal`).
+#[test]
+fn a_holders_own_rows_shipped_ahead_stay_in_the_log_for_its_next_claim() {
+    let seed = 1781;
+    run_seed(seed, config_variant(metered_shared_config(), "links")).unwrap_or_else(|e| {
+        panic!(
+            "metered-shared+links seed {seed}: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=metered-shared+links"
+        )
+    });
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and

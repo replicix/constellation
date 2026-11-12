@@ -1261,7 +1261,12 @@ impl Replica for Meta {
             // next segment records it again.
             let _ = Meta::note_applied_pos(self, pos);
         }
-        self.session().advance(at, pos);
+        // The rows this holder shipped are in the log as a subscriber's
+        // segment names them: those above `pos` (shipped ahead of a held
+        // one) read as carried after the epoch moves on, when this node
+        // claims a later tenure and merges the kept rows of its own
+        // (metered-shared+links seed 1781).
+        self.session().advance_rows(at, pos, seqs);
         Ok(())
     }
 
@@ -2269,6 +2274,35 @@ mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
     use constellation_meta::delegation::GEN_EPOCH_SHIFT;
+
+    /// ADR-59 part A (metered-shared+links seed 1781): a holder that shipped
+    /// a transaction ahead of a held one, and then follows a later epoch,
+    /// still reads that row as in the log; the held one it never shipped
+    /// stays out. (Before: the holder's own ship advanced the position
+    /// without the rows, so after the epoch moved on its kept-row merge as
+    /// the next claimant found a gap below its own copy and dropped the
+    /// acknowledged rows past it.)
+    #[test]
+    fn a_holders_row_shipped_ahead_stays_in_the_log_after_the_epoch_moves_on() {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        for name in ["a", "b", "c"] {
+            meta.create(ROOT_INO, name, 0o644, 0, 0).unwrap();
+        }
+        let txs = meta.journal_txs_from(1, 1000).unwrap();
+        assert_eq!(txs.len(), 3);
+        let rows = |i: usize| (txs[i].first..=txs[i].last).collect::<Vec<u64>>();
+        let at = |jseq| Some(JournalPos { epoch: 1, jseq });
+        Replica::ack_journal(&meta, &rows(0), 1, at(txs[0].last)).unwrap();
+        // The third ships ahead of the second, which stays held.
+        Replica::ack_journal(&meta, &rows(2), 2, at(txs[0].last)).unwrap();
+        assert!(Replica::row_in_log(&meta, 1, txs[2].last));
+        meta.session()
+            .advance(3, Some(JournalPos { epoch: 2, jseq: 0 }));
+        assert!(Replica::row_in_log(&meta, 1, txs[0].last));
+        assert!(Replica::row_in_log(&meta, 1, txs[2].last), "shipped ahead");
+        assert!(!Replica::row_in_log(&meta, 1, txs[1].last), "held");
+    }
 
     /// ADR-43: the executors (`holder.rs` `mutate_request`, the delegate
     /// stream's append and drain) ask the replica's `deps_lost` before
