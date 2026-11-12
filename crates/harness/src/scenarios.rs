@@ -1343,6 +1343,20 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::sticky_abandon,
     },
     Scenario {
+        name: "root-own-sticky",
+        desc: "plan 46 M1.3 step 9 (ADR-55): the root (a) writes /r dominantly with a peer (b) and no backup and is granted /r as its own sticky subtree; its ops there are answered at local speed (percentiles printed beside its ops in /, which wait for the archive); a is stopped past the lease TTL, b takes the lease, a is continued: it keeps writing /r with no error, b reads every row a acknowledged, and b's write into /r is forwarded to a and final",
+        requires: &[],
+        caps: &[],
+        run: m11::root_own_sticky,
+    },
+    Scenario {
+        name: "root-own-sticky-unmount",
+        desc: "plan 46 M1.3 step 9 (ADR-55, Q2): the root (a) unmounts cleanly while it holds /r as its own sticky grant; it releases the subtree before its lease goes, and b writes /r after, with every row of a on b",
+        requires: &[],
+        caps: &[],
+        run: m11::root_own_sticky_unmount,
+    },
+    Scenario {
         name: "sticky-release-on-unmount",
         desc: "plan 46 M1.3 step 7: the sticky holder of d1 (b) unmounts cleanly after writing 40 files; it releases the subtree before it exits, so d1 leaves the root's table at once, c's write into d1 succeeds well inside the time a dead sticky holder's subtree stays read-only, and b's files are on every node",
         requires: &[],

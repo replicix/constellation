@@ -1407,6 +1407,226 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
     result
 }
 
+/// The percentile `p` (0 to 100) of `lat`.
+fn pct(lat: &[Duration], p: usize) -> Duration {
+    let mut v = lat.to_vec();
+    v.sort();
+    v.get((v.len() * p / 100).min(v.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// The environment the root-own scenarios share: the placement on, a window
+/// and a floor a short run reaches, no backup (the root's own ops would
+/// otherwise wait for a group, not the archive), a long dwell.
+const ROOT_OWN_ENV: &[(&str, &str)] = &[
+    ("CONSTELLATION_CTO", "strict"),
+    ("CONSTELLATION_DELEGATION_PLACEMENT", ""),
+    // (The root's own writes wait for the archive until the grant: a few per
+    // second, so the floor lies below that.)
+    ("CONSTELLATION_DELEGATION_WINDOW_MS", "6000"),
+    ("CONSTELLATION_DELEGATION_MIN_OPS", "5"),
+    ("CONSTELLATION_DELEGATION_DWELL_MS", "600000"),
+    ("CONSTELLATION_BACKUPS", "0"),
+];
+
+/// Write into `/r` on the root `a` until its table lists `/r` as its own
+/// sticky grant; the names written.
+fn root_takes_own_grant(a: &Client, a_id: u64) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    let t = Instant::now();
+    let mut i = 0;
+    loop {
+        let name = format!("r/a-{i}");
+        write_timed(&a.mnt.join(&name), name.as_bytes())?;
+        names.push(name);
+        i += 1;
+        let d = deleg_of(a)?;
+        let own = d["table"].as_array().is_some_and(|t| {
+            t.iter()
+                .any(|e| e["path"] == "/r" && e["node"].as_u64() == Some(a_id))
+        });
+        if own {
+            return Ok(names);
+        }
+        anyhow::ensure!(
+            t.elapsed() < Duration::from_secs(40),
+            "the root was not granted /r after {i} writes: {d}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Plan 46 M1.3 step 9 (ADR-55): the root `a` writes `/r` dominantly and is
+/// granted it as its own sticky subtree (`b` is a peer, there is no backup).
+/// `a`'s ops in `/r` run at local speed (the percentiles are printed beside
+/// its ops in `/`, which wait for the archive); `a` is stopped past the lease
+/// TTL, `b` takes the lease; `a` is continued and keeps writing `/r` with no
+/// error; `b` reads every row `a` acknowledged; `b`'s write into `/r` is
+/// forwarded to `a` and final.
+pub fn root_own_sticky(_seed: u64) -> Result<()> {
+    const NAME: &str = "root-own-sticky";
+    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b"], ROOT_OWN_ENV, 0)?;
+    let result = (|| -> Result<()> {
+        let a_id = node_id(&clients[0])?;
+        std::fs::create_dir(clients[0].mnt.join("r"))?;
+        eventually("r visible on b", Duration::from_secs(20), || {
+            anyhow::ensure!(clients[1].mnt.join("r").is_dir());
+            Ok(())
+        })?;
+        let mut acked = root_takes_own_grant(&clients[0], a_id)?;
+        wait_installed(&clients[0], "/r", Duration::from_secs(20))?;
+        let da = deleg_of(&clients[0])?;
+        anyhow::ensure!(
+            n(&da["root_own"], "granted") >= 1,
+            "the grant is not the placement's own: {da}"
+        );
+        // Local speed in the subtree, the archive wait outside it.
+        let (names_r, lat_r) = write_files(&clients[0], "r", "fast", 40)?;
+        acked.extend(names_r);
+        let mut lat_root = Vec::new();
+        for i in 0..40 {
+            lat_root.push(write_timed(
+                &clients[0].mnt.join(format!("slash-{i}")),
+                b"slash",
+            )?);
+        }
+        eprintln!(
+            "    {NAME}: a's ops in /r p50 {:?} p90 {:?}; in / p50 {:?} p90 {:?}; root_own {}",
+            pct(&lat_r, 50),
+            pct(&lat_r, 90),
+            pct(&lat_root, 50),
+            pct(&lat_root, 90),
+            deleg_of(&clients[0])?["root_own"]
+        );
+        anyhow::ensure!(
+            n(&deleg_of(&clients[0])?["root_own"], "answers")
+                + n(&deleg_of(&clients[0])?, "fast_path_executed")
+                > 0,
+            "a answered nothing in its own stream"
+        );
+        // Deposed but alive: stopped past the TTL, b claims the lease.
+        let b_id = node_id(&clients[1])?;
+        clients[0].pause().context("SIGSTOP a")?;
+        let stopped = Instant::now();
+        // b wants the lease (a write in `/`, which only the root sequences):
+        // it claims it once a's has run out.
+        let b_mnt = clients[1].mnt.clone();
+        let claimer = std::thread::spawn(move || write_timed(&b_mnt.join("b-claim"), b"claim"));
+        let took = eventually("b takes the lease", Duration::from_secs(90), || {
+            let l = lease_of(&clients[1])?;
+            anyhow::ensure!(
+                l["held"] == true && l["holder"].as_u64() == Some(b_id),
+                "{l}"
+            );
+            Ok(())
+        });
+        if let Err(e) = took {
+            let _ = clients[0].resume();
+            return Err(e);
+        }
+        let claimed = stopped.elapsed();
+        claimer
+            .join()
+            .map_err(|_| anyhow::anyhow!("b's claiming write panicked"))?
+            .context("b's write in / after it took the lease")?;
+        clients[0].resume().context("SIGCONT a")?;
+        // a keeps writing /r with no error; the grant stays its own.
+        let mut later = Vec::new();
+        eventually(
+            "a writes /r after the deposition",
+            Duration::from_secs(60),
+            || {
+                for i in 0..20 {
+                    let name = format!("r/a-after-{i}");
+                    if !later.contains(&name) {
+                        write_timed(&clients[0].mnt.join(&name), name.as_bytes())?;
+                        later.push(name);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        acked.extend(later);
+        // b reads every row a acknowledged, before and after the deposition.
+        eventually("b reads a's rows", Duration::from_secs(60), || {
+            for name in &acked {
+                anyhow::ensure!(
+                    std::fs::read(clients[1].mnt.join(name))? == name.as_bytes(),
+                    "{name} on b"
+                );
+            }
+            Ok(())
+        })?;
+        // b's own write into /r goes to a (the holder) and is final.
+        let t = Instant::now();
+        eventually("b writes /r/b-0", Duration::from_secs(30), || {
+            std::fs::write(clients[1].mnt.join("r/b-0"), b"b")?;
+            Ok(())
+        })?;
+        let b_wrote = t.elapsed();
+        eventually("a reads /r/b-0", Duration::from_secs(30), || {
+            anyhow::ensure!(std::fs::read(clients[0].mnt.join("r/b-0"))? == b"b");
+            Ok(())
+        })?;
+        eprintln!(
+            "    {NAME}: b took the lease {claimed:?} after a was stopped; b's write into /r \
+             took {b_wrote:?}; a: {} b: {}",
+            deleg_of(&clients[0])?["root_own"],
+            deleg_of(&clients[1])?["root_own"]
+        );
+        ensure_no_conflicts(&[&clients[0], &clients[1]])
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// Plan 46 M1.3 step 9 (Q2): the root `a` unmounts cleanly while it holds
+/// `/r` as its own grant; it releases the subtree before its lease goes, so
+/// `/r` leaves the table at once and `b` writes it after.
+pub fn root_own_sticky_unmount(_seed: u64) -> Result<()> {
+    const NAME: &str = "root-own-sticky-unmount";
+    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b"], ROOT_OWN_ENV, 0)?;
+    let result = (|| -> Result<()> {
+        let a_id = node_id(&clients[0])?;
+        std::fs::create_dir(clients[0].mnt.join("r"))?;
+        eventually("r visible on b", Duration::from_secs(20), || {
+            anyhow::ensure!(clients[1].mnt.join("r").is_dir());
+            Ok(())
+        })?;
+        let acked = root_takes_own_grant(&clients[0], a_id)?;
+        wait_installed(&clients[0], "/r", Duration::from_secs(20))?;
+        clients[0]
+            .unmount_exit(Duration::from_secs(60))
+            .context("a's clean unmount")?;
+        anyhow::ensure!(
+            clients[0]
+                .log_text()
+                .contains("unmount: sticky grants released"),
+            "a's log does not say it released: {}",
+            clients[0].tail_log_n(40)
+        );
+        eventually("b writes /r after a left", Duration::from_secs(60), || {
+            std::fs::write(clients[1].mnt.join("r/b-after"), b"b")?;
+            Ok(())
+        })?;
+        eventually("b reads a's rows", Duration::from_secs(60), || {
+            for name in &acked {
+                anyhow::ensure!(
+                    std::fs::read(clients[1].mnt.join(name))? == name.as_bytes(),
+                    "{name} on b"
+                );
+            }
+            Ok(())
+        })?;
+        ensure_no_conflicts(&[&clients[1]])
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
 /// Plan 46 M1.3 step 7: a sticky holder's clean unmount releases its
 /// subtree before it exits (`sticky-release-on-unmount`).
 pub fn sticky_release_on_unmount(_seed: u64) -> Result<()> {
