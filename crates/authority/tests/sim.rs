@@ -20825,6 +20825,23 @@ fn a_release_row_the_old_root_never_appended_does_not_strand_the_holders_rows() 
         .unwrap_or_else(|e| panic!("sticky-idle-release seed 217: {e}"));
 }
 
+/// `far-placement+deferred`: a forwarded op the root ran, whose outcome waits
+/// for the row's durability (a chunk its far requester holds back) or whose
+/// reply is slow, must not be run again by a sticky grant that installs on
+/// its keys meanwhile (the retry used to execute at the new delegate). The
+/// root skips the delegate's copy (its rid is completed there), so nothing
+/// retired the delegate's journal row (the run never went quiet: 11 of the
+/// first 400 seeds) and the log's stream of the grant had a hole
+/// (`stream_log_contiguous`). Seeds 27 and 83 are the held reply, 136 and 329
+/// the slow one; the others of the first 400 are of the same class.
+#[test]
+fn a_forward_the_root_ran_is_not_run_again_by_a_grant_that_installs() {
+    for seed in [27, 83, 101, 136, 196, 205, 231, 247, 268, 329, 347] {
+        run_seed(seed, config_variant(far_placement_config(), "deferred"))
+            .unwrap_or_else(|e| panic!("far-placement+deferred seed {seed}: {e}"));
+    }
+}
+
 /// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
 /// backup budget) that dominates a subtree is granted a sticky one: it
 /// executes there and its answers are final, with no rollback, no sticky

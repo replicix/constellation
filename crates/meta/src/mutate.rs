@@ -255,6 +255,15 @@ pub enum MutateOutcome {
         /// unsettled `EIO` `held-behind-lost-chunk`, which the sim's oracle
         /// accepts only if a chunk is really lost.
         lost_chunk: bool,
+        /// The hold is for a delegation that is the requester's own: the
+        /// sequencer has not run the rid, and the requester runs it itself
+        /// once its table carries the grant (a grant installing while the op
+        /// was forwarded). Any other answer leaves the requester asking the
+        /// sequencer, which may have run the rid: a second execution at the
+        /// delegation would be skipped by the root when it streams (the rid
+        /// is completed there), leaving the delegate's row unretired for
+        /// good and a hole in the delegation's stream in the log.
+        yours: bool,
     },
     /// Plan 30 §M14 phase 2 (the fencing token): refused because a grant
     /// the op was issued under is no longer live at the executor

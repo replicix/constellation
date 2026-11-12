@@ -6268,6 +6268,7 @@ mod own_chunks {
                 retry_ms: holder.core.cfg.held_retry_ms,
                 outwait_ms: None,
                 lost_chunk: false,
+                yours: false,
             },
             "{reply:?}"
         );
@@ -6364,6 +6365,7 @@ mod own_chunks {
                 retry_ms: holder.core.cfg.held_retry_ms,
                 outwait_ms: None,
                 lost_chunk: false,
+                yours: false,
             }
         );
         assert_eq!(own, OwnChunks::Upload(vec![ino]));
@@ -6434,6 +6436,7 @@ mod own_chunks {
                     retry_ms: 50,
                     outwait_ms: None,
                     lost_chunk: false,
+                    yours: false,
                 },
                 base: None,
                 position: constellation_meta::Position::ZERO,
@@ -14832,6 +14835,30 @@ mod claim_resolution {
 /// / `auto-placement` after a re-delegation).
 #[test]
 fn a_held_forward_executes_locally_once_the_delegation_installs() {
+    held_forward_then_delegation_installs(Some(true));
+}
+
+/// The same, with a root that ran the rid: its `Held` is a parked reply, the
+/// rid's outcome waits for the row's durability (a chunk the delegate has
+/// not uploaded yet). A delegation that installs meanwhile must not run the
+/// rid again: the root skips the delegate's copy of the row (the rid is
+/// completed there), which the delegate never retires, and the log's
+/// stream of the delegation has a hole. Fails without
+/// `ClientOp::sequencer_says_mine`: the retry executed locally.
+#[test]
+fn a_forward_the_root_ran_is_asked_again_once_the_delegation_installs() {
+    held_forward_then_delegation_installs(Some(false));
+}
+
+/// The same, with no answer at all to the forward (a reply lost or slow):
+/// the root may have run the rid.
+#[test]
+fn an_unanswered_forward_is_asked_again_once_the_delegation_installs() {
+    held_forward_then_delegation_installs(None);
+}
+
+/// `yours`: the word of the root's `Held` (`Held::yours`); `None`: no answer.
+fn held_forward_then_delegation_installs(yours: Option<bool>) {
     let mut h = Harness::new(3);
     h.core.cfg.delegation = true;
     h.core.cfg.p2p = true;
@@ -14879,27 +14906,45 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
         );
     };
     let req = *req;
-    // The root holds it: the delegate's table lacks the grant still.
-    let out = h.step(Event::Peer {
-        from: 2,
-        msg: PeerMsg::MutateReply {
-            req,
-            outcome: MutateOutcome::Held {
-                retry_ms: 50,
-                outwait_ms: None,
-                lost_chunk: false,
-            },
-            base: None,
-            position: constellation_meta::Position::ZERO,
-            gen: 0,
-            own_chunks: OwnChunks::None,
-            own_rows: None,
-            committed: false,
-            non_stealable: false,
-        },
-    });
-    let backoff = timers(&out, TimerKind::ForwardBackoff);
-    assert_eq!(backoff.len(), 1, "{out:?}");
+    let backoff = match yours {
+        // The root holds it: the delegate's table lacks the grant still
+        // (`yours`), or the root ran it and its outcome is parked.
+        Some(yours) => {
+            let out = h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::MutateReply {
+                    req,
+                    outcome: MutateOutcome::Held {
+                        retry_ms: 50,
+                        outwait_ms: None,
+                        lost_chunk: false,
+                        yours,
+                    },
+                    base: None,
+                    position: constellation_meta::Position::ZERO,
+                    gen: 0,
+                    own_chunks: OwnChunks::None,
+                    own_rows: None,
+                    committed: false,
+                    non_stealable: false,
+                },
+            });
+            let backoff = timers(&out, TimerKind::ForwardBackoff);
+            assert_eq!(backoff.len(), 1, "{out:?}");
+            backoff
+        }
+        // No answer: the forward's own timeout backs the op off.
+        None => {
+            let out = h.step(Event::PeerFailed {
+                req,
+                to: 2,
+                outage: false,
+            });
+            let backoff = timers(&out, TimerKind::ForwardBackoff);
+            assert_eq!(backoff.len(), 1, "{out:?}");
+            backoff
+        }
+    };
     // The grant lands from the log and installs here.
     crate::replica::Replica::apply_segment(
         &h.meta,
@@ -14924,19 +14969,25 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
         "{:?}",
         h.core.deleg_view()
     );
-    // The retry executes here; nothing is forwarded again.
     h.advance(100);
     let out = h.step(Event::Timer { id: backoff[0] });
-    assert!(
-        !sends(&out)
-            .iter()
-            .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
-        "re-forwarded: {out:?}"
-    );
-    let answered: Vec<Rid> = replies(&out).into_iter().map(|(r, _)| r).collect();
-    assert_eq!(answered, vec![rid], "{out:?}");
-    assert_eq!(h.core.stats.deleg_retry_executed, 1);
-    assert!(h.meta.child_ino(dir, "f").unwrap().is_some());
+    let forwarded = sends(&out)
+        .iter()
+        .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. }));
+    if yours == Some(true) {
+        // The retry executes here; nothing is forwarded again.
+        assert!(!forwarded, "re-forwarded: {out:?}");
+        let answered: Vec<Rid> = replies(&out).into_iter().map(|(r, _)| r).collect();
+        assert_eq!(answered, vec![rid], "{out:?}");
+        assert_eq!(h.core.stats.deleg_retry_executed, 1);
+        assert!(h.meta.child_ino(dir, "f").unwrap().is_some());
+    } else {
+        // The root may have run it: asked again there, not run here.
+        assert!(forwarded, "not asked again: {out:?}");
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.deleg_retry_executed, 0);
+        assert!(h.meta.child_ino(dir, "f").unwrap().is_none());
+    }
 }
 
 /// Plan 46 M0.3 (B): an op the root answered `Held` is asked again at that
@@ -14972,6 +15023,7 @@ fn an_op_held_by_the_root_is_asked_again_there() {
                 retry_ms: 50,
                 outwait_ms: None,
                 lost_chunk: false,
+                yours: false,
             },
             base: None,
             position: constellation_meta::Position::ZERO,
@@ -58393,6 +58445,7 @@ mod c2g_settle {
                     retry_ms: 10,
                     outwait_ms,
                     lost_chunk: false,
+                    yours: false,
                 },
                 base: None,
                 position: constellation_meta::Position::ZERO,
@@ -58476,6 +58529,7 @@ mod c2g_settle {
                         retry_ms: 10,
                         outwait_ms: None,
                         lost_chunk,
+                        yours: false,
                     },
                     base: None,
                     position: constellation_meta::Position::ZERO,
@@ -58538,6 +58592,7 @@ mod c2g_settle {
                         retry_ms: 10,
                         outwait_ms: None,
                         lost_chunk,
+                        yours: false,
                     },
                     base: None,
                     position: constellation_meta::Position::ZERO,
@@ -58661,6 +58716,7 @@ mod c2g_settle {
                     retry_ms: 10,
                     outwait_ms: Some(10_000_000),
                     lost_chunk: false,
+                    yours: false,
                 },
                 base: None,
                 position: constellation_meta::Position::ZERO,
@@ -59642,6 +59698,7 @@ mod c2g_settle {
                 retry_ms: h.core.cfg.recall_hold_ms.max(50),
                 outwait_ms: None,
                 lost_chunk: false,
+                yours: false,
             }),
             "{out:?}"
         );
@@ -61683,6 +61740,7 @@ fn a_delegates_held_answer_is_not_the_roots() {
                 retry_ms: 10,
                 outwait_ms: None,
                 lost_chunk: false,
+                yours: false,
             },
             base: None,
             position: constellation_meta::Position::ZERO,
@@ -63766,6 +63824,7 @@ mod await_retry {
                     retry_ms: 100,
                     outwait_ms: None,
                     lost_chunk: false,
+                    yours: false,
                 },
                 base: None,
                 position: constellation_meta::Position::ZERO,
@@ -75297,6 +75356,7 @@ mod route_fence_wire {
                 retry_ms: 100,
                 outwait_ms: None,
                 lost_chunk: false,
+                yours: false,
             },
             7,
         ));
