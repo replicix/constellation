@@ -258,13 +258,153 @@ impl Meta {
         if txs.is_empty() {
             return Ok(());
         }
+        // Every live key of the tail is at or above the floor (`backup_trim`
+        // keeps it; a resend lowers it below, after the commit), so the
+        // probe for a stored span reaching into a transaction starts there
+        // and walks none of the tombstones the trims left below it (Round
+        // 2): from the floor of this epoch, or from this batch's lowest key
+        // if that is lower; past this epoch, nothing of it is left.
+        let lowest = txs.iter().map(|t| t.first).min().unwrap_or(0);
+        let probe_from = match *self.backup_tail_floor.lock().unwrap() {
+            Some((e, _)) if e > epoch => None,
+            Some((e, f)) if e == epoch => Some(f.min(lowest)),
+            _ => Some(0),
+        };
+        let mut top = *self.backup_tail_top.lock().unwrap();
         let mut tx = self.db.write_tx();
         for t in txs {
-            tx.insert(
-                &self.backup_tail,
-                tail_key(epoch, t.first),
-                postcard::to_allocvec(t)?,
+            // Past every stored span of the epoch (an append's steady
+            // state): nothing to supersede, nothing that spans it.
+            if top.is_some_and(|(e, last)| e == epoch && last < t.first) {
+                tx.insert(
+                    &self.backup_tail,
+                    tail_key(epoch, t.first),
+                    postcard::to_allocvec(t)?,
+                );
+                top = Some((epoch, t.last));
+                continue;
+            }
+            // A resend from a boundary (a holder that restarted, a backup
+            // brought up again) streams the rows its journal no longer has
+            // as one hole, where an earlier send had their transactions:
+            // the hole supersedes every copy it spans, or the copies keyed
+            // inside it break the contiguous hold (`backup_acked`, the
+            // sealed tail's `through`) at the hole's end, and a successor
+            // drops the acknowledged rows past it as never acknowledged
+            // (metered-shared+links seed 1479). Rows a journal no longer
+            // has never come back under the same seq, so a transaction a
+            // stored hole spans is a late copy of rows gone: not kept.
+            //
+            // Both rest on every span (a transaction, a hole) beginning and
+            // ending on transaction boundaries: a stored span keyed inside
+            // `t` ends inside it, and none below it reaches into it, except
+            // a stored hole over a late copy or over the start of a hole
+            // (merged). A producer that breaks that is a bug the debug build
+            // stops at, not a hold that shrinks.
+            let at = tail_key(epoch, t.first);
+            let end = tail_key(epoch, t.last);
+            let mut inside: Vec<(Vec<u8>, BackupTx)> = Vec::new();
+            for guard in tx.range(&self.backup_tail, at.clone()..=end) {
+                let (k, v) = guard.into_inner()?;
+                inside.push((k.to_vec(), crate::record::from_bytes_exact(&v)?));
+            }
+            let below: Option<BackupTx> = match probe_from {
+                Some(from) if from < t.first => {
+                    match tx
+                        .range(&self.backup_tail, tail_key(epoch, from)..at.clone())
+                        .next_back()
+                    {
+                        Some(guard) => {
+                            let (_, v) = guard.into_inner()?;
+                            Some(crate::record::from_bytes_exact(&v)?)
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            let reaches = below.as_ref().filter(|o| o.last >= t.first);
+            if !t.records.is_empty()
+                && (reaches.is_some_and(|o| o.records.is_empty())
+                    || inside.iter().any(|(_, o)| o.records.is_empty()))
+            {
+                // A late copy of rows a stored hole already spans.
+                debug_assert!(
+                    reaches.is_none_or(|o| o.records.is_empty() && o.last >= t.last)
+                        && inside
+                            .iter()
+                            .all(|(_, o)| o.records.is_empty() || o.last <= t.last),
+                    "a late copy {}..={} of epoch {epoch} straddles a stored span",
+                    t.first,
+                    t.last
+                );
+                continue;
+            }
+            if t.records.is_empty() {
+                if let Some(o) = reaches.filter(|o| o.records.is_empty()) {
+                    // A hole that begins inside a stored one (a resend from a
+                    // boundary inside a span its journal no longer has): one
+                    // hole over both, keyed where the stored one begins.
+                    let merged = BackupTx {
+                        first: o.first,
+                        last: o.last.max(t.last),
+                        records: Vec::new(),
+                        origin: o.origin,
+                    };
+                    debug_assert!(
+                        inside.iter().all(|(_, i)| i.last <= merged.last),
+                        "a stored span of epoch {epoch} keyed inside {}..={} ends past it",
+                        t.first,
+                        t.last
+                    );
+                    for (k, _) in inside {
+                        tx.remove(&self.backup_tail, k);
+                    }
+                    tx.insert(
+                        &self.backup_tail,
+                        tail_key(epoch, merged.first),
+                        postcard::to_allocvec(&merged)?,
+                    );
+                    top = None;
+                    continue;
+                }
+            }
+            debug_assert!(
+                reaches.is_none(),
+                "a stored span of epoch {epoch} reaches into {}..={} (hole {}): {:?}",
+                t.first,
+                t.last,
+                t.records.is_empty(),
+                reaches.map(|o| (o.first, o.last, o.records.len()))
             );
+            debug_assert!(
+                inside.iter().all(|(_, o)| o.last <= t.last),
+                "a stored span of epoch {epoch} keyed inside {}..={} ends past it",
+                t.first,
+                t.last
+            );
+            for (k, _) in inside {
+                if k != at {
+                    tx.remove(&self.backup_tail, k);
+                }
+            }
+            tx.insert(&self.backup_tail, at, postcard::to_allocvec(t)?);
+            top = None;
+        }
+        // Where the epoch's highest stored span ends (spans do not overlap,
+        // so the highest key's): one seek, after a batch that probed.
+        if top.is_none() {
+            if let Some(guard) = tx
+                .range(
+                    &self.backup_tail,
+                    tail_key(epoch, 0)..=tail_key(epoch, u64::MAX),
+                )
+                .next_back()
+            {
+                let (_, v) = guard.into_inner()?;
+                let o: BackupTx = crate::record::from_bytes_exact(&v)?;
+                top = Some((epoch, o.last));
+            }
         }
         // A holder's `repair drop-held` rolled back transactions this tail
         // holds (defect B): they are holes from here on. Only a batch that
@@ -274,12 +414,11 @@ impl Meta {
         tx.commit()?;
         // A resend can land below the floor (from the contiguous
         // acknowledgement, under a batch held ahead of a gap).
-        if let Some(lowest) = txs.iter().map(|t| t.first).min() {
-            let mut floor = self.backup_tail_floor.lock().unwrap();
-            if let Some(f) = *floor {
-                *floor = Some(f.min((epoch, lowest)));
-            }
+        let mut floor = self.backup_tail_floor.lock().unwrap();
+        if let Some(f) = *floor {
+            *floor = Some(f.min((epoch, lowest)));
         }
+        *self.backup_tail_top.lock().unwrap() = top;
         Ok(())
     }
 
@@ -418,6 +557,7 @@ impl Meta {
     /// lease moved on, or the tail has been re-shipped).
     pub fn backup_clear(&self) -> Result<(), MetaError> {
         *self.backup_tail_floor.lock().unwrap() = None;
+        *self.backup_tail_top.lock().unwrap() = None;
         let mut tx = self.db.write_tx();
         backup_clear_tx(&mut tx, self)?;
         tx.commit()?;
@@ -934,6 +1074,111 @@ mod tests {
         assert_eq!(backup.backup_acked(3).unwrap(), txs[0].last);
         backup.backup_append(3, &txs[1..2]).unwrap();
         assert_eq!(backup.backup_acked(3).unwrap(), txs[3].last);
+    }
+
+    /// ADR-59 part A (metered-shared+links seed 1479): a backup that held a
+    /// holder's transactions is sent them again from the first boundary (the
+    /// holder restarted) after two of them shipped ahead of a held one: the
+    /// resend carries them as one hole. The hole supersedes both copies, so
+    /// the hold stays contiguous through the tip, and a late copy of a row
+    /// the hole spans is not kept. (Before: the second copy, keyed inside
+    /// the hole, ended the hold at the hole, and the takeover dropped the
+    /// acknowledged rows past it.)
+    #[test]
+    fn a_resent_hole_supersedes_the_copies_it_spans() {
+        let holder = Meta::open_in_memory().unwrap();
+        holder.set_holder_epoch(3);
+        for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            create(&holder, name, i as u64 + 1);
+        }
+        let txs = holder.journal_txs_from(1, 1000).unwrap();
+        assert_eq!(txs.len(), 5);
+        let backup = Meta::open_in_memory().unwrap();
+        backup.backup_append(3, &txs).unwrap();
+        assert_eq!(backup.backup_acked(3).unwrap(), txs[4].last);
+        // The second and third ship ahead and leave the journal.
+        let rows: Vec<u64> = (txs[1].first..=txs[2].last).collect();
+        holder.ack_journal_rows_at(&rows, 7).unwrap();
+        let resent = holder.journal_txs_from(1, 1000).unwrap();
+        assert_eq!(resent.len(), 4);
+        assert!(resent[1].records.is_empty());
+        assert_eq!(
+            (resent[1].first, resent[1].last),
+            (txs[1].first, txs[2].last)
+        );
+        backup.backup_append(3, &resent).unwrap();
+        assert_eq!(backup.backup_acked(3).unwrap(), txs[4].last);
+        assert_eq!(backup.backup_tail(3).unwrap(), resent);
+        // A late copy of either spanned transaction changes nothing.
+        backup.backup_append(3, &txs[2..3]).unwrap();
+        backup.backup_append(3, &txs[1..2]).unwrap();
+        assert_eq!(backup.backup_tail(3).unwrap(), resent);
+        assert_eq!(backup.backup_acked(3).unwrap(), txs[4].last);
+    }
+
+    /// Review 3 (N4): the shape main reaches. The backup already trimmed the
+    /// two shipped-ahead transactions into two holes of their own, and the
+    /// resend carries them as one: the merged hole supersedes both, and the
+    /// hold stays contiguous through the tip.
+    #[test]
+    fn a_resent_hole_supersedes_the_trim_holes_it_spans() {
+        let holder = Meta::open_in_memory().unwrap();
+        holder.set_holder_epoch(3);
+        for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            create(&holder, name, i as u64 + 1);
+        }
+        let txs = holder.journal_txs_from(1, 1000).unwrap();
+        let backup = Meta::open_in_memory().unwrap();
+        backup.backup_append(3, &txs).unwrap();
+        // The segment shipping the second and third ahead lands here.
+        backup
+            .backup_trim(3, 0, &[txs[1].last, txs[2].last])
+            .unwrap();
+        let tail = backup.backup_tail(3).unwrap();
+        assert!(tail[1].records.is_empty() && tail[2].records.is_empty());
+        assert_eq!(backup.backup_acked(3).unwrap(), txs[4].last);
+        let rows: Vec<u64> = (txs[1].first..=txs[2].last).collect();
+        holder.ack_journal_rows_at(&rows, 7).unwrap();
+        let resent = holder.journal_txs_from(1, 1000).unwrap();
+        assert_eq!(resent.len(), 4);
+        backup.backup_append(3, &resent).unwrap();
+        assert_eq!(backup.backup_tail(3).unwrap(), resent);
+        assert_eq!(backup.backup_acked(3).unwrap(), txs[4].last);
+    }
+
+    /// Review 3 (S3): a hole that begins inside a stored one (a resend from a
+    /// boundary inside a span the journal no longer has, metered-shared+links
+    /// seeds 199 and 229 in a debug build) merges with it, and the hold stays
+    /// contiguous past both. Before, it was keyed inside the stored hole and
+    /// the hold ended at the stored hole's end.
+    #[test]
+    fn a_hole_that_begins_inside_a_stored_hole_merges_with_it() {
+        let holder = Meta::open_in_memory().unwrap();
+        holder.set_holder_epoch(3);
+        create(&holder, "a", 1);
+        let real = holder.journal_txs_from(1, 1000).unwrap().remove(0);
+        let (a, z) = (real.last + 1, real.last + 4);
+        let hole = |first, last| BackupTx {
+            first,
+            last,
+            records: Vec::new(),
+            origin: (0, 0),
+        };
+        let mut next = real.clone();
+        next.first = z + 3;
+        next.last = z + 3;
+        let backup = Meta::open_in_memory().unwrap();
+        backup
+            .backup_append(3, &[real.clone(), hole(a, z)])
+            .unwrap();
+        backup
+            .backup_append(3, &[hole(a + 2, z + 2), next.clone()])
+            .unwrap();
+        assert_eq!(
+            backup.backup_tail(3).unwrap(),
+            vec![real, hole(a, z + 2), next.clone()]
+        );
+        assert_eq!(backup.backup_acked(3).unwrap(), next.last);
     }
 
     /// Round 2: rows the journal no longer has stream as holes, and a
