@@ -791,6 +791,19 @@ pub struct Meta {
     /// committed ([`Meta::flush_held_releases`]).
     pub(crate) staged_releases:
         std::sync::Mutex<Vec<(std::thread::ThreadId, member::StagedRelease)>>,
+    /// Holds a transaction indexed in memory before its commit, per thread,
+    /// until it committed ([`Meta::hold_row_tx`], [`Meta::flush_held_releases`]):
+    /// one whose key is not in the committed set then (the transaction was
+    /// dropped) leaves the index.
+    pub(crate) staged_holds: std::sync::Mutex<Vec<(std::thread::ThreadId, u64, u64)>>,
+    /// Bumped whenever a hold is indexed: a read that waited and read
+    /// compares it ([`Meta::hold_raced`]).
+    pub(crate) hold_epoch: AtomicU64,
+    /// Tests only: where the age (ms, the node's wait clock) of each hold at
+    /// its release is noted ([`Meta::set_hold_lifetime_sink`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) hold_lifetime_sink:
+        std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>>,
     /// Plan 45: `0x01` point reads made on behalf of a dentry — the read a
     /// hard-linked name's `Remote` entry costs, where a single-name entry
     /// answers from its copy ([`Meta::inode_reads`]).
@@ -1353,6 +1366,10 @@ impl Meta {
             rolled_back: std::sync::Mutex::new(Vec::new()),
             staged_unvoids: std::sync::Mutex::new(Vec::new()),
             staged_releases: std::sync::Mutex::new(Vec::new()),
+            staged_holds: std::sync::Mutex::new(Vec::new()),
+            hold_epoch: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            hold_lifetime_sink: std::sync::Mutex::new(None),
             inode_reads: AtomicU64::new(0),
             local_rows_read: AtomicU64::new(0),
             dirty_probes: AtomicU64::new(0),

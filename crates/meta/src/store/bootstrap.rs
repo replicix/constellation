@@ -476,6 +476,17 @@ impl Meta {
                         )?;
                     }
                 }
+                // A generation the rebuilt log ended: its rows are final
+                // (ADR-57), whatever the reset held for them above.
+                if prefix == DELEG_VOID_CUT_PREFIX {
+                    if let Some(gen) = std::str::from_utf8(&k)
+                        .ok()
+                        .and_then(|k| k.strip_prefix(DELEG_VOID_CUT_PREFIX))
+                        .and_then(|g| g.parse::<u64>().ok())
+                    {
+                        self.release_ended_gen_tx(&mut tx, gen)?;
+                    }
+                }
             }
         }
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {

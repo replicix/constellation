@@ -4536,6 +4536,7 @@ longer be final); a new dominance threshold for far writers (the window already
 smooths a burst); judging a link by its last sample (load inflates it).
 
 **May revert**: yes, by `CONSTELLATION_DELEGATION_STICKY_PLACEMENT=off`.
+
 ## ADR-57: A node never answers a read from a state that lacks an acknowledged row it rolled back
 
 **Status**: decided by the maintainer (a read of a held key fails with `EIO` after
@@ -4561,14 +4562,29 @@ deposition).
 them and their clients were told they are committed are recorded in the store
 (`read_hold:{slot}:{first}`), in the transaction that takes them out, and leave
 in the transaction that puts them back or makes them final: the drop rules of
-the member copy, the generation's log index reaching the row, the generation's
-end, the tail re-apply of a takeover gate, an operator's abandon. Every local
+the member copy, the generation's log index reaching the row, the log carrying the row's rid
+under any identity (a delegate row this root appended that the delegate
+re-executed under another), the generation's end (in the transaction that
+applies the end, an orphan end, or a rebuild whose log ended it; a row of an
+ended generation is not held), the tail re-apply of a takeover gate, an
+operator's abandon. Every local
 read checks the set at the session wait, whatever the session budget or the
 read's mode; a read that touches it waits, up to `read_hold_span` (ADR-48:
 the client deadline, the takeover window and a forward round), then fails with
 `EIO`. No read is forwarded and none is answered stale. No read grant is made
 over a held key. A recall drops only rows nobody was told were committed, so it
 takes no hold (the sim asserts it: `recall_dropped_acked`).
+
+The hold is indexed in memory before the strand commits, so that no reader
+meets the rolled-back namespace without it; a dropped transaction's hold is
+taken out at the thread's next flush or, at the latest, before a read is
+refused (`Meta::reconcile_read_holds`). A read re-checks the hold epoch after
+it read (`Meta::hold_raced`) and waits and reads again when a hold on its keys
+came in between (lookup, getattr, open, readlink, xattrs, the readdirplus
+entries; a listing page already begun is not re-read). A read waiting for a
+held row ends with `EINTR` when its caller is interrupted. A lock grant waits
+for its floor only (`session_wait_floor`): every read under the grant checks
+the holds itself.
 
 **Consequences**: read-your-writes and close-to-open hold across a deposition,
 a rebuild and a restart. Reads of held keys pay the re-ship latency; others pay
@@ -4577,6 +4593,13 @@ held keys instead of serving them stale (`status.ack.read_holds_refused`). A
 hold that is never released is a bug the sim's quiescence check finds
 (`read_holds_gone`), not a degraded read. A node's own acknowledged write binds
 its reads in every incarnation of the node (the sim's check).
+
+*Not covered*: a `read` or `copy_file_range` on a file handle opened before a
+deposition does not consult the holds (a read runs on an io_uring ring thread,
+which must not wait): close-to-open holds (the open is the check), but
+read-your-writes through an fd that stays open across a deposition does not,
+for a rolled-back write manifest. Records without keys (`Snap*`, `SetQuota`)
+are read through synthetic paths and `statfs`, which do not wait.
 
 **Rejected**: serving stale at the bound (the old cap); forwarding the read to
 the root (no data-carrying read RPC exists, and the root lacks a delegate's row

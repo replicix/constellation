@@ -291,6 +291,242 @@ fn a_hold_survives_a_restart() {
     );
 }
 
+/// A deposed root's append of a delegate's row `a` (gen 5, idx 1, rid 2), held.
+fn deposed_with_a_delegate_row(meta: &Meta) {
+    meta.set_holder_epoch(1);
+    meta.apply_delegate_tx(
+        &[create("a", ino(2), 11), completed(rid(2))],
+        Some(rid(2)),
+        5,
+        1,
+        Position::ZERO,
+    )
+    .unwrap();
+    let stranded = meta.strand_deposed(2).unwrap();
+    assert_eq!(stranded.deleg_member_copied, 1);
+}
+
+/// ADR-57 review MUST-1: the segment that ends a generation releases the
+/// holds of its rows in its own transaction. Without `deleg_backup_clear`
+/// (which runs after the commit, best effort: a crash or an error between
+/// left the holds for good) the hold is gone, and stays gone across a
+/// restart.
+#[test]
+fn the_segment_that_ends_a_generation_releases_its_holds_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m.db");
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    {
+        let meta = Meta::open(&db).unwrap();
+        deposed_with_a_delegate_row(&meta);
+        assert!(meta.member_copy_touches(&a));
+        // The end, cut below the held row: it never returns.
+        apply_rows(
+            &meta,
+            1,
+            2,
+            1,
+            &[1],
+            &[LogRecord::DelegateNodeEnded {
+                node: 2,
+                gen: 5,
+                through: 0,
+            }],
+        );
+        assert!(
+            !meta.member_copy_touches(&a),
+            "released with the end, not by a later best-effort clear"
+        );
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&db).unwrap();
+    assert!(!meta.member_copy_touches(&a), "and persisted so");
+    assert!(meta.read_holds().is_empty());
+}
+
+/// ADR-57 review MUST-1: a rebuild whose log ended the generation (the side
+/// replica carries the end) releases the holds its reset set on the
+/// generation's rows.
+#[test]
+fn a_rebuild_whose_log_ended_the_generation_releases_its_holds() {
+    let meta = Meta::open_in_memory().unwrap();
+    deposed_with_a_delegate_row(&meta);
+    meta.set_holder_epoch(0);
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    let side = Meta::open_in_memory().unwrap();
+    apply_rows(
+        &side,
+        1,
+        2,
+        1,
+        &[1],
+        &[LogRecord::DelegateNodeEnded {
+            node: 2,
+            gen: 5,
+            through: 0,
+        }],
+    );
+    // (The rebuild strands nothing more of it: the row left the journal.)
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(!meta.member_copy_touches(&a));
+}
+
+/// ADR-57 review MUST-1: a hold of a generation that has a persisted end
+/// (left by an older crash between the end and the release) is dropped when
+/// the holds are loaded at open, and a row of an ended generation is not
+/// held to begin with.
+#[test]
+fn a_hold_of_an_ended_generation_is_never_loaded_nor_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m.db");
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    {
+        let meta = Meta::open(&db).unwrap();
+        deposed_with_a_delegate_row(&meta);
+        assert!(meta.member_copy_touches(&a));
+        // The end landed, its release did not.
+        meta.kv_set("deleg_void_cut:5", "0").unwrap();
+        meta.close().unwrap();
+    }
+    let meta = Meta::open(&db).unwrap();
+    assert!(!meta.member_copy_touches(&a), "not loaded");
+    assert!(meta.read_holds().is_empty());
+    // A strand after the end holds nothing of it either.
+    let meta = Meta::open_in_memory().unwrap();
+    meta.kv_set("deleg_void_cut:5", "0").unwrap();
+    deposed_with_a_delegate_row(&meta);
+    assert!(!meta.member_copy_touches(&a), "not set");
+}
+
+/// ADR-57 review SHOULD-1: a delegate's row this root appended that never
+/// returns under its `(gen, idx)` (the delegate re-executed it by rid under
+/// another identity) is released when the log carries its rid.
+#[test]
+fn a_held_delegate_row_is_released_when_the_log_carries_its_rid() {
+    let meta = Meta::open_in_memory().unwrap();
+    deposed_with_a_delegate_row(&meta);
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    assert!(meta.member_copy_touches(&a));
+    // Another row of the log: still held.
+    apply_rows(
+        &meta,
+        1,
+        2,
+        1,
+        &[1],
+        &[create("b", ino(3), 12), completed(rid(3))],
+    );
+    assert!(meta.member_copy_touches(&a));
+    // The rid under another origin ((0, 0): no generation index reaches it).
+    apply_rows(
+        &meta,
+        2,
+        2,
+        2,
+        &[2],
+        &[create("a", ino(2), 11), completed(rid(2))],
+    );
+    assert!(meta.lookup(ROOT_INO, "a").unwrap().is_some());
+    assert!(!meta.member_copy_touches(&a), "released by the rid");
+}
+
+/// ADR-57 review SHOULD-3: a hold indexed in memory by a transaction that
+/// was dropped has no key behind it and no staged release; the thread's next
+/// flush, and a reconcile, take it out of the index.
+#[test]
+fn a_hold_of_a_dropped_transaction_does_not_stay() {
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    let meta = Meta::open_in_memory().unwrap();
+    meta.test_index_hold_in_dropped_tx(5, 1, "a").unwrap();
+    assert!(meta.member_copy_touches(&a), "indexed before the commit");
+    assert!(meta.reconcile_read_holds());
+    assert!(!meta.member_copy_touches(&a), "reconciled");
+    // The thread's next flush does the same.
+    meta.test_index_hold_in_dropped_tx(5, 1, "a").unwrap();
+    meta.flush_held_releases_for_tests();
+    assert!(!meta.member_copy_touches(&a), "flushed");
+    // A committed hold stays through both.
+    let meta = Meta::open_in_memory().unwrap();
+    deposed_with_a_delegate_row(&meta);
+    let a_key = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    assert!(!meta.reconcile_read_holds());
+    meta.flush_held_releases_for_tests();
+    assert!(meta.member_copy_touches(&a_key));
+}
+
+/// ADR-57 review SHOULD-4: a hold indexed after a read took the hold epoch
+/// (and passed its wait) is a race the read re-checks; one indexed before,
+/// or on other keys, is not.
+#[test]
+fn a_read_that_waited_before_a_hold_was_indexed_sees_the_race() {
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    let z = [ReadKey::Dentry(ROOT_INO, "z".into())];
+    let meta = Meta::open_in_memory().unwrap();
+    let e = meta.hold_epoch();
+    assert!(!meta.hold_raced(e, &a));
+    deposed_with_a_delegate_row(&meta);
+    assert!(meta.hold_raced(e, &a), "a hold of its keys came in");
+    assert!(!meta.hold_raced(e, &z), "other keys: no race");
+    assert!(
+        !meta.hold_raced(meta.hold_epoch(), &a),
+        "taken after: held, not raced"
+    );
+}
+
+/// ADR-57 review SHOULD-6: a lock grant's floor wait (`session_wait_floor`)
+/// does not run the hold phase: it returns at once over a held key, where
+/// the read itself waits the span out and is refused.
+#[test]
+fn a_floor_wait_does_not_wait_for_a_hold() {
+    let meta = Meta::open_in_memory().unwrap();
+    deposed_with_a_delegate_row(&meta);
+    meta.set_read_hold_span(std::time::Duration::from_millis(300));
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    let t = std::time::Instant::now();
+    let w = meta.session_wait_floor(&a, &Position::ZERO);
+    assert!(
+        !matches!(
+            w,
+            constellation_meta::SessionWait::Unserved(_)
+                | constellation_meta::SessionWait::Interrupted(_)
+        ),
+        "{w:?}"
+    );
+    assert!(t.elapsed() < std::time::Duration::from_millis(150));
+    assert!(matches!(
+        meta.session_wait_at(&a, &Position::ZERO),
+        constellation_meta::SessionWait::Unserved(_)
+    ));
+}
+
+/// ADR-57 review SHOULD-7: a read waiting for a held row ends with its
+/// caller's interrupt, long before the read hold span.
+#[test]
+fn a_held_read_ends_with_the_callers_interrupt() {
+    let meta = Meta::open_in_memory().unwrap();
+    deposed_with_a_delegate_row(&meta);
+    meta.set_read_hold_span(std::time::Duration::from_secs(60));
+    let a = [ReadKey::Dentry(ROOT_INO, "a".into())];
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let t = std::time::Instant::now();
+    let w = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        meta.session_wait_cancellable(&a, &Position::ZERO, &|| {
+            cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    });
+    assert!(
+        matches!(w, constellation_meta::SessionWait::Interrupted(_)),
+        "{w:?}"
+    );
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    assert!(meta.member_copy_touches(&a), "the hold stays");
+}
+
 /// ADR-57: a row that never leaves the member copy (a leak) does not let a
 /// read of its keys through: after the read hold span the read is refused
 /// (`Unserved`, the engine's `EIO`), never answered without the row, whatever
