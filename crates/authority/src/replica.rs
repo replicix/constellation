@@ -277,7 +277,14 @@ pub trait Replica {
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
+        sequencer: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
+    /// ADR-59 part B (D2): a segment of this node's own that carries a single
+    /// `DropHeld` and matches no journal row is the record in the log all the
+    /// same (a deposition stranded its row after the PUT): what the ack of
+    /// the row would have done is done from the record. Whether `records` was
+    /// such a segment.
+    fn own_drop_segment(&self, records: &[LogRecord]) -> Result<bool, MetaError>;
     /// The decided drop of `ino` never happened (its record is fenced).
     fn drop_held_cancel(&self, ino: Ino) -> Result<(), MetaError>;
     /// Drops decided and not applied: `(inode, journal seq of the record,
@@ -1243,8 +1250,15 @@ impl Replica for Meta {
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
+        sequencer: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError> {
-        Meta::drop_held_apply(self, ino, now_unix, unanswered, live_ops, sessions)
+        Meta::drop_held_apply(
+            self, ino, now_unix, unanswered, live_ops, sessions, sequencer,
+        )
+    }
+
+    fn own_drop_segment(&self, records: &[LogRecord]) -> Result<bool, MetaError> {
+        Meta::own_drop_segment(self, records)
     }
 
     fn drop_held_cancel(&self, ino: Ino) -> Result<(), MetaError> {

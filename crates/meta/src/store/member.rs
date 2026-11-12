@@ -1942,6 +1942,34 @@ pub(crate) fn hole_rolled_back_tx(
 }
 
 impl Meta {
+    /// [`Self::member_cover_shipped_tx`] for rows of this node's own tenure
+    /// `epoch` whose journal rows are gone (a deposition stranded them after
+    /// their segment's PUT; the reader met the segment): they cover the copy
+    /// rows of the epoch at their seqs.
+    pub(crate) fn member_cover_own_rows_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        epoch: u64,
+        rows: &[u64],
+    ) -> Result<(), MetaError> {
+        if !self.has_member_copies() || rows.is_empty() {
+            return Ok(());
+        }
+        member_rules_tx(
+            tx,
+            self,
+            &Facts {
+                epoch,
+                through: 0,
+                rows,
+                records: &[],
+                first_of_epoch: false,
+                own: true,
+            },
+        )
+        .map(|_| ())
+    }
+
     /// The member copies' coverage for this node's own rows that shipped
     /// (`journal_seqs`, a segment of its own tenure, matched against the
     /// journal): a row carrying a `TailOf` retires the copy row it names, and

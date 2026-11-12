@@ -1259,8 +1259,19 @@ impl Core {
             self.root_config_version(),
             constellation_meta::GroupOn::Archive,
         ));
-        let applied =
-            replica.drop_held_apply(ino, now.wall.0 / 1000, &unanswered, &live_ops, &sessions);
+        // Without the lease (a deposed dropper, or one restarted after its
+        // record shipped) the effect follows the log on this replica and
+        // journals nothing: no `Refused` row could ship, the successor's gate
+        // answers the rids from the record (`tail_retired`).
+        let sequencer = self.lease.held.is_some() && !self.lease.lost;
+        let applied = replica.drop_held_apply(
+            ino,
+            now.wall.0 / 1000,
+            &unanswered,
+            &live_ops,
+            &sessions,
+            sequencer,
+        );
         match applied {
             Ok(dropped) => {
                 if let Some(jseq) = dropped.pending {
@@ -1279,6 +1290,9 @@ impl Core {
                     return;
                 }
                 self.stats.drops_applied += 1;
+                if dropped.deposed {
+                    self.stats.drops_applied_deposed += 1;
+                }
                 self.stats.drop_follow_ups += dropped.follow_ups as u64;
                 self.stats.drop_apply_leftovers += dropped.leftovers as u64;
                 // D3: no client waits for a retry to learn the refusal: every
@@ -1868,7 +1882,10 @@ impl Core {
                     }
                 }
                 ParkedWhat::DropApply {
-                    op, ino, sessions, ..
+                    op,
+                    ino,
+                    epoch,
+                    sessions,
                 } => {
                     // The record reached the log before the lease went: the
                     // decision stands, and so does its apply.
@@ -1877,8 +1894,32 @@ impl Core {
                         self.apply_drop(now, op, ino, sessions, replica, out);
                         continue;
                     }
-                    // The lease went before the record was in the log: the
-                    // record is fenced, nothing was dropped (D2).
+                    // The record's segment is out (its PUT answers after the
+                    // lease went): it may land, and then the log carries the
+                    // decision, which a deposed dropper follows like every
+                    // replica (D2) instead of deciding the opposite locally.
+                    // The park stays; the PUT's ack, or the reader meeting the
+                    // segment, releases it, and the fence rule (the log moved
+                    // past the tenure without the record) cancels it if the
+                    // PUT never lands.
+                    if p.durable.is_some_and(|j| self.ship_in_flight_has(j)) {
+                        self.rd.parked.insert(
+                            id,
+                            Parked {
+                                what: ParkedWhat::DropApply {
+                                    op,
+                                    ino,
+                                    epoch,
+                                    sessions,
+                                },
+                                ..p
+                            },
+                        );
+                        n -= 1;
+                        continue;
+                    }
+                    // The lease went before the record left: it is fenced,
+                    // nothing was dropped (D2).
                     self.cancel_drop(op, ino, replica, out);
                 }
                 ParkedWhat::Finish { rid, class, .. } => {
