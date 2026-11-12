@@ -79382,4 +79382,42 @@ mod root_own_sticky {
             "the op did not run after the release: {all:?}"
         );
     }
+
+    /// An unmount's release of the root's own grant (`StickyRelease`, waiting)
+    /// is done when the release row is appended, before the segment that
+    /// carries it ships (the flush that follows ships it): the unmount must not
+    /// wait for what only the flush after it does.
+    #[test]
+    fn the_roots_own_unmount_release_is_done_before_its_row_ships() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        archive_and_step(&mut h);
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::StickyRelease {
+                dirs: Vec::new(),
+                wait: true,
+            },
+        });
+        let mut all = out;
+        for _ in 0..6 {
+            h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+            if let Some(id) = h.core.dl.stream_timer {
+                all.extend(h.step(Event::Timer { id }));
+            }
+            all.extend(h.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            }));
+        }
+        let done = all.iter().find_map(|a| match a {
+            Action::ControlDone { op, result } if *op == OpId(700) => Some(result.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(done, Some(Ok(_))),
+            "the release did not complete before its row shipped: {done:?}"
+        );
+        assert!(h.meta.delegation_table().get(dirs[0]).is_none());
+    }
 }

@@ -9123,12 +9123,52 @@ impl Core {
         {
             return RecallPlan::Gated;
         }
+        // ADR-55 (R-I4): the root's own sticky stream is neither executed
+        // under by the root's own path nor refused by it.
+        let me = self.me();
+        if !cross {
+            if let Some((gen, _)) = involved.first() {
+                if self
+                    .dl
+                    .gens
+                    .get(gen)
+                    .is_some_and(|s| !s.ended && s.node == me && s.non_stealable())
+                {
+                    if self.cfg.root_executes_under_own_grant {
+                        return RecallPlan::None;
+                    }
+                    self.stats.root_own_holds += 1;
+                    return RecallPlan::Hold(*gen);
+                }
+            }
+        }
+        // ADR-55 (Q3): an op across the boundary of the root's own sticky
+        // subtree releases it, as the holder (the root's own decision, never a
+        // recall), and waits for the release row, instead of `EXDEV`. Other
+        // nodes' non-stealable boundaries stay `EXDEV`.
+        let is_own = |core: &Self, g: &u64| {
+            core.dl
+                .gens
+                .get(g)
+                .is_some_and(|s| !s.ended && s.node == me && s.kind() == DelegKind::Sticky)
+        };
         let non_stealable = involved.iter().any(|(g, _)| {
             self.dl
                 .gens
                 .get(g)
-                .is_some_and(|s| !s.ended && s.non_stealable())
+                .is_some_and(|s| !s.ended && s.non_stealable() && !is_own(self, g))
         });
+        let mut own_waiting = BTreeSet::new();
+        if !non_stealable && cross && !self.cfg.root_executes_under_own_grant {
+            for (gen, dirs) in &involved {
+                if is_own(self, gen) {
+                    self.stats.root_own_released_for_cross += 1;
+                    let asked: BTreeSet<Ino> = dirs.keys().copied().collect();
+                    self.own_sticky_release(now, *gen, asked, replica, out);
+                    own_waiting.insert(wait_id(*gen));
+                }
+            }
+        }
         if non_stealable {
             // Plans 03–05: only the designee writes under its path
             // (`EROFS` for anyone else once the designee is unreachable),
@@ -9145,9 +9185,9 @@ impl Core {
                 Code::ReadOnly
             });
         }
-        let mut waiting = BTreeSet::new();
+        let mut waiting = own_waiting;
         for (gen, dirs) in involved {
-            if self.dl.gens.get(&gen).is_some_and(|g| g.ended) {
+            if self.dl.gens.get(&gen).is_some_and(|g| g.ended) || is_own(self, &gen) {
                 continue;
             }
             if cross {
@@ -12948,7 +12988,12 @@ impl Core {
         // Released (by this command's row, or a recall's): done once the
         // root has appended the row (the note is not pending any more).
         if still.is_empty() {
-            return d.release.is_none();
+            // ADR-55: the root's own stream is released when its row is appended
+            // (inline); the state stays until the row has shipped (it
+            // ships in the segment that follows, a flush at an unmount), so the
+            // command does not wait for it. A delegate's is done once the
+            // root has the row (the release note is not pending any more).
+            return d.release.is_none() || self.dl.own_minted.contains(&gen);
         }
         // The ops of the subtrees that are in flight here: parked for their
         // dependencies or a read recall, not the ones this release holds.
