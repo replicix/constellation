@@ -80124,6 +80124,36 @@ mod root_own_sticky {
         );
     }
 
+    /// A grant whose record row was not reported (`record == u64::MAX`) is
+    /// not parked for good: the bound counts from the grant, and the root
+    /// releases it. Fails before: the stream stayed parked, since the
+    /// unknown record is never covered.
+    #[test]
+    fn an_own_grant_with_no_known_record_is_released_after_the_bound() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        h.core
+            .dl
+            .own_grants
+            .get_mut(&d.gen)
+            .expect("own grant")
+            .record = u64::MAX;
+        assert_eq!(h.core.stats.root_own_released_unhonoured, 0);
+        let bound = h.core.dl_t().own_first_op_wait;
+        h.advance(bound / 2);
+        h.hold(1, None);
+        activity(&mut h);
+        assert_eq!(
+            h.core.stats.root_own_released_unhonoured, 0,
+            "released early"
+        );
+        h.advance(bound);
+        h.hold(1, None);
+        activity(&mut h);
+        assert_eq!(h.core.stats.root_own_released_unhonoured, 1);
+    }
+
     /// T3 (M5, R-J): the drain refuses an inbox op under the root's own
     /// stream only in a stream that is honoured: while the archive lacks the
     /// grant's record nothing is journaled in it and the batch halts; once

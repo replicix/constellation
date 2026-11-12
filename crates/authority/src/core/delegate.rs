@@ -1209,7 +1209,9 @@ pub(crate) struct LeaveTell {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OwnGrant {
     /// The journal seq of the stream's last `DelegateNode` record
-    /// (`u64::MAX`: not known; the stream is never honoured on it).
+    /// (When no row was reported: the journal's tip at the grant. `u64::MAX`
+    /// is not known at all: no archive covers it, so the grant is released
+    /// after the liveness bound from `since`.)
     pub record: u64,
     /// The root rows at or below this journal seq are the ones R-H (b)
     /// looks at: `record`, or, for a stream found again after a restart
@@ -2005,7 +2007,13 @@ impl Core {
             // A record the archive carries stays committed (a lease loss
             // resets what this core counts as shipped; the log does not
             // forget).
-            if og.record == u64::MAX || !self.archive_covers(og.record, acked) {
+            if og.record == u64::MAX {
+                if now.wait.since(og.since) >= self.dl_t().own_first_op_wait as i64 {
+                    release.push(g);
+                }
+                continue;
+            }
+            if !self.archive_covers(og.record, acked) {
                 continue;
             }
             if og.covered_at.is_none() {
@@ -12305,7 +12313,7 @@ impl Core {
             )
             .map_err(|e| e.to_string())?;
         if own {
-            self.note_own_grant_row(gen);
+            self.note_own_grant_row(gen, replica);
             self.dl.own_minted.insert(gen);
         }
         let read_recalls = self
@@ -12414,11 +12422,14 @@ impl Core {
 
     /// ADR-55: remember the journal seq of the record `delegate_dir` just
     /// journaled for the root's own stream `gen`.
-    fn note_own_grant_row(&mut self, gen: u64) {
+    fn note_own_grant_row(&mut self, gen: u64, replica: &dyn Replica) {
         let record = match constellation_meta::take_last_journaled() {
             Some(row) => row.last,
-            // (No row was reported: never honoured on it.)
-            None => u64::MAX,
+            // (No row was reported: the record is at or below the journal's
+            // tip, which the archive carries only with it. Not `u64::MAX`:
+            // that is never covered, so neither the honour nor the liveness
+            // bound could end the wait.)
+            None => replica.max_journal_seq().unwrap_or(0),
         };
         let since = self
             .dl
@@ -12512,7 +12523,7 @@ impl Core {
             )
             .map_err(|e| e.to_string())?;
         if node == self.me() {
-            self.note_own_grant_row(gen);
+            self.note_own_grant_row(gen, replica);
         }
         let g = self.dl.gens.get_mut(&gen).expect("present");
         g.dirs.insert(dir, kind);
