@@ -1515,6 +1515,38 @@ fn the_claimant_applies_its_own_markers_drops_to_its_copies_and_holds() {
     assert_eq!(meta.read_holds().len(), 1);
 }
 
+/// A hole is a record-less span of rows the holder shipped ahead of a held
+/// one, streamed so the backup's hold reaches the tip. Nothing carries it (it
+/// names no `TailOf` and no segment lists it once the epoch is over), so a
+/// marker that follows the epoch retires it, whether or not the claim's
+/// `through` reaches it. Fails on the parent: it stayed for good
+/// (`member_copies_drained`).
+#[test]
+fn a_hole_is_retired_once_a_claim_follows_its_epoch() {
+    let meta = Meta::open_in_memory().unwrap();
+    put(
+        &meta,
+        &[
+            mtx(1, 1, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(2, 3, RowCommit::LONE, Vec::new()),
+        ],
+    );
+    let marker = vec![LogRecord::TailFollowsThrough {
+        prev_epoch: 1,
+        through: 3,
+    }];
+    let applied = meta
+        .apply_segment_rows(1, 2, 0, &[], &[], &marker, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.member.dropped, 1);
+    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.tx.first).collect::<Vec<_>>(),
+        [1],
+        "the row a claim carries stays until it is carried; the hole goes"
+    );
+}
+
 /// A marker of a later epoch that announces no tail of this epoch drops the
 /// rows nobody was told were committed; a group-committed row stays until
 /// coverage (it may be another tenure's inherited tail).
