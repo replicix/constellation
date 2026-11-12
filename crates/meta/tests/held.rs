@@ -1220,10 +1220,11 @@ fn drop_held_names_the_rolled_back_rows_that_depend_on_the_damaged_inode() {
         );
     }
     assert_eq!(dropped.redone, 4, "{dropped:?}");
-    assert!(!dropped.non_sequencer && !dropped.strand_all);
-    // The all-rolled-back form: a dropper that is not the sequencer.
+    assert!(!dropped.strand_all);
+    // A dropper that is not the sequencer in force decides nothing (part B,
+    // D1): refused before anything changes.
     let (meta, broken) = build();
-    let decided = meta
+    let err = meta
         .drop_held_knowing_now(
             broken,
             1,
@@ -1233,20 +1234,10 @@ fn drop_held_names_the_rolled_back_rows_that_depend_on_the_damaged_inode() {
             &Default::default(),
             false,
         )
-        .unwrap();
-    let mut on_inode = decided.rolled_back_on_inode.clone();
-    on_inode.sort();
-    for seq in [5, 6, 7, 8] {
-        assert!(decided.rolled_back.contains(&rid_of(1, seq)), "{decided:?}");
-    }
-    assert!(decided.non_sequencer && decided.strand_all);
-    assert!(on_inode.contains(&rid_of(1, 5)), "{decided:?}");
-    assert!(on_inode.contains(&rid_of(1, 6)), "{decided:?}");
-    assert!(on_inode.contains(&rid_of(1, 8)), "{decided:?}");
-    assert!(
-        !on_inode.contains(&rid_of(1, 7)),
-        "the directory's utimes depends on the seed through a merge only: {decided:?}"
-    );
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not the sequencer in force"), "{err}");
+    assert!(meta.pending_replays().unwrap().is_empty());
     // The control: nothing but the seed is attributed to the inode.
     let (meta, broken) = build();
     meta.set_parent_taint_conservative(true);
@@ -1583,16 +1574,16 @@ fn an_op_the_drop_rolled_back_does_not_keep_its_chunk() {
     assert_eq!(dropped.pending_removed, 1);
 }
 
-/// The exclusion of the ops the drop rolled back holds only while the node
-/// stays the sequencer. A deposed dropper's refusals are fenced, and the
-/// op's retry by rid reaches a successor with no outcome of it: the op keeps
-/// its chunk held like any other (`exclude_rolled_back: false`).
+/// An op the drop rolled back is not in flight any more: it does not keep
+/// its chunk held (the dropper is the sequencer in force; a node without the
+/// lease drops nothing).
 #[test]
-fn an_op_the_drop_rolled_back_keeps_its_chunk_when_the_refusal_will_not_ship() {
+fn an_op_the_drop_rolled_back_does_not_keep_its_chunk_held() {
     use constellation_meta::RowCommit;
     #[allow(non_upper_case_globals)]
     const Lone: RowCommit = RowCommit::LONE;
-    for (exclude, kept) in [(true, false), (false, true)] {
+    let (exclude, kept) = (true, false);
+    {
         let meta = Meta::open_in_memory().unwrap();
         meta.set_node_prefix(1).unwrap();
         meta.set_holder_epoch(1);

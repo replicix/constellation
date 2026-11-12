@@ -57,8 +57,6 @@ pub struct DropCounts {
     pub acked_lost: u64,
     /// ADR-59 part B: follow-up decisions (expected 0).
     pub follow_ups: u64,
-    /// Drops by a node that was not the sequencer in force.
-    pub non_sequencer: u64,
 }
 
 #[derive(Default)]
@@ -98,9 +96,6 @@ pub struct ChunkWorld {
     pub dropped_head: Mutex<BTreeMap<constellation_meta::Rid, u64>>,
     /// ADR-59, over the run's operator drops.
     pub drop_counts: Mutex<DropCounts>,
-    /// The rids of the drops whose dropper was not the sequencer in force
-    /// (`DroppedHeld::non_sequencer`): a deposition's strand, not a drop's.
-    pub dropped_by_non_sequencer: Mutex<BTreeSet<constellation_meta::Rid>>,
     /// The rids the drops reported as acknowledged and lost (`acked_lost`):
     /// the double fault of a lost chunk plus an acknowledged operation that
     /// needs it (`drop_acked_loss_invisible`).

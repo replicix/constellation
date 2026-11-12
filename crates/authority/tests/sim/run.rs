@@ -5010,19 +5010,11 @@ fn record_applied_drops(
                 c.redone += d.redone as u64;
                 c.acked_lost += d.acked_lost.len() as u64;
                 c.follow_ups += d.follow_ups as u64;
-                c.non_sequencer += d.non_sequencer as u64;
                 world
                     .acked_lost_rids
                     .lock()
                     .unwrap()
                     .extend(d.acked_lost.iter().map(|(rid, _)| *rid));
-                if d.non_sequencer {
-                    world
-                        .dropped_by_non_sequencer
-                        .lock()
-                        .unwrap()
-                        .extend(d.rolled_back.iter().copied());
-                }
             }
             // (What lands past the log's head from now on is the
             // drop's replay; the oracles' I4 relies on it.)
@@ -6756,13 +6748,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // (`drop_rolled_back_independent_acked` otherwise): none of the sim's
     // namespace ops carries content, and what depended on the seed only
     // through a directory's merged attributes is no longer ordered after it.
-    // The one other excuse: a dropper that was not the sequencer in force
-    // strands what depended on a seed as a deposition does (the successor
-    // re-ships it from the members' copies, ADR-51), so an acknowledged rid
-    // it rolled back is excused if, and only if, its effect survives in the
-    // log ([`survivors_of_drop`]); the dropper alone is no excuse.
     {
-        let by_non_sequencer = world.dropped_by_non_sequencer.lock().unwrap().clone();
         let dropped_set = world.dropped_rids.lock().unwrap().clone();
         let survivors = super::oracle::survivors_of_drop(&oracle, &dropped_set);
         let acked_ns: BTreeSet<Rid> = events
@@ -6796,8 +6782,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             dropped: &dropped_set,
             acked_ns: &acked_ns,
             acked: &acked,
-            by_non_sequencer: &by_non_sequencer,
-            survivors: &survivors,
             completed: &|rid| oracle.completed_at.contains_key(rid),
             lost: &lost,
         }) {

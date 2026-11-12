@@ -411,8 +411,8 @@ pub struct DroppedHeld {
     /// drain runs it: the sim's late-landing check exempts it. A redone row
     /// without a rid (a placeholder-less remote row) is in `redone` only.
     pub redone_rids: Vec<crate::rid::Rid>,
-    /// ADR-59: every dependent was rolled back (the conservative control, or
-    /// a dropper that was not the sequencer in force).
+
+
     pub strand_all: bool,
     /// ADR-59: the rows the drop rolled back whose answer may have left (the
     /// I1 loss it cannot avoid: an acknowledged write of bytes that are gone,
@@ -429,9 +429,6 @@ pub struct DroppedHeld {
     /// ADR-59 part B: follow-up decisions an apply needed (a redone row did
     /// not apply as it did). Expected 0.
     pub follow_ups: usize,
-    /// The dropper was not the sequencer in force: what it rolled back is a
-    /// deposed node's strand, whose refusals are fenced.
-    pub non_sequencer: bool,
     /// The inode's unrecoverable chunks when the drop ran.
     pub missing: BTreeSet<ChunkHash>,
     /// Of `missing`, the chunks whose pending row and poison mark the drop
@@ -537,12 +534,6 @@ impl DroppedHeld {
                  as they were",
                 self.redone
             ));
-        }
-        if self.non_sequencer && !self.rolled_back.is_empty() {
-            text.push_str(
-                "; this node is not the sequencer in force, so everything that depended on the \
-                 seed was rolled back and replayed, as at a deposition",
-            );
         }
         if self.follow_ups > 0 {
             text.push_str(&format!(
@@ -1699,9 +1690,20 @@ impl Meta {
         unanswered: &dyn Fn(crate::rid::Rid) -> bool,
         live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
         sessions: &LiveSessions,
-        exclude_rolled_back: bool,
+        sequencer: bool,
     ) -> Result<DroppedHeld, MetaError> {
         let _ = now_unix;
+        // A drop is a decision of the log (ADR-59 part B, D1): only the
+        // sequencer in force can journal it. A node without the lease decides
+        // nothing and changes nothing; its held rows are what a deposition
+        // strands anyway, and the successor re-ships their copies. The seed
+        // comes back to the sequencer, where the drop is a decision.
+        if !sequencer {
+            return Err(MetaError::Invalid(format!(
+                "this node is not the sequencer in force: nothing was dropped; run `repair \
+                 drop-held {ino}` on the holder (or `--remote` there) once the takeover is through"
+            )));
+        }
         // The `DropHeld` record is answered by the log alone — nobody is
         // told of it — so it is an `Archive` row, the class the core's check
         // wants set. (A caller that holds a configuration sets its own: the
@@ -1744,13 +1746,7 @@ impl Meta {
                  `--remote`)"
             )));
         };
-        // A dropper that is not the sequencer in force (suspended past its
-        // lease, deposed meanwhile) cannot ship what it would keep: a keeper
-        // of rows acknowledged by a group has no one to re-ship them. Everything
-        // that depends on a seed is then rolled back and replayed by rid, as a
-        // deposition does.
-        let strand_all =
-            self.parent_taint_conservative.load(Ordering::Relaxed) || !exclude_rolled_back;
+        let strand_all = self.parent_taint_conservative.load(Ordering::Relaxed);
         let walked = walk_drop(
             &tx,
             self,
@@ -1763,7 +1759,6 @@ impl Meta {
             jseq: 0,
             epoch: 0,
             remote,
-            sequencer: exclude_rolled_back,
             strand_all,
             missing: missing.iter().copied().collect(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
@@ -1776,15 +1771,11 @@ impl Meta {
             redone_rids: walked.redone.iter().filter_map(|(_, rid)| *rid).collect(),
             follow_ups: 0,
         };
-        if walked.seeds.is_empty() || !exclude_rolled_back {
-            // Nothing to carry in the log: either a run after an earlier drop
-            // kept a lost chunk's rows because an op or a write session still
-            // named it (no transaction is left to roll back; the marks and
-            // pending rows of the chunks no longer named go now), or the
-            // dropper is not the sequencer in force. Such a drop journals no
-            // record and decides nothing: it is the node's own stranding, as
-            // at a deposition (its rolled-back acknowledged rows re-ship from
-            // the copies, its parked answers abort by D3).
+        if walked.seeds.is_empty() {
+            // Nothing to carry in the log: a run after an earlier drop kept a
+            // lost chunk's rows because an op or a write session still named
+            // it (no transaction is left to roll back; the marks and pending
+            // rows of the chunks no longer named go now).
             tx.insert(
                 &self.local,
                 drop_plan_key(ino),
@@ -1831,7 +1822,6 @@ impl Meta {
             redone: walked.redone.len(),
             redone_rids: plan.redone_rids.clone(),
             strand_all,
-            non_sequencer: !exclude_rolled_back,
             missing,
             unidentified: walked.unidentified,
             pending: Some(jseq),
@@ -1851,7 +1841,7 @@ impl Meta {
         unanswered: &dyn Fn(crate::rid::Rid) -> bool,
         live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
         sessions: &LiveSessions,
-        exclude_rolled_back: bool,
+        sequencer: bool,
     ) -> Result<DroppedHeld, MetaError> {
         let decided = self.drop_held_knowing(
             ino,
@@ -1860,7 +1850,7 @@ impl Meta {
             unanswered,
             live_ops,
             sessions,
-            exclude_rolled_back,
+            sequencer,
         )?;
         if decided.pending.is_none() {
             return Ok(decided);
@@ -1924,7 +1914,6 @@ impl Meta {
         };
         let plan: DropPlan = postcard::from_bytes(&raw)?;
         let missing: BTreeSet<ChunkHash> = plan.missing.iter().copied().collect();
-        let exclude_rolled_back = plan.sequencer;
         let poisoned = read_poisoned(&tx, self)?;
         let walked = walk_drop(&tx, self, ino, &missing, &poisoned, DropMode::Apply(&plan))?;
         let mut seqs: HashSet<u64> = walked
@@ -2102,13 +2091,7 @@ impl Meta {
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
         // the log. The `DropHeld` record is in the log already (this apply
         // runs when it is); its `Refused` rows follow.
-        // (A dropper that is not the sequencer in force decides nothing: its
-        // refusals would be fenced, and a `Refused` outcome here would make
-        // the takeover skip, as an outcome already here, the very copies
-        // that re-ship the rolled-back rows. Its refused queue entries settle
-        // the rid through the sequencer in force before they make their
-        // conflict copy.)
-        if !refused_rids.is_empty() && exclude_rolled_back {
+        if !refused_rids.is_empty() {
             let local = self.begin_local(&tx)?;
             let now_ms = now_unix.saturating_mul(1000);
             for rid in &refused_rids {
@@ -2139,9 +2122,7 @@ impl Meta {
             // chunk: its row and marks stay. (An op this drop rolled back
             // is not in flight any more: its row is a seed, refused above.)
             let mut live = live_ops(hash);
-            if exclude_rolled_back {
-                live.retain(|rid| !rolled_back.contains(rid));
-            }
+            live.retain(|rid| !rolled_back.contains(rid));
             if !live.is_empty() || sessions.names(hash) {
                 kept_pending.push(*hash);
                 kept_for.extend(live);
@@ -2218,7 +2199,6 @@ impl Meta {
             redone: plan.redone.len(),
             redone_rids: plan.redone_rids.clone(),
             strand_all: plan.strand_all,
-            non_sequencer: !exclude_rolled_back,
             acked_lost,
             await_retry,
             pending_removed,
@@ -2336,8 +2316,6 @@ struct DropPlan {
     jseq: u64,
     epoch: u64,
     remote: bool,
-    /// The dropper was the sequencer in force when it decided.
-    sequencer: bool,
     strand_all: bool,
     missing: Vec<ChunkHash>,
     /// `spec_seq`s of the seed transactions.

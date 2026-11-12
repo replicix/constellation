@@ -62856,67 +62856,56 @@ mod await_retry {
         assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
     }
 
-    /// Defect A, the exclusion of an op the drop rolled back: it keeps its
-    /// lost chunk held unless this node stays the sequencer (its retry then
-    /// meets the shipped refusal). On a deposed dropper the refusal is fenced
-    /// and the retry reaches a successor with no outcome of the rid: the chunk
-    /// stays held for the op.
+    /// Defect A, the exclusion of an op the drop rolled back: an op the drop
+    /// rolled back is not in flight any more, so it keeps no lost chunk held
+    /// (the dropper is the sequencer in force: its retry meets the shipped
+    /// refusal; a node without the lease drops nothing).
     #[test]
-    fn an_op_the_drop_rolled_back_on_a_deposed_dropper_keeps_its_chunk_held() {
-        for deposed in [false, true] {
-            // A backed holder: an own manifest op executes and its answer
-            // waits for the group, so the client entry stays in flight.
-            let (mut h, _broken) = backed_holder_with_a_seed(0);
-            let file = h.meta.create(ROOT_INO, "late", 0o644, 0, 0).unwrap().ino;
-            let lost = ChunkHash::of(b"another lost chunk");
-            let manifest = Manifest {
-                layout: ChunkLayout::new(4096),
-                file_len: 19,
-                chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
-            }
-            .encode();
-            h.meta.add_pending_upload(&lost, file).unwrap();
-            h.meta
-                .note_unrecoverable_chunks(&[(lost, file)], false)
-                .unwrap();
-            let rid = h.rid(5);
-            let out = h.step(Event::Submit {
-                policy: Policy::Client,
-                rid,
-                op: MutateOp::SetManifest {
-                    ino: file,
-                    base_manifest: None,
-                    manifest,
-                    size: 19,
-                    mtime_ns: None,
-                    ctime_ns: None,
-                },
-                tag: Default::default(),
-            });
-            assert!(replies(&out).is_empty(), "answer parked for the group");
-            assert!(h.core.clients().any(|(r, _)| r == rid), "in flight");
-            if deposed {
-                h.core.lease.held = None;
-                h.core.lease.cached_holder = Some(2);
-            }
-            let out = drop_held_via_core(&mut h, file);
-            let dropped = out
-                .iter()
-                .find_map(|a| match a {
-                    Action::ControlDone {
-                        result: Ok(ControlOk::DroppedHeld(d)),
-                        ..
-                    } => Some(d.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("{out:?}"));
-            assert!(dropped.rolled_back.contains(&rid), "{dropped:?}");
-            assert_eq!(
-                !dropped.kept_pending.is_empty(),
-                deposed,
-                "deposed {deposed}: {dropped:?}"
-            );
+    fn an_op_the_drop_rolled_back_does_not_keep_its_chunk_held() {
+        // A backed holder: an own manifest op executes and its answer
+        // waits for the group, so the client entry stays in flight.
+        let (mut h, _broken) = backed_holder_with_a_seed(0);
+        let file = h.meta.create(ROOT_INO, "late", 0o644, 0, 0).unwrap().ino;
+        let lost = ChunkHash::of(b"another lost chunk");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
         }
+        .encode();
+        h.meta.add_pending_upload(&lost, file).unwrap();
+        h.meta
+            .note_unrecoverable_chunks(&[(lost, file)], false)
+            .unwrap();
+        let rid = h.rid(5);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::SetManifest {
+                ino: file,
+                base_manifest: None,
+                manifest,
+                size: 19,
+                mtime_ns: None,
+                ctime_ns: None,
+            },
+            tag: Default::default(),
+        });
+        assert!(replies(&out).is_empty(), "answer parked for the group");
+        assert!(h.core.clients().any(|(r, _)| r == rid), "in flight");
+        let out = drop_held_via_core(&mut h, file);
+        let dropped = out
+            .iter()
+            .find_map(|a| match a {
+                Action::ControlDone {
+                    result: Ok(ControlOk::DroppedHeld(d)),
+                    ..
+                } => Some(d.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{out:?}"));
+        assert!(dropped.rolled_back.contains(&rid), "{dropped:?}");
+        assert!(dropped.kept_pending.is_empty(), "{dropped:?}");
     }
 
     /// A manifest op of this node that has not executed yet (forwarded to
@@ -62958,6 +62947,10 @@ mod await_retry {
             panic!("{out:?}")
         };
         let req = *req;
+        // (The operator's drop runs where the lease is held: the op stays
+        // forwarded, as a handoff pause leaves one.)
+        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        assert!(h.core.lease.epoch_held());
         (h, file, lost, rid, manifest, req)
     }
 
@@ -63493,6 +63486,57 @@ mod await_retry {
         h.advance(250);
         let out = drain(&mut h);
         assert!(copy_started(&out), "{out:?}");
+    }
+
+    /// ADR-59 part B (D1), fail-before 359/1526/1664: a drop on a node that is
+    /// not the sequencer in force decides nothing and changes nothing. Before,
+    /// it stranded and refused the queue entries of the seed, and their
+    /// settles journaled `Refused` rows through the sequencer in force that
+    /// raced the successor's re-ship of the same rows from the copies.
+    #[test]
+    fn a_drop_on_a_node_that_is_not_the_sequencer_in_force_is_refused_and_changes_nothing() {
+        let (mut h, broken) = holder_with_a_seed();
+        h.core.lease.held = None;
+        h.core.lease.cached_holder = Some(2);
+        let journal_before = h.meta.journal_txs_from(0, usize::MAX).unwrap().len();
+        let uploads_before = h.meta.pending_uploads().unwrap();
+        assert!(!uploads_before.is_empty());
+        let out = drop_held_decide_via_core(&mut h, broken);
+        let refused = out.iter().find_map(|a| match a {
+            Action::ControlDone { result: Err(e), .. } => Some(e.clone()),
+            _ => None,
+        });
+        let refused = refused.unwrap_or_else(|| panic!("the drop was not refused: {out:?}"));
+        assert!(
+            refused.contains("not the sequencer in force") && refused.contains("nothing was dropped"),
+            "{refused}"
+        );
+        assert_eq!(
+            h.meta.journal_txs_from(0, usize::MAX).unwrap().len(),
+            journal_before,
+            "nothing journaled"
+        );
+        assert!(h.meta.pending_replays().unwrap().is_empty(), "no queue entry");
+        assert_eq!(h.meta.pending_uploads().unwrap(), uploads_before);
+        assert!(h.meta.take_applied_drops().is_empty());
+        assert_eq!(h.core.stats.drops_decided, 0);
+        assert_eq!(h.core.parked_durable_count(), 0);
+        // The same at the store: refused before any mark or plan is written.
+        let err = h
+            .meta
+            .drop_held_knowing_now(
+                broken,
+                1,
+                true,
+                &|_| false,
+                &|_| Vec::new(),
+                &Default::default(),
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not the sequencer in force"), "{err}");
+        assert_eq!(h.meta.pending_uploads().unwrap(), uploads_before);
     }
 
     /// A dropping node that holds a continuation epoch (a hold owner, which
