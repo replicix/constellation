@@ -69025,6 +69025,69 @@ mod step9_one_stream_per_node {
         assert_eq!(h.core.stats.delegate_refused_unshipped, 1);
     }
 
+    /// A refusal is a root row too: its `Refused` row names no key, the
+    /// keys of its op are the ones it observed (`JournalTx::observed`), and
+    /// the ship plan holds it back with what it observed. A refusal of an op
+    /// in `d1` deferred behind an upload elsewhere keeps `d1` from another
+    /// node: the grant's record would ship ahead of it, and a settle of the
+    /// rid routed to the delegate would be refused for good while this
+    /// journal holds the refusal (far-root-writes+lost-chunk seed 557, I1:
+    /// the delegate's ABANDONED, the root's ENOENT). Fails without the
+    /// observed keys in `Meta::journal_root_rows_through`: `d1` is granted.
+    #[test]
+    fn a_subtree_with_an_unshipped_refusal_of_it_is_not_granted_to_another_node() {
+        use constellation_fs_core::{ChunkInfo, Manifest};
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
+        let (mut h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec]).unwrap();
+        // `d2/g`'s manifest names a chunk still uploading: its row is
+        // deferred, and so is a refusal that observed `g`.
+        let g = h.meta.create(d2, "g", 0o644, 0, 0).unwrap().ino;
+        let hash = ChunkHash::of(b"still uploading");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 15,
+            chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
+        }
+        .encode();
+        h.meta
+            .set_manifest_dirty(g, None, &manifest, 15, None, None, &[hash])
+            .unwrap();
+        // A link of `g` as `d1/h`, refused here: the refusal observed
+        // `d1/h` and `g`.
+        let refused = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 77,
+        };
+        h.meta
+            .journal_refusal(
+                refused,
+                Code::Exists,
+                Some(&MutateOp::Link {
+                    ino: g,
+                    parent: d1,
+                    name: "h".into(),
+                }),
+            )
+            .unwrap();
+        assert!(
+            !delegate(&mut h, 900, d1, 3),
+            "granted over a deferred refusal of an op in it"
+        );
+        assert_eq!(h.core.stats.delegate_refused_unshipped, 1);
+        assert!(h.meta.delegation_table().get(d1).is_none());
+        // The upload is done: the refusal ships as it is, and `d1` is
+        // granted.
+        h.meta.cancel_pending_upload(&hash, g).unwrap();
+        assert!(
+            delegate(&mut h, 901, d1, 3),
+            "refused once nothing held it back"
+        );
+        assert_eq!(h.core.stats.delegate_refused_unshipped, 1);
+    }
+
     /// The grant is decided again under the delegation gate: a root
     /// fast-path op of the subtree (`Meta::root_fast_path` holds the gate
     /// shared across its ownership check and its row) that journals a row

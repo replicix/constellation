@@ -141,7 +141,7 @@ pub trait Replica {
     /// ADR-55 (R-H): the rows that are not delegate-stream rows, still in
     /// the journal, starting at or below `upto` (the root's own rows a
     /// deposition would roll back): each one's first journal seq and the
-    /// keys its records touch.
+    /// keys its records touch or it observed (a refusal's op's keys).
     fn journal_root_rows_through(
         &self,
         upto: u64,
