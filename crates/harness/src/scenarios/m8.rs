@@ -878,6 +878,7 @@ pub fn cto_scan_ahead(_seed: u64) -> Result<()> {
         let calls = ri(r)? - before;
         let bound = (N.div_ceil(K) + 2) as u64;
         eprintln!("    {NAME}: cold ls -l of {N} files: {took:?}, {calls} ReadIndex calls (bound {bound})");
+        print_cto(NAME, "R", &cto_of(r)?);
         anyhow::ensure!(
             calls <= bound,
             "a cold ls -l of {N} files made {calls} ReadIndex calls, more than ceil(N/K)+2 = {bound}; reader {}",

@@ -1197,7 +1197,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "no-peer-in-budget",
-        desc: "plan 30 M9: CONSTELLATION_BACKUP_RTT_BUDGET_MS=0: no backup, local acknowledgements, the fast path open; a dead holder is replaced only when its lease expires (no seal, no fast takeover)",
+        desc: "plan 30 M9: CONSTELLATION_BACKUP_RTT_BUDGET_MS=0: no backup, no candidate, the roster's peers make the holder answer from the archive (ADR-50: the fast path stays gated, the one lease CAS is the singleton flag's); a dead holder is replaced only when its lease expires (no seal, no fast takeover)",
         requires: &[],
         caps: &[],
         run: m9::no_peer_in_budget,
@@ -6973,8 +6973,29 @@ fn node_leave(_seed: u64) -> Result<()> {
     // Let A/B re-sync with S3 before admin-leave.
     std::thread::sleep(Duration::from_secs(3));
 
-    // Admin-retire the unmounted C from A.
-    c0.leave(Some(c2_id), true)?;
+    // Admin-retire the unmounted C. Only the root can end a retired node's
+    // delegations, and the S3 cut above may have moved the lease from A to
+    // B (whichever claimed first once it healed), so the leave runs on
+    // whichever of them holds it.
+    let mut lease_node = None;
+    eventually(
+        "one of A and B holds the lease",
+        Duration::from_secs(30),
+        || {
+            for (i, c) in [&c0, &c1].into_iter().enumerate() {
+                if lease_of(c)?["held"] == true {
+                    lease_node = Some(i);
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("neither holds it")
+        },
+    )?;
+    if lease_node == Some(0) {
+        c0.leave(Some(c2_id), true)?;
+    } else {
+        c1.leave(Some(c2_id), true)?;
+    }
     eventually(
         "A and B see a two-node roster after admin leave",
         Duration::from_secs(20),
@@ -12817,10 +12838,16 @@ fn dedup_write_storm(_seed: u64) -> Result<()> {
     const THREADS: usize = 16;
     let (env, root) = setup("dedup-write-storm")?;
     let _proxy = env.s3_proxy()?;
-    let backend = format!("s3://{BUCKET}/dedup-write-storm-{}", ts());
+    let stamp = ts();
     let mut modes = Vec::new();
     let wanted = std::env::var("CHAOS_DEDUP_STORM_MODES").unwrap_or_else(|_| "through,back".into());
     for mode in wanted.split(',').filter(|m| !m.is_empty()) {
+        // Each mode is the one node of its own file system: a second node
+        // on the first mode's roster, even unmounted, is a write-eligible
+        // peer (ADR-50), and every acknowledgement of this storm would
+        // then wait for the archive, serialised by the directory lock the
+        // kernel holds across an unlink. The storm is about one node.
+        let backend = format!("s3://{BUCKET}/dedup-write-storm-{mode}-{stamp}");
         let mut c = Client::new(
             root.path(),
             &format!("dedup-{mode}"),
@@ -12838,9 +12865,7 @@ fn dedup_write_storm(_seed: u64) -> Result<()> {
         {
             c = c.with_cache_size(bytes);
         }
-        if modes.is_empty() {
-            c.fs_create()?;
-        }
+        c.fs_create()?;
         c.mount()?;
         let dir = c.mnt.join(format!("dedup-{mode}"));
         std::fs::create_dir_all(&dir)?;

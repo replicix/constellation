@@ -23,8 +23,8 @@
 //!   from both sides.
 
 use super::campaign_load::{ledger_converges, ledger_writer};
-use super::m9::{cluster, TTL_MS};
-use super::{eventually, lease_of};
+use super::m9::{cluster, cluster_mounted, TTL_MS};
+use super::{eventually, lease_of, wait_for_p2p};
 use crate::client::Client;
 use crate::verify::{ErrnoLog, Evidence, Ledger};
 use anyhow::{bail, Context, Result};
@@ -104,8 +104,37 @@ impl Drop for StopOnDrop {
 pub(super) fn lease_claimant_ahead(_seed: u64) -> Result<()> {
     const NAME: &str = "lease-claimant-ahead";
     crate::load::set_scenario_clock_offset("b", AHEAD_MS);
-    let (env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], NO_BACKUP, 0)?;
+    // Only `a` mounts at first; `b` and `c` join as forward-only nodes
+    // (`AuthorityMode::forward_only`): they never take the lease from a
+    // live holder. A plain node whose forward to `a` is late (host load: a
+    // forward times out at half a second) asks `a` for the lease over P2P
+    // and `a` hands it over; that cooperative move is no claim, and it
+    // ended the scenario's premise (`a` holds one epoch for 1.5 TTL) with
+    // nothing to do with `b`'s clock. A forward-only node still claims a
+    // lease nobody holds, and `a`'s, once it is dead and has stood still
+    // for a TTL, is that: the claim under test.
+    let (env, _root, mut clients, _) = cluster_mounted(NAME, &["a", "b", "c"], NO_BACKUP, 0, 1)?;
+    let joiners: Vec<Client> = clients
+        .drain(1..)
+        .map(|c| c.with_env("CONSTELLATION_PROFILE_LEASES", "forward-only"))
+        .collect();
+    clients.extend(joiners);
+    for c in clients.iter_mut().skip(1) {
+        c.mount()?;
+    }
     let result = (|| -> Result<()> {
+        let refs: Vec<&Client> = clients.iter().collect();
+        wait_for_p2p(&refs)?;
+        for c in &clients[1..] {
+            eventually("f visible everywhere", Duration::from_secs(30), || {
+                anyhow::ensure!(
+                    std::fs::read(c.mnt.join("f")).ok().as_deref() == Some(&b"initial"[..]),
+                    "f not visible on {}",
+                    c.name
+                );
+                Ok(())
+            })?;
+        }
         let epoch = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
         anyhow::ensure!(
             lease_of(&clients[0])?["held"] == true,

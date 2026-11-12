@@ -1157,7 +1157,11 @@ What `back` gives up, and what it keeps:
   and the node must wait for the records (the answer came on state it
   has not applied yet, or the acknowledgement waits), it uploads those
   files' chunks at once. If the log also waits for another node's chunks,
-  the op waits for that node's uploads too. An op still waiting
+  the op waits for that node's uploads too. (A root with a write-eligible
+  peer on its roster and no backup yet answers its own closes from the
+  archive as well, whose segment names their chunks only once they are up:
+  its first closes upload on a metered network too, until a backup is
+  listed.) An op still waiting
   `CONSTELLATION_OWN_RECORD_WAIT_MS` (10 s) after the sequencer said its
   stream would carry the records uploads the chunks anyway (the stream
   stalled: its backup was lost, say). Before, such an op waited out its
