@@ -4562,9 +4562,10 @@ deposition).
 them and their clients were told they are committed are recorded in the store
 (`read_hold:{slot}:{first}`), in the transaction that takes them out, and leave
 in the transaction that puts them back or makes them final: the drop rules of
-the member copy, the generation's log index reaching the row, the log carrying the row's rid
-under any identity (a delegate row this root appended that the delegate
-re-executed under another), the generation's end (in the transaction that
+the member copy, the generation's log index reaching the row, the row's rid completed here
+(the log carries it under any identity, or this node ran the client's retry
+itself: a delegate row this root appended that the delegate re-executed, an
+own row the client retried), the generation's end (in the transaction that
 applies the end, an orphan end, or a rebuild whose log ended it; a row of an
 ended generation is not held), the tail re-apply of a takeover gate, an
 operator's abandon. Every local
