@@ -458,6 +458,10 @@ pub(crate) fn put_journal_tx(
     first: u64,
     row: &JournalTx,
 ) -> Result<(), MetaError> {
+    if row.gen == 0 {
+        meta.root_tx_hint
+            .fetch_max(first, std::sync::atomic::Ordering::Relaxed);
+    }
     tx.insert(&meta.journal_tx, tx_key(first), postcard::to_allocvec(row)?);
     Ok(())
 }
@@ -1698,6 +1702,49 @@ impl Meta {
         Ok(read_journal_tx_heads(&r, self)?
             .iter()
             .any(|(_, h)| h.gen == 0))
+    }
+
+    /// ADR-55 (M1): the highest journal seq a transaction that is not a
+    /// delegate-stream row (the root's own) may start at: at or below the
+    /// shipped watermark, none is unshipped.
+    pub fn journal_root_bound(&self) -> u64 {
+        self.root_tx_hint.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Read [`Self::journal_root_bound`] from the journal (at the open).
+    pub(crate) fn init_root_tx_hint(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        let top = read_journal_tx_heads(&r, self)?
+            .iter()
+            .filter(|(_, h)| h.gen == 0)
+            .map(|(first, _)| *first)
+            .max()
+            .unwrap_or(0);
+        self.root_tx_hint
+            .fetch_max(top, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// ADR-55 (M1): the first journal seqs of the transactions that are not
+    /// delegate-stream rows, still in the journal and starting at or below
+    /// `upto`. Such a row is the root's own: a deposition rolls it back, so
+    /// a stream row that rests on it must wait until it is in the log.
+    pub fn journal_root_seqs_through(&self, upto: u64) -> Result<Vec<u64>, MetaError> {
+        let r = self.db.read_tx();
+        let from = journal::acked_watermark(&r, &self.local)?.saturating_add(1);
+        let mut out = Vec::new();
+        if from > upto {
+            return Ok(out);
+        }
+        for guard in r.range(&self.journal_tx, tx_key(from)..=tx_key(upto)) {
+            let (k, v) = guard.into_inner()?;
+            self.note_local_rows_read(1);
+            let h: JournalTxHead = postcard::from_bytes(&v)?;
+            if h.gen == 0 {
+                out.push(decode_tx_key(&k)?);
+            }
+        }
+        Ok(out)
     }
 
     /// Plan 30 §M11: the journal seqs of this node's transactions whose

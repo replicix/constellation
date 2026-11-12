@@ -1692,27 +1692,40 @@ impl Core {
     /// Plan 46 M1.4 step 5: whether an answer (not `committed`) came from a
     /// designee or a sticky holder. An uncommitted answer in an open epoch is
     /// no longer one (a hold with two members or more answers committed).
-    fn answered_non_stealable(&self, committed: bool, gen: u64, replica: &dyn Replica) -> bool {
+    ///
+    /// ADR-55 (M2): the holder's reply says so itself (`said`): it knows its
+    /// grant is non-stealable, while the requester's table may not list the
+    /// generation yet (the root's own grant is minted and used before a far
+    /// requester reads its record). The table is the requester's other
+    /// witness, for a reply that did not say.
+    fn answered_non_stealable(
+        &self,
+        committed: bool,
+        said: bool,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> bool {
         !committed
             && gen != 0
-            && replica
-                .delegation_table()
-                .iter()
-                .any(|d| d.gen == gen && d.non_stealable())
+            && (said
+                || replica
+                    .delegation_table()
+                    .iter()
+                    .any(|d| d.gen == gen && d.non_stealable()))
     }
 
     fn note_ungated_shadow(
         &mut self,
         from: NodeId,
         rid: Rid,
-        committed: bool,
+        (committed, said): (bool, bool),
         gen: u64,
         replica: &dyn Replica,
     ) {
         if committed {
             return;
         }
-        if self.answered_non_stealable(committed, gen, replica) {
+        if self.answered_non_stealable(committed, said, gen, replica) {
             self.stats.ungated_shadows_non_stealable += 1;
             return;
         }
@@ -1734,13 +1747,13 @@ impl Core {
         from: NodeId,
         req: OpId,
         outcome: MutateOutcome,
-        (base, position, gen, own_chunks, own_rows, committed): (
+        (base, position, gen, own_chunks, own_rows, (committed, said_non_stealable)): (
             Option<crate::ids::Seq>,
             Position,
             u64,
             OwnChunks,
             Option<constellation_meta::OwnRows>,
-            bool,
+            (bool, bool),
         ),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1922,14 +1935,20 @@ impl Core {
                 };
                 let answer = (
                     committed,
-                    self.answered_non_stealable(committed, gen, replica)
+                    self.answered_non_stealable(committed, said_non_stealable, gen, replica)
                         .then_some(now.wall.0),
                 );
                 match replica.install_shadow(rid, epoch, gen, &op, &tag, &records, answer) {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
-                        self.note_ungated_shadow(from, rid, committed, gen, replica);
+                        self.note_ungated_shadow(
+                            from,
+                            rid,
+                            (committed, said_non_stealable),
+                            gen,
+                            replica,
+                        );
                         // Plan 30 §M6 (coordinator decision 2): installed
                         // effects do not raise `observed`; the shadow
                         // covers its keys (the parent directory's
@@ -2188,7 +2207,13 @@ impl Core {
                     match replica.install_hint(rid, records, position, epoch, gen, committed) {
                         Ok(true) => {
                             self.stats.hints_installed += 1;
-                            self.note_ungated_shadow(from, rid, committed, gen, replica);
+                            self.note_ungated_shadow(
+                                from,
+                                rid,
+                                (committed, said_non_stealable),
+                                gen,
+                                replica,
+                            );
                             replica.note_covering(KeySet::from_records(records), position);
                             hinted = true;
                         }
@@ -3185,6 +3210,19 @@ impl Core {
             self.executed_answer_class(replica, rid),
             constellation_meta::RowCommit::LONE,
         );
+        // ADR-55 (plan §5.4): the root path's answer that waits for the
+        // archive while the root holds a sticky grant of its own (an op in `/`
+        // or in another node's subtree).
+        if !class.is_final()
+            && !class.is_singleton()
+            && self
+                .dl
+                .gens
+                .values()
+                .any(|g| !g.ended && g.node == self.cfg.node_id && g.non_stealable())
+        {
+            self.stats.root_own_archive_waits_elsewhere += 1;
+        }
         if let Some(c) = self.clients.get_mut(&rid) {
             c.answered_by = Some(AnswerSource::Sequenced(class));
         }
@@ -3247,7 +3285,7 @@ impl Core {
             let wait = if !self.deleg_known() || (settle && self.lease.gate.is_some()) {
                 Default::default()
             } else {
-                match self.deleg_recall_plan(now, &keys, replica, out) {
+                match self.deleg_recall_plan(now, true, &keys, replica, out) {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
                     super::delegate::RecallPlan::Refuse(code) => {

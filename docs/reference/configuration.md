@@ -1393,6 +1393,8 @@ rewrites it).
 | `release_seal_window` | 1500 | `max(T, F)` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `release_stream_window` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `archive_put` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `own_first_op_wait` | 550 | `F + k` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `own_cross_release_wait` | 5600 | `5000 + F + 2k` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `inherit_slack` | 1500 | `T` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
 | `abandon_read_wait` | 6000 | `R + m` | `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `abandon_heard_window` | 20000 | `D` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |

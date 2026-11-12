@@ -124,6 +124,16 @@ pub struct Deadlines {
     /// (plan 46 M1.3 step 7): the bound the root's archive answers already
     /// use, `F`. No setting of its own.
     pub archive_put: u64,
+    /// ADR-55 (plan 46 M1.3 step 9): the first op under the root's own sticky
+    /// grant waits for the grant record's archive PUT and the stream tick
+    /// that runs it: `F + k`. Below the attempts window (D17).
+    pub own_first_op_wait: u64,
+    /// ADR-55 (step 9, Q3): an op across the boundary of the root's own
+    /// sticky subtree waits for the release of the grant: the drain at most
+    /// `STICKY_HOLD_MAX_MS`, the archive append of the release row `F`, and
+    /// the two ticks that carry it: `5000 + F + 2k`. Below the attempts
+    /// window (D18).
+    pub own_cross_release_wait: u64,
     pub inherit_slack: u64,
     pub abandon_read_wait: u64,
     pub abandon_heard_window: u64,
@@ -312,6 +322,8 @@ impl Deadlines {
             release_seal_window: seal,
             release_stream_window: f,
             archive_put: f,
+            own_first_op_wait: f + tick,
+            own_cross_release_wait: crate::core::STICKY_HOLD_MAX_MS as u64 + f + 2 * tick,
             inherit_slack: t,
             abandon_read_wait: r + m,
             abandon_heard_window: d,
@@ -492,6 +504,26 @@ impl Deadlines {
                 self.read_hold_span
             ),
         );
+        fail(
+            "D17",
+            Class::Warn,
+            self.own_first_op_wait < self.attempts,
+            format!(
+                "the first op under the root's own sticky grant waits {} ms (the record's \
+                 archive PUT and a tick), not below an op's attempts ({})",
+                self.own_first_op_wait, self.attempts
+            ),
+        );
+        fail(
+            "D18",
+            Class::Warn,
+            self.own_cross_release_wait < self.attempts,
+            format!(
+                "an op across the root's own sticky boundary waits {} ms for the release (the \
+                 drain bound, the archive append and two ticks), not below an op's attempts ({})",
+                self.own_cross_release_wait, self.attempts
+            ),
+        );
         v
     }
 
@@ -659,6 +691,12 @@ impl Deadlines {
             ("release_seal_window", self.release_seal_window, "max(T, F)"),
             ("release_stream_window", self.release_stream_window, "F"),
             ("archive_put", self.archive_put, "F"),
+            ("own_first_op_wait", self.own_first_op_wait, "F + k"),
+            (
+                "own_cross_release_wait",
+                self.own_cross_release_wait,
+                "5000 + F + 2k",
+            ),
             ("inherit_slack", self.inherit_slack, "T"),
             ("abandon_read_wait", self.abandon_read_wait, "R + m"),
             ("abandon_heard_window", self.abandon_heard_window, "D"),
@@ -863,6 +901,8 @@ mod tests {
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 500),
                 ("archive_put", 500),
+                ("own_first_op_wait", 550),
+                ("own_cross_release_wait", 5600),
                 ("inherit_slack", 1_500),
                 // 5000 + 1000.
                 ("abandon_read_wait", 6_000),
@@ -934,6 +974,8 @@ mod tests {
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 500),
                 ("archive_put", 500),
+                ("own_first_op_wait", 550),
+                ("own_cross_release_wait", 5600),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 6_000),
                 ("abandon_heard_window", 20_000),
@@ -998,6 +1040,8 @@ mod tests {
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 400),
                 ("archive_put", 400),
+                ("own_first_op_wait", 450),
+                ("own_cross_release_wait", 5500),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 5_000),
@@ -1073,6 +1117,8 @@ mod tests {
                 ("release_seal_window", 1_500),
                 ("release_stream_window", 400),
                 ("archive_put", 400),
+                ("own_first_op_wait", 450),
+                ("own_cross_release_wait", 5500),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 20_000),
@@ -1134,6 +1180,8 @@ mod tests {
                 ("release_seal_window", 1_000),
                 ("release_stream_window", 400),
                 ("archive_put", 400),
+                ("own_first_op_wait", 450),
+                ("own_cross_release_wait", 5500),
                 ("inherit_slack", 1_000),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 5_000),
@@ -1201,6 +1249,8 @@ mod tests {
                 ("release_seal_window", 3_000),
                 ("release_stream_window", 3_000),
                 ("archive_put", 3_000),
+                ("own_first_op_wait", 3001),
+                ("own_cross_release_wait", 8002),
                 ("inherit_slack", 8),
                 ("abandon_read_wait", 100),
                 ("abandon_heard_window", 50),
@@ -1360,6 +1410,13 @@ mod tests {
         assert!(!has(&Deadlines::new(&sim_long()), "D4"));
         // (The span covers the takeover window by construction: a cap
         // shorter than the waits it caps is a hand-made one.)
+        // (The first op under the root's own grant and the release an op
+        // across its boundary waits for fit the attempts window.)
+        let mut c = sim();
+        c.forward_timeout_ms = 9_000;
+        c.settle_window_ms = 5_000;
+        let d = Deadlines::new(&c);
+        assert!(has(&d, "D17") && has(&d, "D18"), "{:?}", d.check());
         let mut c = Config::defaults(1, 1);
         c.backup_takeover_ms = 40_000;
         assert!(!has(&Deadlines::new(&c), "D5"));

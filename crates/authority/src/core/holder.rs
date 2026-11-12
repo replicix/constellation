@@ -254,6 +254,7 @@ impl Core {
                         own_chunks: OwnChunks::None,
                         own_rows: None,
                         committed: false,
+                        non_stealable: false,
                     },
                 });
             }
@@ -305,6 +306,7 @@ impl Core {
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,
+                            non_stealable: false,
                         },
                     });
                     return;
@@ -345,6 +347,7 @@ impl Core {
                             own_chunks: OwnChunks::None,
                             own_rows: None,
                             committed: false,
+                            non_stealable: false,
                         },
                     });
                     return;
@@ -551,6 +554,7 @@ impl Core {
                                 own_chunks: OwnChunks::None,
                                 own_rows: None,
                                 committed: false,
+                                non_stealable: false,
                             },
                         });
                         return;
@@ -568,7 +572,7 @@ impl Core {
                     // requester's table lacked.)
                     super::delegate::RecallPlan::None
                 } else {
-                    self.deleg_recall_plan(now, &keys, replica, out)
+                    self.deleg_recall_plan(now, false, &keys, replica, out)
                 };
                 let wait = match plan {
                     super::delegate::RecallPlan::None => Default::default(),
@@ -594,6 +598,7 @@ impl Core {
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
                                     committed: false,
+                                    non_stealable: false,
                                 },
                             });
                         }
@@ -613,6 +618,7 @@ impl Core {
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
                                     committed: false,
+                                    non_stealable: false,
                                 },
                             });
                         }
@@ -643,6 +649,7 @@ impl Core {
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
                                     committed: false,
+                                    non_stealable: false,
                                 },
                             });
                         }
@@ -672,6 +679,7 @@ impl Core {
                                     own_chunks: OwnChunks::None,
                                     own_rows: None,
                                     committed: false,
+                                    non_stealable: false,
                                 },
                                 class,
                                 replica,
@@ -976,6 +984,7 @@ impl Core {
                 own_chunks,
                 own_rows,
                 committed: false,
+                non_stealable: false,
             },
             class,
             replica,

@@ -673,6 +673,11 @@ pub enum PeerMsg {
         /// (a lone node's, or one released with the gate off) and on every
         /// non-answer (`Busy`, `NotHolder`, a `Held`).
         committed: bool,
+        /// ADR-55 (M2): the sender is the holder of a non-stealable grant
+        /// (a sticky holder, the root as its own included): its answer is
+        /// final by design, whatever the requester's table lists of the
+        /// generation yet. Only an answer of a stream row says it.
+        non_stealable: bool,
     },
     /// "I want the lease" (`Payload::LeaseRequest`), sent to the holder.
     /// `epoch_applied`: `Some(applied)` asks for a continuation epoch's

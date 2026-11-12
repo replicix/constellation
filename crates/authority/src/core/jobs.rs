@@ -3148,6 +3148,32 @@ impl Core {
         self.issue_release(now, replica, out);
     }
 
+    /// ADR-55 (S8): the lease is not released while a release row of the
+    /// root's own stream is unshipped. The flush before the release ships the
+    /// journal, the row included; when S3 is unreachable the flush fails and
+    /// the release never gets here, so the subtree stays blocked at the
+    /// successor until the row ships (the cost of D3, `delegations.md`).
+    pub(super) fn check_own_release_shipped(&mut self, replica: &dyn Replica) {
+        let in_journal = replica.journal_own_gens();
+        let pending = self
+            .dl
+            .mine
+            .iter()
+            .filter(|(g, d)| d.release.is_some() && self.dl.own_minted.contains(g))
+            .any(|(g, _)| in_journal.contains(g));
+        if pending {
+            self.stats.root_own_release_unshipped_at_lease_release += 1;
+            tracing::error!(
+                node = self.cfg.node_id,
+                "releasing the lease with a release row of the root's own stream unshipped"
+            );
+            debug_assert!(
+                false,
+                "the lease is released with a release row of the root's own stream unshipped"
+            );
+        }
+    }
+
     /// The release CAS — but a released lease can be taken over at once,
     /// so plan 30 §M8's read delegations must all be recalled (or
     /// outwaited) first. `releasing` is up by now: no new grant is made
@@ -3157,6 +3183,7 @@ impl Core {
             return;
         }
         self.lease.releasing = true;
+        self.check_own_release_shipped(replica);
         if self.park_release_for_recalls(now, replica, out) {
             self.set_phase(Phase::RecallBeforeRelease, None);
             return;

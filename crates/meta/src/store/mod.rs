@@ -715,6 +715,12 @@ pub struct Meta {
     /// under a generation the table does not list and that has no void cut
     /// (`Meta::note_unjustified_ship`). Must stay 0.
     pub(crate) ship_unjustified: AtomicU64,
+    /// ADR-55 (M1): an upper bound of the journal seq of the latest
+    /// transaction that is not a delegate-stream row (`Meta::journal_root_bound`):
+    /// raised by every such journaling, and read once from the journal at
+    /// the open. Below the shipped watermark, no root row of the journal is
+    /// unshipped, and the scan is skipped.
+    pub(crate) root_tx_hint: AtomicU64,
     /// How many times a ship plan, a retirement or an ack took a held-set
     /// path (plan 30 §M4 round 2). Only ever moves while something is
     /// poisoned or held; the cost tests in `store::local` pin that it stays
@@ -1370,6 +1376,7 @@ impl Meta {
             read_holds_abandoned: AtomicU64::new(0),
             held_copy_last_warn_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             ship_unjustified: AtomicU64::new(0),
+            root_tx_hint: AtomicU64::new(0),
             held_work: AtomicU64::new(0),
             blame_cache: Default::default(),
             session: crate::session::SessionState::default(),
@@ -1419,6 +1426,7 @@ impl Meta {
             closed: AtomicBool::new(true),
         };
         meta.check_format()?;
+        meta.init_root_tx_hint()?;
         meta.bootstrap()?;
         meta.refresh_member_copy_flag()?;
         meta.load_read_holds()?;

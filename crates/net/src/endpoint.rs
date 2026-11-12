@@ -1468,6 +1468,7 @@ pub trait PeerService: Send + Sync + 'static {
                 own_inos: Vec::new(),
                 own_rows: Vec::new(),
                 committed: false,
+                non_stealable: false,
             }
         })
     }

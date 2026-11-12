@@ -86,6 +86,7 @@ pub use client::{ClientPhase, ABANDONED_CODE};
 pub use deleg_windows::{
     decide, DelegWindows, Refusal, RootLease, Window, WindowStats, WindowsClock,
 };
+pub(crate) use delegate::STICKY_HOLD_MAX_MS;
 pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 pub use roster::RosterView;
 pub use seal_tail::WaitingForGroup;
@@ -1584,9 +1585,26 @@ pub struct Stats {
     /// (`Core::track_fence_audit`): executions by the root's own path of a key
     /// of its own live sticky stream. Must stay 0.
     pub root_path_own_stream_executions: u64,
-    /// ADR-55 (Q3): releases of the root's own sticky subtrees an op across
-    /// their boundary asked for (the root's decision, instead of `EXDEV`).
-    pub root_own_released_for_cross: u64,
+    /// ADR-55 (Q3): ops across the boundary of the root's own sticky
+    /// subtrees that released them (the root's decision, instead of `EXDEV`),
+    /// by whose op it was: the root's own client's, or another node's
+    /// forward (or inbox batch). One per op that waits for a release; an op
+    /// arriving while the same subtrees' release is under way waits for it
+    /// and starts no second.
+    pub root_own_released_for_cross_own: u64,
+    pub root_own_released_for_cross_forwarded: u64,
+    /// ADR-55 (plan §5.4): the root's own client ops its root path answered
+    /// with an archive wait (a class that is not `Final`) while it held a
+    /// sticky grant of its own: the ops in `/` and in other nodes' subtrees.
+    /// The ops in the grant wait for nothing once its record is archived
+    /// (`root_own_answers`).
+    pub root_own_archive_waits_elsewhere: u64,
+    /// ADR-55 (S8): the lease was released (a handoff, a flush, a stop) while
+    /// a release row of the root's own stream was still in its journal: the
+    /// next root would not see the release, and the subtree would stay the
+    /// holder's. Must stay 0 (the lifecycle ships the row first; an
+    /// unreachable S3 stops the release instead).
+    pub root_own_release_unshipped_at_lease_release: u64,
     /// ADR-55: ops the root answered in its own stream (`Final`, at local
     /// speed); the grants whose record the archive carried since, and the
     /// longest the first ops waited for that.
@@ -3094,6 +3112,12 @@ impl Core {
         }
         self.clk = now;
         self.dl.step += 1;
+        // A lease change that landed since the last event closes the old
+        // configuration before any row of this one is journaled.
+        self.sync_cfg_spans(replica);
+        // ADR-55: what the previous step's backlog of messages to this node
+        // left over (the depth cap) is delivered after that: a release row
+        // or a stream batch journals under the configuration in force now.
         if !self.self_inbox.is_empty() {
             let me = self.cfg.node_id;
             for msg in std::mem::take(&mut self.self_inbox) {
@@ -3102,9 +3126,6 @@ impl Core {
                 self.on_peer(now, me, msg, replica, &mut out);
             }
         }
-        // A lease change that landed since the last event closes the old
-        // configuration before any row of this one is journaled.
-        self.sync_cfg_spans(replica);
         self.deleg_root_sync_due(now, replica, &mut out);
         match event {
             Event::Submit {
@@ -3337,7 +3358,11 @@ impl Core {
         std::mem::take(&mut self.self_releases)
     }
 
-    /// The hooks every event ends with.
+    /// The hooks every event ends with. Each is idempotent: the loop above
+    /// runs them again after every round of messages the node delivered to
+    /// itself (up to `SELF_SEND_DEPTH + 1` times in a step), and a second run
+    /// with nothing new does nothing (`report_deleg_durable`,
+    /// `note_client_states` and the publishes record the state they find).
     fn after_event(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.grant_horizon_after_event(replica, out);
         self.deleg_root_sync_due(now, replica, out);
@@ -3462,12 +3487,21 @@ impl Core {
                 // Plan 43 C1-4: the requester's shadow or hint is installed as
                 // committed from it.
                 committed,
+                // ADR-55: the sender says its grant is non-stealable.
+                non_stealable,
             } => self.on_mutate_reply(
                 now,
                 from,
                 req,
                 outcome,
-                (base, position, gen, own_chunks, own_rows, committed),
+                (
+                    base,
+                    position,
+                    gen,
+                    own_chunks,
+                    own_rows,
+                    (committed, non_stealable),
+                ),
                 replica,
                 out,
             ),
