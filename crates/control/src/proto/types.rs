@@ -321,6 +321,25 @@ pub struct WaitingMemberStatus {
     pub heard_ms: Option<u64>,
 }
 
+/// Plan 46 M1.3 step 9 (ADR-55): counters of the root's own sticky grants
+/// (`DelegationReport::root_own`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RootOwnStatus {
+    pub granted: u64,
+    pub released_by_dwell: u64,
+    pub released_for_cross: u64,
+    pub answers: u64,
+    pub holds: u64,
+    pub skipped: u64,
+    pub commit_waits: u64,
+    pub commit_wait_ms_max: u64,
+    pub resumed_rows: u64,
+    pub self_sends: u64,
+    /// Inbox-only forwards refused `EROFS` in the root's own stream (fence
+    /// C9; ADR-55's revisit rule counts them outside partitions).
+    pub inbox_refusals: u64,
+}
+
 /// Plan 30 §M11: this node's delegation state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DelegationReport {
@@ -357,6 +376,16 @@ pub struct DelegationReport {
     pub install_waits: u64,
     pub install_wait_ms: u64,
     pub install_wait_max_ms: u64,
+    /// Plan 46 M1.3 step 9 (ADR-55): the root's own sticky grants. Streams
+    /// this node granted itself as the root (placement), the ops it answered
+    /// in them (`final`, local speed), the ops its root path held instead of
+    /// refusing them, the releases an op across a boundary asked for, the
+    /// longest the first ops waited for the record's archive (ms), the rows
+    /// it streamed to a later root after its deposition, and the messages to
+    /// itself the core delivered inline. The streams themselves are the rows
+    /// of `mine` and `gens` whose node is this one.
+    #[serde(default)]
+    pub root_own: RootOwnStatus,
     pub executed: u64,
     /// Ops the FUSE fast path executed here as the delegate (not
     /// counted in `executed`, which is the core's).

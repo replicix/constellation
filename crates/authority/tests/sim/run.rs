@@ -528,6 +528,15 @@ pub struct SimConfig {
     /// configuration; `sticky_ends_only_by_holder_or_operator` must then fail
     /// the run.
     pub placement_recalls_sticky: bool,
+    /// Negative control (`Config::root_sticky_on_slash`, ADR-55): R-I1: the placement may grant `/`; `no_grant_on_root_dir` must then fail the run.
+    /// `AUTHORITY_SIM_ROOT_STICKY_ON_SLASH=1` sets it on every configuration.
+    pub root_sticky_on_slash: bool,
+    /// Negative control (`Config::deposed_root_strands_own_stream`, ADR-55): R-I5: a deposed root's takeover strands the rows of its own stream; I5 / `acked_at_or_below_cut` must then fail the run.
+    /// `AUTHORITY_SIM_DEPOSED_ROOT_STRANDS_OWN_STREAM=1` sets it on every configuration.
+    pub deposed_root_strands_own_stream: bool,
+    /// Negative control (`Config::root_executes_under_own_grant`, ADR-55): R-I4: the root's own path executes a key of its live own grant in its own journal; I2 / the per-key order must then fail the run.
+    /// `AUTHORITY_SIM_ROOT_EXECUTES_UNDER_OWN_GRANT=1` sets it on every configuration.
+    pub root_executes_under_own_grant: bool,
     /// Negative control (`Config::kept_fetch_skipped`, ADR-51): a takeover
     /// never collects the kept rows of the tenure it ends.
     /// `AUTHORITY_SIM_KEPT_FETCH_SKIPPED=1` sets it on every configuration;
@@ -1205,6 +1214,16 @@ impl Default for SimConfig {
                 .is_some_and(|v| v == "1"),
             placement_recalls_sticky: std::env::var_os("AUTHORITY_SIM_PLACEMENT_RECALLS_STICKY")
                 .is_some_and(|v| v == "1"),
+            root_sticky_on_slash: std::env::var_os("AUTHORITY_SIM_ROOT_STICKY_ON_SLASH")
+                .is_some_and(|v| v == "1"),
+            deposed_root_strands_own_stream: std::env::var_os(
+                "AUTHORITY_SIM_DEPOSED_ROOT_STRANDS_OWN_STREAM",
+            )
+            .is_some_and(|v| v == "1"),
+            root_executes_under_own_grant: std::env::var_os(
+                "AUTHORITY_SIM_ROOT_EXECUTES_UNDER_OWN_GRANT",
+            )
+            .is_some_and(|v| v == "1"),
             kept_fetch_skipped: std::env::var_os("AUTHORITY_SIM_KEPT_FETCH_SKIPPED")
                 .is_some_and(|v| v == "1"),
             parent_taint_conservative: std::env::var_os("AUTHORITY_SIM_PARENT_TAINT_CONSERVATIVE")
@@ -1564,6 +1583,11 @@ pub struct Report {
     /// Core counters, summed over the nodes: sticky grants made, and sticky
     /// streams ended by reason (released, abandoned, other).
     pub sticky_core: [u64; 16],
+    /// ADR-55 coverage: the root's own grants made, answers in its own
+    /// stream, holds by its root path, the longest commit wait of a grant
+    /// (ms), self-delivered messages, candidates the walk skipped for the
+    /// root, the root's own long-dwell releases, deliveries cut off.
+    pub root_own_core: [u64; 10],
     /// Late-landing cores' counters, summed over the nodes (`SWEEP-LL-STATS`):
     /// settles withdrawn first, ops resubmitted by a tombstone, stale reads
     /// discarded, stale relists, stale parks dropped, unacked replay settles,
@@ -5269,6 +5293,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         placement_recalls_sticky: cfg.placement_recalls_sticky,
+        root_sticky_on_slash: cfg.root_sticky_on_slash,
+        deposed_root_strands_own_stream: cfg.deposed_root_strands_own_stream,
+        root_executes_under_own_grant: cfg.root_executes_under_own_grant,
         kept_fetch_skipped: cfg.kept_fetch_skipped,
         parent_taint_conservative: cfg.parent_taint_conservative,
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
@@ -7323,6 +7350,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         ]) {
             *t += v;
         }
+        report.root_own_core[0] += s.place_root_own_granted;
+        report.root_own_core[1] += s.root_own_answers;
+        report.root_own_core[2] += s.root_own_holds;
+        report.root_own_core[3] = report.root_own_core[3].max(s.root_own_commit_wait_ms_max);
+        report.root_own_core[4] += s.self_sends;
+        report.root_own_core[5] += s.place_skipped_root_own;
+        report.root_own_core[6] += s.place_root_own_released;
+        report.root_own_core[7] += s.self_send_overflow;
+        report.root_own_core[8] += s.root_own_resumed;
+        report.root_own_core[9] += s.holder_inbox_refusals_own_root;
         report.sticky_core[0] += s.deleg_sticky;
         report.sticky_core[1] += s.deleg_sticky_ended_released;
         report.sticky_core[2] += s.deleg_sticky_ended_abandoned;
@@ -7547,6 +7584,20 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         return Err(format!(
             "I2c unjustified_ships: {} journal row(s) of a generation the log never granted              reached the shipper\n  {counters}\n  faults: {:?}",
             report.unjustified_ships, report.faults
+        ));
+    }
+    // ADR-55 (R-I4): the root's own path never executed a key of its own live
+    // sticky stream (`root_executes_under_own_grant` is the fault).
+    let root_path_own: u64 = report
+        .stats
+        .values()
+        .map(|s| s.root_path_own_stream_executions)
+        .sum();
+    if root_path_own > 0 {
+        return Err(format!(
+            "I2 root_path_executes_own_stream: the root's own path executed {root_path_own} op(s) \
+             on keys of its own live sticky stream\n  {counters}\n  faults: {:?}",
+            report.faults
         ));
     }
     if cfg.strict_commit && report.ungated_shadows > 0 {

@@ -522,6 +522,19 @@ impl EngineControl {
                     install_waits: stats.deleg_install_waits_end,
                     install_wait_ms: stats.deleg_install_wait_ms,
                     install_wait_max_ms: stats.deleg_install_wait_max_ms,
+                    root_own: api::RootOwnStatus {
+                        granted: stats.place_root_own_granted,
+                        released_by_dwell: stats.place_root_own_released,
+                        released_for_cross: stats.root_own_released_for_cross,
+                        answers: stats.root_own_answers,
+                        holds: stats.root_own_holds,
+                        skipped: stats.place_skipped_root_own,
+                        commit_waits: stats.root_own_commit_waits,
+                        commit_wait_ms_max: stats.root_own_commit_wait_ms_max,
+                        resumed_rows: stats.root_own_resumed,
+                        self_sends: stats.self_sends,
+                        inbox_refusals: stats.holder_inbox_refusals_own_root,
+                    },
                     waiting: v
                         .waiting
                         .iter()

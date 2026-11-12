@@ -4539,7 +4539,15 @@ impl Driver {
                         let _ = tx.send(reply);
                     }
                 }
-                Action::Send { to, msg } => self.send(to, msg),
+                Action::Send { to, msg } => {
+                    // Plan 46 M1.3 step 9: the core delivers a message to its
+                    // own node inline; none leaves it.
+                    debug_assert!(
+                        to != self.node_id || !msg.is_delegate_family(),
+                        "the core sent {msg:?} to its own node"
+                    );
+                    self.send(to, msg)
+                }
                 Action::S3 { op, req } => self.spawn_s3(op, req),
                 Action::SetTimer { id, after_ms, kind } => {
                     let tx = if prompt_timer(kind) {

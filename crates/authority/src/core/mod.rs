@@ -94,6 +94,10 @@ pub use seal_tail::WaitingForGroup;
 /// `epoch = DELEG_READ_EPOCH_BASE + gen`, so a `DelegateNodeEnded` of the
 /// generation voids exactly them (`ReadDelegations::void_epoch`).
 pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
+
+/// Plan 46 M1.3 step 9 (ADR-55): the rounds of self-delivery one step runs
+/// before it leaves the rest for the next.
+const SELF_SEND_DEPTH: u32 = 64;
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{backup_claim_grace_ms, LeaseState, PendingGate, Plan, ReconfigDoubt};
@@ -652,6 +656,25 @@ pub struct Config {
     /// one. The sim's `sticky_ends_only_by_holder_or_operator` must then
     /// fail the run.
     pub placement_recalls_sticky: bool,
+    /// Plan 46 M1.3 step 9 (ADR-55), `CONSTELLATION_DELEGATION_ROOT_STICKY`
+    /// (default on, with `placement_sticky`): a root with a write-eligible
+    /// peer and no group takes a sticky grant on the topmost subtree it
+    /// dominates, never `/`, and holds its own stream there.
+    pub placement_root_sticky: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): `/` may be granted (R-I1). The sim's
+    /// `no_grant_on_root_dir` must then fail the run.
+    pub root_sticky_on_slash: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): a deposed root's takeover strands the rows of its own
+    /// stream as it strands root rows (R-I5). `acked_at_or_below_cut` /
+    /// I5 must then fail the run.
+    pub deposed_root_strands_own_stream: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine): the root's own path executes a key of its live own
+    /// grant in its own journal (R-I4). I2 / the per-key order must then
+    /// fail the run.
+    pub root_executes_under_own_grant: bool,
 }
 
 impl Config {
@@ -815,6 +838,10 @@ impl Config {
             placement_far_rtt_ms: 20,
             placement_far_dwell_ms: 30_000,
             placement_recalls_sticky: false,
+            placement_root_sticky: true,
+            root_sticky_on_slash: false,
+            deposed_root_strands_own_stream: false,
+            root_executes_under_own_grant: false,
         }
     }
 }
@@ -1314,6 +1341,9 @@ pub struct Stats {
     /// Fence C9.2: inbox-ever forwards a non-stealable holder refused
     /// `EROFS` in its own stream.
     pub holder_inbox_refusals: u64,
+    /// ADR-55 (Q4): of them, those refused in the root's own stream (the
+    /// revisit rule counts them outside partitions).
+    pub holder_inbox_refusals_own_root: u64,
     /// Fence C9.3: touched inbox-ever rids the root sent to a live
     /// non-stealable holder.
     pub inbox_ever_redirects: u64,
@@ -1541,6 +1571,36 @@ pub struct Stats {
     /// group within the backup RTT budget and is not (yet, or robustly)
     /// far: it is forwarded to the root.
     pub place_skipped_far: u64,
+    /// Plan 46 M1.3 step 9 (ADR-55): the root's own sticky grants made
+    /// (counted at the mint and at a growth), and released by its own
+    /// long-dwell decision; candidates the walk skipped for the root.
+    pub place_root_own_granted: u64,
+    pub place_root_own_released: u64,
+    pub place_skipped_root_own: u64,
+    /// ADR-55: ops of the root's own stream its root path held (`Held`)
+    /// instead of refusing or executing them.
+    pub root_own_holds: u64,
+    /// ADR-55 (R-I4), counted only when the simulation audits
+    /// (`Core::track_fence_audit`): executions by the root's own path of a key
+    /// of its own live sticky stream. Must stay 0.
+    pub root_path_own_stream_executions: u64,
+    /// ADR-55 (Q3): releases of the root's own sticky subtrees an op across
+    /// their boundary asked for (the root's decision, instead of `EXDEV`).
+    pub root_own_released_for_cross: u64,
+    /// ADR-55: ops the root answered in its own stream (`Final`, at local
+    /// speed); the grants whose record the archive carried since, and the
+    /// longest the first ops waited for that.
+    pub root_own_answers: u64,
+    pub root_own_commit_waits: u64,
+    pub root_own_commit_wait_ms_max: u64,
+    /// ADR-55: rows of its own stream the node streamed to another root after
+    /// it was deposed.
+    pub root_own_resumed: u64,
+    /// Plan 46 M1.3 step 9 (ADR-55): messages this node sent to itself and
+    /// the core delivered inline (the root is the holder of its own stream).
+    pub self_sends: u64,
+    /// Self-deliveries cut off at [`SELF_SEND_DEPTH`] rounds (a defect).
+    pub self_send_overflow: u64,
     /// Plan 46 M1.3 step 7: operator grants refused for the same reason
     /// (`delegate_dir`).
     pub delegate_refused_far: u64,
@@ -2668,6 +2728,12 @@ pub struct Core {
     /// Plan 41 L2: the certificate the lock lane judges by, published at the
     /// end of every step (`lock_lane_view`).
     lane_cell: std::sync::Arc<crate::lane::LaneCell>,
+    /// Plan 46 M1.3 step 9: messages to this node itself that one step left
+    /// for the next ([`SELF_SEND_DEPTH`]).
+    self_inbox: Vec<PeerMsg>,
+    /// Releases sent to this node itself, for the simulation's oracle
+    /// ([`Core::take_self_releases`]).
+    self_releases: Vec<(u64, bool, Vec<constellation_fs_core::Ino>)>,
     /// Plan 30 §M11 phase 2b: the placement window (the root).
     pl: placement::PlacementState,
     /// Plan 30 §M14.
@@ -2771,6 +2837,8 @@ impl Core {
             dl: delegate::DelegationState::default(),
             dw: DelegWindows::new(),
             lane_cell: crate::lane::LaneCell::new(),
+            self_inbox: Vec::new(),
+            self_releases: Vec::new(),
             pl: placement::PlacementState::default(),
             lk: locks::LockState::default(),
             mode: AuthorityMode {
@@ -3026,6 +3094,14 @@ impl Core {
         }
         self.clk = now;
         self.dl.step += 1;
+        if !self.self_inbox.is_empty() {
+            let me = self.cfg.node_id;
+            for msg in std::mem::take(&mut self.self_inbox) {
+                self.stats.self_sends += 1;
+                self.note_self_release(&msg);
+                self.on_peer(now, me, msg, replica, &mut out);
+            }
+        }
         // A lease change that landed since the last event closes the old
         // configuration before any row of this one is journaled.
         self.sync_cfg_spans(replica);
@@ -3211,29 +3287,103 @@ impl Core {
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
-        self.grant_horizon_after_event(replica, &mut out);
-        self.deleg_root_sync_due(now, replica, &mut out);
-        self.resolve_moot_waits(now, replica, &mut out);
-        self.reroute_ended_epoch_waits(now, replica, &mut out);
-        self.inbox_after_event(now, &mut out);
-        self.stream_after_event(now, &mut out);
-        self.backup_after_event(now, replica, &mut out);
-        self.root_stream_push(now, replica, &mut out);
-        self.renew_after_own_cas(now, &mut out);
-        self.promise_after_event(now, replica, &mut out);
-        self.deleg_after_event(now, replica, &mut out);
+        // Plan 46 M1.3 step 9 (ADR-55): a message to this node itself (the
+        // root is the holder of its own stream) is delivered here, in this
+        // step, and what it provokes is run through the same hooks; no
+        // driver ever sees a send to its own node.
+        let mut depth = 0u32;
+        loop {
+            self.after_event(now, replica, &mut out);
+            let looped = Self::take_self_sends(self.cfg.node_id, &mut out);
+            if looped.is_empty() {
+                break;
+            }
+            depth += 1;
+            if depth > SELF_SEND_DEPTH {
+                // A long backlog of stream batches and their acknowledgements:
+                // the rest is delivered at the start of the next event.
+                self.stats.self_send_overflow += looped.len() as u64;
+                self.self_inbox.extend(looped);
+                break;
+            }
+            let me = self.cfg.node_id;
+            for msg in looped {
+                self.stats.self_sends += 1;
+                self.note_self_release(&msg);
+                self.on_peer(now, me, msg, replica, &mut out);
+            }
+        }
+        out
+    }
+
+    /// A release this node's holder side sent to its root side (itself) is
+    /// kept for the simulation's oracle, which sees what a driver carries
+    /// between nodes (`sticky_ends_only_by_holder_or_operator`).
+    fn note_self_release(&mut self, msg: &PeerMsg) {
+        if let PeerMsg::DelegateStream {
+            gen,
+            released: Some(note),
+            ..
+        } = msg
+        {
+            self.self_releases
+                .push((*gen, note.end_at.is_some(), note.dirs.clone()));
+        }
+    }
+
+    /// The releases this node sent to itself since the last call
+    /// `(gen, whole stream, subtrees)`: the simulation's oracle.
+    pub fn take_self_releases(&mut self) -> Vec<(u64, bool, Vec<constellation_fs_core::Ino>)> {
+        std::mem::take(&mut self.self_releases)
+    }
+
+    /// The hooks every event ends with.
+    fn after_event(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        self.grant_horizon_after_event(replica, out);
+        self.deleg_root_sync_due(now, replica, out);
+        self.resolve_moot_waits(now, replica, out);
+        self.reroute_ended_epoch_waits(now, replica, out);
+        self.inbox_after_event(now, out);
+        self.stream_after_event(now, out);
+        self.backup_after_event(now, replica, out);
+        self.root_stream_push(now, replica, out);
+        self.renew_after_own_cas(now, out);
+        self.promise_after_event(now, replica, out);
+        self.deleg_after_event(now, replica, out);
         self.report_deleg_durable(replica);
         if self.cfg.delegation {
-            self.withdraw_lost_deps_inbox_ops(now, replica, &mut out);
+            self.withdraw_lost_deps_inbox_ops(now, replica, out);
         }
-        self.locks_after_event(now, replica, &mut out);
-        self.renew_after_event(now, replica, &mut out);
+        self.locks_after_event(now, replica, out);
+        self.renew_after_event(now, replica, out);
         self.note_client_states(now);
         // Plan 41 R2: what the root's off-core answerer may rest on, as of
         // the end of this step and before the driver dispatches its actions.
         self.deleg_publish_root(replica);
         self.lock_publish_lane(now, replica);
-        out
+    }
+
+    /// Remove the sends to `me` from `out` and return their messages, in
+    /// order.
+    fn take_self_sends(me: NodeId, out: &mut Vec<Action>) -> Vec<PeerMsg> {
+        if !out
+            .iter()
+            .any(|a| matches!(a, Action::Send { to, msg } if *to == me && msg.is_delegate_family()))
+        {
+            return Vec::new();
+        }
+        let mut looped = Vec::new();
+        let mut kept = Vec::with_capacity(out.len());
+        for a in out.drain(..) {
+            match a {
+                Action::Send { to, msg } if to == me && msg.is_delegate_family() => {
+                    looped.push(msg)
+                }
+                other => kept.push(other),
+            }
+        }
+        *out = kept;
+        looped
     }
 
     /// When a pending timer fires, on the clock it was set against.
