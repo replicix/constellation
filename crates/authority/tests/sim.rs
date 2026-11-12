@@ -1336,6 +1336,24 @@ fn an_op_with_an_inbox_batch_refused_by_a_frozen_epoch_is_withdrawn_before_its_e
     assert_eq!(r.late_landings, 0);
 }
 
+/// I5 (`flex-tight+settle+oracles+unsettled` 1079, 1267 with the settle
+/// route to the cached holder): a hold streamed rows its group had not
+/// acknowledged to a subscriber outside its epoch, as uncommitted. A
+/// takeover's epoch marker reached the subscriber before the re-shipped
+/// tail and stranded its copy of a row the group had answered, which was
+/// rolled back. The hold now streams a subscriber outside the epoch only
+/// what its group acknowledged, as committed. (The seed still fails an
+/// unrelated oracle later, so this pins the absence of I5 alone.)
+#[test]
+fn a_subscriber_outside_a_hold_is_not_streamed_rows_the_group_has_not_acknowledged() {
+    let cfg = ["settle", "oracles", "unsettled"]
+        .into_iter()
+        .fold(base_config("flex-tight"), config_variant);
+    if let Err(e) = run_seed(1079, cfg) {
+        assert!(!e.contains("I5"), "seed 1079: {e}");
+    }
+}
+
 /// Re-pin helper for `a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3`:
 /// lists the seeds of its configuration whose settle gives up a tombstone
 /// and whose `EIO` is labelled `isolated-from-s3`.
