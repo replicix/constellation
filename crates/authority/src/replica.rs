@@ -146,6 +146,10 @@ pub trait Replica {
         &self,
         upto: u64,
     ) -> Result<Vec<(u64, constellation_meta::TouchSet)>, MetaError>;
+    /// The first journal seq of each unshipped transaction the ship plan
+    /// holds or defers now (`Meta::journal_held_back`): what a later row may
+    /// ship ahead of.
+    fn journal_held_back(&self) -> Result<std::collections::BTreeSet<u64>, MetaError>;
 
     // ---- speculation (requester side) ----
 
@@ -1086,6 +1090,9 @@ impl Replica for Meta {
         upto: u64,
     ) -> Result<Vec<(u64, constellation_meta::TouchSet)>, MetaError> {
         Meta::journal_root_rows_through(self, upto)
+    }
+    fn journal_held_back(&self) -> Result<std::collections::BTreeSet<u64>, MetaError> {
+        Meta::journal_held_back(self)
     }
 
     fn adopt_streamed(&self, rid: Rid, op: &MutateOp, tag: &LockTag) -> Result<bool, MetaError> {

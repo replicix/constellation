@@ -67983,6 +67983,60 @@ mod step9_one_stream_per_node {
         (h, d1, d2)
     }
 
+    /// A subtree with a root row the ship plan holds back (deferred behind
+    /// an upload, or held behind a lost chunk) is not granted to another
+    /// node: the plan would send the grant's record ahead of the row, and
+    /// the delegate, which executes on the log's state, would refuse the
+    /// row's rid for good at a settle while this journal holds its outcome
+    /// (far-placement+lost-chunk seed 1120: I1). A row the plan ships as it
+    /// is holds nothing back (it goes into the log ahead of the record), nor
+    /// does a held-back row elsewhere; once the row is no longer held back
+    /// the grant is made. Fails without `Core::root_rows_unshipped_under`:
+    /// the first grant is made.
+    #[test]
+    fn a_subtree_with_an_unshipped_root_row_is_not_granted_to_another_node() {
+        use constellation_fs_core::{ChunkInfo, Manifest};
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
+        let (mut h, d1) = root_with_dir();
+        let (d2, rec) = mkdir(&h, "d2");
+        let (d3, rec3) = mkdir(&h, "d3");
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[rec, rec3]).unwrap();
+        // `d1/f`'s manifest names a chunk still uploading: its row is
+        // deferred.
+        let f = h.meta.create(d1, "f", 0o644, 0, 0).unwrap().ino;
+        let hash = ChunkHash::of(b"still uploading");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 15,
+            chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
+        }
+        .encode();
+        h.meta
+            .set_manifest_dirty(f, None, &manifest, 15, None, None, &[hash])
+            .unwrap();
+        // `d2/g`: a row the plan ships as it is.
+        h.meta.create(d2, "g", 0o644, 0, 0).unwrap();
+        assert!(
+            !delegate(&mut h, 900, d1, 3),
+            "granted over a deferred root row"
+        );
+        assert_eq!(h.core.stats.delegate_refused_unshipped, 1);
+        assert!(h.meta.delegation_table().get(d1).is_none());
+        assert!(
+            delegate(&mut h, 901, d2, 3),
+            "an unshipped row held d2 back"
+        );
+        assert!(delegate(&mut h, 902, d3, 3), "a row elsewhere held d3 back");
+        // The upload is done: the row ships as it is, and `d1` is granted
+        // (it grows the stream).
+        h.meta.cancel_pending_upload(&hash, f).unwrap();
+        assert!(
+            delegate(&mut h, 903, d1, 3),
+            "refused once nothing held it back"
+        );
+        assert_eq!(h.core.stats.delegate_refused_unshipped, 1);
+    }
+
     /// Two subtrees granted to one node are one generation and one stream, and
     /// a rename between them is an ordinary op of that stream: the root
     /// forwards it to the delegate and recalls nothing. On the parent the

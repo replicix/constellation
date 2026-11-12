@@ -20843,6 +20843,28 @@ fn a_forward_the_root_ran_is_not_run_again_by_a_grant_that_installs() {
     }
 }
 
+/// `far-placement+lost-chunk`: the root grants (or grows a far node's stream
+/// by) `d1` while a root row under it is held behind the lost chunk. The
+/// grant's record ships ahead of the row, so the delegate executes on a state
+/// without it and refuses its rid for good when the rid's requester settles
+/// (the root's own client: the settle goes to the delegate of the keys),
+/// while the root's journal holds the rid's outcome. Seed 1120 is the I1
+/// (the delegate's `ABANDONED` and the root's `ENOENT` of one rid), 53, 324
+/// and 1219 the delegate's settle refusal the root then skips (never
+/// retired: no quiescence), 306 the causal cut (a delegate batch resting on
+/// the held row), 1881 an op never answered. The root now grants no
+/// subtree to another node while a root row of it is unshipped, nor while a
+/// replay the drop queued is (1527: granted at once after the drop, the
+/// replay could no longer run on keys another node held, and the root's
+/// replay job never ended).
+#[test]
+fn a_subtree_with_a_held_root_row_is_not_granted_to_a_far_writer() {
+    for seed in [53, 306, 324, 1120, 1219, 1527, 1881] {
+        run_seed(seed, config_variant(far_placement_config(), "lost-chunk"))
+            .unwrap_or_else(|e| panic!("far-placement+lost-chunk seed {seed}: {e}"));
+    }
+}
+
 /// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
 /// backup budget) that dominates a subtree is granted a sticky one: it
 /// executes there and its answers are final, with no rollback, no sticky
