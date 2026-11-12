@@ -62701,6 +62701,65 @@ mod await_retry {
         out
     }
 
+    /// ADR-59 part B (D3), B4, 1529's answer shape: an own gated write of the
+    /// damaged file waits for its group; the drop refuses its rid; then the
+    /// group (and the log) cover its journal seq. The client is never told
+    /// `Ok`: the answer is what the store says. Fail before: the parked
+    /// answer survived the refusal (`answer_parked` knew `Reply` only) and was
+    /// released `Ok` when its seq was covered.
+    #[test]
+    fn a_parked_own_write_of_a_rid_the_drop_refused_is_not_answered_ok() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        let rid = h.rid(7);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::SetManifest {
+                ino: broken,
+                base_manifest: None,
+                manifest,
+                size: 19,
+                mtime_ns: None,
+                ctime_ns: None,
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            replies(&out).is_empty(),
+            "the answer waits for the group: {out:?}"
+        );
+        assert_eq!(h.core.parked_durable_count(), 1);
+        let mut all = drop_held_via_core(&mut h, broken);
+        assert!(
+            matches!(
+                h.meta.completed_outcome(rid).unwrap(),
+                Some(constellation_meta::CompletedOutcome::Refused { .. })
+            ),
+            "the drop refused the rid"
+        );
+        // The group has everything now, and the log carries the rest.
+        if let Some(peer) = h.core.ack.peers.get_mut(&3) {
+            peer.acked = u64::MAX / 2;
+            peer.counted = u64::MAX / 2;
+        }
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        ship_round(&mut h, 100, &mut all);
+        assert!(
+            !replies(&all).iter().any(|(r, reply)| *r == rid
+                && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))),
+            "no `Ok` for a refused rid: {all:?}"
+        );
+    }
+
     /// ADR-59 part B (D1, D4), B3 (iii): the drop decides nothing locally. The
     /// decision transaction carries one `DropHeld` record, alone, naming the
     /// seed (the chmod needs none of the lost content: it is redone, not

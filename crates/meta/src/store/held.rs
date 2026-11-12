@@ -396,6 +396,10 @@ pub struct DroppedHeld {
     /// Empty of dependents under the conservative control (nothing is
     /// attributed to the inode).
     pub rolled_back_on_inode: Vec<crate::rid::Rid>,
+    /// The rids the drop refused (`Refused` rows, conflict copies): the
+    /// seeds' and the queued replays of the manifest (ADR-59 part B, D3: a
+    /// parked answer of one is settled with the refusal).
+    pub refused: Vec<crate::rid::Rid>,
     /// ADR-59: held transactions that depend on a seed but need none of the
     /// lost content (a rename, chmod or unlink of the damaged file, a create
     /// or unlink in its directory): redone in place with their journal rows,
@@ -2220,6 +2224,7 @@ impl Meta {
             pending_removed,
             queued_dropped,
             rolled_back,
+            refused: refused_rids,
             placeholders,
             rolled_back_on_inode: on_inode,
             missing,
