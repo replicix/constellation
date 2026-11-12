@@ -893,6 +893,16 @@ pub trait Replica {
         &self,
         proof: Option<(Epoch, constellation_meta::OrphanProof)>,
     ) -> Result<(), MetaError>;
+    /// Review round 2 (SHOULD-2): the records of the takeover claim's marker
+    /// (`local["gate_marker"]`), written with the orphan proof before the
+    /// marker ships; the claimant's strand judges its own member copies by
+    /// the marker that landed, also after a restart. Only the epoch it names
+    /// counts.
+    fn gate_marker_persisted(&self) -> Option<(Epoch, Vec<constellation_meta::LogRecord>)>;
+    fn persist_gate_marker(
+        &self,
+        marker: Option<(Epoch, &[constellation_meta::LogRecord])>,
+    ) -> Result<(), MetaError>;
 }
 
 impl Replica for Meta {
@@ -2223,6 +2233,34 @@ impl Replica for Meta {
             })
             .unwrap_or_default();
         Meta::kv_set_durable(self, "gate_orphan_proof", &v)
+    }
+
+    fn gate_marker_persisted(&self) -> Option<(Epoch, Vec<constellation_meta::LogRecord>)> {
+        let v = Meta::kv_get(self, "gate_marker").ok().flatten()?;
+        let (epoch, hex) = v.split_once(':')?;
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        Some((epoch.parse().ok()?, postcard::from_bytes(&bytes).ok()?))
+    }
+
+    fn persist_gate_marker(
+        &self,
+        marker: Option<(Epoch, &[constellation_meta::LogRecord])>,
+    ) -> Result<(), MetaError> {
+        let v = match marker {
+            None => String::new(),
+            Some((e, records)) => {
+                let bytes = postcard::to_allocvec(records)?;
+                let mut v = format!("{e}:");
+                for b in bytes {
+                    v.push_str(&format!("{b:02x}"));
+                }
+                v
+            }
+        };
+        Meta::kv_set_durable(self, "gate_marker", &v)
     }
 }
 

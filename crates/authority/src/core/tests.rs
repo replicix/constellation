@@ -17740,6 +17740,38 @@ mod locks {
         );
     }
 
+    /// Review round 2 (SHOULD-2): the marker a claim ships is persisted with
+    /// its proof, and the claimant's strand after a restart uses it, not a
+    /// marker recomputed from state the restart rebuilt (here, a re-adoption
+    /// that now names a tail would recompute an empty marker and drop nothing
+    /// from its copies). Fails without the persisted marker: the records
+    /// come back empty.
+    #[test]
+    fn the_claimants_marker_is_the_one_that_was_shipped_also_after_a_restart() {
+        let g = (1u64 << constellation_meta::delegation::GEN_EPOCH_SHIFT) | 1;
+        let mut h = orphan_delegate_of(g);
+        h.hold(2, Some(takeover_gate(false)));
+        let mut out = Vec::new();
+        h.core.issue_marker(h.clk(), 0, &h.meta, &mut out);
+        let shipped = vec![constellation_meta::LogRecord::TailFollowsThrough {
+            prev_epoch: 1,
+            through: 0,
+        }];
+        assert_eq!(
+            crate::replica::Replica::gate_marker_persisted(&h.meta),
+            Some((2, shipped.clone()))
+        );
+        // The restart: memory gone, the re-adoption names a tail.
+        h.core.bk.gate_marker = None;
+        h.core.bk.gate_names_tail = true;
+        let gate = takeover_gate(true);
+        assert_eq!(h.core.gate_marker_records(&gate, &h.meta), shipped);
+        // Another epoch's persisted marker is not this gate's.
+        h.core.bk.gate_marker = None;
+        let other = PendingGate { epoch: 3, ..gate };
+        assert!(h.core.gate_marker_records(&other, &h.meta).is_empty());
+    }
+
     /// ADR-43 (re-review SHOULD-1): a backup role that cannot be read is not
     /// "no role". The start notes it, and a claim is refused (it would
     /// re-ship no tail) until a read succeeds, which restores the role.

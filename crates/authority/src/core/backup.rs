@@ -979,6 +979,12 @@ pub(crate) struct BackupState {
     /// pass of the gate has cleared the tail it re-applied, which would read
     /// as a marker that carried none).
     pub(crate) gate_orphan_proof: Option<(Epoch, constellation_meta::OrphanProof)>,
+    /// Review round 2 (SHOULD-2): the records of the open gate's marker as
+    /// they were shipped, with the gate's epoch (persisted before the marker
+    /// ships, next to the orphan proof): the claimant's own strand judges
+    /// its member copies by them, not by a marker recomputed from state a
+    /// restart has rebuilt.
+    pub(crate) gate_marker: Option<(Epoch, Vec<constellation_meta::LogRecord>)>,
     /// Plan 43 C3 (a delegate that takes the root over): this node's own
     /// rows as the delegate of the generations the open gate strands, as
     /// its journal held them, until the gate re-appends them after the

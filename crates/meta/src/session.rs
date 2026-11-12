@@ -1915,8 +1915,14 @@ impl SessionState {
         // caller's interrupt.
         //
         // (Lock order: `holds()` takes the store's `held_copies` while this
-        // holds `inner`; a release drops `held_copies` before it wakes this
-        // state, so the order `inner`, `held_copies` is the only one.)
+        // holds `inner`, only to copy the candidates out; a release drops
+        // `held_copies` before it wakes this state, so the order `inner`,
+        // `held_copies` is the only one. The store snapshot the lazy
+        // completed-rid check opens is opened with `held_copies` unlocked,
+        // but under `inner`: that is deadlock-free because a fjall
+        // snapshot (`read_tx`) is a lock-free read of the keyspace and never
+        // waits for the single writer, and no writer takes `inner` while
+        // it holds the writer lock (`wake` runs after the transaction).)
         if let Some(p) = phase.filter(|p| (p.holds)()) {
             let started = Instant::now();
             let mut reconciled = false;

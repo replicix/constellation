@@ -4606,7 +4606,30 @@ in the re-ship's transaction (`StrandArgs::marker`). Before, those copies stayed
 for good (a silent leak without the holds) and their holds failed reads of their
 keys at the bound.
 
-*Not covered*: a `read` or `copy_file_range` on a file handle opened before a
+The rule is a stored fact, not only a segment-time rule: a marker with no tail
+raises `local["member_settled_below"]` to the lowest epoch it names
+(`note_log_tail_tx`), and a copy whose identity epoch is below it (and that no
+marker named with a `through`) is settled wherever this replica meets it
+(`log_settled_tx`): a namespace rebuilt from a log that carries the marker
+adopts the fact (`adopt_log_tail_facts_tx`), so the rebuild's own strand keeps
+no older copy and no hold (`locks-unlinked-delegated-dcrash-pause` seed 558's
+rebuild lane). An acknowledged row the rule drops is counted
+`read_holds_abandoned` and warned of: it only happens after a lossy claim.
+The claimant's marker is persisted next to its orphan proof before it ships and
+its gate strand uses that, not a recomputation. The model's `marker_keeps`
+(`crates/model/src/backup.rs`) has the rule, and `tests/marker_parity.rs`
+compares it with the product's on the marker cases.
+
+The lazy reap of holds whose rid is completed never takes a hold whose
+transaction has not committed (the strand that indexes the hold removes the
+`completed` row in the same transaction, and a reader's snapshot still has it),
+and re-checks the row inside its write transaction.
+
+`copy_file_range` waits on its source's hold (it writes what a read of the
+source answers as a new acknowledged write, so a stale read would be durable),
+on the pool thread the copy runs on.
+
+*Not covered*: a `read` on a file handle opened before a
 deposition does not consult the holds (a read runs on an io_uring ring thread,
 which must not wait): close-to-open holds (the open is the check), but
 read-your-writes through an fd that stays open across a deposition does not,

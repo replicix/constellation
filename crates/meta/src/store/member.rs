@@ -35,8 +35,10 @@
 //!    never committed (the sealer's contiguous hold did not reach them).
 //!    A claim that carries no tail at all (every `TailFollowsThrough` of its
 //!    marker says `through: 0`, nothing else follows, no abandon) settles the
-//!    older epochs too: the epochs below the ones it names are rows no claim
-//!    will carry either (the lease it took over named no tail, and its
+//!    older epochs too: the epochs below the ones it names (every row whose
+//!    identity epoch, `ident.0`, is lower, not the copy's slot: a row
+//!    re-journaled under `k-1` with `TailOf(k-2, j)` is judged by `k-2`) are
+//!    rows no claim will carry either (the lease it took over named no tail, and its
 //!    predecessor's marker may never have landed), so those rows go as well.
 //!    The claimant applies the same rules to its own copies at its gate
 //!    ([`super::StrandArgs`]), as it never applies its own marker.
@@ -108,6 +110,9 @@ pub struct ReadHoldStats {
     pub abandoned: u64,
 }
 
+/// A hold as the lazy checks carry it: `(slot, first, rid)`.
+type HoldRef = (u64, u64, Option<Rid>);
+
 /// A release a transaction staged ([`Meta::flush_held_releases`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StagedRelease {
@@ -162,16 +167,50 @@ fn kv_u64(r: &impl Readable, meta: &Meta, key: &str) -> Result<Option<u64>, Meta
     Ok(kv_get_tx(r, &meta.local, key)?.and_then(|s| s.parse().ok()))
 }
 
+/// Raise `key` to `value` when that is more than it holds; whether it did.
 fn kv_raise(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     key: &str,
     value: u64,
-) -> Result<(), MetaError> {
+) -> Result<bool, MetaError> {
     if kv_u64(&*tx, meta, key)?.is_none_or(|old| value > old) {
         kv_set_tx(tx, &meta.local, key, &value.to_string());
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
+}
+
+/// `local["member_settled_below"]`: the lowest epoch a marker that carried
+/// no tail named ([`no_tail_floor`]). A claim without a tail says that no
+/// claim after it carries a row of an epoch below the ones it names, so a
+/// row whose identity epoch is below it (and that no marker named with a
+/// `through`) is settled whenever this replica meets it, not only when it
+/// applies the marker: a copy made after the marker was applied (a namespace
+/// rebuilt from a log that carries it) is judged by it too.
+fn settled_below_key() -> &'static str {
+    "member_settled_below"
+}
+
+/// The lowest epoch the marker `records` names when it is the marker of a
+/// claim that carries no tail at all: every `TailFollowsThrough` of it says
+/// `through: 0`, no plain `TailFollows`, no abandon, no re-shipped identity.
+fn no_tail_floor(records: &[LogRecord]) -> Option<u64> {
+    let mut lo: Option<u64> = None;
+    for rec in records {
+        match rec {
+            LogRecord::TailFollowsThrough {
+                prev_epoch,
+                through: 0,
+            } => lo = Some(lo.map_or(*prev_epoch, |l| l.min(*prev_epoch))),
+            LogRecord::TailFollowsThrough { .. }
+            | LogRecord::TailFollows { .. }
+            | LogRecord::TailOf { .. }
+            | LogRecord::GroupAbandoned { gen: 0, .. } => return None,
+            _ => {}
+        }
+    }
+    lo
 }
 
 /// Remember what a segment the log delivered says of an epoch's tail
@@ -184,21 +223,27 @@ pub(crate) fn note_log_tail_tx(
     epoch: u64,
     records: &[LogRecord],
     prev_applied: Option<crate::session::JournalPos>,
-) -> Result<(), MetaError> {
+) -> Result<bool, MetaError> {
+    let mut changed = false;
     if let Some(prev) = prev_applied.filter(|p| p.epoch < epoch) {
-        kv_raise(tx, meta, &shipped_key(prev.epoch), prev.jseq)?;
+        changed |= kv_raise(tx, meta, &shipped_key(prev.epoch), prev.jseq)?;
     }
     for rec in records {
         match rec {
-            LogRecord::TailOf { epoch, jseq } => kv_raise(tx, meta, &reship_key(*epoch), *jseq)?,
+            LogRecord::TailOf { epoch, jseq } => {
+                changed |= kv_raise(tx, meta, &reship_key(*epoch), *jseq)?
+            }
             LogRecord::TailFollowsThrough {
                 prev_epoch,
                 through,
-            } => kv_raise(tx, meta, &through_key(*prev_epoch), *through)?,
+            } => changed |= kv_raise(tx, meta, &through_key(*prev_epoch), *through)?,
             _ => {}
         }
     }
-    Ok(())
+    if let Some(lo) = no_tail_floor(records) {
+        changed |= kv_raise(tx, meta, settled_below_key(), lo)?;
+    }
+    Ok(changed)
 }
 
 /// Plan 46 M1.4 step 4 (SHOULD-3): how far a re-ship of `epoch`'s own tail
@@ -239,22 +284,51 @@ pub(crate) fn reship_progress_tx(
 
 /// Whether the log says a row of `epoch`'s tail needs no copy: it is carried
 /// (shipped by its own epoch, or named by a re-ship), or it was never
-/// committed (past the sealer's hold).
+/// committed (past the sealer's hold, or in an epoch a claim without a tail
+/// settled, [`settled_below_key`]).
 fn log_settled_tx(
     r: &impl Readable,
     meta: &Meta,
     epoch: u64,
     row: &MemberTx,
 ) -> Result<bool, MetaError> {
+    Ok(log_settled_why_tx(r, meta, epoch, row)?.is_some())
+}
+
+/// [`log_settled_tx`] with the reason: `Some(true)` when only the settled
+/// floor of a claim without a tail settles the row (a gated one is then lost
+/// by that rule, not carried), `Some(false)` for the other reasons.
+fn log_settled_why_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    epoch: u64,
+    row: &MemberTx,
+) -> Result<Option<bool>, MetaError> {
     let (first, last) = (row.tx.first, row.tx.last);
     if kv_u64(r, meta, &shipped_key(epoch))?.is_some_and(|s| last <= s) {
-        return Ok(true);
+        return Ok(Some(false));
     }
     let (ie, ij) = tail_identity(&row.tx.records).unwrap_or((epoch, first));
     if kv_u64(r, meta, &through_key(ie))?.is_some_and(|t| ij > t) {
-        return Ok(true);
+        return Ok(Some(false));
     }
-    Ok(kv_u64(r, meta, &reship_key(ie))?.is_some_and(|m| ij <= m))
+    if kv_u64(r, meta, &reship_key(ie))?.is_some_and(|m| ij <= m) {
+        return Ok(Some(false));
+    }
+    Ok(below_settled_floor_tx(r, meta, ie, None)?.then_some(true))
+}
+
+/// Whether identity epoch `ie` is below the floor a claim without a tail
+/// set, and no marker named it with a `through`. `also` is the floor of the
+/// segment being applied, whose facts are not in the store yet.
+fn below_settled_floor_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    ie: u64,
+    also: Option<u64>,
+) -> Result<bool, MetaError> {
+    let floor = kv_u64(r, meta, settled_below_key())?.max(also);
+    Ok(floor.is_some_and(|b| ie < b) && kv_u64(r, meta, &through_key(ie))?.is_none())
 }
 
 /// Whether the log this replica applied carries row `ident` of `epoch`'s
@@ -298,9 +372,14 @@ pub(crate) fn drop_settled_rows_tx(
     for e in epochs_in(&*tx, meta)? {
         let mut left = 0usize;
         for row in rows_in(&*tx, meta, e)? {
-            if log_settled_tx(&*tx, meta, e, &row)? {
+            if let Some(by_floor) = log_settled_why_tx(&*tx, meta, e, &row)? {
                 tx.remove(&meta.backup_tail, tail_key(member_epoch(e), row.tx.first));
-                meta.release_row_tx(tx, member_epoch(e), row.tx.first);
+                if by_floor && row.class.gated() {
+                    warn_gated_row_lost(e, &row);
+                    meta.release_abandoned_row_tx(tx, member_epoch(e), row.tx.first);
+                } else {
+                    meta.release_row_tx(tx, member_epoch(e), row.tx.first);
+                }
                 dropped += 1;
             } else {
                 left += 1;
@@ -313,9 +392,25 @@ pub(crate) fn drop_settled_rows_tx(
     Ok(dropped)
 }
 
+/// A gated (acknowledged) row the settled floor of a claim without a tail
+/// dropped: its client was told it is committed and no lease names it any
+/// more, so this was the last copy. Counted as an abandoned hold by the
+/// caller.
+fn warn_gated_row_lost(epoch: u64, row: &MemberTx) {
+    tracing::warn!(
+        epoch,
+        first = row.tx.first,
+        last = row.tx.last,
+        class = ?row.class,
+        rid = ?row.rid,
+        "an acknowledged member copy row was dropped by a claim without a tail \
+         (no lease names its epoch's tail any more)"
+    );
+}
+
 /// Take over what the log told `side` of every epoch's tail (module doc's
-/// `member_shipped`/`member_reship`/`member_through`, each raised, never
-/// lowered): a namespace rebuilt from `side` is a replica that applied that
+/// `member_shipped`/`member_reship`/`member_through`/`member_settled_below`,
+/// each raised, never lowered): a namespace rebuilt from `side` is a replica that applied that
 /// log.
 pub(crate) fn adopt_log_tail_facts_tx(
     tx: &mut SingleWriterWriteTx,
@@ -324,7 +419,12 @@ pub(crate) fn adopt_log_tail_facts_tx(
     side: &Meta,
 ) -> Result<(), MetaError> {
     let mut facts: Vec<(String, u64)> = Vec::new();
-    for prefix in ["member_shipped:", "member_reship:", "member_through:"] {
+    for prefix in [
+        "member_shipped:",
+        "member_reship:",
+        "member_through:",
+        "member_settled_below",
+    ] {
         for guard in side_snap.prefix(&side.local, prefix.as_bytes()) {
             let (k, v) = guard.into_inner()?;
             let (Ok(k), Some(v)) = (
@@ -581,27 +681,63 @@ impl Meta {
         if !self.any_held() {
             return false;
         }
-        let held = self.held_copies.lock().unwrap();
-        let mut snap = None;
-        held.iter()
-            .any(|h| keys.iter().any(|k| h.keys.touches(k)) && !self.hold_row_is_back(&mut snap, h))
+        // The candidates are copied out under `held_copies`, so that no
+        // store snapshot is opened while it is locked (the writer takes it
+        // after the store's own lock).
+        let cands: Vec<HoldRef> = {
+            let held = self.held_copies.lock().unwrap();
+            held.iter()
+                .filter(|h| keys.iter().any(|k| h.keys.touches(k)))
+                .map(|h| (h.slot, h.first, h.rid))
+                .collect()
+        };
+        if cands.is_empty() {
+            return false;
+        }
+        let back = self.holds_back(&cands);
+        cands.iter().any(|c| !back.contains(&(c.0, c.1)))
     }
 
-    /// The row a hold is for is back: its rid is completed here, by the log
-    /// (a re-ship under any identity, or the client's retry run by the
-    /// successor) or by this node running it again as the holder. A
-    /// strand takes the `completed` row of an unshipped transaction out with
-    /// it, so a row that is there after the strand is the log's or a new
-    /// execution's (`locks-unlinked-delegated-dcrash-pause` seeds 651, 1687:
-    /// the re-elected holder ran the retry itself and kept the old copy).
-    /// The hold is reaped ([`Self::reap_completed_holds`]).
-    fn hold_row_is_back(&self, snap: &mut Option<fjall::Snapshot>, h: &HeldCopy) -> bool {
-        let Some(rid) = h.rid else {
-            return false;
-        };
-        let snap = snap.get_or_insert_with(|| self.db.read_tx());
-        let back = matches!(snap.get(&self.completed, rid.to_key()), Ok(Some(_)));
-        if back {
+    /// Which of `cands` are back: the row a hold is for is back when its
+    /// rid is completed here, by the log (a re-ship under any identity, or
+    /// the client's retry run by the successor) or by this node running it
+    /// again as the holder. A strand takes the `completed` row of an
+    /// unshipped transaction out with it, so a row that is there after the
+    /// strand is the log's or a new execution's
+    /// (`locks-unlinked-delegated-dcrash-pause` seeds 651, 1687: the
+    /// re-elected holder ran the retry itself and kept the old copy). The
+    /// holds found back are reaped ([`Self::reap_completed_holds`]).
+    ///
+    /// A hold whose transaction has not committed (it is in `staged_holds`
+    /// until its thread's flush) is never back: the strand that indexed it
+    /// also removes the rid's `completed` row, but the snapshot read here
+    /// still has the old one (review MUST-1). The staged set is read before
+    /// the snapshot is opened, and a hold is staged before it is indexed
+    /// (`hold_row_tx`), so a candidate that is not staged was committed
+    /// before the snapshot.
+    fn holds_back(&self, cands: &[HoldRef]) -> Vec<(u64, u64)> {
+        if cands.iter().all(|c| c.2.is_none()) {
+            return Vec::new();
+        }
+        let staged: Vec<(u64, u64)> = self
+            .staged_holds
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, s, f)| (*s, *f))
+            .collect();
+        let snap = self.db.read_tx();
+        let back: Vec<(u64, u64)> = cands
+            .iter()
+            .filter(|(slot, first, rid)| {
+                !staged.contains(&(*slot, *first))
+                    && rid.is_some_and(|rid| {
+                        matches!(snap.get(&self.completed, rid.to_key()), Ok(Some(_)))
+                    })
+            })
+            .map(|c| (c.0, c.1))
+            .collect();
+        if !back.is_empty() {
             self.reap_needed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -610,32 +746,60 @@ impl Meta {
 
     /// Take the holds of rows that are back out of the persisted set and the
     /// index (the lazy check of [`Self::member_copy_touches`] found them).
+    /// Each is checked again inside the write transaction: a strand that
+    /// committed while this waited for the writer may have held the row anew
+    /// (the `completed` row it removed is gone, or the hold key is another
+    /// execution's), and that hold stays.
     pub(crate) fn reap_completed_holds(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.reap_needed.swap(false, Relaxed) {
             return;
         }
-        let back: Vec<(u64, u64)> = {
-            let held = self.held_copies.lock().unwrap();
-            let mut snap = None;
-            held.iter()
-                .filter(|h| self.hold_row_is_back(&mut snap, h))
-                .map(|h| (h.slot, h.first))
-                .collect()
-        };
+        let cands: Vec<HoldRef> = self
+            .held_copies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| (h.slot, h.first, h.rid))
+            .collect();
+        let back = self.holds_back(&cands);
         self.reap_needed.store(false, Relaxed);
         if back.is_empty() {
             return;
         }
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(hook) = self.reap_hook.get() {
+            hook();
+        }
         let mut tx = self.db.write_tx();
+        let mut reaped: Vec<(u64, u64)> = Vec::new();
         for (slot, first) in &back {
-            tx.remove(&self.local, read_hold_key(*slot, *first));
+            let Some(rid) = cands
+                .iter()
+                .find(|c| (c.0, c.1) == (*slot, *first))
+                .and_then(|c| c.2)
+            else {
+                continue;
+            };
+            let key = read_hold_key(*slot, *first);
+            let same_hold = matches!(
+                tx.get(&self.local, &key),
+                Ok(Some(v)) if crate::KeySet::decode(&v).is_ok_and(|(_, r)| r == Some(rid))
+            );
+            let completed = matches!(tx.get(&self.completed, rid.to_key()), Ok(Some(_)));
+            if same_hold && completed {
+                tx.remove(&self.local, key);
+                reaped.push((*slot, *first));
+            }
+        }
+        if reaped.is_empty() {
+            return;
         }
         if tx.commit().is_err() {
             return;
         }
         let mut held = self.held_copies.lock().unwrap();
-        held.retain(|h| !back.contains(&(h.slot, h.first)));
+        held.retain(|h| !reaped.contains(&(h.slot, h.first)));
         self.any_held_copy.store(!held.is_empty(), Relaxed);
         drop(held);
         self.session.wake();
@@ -773,6 +937,12 @@ impl Meta {
             );
         }
         tx.insert(&self.local, read_hold_key(slot, first), keys.encode(rid)?);
+        // Staged before it is indexed: a reader that meets the index entry
+        // finds the stage too (`holds_back`).
+        self.staged_holds
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), slot, first));
         let mut held = self.held_copies.lock().unwrap();
         held.retain(|h| (h.slot, h.first) != (slot, first));
         let since_ms = self.held_copy_now_ms();
@@ -788,10 +958,6 @@ impl Meta {
         self.hold_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(held);
-        self.staged_holds
-            .lock()
-            .unwrap()
-            .push((std::thread::current().id(), slot, first));
         Ok(())
     }
 
@@ -862,6 +1028,79 @@ impl Meta {
         )?;
         drop(tx);
         Ok(())
+    }
+
+    /// Tests only: what a strand does to a held row, with its transaction
+    /// open while `during` runs: index a hold of `(slot, first)` on the
+    /// dentry `name` of the root for `rid`, and remove `completed[rid]` (the
+    /// strand takes the row of an unshipped transaction out with it); then
+    /// commit and flush. `completed[rid]` is set before, as the row's first
+    /// execution left it.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_strand_hold_while(
+        &self,
+        slot: u64,
+        first: u64,
+        name: &str,
+        rid: Rid,
+        during: impl FnOnce(),
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        tx.insert(&self.completed, rid.to_key(), vec![0u8]);
+        tx.commit()?;
+        let mut tx = self.db.write_tx();
+        tx.remove(&self.completed, rid.to_key());
+        self.hold_row_tx(
+            &mut tx,
+            slot,
+            first,
+            crate::KeySet {
+                dentries: vec![(constellation_fs_core::types::ROOT_INO, name.into())],
+                inos: Vec::new(),
+            },
+            Some(rid),
+        )?;
+        during();
+        tx.commit()?;
+        self.flush_held_releases();
+        Ok(())
+    }
+
+    /// Tests only: a committed hold of `(slot, first)` on the inode `ino`
+    /// (a strand's, with no row behind it).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_hold_ino_committed(
+        &self,
+        slot: u64,
+        first: u64,
+        ino: u64,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        self.hold_row_tx(
+            &mut tx,
+            slot,
+            first,
+            crate::KeySet {
+                dentries: Vec::new(),
+                inos: vec![ino],
+            },
+            None,
+        )?;
+        tx.commit()?;
+        self.flush_held_releases();
+        Ok(())
+    }
+
+    /// Tests only: see [`Meta::reap_hook`] field.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_reap_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.reap_hook.set(hook);
+    }
+
+    /// Tests only: the lazy reap of holds whose row is back.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn reap_completed_holds_for_tests(&self) {
+        self.reap_completed_holds();
     }
 
     /// [`Self::test_index_hold_in_dropped_tx`] on the inode `ino`.
@@ -955,11 +1194,18 @@ impl Meta {
     /// The `(slot, first)` of every acknowledged row this node holds reads of
     /// (ADR-57): empty at quiescence.
     pub fn read_holds(&self) -> Vec<(u64, u64)> {
-        let held = self.held_copies.lock().unwrap();
-        let mut snap = None;
-        held.iter()
-            .filter(|h| !self.hold_row_is_back(&mut snap, h))
-            .map(|h| (h.slot, h.first))
+        let cands: Vec<HoldRef> = self
+            .held_copies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| (h.slot, h.first, h.rid))
+            .collect();
+        let back = self.holds_back(&cands);
+        cands
+            .iter()
+            .filter(|c| !back.contains(&(c.0, c.1)))
+            .map(|c| (c.0, c.1))
             .collect()
     }
 
@@ -1350,7 +1596,6 @@ pub(crate) fn member_rules_tx(
     let mut tail_ids: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut through_of: std::collections::BTreeMap<u64, u64> = Default::default();
     let mut follows: BTreeSet<u64> = BTreeSet::new();
-    let mut plain_follows = false;
     let mut abandoned: std::collections::BTreeMap<u64, u64> = Default::default();
     for rec in f.records {
         match rec {
@@ -1366,7 +1611,6 @@ pub(crate) fn member_rules_tx(
             }
             LogRecord::TailFollows { prev_epoch } => {
                 follows.insert(*prev_epoch);
-                plain_follows = true;
             }
             LogRecord::GroupAbandoned {
                 epoch,
@@ -1378,12 +1622,11 @@ pub(crate) fn member_rules_tx(
             _ => {}
         }
     }
-    // A claim that carries no tail: its marker names only empty tails.
-    let carries_no_tail = !through_of.is_empty()
-        && through_of.values().all(|t| *t == 0)
-        && !plain_follows
-        && abandoned.is_empty()
-        && tail_ids.is_empty();
+    // A claim that carries no tail: its marker names only empty tails. The
+    // fact it sets ([`settled_below_key`]) is read from the store, where
+    // `note_log_tail_tx` put it (and from this segment's records, for a
+    // caller that has not noted them yet).
+    let floor_here = no_tail_floor(f.records);
     for e in epochs_in(&*tx, meta)? {
         let mut left = 0usize;
         for row in rows_in(&*tx, meta, e)? {
@@ -1426,11 +1669,22 @@ pub(crate) fn member_rules_tx(
                 meta.release_abandoned_row_tx(tx, member_epoch(e), first);
                 continue;
             }
-            if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th)
-                || (carries_no_tail && ident.0 < f.epoch && !through_of.contains_key(&ident.0))
-            {
+            if through_of.get(&ident.0).is_some_and(|th| ident.1 > *th) {
                 tx.remove(&meta.backup_tail, key);
                 meta.release_row_tx(tx, member_epoch(e), first);
+                out.dropped += 1;
+                continue;
+            }
+            if !through_of.contains_key(&ident.0)
+                && below_settled_floor_tx(&*tx, meta, ident.0, floor_here)?
+            {
+                tx.remove(&meta.backup_tail, key);
+                if row.class.gated() {
+                    warn_gated_row_lost(e, &row);
+                    meta.release_abandoned_row_tx(tx, member_epoch(e), first);
+                } else {
+                    meta.release_row_tx(tx, member_epoch(e), first);
+                }
                 out.dropped += 1;
                 continue;
             }

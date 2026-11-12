@@ -677,22 +677,60 @@ impl State {
     /// for its member copies (coverage is `Tail` of the written slot).
     fn marker_drops(&mut self, cfg: &BackupModel, i: usize, e: u8) {
         let follows = self.follows.iter().find(|(fe, _, _)| *fe == e).cloned();
+        let follows = follows.as_ref().map(|(_, prev, rows)| (*prev, &rows[..]));
         self.nodes[i].member.retain(|(me, id, class)| {
-            if *me >= e {
-                return true;
-            }
-            match &follows {
-                // Rule 2: `TailFollowsThrough { prev_epoch, through }` drops
-                // the rows the sealer's contiguous hold did not reach.
-                Some((_, prev, rows)) if prev == me => {
-                    !cfg.drop_member_at_tail_follows && rows.contains(id)
-                }
-                // Rule 4: a marker with no tail for the epoch drops the
-                // never-acknowledged (Archive) rows only; a RootGroup row may
-                // be another tenure's inherited tail and stays until covered.
-                _ => *class == Class::RootGroup,
-            }
+            marker_keeps(
+                *me,
+                *id,
+                *class,
+                e,
+                follows,
+                cfg.drop_member_at_tail_follows,
+            )
         });
+    }
+}
+
+/// Whether a member row `(me, id, class)` survives the marker of epoch `e`
+/// (spec §6.4's drop rules for a copy, as the product's `member_rules_tx`
+/// applies them): `follows` is the tail the marker names, `(prev_epoch, the
+/// ids it re-ships)`, or `None` for a claim that names none.
+///
+/// - Rule 2: a named tail drops the rows of `prev_epoch` it does not
+///   re-ship (the sealer's contiguous hold did not reach them).
+/// - A claim that carries no tail at all (none named, or a named one that
+///   re-ships nothing: the product's marker says `through: 0` for every
+///   epoch it names, and for a claim over no tail `{e - 1, 0}`) settles the
+///   older epochs too: nothing of an epoch below the ones it names, the
+///   named one included, is carried by any later claim, whatever the
+///   row's class (review round 2, MUST-2; the product's persisted
+///   `member_settled_below`).
+/// - Rule 4: a marker that names no tail of the row's epoch drops only its
+///   [`Class::Archive`] rows; a [`Class::RootGroup`] row may be another
+///   tenure's inherited tail and stays until coverage.
+pub fn marker_keeps(
+    me: u8,
+    id: u8,
+    class: Class,
+    e: u8,
+    follows: Option<(u8, &[u8])>,
+    drop_member_at_tail_follows: bool,
+) -> bool {
+    if me >= e {
+        return true;
+    }
+    // The lowest epoch the marker names, when it carries no tail.
+    let no_tail_lo = match follows {
+        Some((prev, [])) => Some(prev),
+        None if e >= 2 => Some(e - 1),
+        _ => None,
+    };
+    if no_tail_lo.is_some_and(|lo| me <= lo) {
+        return false;
+    }
+    match follows {
+        Some((prev, rows)) if prev == me => !drop_member_at_tail_follows && rows.contains(&id),
+        _ => class == Class::RootGroup,
     }
 }
 

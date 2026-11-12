@@ -4763,6 +4763,10 @@ fn backup_strict_1389_waits_for_the_group() {
     let sum =
         |f: fn(&constellation_authority::Stats) -> u64| -> u64 { r.stats.values().map(f).sum() };
     assert_eq!(sum(|s| s.ttl_claims_without_tail), 0);
+    assert_eq!(
+        r.read_holds_abandoned, 0,
+        "a claim that lost nothing abandoned no acknowledged row"
+    );
     assert!(
         sum(|s| s.tail_fetch_attempts) > 0,
         "node 3 never asked the group: {:?}",
@@ -17533,6 +17537,34 @@ fn regression_dcrash_pause_leaked_read_holds_seeds_651_3994_5767() {
                  AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dcrash-pause"
             )
         });
+    }
+}
+
+/// `locks-unlinked-delegated-dcrash-pause` seed 558 (ADR-57 review round 2,
+/// MUST-2): the seed the review traced the rebuild's leak through. A
+/// deposed root's rebuild from the log puts its unshipped acknowledged rows
+/// into a member copy with a read hold each, and a claim without a tail in
+/// that log settles the older epochs, a fact the rebuild adopts
+/// (`member_settled_below`; the store-level pin is
+/// `a_rebuild_from_a_log_with_a_no_tail_marker_keeps_no_older_copy_nor_hold`).
+/// In this simulation the seed does not reach a rebuild any more (the rebuild
+/// counter is 0, before and after the fix), so this pin only holds the run
+/// to the outcome: no hold left at convergence, and no acknowledged row given
+/// up by the rule (a lossy claim would count one).
+#[test]
+fn regression_locks_unlinked_delegated_dcrash_pause_seed_558_leaves_no_hold_and_gives_up_no_row() {
+    for cfg in [
+        unclocked(locks_unlinked_dcrash_pause_config()),
+        locks_unlinked_dcrash_pause_config(),
+    ] {
+        let r = run_seed(558, cfg).unwrap_or_else(|e| {
+            panic!(
+                "locks-unlinked-delegated-dcrash-pause seed 558: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dcrash-pause"
+            )
+        });
+        assert_eq!(r.read_holds_left, 0);
+        assert_eq!(r.read_holds_abandoned, 0);
     }
 }
 
