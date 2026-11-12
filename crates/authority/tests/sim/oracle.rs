@@ -1068,6 +1068,12 @@ struct ArchiveInner {
     /// When each segment first arrived (ADR-58 C3: when a rid's outcome
     /// reached the log, for the end-of-run half of `held-behind-lost-chunk`).
     arrived: HashMap<Seq, tokio::time::Instant>,
+    /// ADR-55 (M3, `stream_log_contiguous`): the highest index of each
+    /// delegation stream in the applied, unfenced prefix, and the segments
+    /// that carried an index past the next one (a hole the successor's cursor
+    /// skips for good).
+    stream_top: HashMap<u64, u64>,
+    stream_holes: Vec<String>,
 }
 
 impl Default for ArchiveIndex {
@@ -1146,6 +1152,18 @@ impl ArchiveIndex {
                         }
                     }
                 }
+                for (gen, idx) in seg.origins.iter().copied() {
+                    if gen == 0 {
+                        continue;
+                    }
+                    let top = g.stream_top.get(&gen).copied().unwrap_or(0);
+                    if idx > top + 1 {
+                        g.stream_holes.push(format!(
+                            "stream_log_contiguous: stream {gen:#x} index {idx} is in segment {seq} but the log carries it only through {top}"
+                        ));
+                    }
+                    g.stream_top.insert(gen, top.max(idx));
+                }
                 g.max_epoch = g.max_epoch.max(seg.epoch);
             }
             g.prefix = seq;
@@ -1169,6 +1187,12 @@ impl ArchiveIndex {
                 )
             })
             .collect()
+    }
+
+    /// ADR-55 (M3): the delegation streams whose rows reached the log with an
+    /// index missing before them, one description each.
+    pub fn stream_holes(&self) -> Vec<String> {
+        self.inner.lock().unwrap().stream_holes.clone()
     }
 
     /// Where the rid's outcome (`Completed { rid }` or `Refused { rid, .. }`)
