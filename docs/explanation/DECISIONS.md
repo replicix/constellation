@@ -4678,9 +4678,9 @@ See: `crates/meta/src/store/member.rs` (`hold_row_tx`, `release_*_tx`),
 
 **Status**: decided by the maintainer on 2026-11-11 (parent-directory key
 tainting; the `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751).
-Refines the ship rule of plan 30 M4. Part A only: the second half of the
-decision as first drafted, a `repair drop-held` that redoes in place what does
-not need the lost content, is **deferred to a design item** (part B, below).
+Refines the ship rule of plan 30 M4. Part A is the ship rule and the drop's
+dependency walk; part B (below) is the drop that redoes in place what does not
+need the lost content.
 
 **Context**: in those seeds Group-acknowledged namespace rows sat in the
 holder's journal, held behind a seed (a `WriteManifest` naming a chunk whose
@@ -4718,35 +4718,57 @@ a directory held every later one in it, and the drop rolled all of them back.
   outstanding row wrote exclusively) is a planner violation: counted
   (`Meta::publish_unplaced`), logged, a `debug_assert!`, and the publish
   defers.
-- **The drop follows the rule.** `repair drop-held` rolls back the seeds and
-  the held transactions that depend on them by the same rule, so a sibling
-  that only merges the directory is no longer rolled back with them. What it
-  does roll back and may have been acknowledged (a rename, chmod or unlink of
-  the damaged file itself, or a create of a name it vacated) is the operator's
-  cost of a lost chunk that part A does not avoid; the drop names those rows
-  (`DroppedHeld::rolled_back_on_inode`) and the sim fails any other
-  acknowledged namespace op in `rolled_back`
-  (`drop_rolled_back_independent_acked`). `DroppedHeld::non_sequencer` says the
-  dropper was not the sequencer in force (a deposition's strand).
+- **The drop follows the rule.** `repair drop-held` walks the seeds and the
+  held transactions that depend on them by the same rule, so a sibling that
+  only merges the directory is no longer reached by it. Of what depends on
+  the seeds by key, part B rolls back only what needs the lost content and
+  redoes the rest in place (a rename, chmod or unlink of the damaged file, a
+  create of a name it vacated). `DroppedHeld::non_sequencer` says the dropper
+  was not the sequencer in force (a deposition's strand, which rolls back
+  every dependent).
 
-**Part B, deferred to a design item**: the drop could redo in place the rows
-that do not need the lost content (keeping their journal rows, rids and
-answers) and list what it does undo. A first implementation did not converge in
-the simulation: a redone row outlives its `RolledBack` in the members' copies
-and in a deposed dropper's sealed tail, a parked answer of a refused rid is
-released as `Ok`, the reship gate resurrects a refused rid, and a kept in-doubt
-inode keeps an allocation its requester then reuses, and a rid a second drop
-rolls back again replays behind the rids the first drop queued, out of the order
-their clients were told (drop-held-chain-backed seed 1848: an acknowledged
-rename replayed after a later acknowledged create of the name it moves). Those
-are one class (what
-a partial rollback leaves behind on other nodes and in parked state) and get
-one design: where the `RolledBack` is placed and how it reaches every member,
-the reship gate's outcome test, the parked reply of a refused rid, the
-dropper's lease margin, and what a kept in-doubt row means for the requester's
-allocations. Until then the acknowledged operations a drop rolls back on the
-damaged file itself are listed by rid in `rolled_back_on_inode`, and a client
-that sees them later finds them replayed or refused, as before.
+**Part B: a drop's partial rollback is a decision the log makes.** A first
+implementation of the redo (the drop undoes only what needs the lost content
+and redoes the rest in place) did not converge in the simulation: it made the
+drop one local transaction, and every other copy of the dropper's state (the
+members' copies of the rolled-back rows, the successor's re-ship gate, the
+dropper's own sealed tail, a parked answer's snapshot, the kept merge's gap
+rule) learned of it by its own rule, later, and some never. Those failures
+(`drop-held-chain-backed` seeds 1714 and 1529, `flex-backup+durability` 1818)
+are one class: what a partial rollback leaves behind on other nodes and in
+parked state. Part B inverts the structure: **the drop decides nothing locally;
+it journals one decision record, and every effect, the dropper's own included,
+is the consequence of that record being in the log.**
+
+- **D1, the decision is in the log.** `LogRecord::DropHeld { ino, chunks,
+  rolled_back: [((epoch, jseq), rid)] }` (it replaces `RolledBack`) is an
+  archive-class record with no keys: it ships in the next segment ahead of
+  everything the seed holds, and its transaction changes no other state.
+- **D2, retired idents never land.** A replica that applies it from the log
+  (or ships it) records the identities as retired, holes its member and backup
+  copies and strands what it was streamed of them. The takeover's re-ship gate
+  skips a retired identity (`tail_retired`) and a `DropHeld` the log lacks
+  (`tail_drop_fenced`: its dropper lost the lease before deciding, the drop
+  never happened); any outcome of a rid, a refusal included, is done. The
+  kept merge drops a retired copy before comparing its sources and does not
+  read the rows above one as past a gap.
+- **D3, an answer is what the store says at its release.** A parked answer
+  (`Reply`, `Finish`) is released from the rid's outcome read at that
+  moment: `Executed` as it was parked releases as is, `Refused` releases the
+  refusal, no outcome aborts. The apply settles every park of a rid it refused.
+- **D4, local state follows the log.** The dropper strands the seed, redoes
+  the rest, refuses the queued seeds and removes the pending rows only when
+  it applies its own record from the log (the archive covers it). A dropper
+  deposed before that has a journal that differs from the members' copies by
+  the unshipped record alone.
+
+A drop that is decided in the log whose dropper dies before applying it is
+accepted (the maintainer, 2026-11-12): no successor completes it. Counted
+(`drop_decided_unapplied`) and documented in the Consequences. A redone row
+that does not apply as it ran at the apply (expected never) is rolled back by
+a follow-up `DropHeld` (`drop_follow_ups`). The dropper's lease margin, the
+`kept_diverged` special case and the escalation loop of the first
+implementation are gone: D4 makes them unnecessary.
 
 **Consequences**: the sim's real-time and session-order checks keep the log as
 the witness: a tenure's rows are taken in the order it journaled them only
@@ -4786,13 +4808,36 @@ that restarted) carries as one hole rows an earlier send had as transactions;
 the backup's hole supersedes the copies it spans, or its contiguous hold would
 end there and a successor drop the acknowledged rows past it.
 
+Part B's consequences. A drop's effect waits for its record to be archived, one
+archive round trip after an operator command, bounded by the existing
+`drop_held_await`. The one residual: a dropper that dies after the record
+shipped and before it applied the drop leaves no conflict copy and no
+`Refused` row for the seed's rid (the lost write's surviving bytes are not
+preserved as an artifact; the seed's rows are retired, so nothing lands); the
+requester's retry by rid executes afresh from its own bytes, which is the better
+artifact when it exists. A redone row told in doubt (a parked Archive or Group
+answer whose settle window ended) lands when the operator's drop releases it,
+as a queued replay lands when the drain runs it: the sim's late-landing check
+exempts it past the log head at the apply (`redone_rids`; a redone row without
+a rid is in `redone` only), and a client that retried under a new rid gets two
+effects, as with a replay. A kept in-doubt create keeps its inode allocated
+(`needs_lost_content` leaves it redone): a requester's retry under a new rid
+allocates afresh. What the drop cannot avoid undoing and may have been
+acknowledged (a seed's own acknowledged write; an operation that needs its
+bytes) is listed (`acked_lost`), warned of per rid and counted
+(`status.held.acked_lost_total`); the sim fails any acknowledged namespace op in
+what a drop rolled back (`drop_rolled_back_independent_acked`, no excuse by
+inode) and any acknowledged rolled-back rid the drop did not list
+(`drop_acked_loss_invisible`).
+
 **Rejected**: removing `named.shared` from the planner alone (the captured
 before-images re-enter the same keys); treating a seed that changes the mode
 as exclusive on it (`WriteManifest` carries no mode); shipping part B's redo
 with part A (the oracle gate it needs does not converge).
 
 **May revert**: no. `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751
-pin part A.
+pin part A. Part B is pinned by `drop-held-chain-backed` seeds 1714, 1529 and
+1818 and by the five seeds above under the strict gate.
 
 See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
 `crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),

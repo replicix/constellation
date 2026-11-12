@@ -4920,6 +4920,7 @@ async fn operator_drop_hopeless(
     let now_ms = cluster.env.clock.elapsed_ms();
     for id in cluster.ids() {
         let n = cluster.get(id);
+        record_applied_drops(cluster, world, bucket, fault_log, id, now_ms);
         if !n.alive() {
             continue;
         }
@@ -4946,90 +4947,123 @@ async fn operator_drop_hopeless(
             // Through the core (`Control::DropHeld`), as the control API
             // does: it alone knows which answers of the dropped rows are
             // still parked.
-            let head_before = bucket.archive.head();
-            let dropped = match tokio::time::timeout(
-                Duration::from_secs(5),
+            let answer = tokio::time::timeout(
+                Duration::from_secs(60),
                 n.control(constellation_authority::Control::DropHeld {
                     ino,
                     remote,
                     sessions: Default::default(),
                 }),
             )
-            .await
-            {
-                Ok(Ok(Ok(constellation_authority::ControlOk::DroppedHeld(d)))) => Ok(d),
-                Ok(Ok(Ok(other))) => Err(format!("unexpected answer {other:?}")),
-                Ok(Ok(Err(e))) => Err(e),
-                _ => Err("no answer from the core".to_string()),
-            };
-            match dropped {
-                Ok(d) => {
-                    world
-                        .dropped_rids
-                        .lock()
-                        .unwrap()
-                        .extend(d.rolled_back.iter().copied());
-                    world.note_drop(d.rolled_back.iter().copied());
-                    // ADR-59: what the drop undid, and of it what depended
-                    // on the damaged inode's own keys.
-                    {
-                        let mut c = world.drop_counts.lock().unwrap();
-                        c.drops += 1;
-                        c.requeued += d.requeued as u64;
-                        c.on_inode += d.rolled_back_on_inode.len() as u64;
-                        c.non_sequencer += d.non_sequencer as u64;
-                        world
-                            .dropped_on_inode
-                            .lock()
-                            .unwrap()
-                            .extend(d.rolled_back_on_inode.iter().copied());
-                        if d.non_sequencer {
-                            world
-                                .dropped_by_non_sequencer
-                                .lock()
-                                .unwrap()
-                                .extend(d.rolled_back.iter().copied());
-                        }
-                    }
-                    // (What lands past the log's head from now on is the
-                    // drop's replay; the oracles' I4 relies on it.)
-                    world
-                        .dropped_head
-                        .lock()
-                        .unwrap()
-                        .extend(d.rolled_back.iter().map(|rid| (*rid, head_before)));
-                    // A row the drop kept with its op (its answer may have
-                    // left) is counted with the ungated I2 (b) pairs, not
-                    // judged: see `IdentityLedger::kept`.
-                    cluster.env.oracles.identity.lock().unwrap().keep(
-                        d.rolled_back
-                            .iter()
-                            .filter(|rid| !d.placeholders.contains(rid))
-                            .copied(),
-                    );
-                    world.remote_dropped.fetch_add(
-                        (d.dropped + d.queued_dropped) as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    // What the drop rolled back is tentative for the
-                    // checkers, as a deposition's rollback is (the core's
-                    // counters do not move for an operator's drop): the
-                    // dropped writes (refused replays) and their
-                    // dependents, re-executed after later ops.
-                    n.shared
-                        .tentative
-                        .lock()
-                        .unwrap()
-                        .extend(d.rolled_back.iter().copied());
-                    fault_log.lock().unwrap().push(format!(
-                        "t={now_ms} node {id}: repair drop-held {ino:#x}{}: {d:?}",
-                        if remote { " --remote" } else { "" }
-                    ));
-                }
-                Err(e) => fault_log.lock().unwrap().push(format!(
+            .await;
+            // (What the drops did is read from the replica's account, not
+            // from the command's answer alone: a dropper that restarts
+            // between its decision and its apply applies it from the plan,
+            // and nobody is waiting.)
+            if let Some(e) = match answer {
+                Ok(Ok(Ok(constellation_authority::ControlOk::DroppedHeld(_)))) => None,
+                Ok(Ok(Ok(other))) => Some(format!("unexpected answer {other:?}")),
+                Ok(Ok(Err(e))) => Some(e),
+                _ => Some("no answer from the core".to_string()),
+            } {
+                fault_log.lock().unwrap().push(format!(
                     "t={now_ms} node {id}: repair drop-held {ino:#x} refused: {e}"
-                )),
+                ));
             }
+            record_applied_drops(cluster, world, bucket, fault_log, id, now_ms);
+        }
+    }
+}
+
+/// ADR-59 part B: the drops node `id` applied since the last call, recorded
+/// for the oracles when they were applied (the apply is the drop's effect;
+/// what lands past the log's head from now on is its replay).
+fn record_applied_drops(
+    cluster: &Arc<Cluster>,
+    world: &Arc<ChunkWorld>,
+    bucket: &Arc<Bucket>,
+    fault_log: &Arc<Mutex<Vec<String>>>,
+    id: NodeId,
+    now_ms: u64,
+) {
+    let n = cluster.get(id);
+    for d in n.meta.take_applied_drops() {
+        let ino = d.ino;
+        let remote = false;
+        {
+            // ADR-59 part B: the drop's effect is its apply, when the
+            // log carried the decision; what lands past the log's head
+            // now is the drop's replay.
+            let head_before = bucket.archive.head();
+            world
+                .dropped_rids
+                .lock()
+                .unwrap()
+                .extend(d.rolled_back.iter().copied());
+            world.note_drop(d.rolled_back.iter().copied());
+            // ADR-59: what the drop undid, and of it what depended
+            // on the damaged inode's own keys.
+            {
+                let mut c = world.drop_counts.lock().unwrap();
+                c.drops += 1;
+                c.requeued += d.requeued as u64;
+                c.redone += d.redone as u64;
+                c.acked_lost += d.acked_lost.len() as u64;
+                c.follow_ups += d.follow_ups as u64;
+                c.non_sequencer += d.non_sequencer as u64;
+                world
+                    .acked_lost_rids
+                    .lock()
+                    .unwrap()
+                    .extend(d.acked_lost.iter().map(|(rid, _)| *rid));
+                if d.non_sequencer {
+                    world
+                        .dropped_by_non_sequencer
+                        .lock()
+                        .unwrap()
+                        .extend(d.rolled_back.iter().copied());
+                }
+            }
+            // (What lands past the log's head from now on is the
+            // drop's replay; the oracles' I4 relies on it.)
+            world
+                .dropped_head
+                .lock()
+                .unwrap()
+                .extend(d.rolled_back.iter().map(|rid| (*rid, head_before)));
+            {
+                let mut redone = cluster.env.oracles.redone_heads.lock().unwrap();
+                for rid in &d.redone_rids {
+                    redone.insert(*rid, head_before);
+                }
+            }
+            // A row the drop kept with its op (its answer may have
+            // left) is counted with the ungated I2 (b) pairs, not
+            // judged: see `IdentityLedger::kept`.
+            cluster.env.oracles.identity.lock().unwrap().keep(
+                d.rolled_back
+                    .iter()
+                    .filter(|rid| !d.placeholders.contains(rid))
+                    .copied(),
+            );
+            world.remote_dropped.fetch_add(
+                (d.dropped + d.queued_dropped) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // What the drop rolled back is tentative for the
+            // checkers, as a deposition's rollback is (the core's
+            // counters do not move for an operator's drop): the
+            // dropped writes (refused replays) and their
+            // dependents, re-executed after later ops.
+            n.shared
+                .tentative
+                .lock()
+                .unwrap()
+                .extend(d.rolled_back.iter().copied());
+            fault_log.lock().unwrap().push(format!(
+                "t={now_ms} node {id}: repair drop-held {ino:#x}{}: {d:?}",
+                if remote { " --remote" } else { "" }
+            ));
         }
     }
 }
@@ -6621,6 +6655,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         operator_lost_rids.extend(super::oracle::unlogged_delegate_rows(&oracles, &oracle));
         tentative.extend(lost);
     }
+    // ADR-59: the double fault of a lost chunk plus an acknowledged operation
+    // that needs it. The drop lists each such rid (`acked_lost`), warns of it
+    // and counts it; the listing is what I2 (c) accepts for it, and
+    // `drop_acked_loss_invisible` fails any acknowledged rolled-back rid the
+    // drop did not list.
+    operator_lost_rids.extend(world.acked_lost_rids.lock().unwrap().iter().copied());
     report.segments = oracle.segments;
     report.fenced = oracle.fenced;
     report.commits = commit_list.len();
@@ -6723,7 +6763,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // log ([`survivors_of_drop`]); the dropper alone is no excuse.
     {
         let by_non_sequencer = world.dropped_by_non_sequencer.lock().unwrap().clone();
-        let on_inode = world.dropped_on_inode.lock().unwrap().clone();
         let dropped_set = world.dropped_rids.lock().unwrap().clone();
         let survivors = super::oracle::survivors_of_drop(&oracle, &dropped_set);
         let acked_ns: BTreeSet<Rid> = events
@@ -6737,14 +6776,31 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 _ => None,
             })
             .collect();
-        let findings = super::oracle::drop_ack_findings(&super::oracle::DropAcks {
+        // (A namespace op the sim saw returned `Ok`, or an answer a client
+        // was given: the node's own reply or a requester's relay of the
+        // sequencer's, not the sequencer's `MutateReply` to the requester,
+        // which a lost message never delivers; a content op's commit is only
+        // the latter.)
+        let mut acked = acked_ns.clone();
+        acked.extend(
+            oracles
+                .acks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| a.kind == super::oracle::OutcomeKind::Ok && !a.reply)
+                .map(|a| a.rid),
+        );
+        let lost = world.acked_lost_rids.lock().unwrap().clone();
+        if let Some((check, rids)) = super::oracle::drop_ack_findings(&super::oracle::DropAcks {
             dropped: &dropped_set,
             acked_ns: &acked_ns,
+            acked: &acked,
             by_non_sequencer: &by_non_sequencer,
             survivors: &survivors,
-            on_inode: &on_inode,
-        });
-        if let Some((check, rids)) = findings {
+            completed: &|rid| oracle.completed_at.contains_key(rid),
+            lost: &lost,
+        }) {
             let acks = oracles.acks.lock().unwrap();
             let why: Vec<String> = rids
                 .iter()
@@ -6777,15 +6833,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             )));
         }
     }
-    // (What the drops attributed to the damaged inode is the operator's
-    // cost: a refusal that saw it saw the drop's action.)
-    let operator_cost: HashSet<Rid> = world
-        .dropped_on_inode
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .collect();
+    // (ADR-59 part B: no excuse by inode: what the drop rolled back is what
+    // needs the lost content, and a refusal that saw an acknowledged effect
+    // of a dropped op is a violation.)
+    let operator_cost: HashSet<Rid> = HashSet::new();
     // The history's verdicts are kept and returned after the log oracles
     // below: a run that breaks both (a refused call whose rid also ran, now
     // that its `EROFS` return is in the history) names the log oracle the
