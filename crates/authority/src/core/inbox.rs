@@ -1860,6 +1860,22 @@ impl Core {
                         // refused as a settle is. Halting would leave the
                         // requester's op unanswered until its deadline.
                         super::delegate::RecallPlan::Hold(gen) => {
+                            // R-J: a row of the stream only through the
+                            // holder's gate. The keys must still be the
+                            // stream's (a release in progress may have
+                            // taken them: the root path runs the op once it
+                            // has), and the stream honoured (the archive
+                            // carries its record, no root row of its keys
+                            // is unshipped): else the poll is repeated.
+                            if !matches!(
+                                replica.resolve_ownership(&keys),
+                                constellation_meta::delegation::Ownership::Delegated(ref d)
+                                    if d.gen == gen
+                            ) || !self.stream_honoured(now, gen)
+                            {
+                                self.stats.inbox_halted += 1;
+                                return Err(Halt::Recall);
+                            }
                             let settle = batch.ops[i].settle;
                             let code = if settle {
                                 super::client::settle_code(rid, decoded.as_ref().ok())

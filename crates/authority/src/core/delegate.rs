@@ -3292,6 +3292,12 @@ impl Core {
         deps: Position,
         replica: &dyn Replica,
     ) -> bool {
+        // R-J: a refusal is a row of the stream, journaled only through the
+        // holder's gate: for the root's own stream, honoured.
+        debug_assert!(
+            self.own_honoured(gen),
+            "a refusal journaled in the root's own stream {gen} before it is honoured"
+        );
         constellation_meta::clear_last_journaled();
         if let Err(error) = replica.delegate_refusal(rid, code, gen, deps) {
             tracing::warn!(node = self.me(), ?rid, %code, %error, "could not journal a delegate refusal");
