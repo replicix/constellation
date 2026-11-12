@@ -524,60 +524,115 @@ pub struct ClusterLocks {
 /// load while there is none.
 #[derive(Default)]
 pub struct Orphans {
+    state: Arc<OrphanState>,
+}
+
+#[derive(Default)]
+struct OrphanState {
     n: std::sync::atomic::AtomicUsize,
+    next_id: std::sync::atomic::AtomicU64,
     answers: Mutex<Vec<(Ino, Orphan)>>,
+    /// Signalled when an answer owed comes in.
+    landed: std::sync::Condvar,
 }
 
 /// An answer [`Orphans`] keeps.
 enum Orphan {
-    /// Not in yet.
-    Owed(tokio::sync::oneshot::Receiver<LockAnswer>),
+    /// Not in yet: a thread waits for it (the id names the entry).
+    Owed(u64),
     /// A grant, its floor not waited for.
     Granted(Position),
 }
 
 impl Orphans {
     /// Keep `answer`, owed to a request for `ino` that ended. What no longer
-    /// matters goes: answers that granted nothing, and grants no longer held.
-    fn keep(&self, meta: &Meta, ino: Ino, answer: tokio::sync::oneshot::Receiver<LockAnswer>) {
-        let mut v = self.answers.lock().unwrap();
-        v.retain_mut(|(i, o)| {
-            if let Orphan::Owed(rx) = o {
-                match rx.try_recv() {
-                    Ok(LockAnswer::Granted { position }) => *o = Orphan::Granted(position),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return true,
-                    Ok(_) | Err(_) => return false,
-                }
-            }
-            meta.locks().held(*i).is_some()
-        });
-        v.push((ino, Orphan::Owed(answer)));
-        self.n.store(v.len(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// The answers kept for `ino`, taken.
-    fn take(&self, ino: Ino) -> Vec<Orphan> {
-        if self.n.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return Vec::new();
+    /// matters goes: grants no longer held.
+    ///
+    /// A grant that lands in `answer` after this (the request ended while
+    /// its answer was in flight: a waiter killed as the lock was let go)
+    /// has nobody to take its first lock, and the waiter behind it, which
+    /// has recalled it, would wait for the first-use budget (4 s) to run
+    /// out. A thread of its own waits for the answer (no timer: it sleeps
+    /// until the core answers, and is there only while an answer is owed)
+    /// and gives such a grant up the moment it lands, as
+    /// [`ClusterLocks::settled`] does for one that landed before the
+    /// request ended. A file system that unlocks faster than the kill
+    /// reaches the owner (tmpfs: 4.3 s a handoff in
+    /// `lock-contention-delegated-moves`, 30 ms elsewhere) shows the race.
+    fn keep(
+        &self,
+        meta: &Arc<Meta>,
+        tx: &tokio::sync::mpsc::UnboundedSender<SyncRequest>,
+        ino: Ino,
+        answer: tokio::sync::oneshot::Receiver<LockAnswer>,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let id = self.state.next_id.fetch_add(1, Relaxed);
+        {
+            let mut v = self.state.answers.lock().unwrap();
+            v.retain(|(i, o)| matches!(o, Orphan::Owed(_)) || meta.locks().held(*i).is_some());
+            v.push((ino, Orphan::Owed(id)));
+            self.state.n.store(v.len(), Relaxed);
         }
-        let mut v = self.answers.lock().unwrap();
-        let mut taken = Vec::new();
-        v.retain_mut(|(i, o)| {
-            if *i != ino {
-                return true;
-            }
-            taken.push(std::mem::replace(o, Orphan::Granted(Position::ZERO)));
-            false
-        });
-        self.n.store(v.len(), std::sync::atomic::Ordering::Relaxed);
-        taken
+        let (state, meta2, tx2) = (self.state.clone(), meta.clone(), tx.clone());
+        let spawned = std::thread::Builder::new()
+            .name("lock-orphan".into())
+            .spawn(move || {
+                let answer = answer.blocking_recv();
+                let mut landed = false;
+                {
+                    let mut v = state.answers.lock().unwrap();
+                    if let Some(at) = v
+                        .iter()
+                        .position(|(_, o)| matches!(o, Orphan::Owed(i) if *i == id))
+                    {
+                        match answer {
+                            Ok(LockAnswer::Granted { position }) => {
+                                v[at].1 = Orphan::Granted(position);
+                                landed = true;
+                            }
+                            _ => {
+                                v.remove(at);
+                            }
+                        }
+                        state.n.store(v.len(), Relaxed);
+                    }
+                }
+                state.landed.notify_all();
+                if landed && meta2.locks().abandon_first_use(ino, now()) {
+                    let _ = tx2.send(SyncRequest::LockIdle { ino });
+                }
+            });
+        if spawned.is_err() {
+            // The first-use budget gives such a grant up, as it always did.
+            let mut v = self.state.answers.lock().unwrap();
+            v.retain(|(_, o)| !matches!(o, Orphan::Owed(i) if *i == id));
+            self.state.n.store(v.len(), Relaxed);
+        }
     }
 
-    /// Put back what a request took and could not finish.
-    fn put_back(&self, ino: Ino, rest: impl IntoIterator<Item = Orphan>) {
-        let mut v = self.answers.lock().unwrap();
-        v.extend(rest.into_iter().map(|o| (ino, o)));
-        self.n.store(v.len(), std::sync::atomic::Ordering::Relaxed);
+    /// The next answer kept for `ino` once it is in: a grant, taken. `None`
+    /// when none is kept (or the one owed was not a grant). Waits, in
+    /// slices of [`ANSWER_SLICE`] that look at the request's cancellation,
+    /// for an answer still owed.
+    fn take_next(&self, ino: Ino, interrupt: Interrupt<'_>) -> Result<Option<Position>, Code> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.state.n.load(Relaxed) == 0 {
+            return Ok(None);
+        }
+        let mut v = self.state.answers.lock().unwrap();
+        loop {
+            let Some(at) = v.iter().position(|(i, _)| *i == ino) else {
+                return Ok(None);
+            };
+            if let Orphan::Granted(position) = v[at].1 {
+                v.remove(at);
+                self.state.n.store(v.len(), Relaxed);
+                return Ok(Some(position));
+            }
+            interrupt.check()?;
+            v = self.state.landed.wait_timeout(v, ANSWER_SLICE).unwrap().0;
+        }
     }
 }
 
@@ -1705,22 +1760,7 @@ impl ClusterLocks {
     /// grant among them is waited for as its requester would have
     /// ([`Self::granted`]) before this request takes a lock under it.
     fn adopt_orphans(&self, ino: Ino, interrupt: Interrupt<'_>) -> Result<(), Code> {
-        let mut taken = self.orphans.take(ino).into_iter();
-        while let Some(orphan) = taken.next() {
-            let position = match orphan {
-                Orphan::Granted(position) => position,
-                Orphan::Owed(mut rx) => match Self::await_core(&mut rx, interrupt) {
-                    Ok(LockAnswer::Granted { position }) => position,
-                    Ok(_) => continue,
-                    Err(code @ (Code::Intr | Code::TimedOut)) => {
-                        self.orphans
-                            .put_back(ino, std::iter::once(Orphan::Owed(rx)).chain(taken));
-                        return Err(code);
-                    }
-                    // Nobody will answer it.
-                    Err(_) => continue,
-                },
-            };
+        while let Some(position) = self.orphans.take_next(ino, interrupt)? {
             self.granted(ino, &position);
         }
         Ok(())
@@ -1845,7 +1885,7 @@ impl ClusterLocks {
                         // Ended before its answer: the core answers nobody,
                         // and a grant it brings is the next request's to
                         // wait for (`Orphans`).
-                        self.orphans.keep(&self.meta, ino, answer);
+                        self.orphans.keep(&self.meta, &self.tx, ino, answer);
                         return Err(code);
                     }
                     match answered? {
@@ -2716,6 +2756,127 @@ mod tests {
         assert!(!cluster_effective(Some(false), true).unwrap());
         let e = cluster_effective(Some(true), false).unwrap_err();
         assert!(e.to_string().contains("use --locks local"));
+    }
+
+    /// A request that ended before its answer (a waiter killed as the lock
+    /// was let go) leaves the grant that lands for it unused; the waiter
+    /// behind it, which recalled it, must not wait for the first-use
+    /// budget (4 s): the grant is given up as it lands. Without the thread
+    /// behind `Orphans::keep` it was released 4.3 s later (tmpfs, in
+    /// `lock-contention-delegated-moves`).
+    #[test]
+    fn a_grant_landing_for_an_ended_request_is_given_up_at_once() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let locks = ClusterLocks {
+            meta: meta.clone(),
+            tx,
+            inval: None,
+            lineage: Default::default(),
+            owner_wait_max: Duration::from_secs(50),
+            poll_hint: Duration::from_millis(50),
+            waits: Default::default(),
+            orphans: Default::default(),
+        };
+        let ino = 7;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        // The request ended; the answer is still in flight.
+        locks.orphans.keep(&locks.meta, &locks.tx, ino, answer);
+        // The grant lands already recalled (the waiter behind it asked), and
+        // then its answer: nothing will ever take the lock it was made for.
+        let now = now().honour;
+        meta.locks().install_held(
+            ino,
+            constellation_meta::locks::HeldGrant {
+                id: constellation_meta::locks::GrantId { node: 1, seq: 1 },
+                mode: constellation_meta::locks::LockMode::Exclusive,
+                until: now.plus(3_000),
+                renew_at: now.plus(1_500),
+                owner: 1,
+                recalled: true,
+                position: Position::ZERO,
+                renewing: None,
+                releasing: false,
+                first_use: false,
+                idle_since: None,
+                installed: now,
+                lapsing: None,
+                written: false,
+                route: None,
+            },
+        );
+        assert!(meta.locks().held(ino).unwrap().first_use);
+        reply
+            .send(LockAnswer::Granted {
+                position: Position::ZERO,
+            })
+            .unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(2);
+        let idle = loop {
+            match rx.try_recv() {
+                Ok(SyncRequest::LockIdle { ino: i }) => break Some(i),
+                Ok(_) => {}
+                Err(_) if std::time::Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(_) => break None,
+            }
+        };
+        assert_eq!(idle, Some(ino), "the grant was not given up");
+        assert!(!meta.locks().held(ino).unwrap().first_use);
+        assert_eq!(meta.locks().stats().first_use_abandoned, 1);
+        // The next request for the file still waits for the floor.
+        assert!(locks
+            .orphans
+            .take_next(ino, Interrupt::NONE)
+            .unwrap()
+            .is_some());
+    }
+
+    /// The other order: the grant is already there, unused and recalled,
+    /// when the request ends: `settled` gives it up at once.
+    #[test]
+    fn a_grant_present_when_its_request_ends_is_given_up_at_once() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let locks = ClusterLocks {
+            meta: meta.clone(),
+            tx,
+            inval: None,
+            lineage: Default::default(),
+            owner_wait_max: Duration::from_secs(50),
+            poll_hint: Duration::from_millis(50),
+            waits: Default::default(),
+            orphans: Default::default(),
+        };
+        let ino = 8;
+        let now = now().honour;
+        meta.locks().install_held(
+            ino,
+            constellation_meta::locks::HeldGrant {
+                id: constellation_meta::locks::GrantId { node: 1, seq: 1 },
+                mode: constellation_meta::locks::LockMode::Exclusive,
+                until: now.plus(3_000),
+                renew_at: now.plus(1_500),
+                owner: 1,
+                recalled: true,
+                position: Position::ZERO,
+                renewing: None,
+                releasing: false,
+                first_use: false,
+                idle_since: None,
+                installed: now,
+                lapsing: None,
+                written: false,
+                route: None,
+            },
+        );
+        assert!(locks.settled(ino, Err(Code::Intr), true).is_err());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SyncRequest::LockIdle { ino: 8 })
+        ));
+        assert!(!meta.locks().held(ino).unwrap().first_use);
     }
 
     #[test]
