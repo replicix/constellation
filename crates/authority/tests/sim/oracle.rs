@@ -1111,18 +1111,6 @@ impl ArchiveIndex {
         self.note_segment(seq, seg);
     }
 
-    /// The highest segment that has landed (0: none).
-    pub fn head(&self) -> Seq {
-        self.inner
-            .lock()
-            .unwrap()
-            .segments
-            .keys()
-            .next_back()
-            .copied()
-            .unwrap_or(0)
-    }
-
     /// The segments that landed, their decompressed bytes and their bytes
     /// as stored.
     pub fn landed(&self) -> (u64, u64, u64) {

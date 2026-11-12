@@ -4912,7 +4912,6 @@ async fn wait_for_locker(cluster: &Arc<Cluster>) -> Option<NodeId> {
 async fn operator_drop_hopeless(
     cluster: &Arc<Cluster>,
     world: &Arc<ChunkWorld>,
-    bucket: &Arc<Bucket>,
     fault_log: &Arc<Mutex<Vec<String>>>,
     after_ms: Option<u64>,
     first_seen: &mut BTreeMap<(NodeId, u64, bool), u64>,
@@ -4920,7 +4919,7 @@ async fn operator_drop_hopeless(
     let now_ms = cluster.env.clock.elapsed_ms();
     for id in cluster.ids() {
         let n = cluster.get(id);
-        record_applied_drops(cluster, world, bucket, fault_log, id, now_ms);
+        record_applied_drops(cluster, world, fault_log, id, now_ms);
         if !n.alive() {
             continue;
         }
@@ -4970,7 +4969,7 @@ async fn operator_drop_hopeless(
                     "t={now_ms} node {id}: repair drop-held {ino:#x} refused: {e}"
                 ));
             }
-            record_applied_drops(cluster, world, bucket, fault_log, id, now_ms);
+            record_applied_drops(cluster, world, fault_log, id, now_ms);
         }
     }
 }
@@ -4981,7 +4980,6 @@ async fn operator_drop_hopeless(
 fn record_applied_drops(
     cluster: &Arc<Cluster>,
     world: &Arc<ChunkWorld>,
-    bucket: &Arc<Bucket>,
     fault_log: &Arc<Mutex<Vec<String>>>,
     id: NodeId,
     now_ms: u64,
@@ -4994,7 +4992,9 @@ fn record_applied_drops(
             // ADR-59 part B: the drop's effect is its apply, when the
             // log carried the decision; what lands past the log's head
             // now is the drop's replay.
-            let head_before = bucket.archive.head();
+            // (Stamped by the replica at the apply, not read from the bucket
+            // at this poll: a replay that landed in between is not late.)
+            let head_before = d.applied_seq;
             world
                 .dropped_rids
                 .lock()
@@ -5792,7 +5792,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             stall_violations.clone(),
         );
         let fault_log = fault_log.clone();
-        let bucket = bucket.clone();
         tokio::spawn(async move {
             let world = cluster.env.world.clone();
             let mut stalled: BTreeMap<NodeId, u32> = BTreeMap::new();
@@ -5807,7 +5806,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     operator_drop_hopeless(
                         &cluster,
                         &world,
-                        &bucket,
                         &fault_log,
                         Some(cfg.drop_held_after_ms),
                         &mut first_seen,
@@ -5978,15 +5976,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // at the settle's cadence for what appeared after the
             // clients finished.
             if waited.is_multiple_of(3_000) {
-                operator_drop_hopeless(
-                    &cluster,
-                    &world,
-                    &bucket,
-                    &fault_log,
-                    None,
-                    &mut BTreeMap::new(),
-                )
-                .await;
+                operator_drop_hopeless(&cluster, &world, &fault_log, None, &mut BTreeMap::new())
+                    .await;
             }
         }
         // A hint installed after the settle write (a replayed op refused

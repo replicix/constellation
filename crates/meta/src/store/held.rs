@@ -384,18 +384,6 @@ pub struct DroppedHeld {
     pub rolled_back: Vec<crate::rid::Rid>,
     /// Of `rolled_back`, the rids queued as placeholders (`await_retry`).
     pub placeholders: Vec<crate::rid::Rid>,
-    /// ADR-59: of `rolled_back`, the rids that depend on the damaged inode's
-    /// own keys: the seeds, the queued replays of its manifest, and the held
-    /// transactions that write exclusively a key the seeds or such a
-    /// transaction wrote exclusively (a rename, chmod or unlink of the file,
-    /// a create of a name it vacated). The operator's cost of a lost chunk
-    /// that this drop does not avoid (part B of the ADR is to avoid it). A
-    /// rolled-back rid not listed here depended on the seeds only through a
-    /// directory's merged attributes or a name unrelated to the file, which
-    /// the ship rule no longer orders: the sibling class the ADR removes.
-    /// Empty of dependents under the conservative control (nothing is
-    /// attributed to the inode).
-    pub rolled_back_on_inode: Vec<crate::rid::Rid>,
     /// The rids the drop refused (`Refused` rows, conflict copies): the
     /// seeds' and the queued replays of the manifest (ADR-59 part B, D3: a
     /// parked answer of one is settled with the refusal).
@@ -411,8 +399,7 @@ pub struct DroppedHeld {
     /// drain runs it: the sim's late-landing check exempts it. A redone row
     /// without a rid (a placeholder-less remote row) is in `redone` only.
     pub redone_rids: Vec<crate::rid::Rid>,
-
-
+    /// ADR-59: every dependent was rolled back (the conservative control).
     pub strand_all: bool,
     /// ADR-59: the rows the drop rolled back whose answer may have left (the
     /// I1 loss it cannot avoid: an acknowledged write of bytes that are gone,
@@ -429,6 +416,9 @@ pub struct DroppedHeld {
     /// ADR-59 part B: follow-up decisions an apply needed (a redone row did
     /// not apply as it did). Expected 0.
     pub follow_ups: usize,
+    /// The log segment this replica had applied when the drop took effect
+    /// (the final result only): what lands past it is the drop's replay.
+    pub applied_seq: u64,
     /// The inode's unrecoverable chunks when the drop ran.
     pub missing: BTreeSet<ChunkHash>,
     /// Of `missing`, the chunks whose pending row and poison mark the drop
@@ -1559,6 +1549,27 @@ impl Meta {
             Ordering::Relaxed,
         );
         *self.held.lock().unwrap() = summarize(&plan, &poisoned);
+        // ADR-59 part B (D2): what a `DropHeld` retired never ships. (Open:
+        // under debug assertions the sim finds the plan carrying one in the
+        // window between the record's ship and the apply, in about 4 seeds of
+        // 2,000 per backed label; skipping it at the plan breaks the planner's
+        // order rule for the rows behind it, so the pin stays an assertion.)
+        if cfg!(debug_assertions) && self.any_retired.load(Ordering::Relaxed) {
+            for tx in &plan.ship {
+                let Some((first, rec)) = tx.rows.first() else {
+                    continue;
+                };
+                let head_epoch =
+                    super::local::get_journal_tx_head(&r, self, *first)?.map(|h| h.epoch);
+                if let Some((e, j)) = rolled_back_ident(head_epoch, *first, std::slice::from_ref(rec))
+                {
+                    debug_assert!(
+                        !self.row_retired(e, j),
+                        "the ship plan carries the transaction ({e}, {j}), which a DropHeld retired"
+                    );
+                }
+            }
+        }
         let mut batch = Vec::new();
         for tx in plan.ship {
             if !batch.is_empty() && batch.len() >= max {
@@ -1762,11 +1773,7 @@ impl Meta {
             strand_all,
             missing: missing.iter().copied().collect(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
-            s_deps: walked
-                .dependents
-                .iter()
-                .map(|(seq, _, _, _)| *seq)
-                .collect(),
+            s_deps: walked.dependents.iter().map(|(seq, _, _)| *seq).collect(),
             redone: walked.redone.iter().map(|(seq, _)| *seq).collect(),
             redone_rids: walked.redone.iter().filter_map(|(_, rid)| *rid).collect(),
             follow_ups: 0,
@@ -1845,13 +1852,7 @@ impl Meta {
         sequencer: bool,
     ) -> Result<DroppedHeld, MetaError> {
         let decided = self.drop_held_knowing(
-            ino,
-            now_unix,
-            remote,
-            unanswered,
-            live_ops,
-            sessions,
-            sequencer,
+            ino, now_unix, remote, unanswered, live_ops, sessions, sequencer,
         )?;
         if decided.pending.is_none() {
             return Ok(decided);
@@ -1899,7 +1900,11 @@ impl Meta {
             let mut plan: DropPlan = postcard::from_bytes(&raw)?;
             if plan.jseq == jseq && !plan.shipped {
                 plan.shipped = true;
-                tx.insert(&self.local, drop_plan_key(ino), postcard::to_allocvec(&plan)?);
+                tx.insert(
+                    &self.local,
+                    drop_plan_key(ino),
+                    postcard::to_allocvec(&plan)?,
+                );
             }
         }
         Ok(())
@@ -1947,11 +1952,7 @@ impl Meta {
         let missing: BTreeSet<ChunkHash> = plan.missing.iter().copied().collect();
         let poisoned = read_poisoned(&tx, self)?;
         let walked = walk_drop(&tx, self, ino, &missing, &poisoned, DropMode::Apply(&plan))?;
-        let mut seqs: HashSet<u64> = walked
-            .dependents
-            .iter()
-            .map(|(seq, _, _, _)| *seq)
-            .collect();
+        let mut seqs: HashSet<u64> = walked.dependents.iter().map(|(seq, _, _)| *seq).collect();
         seqs.extend(walked.seeds.iter().map(|(_, seq, _)| *seq));
         let staged = UsageTracker::staging();
         let (_, redo_skipped) = spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
@@ -1964,7 +1965,6 @@ impl Meta {
         }
         let mut rolled_back: Vec<crate::rid::Rid> = Vec::new();
         let mut placeholders: Vec<crate::rid::Rid> = Vec::new();
-        let mut on_inode: Vec<crate::rid::Rid> = Vec::new();
         // The rows of `S` whose answer may have left (the I1 loss the drop
         // cannot avoid: an acknowledged write of bytes that are gone, or an
         // acknowledged op that needs them). Listed, counted and warned of,
@@ -1982,13 +1982,10 @@ impl Meta {
         // never given is no copy of its op any more, but a placeholder in
         // its place: its requester's retry is the one copy that executes.
         let mut await_retry = 0;
-        for (_, origin, keys, on_this_inode) in &walked.dependents {
+        for (_, origin, keys) in &walked.dependents {
             let queued = spec::queued_class_at(&tx, self, *origin)?;
             if let Some((rid, _)) = queued {
                 rolled_back.push(rid);
-                if *on_this_inode {
-                    on_inode.push(rid);
-                }
             }
             match spec::mark_await_retry_tx(
                 &mut tx,
@@ -2064,7 +2061,6 @@ impl Meta {
             spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing), true)?;
             refused_rids.push(rid);
             rolled_back.push(rid);
-            on_inode.push(rid);
         }
         // Replays of this inode's manifest already queued by an earlier
         // deposition: the same treatment.
@@ -2116,7 +2112,6 @@ impl Meta {
             )?;
             refused_rids.push(queued.rid);
             rolled_back.push(queued.rid);
-            on_inode.push(queued.rid);
             queued_dropped += 1;
         }
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
@@ -2237,7 +2232,6 @@ impl Meta {
             rolled_back,
             refused: refused_rids,
             placeholders,
-            rolled_back_on_inode: on_inode,
             missing,
             kept_pending,
             kept_for,
@@ -2245,6 +2239,7 @@ impl Meta {
             pending: None,
             pending_epoch: 0,
             follow_ups: plan.follow_ups as usize,
+            applied_seq: self.applied_seq()?,
         };
         {
             let mut sink = self.applied_drops.lock().unwrap();
@@ -2390,9 +2385,8 @@ enum DropMode<'a> {
 struct Walked {
     /// (transaction, spec_seq, origin)
     seeds: Vec<(Tx, u64, u64)>,
-    /// (spec_seq, origin, the keys a placeholder of it holds, whether it
-    /// depends on the damaged inode's own keys)
-    dependents: Vec<(u64, u64, crate::replay::TouchSet, bool)>,
+    /// (spec_seq, origin, the keys a placeholder of it holds)
+    dependents: Vec<(u64, u64, crate::replay::TouchSet)>,
     /// (spec_seq, rid) of the rows redone in place.
     redone: Vec<(u64, Option<crate::rid::Rid>)>,
     /// The identity of every transaction the drop rolls back, as a member
@@ -2417,12 +2411,6 @@ fn walk_drop(
     // The inodes whose content the loss reaches: the damaged file, and any
     // file a later write of it was copied into.
     let mut lost: HashSet<Ino> = HashSet::from([ino]);
-    // The exclusive keys of the seeds and of what depends on them through
-    // such keys (`DroppedHeld::rolled_back_on_inode`). The conservative
-    // control folds merges into exclusive keys, which would attribute a
-    // directory's siblings to the inode: it attributes nothing.
-    let mut own: HashSet<Vec<u8>> = HashSet::new();
-    let attribute = !meta.parent_taint_conservative.load(Ordering::Relaxed);
     let mut out = Walked {
         seeds: Vec::new(),
         dependents: Vec::new(),
@@ -2490,18 +2478,13 @@ fn walk_drop(
                 );
             }
         }
-        let on_this_inode = attribute && (is_seed || keys.excl.iter().any(|k| own.contains(k)));
-        if on_this_inode {
-            own.extend(keys.excl.iter().cloned());
-        }
         let origin = spec::row_keys_and_origin(tx, meta, spec_seq)?
             .map(|row| row.origin)
             .unwrap_or(spec_seq);
         if is_seed {
             out.seeds.push((t, spec_seq, origin));
         } else {
-            out.dependents
-                .push((spec_seq, origin, placeholder, on_this_inode));
+            out.dependents.push((spec_seq, origin, placeholder));
         }
     }
     Ok(out)

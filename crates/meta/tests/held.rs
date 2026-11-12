@@ -1175,9 +1175,8 @@ fn drop_held_keeps_the_rows_that_need_the_content_in_journal_order() {
 /// the lost content (a chmod, a rename of the file, a utimes of the directory
 /// the held rename merged, a later chmod of the renamed file) is not rolled
 /// back: it is redone in place, and the drop lists its rid in `redone_rids`.
-/// Under the conservative control (and for a dropper that was not the
-/// sequencer) every dependent is rolled back, as before the ADR, and the
-/// drop names those that depend on the damaged inode's own keys.
+/// Under the conservative control every dependent is rolled back, as before
+/// the ADR.
 #[test]
 fn drop_held_names_the_rolled_back_rows_that_depend_on_the_damaged_inode() {
     use constellation_meta::RowCommit;
@@ -1238,17 +1237,17 @@ fn drop_held_names_the_rolled_back_rows_that_depend_on_the_damaged_inode() {
         .to_string();
     assert!(err.contains("not the sequencer in force"), "{err}");
     assert!(meta.pending_replays().unwrap().is_empty());
-    // The control: nothing but the seed is attributed to the inode.
+    // The control: every dependent is rolled back.
     let (meta, broken) = build();
     meta.set_parent_taint_conservative(true);
     let dropped = meta.drop_held(broken, 1).unwrap();
-    assert!(
-        dropped
-            .rolled_back_on_inode
-            .iter()
-            .all(|r| ![5, 6, 7, 8].iter().any(|s| *r == rid_of(1, *s))),
-        "{dropped:?}"
-    );
+    assert!(dropped.strand_all);
+    for seq in [5, 6, 7, 8] {
+        assert!(
+            dropped.rolled_back.contains(&rid_of(1, seq)),
+            "{seq}: {dropped:?}"
+        );
+    }
 }
 
 /// Review item 8: the queue is decoded once per generation of the queue,
