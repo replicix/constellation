@@ -2534,13 +2534,45 @@ async fn client_thread(
                 // Plan 30 §M10: a frozen continuation epoch refuses writes
                 // with `EROFS` before executing them; the FUSE caller
                 // retries (here: the same rid, like an in-doubt answer).
+                // The engine answers the application `EROFS` and never sends
+                // that rid again (`mutate_op_rebasable`, write_gate.rs: the rid
+                // is allocated per call and changes only for a lapsed token);
+                // the application's retry is an op of its own, under a fresh
+                // rid. A final `EROFS` (a refusal the root journaled for good,
+                // fence C9) must not meet the same rid at a holder later.
                 Ok(ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))) => {
                     attempts += 1;
                     if attempts > MAX_RESUBMITS {
                         abandoned.lock().unwrap().insert(rid);
                         break;
                     }
+                    // (The old call stays unreturned in the history, as an
+                    // in-doubt one does: a refusal that was final was not
+                    // run, and one that was run anyway is the oracles' to
+                    // name, not this client's.)
                     tokio::time::sleep(Duration::from_millis(500)).await;
+                    let handle = cluster.get(node);
+                    if !handle.alive() {
+                        break;
+                    }
+                    let fresh = handle.next_rid();
+                    match (&op, &write) {
+                        (Some(op), _) => {
+                            if matches!(op, NsOp::Create(_)) {
+                                match mutate_op(&handle.meta, op) {
+                                    Some(m) => mop = m,
+                                    None => break,
+                                }
+                            }
+                            history.invoke(thread, fresh, op.clone())
+                        }
+                        (None, Some(name)) => match write_op(&cluster, node, fresh, name) {
+                            Some(m) => mop = m,
+                            None => break,
+                        },
+                        (None, None) => unreachable!(),
+                    }
+                    rid = fresh;
                     continue;
                 }
                 // A write's outcome is not part of the namespace history
@@ -2960,7 +2992,7 @@ async fn submit_until_answered(
     cluster: &Arc<Cluster>,
     node: NodeId,
     thread: u64,
-    rid: Rid,
+    mut rid: Rid,
     mop: MutateOp,
     abandoned: &Arc<Mutex<HashSet<Rid>>>,
 ) -> Option<MutateOutcome> {
@@ -2990,7 +3022,9 @@ async fn submit_until_answered(
                     abandoned.lock().unwrap().insert(rid);
                     return None;
                 }
+                // (As the namespace clients: a retry is a fresh rid.)
                 tokio::time::sleep(Duration::from_millis(500)).await;
+                rid = cluster.get(node).next_rid();
             }
             Ok(ClientReply::Outcome(outcome)) => {
                 if outcome != MutateOutcome::Abandoned {
