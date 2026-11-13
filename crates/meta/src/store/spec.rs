@@ -1827,8 +1827,17 @@ fn strand_local_tx(
     // in, the lowest of them sets the index. As `forget_recent` below, the
     // session side is in memory: a failed commit leaves it lower than the
     // store, which only makes a wait, never an early execution.
-    if let Some(to) = local::retract_log_idx_tx(tx, meta, row.gen, row.idx)? {
-        meta.session.retract_stream(row.gen, to);
+    // (Not a row a stream holder's drop names: the log carries the record at
+    // its position, or fills it.)
+    let named_by_drop = row.gen != 0
+        && !row.appended
+        && super::held::stream_drops_tx(&*tx, meta)?
+            .iter()
+            .any(|(gen, _, named)| *gen == row.gen && named.contains(&first));
+    if !named_by_drop {
+        if let Some(to) = local::retract_log_idx_tx(tx, meta, row.gen, row.idx)? {
+            meta.session.retract_stream(row.gen, to);
+        }
     }
     for (seq, _) in &rows {
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
@@ -1948,6 +1957,25 @@ fn strand_local_tx(
             )?;
         }
         return Ok(Stranding::DelegMember);
+    }
+    // ADR-59 part B: a stream holder's own drop record that leaves the
+    // journal unshipped (the stream ended before the root appended it): the
+    // drop never happened; its plan goes, nothing is queued.
+    if row.gen != 0 && !row.appended {
+        if let Some(ino) = records.iter().find_map(|rec| match rec {
+            LogRecord::DropHeld { ino, .. } => Some(*ino),
+            _ => None,
+        }) {
+            if super::held::cancel_stream_drop_tx(tx, meta, ino)? {
+                tracing::warn!(
+                    ino,
+                    gen = row.gen,
+                    idx = row.idx,
+                    "a stream's drop record left the journal unshipped: the drop never happened"
+                );
+            }
+            return Ok(Stranding::Dropped);
+        }
     }
     // ADR-59 part B (drop contiguity): this node's own stream row at a
     // position a `DropHeld` of the log fills (a segment's strand marks it
@@ -2899,8 +2927,20 @@ fn filled_own_rows_tx(
     records: &[LogRecord],
 ) -> Result<HashSet<u64>, MetaError> {
     let mut out = HashSet::new();
+    // (Not the rows a drop of this node names: its own apply strands them.)
+    let named: HashSet<u64> = if records.iter().any(|rec| !rec.stream_fills().is_empty()) {
+        super::held::stream_drops_tx(r, meta)?
+            .into_iter()
+            .flat_map(|(_, _, named)| named)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     for (gen, idx) in records.iter().flat_map(|rec| rec.stream_fills()) {
         for found in local::journal_origins_at(r, meta, *gen, *idx)? {
+            if named.contains(&found) {
+                continue;
+            }
             let Some(row) = local::get_journal_tx(r, meta, found)? else {
                 continue;
             };

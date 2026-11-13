@@ -21105,6 +21105,19 @@ fn a_drop_fills_the_stream_indices_it_rolls_back() {
     }
 }
 
+/// ADR-59 part B, D1 widened (`far-placement+lost-chunk` 326): node 1 lost a
+/// chunk of its own sticky stream's seed, was deposed (node 3 took over), and
+/// kept its stream as a holder (R-I5); `repair drop-held` there was refused
+/// ("not the sequencer in force") and no one could decide the drop: the run
+/// never went quiet. The holder of the stream decides it now: the record is
+/// the stream's row at the seed's index, appended by the root like any row of
+/// the stream, with fills for the rest. Failed on 642f2057 (quiescence).
+#[test]
+fn a_stream_holder_drops_its_own_streams_held_rows() {
+    run_seed(326, config_variant(far_placement_config(), "lost-chunk"))
+        .unwrap_or_else(|e| panic!("far-placement+lost-chunk seed 326: {e}"));
+}
+
 /// ADR-59 part B, the `kept_diverged` residual (benign): a claim's kept merge
 /// met, at one journal seq of the tenure, a hole from the holder's sealed tail
 /// (the rows it shipped ahead of a held one) and a live copy from the

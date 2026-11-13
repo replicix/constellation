@@ -764,15 +764,30 @@ impl Core {
             self.root_config_version(),
             constellation_meta::GroupOn::Archive,
         ));
-        let dropped = replica.drop_held(
-            ino,
-            now.wall.0 / 1000,
-            remote,
-            &unanswered,
-            &live_ops,
-            &sessions,
-            sequencer,
-        );
+        // ADR-59 part B (D1): without the lease, the holder of the stream the
+        // held rows are rows of decides (a deposed root's own sticky stream
+        // included): the record goes into that stream.
+        let dropped = if sequencer || remote {
+            replica.drop_held(
+                ino,
+                now.wall.0 / 1000,
+                remote,
+                &unanswered,
+                &live_ops,
+                &sessions,
+                sequencer,
+            )
+        } else {
+            let holds = |gen: u64| self.dl.mine.get(&gen).is_some_and(|d| !d.stopped);
+            replica.drop_held_in_stream(
+                ino,
+                now.wall.0 / 1000,
+                &unanswered,
+                &live_ops,
+                &sessions,
+                &holds,
+            )
+        };
         match dropped {
             Ok(dropped) => match dropped.pending {
                 // ADR-59 part B (D1, D4): decided, journaled; the effect (and

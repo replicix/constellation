@@ -1352,7 +1352,8 @@ impl Core {
             out.push(Action::ControlDone {
                 op,
                 result: Err(
-                    "the lease was lost before the drop was in the log; nothing was dropped"
+                    "the lease (or the stream holding the record) was lost before the drop was \
+                     in the log; nothing was dropped"
                         .to_string(),
                 ),
             });
@@ -1373,6 +1374,25 @@ impl Core {
             return;
         };
         for (ino, jseq, epoch, shipped) in plans {
+            // A stream holder's drop waits for its stream, whatever the lease.
+            if matches!(replica.drop_plan_of(ino), Some(Some(_))) {
+                if shipped {
+                    self.apply_drop(now, None, ino, Default::default(), replica, out);
+                } else {
+                    self.park(
+                        now,
+                        (BTreeSet::new(), None),
+                        Some(jseq),
+                        ParkedWhat::DropApply {
+                            op: None,
+                            ino,
+                            epoch,
+                            sessions: Default::default(),
+                        },
+                    );
+                }
+                continue;
+            }
             // The record is in the log exactly when this node shipped it (the
             // plan says so, persisted by the acknowledgement of its row).
             // Else the park waits for the shipment, or for the log to move
@@ -1896,6 +1916,25 @@ impl Core {
                     epoch,
                     sessions,
                 } => {
+                    // ADR-59 part B: a stream holder's drop does not rest on
+                    // the lease; its record is fenced with the stream (the
+                    // plan goes when the stream ends without it).
+                    if matches!(replica.drop_plan_of(ino), Some(Some(_))) {
+                        self.rd.parked.insert(
+                            id,
+                            Parked {
+                                what: ParkedWhat::DropApply {
+                                    op,
+                                    ino,
+                                    epoch,
+                                    sessions,
+                                },
+                                ..p
+                            },
+                        );
+                        n -= 1;
+                        continue;
+                    }
                     // The record reached the log before the lease went: the
                     // decision stands, and so does its apply.
                     let shipped = replica.journal_acked_seq().unwrap_or(0);
@@ -2634,9 +2673,17 @@ impl Core {
             .iter()
             .filter(|(_, p)| match (&p.what, p.durable) {
                 (ParkedWhat::DropApply { epoch, ino, .. }, Some(j)) => {
-                    !self.archive_covers(j, shipped)
-                        && !replica.drop_plan_shipped(*ino)
-                        && replica.applied_epoch() > *epoch
+                    match replica.drop_plan_of(*ino) {
+                        // A stream holder's: fenced with its stream (the strand of
+                        // its unshipped record took the plan).
+                        Some(Some(_)) => false,
+                        None => true,
+                        Some(None) => {
+                            !self.archive_covers(j, shipped)
+                                && !replica.drop_plan_shipped(*ino)
+                                && replica.applied_epoch() > *epoch
+                        }
+                    }
                 }
                 _ => false,
             })

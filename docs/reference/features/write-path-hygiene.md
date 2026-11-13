@@ -239,10 +239,16 @@ refuses exactly those. A queued replay the drop leaves alone (another node's
 accepted shadow, or one queued after the decision) is counted in
 `queued_kept`, warned of, and keeps the chunk held for a later drop.
 
-**A dropper without the lease decides nothing, and follows the log for a record
-that was put.** The command on a node that is not the sequencer in force is
-refused before anything changes ("run it on the holder"): its held rows are
-what a deposition strands anyway, and the successor re-ships their copies.
+**A dropper without the lease decides nothing of the root's rows, and follows
+the log for a record that was put.** The command on a node that is not the
+sequencer in force is refused before anything changes ("run it on the holder"):
+its held root rows are what a deposition strands anyway, and the successor
+re-ships their copies. The exception is a node that holds a delegation stream
+whose rows are the held ones (a deposed root keeps its own sticky stream): it
+decides their drop as the stream's holder, and the record is the stream's row
+at the seed's index, with fills for the rest; the stream sends nothing above it
+until the apply, a release of the stream waits for the apply, and a stream that
+ends without the record cancels the drop.
 From the decision until the apply the rows the record names stay held in the
 dropper's journal (the ship plan holds a transaction the record names, or
 whose identity the log retired, whatever else would release it), and the apply

@@ -8572,6 +8572,14 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let me = self.me();
+        // ADR-59 part B: a drop this node decided as the stream's holder waits
+        // for its record to reach the log through the stream; a release now
+        // would end the stream before it and the drop would never happen.
+        // The root's repeated request tries again once the drop applied.
+        if self.dl.mine.contains_key(&gen) && replica.stream_drop_pending(gen) {
+            self.stats.deleg_release_drop_pending += 1;
+            return;
+        }
         let asked: BTreeSet<Ino> = dirs.into_iter().collect();
         let Some(d) = self.dl.mine.get(&gen) else {
             // Never installed here (the grant was parked, or not committed

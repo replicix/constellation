@@ -469,6 +469,9 @@ pub(crate) struct PendingDelegate {
     pub gen: u64,
     pub idx: Option<u64>,
     pub deps: crate::session::Position,
+    /// ADR-59 part B (a stream holder's drop): `idx` is this node's own
+    /// position for the row, not a root's append of another node's row.
+    pub own: bool,
 }
 
 impl PendingDelegate {
@@ -477,7 +480,33 @@ impl PendingDelegate {
         idx: Option<u64>,
         deps: crate::session::Position,
     ) -> PendingDelegateGuard {
-        PENDING_DELEGATE.with(|c| c.set(Some(PendingDelegate { gen, idx, deps })));
+        PENDING_DELEGATE.with(|c| {
+            c.set(Some(PendingDelegate {
+                gen,
+                idx,
+                deps,
+                own: false,
+            }))
+        });
+        PendingDelegateGuard
+    }
+
+    /// ADR-59 part B: the holder of stream `gen` journals its own row at
+    /// `idx`, a position it assigned before (a drop's record takes the
+    /// seed's): not an append, and the stream's counter is not raised.
+    pub(crate) fn set_own_at(
+        gen: u64,
+        idx: u64,
+        deps: crate::session::Position,
+    ) -> PendingDelegateGuard {
+        PENDING_DELEGATE.with(|c| {
+            c.set(Some(PendingDelegate {
+                gen,
+                idx: Some(idx),
+                deps,
+                own: true,
+            }))
+        });
         PendingDelegateGuard
     }
 
