@@ -1411,6 +1411,9 @@ pub struct Stats {
     /// of an untouched inbox-ever rid, journaled (`root_journals_inbox_ever`)
     /// so that the rid's batch, drained later, dedups to them.
     pub inbox_ever_refusals_journaled: u64,
+    /// Fence C9.3 on the root's own path: this node's touched inbox-ever ops
+    /// sent to a live non-stealable holder (`local_redirect_to_live_holder`).
+    pub local_redirects_to_live_holder: u64,
     /// Fence C9.3: touched inbox-ever rids the root sent to a live
     /// non-stealable holder.
     pub inbox_ever_redirects: u64,

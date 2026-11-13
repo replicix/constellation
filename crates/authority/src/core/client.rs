@@ -2825,7 +2825,7 @@ impl Core {
             return false;
         }
         if !matches!(
-            self.gate_settle(now, self.cfg.node_id, &c.op, replica),
+            self.gate_settle(now, self.cfg.node_id, rid, &c.op, replica),
             Some(super::holder::GateSettle::Answer(_))
         ) {
             return false;
@@ -3312,11 +3312,20 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
-        let Some((op, policy, deps, tag, settle)) = self
-            .clients
-            .get(&rid)
-            .map(|c| (c.op.clone(), c.policy, c.deps, c.tag.clone(), c.settle))
-        else {
+        let Some((op, policy, deps, tag, settle, fence)) = self.clients.get(&rid).map(|c| {
+            (
+                c.op.clone(),
+                c.policy,
+                c.deps,
+                c.tag.clone(),
+                c.settle,
+                super::holder::Fence {
+                    routed_gen: 0,
+                    touched_gen: c.touched_gen,
+                    inbox_ever: c.inbox_ever,
+                },
+            )
+        }) else {
             // Already finished by a nested pass (see `release_gated`);
             // the outcome goes to `finish`, which drops it.
             return MutateOutcome::Errno(Code::Io);
@@ -3331,6 +3340,7 @@ impl Core {
                 self.clients.get(&rid).map(|c| c.origin),
                 Some(Origin::Replay { .. })
             )
+            && !self.refusal_journaled_for(&op, fence, replica)
             && self.queue_gate_blocks(rid, &op, replica)
         {
             self.stats.ops_parked_behind_queue += 1;
@@ -3379,12 +3389,26 @@ impl Core {
                         // is set before a send or a local offer to a
                         // generation, `UNKNOWN` for a replay or an in-doubt
                         // resubmission; `EXDEV` is final.)
-                        if self.root_holds_touched(
-                            code,
-                            self.clients
-                                .get(&rid)
-                                .map_or(TOUCHED_UNKNOWN, |c| c.touched_gen),
-                        ) {
+                        // Fence C9.3 here: a touched inbox-ever rid under a
+                        // live non-stealable holder goes to it, one attempt
+                        // per round (its deadlines end the bounce).
+                        if let Some((holder, gen)) = self
+                            .local_redirect_to_live_holder(now, code, fence, settle, &keys, replica)
+                            .filter(|_| {
+                                self.clients
+                                    .get(&rid)
+                                    .is_some_and(|c| c.attempts < self.cfg.forward_retries)
+                            })
+                        {
+                            self.stats.inbox_ever_redirects += 1;
+                            self.stats.local_redirects_to_live_holder += 1;
+                            if let Some(c) = self.clients.get_mut(&rid) {
+                                c.attempts += 1;
+                            }
+                            self.send_forward(now, rid, holder, gen, replica, out);
+                            return MutateOutcome::held(0);
+                        }
+                        if self.root_holds_touched(code, fence.touched_gen) {
                             let gens: Vec<u64> = match replica.resolve_ownership(&keys) {
                                 constellation_meta::delegation::Ownership::Delegated(d) => {
                                     vec![d.gen]
@@ -3408,11 +3432,8 @@ impl Core {
                         // (ADR-47 rule 2 for an untouched inbox-ever op of
                         // this node's: journaled, `root_journals_inbox_ever`;
                         // the answer waits for the row like any refusal's.)
-                        let (touched, inbox_ever) = self
-                            .clients
-                            .get(&rid)
-                            .map_or((TOUCHED_UNKNOWN, true), |c| (c.touched_gen, c.inbox_ever));
-                        if self.root_journals_inbox_ever(code, touched, inbox_ever) {
+                        if self.root_journals_inbox_ever(code, fence.touched_gen, fence.inbox_ever)
+                        {
                             refused_here = Some(code);
                             Default::default()
                         } else {
@@ -3456,7 +3477,9 @@ impl Core {
                     }
                 }
             };
-            let deps_wait = (!settle && !replica.reaches_streams(&deps)).then_some(deps);
+            // (A journaled refusal orders nothing: no `deps` wait.)
+            let deps_wait = (!settle && refused_here.is_none() && !replica.reaches_streams(&deps))
+                .then_some(deps);
             if !wait.is_empty() || deps_wait.is_some() {
                 if deps_wait.is_some() {
                     self.stats.deleg_deps_waits += 1;
@@ -3506,7 +3529,7 @@ impl Core {
         if !settle && refused_here.is_none() {
             self.audit_root_path_execution(&op, replica);
         }
-        if self.cfg.placement && self.cfg.delegation {
+        if self.cfg.placement && self.cfg.delegation && refused_here.is_none() {
             let dirs = Core::dirs_of_keys(&super::holder::keys_of_op(&op), replica);
             self.place_note(self.cfg.node_id, dirs);
         }
@@ -3515,12 +3538,9 @@ impl Core {
         // (`resolve_in_doubt_then_execute` found no outcome): refused for
         // good, answered once the refusal's row is committed (below).
         let outcome = if let Some(code) = refused_here {
-            if !self.record_refusal(rid, code, Some(&op), super::Asker::Remote, replica) {
+            if !self.journal_inbox_ever_refusal(now, rid, code, replica, out) {
                 return MutateOutcome::Busy;
             }
-            self.note_final_nonholder_refusal(rid, code, true);
-            self.stats.inbox_ever_refusals_journaled += 1;
-            self.nudge(now, out);
             (MutateOutcome::Errno(code), None)
         } else if settle {
             match self.settle_refusal(rid, Some(&op), super::Asker::Own, replica) {
@@ -5127,7 +5147,7 @@ impl Core {
         // effect is not answered here before the quarantine: it goes on
         // retrying.
         if let Some(super::holder::GateSettle::Answer(epoch)) =
-            self.gate_settle(now, self.cfg.node_id, &op, replica)
+            self.gate_settle(now, self.cfg.node_id, rid, &op, replica)
         {
             if !super::holder::took_effect_here(replica, rid) {
                 // (The gate's keys are the root's and this node's own
@@ -5868,12 +5888,16 @@ impl Core {
             return;
         }
         // Held for a lost dependency (`hold_for_lost_deps`): its backoff
-        // timer drives it on.
+        // timer drives it on. Or sent on to a live holder from the root's own
+        // path (`local_redirect_to_live_holder`): the forward's reply does.
         if matches!(outcome, MutateOutcome::Held { .. })
-            && self
-                .clients
-                .get(&rid)
-                .is_some_and(|c| c.phase == Phase::Backoff && c.timer.is_some())
+            && self.clients.get(&rid).is_some_and(|c| {
+                (c.phase == Phase::Backoff && c.timer.is_some())
+                    || matches!(
+                        c.phase,
+                        Phase::Forwarded { .. } | Phase::InboxWithdraw { .. }
+                    )
+            })
         {
             return;
         }

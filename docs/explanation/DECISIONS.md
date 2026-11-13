@@ -3590,17 +3590,24 @@ The rules:
    answer once the holder is reachable or its stream has ended, or, at the
    op's deadlines, in doubt (the settle's unsettled `EIO`, ADR-45's I4
    exception, now decided by the root from the request). The root's own client
-   ops under such a grant follow the same rule. An untouched rid that was ever
-   in an inbox (amended 2026-11-13, `far-root-writes-shared+lost-chunk` seeds
-   617, 1477) is refused with its refusal journaled (`Refused { rid, EROFS }`,
-   as the drain journals its own refusal of it) and answered once that row is
-   committed, as a settle's refusal is: its batch may still be in the bucket,
-   and a drain runs it once the generation ends, so an unjournaled `EROFS` was
-   not final; the batch's run now dedups to the refusal
-   (`root_journals_inbox_ever`, `inbox_ever_refusals_journaled`). `EXDEV` for a cross-subtree op
+   ops under such a grant follow the same rule. `EXDEV` for a cross-subtree op
    stays final: a non-stealable range shrinks only by the holder's own release
    or an end that appended its rows (so a run rid has an outcome at the root),
-   or by the operator's abandon (operator I5, not I1).
+   or by the operator's abandon (operator I5, not I1). That covers a rid the
+   holder ran, not the batch copy the root runs later: every final refusal of
+   a rid that was ever in an inbox (amended 2026-11-13,
+   `far-root-writes-shared+lost-chunk` seeds 617, 1477), an untouched one's
+   `EROFS` and any one's `EXDEV`, is journaled (`Refused { rid, code }`, as the
+   drain journals its own refusal of it) and answered once that row is
+   committed, as a settle's refusal is: its batch may still be in the bucket,
+   and a drain runs it once the generation ends or the range shrinks, so an
+   unjournaled refusal was not final; the batch's run now dedups to the
+   refusal (`root_journals_inbox_ever`, `inbox_ever_refusals_journaled`). The
+   row observes no keys (ownership decides it, not the keys' state, as ADR-58
+   C1's `ABANDONED`) and waits for neither the op's `deps` nor the replay
+   queue; a settle of an untouched inbox-ever rid under a non-stealable grant
+   is decided by the root too, and a gated root answers a settle from the
+   rid's outcome before it redirects it to a live holder.
 3. **Inbox-ever rids never run at a designee of a non-stealable generation.**
    A rid that was ever enqueued in the inbox (or whose send history is
    unknown) is forwarded only to the lease holder, or along the lease
@@ -3613,7 +3620,15 @@ The rules:
    of its own placed generation (nobody refuses under a stealable grant for
    good). The root redirects a touched inbox-ever rid to a live non-stealable
    holder, so that the holder's stream decides it; an untouched one it
-   refuses itself (rule 2). This closes a race that predates ADR-45: a drain
+   refuses itself (rule 2). The root's own such op goes the same way
+   (amended 2026-11-13, `far-root-writes-paused+lost-chunk` 1310: a requeued
+   replay, touched by rule 5, was held for a grant that never ends): a touched,
+   inbox-ever, non-settle op of the root's under a live non-stealable holder
+   (the forward path's liveness test, `deleg_gen_reachable`) is forwarded to
+   it (`local_redirect_to_live_holder`), one attempt per round, and held as
+   before while the holder is out of reach. The holder dedups it or refuses it
+   `EROFS` in its stream; an acknowledged stranded row ends as a conflict
+   copy, the existing cost of this rule. This closes a race that predates ADR-45: a drain
    that read the batch before the requester's tombstone processed it
    afterwards and journaled `Refused` while the designee ran the direct
    forward.
@@ -3673,7 +3688,9 @@ honours the generation (so its stream's dedup sees every earlier outcome of the
 rid); a replay of an unacknowledged or foreign stranded row only settles.
 
 **Consequences**: the cost is latency and errno, never safety. A forward
-whose requester's table lags costs one `Fenced` hop. Ops touched, replayed or
+whose requester's table lags costs one `Fenced` hop. A final refusal of an
+inbox-ever rid costs one journal row and one commit wait (an archive PUT on a
+root without backups); with S3 cut it cannot commit and ends in doubt. Ops touched, replayed or
 of unknown history under an unreachable designation wait and then end in doubt
 where they ended `EROFS`; the share of replays that become conflict copies
 quickly may shift. A halted batch blocks that requester's later batches until
