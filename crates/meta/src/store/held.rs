@@ -3420,6 +3420,83 @@ mod tests {
         assert_eq!(meta.log_stream_idx(gen).unwrap(), 5);
     }
 
+    /// ADR-59 part B (drop contiguity), review SHOULD-3: a fill is the retire
+    /// key of a delegate's own outstanding row. The root's drop rolled back
+    /// its append of the delegate's row 2 (a dependent that needs the lost
+    /// bytes) and the log carries the record there: the delegate, applying
+    /// the record's segment, strands its own row 2 quietly (the root's queue
+    /// owns the replay or the refusal), its rid's completion with it, and
+    /// keeps row 1. Fails on the parent: row 2 stayed outstanding for good,
+    /// with its `completed` entry, under a log index that passed it.
+    #[test]
+    fn a_fill_retires_the_delegates_own_row_at_its_position() {
+        use crate::mutate::MutateOp;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(2).unwrap();
+        let files: Vec<Ino> = (1..=2)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let gen = (1u64 << 32) | 3;
+        let rid = |seq: u64| crate::rid::Rid {
+            node: 2,
+            incarnation: 1,
+            seq,
+        };
+        for (i, ino) in files.iter().enumerate() {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(
+                &meta,
+                &MutateOp::Setattr {
+                    ino: *ino,
+                    mode: Some(0o600),
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime_ns: None,
+                    mtime_ns: None,
+                },
+                Some(rid(i as u64 + 1)),
+            )
+            .unwrap();
+        }
+        let idx = |m: &Meta| -> Vec<u64> {
+            m.delegate_rows_for_audit(gen)
+                .unwrap()
+                .into_iter()
+                .map(|(idx, ..)| idx)
+                .collect()
+        };
+        assert_eq!(idx(&meta), vec![1, 2]);
+        assert!(meta.completed_position(rid(2)).unwrap().is_some());
+        meta.apply_segment_rows(
+            1,
+            1,
+            0,
+            &[9],
+            &[(0, 0)],
+            &[LogRecord::DropHeld {
+                ino: 99,
+                chunks: Vec::new(),
+                rolled_back: Vec::new(),
+                fills: vec![(gen, 2)],
+                queued: Vec::new(),
+            }],
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(idx(&meta), vec![1], "the filled row is still outstanding");
+        assert_eq!(meta.completed_position(rid(2)).unwrap(), None);
+        assert!(meta.completed_position(rid(1)).unwrap().is_some());
+        let queued = meta.pending_replays().unwrap();
+        assert!(queued.is_empty(), "nothing is queued here: {queued:?}");
+    }
+
     /// ADR-58 M1 (review): a transaction waiting for this node's own upload is
     /// not behind a lost chunk. The refusal of an op that touched a file
     /// whose chunk is still uploading here is merely deferred: it ships by
