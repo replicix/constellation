@@ -80,7 +80,7 @@ fn flock_holder_pids(lock: &Path) -> Vec<u32> {
     let Ok(file) = File::open(lock) else {
         return Vec::new();
     };
-    let (Ok(meta), Ok(locks)) = (file.metadata(), std::fs::read_to_string("/proc/locks")) else {
+    let Ok(meta) = file.metadata() else {
         return Vec::new();
     };
     let key = |major: u32, minor: u32| format!("{major:02x}:{minor:02x}:{}", meta.ino());
@@ -89,7 +89,36 @@ fn flock_holder_pids(lock: &Path) -> Vec<u32> {
     if let Some((major, minor)) = superblock_dev(&file) {
         keys.push(key(major, minor));
     }
-    flock_pids_in(&locks, &keys)
+    // `/proc/locks` is a seq_file: the kernel walks the lock list afresh for
+    // each `read(2)` and does not hold it between two, so a lock added or
+    // dropped meanwhile by any process of the host (a busy host has many)
+    // can make a snapshot skip a line that was there throughout. A lock
+    // that reads as absent is therefore looked for again; one that is
+    // really released stays absent in every snapshot.
+    for _ in 0..PROC_LOCKS_SNAPSHOTS {
+        let Some(locks) = read_proc_locks() else {
+            return Vec::new();
+        };
+        let pids = flock_pids_in(&locks, &keys);
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+    Vec::new()
+}
+
+/// Snapshots of `/proc/locks` taken before a lock is taken as released.
+const PROC_LOCKS_SNAPSHOTS: usize = 4;
+
+/// `/proc/locks` read with large buffers, so that the fewest `read(2)`s
+/// (each a point where the list may change under the reader) make up the
+/// snapshot: the kernel fills a page of lines per call.
+fn read_proc_locks() -> Option<String> {
+    use std::io::Read;
+    let mut file = File::open("/proc/locks").ok()?;
+    let mut bytes = Vec::with_capacity(1 << 16);
+    file.read_to_end(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Whether `pid` has `path`'s file open: an fd under any of its threads'
@@ -820,6 +849,38 @@ garbage line without the separator
         drop(guard);
         assert!(!locks.holder_pids(&path).contains(&std::process::id()));
         assert!(!locks.opened_by(std::process::id(), &path));
+    }
+
+    /// `/proc/locks` is read piecemeal by the kernel: while other locks come
+    /// and go (here four threads taking and dropping their own), a lock held
+    /// throughout must still be attributed to its holder every time.
+    #[test]
+    fn a_held_flock_is_found_while_other_locks_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let locks = file_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held.lock");
+        let guard = locks.lock(open_lock_file(&held).unwrap()).unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for n in 0..4 {
+                let (locks, stop, path) = (&locks, &stop, dir.path().join(format!("{n}.lock")));
+                scope.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        drop(locks.lock(open_lock_file(&path).unwrap()).unwrap());
+                    }
+                });
+            }
+            let mut missed = 0;
+            for _ in 0..2000 {
+                if !locks.holder_pids(&held).contains(&std::process::id()) {
+                    missed += 1;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(missed, 0, "a held lock read as released");
+        });
+        drop(guard);
     }
 
     /// A directory under the build's target dir (`target/<profile>/
