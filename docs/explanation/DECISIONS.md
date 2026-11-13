@@ -4806,9 +4806,10 @@ is the consequence of that record being in the log.**
   first position the log does not carry, so a fill is never taken back; the
   root's cursor of a delegate's stream passes fills; and a fill is the retire
   key of a delegate's own outstanding row at its position (stranded quietly:
-  the root's queue owns the replay or the refusal). A generation is never
-  continued below a recorded fill by a handover (step 8: the cut is at least
-  the highest fill, or the handover opens a new generation). Rejected: (b) rolling back the whole tail of
+  the root's queue owns the replay or the refusal). **A handover opens a new
+  generation** (step 8): another node never continues a generation, since its
+  old holder may hold a drop record the root has not appended, or rows below
+  a fill, and only the old holder numbers its positions. Rejected: (b) rolling back the whole tail of
   the stream past the first rolled-back index, which rolls back acknowledged
   rows that do not need the lost bytes (I5).
 - **What the record names, the apply refuses, and no more.** A replay of the
