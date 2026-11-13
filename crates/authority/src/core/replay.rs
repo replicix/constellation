@@ -766,8 +766,9 @@ impl Core {
         ));
         // ADR-59 part B (D1): without the lease, the holder of the stream the
         // held rows are rows of decides (a deposed root's own sticky stream
-        // included): the record goes into that stream.
-        let dropped = if sequencer || remote {
+        // included): the record goes into that stream. So does `--remote`'s
+        // (a delegate's row deferred on a gone node's pending chunks).
+        let dropped = if sequencer {
             replica.drop_held(
                 ino,
                 now.wall.0 / 1000,
@@ -782,6 +783,7 @@ impl Core {
             replica.drop_held_in_stream(
                 ino,
                 now.wall.0 / 1000,
+                remote,
                 &unanswered,
                 &live_ops,
                 &sessions,

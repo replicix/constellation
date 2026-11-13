@@ -21156,6 +21156,26 @@ fn a_stream_holders_drop_rows_carry_the_streams_configuration() {
     }
 }
 
+/// ADR-59 part B, D1 widened, `--remote`: node 1 lost the chunk of a write it
+/// forwarded to node 2, the delegate of `d2`, whose stream row waits for node
+/// 1's upload. Only the sequencer could run `repair drop-held --remote`, the
+/// delegate was refused ("not the sequencer in force"), and the run never went
+/// quiet. The stream holder decides the remote form for its stream's rows too.
+/// Failed on 7665d4d0 (quiescence).
+#[test]
+fn a_delegate_drops_its_row_deferred_on_a_gone_nodes_chunk() {
+    for (label, config) in [
+        (
+            "far-root-writes",
+            far_root_writes_config as fn() -> SimConfig,
+        ),
+        ("far-root-writes-paused", far_root_writes_paused_config),
+    ] {
+        run_seed(1051, config_variant(config(), "lost-chunk"))
+            .unwrap_or_else(|e| panic!("{label}+lost-chunk seed 1051: {e}"));
+    }
+}
+
 /// ADR-59 part B, the `kept_diverged` residual (benign): a claim's kept merge
 /// met, at one journal seq of the tenure, a hole from the holder's sealed tail
 /// (the rows it shipped ahead of a held one) and a live copy from the

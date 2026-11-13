@@ -245,7 +245,8 @@ sequencer in force is refused before anything changes ("run it on the holder"):
 its held root rows are what a deposition strands anyway, and the successor
 re-ships their copies. The exception is a node that holds a delegation stream
 whose rows are the held ones (a deposed root keeps its own sticky stream): it
-decides their drop as the stream's holder, and the record is the stream's row
+decides their drop as the stream's holder (`--remote` too, for its stream's
+rows deferred on a gone node's chunk), and the record is the stream's row
 at the seed's index, with fills for the rest; the stream sends nothing above it
 until the apply, a release of the stream waits for the apply, and a stream that
 ends without the record cancels the drop.

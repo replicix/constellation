@@ -269,11 +269,14 @@ pub trait Replica {
         sequencer: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
     /// ADR-59 part B (D1, a stream holder's drop): `drop_held` decided by
-    /// the holder of the stream the held rows are rows of (`holds(gen)`).
+    /// the holder of the stream the held rows are rows of (`holds(gen)`);
+    /// `remote` is `--remote`'s.
+    #[allow(clippy::too_many_arguments)]
     fn drop_held_in_stream(
         &self,
         ino: Ino,
         now_unix: i64,
+        remote: bool,
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
@@ -1263,16 +1266,20 @@ impl Replica for Meta {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drop_held_in_stream(
         &self,
         ino: Ino,
         now_unix: i64,
+        remote: bool,
         unanswered: &dyn Fn(Rid) -> bool,
         live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
         sessions: &constellation_meta::LiveSessions,
         holds: &dyn Fn(u64) -> bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError> {
-        Meta::drop_held_in_stream(self, ino, now_unix, unanswered, live_ops, sessions, holds)
+        Meta::drop_held_in_stream(
+            self, ino, now_unix, remote, unanswered, live_ops, sessions, holds,
+        )
     }
 
     fn drop_plan_of(&self, ino: Ino) -> Option<Option<(u64, u64)>> {
