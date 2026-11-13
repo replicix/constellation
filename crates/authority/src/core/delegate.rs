@@ -5596,7 +5596,9 @@ impl Core {
         let Some(gs) = self.dl.gens.get(&gen) else {
             return (0, false);
         };
-        let mut cursor = gs.cursor;
+        // ADR-59 part B (drop contiguity): a position a `DropHeld` of the log
+        // fills is the stream's row there; the cursor passes it.
+        let mut cursor = replica.stream_fills_past(gen, gs.cursor);
         let mut drained = 0u64;
         let mut lost = false;
         for tx in txs {
@@ -5637,7 +5639,7 @@ impl Core {
             match applied {
                 Ok(_) => {
                     replica.note_foreign_executed(&tx.records);
-                    cursor = tx.idx;
+                    cursor = replica.stream_fills_past(gen, tx.idx);
                     drained += 1;
                     self.dl.drained_rows.push((gen, tx.idx));
                 }
@@ -12294,7 +12296,9 @@ impl Core {
             cursor = g.cursor,
             "delegate stream batch received"
         );
-        let mut cursor = g.cursor;
+        // ADR-59 part B (drop contiguity): the cursor passes the positions a
+        // `DropHeld` of the log fills.
+        let mut cursor = replica.stream_fills_past(gen, g.cursor);
         let mut appended = 0u64;
         let batch_last = txs.last().map(|t| t.idx).unwrap_or(0);
         // Plan 46 M1.2 step 10: the lock grants of the subtrees the delegate
@@ -12375,7 +12379,7 @@ impl Core {
                     // could never fire. The cut is judged on the refusals:
                     // see `deleg_deps_refused`.)
                     replica.note_foreign_executed(&tx.records);
-                    cursor = tx.idx;
+                    cursor = replica.stream_fills_past(gen, tx.idx);
                     appended += 1;
                     for r in &tx.records {
                         match r {

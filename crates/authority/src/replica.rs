@@ -448,6 +448,9 @@ pub trait Replica {
     /// log* (appended by a root here, applied from a segment), never a
     /// shadow's: a successor's cursor, a delegate's re-stream start.
     fn log_stream_idx(&self, gen: u64) -> u64;
+    /// ADR-59 part B (drop contiguity): `idx` raised over the consecutive
+    /// positions of `gen` right above it that a `DropHeld` of the log fills.
+    fn stream_fills_past(&self, gen: u64, idx: u64) -> u64;
     /// The highest stream index this node assigned as the delegate of
     /// `gen`.
     fn delegate_idx(&self, gen: u64) -> u64;
@@ -1655,6 +1658,10 @@ impl Replica for Meta {
 
     fn stream_applied(&self, gen: u64) -> u64 {
         self.session().stream_applied(gen)
+    }
+
+    fn stream_fills_past(&self, gen: u64, idx: u64) -> u64 {
+        Meta::stream_fills_past(self, gen, idx).unwrap_or(idx)
     }
 
     fn log_stream_idx(&self, gen: u64) -> u64 {

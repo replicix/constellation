@@ -1065,7 +1065,8 @@ struct Strand<'a> {
     /// Seed 2560: this `Local` row is a root's append of a delegate's row
     /// whose outcome a segment of a later tenure carries under another
     /// identity ([`superseded_root_appends_tx`]): rolled back like any
-    /// stranded row, then dropped. Set per row by `redo_row_tx` for a
+    /// stranded row, then dropped. Or (not an append) this node's own stream
+    /// row at a position a `DropHeld` of the log fills: dropped the same way. Set per row by `redo_row_tx` for a
     /// `Local` entry of the pass's `quiet` set.
     superseded: bool,
     /// The pass is the claimant's own takeover gate at this epoch, after its
@@ -1947,6 +1948,14 @@ fn strand_local_tx(
             )?;
         }
         return Ok(Stranding::DelegMember);
+    }
+    // ADR-59 part B (drop contiguity): this node's own stream row at a
+    // position a `DropHeld` of the log fills (a segment's strand marks it
+    // quiet: `filled_own_rows_tx`). The root's drop rolled its append back
+    // and the record stands at its position; the root's queue owns the replay
+    // or the refusal, so nothing is queued here.
+    if row.gen != 0 && !row.appended && strand.superseded {
+        return Ok(Stranding::Dropped);
     }
     // Plan 43 C1-4 (§5.2 item 2, §5.6): a row this node's client was told
     // is committed (its group or the archive held it) is not this node's to
@@ -2879,6 +2888,28 @@ fn deleg_rows_may_overlap(
             .iter()
             .any(|i| union.inos.contains(i) || union.shared.contains(i))
         || touch.shared.iter().any(|i| union.inos.contains(i)))
+}
+
+/// ADR-59 part B (drop contiguity): the first journal seqs of this node's own
+/// outstanding stream rows (not a root's appends) at a position a `DropHeld`
+/// of `records` fills.
+fn filled_own_rows_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    records: &[LogRecord],
+) -> Result<HashSet<u64>, MetaError> {
+    let mut out = HashSet::new();
+    for (gen, idx) in records.iter().flat_map(|rec| rec.stream_fills()) {
+        for found in local::journal_origins_at(r, meta, *gen, *idx)? {
+            let Some(row) = local::get_journal_tx(r, meta, found)? else {
+                continue;
+            };
+            if !row.appended {
+                out.insert(found);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The origins in `origins` whose generation may have a transaction in
@@ -5429,6 +5460,13 @@ impl Meta {
         // identity (`superseded_root_appends_tx`): stranded below, quietly.
         let superseded_appends =
             superseded_root_appends_tx(&tx, self, epoch, origins, &completes, &refused)?;
+        // ADR-59 part B (drop contiguity): this node's own outstanding stream
+        // rows (a delegate's, never appended here) at a position a `DropHeld`
+        // of the segment fills: the root's drop rolled their appended copy back
+        // and the log carries the record there, not the row. Stranded below,
+        // quietly (the root's queue owns the replay or the refusal), as a
+        // streamed copy the record retires is.
+        let filled_own = filled_own_rows_tx(&tx, self, records)?;
         let staged = UsageTracker::staging();
         // ADR-43 (orphan grants): what the table lists before an operator's
         // abandon, or a takeover that carries no tail, strands the
@@ -5474,6 +5512,7 @@ impl Meta {
                 || matches!(entry, LiveEntry::Shadow { rid, .. } if refused.contains(rid))
                 || matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident))
                 || matches!(entry, LiveEntry::Local { first, .. } if superseded_appends.contains(first))
+                || matches!(entry, LiveEntry::Local { first, .. } if filled_own.contains(first))
                 // A streamed transaction of this tenure the segment ships
                 // *past* (`through` at or beyond its last row) without
                 // naming its rows is gone from the holder's journal: it
@@ -5524,6 +5563,7 @@ impl Meta {
             > counter_get(&tx, &self.local, KV_DELEG_SPEC_COUNT)?;
         let stranded = if holder_locals
             || !superseded_appends.is_empty()
+            || !filled_own.is_empty()
             || live_non_local(&tx, self)?
                 .iter()
                 .any(|(_, entry)| strands(entry))
@@ -5542,6 +5582,7 @@ impl Meta {
                 |entry| {
                     matches!(entry, LiveEntry::Streamed { ident, .. } if rolled.contains(ident))
                         || matches!(entry, LiveEntry::Local { first, .. } if superseded_appends.contains(first))
+                        || matches!(entry, LiveEntry::Local { first, .. } if filled_own.contains(first))
                 },
             )?
         } else {

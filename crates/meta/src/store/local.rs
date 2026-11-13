@@ -566,6 +566,25 @@ fn journal_origins_from<'a>(
         }))
 }
 
+/// The outstanding transactions of delegation origin `(gen, idx)` exactly,
+/// by first journal seq.
+pub(crate) fn journal_origins_at(
+    r: &impl Readable,
+    meta: &Meta,
+    gen: u64,
+    idx: u64,
+) -> Result<Vec<u64>, MetaError> {
+    let mut out = Vec::new();
+    for found in journal_origins_from(r, meta, gen, idx)? {
+        let (at, first) = found?;
+        if at != idx {
+            break;
+        }
+        out.push(first);
+    }
+    Ok(out)
+}
+
 /// Every `journal_tx` row's head, oldest first. Starts past the acked
 /// watermark (the shipped history's tombstones), so the cost is the
 /// unshipped backlog's; callers that only need a count read the counters
@@ -3619,6 +3638,18 @@ fn past_stream_fills(r: &impl Readable, meta: &Meta, gen: u64, idx: u64) -> Resu
 }
 
 impl Meta {
+    /// `idx` raised over the consecutive positions of `gen` right above it
+    /// that a `DropHeld` of the log fills (one atomic read when none is).
+    pub fn stream_fills_past(&self, gen: u64, idx: u64) -> Result<u64, MetaError> {
+        if !self
+            .any_stream_fill
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(idx);
+        }
+        past_stream_fills(&self.db.read_tx(), self, gen, idx)
+    }
+
     /// Every stream position a `DropHeld` of the log fills, into the
     /// session (open).
     pub(crate) fn load_stream_fills(&self) -> Result<(), MetaError> {
