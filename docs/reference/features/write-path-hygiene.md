@@ -232,7 +232,12 @@ stream's later rows: the record *fills* each such index (`fills`), as the
 stream's no-op row there. Every replica counts a fill in its index of the
 stream once the stream reaches the index below it (a row the drop redid below
 a fill lands after the record), so the log's stream stays contiguous and a
-successor's cursor never waits at an index that is gone.
+successor's cursor never waits at an index that is gone. The record also names
+each replay of the damaged manifest an earlier deposition queued on this node
+(by request id; such a row has no transaction left to retire), and the apply
+refuses exactly those. A queued replay the drop leaves alone (another node's
+accepted shadow, or one queued after the decision) is counted in
+`queued_kept`, warned of, and keeps the chunk held for a later drop.
 
 **A dropper without the lease decides nothing, and follows the log for a record
 that was put.** The command on a node that is not the sequencer in force is

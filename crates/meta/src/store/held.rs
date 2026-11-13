@@ -376,8 +376,17 @@ pub struct DroppedHeld {
     /// Unrecoverable pending-upload rows removed.
     pub pending_removed: usize,
     /// Queued replays (from an earlier deposition) of this inode's
-    /// manifest, turned into conflict copies as well.
+    /// manifest, turned into conflict copies as well (those the decision
+    /// named: ADR-59 part B, D1).
     pub queued_dropped: usize,
+    /// Queued replays of this inode's manifest naming a lost chunk that the
+    /// drop left alone, warned of one by one: a shadow a delegate accepted
+    /// (`gen` other than 0: the delegate's row lands, or the entry replays
+    /// here once the generation ends), or an entry queued after the
+    /// decision (no record names it). Each keeps the chunk's pending row and
+    /// poison mark, so the row it lands as is held at once and a later drop
+    /// names it.
+    pub queued_kept: usize,
     /// Every rid the drop rolled back or refused: the seeds', the
     /// dependents' and the queued replays' (what the oracle treats as the
     /// operator's action, and what a requester's retry may now meet).
@@ -596,6 +605,14 @@ impl DroppedHeld {
                 self.redone
             ));
         }
+        if self.queued_kept > 0 {
+            text.push_str(&format!(
+                "; {} queued replay(s) of the file naming a lost chunk were left alone (another \
+                 node's accepted write, or queued after the decision): the chunk stays held for \
+                 a later drop",
+                self.queued_kept
+            ));
+        }
         if self.deposed {
             text.push_str(
                 "; applied on a node that no longer holds the lease: the record is in the log \
@@ -719,6 +736,51 @@ fn names_any(manifest: &[u8], missing: &BTreeSet<ChunkHash>) -> bool {
         },
         Err(_) => true,
     }
+}
+
+/// The chunks of `missing` that `manifest` names (all of them when it cannot
+/// tell: a spilled or undecodable manifest, as [`names_any`]).
+fn named_missing(manifest: &[u8], missing: &BTreeSet<ChunkHash>) -> Vec<ChunkHash> {
+    match Manifest::decode(manifest) {
+        Ok(Manifest {
+            chunks: ChunkInfo::Inline(chunks),
+            ..
+        }) => chunks
+            .values()
+            .filter(|h| missing.contains(h))
+            .copied()
+            .collect(),
+        _ => missing.iter().copied().collect(),
+    }
+}
+
+/// The non-refused replays of `ino`'s manifest queued here as the root's
+/// own (`gen` 0) that name a chunk of `missing`: `(queue key, rid)`.
+fn queued_namers(
+    r: &impl Readable,
+    meta: &Meta,
+    ino: Ino,
+    missing: &BTreeSet<ChunkHash>,
+) -> Result<Vec<(u64, crate::rid::Rid)>, MetaError> {
+    let mut out = Vec::new();
+    for queued in spec::read_pending_replays(r, meta)? {
+        if queued.refused.is_some() || queued.gen != 0 {
+            continue;
+        }
+        let (m, manifest) = match &queued.op {
+            MutateOp::SetManifest {
+                ino: m, manifest, ..
+            }
+            | MutateOp::Publish {
+                ino: m, manifest, ..
+            } => (*m, manifest),
+            _ => continue,
+        };
+        if m == ino && names_any(manifest, missing) {
+            out.push((queued.queue_seq, queued.rid));
+        }
+    }
+    Ok(out)
 }
 
 /// The poisoned inodes `tx` is a seed for.
@@ -1919,6 +1981,7 @@ impl Meta {
             idents: walked.idents.iter().map(|(ident, _)| *ident).collect(),
             fills: walked.fills.clone(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
+            queued: Vec::new(),
             s_deps: walked.dependents.iter().map(|(seq, _, _)| *seq).collect(),
             redone: walked.redone.iter().map(|(seq, _)| *seq).collect(),
             redone_rids: walked.redone.iter().filter_map(|(_, rid)| *rid).collect(),
@@ -1938,11 +2001,23 @@ impl Meta {
                 }
             }
         }
-        if walked.seeds.is_empty() {
+        // The replays of this inode's manifest an earlier deposition queued
+        // here (the root's own: `gen` 0) are refused by this drop too, so the
+        // record names them (D1): by rid, under `QUEUED_REPLAY_IDENT` (the
+        // row left this journal; nothing retires).
+        plan.queued = queued_namers(&tx, self, ino, &missing)?;
+        let mut rolled_back = walked.idents.clone();
+        rolled_back.extend(
+            plan.queued
+                .iter()
+                .map(|(_, rid)| (crate::record::QUEUED_REPLAY_IDENT, Some(*rid))),
+        );
+        if walked.seeds.is_empty() && plan.queued.is_empty() {
             // Nothing to carry in the log: a run after an earlier drop kept a
             // lost chunk's rows because an op or a write session still named
-            // it (no transaction is left to roll back; the marks and pending
-            // rows of the chunks no longer named go now).
+            // it (no transaction is left to roll back, no queued replay to
+            // refuse; the marks and pending rows of the chunks no longer named
+            // go now).
             tx.insert(
                 &self.local,
                 drop_plan_key(ino),
@@ -1960,7 +2035,7 @@ impl Meta {
             &LogRecord::DropHeld {
                 ino,
                 chunks: missing.iter().copied().collect(),
-                rolled_back: walked.idents.clone(),
+                rolled_back,
                 fills: walked.fills.clone(),
             },
         )?;
@@ -2381,8 +2456,11 @@ impl Meta {
         // delegate's row, or the entry replays here once the generation
         // ends and its journaled row is a later drop's seed.
         let mut queued_dropped = 0;
+        let mut queued_kept = 0;
+        // The lost chunks a queued replay this drop leaves alone still names.
+        let mut queued_names: BTreeSet<ChunkHash> = BTreeSet::new();
         for queued in spec::read_pending_replays(&tx, self)? {
-            if queued.refused.is_some() || queued.gen != 0 {
+            if queued.refused.is_some() {
                 continue;
             }
             let (m, manifest, size) = match &queued.op {
@@ -2401,6 +2479,27 @@ impl Meta {
                 _ => continue,
             };
             if m != ino || !names_any(manifest, &missing) {
+                continue;
+            }
+            // D1: only what the record names. A delegate's shadow (`gen` other
+            // than 0) is never named; an entry queued since the decision is
+            // not either. Either keeps the chunk's marks (below).
+            if queued.gen != 0
+                || !plan
+                    .queued
+                    .iter()
+                    .any(|(key, rid)| *key == queued.queue_seq && *rid == queued.rid)
+            {
+                queued_names.extend(named_missing(manifest, &missing));
+                queued_kept += 1;
+                tracing::warn!(
+                    ino,
+                    rid = ?queued.rid,
+                    gen = %crate::delegation::GenLabel::of(queued.gen),
+                    "drop-held left a queued replay of a write of the inode alone (a \
+                     delegate's shadow, or queued after the decision): its row lands or \
+                     replays later, held behind the chunk, for a later drop"
+                );
                 continue;
             }
             let op = MutateOp::SetManifest {
@@ -2483,7 +2582,9 @@ impl Meta {
             if sequencer {
                 live.retain(|rid| !rolled_back.contains(rid));
             }
-            if !live.is_empty() || sessions.names(hash) {
+            // A queued replay the drop left alone still names the chunk too:
+            // the row it lands as must be held at once.
+            if !live.is_empty() || sessions.names(hash) || queued_names.contains(hash) {
                 kept_pending.push(*hash);
                 kept_for.extend(live);
                 continue;
@@ -2542,6 +2643,7 @@ impl Meta {
             redone = plan.redone.len(),
             await_retry,
             queued_dropped,
+            queued_kept,
             pending_removed,
             kept = kept_pending.len(),
             acked_lost = acked_lost.len(),
@@ -2569,6 +2671,7 @@ impl Meta {
             await_retry,
             pending_removed,
             queued_dropped,
+            queued_kept,
             rolled_back,
             refused: refused_rids,
             placeholders,
@@ -2771,6 +2874,9 @@ struct DropPlan {
     fills: Vec<(u64, u64)>,
     /// `spec_seq`s of the seed transactions.
     seeds: Vec<u64>,
+    /// The queued replays the record names (`QUEUED_REPLAY_IDENT`), by queue
+    /// key and rid: the apply refuses these and no other.
+    queued: Vec<(u64, crate::rid::Rid)>,
     /// `spec_seq`s of the dependents rolled back with them.
     s_deps: Vec<u64>,
     /// `spec_seq`s of the dependents redone in place.

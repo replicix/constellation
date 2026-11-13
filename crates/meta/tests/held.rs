@@ -1999,6 +1999,125 @@ fn a_drop_leaves_a_queued_replay_of_a_delegates_shadow_alone() {
     assert_eq!(shadow.gen, gen);
 }
 
+/// Final review of ADR-59 part B, SHOULD 1 and 2: a queued replay the drop
+/// leaves alone (a delegate's shadow) is counted and warned of
+/// (`queued_kept`), and it keeps the chunk's pending row and poison mark, as
+/// an op in flight does: the delegate's row, or the replay once the
+/// generation ends, names the lost chunk and must be held at once, not
+/// after the next upload pass re-marks it. Fails on the parent: no
+/// `queued_kept` count, and the marks went with the drop.
+#[test]
+fn a_queued_shadow_the_drop_leaves_alone_keeps_the_chunks_marks() {
+    let (meta, broken) = node_one_with_a_seed();
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let write = MutateOp::SetManifest {
+        ino: broken,
+        base_manifest: None,
+        manifest: manifest_naming(lost, 19),
+        size: 19,
+        mtime_ns: None,
+        ctime_ns: None,
+    };
+    let tag = constellation_meta::locks::LockTag::default();
+    let gen = (1u64 << 32) | 1;
+    assert!(!meta
+        .install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
+        .unwrap());
+    let dropped = meta.drop_held(broken, 1).unwrap();
+    assert_eq!(dropped.dropped, 1, "{dropped:?}");
+    assert_eq!(dropped.queued_kept, 1, "{dropped:?}");
+    assert_eq!(dropped.kept_pending, vec![lost], "{dropped:?}");
+    assert_eq!(
+        meta.unrecoverable_chunks().unwrap(),
+        vec![(lost, broken)],
+        "the chunk's mark went with the drop"
+    );
+}
+
+/// Final review of ADR-59 part B, SHOULD 3: a drop with no journaled seed
+/// left (an earlier drop kept the chunk's marks for an op that still named
+/// it) that refuses a replay of the damaged manifest an earlier deposition
+/// queued here decides it in the log (D1): a `DropHeld` names the rid (no
+/// transaction: `QUEUED_REPLAY_IDENT`), and the refusal waits for the
+/// apply. Before, the seedless path applied at once with no record: the
+/// rid was refused and listed lost while nothing in the log named it
+/// (`drop_acked_loss_unrecorded`, the shape of seed 1051). Fails on the
+/// parent: the decision is not pending and the journal carries no record.
+#[test]
+fn a_seedless_drop_names_the_queued_replays_it_refuses() {
+    let (meta, broken) = node_one_with_a_seed();
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let sessions = Default::default();
+    // An op in flight still names the chunk: the first drop strands the seed
+    // and keeps the marks.
+    let first = meta
+        .drop_held_knowing_now(
+            broken,
+            1,
+            false,
+            &|_| false,
+            &|_| vec![rid_of(3, 1)],
+            &sessions,
+            true,
+        )
+        .unwrap();
+    assert_eq!(first.dropped, 1, "{first:?}");
+    assert_eq!(first.kept_pending, vec![lost], "{first:?}");
+    let rows = batch(&meta);
+    ship(&meta, &rows, 2);
+    // The root's own replay of a write of the file, queued by a deposition.
+    let write = MutateOp::SetManifest {
+        ino: broken,
+        base_manifest: None,
+        manifest: manifest_naming(lost, 19),
+        size: 19,
+        mtime_ns: None,
+        ctime_ns: None,
+    };
+    meta.queue_replay(rid_of(1, 7), &write, &Default::default())
+        .unwrap();
+    let decided = meta
+        .drop_held_knowing(
+            broken,
+            2,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &sessions,
+            true,
+        )
+        .unwrap();
+    assert!(decided.pending.is_some(), "{decided:?}");
+    let rows = batch(&meta);
+    let named: Vec<_> = rows
+        .iter()
+        .filter_map(|(_, rec)| match rec {
+            LogRecord::DropHeld { rolled_back, .. } => Some(rolled_back.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(
+        named,
+        vec![(constellation_meta::QUEUED_REPLAY_IDENT, Some(rid_of(1, 7)))]
+    );
+    // Not refused before the log carries the record.
+    let queued = meta.pending_replays().unwrap();
+    assert!(
+        queued
+            .iter()
+            .any(|q| q.rid == rid_of(1, 7) && q.refused.is_none()),
+        "{queued:?}"
+    );
+    ship(&meta, &rows, 3);
+    let applied = meta
+        .drop_held_apply(broken, 2, &|_| false, &|_| Vec::new(), &sessions, true)
+        .unwrap();
+    assert_eq!(applied.queued_dropped, 1, "{applied:?}");
+    assert!(applied.refused.contains(&rid_of(1, 7)), "{applied:?}");
+    assert!(meta.unrecoverable_chunks().unwrap().is_empty());
+}
+
 /// A row classed for the archive alone is no proof its answer never left:
 /// a configuration that formed after it was journaled (an epoch's hold) can
 /// release the answer before the row ships (flex-crash+durability seed

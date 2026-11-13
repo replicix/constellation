@@ -4788,6 +4788,17 @@ is the consequence of that record being in the log.**
   took back for the filled rows. Rejected: (b) rolling back the whole tail of
   the stream past the first rolled-back index, which rolls back acknowledged
   rows that do not need the lost bytes (I5).
+- **What the record names, the apply refuses, and no more.** A replay of the
+  damaged manifest that an earlier deposition queued here (the root's own,
+  `gen` 0) is named by the decision's record by its rid, under the identity
+  `QUEUED_REPLAY_IDENT` (`(0, 0)`: no transaction, nothing retires), and only
+  the named entries are refused at the apply. A drop with no journaled seed
+  that refuses such an entry now journals a record and waits for the log like
+  any other (D1; before, it refused and listed the rid with no record: seed
+  1051's shape). A queued replay the drop leaves alone (a delegate's shadow,
+  `gen` other than 0, or an entry queued after the decision) is counted
+  (`queued_kept`) and warned of, and keeps the chunk's pending row and poison
+  mark as an op in flight does, so the row it lands as is held at once.
 
 A drop that is decided in the log whose dropper dies before applying it is
 accepted (the maintainer, 2026-11-12): no successor completes it. Counted
