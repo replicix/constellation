@@ -88,23 +88,91 @@ impl Core {
         code == Code::ReadOnly && touched_gen != 0 && !self.cfg.root_ignores_touched
     }
 
-    /// ADR-47 rule 2 for an untouched rid that was ever in an inbox (rule
-    /// 3: the root decides it): its refusal under an unreachable designation
-    /// is journaled (`Refused { rid, EROFS }`, as the drain's own refusal of
-    /// it is) and answered once committed. Its batch may still be in the
-    /// bucket, and a drain runs it once the generation ends (the holder
-    /// tick's leftover run, a later poll, a successor's gate): the batch's
-    /// run must find the refusal by dedup. Before, the refusal was
-    /// unjournaled and final, and the batch later executed the rid the
-    /// client had been told was refused (`far-root-writes-shared+lost-chunk`
-    /// seeds 617, 1477: a real-time order violation).
+    /// ADR-47 rule 2 for a rid that was ever in an inbox (rule 3: the root
+    /// decides it): every final refusal of it under a designation, `EROFS`
+    /// under an unreachable holder and `EXDEV` across a boundary alike, is
+    /// journaled (`Refused { rid, code }`, as the drain's own refusal of it
+    /// is) and answered once committed. Its batch may still be in the
+    /// bucket, and a drain runs it once the generation ends or the range
+    /// shrinks (the holder tick's leftover run, a later poll, a successor's
+    /// gate): the batch's run must find the refusal by dedup. Before, the
+    /// refusal was unjournaled and final, and the batch later executed the
+    /// rid the client had been told was refused
+    /// (`far-root-writes-shared+lost-chunk` seeds 617, 1477: a real-time order
+    /// violation). A touched rid's `EROFS` is held instead
+    /// (`root_holds_touched`).
     pub(crate) fn root_journals_inbox_ever(
         &self,
         code: Code,
         touched_gen: u64,
         inbox_ever: bool,
     ) -> bool {
-        code == Code::ReadOnly && inbox_ever && !self.root_holds_touched(code, touched_gen)
+        inbox_ever && !self.root_holds_touched(code, touched_gen)
+    }
+
+    /// A generation `gen` held by `node` that a redirect may go to: not
+    /// ended, within its grant (`gen_until`), its holder's link up. The
+    /// forward path's test for a live delegate, shared with the root's own
+    /// path (`local_redirect_to_live_holder`).
+    pub(crate) fn deleg_gen_reachable(&self, now: Now, gen: u64, node: NodeId) -> bool {
+        self.dl.gens.get(&gen).is_some_and(|g| !g.ended)
+            && now.wait < self.gen_until(gen)
+            && self.roster.links().get(&node).is_some_and(|l| l.connected)
+    }
+
+    /// Fence C9.3, the root's own path (paused seed 1310): a touched,
+    /// inbox-ever, non-settle rid of this node's own whose keys are wholly one
+    /// live non-stealable generation of another node goes to that holder, as
+    /// `mutate_request` redirects a requester's (`inbox_ever_redirects`): its
+    /// stream decides it (answers from the rid's outcome or refuses it
+    /// `EROFS` as a row of its stream) and runs nothing. A replay is such a
+    /// rid (unknown history, ADR-47 rule 5). Held here it waited for a grant
+    /// that never ends, went in doubt and was replayed again, forever. The
+    /// holder and the generation to route by, or `None` (the hold stays).
+    pub(crate) fn local_redirect_to_live_holder(
+        &self,
+        now: Now,
+        code: Code,
+        fence: Fence,
+        settle: bool,
+        keys: &TouchSet,
+        replica: &dyn Replica,
+    ) -> Option<(NodeId, u64)> {
+        if settle || !fence.inbox_ever || !self.root_holds_touched(code, fence.touched_gen) {
+            return None;
+        }
+        let Ownership::Delegated(d) = replica.resolve_ownership(keys) else {
+            return None;
+        };
+        let non_stealable = self.dl.gens.get(&d.gen).is_some_and(|g| g.non_stealable());
+        (non_stealable
+            && d.node != self.cfg.node_id
+            && self.deleg_gen_reachable(now, d.gen, d.node))
+        .then_some((d.node, d.gen))
+    }
+
+    /// [`Self::root_journals_inbox_ever`]'s row, journaled: the designation's
+    /// refusal of `rid`, observing no keys (it is decided by who owns them,
+    /// not by their state, as ADR-58 C1's `ABANDONED`: the ship plan never
+    /// holds it behind a held row on them, seed 1051's shape), never `Lone`.
+    /// Returns whether it was journaled.
+    pub(crate) fn journal_inbox_ever_refusal(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        code: Code,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.record_refusal(rid, code, None, super::Asker::Remote, replica) {
+            return false;
+        }
+        self.note_final_nonholder_refusal(rid, code, true);
+        self.stats.inbox_ever_refusals_journaled += 1;
+        // Its answer waits for the row's commit: start a round now, not at
+        // the idle backoff's next one.
+        self.nudge(now, out);
+        true
     }
 
     /// The generation of `keys` a refusal names (informational: the
@@ -279,7 +347,7 @@ impl Core {
         // is answered by the gate (below), not held for a grant that never
         // comes: the gate ends a generation delegated to this node itself.
         let gate_settle = if settle && req != OpId(0) {
-            self.gate_settle(now, from, &op, replica)
+            self.gate_settle(now, from, rid, &op, replica)
         } else {
             None
         };
@@ -421,6 +489,10 @@ impl Core {
             // handoff pause closes this node's *own* new writes so a
             // waiter can claim, not a peer's forwarded ones.
             self.deleg_root_sync_due(now, replica, out);
+            // The rid's refusal was journaled just now (`root_journals_inbox_ever`):
+            // its answer orders nothing, so it waits for neither `deps` nor the
+            // replay queue.
+            let mut refused_now = false;
             if self.cfg.delegation && self.deleg_known() {
                 let keys = keys_of_op_in(&op, replica);
                 let mut answered_from_outcome = false;
@@ -431,15 +503,11 @@ impl Core {
                     // op parks behind it below), and not a delegate's own op
                     // once its grant had time to reach it (it has disowned
                     // the generation: recalled now, not outwaited).
-                    let live = self.dl.gens.get(&d.gen).filter(|g| {
-                        !g.ended
-                            && now.wait < self.gen_until(d.gen)
-                            && self
-                                .roster
-                                .links()
-                                .get(&d.node)
-                                .is_some_and(|l| l.connected)
-                    });
+                    let live = self
+                        .dl
+                        .gens
+                        .get(&d.gen)
+                        .filter(|_| self.deleg_gen_reachable(now, d.gen, d.node));
                     // (A non-stealable grant is never recalled: its designee's own op
                     // is held as it was, and `deleg_recall_plan` refuses.)
                     let non_stealable = self.dl.gens.get(&d.gen).is_some_and(|g| g.non_stealable());
@@ -467,8 +535,13 @@ impl Core {
                     // it answers from the rid's outcome, or refuses it
                     // `EROFS` in its stream, and runs nothing. An untouched
                     // rid is refused here (row 8).
+                    // (A settle of an untouched inbox-ever rid under a
+                    // non-stealable grant is the root's too: the drain refuses its batch copy here, and the
+                    // holder would refuse the settle `ABANDONED` beside it,
+                    // the 1206 signature. A touched one's settle goes to the
+                    // holder as before.)
                     let inbox_only = fence.inbox_ever
-                        && !settle
+                        && (!settle || (non_stealable && fence.touched_gen == 0))
                         && from != d.node
                         && !(non_stealable && fence.touched_gen != 0);
                     // Nor to a generation this root inherited and has not
@@ -589,8 +662,7 @@ impl Core {
                                 fence.inbox_ever,
                             ) =>
                     {
-                        if !self.record_refusal(rid, code, Some(&op), super::Asker::Remote, replica)
-                        {
+                        if !self.journal_inbox_ever_refusal(now, rid, code, replica, out) {
                             if req != OpId(0) {
                                 out.push(Action::Send {
                                     to: from,
@@ -609,8 +681,7 @@ impl Core {
                             }
                             return;
                         }
-                        self.note_final_nonholder_refusal(rid, code, true);
-                        self.stats.inbox_ever_refusals_journaled += 1;
+                        refused_now = true;
                         true
                     }
                     _ => has_outcome,
@@ -728,7 +799,8 @@ impl Core {
                         return;
                     }
                 };
-                let deps_wait = (!settle && !replica.reaches_streams(&deps)).then_some(deps);
+                let deps_wait =
+                    (!settle && !refused_now && !replica.reaches_streams(&deps)).then_some(deps);
                 if !wait.is_empty() || deps_wait.is_some() {
                     if deps_wait.is_some() {
                         self.stats.deleg_deps_waits += 1;
@@ -764,7 +836,7 @@ impl Core {
                 return;
             }
             // Plan 46 M0.2 (R3): behind the replay queue on its keys.
-            if !settle && self.queue_gate_blocks(rid, &op, replica) {
+            if !settle && !refused_now && self.queue_gate_blocks(rid, &op, replica) {
                 self.stats.ops_parked_behind_queue += 1;
                 tracing::debug!(
                     node = self.cfg.node_id,
@@ -1713,7 +1785,7 @@ impl Core {
     /// work is done it has taken the generation on and keeps it renewed
     /// (ADR-42), so a settle from a node other than its delegate is
     /// redirected to it, as an open root does for a live, reachable one
-    /// (S3). The delegate's own settle, an unreachable or ended or
+    /// (S3), unless the rid has its outcome here (answered from it). The delegate's own settle, an unreachable or ended or
     /// recalled generation, one outwaited, and a cross-subtree op that
     /// involves another node's generation (which needs a recall) are left
     /// to the ordinary route (`Busy`).
@@ -1724,6 +1796,7 @@ impl Core {
         &self,
         now: Now,
         from: NodeId,
+        rid: Rid,
         op: &MutateOp,
         replica: &dyn Replica,
     ) -> Option<GateSettle> {
@@ -1755,6 +1828,14 @@ impl Core {
                             .is_some_and(|l| l.connected);
                     if !live {
                         return None;
+                    }
+                    // ADR-47 row 4 in the gate: a rid with an outcome here
+                    // (the predecessor's committed refusal of an inbox-ever
+                    // rid, re-shipped) is answered from it, not sent to a
+                    // holder that may not have applied it and would refuse
+                    // the settle `ABANDONED` beside it (the 1206 signature).
+                    if self.rid_has_outcome(rid, replica) {
+                        return Some(GateSettle::Answer(g.epoch));
                     }
                     // Only a delegate this tenure has granted owns the
                     // generation again: one that lapsed while the gate was

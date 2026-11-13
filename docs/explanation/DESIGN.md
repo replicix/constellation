@@ -825,9 +825,10 @@ requester's memory: a forward carries the generation it was routed by and the
 highest generation the rid ever touched; a designee runs it only under the
 generation it was routed by (else `Fenced`), and the root refuses for good (`EROFS`)
 only a rid that touched none, otherwise it answers `HolderUnreachable` and
-holds; such a refusal of a rid that was ever in an inbox is journaled and
-answered once committed, so that its batch, drained later, dedups to it; a
-cross-subtree `EXDEV` stays final. A rid that was ever in an inbox
+holds; a cross-subtree `EXDEV` stays final. Every final refusal of a rid
+that was ever in an inbox is journaled and answered once committed, so that
+its batch, drained later, dedups to it; the root's own touched inbox-ever op
+under a live non-stealable holder goes to that holder, as a requester's does. A rid that was ever in an inbox
 is never run by a designee of a non-stealable generation, the lease holder's
 own included: the holder refuses it (`EROFS`) as a row of its stream, after its
 dedup, so no clock decides whether a refused rid also ran. The drain halts such

@@ -9456,6 +9456,70 @@ impl Core {
 
     // ----------------------------------------------------- the root
 
+    /// The final designation refusal [`Self::deleg_recall_plan`] gives `keys`
+    /// (`EROFS` under another node's non-stealable grant, `EXDEV` across one),
+    /// without its side effects: `None` where the plan does anything else
+    /// (no delegation, the gate, the root's own sticky stream). Exactly the
+    /// plan's `Refuse` cases, so a caller may skip what only an execution
+    /// needs on its word.
+    pub(crate) fn designation_refusal_of(
+        &self,
+        keys: &TouchSet,
+        replica: &dyn Replica,
+    ) -> Option<Code> {
+        if !self.cfg.delegation || !self.deleg_known() {
+            return None;
+        }
+        let (gens, cross): (Vec<u64>, bool) = match replica.resolve_ownership(keys) {
+            Ownership::Root => return None,
+            Ownership::Delegated(d) => (vec![d.gen], false),
+            Ownership::CrossSubtree { involved, .. } => {
+                (involved.iter().map(|d| d.gen).collect(), true)
+            }
+        };
+        let live = |g: &u64| self.dl.gens.get(g).filter(|s| !s.ended);
+        if self.lease.gate.is_some() && gens.iter().any(|g| live(g).is_some()) {
+            return None;
+        }
+        let me = self.me();
+        if !cross
+            && gens
+                .first()
+                .and_then(live)
+                .is_some_and(|s| s.node == me && s.non_stealable())
+        {
+            return None;
+        }
+        gens.iter()
+            .any(|g| {
+                live(g).is_some_and(|s| {
+                    s.non_stealable() && !(s.node == me && s.kind() == DelegKind::Sticky)
+                })
+            })
+            .then_some(if cross {
+                Code::CrossDevice
+            } else {
+                Code::ReadOnly
+            })
+    }
+
+    /// Whether the root's own path journals `op`'s designation refusal
+    /// (`root_journals_inbox_ever`): such an op orders nothing, so it does
+    /// not wait behind the replay queue.
+    pub(crate) fn refusal_journaled_for(
+        &self,
+        op: &MutateOp,
+        fence: super::holder::Fence,
+        replica: &dyn Replica,
+    ) -> bool {
+        fence.inbox_ever
+            && self
+                .designation_refusal_of(&super::holder::keys_of_op_in(op, replica), replica)
+                .is_some_and(|code| {
+                    self.root_journals_inbox_ever(code, fence.touched_gen, fence.inbox_ever)
+                })
+    }
+
     /// The generations `keys` fall under that this root must end before
     /// it executes: started (recalled) here; the caller parks on their
     /// wait ids. `None`: nothing to recall.

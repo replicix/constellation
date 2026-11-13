@@ -21118,7 +21118,8 @@ fn a_stream_holder_drops_its_own_streams_held_rows() {
         .unwrap_or_else(|e| panic!("far-placement+lost-chunk seed 326: {e}"));
 }
 
-/// ADR-47 rule 2 for an inbox-ever rid: the root told an untouched rid that
+/// ADR-47 rule 2 for an inbox-ever rid (every final designation refusal,
+/// `EXDEV` too): the root told an untouched rid that
 /// was ever in an inbox `EROFS` under an unreachable sticky holder, unjournaled
 /// and final (a requester's forward, 1477, 1510; the root's own op on the
 /// lease path, 389, 617, 1133), while the rid's batch was still in the bucket;
@@ -21174,6 +21175,21 @@ fn a_delegate_drops_its_row_deferred_on_a_gone_nodes_chunk() {
         run_seed(1051, config_variant(config(), "lost-chunk"))
             .unwrap_or_else(|e| panic!("{label}+lost-chunk seed 1051: {e}"));
     }
+}
+
+/// Fence C9.3 on the root's own path (`far-root-writes-paused+lost-chunk` seed
+/// 1310): the root's requeued replay (inbox-ever and touched: unknown history)
+/// under node 2's live sticky grant took the local path, was held for a grant
+/// that never ends, went in doubt and was replayed again, forever. It now goes
+/// to the live holder, whose stream decides it. Failed on 7665d4d0
+/// (quiescence; the session-order rule below hid it after that).
+#[test]
+fn the_roots_own_replay_under_a_live_sticky_holder_goes_to_it() {
+    run_seed(
+        1310,
+        config_variant(far_root_writes_paused_config(), "lost-chunk"),
+    )
+    .unwrap_or_else(|e| panic!("far-root-writes-paused+lost-chunk seed 1310: {e}"));
 }
 
 /// ADR-59 part B, the `kept_diverged` residual (benign): a claim's kept merge

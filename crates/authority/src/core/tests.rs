@@ -55768,7 +55768,7 @@ mod c1_tail_fetch {
         let now = h.clk();
         assert!(
             matches!(
-                h.core.gate_settle(now, 3, &settle, &h.meta),
+                h.core.gate_settle(now, 3, h.rid(99), &settle, &h.meta),
                 Some(super::super::holder::GateSettle::Held)
             ),
             "not shippable yet: held"
@@ -55777,7 +55777,7 @@ mod c1_tail_fetch {
         let now = h.clk();
         assert!(
             matches!(
-                h.core.gate_settle(now, 3, &settle, &h.meta),
+                h.core.gate_settle(now, 3, h.rid(99), &settle, &h.meta),
                 Some(super::super::holder::GateSettle::Answer(2))
             ),
             "answered while the floor runs"
@@ -78892,6 +78892,18 @@ mod route_fence_root {
         assert_eq!(h.core.stats.inbox_ever_refusals_journaled, 1);
         let refused = h.core.take_final_nonholder_refusals();
         assert_eq!(refused, vec![(rid_of(2, 1), Code::ReadOnly, true)]);
+        // `EXDEV` across the boundary, the same (MUST-1).
+        let cross = cross_op(&h, d1);
+        let out = forward_ever(&mut h, 2, 2, 2, cross, false, (0, 0), true);
+        assert_eq!(outcome_to(&out, 2), None, "EXDEV answered before its row");
+        assert!(h.core.rid_refused_here(rid_of(2, 2), &h.meta));
+        let out = h.archive_lands();
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::CrossDevice)),
+            "{out:?}"
+        );
+        let _ = h.core.take_final_nonholder_refusals();
         // The grant ends; the batch is drained: it runs nothing.
         crate::replica::Replica::apply_segment(
             &h.meta,
@@ -79025,6 +79037,105 @@ mod route_fence_root {
                         .any(|(r, reply)| *r == rid && format!("{reply:?}").contains("ReadOnly")),
                     "touched {touched}, in doubt {in_doubt}: {out:?}"
                 );
+            }
+        }
+    }
+
+    /// The root's own path (lcres review MUST-1, SHOULD-5): an untouched op
+    /// of this node's that was in an inbox (its batch may still be in the
+    /// bucket) is refused under a designation with its refusal journaled,
+    /// `EROFS` under the unreachable holder and `EXDEV` across its boundary
+    /// alike, and answered once the row is committed. Fails on the parent:
+    /// told at once, nothing journaled (seeds 389, 617, 1133 for `EROFS`).
+    #[test]
+    fn the_roots_own_inbox_ever_refusal_is_journaled_before_its_answer() {
+        for cross in [false, true] {
+            let (mut h, d1, _gen) = sticky_root();
+            let rid = h.rid(1);
+            h.core.in_doubt_rids.insert(rid);
+            h.core.in_doubt_batches.insert(
+                rid,
+                vec![constellation_store_s3::inbox::InboxKey {
+                    epoch: 1,
+                    node: 1,
+                    n: 0,
+                }],
+            );
+            let op = if cross {
+                cross_op(&h, d1)
+            } else {
+                create_in(&h, d1, "own")
+            };
+            let code = if cross { "CrossDevice" } else { "ReadOnly" };
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            assert!(
+                !replies(&out).iter().any(|(r, _)| *r == rid),
+                "{code}: told before its row: {out:?}"
+            );
+            assert!(h.core.rid_refused_here(rid, &h.meta), "{code}: journaled");
+            assert_eq!(h.core.stats.inbox_ever_refusals_journaled, 1);
+            let out = h.archive_lands();
+            assert!(
+                replies(&out)
+                    .iter()
+                    .any(|(r, reply)| *r == rid && format!("{reply:?}").contains(code)),
+                "{code}: {out:?}"
+            );
+        }
+    }
+
+    /// Fence C9.3 on the root's own path (paused seed 1310): a touched op of
+    /// this node's that was in an inbox, under a live non-stealable holder,
+    /// goes to that holder routed by its generation; with the holder out of
+    /// reach it is held as before. Fails on the parent: held either way (a
+    /// grant that never ends; the op went in doubt and was replayed again).
+    #[test]
+    fn the_roots_own_touched_inbox_ever_op_goes_to_a_live_sticky_holder() {
+        for live in [true, false] {
+            let (mut h, d1, gen) = sticky_root();
+            peers(&mut h, Some(live));
+            h.advance(5);
+            let rid = h.rid(1);
+            h.core.in_doubt_rids.insert(rid);
+            h.core.in_doubt_touched.insert(rid, gen);
+            h.core.in_doubt_batches.insert(
+                rid,
+                vec![constellation_store_s3::inbox::InboxKey {
+                    epoch: 1,
+                    node: 1,
+                    n: 0,
+                }],
+            );
+            let op = create_in(&h, d1, "own");
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            assert!(replies(&out).iter().all(|(r, _)| *r != rid), "{out:?}");
+            let c = &h.core.clients[&rid];
+            if live {
+                assert_eq!(h.core.stats.local_redirects_to_live_holder, 1);
+                assert!(
+                    matches!(
+                        c.phase,
+                        crate::core::client::Phase::InboxWithdraw { holder: 3, .. }
+                            | crate::core::client::Phase::Forwarded { holder: 3, .. }
+                    ),
+                    "{:?}",
+                    c.phase
+                );
+                assert_eq!(c.touched_gen, gen);
+                assert!(!c.designation_held);
+            } else {
+                assert_eq!(h.core.stats.local_redirects_to_live_holder, 0);
+                assert!(c.designation_held, "held while the holder is out of reach");
             }
         }
     }
