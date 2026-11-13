@@ -711,6 +711,7 @@ pub(super) fn poison_record_isolation(seed: u64) -> Result<()> {
 ///   writes returned, A's placeholders are gone and none was settled.
 pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     const NAME: &str = "drop-held-remote-dependents";
 
@@ -809,8 +810,15 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
     })?;
     std::fs::write(a.mnt.join("d/broken"), &lost)?;
     std::fs::rename(a.mnt.join("d/broken"), a.mnt.join("d/renamed"))?;
+    // ADR-59 part A: a directory's times and link count are merged, so B's
+    // `mkdir` beside the rename would ship past the held rows and be
+    // answered. An explicit `chmod` of `d` writes its inode exclusively and
+    // so waits behind the held rename (which merged it); B's `mkdir`,
+    // which merges `d` too, then waits behind the chmod: a row of another
+    // node held by key, as this scenario needs.
+    std::fs::set_permissions(a.mnt.join("d"), std::fs::Permissions::from_mode(0o750))?;
 
-    // B writes into the directory the rename touched. A forwards-executes
+    // B writes into the directory the chmod touched. A forwards-executes
     // it and cannot answer (the log is held): B's ops wait, off this thread.
     let (bmnt, payload_b) = (b.mnt.clone(), payload.clone());
     let writer = std::thread::spawn(move || -> Result<()> {
@@ -829,16 +837,16 @@ pub(super) fn drop_held_remote_dependents(seed: u64) -> Result<()> {
     std::fs::write(a.mnt.join("after"), b"written after the broken file")?;
     std::fs::remove_file(&hold)?;
 
-    // The round finds the chunk gone: the seed, the rename and B's mkdir
-    // are held.
+    // The round finds the chunk gone: the seed, the rename, the chmod and
+    // B's mkdir are held.
     let ino = {
         let mut found = None;
         eventually("A reports the held set", Duration::from_secs(60), || {
             let held = a.control_status()?["held"].clone();
             let inodes = held["inodes"].as_array().cloned().unwrap_or_default();
             anyhow::ensure!(
-                held["transactions"].as_u64().unwrap_or(0) >= 3 && inodes.len() == 1,
-                "the seed, the rename and B's mkdir are not all held: {held}"
+                held["transactions"].as_u64().unwrap_or(0) >= 4 && inodes.len() == 1,
+                "the seed, the rename, the chmod and B's mkdir are not all held: {held}"
             );
             found = inodes[0]["ino"].as_u64();
             Ok(())
