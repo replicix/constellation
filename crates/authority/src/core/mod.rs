@@ -1293,6 +1293,9 @@ pub struct Stats {
     /// yet, and one for a part of the stream that could journal no row (it
     /// ended the whole stream at the cut).
     pub deleg_release_merged: u64,
+    /// ADR-59 part B: release requests deferred because this node's drop as
+    /// the stream's holder had not reached the log yet.
+    pub deleg_release_drop_pending: u64,
     pub deleg_release_rowless_partial: u64,
     /// Delegate (plan 46 M1.2 step 14): rowless releases by reason: the cut
     /// capped below the delegate's holder appends, a stream never installed

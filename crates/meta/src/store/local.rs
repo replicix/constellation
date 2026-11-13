@@ -802,7 +802,7 @@ impl Meta {
         let delegated = journal::PendingDelegate::peek().is_some();
         let (gen, idx, deps, appended) = match journal::PendingDelegate::take() {
             Some(d) => {
-                let appended = d.idx.is_some();
+                let appended = d.idx.is_some() && !d.own;
                 let idx = match d.idx {
                     Some(i) => i,
                     None => {
@@ -1401,6 +1401,20 @@ impl Meta {
         }
         let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
         self.apply_records_journaled_inner(records, rid, Journaled::Appended)?;
+        // ADR-59 part B: a stream holder's `DropHeld` (the row at the seed's
+        // index) fills the stream's other rolled-back positions; the root
+        // counts them as it counts the append (before raising the index, so
+        // the raise passes the fills right above it).
+        let fills: Vec<(u64, u64)> = records
+            .iter()
+            .flat_map(|rec| rec.stream_fills().iter().copied())
+            .collect();
+        if !fills.is_empty() {
+            let mut tx = self.db.write_tx();
+            self.note_drop_fills_tx(&mut tx, &fills)?;
+            tx.commit()?;
+            self.note_drop_fills(&fills);
+        }
         self.note_log_idx(gen, idx)?;
         Ok(true)
     }
@@ -1482,6 +1496,13 @@ impl Meta {
         let mut pending = crate::store::remote::PendingView::new(&r, self)?;
         let mut out = Vec::new();
         let mut rows = 0usize;
+        // ADR-59 part B: a drop this node decided as the stream's holder. The
+        // rows its record names are never sent (the record stands at the
+        // seed's index, and fills the rest), and nothing above the record
+        // until the apply strands them.
+        let drop = super::held::stream_drops_tx(&r, self)?
+            .into_iter()
+            .find(|(g, _, _)| *g == gen);
         // In index order from `from_idx`, read by origin
         // (`journal_origin`): the cost is the batch's, not the whole
         // outstanding stream's (a delegate far ahead of the log read
@@ -1502,6 +1523,14 @@ impl Meta {
             };
             if row.gen != gen || row.idx < from_idx {
                 continue;
+            }
+            if let Some((_, at, named)) = &drop {
+                if named.contains(&first) {
+                    continue;
+                }
+                if row.idx > *at {
+                    break;
+                }
             }
             self.note_local_rows_read(1);
             let records: Vec<LogRecord> = journal_records(&r, self, first, row.last)?
@@ -1829,11 +1858,22 @@ impl Meta {
         if wanted.is_empty() {
             return Ok(out);
         }
+        // ADR-59 part B: a stream holder's drop record shares its position
+        // with the seed it names; the segment carries the record, never the
+        // seed.
+        let named: std::collections::BTreeSet<u64> = super::held::stream_drops_tx(tx, self)?
+            .into_iter()
+            .flat_map(|(_, _, named)| named)
+            .collect();
         let from = journal::acked_watermark(tx, &self.local)?.saturating_add(1);
         for guard in tx.range(&self.journal_tx, tx_key(from)..) {
             let (k, v) = guard.into_inner()?;
             let h: JournalTxHead = postcard::from_bytes(&v)?;
             self.note_local_rows_read(1);
+            let first = decode_tx_key(&k)?;
+            if named.contains(&first) {
+                continue;
+            }
             if h.gen != 0 && wanted.remove(&(h.gen, h.idx)) {
                 out.push((decode_tx_key(&k)?, h.last, h.spec_seq));
                 if wanted.is_empty() {

@@ -2114,6 +2114,9 @@ merges, or a merge and an observation, order nothing
 turns a held manifest into a conflict copy with the lost chunks as holes,
 rolls back and replays by rid only the dependents that need the lost content,
 and redoes the rest in place; the drop is a `DropHeld` record the log carries,
+journaled by the node whose rows reach the log by right (the lease holder for
+root rows, the holder of a stream's grant for that stream's rows, the record
+then being the stream's row at the seed's index),
 and its effect, the dropper's own included, follows the record (ADR-59 part B;
 [Write-path hygiene](../reference/features/write-path-hygiene.md#held-records-statusheld)).
 

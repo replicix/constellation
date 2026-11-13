@@ -4723,8 +4723,9 @@ a directory held every later one in it, and the drop rolled all of them back.
   only merges the directory is no longer reached by it. Of what depends on
   the seeds by key, part B rolls back only what needs the lost content and
   redoes the rest in place (a rename, chmod or unlink of the damaged file, a
-  create of a name it vacated). A node that is not the sequencer in force
-  decides nothing: the command is refused (part B, D1).
+  create of a name it vacated). Only the node whose rows reach the log by
+  right decides a drop of them (part B, D1); any other node's command is
+  refused.
 
 **Part B: a drop's partial rollback is a decision the log makes.** A first
 implementation of the redo (the drop undoes only what needs the lost content
@@ -4749,6 +4750,22 @@ is the consequence of that record being in the log.**
   break the order of the rows behind it) a transaction the pending plan names or
   whose identity the log retired, whatever else would release it, and the apply
   strands by journal row anything of the record it still finds.
+  **Who decides (widened by the maintainer, 2026-11-13).** The node whose rows
+  reach the log by right journals the record: the lease holder for root rows;
+  the holder of a delegation stream's grant for that stream's rows, a deposed
+  root's own sticky stream included (`far-placement+lost-chunk` 326: the
+  deposed root kept its stream with the seed in it, and no node could decide).
+  A stream holder's record is the stream's own row at the seed's index (the
+  lowest rolled-back one), with `fills` for the stream's other rolled-back
+  positions, and its identities are the stream positions
+  `(deleg_epoch(gen), idx)` its copies are kept by. It reaches the log as the
+  stream's rows do (the root appends it and counts its fills), and is fenced
+  as they are: until the apply the stream sends none of the rows it names and
+  nothing above it, a release of the stream waits for the apply, and a
+  generation that ends without the record (its row stranded unshipped)
+  cancels the drop. The holder applies it when the root's segment carrying it
+  acknowledges its row (never the seed's, which shares the position), and
+  journals the seeds' refusals as rows of its stream.
 - **D2, retired idents never land.** A replica that applies it from the log
   (or ships it) records the identities as retired, holes its member and backup
   copies and strands what it was streamed of them. The takeover's re-ship gate
@@ -4904,7 +4921,9 @@ pin part A. Part B is pinned by `drop-held-chain-backed` seeds 1714, 1529 and
 1818 and by the five seeds above under the strict gate; drop contiguity by
 `far-root-writes+lost-chunk` 557 and 1005, `-paused` 464 and 1822, `-cross`
 1333 and 1523 and `far-placement+lost-chunk` 96, 829, 956, 1469, 1778, 1910,
-1932, 1943 and 1988 (`a_drop_fills_the_stream_indices_it_rolls_back`).
+1932, 1943 and 1988 (`a_drop_fills_the_stream_indices_it_rolls_back`); a
+stream holder's drop by `far-placement+lost-chunk` 326
+(`a_stream_holder_drops_its_own_streams_held_rows`).
 
 See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
 `crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),

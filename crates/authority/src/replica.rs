@@ -268,6 +268,23 @@ pub trait Replica {
         sessions: &constellation_meta::LiveSessions,
         sequencer: bool,
     ) -> Result<constellation_meta::DroppedHeld, MetaError>;
+    /// ADR-59 part B (D1, a stream holder's drop): `drop_held` decided by
+    /// the holder of the stream the held rows are rows of (`holds(gen)`).
+    fn drop_held_in_stream(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        unanswered: &dyn Fn(Rid) -> bool,
+        live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
+        sessions: &constellation_meta::LiveSessions,
+        holds: &dyn Fn(u64) -> bool,
+    ) -> Result<constellation_meta::DroppedHeld, MetaError>;
+    /// Whether a drop of `ino` is decided and not applied (`Some`), and if it
+    /// is a stream holder's, its record's stream position.
+    fn drop_plan_of(&self, ino: Ino) -> Option<Option<(u64, u64)>>;
+    /// Whether this node decided a drop as the holder of stream `gen` that is
+    /// not applied yet.
+    fn stream_drop_pending(&self, gen: u64) -> bool;
     /// ADR-59 part B (D4): the effect of the drop `drop_held` decided for
     /// `ino`, run when the log carries its record.
     fn drop_held_apply(
@@ -1244,6 +1261,26 @@ impl Replica for Meta {
         Meta::drop_held_knowing(
             self, ino, now_unix, remote, unanswered, live_ops, sessions, sequencer,
         )
+    }
+
+    fn drop_held_in_stream(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        unanswered: &dyn Fn(Rid) -> bool,
+        live_ops: &dyn Fn(&replicix_chunkfmt::ChunkHash) -> Vec<Rid>,
+        sessions: &constellation_meta::LiveSessions,
+        holds: &dyn Fn(u64) -> bool,
+    ) -> Result<constellation_meta::DroppedHeld, MetaError> {
+        Meta::drop_held_in_stream(self, ino, now_unix, unanswered, live_ops, sessions, holds)
+    }
+
+    fn drop_plan_of(&self, ino: Ino) -> Option<Option<(u64, u64)>> {
+        Meta::drop_plan_of(self, ino)
+    }
+
+    fn stream_drop_pending(&self, gen: u64) -> bool {
+        Meta::stream_drop_pending(self, gen)
     }
 
     fn drop_held_apply(

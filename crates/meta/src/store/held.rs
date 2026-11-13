@@ -1909,22 +1909,71 @@ impl Meta {
         sessions: &LiveSessions,
         sequencer: bool,
     ) -> Result<DroppedHeld, MetaError> {
-        let _ = now_unix;
-        // A drop is a decision of the log (ADR-59 part B, D1): only the
-        // sequencer in force can journal it, so a node without the lease
-        // decides nothing and changes nothing. Its root rows a deposition
-        // strands, and the successor re-ships their copies; but the held rows
-        // of a sticky stream it still holds (a deposed root keeps its own
-        // stream, R-I5) stay in that stream, where neither the successor nor
-        // this node can drop them (`far-placement+lost-chunk` 326: a delegate's
-        // drop would need the record as a row of its stream, an open design
-        // question).
+        // A drop is a decision of the log (ADR-59 part B, D1), journaled by
+        // the node whose rows reach the log by right: the sequencer in force
+        // for root rows, here; the holder of a stream for that stream's rows
+        // ([`Self::drop_held_in_stream`]). Any other node decides nothing and
+        // changes nothing.
         if !sequencer {
             return Err(MetaError::Invalid(format!(
                 "this node is not the sequencer in force: nothing was dropped; run `repair \
                  drop-held {ino}` on the holder (or `--remote` there) once the takeover is through"
             )));
         }
+        self.drop_held_decide(
+            ino,
+            now_unix,
+            remote,
+            unanswered,
+            live_ops,
+            sessions,
+            Decider::Sequencer,
+        )
+    }
+
+    /// ADR-59 part B (D1, widened for `far-placement+lost-chunk` 326): the
+    /// drop decided by the holder of a delegation stream (`holds(gen)`: this
+    /// node holds the live grant of `gen`, a deposed root's own sticky stream
+    /// included) for held rows that are all rows of that stream. The
+    /// `DropHeld` record is the stream's row at the lowest rolled-back index
+    /// (the seed's), with `fills` for the stream's other rolled-back
+    /// positions; it reaches the log as the stream's rows do (the root
+    /// appends it) and is fenced as they are (a generation that ends without
+    /// it cancels the drop). Its identities are the stream positions
+    /// `(deleg_epoch(gen), idx)`, the keys the stream's copies are kept by.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drop_held_in_stream(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        unanswered: &dyn Fn(crate::rid::Rid) -> bool,
+        live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
+        sessions: &LiveSessions,
+        holds: &dyn Fn(u64) -> bool,
+    ) -> Result<DroppedHeld, MetaError> {
+        self.drop_held_decide(
+            ino,
+            now_unix,
+            false,
+            unanswered,
+            live_ops,
+            sessions,
+            Decider::Stream(holds),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drop_held_decide(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        remote: bool,
+        unanswered: &dyn Fn(crate::rid::Rid) -> bool,
+        live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
+        sessions: &LiveSessions,
+        decider: Decider<'_>,
+    ) -> Result<DroppedHeld, MetaError> {
+        let _ = now_unix;
         // The `DropHeld` record is answered by the log alone — nobody is
         // told of it — so it is an `Archive` row, the class the core's check
         // wants set. (A caller that holds a configuration sets its own: the
@@ -1976,14 +2025,38 @@ impl Meta {
             &poisoned,
             DropMode::Decide { strand_all },
         )?;
+        // The stream holder's drop: every row walked is a row of one stream
+        // it holds (not an append of another node's row); the record takes the
+        // lowest rolled-back index.
+        let stream = match decider {
+            Decider::Sequencer => None,
+            Decider::Stream(holds) => Some(stream_of_drop(ino, &walked, holds)?),
+        };
+        let (idents, fills) = match stream {
+            None => (walked.idents.clone(), walked.fills.clone()),
+            Some((gen, at)) => (
+                walked
+                    .rows
+                    .iter()
+                    .filter(|row| row.in_s)
+                    .map(|row| ((super::backup::deleg_epoch(gen), row.idx), row.rid))
+                    .collect(),
+                walked
+                    .fills
+                    .iter()
+                    .copied()
+                    .filter(|fill| *fill != (gen, at))
+                    .collect(),
+            ),
+        };
         let mut plan = DropPlan {
             jseq: 0,
             epoch: 0,
             remote,
             strand_all,
             missing: missing.iter().copied().collect(),
-            idents: walked.idents.iter().map(|(ident, _)| *ident).collect(),
-            fills: walked.fills.clone(),
+            idents: idents.iter().map(|(ident, _)| *ident).collect(),
+            fills: fills.clone(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
             queued: Vec::new(),
             s_deps: walked.dependents.iter().map(|(seq, _, _)| *seq).collect(),
@@ -1992,6 +2065,16 @@ impl Meta {
             follow_ups: 0,
             shipped: false,
             acked_lost: Vec::new(),
+            stream,
+            named_firsts: match stream {
+                Some(_) => walked
+                    .rows
+                    .iter()
+                    .filter(|row| row.in_s)
+                    .map(|row| row.first)
+                    .collect(),
+                None => Vec::new(),
+            },
         };
         for (t, _, _) in &walked.seeds {
             // The journal row's own rid and class: what the writer was told.
@@ -2009,7 +2092,10 @@ impl Meta {
         // here (the root's own: `gen` 0) are refused by this drop too, so the
         // record names them (D1), by rid (`DropHeld::queued`: the row left
         // this journal; nothing retires). O(queue): an operator's path.
-        plan.queued = queued_namers(&tx, self, ino, &missing)?;
+        // (Not a stream holder's: queued replays are root rows.)
+        if stream.is_none() {
+            plan.queued = queued_namers(&tx, self, ino, &missing)?;
+        }
         if walked.seeds.is_empty() && plan.queued.is_empty() {
             // Nothing to carry in the log: a run after an earlier drop kept a
             // lost chunk's rows because an op or a write session still named
@@ -2024,6 +2110,10 @@ impl Meta {
             tx.commit()?;
             return self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions, true);
         }
+        // A stream holder's record is its stream's row at the seed's index.
+        let _own = stream.map(|(gen, at)| {
+            journal::PendingDelegate::set_own_at(gen, at, crate::session::Position::ZERO)
+        });
         let local = self.begin_local(&tx)?;
         let jseq = journal::append_tx(
             &mut tx,
@@ -2033,8 +2123,8 @@ impl Meta {
             &LogRecord::DropHeld {
                 ino,
                 chunks: missing.iter().copied().collect(),
-                rolled_back: walked.idents.clone(),
-                fills: walked.fills.clone(),
+                rolled_back: idents,
+                fills,
                 queued: plan.queued.iter().map(|(_, rid)| *rid).collect(),
             },
         )?;
@@ -2054,7 +2144,8 @@ impl Meta {
             dropped = walked.seeds.len(),
             requeued = walked.dependents.len(),
             redone = walked.redone.len(),
-            fills = ?walked.fills,
+            fills = ?plan.fills,
+            stream = ?plan.stream,
             "drop-held decided: a DropHeld record is journaled; the drop takes effect when the \
              log carries it"
         );
@@ -2109,6 +2200,25 @@ impl Meta {
             out.push((ino, plan.jseq, plan.epoch, plan.shipped));
         }
         Ok(out)
+    }
+
+    /// ADR-59 part B: whether this node decided a drop as the holder of
+    /// stream `gen` that is not applied yet (it holds the stream's release).
+    pub fn stream_drop_pending(&self, gen: u64) -> bool {
+        stream_drops_tx(&self.db.read_tx(), self)
+            .map(|drops| drops.iter().any(|(g, _, _)| *g == gen))
+            .unwrap_or(false)
+    }
+
+    /// ADR-59 part B: whether a drop of `ino` is decided and not yet applied,
+    /// and if it is a stream holder's, the stream position of its record.
+    pub fn drop_plan_of(&self, ino: Ino) -> Option<Option<(u64, u64)>> {
+        let r = self.db.read_tx();
+        r.get(&self.local, drop_plan_key(ino))
+            .ok()
+            .flatten()
+            .and_then(|raw| postcard::from_bytes::<DropPlan>(&raw).ok())
+            .map(|plan| plan.stream)
     }
 
     /// ADR-59 part B (D2, D4): a segment of this node's own that carries a
@@ -2554,7 +2664,12 @@ impl Meta {
         // Fix "capture under an epoch hold": the dropped ops' outcome, in
         // the log. The `DropHeld` record is in the log already (this apply
         // runs when it is); its `Refused` rows follow.
-        if !refused_rids.is_empty() && sequencer {
+        // (A stream holder's apply journals them as rows of its stream: they
+        // follow the record there.)
+        if !refused_rids.is_empty() && (sequencer || plan.stream.is_some()) {
+            let _own = plan.stream.map(|(gen, _)| {
+                journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO)
+            });
             let local = self.begin_local(&tx)?;
             let now_ms = now_unix.saturating_mul(1000);
             for rid in &refused_rids {
@@ -2689,7 +2804,7 @@ impl Meta {
             pending_epoch: 0,
             follow_ups: plan.follow_ups as usize,
             leftovers,
-            deposed: !sequencer,
+            deposed: !sequencer && plan.stream.is_none(),
             applied_seq: self.applied_seq()?,
         };
         {
@@ -2739,6 +2854,37 @@ impl Meta {
                 "drop-held {ino}: a redone transaction diverged and cannot be named"
             )));
         }
+        // A stream holder's follow-up is its stream's row at the lowest index
+        // it rolls back, as the decision was.
+        let stream = plan.stream.and_then(|(gen, _)| {
+            walked
+                .rows
+                .iter()
+                .filter(|row| row.in_s)
+                .map(|row| row.idx)
+                .min()
+                .map(|at| (gen, at))
+        });
+        let (idents, fills): (Vec<_>, Vec<_>) = match stream {
+            None => (walked.idents.clone(), walked.fills.clone()),
+            Some((gen, at)) => (
+                walked
+                    .rows
+                    .iter()
+                    .filter(|row| row.in_s)
+                    .map(|row| ((super::backup::deleg_epoch(gen), row.idx), row.rid))
+                    .collect(),
+                walked
+                    .fills
+                    .iter()
+                    .copied()
+                    .filter(|fill| *fill != (gen, at))
+                    .collect(),
+            ),
+        };
+        let _own = stream.map(|(gen, at)| {
+            journal::PendingDelegate::set_own_at(gen, at, crate::session::Position::ZERO)
+        });
         let local = self.begin_local(&tx)?;
         let jseq = journal::append_tx(
             &mut tx,
@@ -2748,16 +2894,25 @@ impl Meta {
             &LogRecord::DropHeld {
                 ino,
                 chunks: Vec::new(),
-                rolled_back: walked.idents.clone(),
-                fills: walked.fills.clone(),
+                rolled_back: idents.clone(),
+                fills: fills.clone(),
                 queued: Vec::new(),
             },
         )?;
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
         self.finish_local(&mut tx, local)?;
-        plan.idents
-            .extend(walked.idents.iter().map(|(ident, _)| *ident));
-        plan.fills.extend(walked.fills.iter().copied());
+        plan.idents.extend(idents.iter().map(|(ident, _)| *ident));
+        plan.fills.extend(fills.iter().copied());
+        if stream.is_some() {
+            plan.named_firsts.extend(
+                walked
+                    .rows
+                    .iter()
+                    .filter(|row| row.in_s)
+                    .map(|row| row.first),
+            );
+            plan.stream = stream;
+        }
         plan.redone.retain(|s| !moved.contains(s));
         plan.s_deps.extend(moved.iter().copied());
         plan.jseq = jseq;
@@ -2901,14 +3056,108 @@ struct DropPlan {
     /// exact then). The apply reports them if the seed is gone by then (a
     /// dropper restarted after its record shipped).
     acked_lost: Vec<(crate::rid::Rid, String)>,
+    /// ADR-59 part B (a stream holder's drop): the record is the row of
+    /// stream `gen` at index `idx` (the lowest rolled-back one); `None` for
+    /// the sequencer's drop.
+    stream: Option<(u64, u64)>,
+    /// With `stream`: the first journal seqs of the rows the record names.
+    /// The stream sends none of them and nothing above the record until
+    /// the apply; a segment carrying the record's position retires the
+    /// record's row, not the seed's.
+    named_firsts: Vec<u64>,
 }
 
 const DROP_PLAN_PREFIX: &[u8] = b"drop_plan:";
+
+/// ADR-59 part B: the stream holder's drops decided and not yet applied, as
+/// `(gen, record's index, first journal seqs of the rows the record names)`.
+/// One seek when there is no plan (the common case: the stream's sender and
+/// a segment's apply read it).
+pub(crate) fn stream_drops_tx(
+    r: &impl Readable,
+    meta: &Meta,
+) -> Result<Vec<(u64, u64, BTreeSet<u64>)>, MetaError> {
+    let mut out = Vec::new();
+    for guard in r.prefix(&meta.local, DROP_PLAN_PREFIX) {
+        let (_, v) = guard.into_inner()?;
+        let plan: DropPlan = postcard::from_bytes(&v)?;
+        if let Some((gen, at)) = plan.stream {
+            out.push((gen, at, plan.named_firsts.iter().copied().collect()));
+        }
+    }
+    Ok(out)
+}
+
+/// ADR-59 part B: the decided drop of `ino` never happened (its record, a row
+/// of a stream, left the journal unshipped with the stream's end): the plan
+/// goes, in the caller's transaction. Whether there was one.
+pub(crate) fn cancel_stream_drop_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+) -> Result<bool, MetaError> {
+    let Some(raw) = tx.get(&meta.local, drop_plan_key(ino))? else {
+        return Ok(false);
+    };
+    let plan: DropPlan = postcard::from_bytes(&raw)?;
+    tx.remove(&meta.local, drop_plan_key(ino));
+    if !plan.shipped {
+        counter_add_tx(tx, &meta.local, KV_DROP_HELD_UNSHIPPED, -1)?;
+    }
+    Ok(true)
+}
 
 fn drop_plan_key(ino: Ino) -> Vec<u8> {
     let mut k = DROP_PLAN_PREFIX.to_vec();
     k.extend_from_slice(&ino.to_be_bytes());
     k
+}
+
+/// Who decides a drop (ADR-59 part B, D1): the sequencer in force for root
+/// rows, or the holder of a stream for its stream's rows (`holds(gen)`).
+#[derive(Clone, Copy)]
+enum Decider<'a> {
+    Sequencer,
+    Stream(&'a dyn Fn(u64) -> bool),
+}
+
+/// The stream `(gen, record's index)` of a stream holder's drop: every row
+/// walked is a row of one generation this node holds, none an append of
+/// another node's row, and a seed is among them.
+fn stream_of_drop(
+    ino: Ino,
+    walked: &Walked,
+    holds: &dyn Fn(u64) -> bool,
+) -> Result<(u64, u64), MetaError> {
+    let not_here = |why: &str| {
+        MetaError::Invalid(format!(
+            "this node is not the sequencer in force and {why}: nothing was dropped; run \
+             `repair drop-held {ino}` on the holder once the takeover is through"
+        ))
+    };
+    let gens: BTreeSet<u64> = walked.rows.iter().map(|row| row.gen).collect();
+    let gen = match gens.iter().next() {
+        Some(&gen) if gens.len() == 1 && gen != 0 && holds(gen) => gen,
+        _ => {
+            return Err(not_here(
+                "the held rows are not all rows of a stream it holds",
+            ))
+        }
+    };
+    if walked.rows.iter().any(|row| row.appended) {
+        return Err(not_here("a held row is another node's row it appended"));
+    }
+    if walked.seeds.is_empty() {
+        return Err(not_here("no seed of the stream is held here"));
+    }
+    let at = walked
+        .rows
+        .iter()
+        .filter(|row| row.in_s)
+        .map(|row| row.idx)
+        .min()
+        .ok_or_else(|| not_here("nothing of the stream is rolled back"))?;
+    Ok((gen, at))
 }
 
 /// How [`walk_drop`] picks the rows.
@@ -2921,6 +3170,18 @@ enum DropMode<'a> {
     Apply(&'a DropPlan),
     /// A follow-up: only the `moved` rows of the plan's redone set, named.
     Follow(&'a DropPlan, &'a HashSet<u64>),
+}
+
+/// One transaction [`walk_drop`] walked.
+#[derive(Clone, Copy, Debug)]
+struct WalkedRow {
+    first: u64,
+    gen: u64,
+    idx: u64,
+    appended: bool,
+    /// Rolled back (else redone in place).
+    in_s: bool,
+    rid: Option<crate::rid::Rid>,
 }
 
 /// What [`walk_drop`] found.
@@ -2937,6 +3198,9 @@ struct Walked {
     /// The delegation stream positions of the rolled-back transactions
     /// (`DropHeld::fills`), in walk order.
     fills: Vec<(u64, u64)>,
+    /// Every transaction walked (rolled back or redone). A stream holder's
+    /// drop is decided only for rows of the stream it holds.
+    rows: Vec<WalkedRow>,
     unidentified: usize,
 }
 
@@ -2962,6 +3226,7 @@ fn walk_drop(
         redone: Vec::new(),
         idents: Vec::new(),
         fills: Vec::new(),
+        rows: Vec::new(),
         unidentified: 0,
     };
     for (t, seed_inos, keys) in held.held {
@@ -3003,6 +3268,14 @@ fn walk_drop(
         let row = local::get_journal_tx(tx, meta, t.first)?;
         let rid = tx_rid(&t, row.as_ref());
         chain.add(&keys);
+        out.rows.push(WalkedRow {
+            first: t.first,
+            gen: row.as_ref().map_or(0, |row| row.gen),
+            idx: row.as_ref().map_or(0, |row| row.idx),
+            appended: row.as_ref().is_some_and(|row| row.appended),
+            in_s,
+            rid,
+        });
         if !in_s {
             out.redone.push((spec_seq, rid));
             continue;
@@ -3499,6 +3772,119 @@ mod tests {
         assert!(meta.completed_position(rid(1)).unwrap().is_some());
         let queued = meta.pending_replays().unwrap();
         assert!(queued.is_empty(), "nothing is queued here: {queued:?}");
+    }
+
+    /// ADR-59 part B, D1 widened (`far-placement+lost-chunk` 326): a node
+    /// that is not the sequencer but holds the stream the held rows are rows
+    /// of (a deposed root's own sticky stream) decides their drop. The record
+    /// is the stream's own row at the seed's index (2), filling the other
+    /// rolled-back index (4); the stream sends index 1 and the record and
+    /// nothing above until the apply; the root's segment carrying the record
+    /// at (gen, 2) acknowledges the record, not the seed; the apply strands 2
+    /// and 4, keeps 3, and journals the seed's refusal as the stream's next
+    /// row. Fails on the parent: the drop is refused ("not the sequencer").
+    #[test]
+    fn a_stream_holder_drops_its_streams_held_rows() {
+        use crate::mutate::MutateOp;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        let files: Vec<Ino> = (1..=3)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let gen = (1u64 << 32) | 1;
+        let rid = |seq: u64| crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        };
+        let setattr = |ino: Ino, mode: Option<u32>, size: Option<u64>| MutateOp::Setattr {
+            ino,
+            mode,
+            uid: None,
+            gid: None,
+            size,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        let run = |op: &MutateOp, seq: u64| {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, op, Some(rid(seq))).unwrap();
+        };
+        run(&setattr(files[0], Some(0o600), None), 1);
+        let hash = ChunkHash::of(b"lost");
+        let manifest = Manifest {
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_dirty(files[1], None, &manifest, 7, None, None, &[hash])
+                .unwrap();
+        }
+        run(&setattr(files[2], Some(0o600), None), 3);
+        run(&setattr(files[1], None, Some(3)), 4);
+        assert_eq!(meta.delegate_idx(gen).unwrap(), 4);
+        meta.note_unrecoverable_chunks(&[(hash, files[1])], false)
+            .unwrap();
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        let decided = meta
+            .drop_held_in_stream(files[1], 0, &none, &no_ops, &sessions, &|g| g == gen)
+            .unwrap();
+        assert!(decided.pending.is_some(), "{decided:?}");
+        // The stream sends index 1 and the record at index 2, nothing more.
+        let sent = meta.delegate_txs_from(gen, 1, usize::MAX).unwrap();
+        let idx: Vec<u64> = sent.iter().map(|t| t.idx).collect();
+        assert_eq!(idx, vec![1, 2], "{sent:?}");
+        let record = sent[1].records.clone();
+        let [LogRecord::DropHeld {
+            fills, rolled_back, ..
+        }] = &record[..]
+        else {
+            panic!("index 2 is not the record: {record:?}");
+        };
+        assert_eq!(fills, &vec![(gen, 4)]);
+        assert_eq!(rolled_back.len(), 2, "{rolled_back:?}");
+        // The root's segment carries the record at (gen, 2).
+        meta.apply_segment_rows(1, 1, 0, &[50], &[(gen, 2)], &record, &Default::default())
+            .unwrap();
+        assert!(
+            meta.drop_plan_shipped(files[1]),
+            "the record's row is acknowledged"
+        );
+        let applied = meta
+            .drop_held_apply(files[1], 0, &none, &no_ops, &sessions, false)
+            .unwrap();
+        assert!(applied.pending.is_none(), "{applied:?}");
+        assert!(!applied.deposed, "{applied:?}");
+        assert_eq!(applied.refused.len(), 1, "the seed's refusal: {applied:?}");
+        let left: Vec<u64> = meta
+            .delegate_rows_for_audit(gen)
+            .unwrap()
+            .into_iter()
+            .map(|(idx, ..)| idx)
+            .collect();
+        assert_eq!(
+            left,
+            vec![1, 3, 5],
+            "the seed and index 4 go; the refusal is 5"
+        );
+        let sent: Vec<u64> = meta
+            .delegate_txs_from(gen, 3, usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|t| t.idx)
+            .collect();
+        assert_eq!(sent, vec![3, 5]);
     }
 
     /// ADR-58 M1 (review): a transaction waiting for this node's own upload is
