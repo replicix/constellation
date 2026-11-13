@@ -69806,3 +69806,29 @@ the simulation, C7 the harness scenarios, the read-delegation fixes they found, 
 - Not done / judgment calls: C6; the busy-holder wait in the simulation (above); `handover_pending` per generation in the
   status (a block of counters instead); the perf runs shared the box with other jobs at times, so the p50s of 100 us ops move by
   10 to 20 % between two runs in both builds.
+
+### Plan 46 M1.3 step 8, the fix round (review of C4/C5/C7, 2026-11-13)
+
+Rebased on `753d0266` (fpdefer, lostchunk) with no textual conflict; one semantic one: the new `sent` guard in
+`delegate_try_execute` refuses an op that was forwarded to the old holder, so the root's own op that comes back under its stream is
+asked again after a back-off (`RecallPlan::Hold`), not answered `Busy`.
+- **M1 (H-I1).** A transient `!root_usable` at a placement tick cleared `pl.handover` and left the subtree in `g.releasing`; the
+  resend timer then sent it as a recall of a subtree of a sticky stream and, after the patience, a recall of the stream. Now the
+  tick drops the waiting requests with their bookkeeping (`handover_drop_all`), a release request of a sticky stream not being
+  recalled is always a handover, and the escalation is not taken for a sticky stream. Fails before:
+  `a_transient_unusable_root_does_not_turn_a_handover_into_a_recall`.
+- **S1** a handover to the root waits out a skip that passes (`a_handover_to_the_root_waits_out_a_transient_skip`, fails before);
+  `place_handover_root_keys` counts the terminal outcome. **S2** ADR text; a holder answers only the root it streams to.
+  **S3** pinned: a holder answers no read of a subtree it released (`my_generation_for` needs it in `dirs`), the root's own honoured
+  stream grants its reader; no topology-8 reader A/B was run. **S5** ADR text; `+lost-chunk` sweeps. **S6** the check is skipped
+  without an own stream. **S7** `pl.hands` pruned. NITs done: the request-dirs struct, one call per resend, ended-stream count,
+  `get` in the request loop, `HandEvent` hidden, the debug_assert.
+- **S4.** `sticky-handover-busy` (an own op in flight 800 ms, emulated with `Config::emulated_inflight_ms`), `-busy-patient` (3 s),
+  strict `handover_inflight`, control `handover_ignores_inflight`; a third phase in `sticky-handover-root` (the root as the holder
+  hands the subtree to node 2). x2,000: busy requested 1334, holder waits 377, released 1334, root drops 0; patient requested 2538,
+  waits 1323, root drops 1236, holder expiry 1 (its wait is refreshed by every repeat of the request), granted 1302.
+- **Gate:** fmt, clippy, debug `--workspace --lib` and release authority (1570 lib, 522 sim) 0 FAILED. **Sweeps x2,000, 0 failing,
+  0 panics**: the previous list, the new busy configs, and `+lost-chunk` of every handover config; `flex+settle+oracles+unsettled` the
+  same 7 seeds as `753d0266`. **Smoke** seed 42: the 7 and both handover scenarios pass. **Perf**: topologies 3 and 7 ABBA on
+  ext4, xfs, btrfs, tmpfs (two rounds: delegate ops 0.97 to 1.10, in both builds' noise); ten rounds of 200 samples of topology 3
+  on tmpfs and ext4: 0.99 to 1.03.
