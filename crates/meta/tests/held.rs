@@ -2500,3 +2500,54 @@ fn an_op_the_drop_rolled_back_keeps_its_chunk_when_the_apply_has_no_lease() {
         assert_eq!(dropped.deposed, !sequencer);
     }
 }
+
+/// ADR-59 D1 (lcres review SHOULD-6): a deferred row that is a live stream's
+/// row the root appended is that stream holder's to drop, `--remote`
+/// included. The root's remote form is refused for it ("run it on that
+/// stream's holder"), so that the root and the holder cannot both decide one
+/// inode's drop, each with a record of its own. Fails on the parent: the root
+/// decides the drop.
+#[test]
+fn the_roots_remote_drop_of_a_live_streams_appended_row_is_refused() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+    let file = meta.create(dir, "f", 0o644, 0, 0).unwrap().ino;
+    let gen = (1u64 << 32) | 1;
+    meta.apply_segment(
+        1,
+        1,
+        &[LogRecord::delegate_one(
+            2,
+            gen,
+            dir,
+            constellation_meta::SubtreeKind::Sticky,
+        )],
+        &TouchSet::default(),
+    )
+    .unwrap();
+    let away = ChunkHash::of(b"only on the node that lost it");
+    meta.enroll_remote_chunks(file, &[away], 7).unwrap();
+    meta.apply_delegate_tx(
+        &[LogRecord::WriteManifest {
+            ino: file,
+            base_manifest: None,
+            manifest: manifest_naming(away, 19),
+            size: 19,
+            time_ns: 1,
+            mtime_ns: 1,
+        }],
+        None,
+        gen,
+        1,
+        constellation_meta::Position::ZERO,
+    )
+    .unwrap();
+    let err = meta.drop_held_remote(file, 1).unwrap_err().to_string();
+    assert!(err.contains("stream's holder"), "{err}");
+    assert_eq!(
+        meta.remote_chunks().unwrap().len(),
+        1,
+        "nothing was marked or dropped"
+    );
+}

@@ -2031,6 +2031,25 @@ impl Meta {
             &poisoned,
             DropMode::Decide { strand_all },
         )?;
+        // D1: a deferred row that is a live stream's row the root appended is
+        // that stream holder's to drop (`--remote` included), not the root's:
+        // otherwise both could decide one inode's drop, each with a record of
+        // its own. The root decides it once the generation has ended.
+        if remote && matches!(decider, Decider::Sequencer) {
+            let table = crate::delegation::read_table_tx(&tx, self)?;
+            if let Some(row) = walked
+                .rows
+                .iter()
+                .find(|row| row.appended && table.has_gen(row.gen))
+            {
+                return Err(MetaError::Invalid(format!(
+                    "inode {ino}'s deferred rows are rows of the live delegation stream {}, \
+                     which this node appended: nothing was dropped; run `repair drop-held \
+                     {ino} --remote` on that stream's holder",
+                    crate::delegation::GenLabel::of(row.gen)
+                )));
+            }
+        }
         // The stream holder's drop: every row walked is a row of one stream
         // it holds (not an append of another node's row); the record takes the
         // lowest rolled-back index.
@@ -3169,7 +3188,8 @@ fn stream_of_drop(
     let not_here = |why: &str| {
         MetaError::Invalid(format!(
             "this node is not the sequencer in force and {why}: nothing was dropped; run \
-             `repair drop-held {ino}` on the holder once the takeover is through"
+             `repair drop-held {ino}` (with `--remote` for a deferred row) on the holder once \
+             the takeover is through"
         ))
     };
     let gens: BTreeSet<u64> = walked.rows.iter().map(|row| row.gen).collect();

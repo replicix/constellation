@@ -5068,7 +5068,11 @@ is the consequence of that record being in the log.**
   also decides `--remote` for its stream's rows: a delegate's row deferred on
   a chunk another node forwarded as pending and lost (`far-root-writes+lost-chunk`
   1051: only the sequencer could run the remote form, and the row waited for
-  good).
+  good). The sequencer's `--remote` is refused for a deferred row of a live
+  stream it appended ("run it on that stream's holder"), so the two never both
+  decide one inode's drop. (With no group, an ordinary stream row is `Lone`
+  and the drop's rows `group(0, Archive)`: the drop takes effect from the log,
+  D4.)
 - **D2, retired idents never land.** A replica that applies it from the log
   (or ships it) records the identities as retired, holes its member and backup
   copies and strands what it was streamed of them. The takeover's re-ship gate
