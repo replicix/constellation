@@ -1121,7 +1121,12 @@ What `back` gives up, and what it keeps:
   a read waits for the chunk rather than failing. Unrelated changes the
   same node makes afterwards can become visible first (the ship plan
   defers only what depends on the pending file, as for the sequencer's
-  own write-back since plan 30 M7).
+  own write-back since plan 30 M7; under a sticky grant a delegation stream
+  is one order, so every later row of that subtree's stream waits too, while
+  the node's changes outside the subtree ship). That holds across a
+  deposition: a root's own sticky stream row that waited reaches the log
+  through the successor once the stream resumes, after rows the root shipped
+  past it (ADR-55).
 - **`--cto strict`.** An `open` elsewhere still sees every completed
   close's manifest (the sequencer has it); reading the content waits for
   the upload on the sequencer, and elsewhere reads the file as it was

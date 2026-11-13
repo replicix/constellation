@@ -21192,6 +21192,36 @@ fn the_roots_own_replay_under_a_live_sticky_holder_goes_to_it() {
     .unwrap_or_else(|e| panic!("far-root-writes-paused+lost-chunk seed 1310: {e}"));
 }
 
+/// ADR-55/59 (lcres ruling B): the root's own sticky stream row held behind a
+/// lost chunk, its later root rows shipped past it (the write-back
+/// relaxation), the root deposed, and the row reaching the log through the
+/// successor once the stream resumed. The session-order check excuses that
+/// pair alone (`history::check_session_order`'s resumed rows). Failed on
+/// 7665d4d0 ("the log breaks the node's program order").
+#[test]
+fn a_resumed_own_stream_row_keeps_its_tenures_order() {
+    type Case = (&'static str, fn() -> SimConfig, &'static [u64]);
+    let cases: [Case; 3] = [
+        ("far-root-writes", far_root_writes_config, &[1271, 1856]),
+        (
+            "far-root-writes-cross",
+            far_root_writes_cross_config,
+            &[1441],
+        ),
+        (
+            "far-root-writes-paused",
+            far_root_writes_paused_config,
+            &[557],
+        ),
+    ];
+    for (label, config, seeds) in cases {
+        for &seed in seeds {
+            run_seed(seed, config_variant(config(), "lost-chunk"))
+                .unwrap_or_else(|e| panic!("{label}+lost-chunk seed {seed}: {e}"));
+        }
+    }
+}
+
 /// ADR-59 part B, the `kept_diverged` residual (benign): a claim's kept merge
 /// met, at one journal seq of the tenure, a hole from the holder's sealed tail
 /// (the rows it shipped ahead of a held one) and a live copy from the
