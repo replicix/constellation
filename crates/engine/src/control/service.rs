@@ -544,6 +544,7 @@ impl EngineControl {
                         grant_dropped: stats.place_handover_grant_dropped,
                         held_by_tenure: stats.place_handover_tenure,
                         ineligible: stats.place_handover_ineligible,
+                        root_keys: stats.place_handover_root_keys,
                         holder_waits: stats.deleg_handover_waits,
                         holder_released: stats.deleg_handover_released,
                         holder_ignored: stats.deleg_handover_ignored,

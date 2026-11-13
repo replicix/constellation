@@ -168,6 +168,14 @@ impl DelegKind {
 /// recall closes the stream's window.
 pub(crate) const PARTIAL_RESENDS_BEFORE_RECALL: u32 = 3;
 
+/// The subtrees a release request of one stream names (ADR-56): to release
+/// as a recall, and to hand over.
+struct ReleaseDirs {
+    to: NodeId,
+    recall: Vec<Ino>,
+    handover: Vec<Ino>,
+}
+
 /// The root's view of one generation.
 #[derive(Debug, Clone)]
 pub(crate) struct GenState {
@@ -1371,6 +1379,10 @@ pub(crate) struct DelegationState {
     /// journaled when it last reported ([`Core::deleg_note_local`]), per
     /// (stream, subtree).
     pub fast_inflight: BTreeMap<(u64, Ino), u64>,
+    /// Simulation only (`Config::emulated_inflight_ms`): until when an own op
+    /// of the core's path counts as in flight in (stream, subtree), standing
+    /// for the engine's fast-path sample, which the simulation has none of.
+    pub emulated_inflight: BTreeMap<(u64, Ino), WaitMs>,
     /// Steps `Core::handle` has run (see [`StickyReleaseCmd::made_at`]).
     pub step: u64,
     /// The step the engine's last report followed.
@@ -8522,6 +8534,18 @@ impl Core {
         // ADR-56: a handover is a request the holder answers when it is
         // quiet; what it does not cover (a placed grant) is a recall.
         let dirs = if why == ReleaseWhy::Handover {
+            // Only the root this node streams to asks (a deposed root's
+            // repeat, or one of a node that is not the root, is not answered:
+            // the release would reach a root with no handover to grant from).
+            if self.holder_root().is_some_and(|r| r != from) {
+                tracing::debug!(
+                    node = self.me(),
+                    from,
+                    "a handover request from a node that is not this holder's root is ignored"
+                );
+                self.stats.deleg_handover_ignored += 1;
+                return;
+            }
             match self.on_handover_request(now, from, gen, dirs, replica, out) {
                 Some(rest) if !rest.is_empty() => rest,
                 _ => return,
@@ -9376,14 +9400,17 @@ impl Core {
     /// grants made behind the recalls its release waits for (ADR-56: the
     /// root as the holder of a handed-over subtree, with a reader writing).
     pub(crate) fn own_stream_covers(&self, ino: Ino, replica: &dyn Replica) -> bool {
-        if !self.cfg.delegation || replica.delegation_table().is_empty() {
+        // (No stream of this node's own: nothing to cover, the common case.)
+        if self.dl.mine.is_empty() || !self.cfg.delegation || replica.delegation_table().is_empty()
+        {
             return false;
         }
-        // (The inode itself, and, for a directory, its entries: a grant on a
-        // directory covers the lookups in it.)
-        [None, Some("")].into_iter().any(|name| {
+        // The inode itself, and, for a directory, its entries: a grant on a
+        // directory covers the lookups in it.
+        let (inode, entries) = (Self::read_keys(ino, None), Self::read_keys(ino, Some("")));
+        [inode, entries].iter().any(|k| {
             matches!(
-                replica.resolve_ownership(&Self::read_keys(ino, name)),
+                replica.resolve_ownership(k),
                 Ownership::Delegated(d) if d.node == self.cfg.node_id
             )
         })
@@ -9813,21 +9840,40 @@ impl Core {
     /// The delegate of `gen` and the subtrees its release request names:
     /// those to release as a recall, and those asked for a handover (ADR-56:
     /// the holder answers when it is quiet, `why: Handover`).
-    fn release_request_dirs(&self, gen: u64) -> Option<(NodeId, Vec<Ino>, Vec<Ino>)> {
+    fn release_request_dirs(&self, gen: u64) -> Option<ReleaseDirs> {
         let g = self.dl.gens.get(&gen)?;
+        // A sticky stream is never asked for part of it by a recall (the
+        // root takes no sticky grant back, H-I1): while it is not being
+        // recalled whole, every subtree it is releasing is a handover, so a
+        // request whose bookkeeping went missing can never be sent as a
+        // recall of a subtree (the caller drops it, `handover_drop_all`).
+        let sticky_open = g.kind() == DelegKind::Sticky && g.recall == RecallPhase::None;
         let handover = self.handover_asked(gen);
         let (asked, recall): (Vec<Ino>, Vec<Ino>) = g
             .releasing
             .iter()
             .copied()
-            .partition(|d| handover.contains(d));
-        Some((g.node, recall, asked))
+            .partition(|d| sticky_open || handover.contains(d));
+        debug_assert!(
+            !sticky_open || asked.iter().all(|d| handover.contains(d)),
+            "a sticky stream is releasing a subtree that no handover asked for: {asked:?} {handover:?}"
+        );
+        Some(ReleaseDirs {
+            to: g.node,
+            recall,
+            handover: asked,
+        })
     }
 
     /// Send `gen`'s release request for its `releasing` subtrees: a new
     /// attempt under a new request id, with its resend timer (L3).
     fn send_release_request(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
-        let Some((to, dirs, handover)) = self.release_request_dirs(gen) else {
+        let Some(ReleaseDirs {
+            to,
+            recall: dirs,
+            handover,
+        }) = self.release_request_dirs(gen)
+        else {
             return;
         };
         let Some(g) = self.dl.gens.get_mut(&gen) else {
@@ -9993,6 +10039,36 @@ impl Core {
         self.release_wait_idle(gen, out);
     }
 
+    /// ADR-56, the root: every handover request still waiting for its holder
+    /// is dropped, with its bookkeeping (the subtree leaves `releasing`, the
+    /// resend timer idles): the root cannot decide a handover now (it is not
+    /// usable for a tick, an epoch is open, it was deposed). A grant waiting
+    /// for the holder's row already in the log is dropped too. Nothing is
+    /// recalled: the sticky stream stays as it is (H-I1).
+    pub(crate) fn handover_drop_all(&mut self, out: &mut Vec<Action>) {
+        let waiting: Vec<(Ino, u64)> = self
+            .pl
+            .handover
+            .iter()
+            .filter(|(_, r)| r.granting.is_none())
+            .map(|(d, r)| (*d, r.gen))
+            .collect();
+        let mut gens = BTreeSet::new();
+        for (dir, gen) in waiting {
+            self.pl.handover.remove(&dir);
+            self.stats.place_handover_expired += 1;
+            if let Some(g) = self.dl.gens.get_mut(&gen) {
+                g.releasing.remove(&dir);
+            }
+            gens.insert(gen);
+        }
+        self.stats.place_handover_grant_dropped += self.pl.handover.len() as u64;
+        self.pl.handover.clear();
+        for gen in gens {
+            self.release_wait_idle(gen, out);
+        }
+    }
+
     /// A stream with nothing left to release forgets its request's
     /// bookkeeping and timer (a recall's is cleared by its row).
     fn release_wait_idle(&mut self, gen: u64, out: &mut Vec<Action>) {
@@ -10035,7 +10111,12 @@ impl Core {
         // ADR-56: a handover request the root has waited long enough for is
         // dropped, not escalated.
         self.handover_expire(now, gen, out);
-        let Some((_, recall_dirs, _)) = self.release_request_dirs(gen) else {
+        let Some(ReleaseDirs {
+            to,
+            recall: dirs,
+            handover,
+        }) = self.release_request_dirs(gen)
+        else {
             return;
         };
         let Some(g) = self.dl.gens.get_mut(&gen) else {
@@ -10047,8 +10128,11 @@ impl Core {
         {
             return;
         }
+        // (A sticky stream is never escalated to a recall here: the root takes
+        // no sticky grant back, H-I1; an unanswered handover is dropped.)
         if g.recall == RecallPhase::None
-            && !recall_dirs.is_empty()
+            && g.kind() != DelegKind::Sticky
+            && !dirs.is_empty()
             && g.release_resends >= PARTIAL_RESENDS_BEFORE_RECALL
             && g.recall_started
                 .is_some_and(|at| now.wait.since(at) >= patience as i64)
@@ -10063,9 +10147,6 @@ impl Core {
                 return;
             }
         }
-        let Some((to, dirs, handover)) = self.release_request_dirs(gen) else {
-            return;
-        };
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -13903,6 +13984,18 @@ impl Core {
                 if let Some(d) = self.dl.mine.get_mut(&gen) {
                     d.last_own_op.insert(t.dir, now.wait);
                 }
+                if self.cfg.emulated_inflight_ms > 0 {
+                    tracing::debug!(
+                        node = me,
+                        dir = t.dir,
+                        "an own op of a holder ran (in flight)"
+                    );
+                    self.dl
+                        .emulated_inflight
+                        .insert((gen, t.dir), now.wait.plus(self.cfg.emulated_inflight_ms));
+                    self.hand_events
+                        .push(super::HandEvent::OwnOp { dir: t.dir });
+                }
             }
         }
     }
@@ -13954,6 +14047,17 @@ impl Core {
     /// engine's fast path under that subtree.
     pub(crate) fn own_in_flight(&self, gen: u64, dir: Ino, replica: &dyn Replica) -> bool {
         if self.dl.fast_inflight.contains_key(&(gen, dir)) {
+            return true;
+        }
+        // (Simulation: an own op is in flight for `emulated_inflight_ms` after
+        // it ran; the fault `handover_ignores_inflight` does not look.)
+        if !self.cfg.handover_ignores_inflight
+            && self
+                .dl
+                .emulated_inflight
+                .get(&(gen, dir))
+                .is_some_and(|until| *until > self.clk.wait)
+        {
             return true;
         }
         let me = self.me();
@@ -14056,6 +14160,12 @@ impl Core {
     /// and journals the row once the engine has reported the fast path clear
     /// (see [`StickyReleaseCmd::made_at`]).
     fn handover_release(&mut self, now: Now, root: NodeId, parts: BTreeMap<u64, BTreeSet<Ino>>) {
+        for dirs in parts.values() {
+            for dir in dirs {
+                self.hand_events
+                    .push(super::HandEvent::HandoverReleased { dir: *dir });
+            }
+        }
         self.stats.deleg_handover_released += parts.values().map(|p| p.len() as u64).sum::<u64>();
         self.dl.sticky_cmds.push(StickyReleaseCmd {
             op: None,

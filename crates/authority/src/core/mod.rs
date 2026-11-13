@@ -100,7 +100,9 @@ pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
 /// before it leaves the rest for the next.
 const SELF_SEND_DEPTH: u32 = 64;
 
-/// What the root did in a handover (ADR-56), for the simulation's oracles.
+/// What the root and the holders did in a handover (ADR-56), for the
+/// simulation's oracles.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandEvent {
     /// The holder of `dir` was asked to hand it to `to`.
@@ -114,6 +116,12 @@ pub enum HandEvent {
         to: NodeId,
         handover: bool,
     },
+    /// This node, a holder, ran an op of its own in `dir` (only with
+    /// `Config::emulated_inflight_ms`).
+    OwnOp { dir: constellation_fs_core::Ino },
+    /// This node, a holder, released `dir` for a handover (the command is made
+    /// once it is quiet there).
+    HandoverReleased { dir: constellation_fs_core::Ino },
 }
 pub use inbox::InboxView;
 pub use jobs::JobKind;
@@ -665,6 +673,13 @@ pub struct Config {
     /// `handover_grants_before_release`: the root grants the requester in the
     /// request's event, over the holder's live subtree (I2).
     pub handover_grants_before_release: bool,
+    /// Simulation only: an own op that ran on the core's path counts as in
+    /// flight in its subtree for this many ms (the engine's fast-path sample
+    /// stands for it in production; `0`: none).
+    pub emulated_inflight_ms: u64,
+    /// `handover_ignores_inflight` (fault, tests only): the holder does not
+    /// look at its ops in flight before it releases (`handover_inflight`).
+    pub handover_ignores_inflight: bool,
     /// ADR-56: the driver mirrors the delegate fast path's view after every
     /// step and reports what it has in flight ([`Core::deleg_note_local`]);
     /// a holder's release waits for that report. Off: no fast path (the
@@ -875,6 +890,8 @@ impl Config {
             handover_ends_sticky: false,
             handover_ignores_tenure: false,
             handover_grants_before_release: false,
+            emulated_inflight_ms: 0,
+            handover_ignores_inflight: false,
             fast_path_sampled: false,
             placement_sticky: true,
             placement_far_rtt_ms: 20,
@@ -1466,6 +1483,9 @@ pub struct Stats {
     pub place_handover_grant_dropped: u64,
     pub place_handover_tenure: u64,
     pub place_handover_ineligible: u64,
+    /// A handover to the root that ended on the root's keys (its own sticky
+    /// grant was refused for a reason that did not pass).
+    pub place_handover_root_keys: u64,
     pub deleg_sticky_ended_abandoned: u64,
     /// Plan 46 M1.3 step 13: `repair abandon` of non-stealable streams:
     /// commands accepted, those that waited for read delegations, streams
