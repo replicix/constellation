@@ -68703,7 +68703,7 @@ The maintainer's P2 decision (2026-11-07): keep the exact mirror; fix the livelo
 | Delta-log replay: `DeltaLog` (size and age bounds), `respond_replay`, `ReplayReply`, `Mirror::{exact_seq, replay_point, apply_replay}`; `Payload::{ReplayRequest, ReplayReply}`, `PeerService::replay_requested`; the engine tries replay before a session and accepts it only when count and root fingerprint equal the owner's summary at the last replayed seq | done | `crates/net/src/{reconcile,message,peers,endpoint}.rs`, `crates/engine/src/{coop.rs,coop/exact.rs,p2p.rs}` |
 | Knob `CONSTELLATION_COOP_REPLAY_LOG_BYTES` (default 8 MiB, 0 = off); status `replay_hits`, `replay_misses`, `replay_bytes`, `replay_log_bytes`; `/metrics` `constellation_coop_replay_*`; schema re-blessed | done | `crates/control/src/{proto/types.rs,web.rs}`, `crates/control/schema/control.schema.json`, `docs/reference/{configuration.md,features/cooperative-cache.md}` |
 | Bench: `product` repair method (replay then sessions), `--plog` A/B, depth-first generic initiator; results, decision | done | `bench/coop-digest/{src,RESULTS.md (section 12),DECISION.md (section 7),raw/p3-*}` |
-| Plan 47 | wip; open: pjdfstest, smoke, integration and the full harness matrix were not run for P3 | `docs/plans/v1/wip/47-chunk-location-digests.md` |
+| Plan 47 | wip at the time; closed 2026-11-12 (see the plan file) | `docs/plans/v1/done/47-chunk-location-digests.md` |
 
 Evidence (RESULTS section 12): 8 Mi keys, 100 k changes: session only 26.1 MiB / 3 sessions / 314 ms (P1: never finished); replay first 767 KiB / 17 rounds / 22.6 ms; 1 k: 777 KiB against 8.2 KiB; a silent burst costs 227 B more than before; steady wire identical, publisher CPU within noise (box 3, A/B/B/A); log memory 1.2 / 7.3 / 8.4 MB at 0.1 / 1 / 10 % churn per minute on 8 Mi keys. Real nodes: `coop-exact-churn` repaired two gaps by replay.
 
@@ -69832,3 +69832,120 @@ asked again after a back-off (`RecallPlan::Hold`), not answered `Busy`.
   same 7 seeds as `753d0266`. **Smoke** seed 42: the 7 and both handover scenarios pass. **Perf**: topologies 3 and 7 ABBA on
   ext4, xfs, btrfs, tmpfs (two rounds: delegate ops 0.97 to 1.10, in both builds' noise); ten rounds of 200 samples of topology 3
   on tmpfs and ext4: 0.99 to 1.03.
+
+## Plan 46 stage 1, 2026-11-10 to 2026-11-13: what landed after M1.3 step 10 (catch-up entries)
+
+These entries bring the file level with `main`. The steps with their own entries above (M1.3 steps 7, 8, 9, 10) are listed
+here only so that the order is clear; the evidence of each item is in its ADR in `docs/explanation/DECISIONS.md` and in
+the triage log's dated entries. Seeds quoted are the sim's.
+
+### ADR-48: every protocol bound is derived in one module (2026-11-10 to 2026-11-11)
+
+`ce894532..cb0d7337`. A `deadlines` module derives each bound (client deadline, settle caps, claim grace, read grant TTLs
+and blocks, takeover ack floor, lag threshold and silence window, delegation request timeout, reclaim horizon, lock TTL) from
+the base knobs; the daemon and the simulation run the same derivation (`be6f347e`, `7b636040`), the lock TTL is cut to the
+lease TTL less two margins at start (`6f97e40a`), and the derived timings are a generated table in the docs (`cb0d7337`).
+The sim's fixed 12 s client deadline is gone.
+
+### ADR-49: a late landing is bounded by what the executor can see (2026-11-10 to 2026-11-11)
+
+`7b1e77f9..50c588f9`. A poll result is matched to its op, a batch key is recorded when its PUT is issued, an EIO after a
+failed tombstone is labelled, and a settle's tombstones start a freshness bound after the first deadline (`a9f513a8`).
+The unlocked-write residual and two follow-ups are in the ADR.
+
+### ADR-51: a takeover collects the tenure's kept rows before it serves (2026-11-10 to 2026-11-11)
+
+`e2f3198c..ac777325`, v1 and v2. Seals per source stream and exact-carrier evidence, one abandon rule for every strand site
+(`e2f3198c`); a member seals a claimant's kept fetch per stream (`30bbdead`); every marker takeover collects the tenure's
+kept rows after its promise check (`0e048bc4`); a takeover over a handed-over hold lands above it and carries every epoch's
+rows in order (`01d2536e`).
+
+### ADR-52: a singleton answer leaves only on a fresh reading of a usable lease (landed 2026-11-11)
+
+`169f1771..ab5c4be3`, perf `d9c84d0f` (A/A on ext4, xfs, btrfs, tmpfs). The core reads a clock where an answer leaves
+(`169f1771`), a singleton holds its answer until the reading finds the lease usable (`8ce67ed7`), a stalled commit's row is
+answered in doubt (`ac878d8d`, `1e4fa11f`, `63ea095f`), the `lease6` configuration is strict (`fcd796a0`), and
+`singleton-stall-takeover` with a hold-off control is a sim witness (`5e22934c`). Exit: `delegated-core-stall-root-lease6+commit`
+0 of 2,000 with the exemption removed.
+
+### ADR-53: a row keeps its configuration's rule across its holder's own tenure gap (2026-11-11)
+
+`ede88068`, `c40fec09`, `08cd610f`, `65f24b2d`. A resumed tenure keeps the rule of its earlier unshipped rows (a span at the
+tenure's start), a node without a lease never answers its own unshipped row as the log's at the client deadline, and an
+earlier tenure's root row is decided by its own state at every answer path. M1.4 step 6a; the flex class-claim failures.
+
+### ADR-47 C9: the holder's refusal in its own stream (2026-11-11)
+
+`271cefdc`, `c11d0e64` (ADR-47 amended; the code is `ed7dec83` and the C1 to C8 commits of 2026-11-10). A holder that
+refuses an op in its own stream refuses it as a stream row; an inbox-ever rid runs only through the lease holder.
+
+### ADR-57: a node never answers a read from a state that lacks an acknowledged row it rolled back (2026-11-11 to 2026-11-12)
+
+`584ff138..5bd83d76`, `4e769fdf`, `d85964e4`. Read holds are persisted with the strand, released when the log carries the
+row or its rid completes, refuse with EIO after the hold span, and are re-checked after the read. Sim checks at the read,
+across a restart and at quiescence (`c5bb43d1`). Seeds 745, 7, 240, 1728, 1191 closed; perf neutral.
+
+### ADR-58: every unsettled EIO ends a settle window (2026-11-11)
+
+`a83d8c07`, `ac58cb6f`, `c3e51412`, `8ab4922c`. A settle's refusal observes no keys, an unsettled EIO for a row waiting behind
+a lost chunk is a labelled class checked against global truth, a frozen epoch's settle ends in one window. Residual seeds
+are in the ADR.
+
+### ADR-59 part A: a directory's merged attributes order nothing (2026-11-12)
+
+`a3452a1b..1e5585f3` (21 commits). Part A also fixed the resent-hole and answer-on-tip I1s that exist on the previous main
+(`967978fc`, `5d7d4d90`). Seed sets: flex-crash+durability 255 to 0, metered 14 to 1, chain-backed 32 to 7.
+
+### ADR-59 part B: a drop decides in the log and applies when the log carries it (2026-11-12)
+
+`c081cc67..642f2057` (26 commits): `DropHeld` replaces `RolledBack`, the reship gate and the kept merge skip what a
+`DropHeld` retired, a parked answer is what the store says when released (`b4446f21`), a drop on a node that is not the
+sequencer in force is refused (`1d01d3d5`), the sim records a drop at its apply (`9e15e3a2`). Fail-before for each; no seed
+set grows over 39 labels.
+
+### ADR-59 fill and D1 follow-up (2026-11-13)
+
+`ad458e10..51881848`. A drop fills the stream indices it rolls back with no-op rows (`ad458e10`, `f7d9c012`); the holder of
+a stream decides the drop of its rows (D1 widened: lease for root rows, grant for stream rows, `12c09d4b`, `50536a95`,
+`5def5295`). far-placement+lost-chunk 10 to 0, far-root-writes-shared+lost-chunk 567 to 5.
+
+### lostchunk: no grant over a held root row (2026-11-12)
+
+`17213ff4`, `ce097395`, `f72b327b`, `e7f0ba06`. The root grants no subtree to another node while the ship plan holds back a
+root row of it, and the check is repeated under the delegation gate; a refusal held back from the log keeps its subtree.
+
+### fpdefer: a forwarded op the root may have run is not run again (2026-11-12)
+
+`858a51b8`, `3796c136`, `9e2c6f39`. A delegation that installs on the keys of a forwarded op the root may have run neither
+runs nor settles it again (`MutateOutcome::Held.yours`); with the root unreachable the op ends in doubt (the guard's cost,
+tested). far-placement+deferred 49 to 1. Open: a root witness for a skipped duplicate delegate row.
+
+### lockstale: a lock holder's next turn waits for an abandoned write's outcome (2026-11-11)
+
+`f78c06c4`. The engine abandoned a tagged write on an fsync wait timeout while the core kept the rid, which the root could
+execute over later acknowledged writes. The next turn now waits for the outcome, bounded by the settle's cap. Late
+unacknowledged turns 4/1/1 to 0.
+
+### I1: a root row of a node's own unshipped journal is not the log's (2026-11-12)
+
+`8aae63af`, guards pinned at the reroute and the inbox enqueue in `fb3443a9`. Seed 3159: `answer_awaiting_log` read a root
+refusal from the node's own unshipped journal after the takeover gate opened. Seed 5005 was an oracle fix (backups keyed by
+epoch across a same-epoch restart).
+
+### Stall fixes (2026-11-11)
+
+`a1f433e8`, `57fb3b8d`, `83e4b775`, `f24f899e`. The takeover gate's inbox drain runs outside the job slot so the lease keeps
+renewing, fetches the older batches together, and its leftovers hold the lease for a bounded time; a delegate failover
+rewind needs the known root. Held reads no longer end in EIO over 864 seeds.
+
+### Lock two-holder fix and route558 (2026-11-12)
+
+`d6102342`, `76556968`: a subtree returned to the generation that released it keeps its lock grants, and a re-sent release
+note is told from a later one (dcrash-pause 3808 and 4016 to 0). `04a7d4fc`: a delegation sync ends only the generations it
+knew before the loop (seed 558, `lk1` routed to a locally ended generation).
+
+### M1.3 steps 7, 8 and 9 (2026-11-11 to 2026-11-13)
+
+Step 7, ADR-54: `cc37a713..0976f7a9`. Step 9, ADR-55: `f7f41822`, `dfa4664e..77b3a43a` (25 commits). Step 8, ADR-56:
+`874c922d..51881848`, including the new generation opened by each handover (`0e3e414e`). Their entries are above. Open: step 9's
+sim control S2 fails no seed, so step 9 is not closed; step 8's C6 (placed grants by handover) is deferred.
