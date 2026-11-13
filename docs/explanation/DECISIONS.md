@@ -2743,7 +2743,6 @@ See: [plan 43](../plans/v1/done/43-commit-rule.md) (§4 the oracle, Q16),
 `root_stream_push`, `deleg_poke_root`, `on_delegate_stream`,
 `on_delegate_stream_ack`, `deleg_group_through`).
 
-
 ## ADR-42: A takeover gate whose journal work is done serves the generations it inherits
 
 **Status**: decided by the maintainer on 2026-11-03 (plan 46 M0.3, S5, option
@@ -2920,127 +2919,6 @@ See: `crates/authority/src/core/delegate.rs` (`delegation_sync`,
 `deleg_recall_plan`, `root_log_floor`), `holder.rs` (`gate_settle`),
 `client.rs`, `crates/meta/src/replay.rs` (`TouchSet::from_op_in_names`);
 [plan 46](../plans/v1/wip/46-committed-or-final.md) M0.3 S5; PROGRESS "S5".
-
-## ADR-44: A takeover gate whose journal work is done recalls on demand
-
-**Status**: decided by the maintainer on 2026-11-05 (plan 46 M0.4 follow-up;
-the spec reviewed before it landed); interim until plan 46 M1.3. Amends
-[ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)'s "recalls, seals, reclaims and ends nothing".
-
-**Context**: under ADR-42 an op that needs a generation of another node
-recalled (keys across generations; a generation its delegate disowned or whose
-delegate is unreachable or past its window) waited for the gate to open (the
-12.5 s read quarantine plus the drain) before the root sent the recall. Its
-requester's deadline and settle window (9 s + 3 s) ran out meanwhile: the
-settle was `Busy` (S1 answers only keys the gate owns), the `EIO` went
-unsettled, and the op took effect after the open. The stricter I4 classifier
-(SHOULD-2 of the M0.4 review) counts 432 such `EIO`s as violations over 2,000
-seeds of the delegated configurations.
-
-**Decision**: a shippable gate (lease held, not lost, not releasing,
-`PendingGate::shippable`, `journal_ship_epoch` in force) recalls, on demand,
-exactly the generations an open root would recall for a pending op or settle it
-is asked to execute or settle, and only among the generations of other nodes it
-took on from the table (`GenState::inherited`, not ended, not a designation):
-- what: every involved generation of a cross-subtree op (`redelegate` set, the
-  re-grant waits for the open); the one a single-generation forward or settle
-  falls under when the open root's S3 test would not redirect it (ended,
-  recalling, past its window, delegate unreachable, or the delegate's own op or
-  settle: for an inherited generation `grant_in_flight` is false, so a
-  delegate's own request counts as disowned also while its first renewal only
-  waits for the quarantine; M1.3's holder-initiated release replaces that
-  test); every involved generation of the gated root's own op or settle that
-  reaches `route` (as `execute_local_outcome` plans it for an open root). Entry
-  points: `on_forward`'s fenced branch, `route` and `on_forward_backoff` for the
-  gated root's own ops and settles and the takeover drain's halt for an inbox
-  op. One function decides, `Core::gate_recall_on_demand`;
-  `start_recall` refuses in a gate that is not shippable and, in one that is,
-  any generation not inherited or this node's.
-- when: at the first such request after `shippable`, and again on a later one
-  while no recall is in flight. Never at `shippable`, a sync, an expiry, a
-  renewal or a batch.
-- not: no seal, no reclaim or outwait (`on_deleg_expiry` re-arms), no end of a
-  generation it did not recall on demand (its own end at the open; a recall kept
-  from a usable phase ends at the open), no renewal of a generation it recalls
-  (left unanswered, S2), no re-delegation, no execution before the open (the
-  forward stays `Busy`).
-- the drain and the end: the gate takes the recalled generation's batches
-  (`gated_takes_stream`), resends the recall (L3) for `gate_recalled` only, and
-  once `cursor >= through` journals the end (`RecallCut { through: cursor }`,
-  `void_stream`, `note_void_cut`, its own speculation stranded, the returned
-  lock grants installed) inside the gate.
-- the settle: `Held` (`recall_hold_ms`, no attempt spent; before: `Busy`) while
-  the recall is in flight; once the cut is journaled the keys are the gate's and
-  S1 answers: a rid with no outcome gets the journaled `Refused { ABANDONED }`
-  once its row ships, a rid that took effect is `Held` until the open (M8). The
-  gated root's own settle waits in `Backoff` (`ClientOp::gate_recall_wait`) and
-  is routed as a settle again, not down the lease path.
-
-**Integrity**: the recall, the drain and the cut are the open root's code paths
-under the same lease; the cut is a journal row after the marker, the tail and
-the gate's own rows and after every appended row of the generation (tail rows
-are at or below `log_stream_idx`, the inherited cursor); a deposition strands it
-like an open root's (the cut retracted, the void lifted, the successor inherits
-the generation live and the stopped delegate answers again from
-`handed_back`); ADR-43's orphan rule sees a durable end of a listed number; the
-drained batches are acknowledged with `committed` per ADR-41 as ADR-42 already
-does, and inherit the lone gate's exposure (M0.4 STAGE-1, not new). No new
-acknowledgement class (I1); the op is never parked at the gate and a
-delegate-executed copy is in the log before the cut (I2, I2c); `Abandoned` only
-on the gate's own keys for a rid with no outcome here (I4); the cut is at the
-cursor and the gate's speculation of the generation strands and replays (I5).
-The read quarantine covers every key it covered: the ended generation's keys
-join it, and the gate's view stays closed until the open.
-
-**Consequences**: over 2,000 seeds the stricter classifier's unsettled-`EIO`
-violations fall from 281/676 (long-delegated-late-answers, without/with slow
-lease reads) to 15/152, 29/65 to 2/32 (placement-hot), 325/627 to 35/100
-(delegated-holder-cut), 174/406 to 2/70 (long-delegated-backup); no failing
-seed; I1, I2, I2c, I5 unchanged; I4 late landings fall. Residual: the gated
-root's own op whose live delegate waits for its first renewal, a rid that took
-effect (held until the quarantine), a gate that is not shippable while the recall drains (seed 1796: a
-gate paused past its lease with the recall in flight; the end is journaled at the
-next event once it is shippable again, else at the open; the seed stays open as a
-liveness case), an unreachable delegate (`Held` until the open; the
-lease path could not answer either), a refusal not shipped by the window's end.
-Cost: none on an open root; in the gate one recall per needed generation, 12 to
-20 s earlier than before; a cross-subtree op's subtree is re-granted at the open
-and may be recalled once more by the op's retry (`deleg_gate_redelegated` counts it); a forwarded settle is `Held`
-instead of `Busy`. Two S5 unit tests changed their expectation (a disowned and
-an outwaited generation: recalled and `Held`, were `Busy`); the m03 witness
-seed moved from 2 to 449 (2 and 260 are closed by this rule). No version bump,
-no shim.
-
-**Rejected**: wholesale recall in the gate (ADR-42 (b): ends grants sticky
-grants keep); a cut held until the open with the settle answered from the drain
-state (a root refusal journaled on a delegated key); `Held` until the open (no
-I4 fix); redirecting a cross-subtree settle to a delegate (it cannot settle
-keys outside its subtree).
-
-**May revert**: under plan 46 M1.2/M1.3 the recall is a request the holder
-answers with `SubtreeReleased`; the rule becomes "the subtrees the op needs
-released", the end the journaled release, and `GenState::gate_recalled` goes
-with `GenState`.
-
-*Amended by plan 46 M1.2 step 10:* the recall is a `ReleaseRequest { gen,
-dirs }`, one way; the delegate answers in its stream with a `StreamReleased`
-(or `SubtreeReleased`) row, and the gate ends the generation once it has
-appended that row (the drain `root_progress` waits for), the L3 resend
-applying to the request. The gate's on-demand recall asks for every subtree
-of the stream; a release of some subtrees only is the open root's
-(`request_release`), the gate sequences nothing it has not taken whole.
-
-See: `crates/authority/src/core/delegate.rs` (`gate_recall_on_demand`,
-`gated_takes_stream`, `start_recall`, `on_release_resend`,
-`root_progress`), `holder.rs` (`on_forward`'s fenced branch, `gate_settle`),
-`client.rs` (`route`, `on_forward_backoff`, `settle_route`,
-`ClientOp::gate_recall_wait`), `inbox.rs`; tests
-`igr_a_shippable_gate_recalls_the_generation_a_cross_op_needs` (fail-before),
-`igr_a_gate_recalls_nothing_unprompted`, sim
-`s5_a_gated_root_serves_another_nodes_generation`,
-`m03_the_configurations_without_an_unsettled_eio_run_strict`; plan 46 M0.4
-follow-up; the M0.4 review STAGE-1 "ADR-42's in-gate class" (superseded by this
-decision).
 
 ## ADR-43: A generation number carries the epoch of the tenure that minted it
 
@@ -3293,6 +3171,126 @@ See: `crates/meta/src/delegation.rs` (`next_delegation_gen`, `GEN_MAX_EPOCH`,
 `regression_no_generation_number_is_minted_twice`;
 [plan 46](../plans/v1/wip/46-committed-or-final.md) M0.3, §5.2; PROGRESS "ADR-43".
 
+## ADR-44: A takeover gate whose journal work is done recalls on demand
+
+**Status**: decided by the maintainer on 2026-11-05 (plan 46 M0.4 follow-up;
+the spec reviewed before it landed); interim until plan 46 M1.3. Amends
+[ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)'s "recalls, seals, reclaims and ends nothing".
+
+**Context**: under ADR-42 an op that needs a generation of another node
+recalled (keys across generations; a generation its delegate disowned or whose
+delegate is unreachable or past its window) waited for the gate to open (the
+12.5 s read quarantine plus the drain) before the root sent the recall. Its
+requester's deadline and settle window (9 s + 3 s) ran out meanwhile: the
+settle was `Busy` (S1 answers only keys the gate owns), the `EIO` went
+unsettled, and the op took effect after the open. The stricter I4 classifier
+(SHOULD-2 of the M0.4 review) counts 432 such `EIO`s as violations over 2,000
+seeds of the delegated configurations.
+
+**Decision**: a shippable gate (lease held, not lost, not releasing,
+`PendingGate::shippable`, `journal_ship_epoch` in force) recalls, on demand,
+exactly the generations an open root would recall for a pending op or settle it
+is asked to execute or settle, and only among the generations of other nodes it
+took on from the table (`GenState::inherited`, not ended, not a designation):
+- what: every involved generation of a cross-subtree op (`redelegate` set, the
+  re-grant waits for the open); the one a single-generation forward or settle
+  falls under when the open root's S3 test would not redirect it (ended,
+  recalling, past its window, delegate unreachable, or the delegate's own op or
+  settle: for an inherited generation `grant_in_flight` is false, so a
+  delegate's own request counts as disowned also while its first renewal only
+  waits for the quarantine; M1.3's holder-initiated release replaces that
+  test); every involved generation of the gated root's own op or settle that
+  reaches `route` (as `execute_local_outcome` plans it for an open root). Entry
+  points: `on_forward`'s fenced branch, `route` and `on_forward_backoff` for the
+  gated root's own ops and settles and the takeover drain's halt for an inbox
+  op. One function decides, `Core::gate_recall_on_demand`;
+  `start_recall` refuses in a gate that is not shippable and, in one that is,
+  any generation not inherited or this node's.
+- when: at the first such request after `shippable`, and again on a later one
+  while no recall is in flight. Never at `shippable`, a sync, an expiry, a
+  renewal or a batch.
+- not: no seal, no reclaim or outwait (`on_deleg_expiry` re-arms), no end of a
+  generation it did not recall on demand (its own end at the open; a recall kept
+  from a usable phase ends at the open), no renewal of a generation it recalls
+  (left unanswered, S2), no re-delegation, no execution before the open (the
+  forward stays `Busy`).
+- the drain and the end: the gate takes the recalled generation's batches
+  (`gated_takes_stream`), resends the recall (L3) for `gate_recalled` only, and
+  once `cursor >= through` journals the end (`RecallCut { through: cursor }`,
+  `void_stream`, `note_void_cut`, its own speculation stranded, the returned
+  lock grants installed) inside the gate.
+- the settle: `Held` (`recall_hold_ms`, no attempt spent; before: `Busy`) while
+  the recall is in flight; once the cut is journaled the keys are the gate's and
+  S1 answers: a rid with no outcome gets the journaled `Refused { ABANDONED }`
+  once its row ships, a rid that took effect is `Held` until the open (M8). The
+  gated root's own settle waits in `Backoff` (`ClientOp::gate_recall_wait`) and
+  is routed as a settle again, not down the lease path.
+
+**Integrity**: the recall, the drain and the cut are the open root's code paths
+under the same lease; the cut is a journal row after the marker, the tail and
+the gate's own rows and after every appended row of the generation (tail rows
+are at or below `log_stream_idx`, the inherited cursor); a deposition strands it
+like an open root's (the cut retracted, the void lifted, the successor inherits
+the generation live and the stopped delegate answers again from
+`handed_back`); ADR-43's orphan rule sees a durable end of a listed number; the
+drained batches are acknowledged with `committed` per ADR-41 as ADR-42 already
+does, and inherit the lone gate's exposure (M0.4 STAGE-1, not new). No new
+acknowledgement class (I1); the op is never parked at the gate and a
+delegate-executed copy is in the log before the cut (I2, I2c); `Abandoned` only
+on the gate's own keys for a rid with no outcome here (I4); the cut is at the
+cursor and the gate's speculation of the generation strands and replays (I5).
+The read quarantine covers every key it covered: the ended generation's keys
+join it, and the gate's view stays closed until the open.
+
+**Consequences**: over 2,000 seeds the stricter classifier's unsettled-`EIO`
+violations fall from 281/676 (long-delegated-late-answers, without/with slow
+lease reads) to 15/152, 29/65 to 2/32 (placement-hot), 325/627 to 35/100
+(delegated-holder-cut), 174/406 to 2/70 (long-delegated-backup); no failing
+seed; I1, I2, I2c, I5 unchanged; I4 late landings fall. Residual: the gated
+root's own op whose live delegate waits for its first renewal, a rid that took
+effect (held until the quarantine), a gate that is not shippable while the recall drains (seed 1796: a
+gate paused past its lease with the recall in flight; the end is journaled at the
+next event once it is shippable again, else at the open; the seed stays open as a
+liveness case), an unreachable delegate (`Held` until the open; the
+lease path could not answer either), a refusal not shipped by the window's end.
+Cost: none on an open root; in the gate one recall per needed generation, 12 to
+20 s earlier than before; a cross-subtree op's subtree is re-granted at the open
+and may be recalled once more by the op's retry (`deleg_gate_redelegated` counts it); a forwarded settle is `Held`
+instead of `Busy`. Two S5 unit tests changed their expectation (a disowned and
+an outwaited generation: recalled and `Held`, were `Busy`); the m03 witness
+seed moved from 2 to 449 (2 and 260 are closed by this rule). No version bump,
+no shim.
+
+**Rejected**: wholesale recall in the gate (ADR-42 (b): ends grants sticky
+grants keep); a cut held until the open with the settle answered from the drain
+state (a root refusal journaled on a delegated key); `Held` until the open (no
+I4 fix); redirecting a cross-subtree settle to a delegate (it cannot settle
+keys outside its subtree).
+
+**May revert**: under plan 46 M1.2/M1.3 the recall is a request the holder
+answers with `SubtreeReleased`; the rule becomes "the subtrees the op needs
+released", the end the journaled release, and `GenState::gate_recalled` goes
+with `GenState`.
+
+*Amended by plan 46 M1.2 step 10:* the recall is a `ReleaseRequest { gen,
+dirs }`, one way; the delegate answers in its stream with a `StreamReleased`
+(or `SubtreeReleased`) row, and the gate ends the generation once it has
+appended that row (the drain `root_progress` waits for), the L3 resend
+applying to the request. The gate's on-demand recall asks for every subtree
+of the stream; a release of some subtrees only is the open root's
+(`request_release`), the gate sequences nothing it has not taken whole.
+
+See: `crates/authority/src/core/delegate.rs` (`gate_recall_on_demand`,
+`gated_takes_stream`, `start_recall`, `on_release_resend`,
+`root_progress`), `holder.rs` (`on_forward`'s fenced branch, `gate_settle`),
+`client.rs` (`route`, `on_forward_backoff`, `settle_route`,
+`ClientOp::gate_recall_wait`), `inbox.rs`; tests
+`igr_a_shippable_gate_recalls_the_generation_a_cross_op_needs` (fail-before),
+`igr_a_gate_recalls_nothing_unprompted`, sim
+`s5_a_gated_root_serves_another_nodes_generation`,
+`m03_the_configurations_without_an_unsettled_eio_run_strict`; plan 46 M0.4
+follow-up; the M0.4 review STAGE-1 "ADR-42's in-gate class" (superseded by this
+decision).
 
 ## ADR-45: An op sent to a non-stealable holder is never refused for good
 
@@ -4139,75 +4137,9 @@ See: `crates/authority/src/core/kept.rs`, `core/seal_tail.rs`,
 `crates/meta/src/store/spec.rs` (`stranded_by_abandon`), `lease.rs` of `replicix-objcas` (`fenced_for_retirement`),
 [durability and failover](../reference/features/durability-and-failover.md).
 
-## ADR-53: A row keeps its configuration's rule across its holder's own tenure gap
-
-**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.4 step 6a;
-the class-claim failures of the flex configurations). Completes the rule of
-plan 46 M1.1 step 5 ("a row keeps the rule of the configuration it was
-journaled in") for a gap in the holder's own tenure.
-
-**Context**: the simulation's I1 oracle rejects an answer that claims a gated
-rule (`Archive`, a `Root` group) which only a singleton or the final rule
-judges. Replays (`flex-tight+oracles`, `flex+commit`) found two shapes. (a) A
-node journals its own row `Archive` while a peer is about; S3 is down and the
-answer parks. A continuation epoch closes and lets the lease go, which clears
-the closed configurations (`ack.spans`) that held the answer back; the node
-takes the same lease again, lone, at a higher `config_version`, and the
-parked answer leaves in the same event claiming `Archive` for a row that
-never shipped. (b) A node that holds no lease, not lost and with no hold,
-reached the client deadline and read its own unshipped journal row as the
-log's, answering `Archive`.
-
-**Decision**: a row this node journaled under a configuration no longer in
-force is answered only once that configuration's own rule has committed it:
-for `Archive` and a `Root` group (whose acks do not survive the gap), the
-archive. A node that holds no lease never reads its own unshipped row as the
-log's.
-
-- A tenure starts whenever the lease is held and was not before (the
-  process's first, a re-take after the lease was let go or lost, a restart
-  re-adopting the node's own lease) or is of another epoch. The tenure notes
-  its start (`Ack.tenure_start`: the lease's `config_version` and the
-  journal's tip). A gated root row (`Archive` or a `Root` group) at or below
-  that tip, journaled under an older version, is an earlier tenure's: its
-  group's acks do not survive the gap, so only the archive commits it.
-- The test is the row's own state (`Core::unsettled_root_row`), never a flag
-  of how the tenure came about. Every path asks it: `answer_need_of` (the
-  retries and the deadline), `completed_row_settled` (the replay, the inbox,
-  the release of a parked answer), and the emission gate where an answer
-  leaves (the backstop, counted as `held_at_emission_root_row`). An earlier
-  tenure's row waits for the archive; the rows of the tenure itself are
-  answered by the tenure's own rule and do not wait behind them. (An
-  earlier version of this ADR capped `durable_jseq` with a span ending at the
-  last earlier row; a row held back for its data then blocked every answer of
-  the resumed tenure, and a restart, which sees no gap, got no span at all.)
-- `settled_outcome` of a node that holds no lease returns nothing for a row
-  the journal carries and no applied segment does when the node is deposed or
-  left a hold (as before), or when the row is a root row (not a delegation's,
-  which commit by their group or the log); the settle path decides.
-
-A true singleton's row stays ungated (its rule never gates): its answer after
-a re-take does not wait for the archive.
-
-**Consequences**: after an epoch's close, a lapse or a restart, the answers
-of the earlier tenure's unshipped rows wait for the archive (while S3 is
-unreachable they wait for it; the client's retries or its deadline settle
-them). Unsettled `EIO`s of ops whose row is unshipped at the deadline settle
-instead of answering.
-
-**Rejected**: keeping the configuration and the spans across the gap (they
-would outlive a journal another tenure rolled back and block forever); a span
-at a tenure's start that caps the whole journal's answers.
-
-**May revert**: no.
-
-See: `crates/authority/src/core/backup.rs` (`sync_cfg_spans`,
-`unsettled_root_row`), `crates/authority/src/core/client.rs`
-(`settled_outcome`), [DESIGN](DESIGN.md) ("Acknowledgement and durability").
-
 ## ADR-52: A singleton answer leaves only on a fresh reading of a usable lease
 
-**Status**: plan 46 M1.3 (the stale-clock re-check, lease6 triage F1).
+**Status**: landed 2026-11-11, plan 46 M1.3 (the stale-clock re-check, lease6 triage F1).
 
 **Context**: a core step decides on the `now` it read when it began. A step
 that stalled between that read and its answer (a slow store write, a stopped
@@ -4274,235 +4206,71 @@ See: `crates/authority/src/core/backup.rs` (`emission_hold_of`),
 `crates/authority/src/core/readindex.rs` (`park_stale_lease`,
 `complete_ready`), `crates/engine/src/view/write_gate.rs` (`fast_ack_target`).
 
-## ADR-58: Every unsettled EIO ends a settle window, and a settle's refusal waits for nothing
+## ADR-53: A row keeps its configuration's rule across its holder's own tenure gap
 
-**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.4 exit: the
-"root/job" and "takeover gate+job" classes of I4's unsettled `EIO`). Complements
-[ADR-49](#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see).
+**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.4 step 6a;
+the class-claim failures of the flex configurations). Completes the rule of
+plan 46 M1.1 step 5 ("a row keeps the rule of the configuration it was
+journaled in") for a gap in the holder's own tenure.
 
-**Context**: the simulation reported unsettled `EIO`s told with a sequencer
-reachable, labelled "root/job" or "takeover gate+job". The labels were
-misleading: the classifier ORed the core's busy bits over the whole reachable
-run, and a writing root almost always had a job in its slot at some moment. No
-settle in the sample waited for the job slot or a busy core. Three mechanisms
-caused them: (M1) the op's own row sat in the root's journal held behind a
-chunk that exists nowhere (plan 30 section M4), where no sequencer can answer
-the rid until the operator's `repair drop-held`; (M2) the settle's own
-`Refused { rid, ABANDONED }` row was held behind the same chunk, because a
-journaled refusal records the keys of the op it refused as observed keys and
-the ship plan holds a transaction whose observed keys meet a held one; (M3) an
-op already sent reached the lease path in an epoch that refuses writes
-(frozen, or carrier-less), and `refuse_on_lease_path` told the unsettled `EIO`
-at once with no settle, so the classifier's window reached back into the time
-before the outage.
+**Context**: the simulation's I1 oracle rejects an answer that claims a gated
+rule (`Archive`, a `Root` group) which only a singleton or the final rule
+judges. Replays (`flex-tight+oracles`, `flex+commit`) found two shapes. (a) A
+node journals its own row `Archive` while a peer is about; S3 is down and the
+answer parks. A continuation epoch closes and lets the lease go, which clears
+the closed configurations (`ack.spans`) that held the answer back; the node
+takes the same lease again, lone, at a higher `config_version`, and the
+parked answer leaves in the same event claiming `Archive` for a row that
+never shipped. (b) A node that holds no lease, not lost and with no hold,
+reached the client deadline and read its own unshipped journal row as the
+log's, answering `Archive`.
 
-**Decision**:
+**Decision**: a row this node journaled under a configuration no longer in
+force is answered only once that configuration's own rule has committed it:
+for `Archive` and a `Root` group (whose acks do not survive the gap), the
+archive. A node that holds no lease never reads its own unshipped row as the
+log's.
 
-- **C1, a settle's refusal observes nothing.** A refusal with
-  `ABANDONED_CODE` ("this op did not happen") is journaled with no observed
-  keys, at the root (`settle_refusal`) and in the inbox settle. It writes no
-  namespace key and was evaluated against no state, so shipping it ahead of
-  any transaction commutes; the reason errno refusals observe keys (the log's
-  own prefix must explain the refusal) does not apply. It is journaled only
-  when the dedup found no outcome for the rid, so the journal holds no row of
-  the rid that a drop could roll back. A dropped-code settle refusal keeps its
-  observed keys (conservative). The inbox settle's `InboxAck` is a
-  max-watermark and can now ship ahead of an earlier, held inbox-drained row;
-  that was already possible for any refusal or row on untainted keys, and the
-  watermark's ordering is unaffected.
-- **C2, no unsettled `EIO` without a settle window.** A sent op that settles
-  and finds its node's epoch refusing writes starts its settle
-  (`client_deadline`) instead of being told in doubt at once. A settle that
-  comes back to the lease path of such an epoch waits in `Backoff`
-  (`recall_hold_ms`, at least 50 ms) and is routed again; the deadline then
-  tells the unsettled `EIO` after its window. `settle_route` sends the settle
-  to the epoch's hold owner (the carrier) when this node reaches it. Never-sent ops keep `EROFS`; replays and
-  best-effort ops are unchanged. The settle of this path is bounded at one
-  settle window from the freeze (`SettleUntil::Window`: 30 s at the defaults,
-  3 s in the sim), not at the client's deadline (twice the lease TTL after the
-  submission, 120 s at the defaults, which an ordinary settle runs to): in a
-  frozen or carrier-less epoch the in-doubt answer for an op in flight comes
-  one settle window later (maintainer decision Q2). A window shorter than the
-  epoch leaves an isolated requester's `EIO`, which the classifier allows as
-  before.
-- **C2 follow-up, a settle with no holder to ask asks the reachable nodes
-  inside its window** (Q2's bound kept; the rule found by the re-review of the
-  first round). A settle of this node's own op in an epoch that refuses
-  writes used to send itself to the epoch's carrier only, and with none only
-  backed off until the window ended; a requester that could not read the lease
-  (its S3 cut) never learned who the sequencer was (flex 736). Now every
-  `ForwardBackoff` tick (`recall_hold_ms`, at least 50 ms) sends the settle to
-  one *main* candidate (`settle_ask_peers`): the node that last answered it
-  `Held`, else the carrier, else the cached holder, on every tick; and, beside
-  it, one *probe* (`settle_probe`) to the next other roster peer `reaches`
-  says is up, each once before any is probed again. With no main candidate
-  the peers take the ticks in turn. A probe's reply stands for the forward
-  unless it is `NotHolder { 0 }` or `Busy`; `NotHolder { h }` redirects to
-  `h` (the redirect budget, the attempts and the fence bounces are per
-  candidate, so a dead one does not use up the retries the holder's forwards
-  get once the epoch ends). A probe no answer reaches within a forward
-  timeout marks its peer dead for the rest of the window. A settle with no
-  cached holder on the lease path (the acquire retry of a node whose lease
-  reads fail) asks a peer in place of the route on every other retry, the
-  same way. The deadline stays `SettleUntil::Window`, plus one grace of a
-  forward timeout (`settle_forward_graces`) for a second deadline that finds a
-  forward in flight, or finds the settle idle in its backoff after the epoch
-  that refused writes ended (it is sent at once). **Bound**: a settle no node
-  answers ends at the window plus one forward timeout (30.5 s at the defaults,
-  3.5 s in the sim;
-  `a_frozen_settle_nobody_answers_ends_by_the_window_and_a_forward_timeout`);
-  one a live sequencer answers `Held` with an outwait ends at
-  `Deadlines::settle_cap_span` (69.5 s at the defaults), the bound every
-  settle already has; never twice the lease TTL. Latency of the answers of
-  such settles (`Stats::settle_frozen_answer_ms`, from the first ask, seeds
-  0..1999 of the four flex configurations): p50 2.0 to 2.25 s, p90 3.0 to
-  3.5 s, the longest past 3.75 s (a `Held` outwait, within the cap) of a 3 s
-  window.
-- **C3, `held-behind-lost-chunk`, an allowed class.** `MutateOutcome::Held`
-  gains `lost_chunk`, set by a root whose answer waits for the durability of a
-  row that the ship plan *holds* for a chunk that exists nowhere, or defers
-  behind another node's pending upload whose uploader may never return
-  (`Meta::rid_behind_lost_chunk`, from the last ship round, by the plan's
-  blame on the remote-pending rows). A row that is merely deferred for this
-  node's own upload ships by itself and does not count. A settling requester that hears it (or that is the sequencer
-  itself and finds the rid in its own plan) labels its unsettled `EIO`
-  (`take_unsettled_lost_chunk`, stat `unsettled_held_lost_chunk`); the label
-  is the last `Held`'s word. The oracle accepts it only against global truth,
-  as for ADR-47's `HolderUnreachable`, and the verdict would have been a
-  violation: the sim's chunk ledger has a chunk that exists nowhere at the
-  `EIO`, and either (a) an operator's `repair drop-held` rolled the rid back at
-  or after the `EIO` (a drop before it ran when a sequencer could settle the
-  rid), or (b) the requester said so, some node's ship plan held the rid's
-  transaction (or deferred it behind another node's pending upload) at the
-  `EIO`, and the rid's outcome reached the log only after
-  the first drop at or after the `EIO`, or never. A row that shipped by itself,
-  before any drop, makes the label a lie. It is counted apart
-  (`Report::unsettled_held_lost_chunk`), never a violation, with a ratcheting
-  ceiling of its own: it does not share the old allowed classes' ceiling. The
-  negative control is `AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS` (a requester
-  labels every `Held`): with the real oracle it must not lower any violation
-  count, and with `AUTHORITY_SIM_LOST_CHUNK_TRUST_LABEL` also set (an oracle
-  that takes the requester's word) it does lower them: the checks above are
-  what holds the line. An oracle unit test pins that a row deferred for the
-  node's own upload never converts. The settle is not
-  rolled back automatically (maintainer decision Q1): only the operator
-  decides, since the chunk may come back.
-- **C4, the classifier says what the core was busy with when it mattered.**
-  `Verdict::Reachable` reports the busy bits at the reachable run's last
-  instant and the OR over the run as `ever`.
+- A tenure starts whenever the lease is held and was not before (the
+  process's first, a re-take after the lease was let go or lost, a restart
+  re-adopting the node's own lease) or is of another epoch. The tenure notes
+  its start (`Ack.tenure_start`: the lease's `config_version` and the
+  journal's tip). A gated root row (`Archive` or a `Root` group) at or below
+  that tip, journaled under an older version, is an earlier tenure's: its
+  group's acks do not survive the gap, so only the archive commits it.
+- The test is the row's own state (`Core::unsettled_root_row`), never a flag
+  of how the tenure came about. Every path asks it: `answer_need_of` (the
+  retries and the deadline), `completed_row_settled` (the replay, the inbox,
+  the release of a parked answer), and the emission gate where an answer
+  leaves (the backstop, counted as `held_at_emission_root_row`). An earlier
+  tenure's row waits for the archive; the rows of the tenure itself are
+  answered by the tenure's own rule and do not wait behind them. (An
+  earlier version of this ADR capped `durable_jseq` with a span ending at the
+  last earlier row; a row held back for its data then blocked every answer of
+  the resumed tenure, and a restart, which sees no gap, got no span at all.)
+- `settled_outcome` of a node that holds no lease returns nothing for a row
+  the journal carries and no applied segment does when the node is deposed or
+  left a hold (as before), or when the row is a root row (not a delegation's,
+  which commit by their group or the log); the settle path decides.
 
-**Rejected**: rolling back the held dependents of a settled rid automatically
-(it puts rollback in the settle path and pre-empts the operator); C1b, letting
-`ABANDONED` refusals ship past an uncaptured held transaction (only on
-evidence; none yet); shortening the carrier-less epoch's in-doubt answer to the
-epoch's end (the classifier would have to treat such an epoch as isolation).
+A true singleton's row stays ungated (its rule never gates): its answer after
+a re-take does not wait for the archive.
 
-**Consequences**: latency and errno, never safety. The settle sends nothing the
-rules of ADR-49 do not already cover, and executes nothing. An unsettled `EIO`
-in a frozen epoch arrives up to a settle window later; a settle's refusal
-behind a lost chunk is answered instead of held until the drop. Counters:
-`settles_sent`, `unsettled_held_lost_chunk`, `settle_frozen_asks`,
-`settle_forward_graces`, `settle_frozen_answer_ms`.
+**Consequences**: after an epoch's close, a lapse or a restart, the answers
+of the earlier tenure's unshipped rows wait for the archive (while S3 is
+unreachable they wait for it; the client's retries or its deadline settle
+them). Unsettled `EIO`s of ops whose row is unshipped at the deadline settle
+instead of answering.
 
-**Residuals** (seeds 0..1999, release, `+settle+oracles+unsettled`; main fails
-flex 98, flex-crash 952, flex-tight 876, flex-backup 101 seeds, flex-crash
-1834 and flex-tight 936 and 1079 and flex-backup 596 among them). After this
-ADR: flex 20, flex-crash 73, flex-tight 98, flex-backup 55. Every one is an
-unsettled `EIO` told with a sequencer reachable, except where named:
-
-- flex: 215 490 685 736 757 821 934 974 1020 1078 1101 1278 1340 1489 1524
-  1552 1754 1759 1884 1911.
-- flex-crash: 124 197 201 215 225 246 253 267 353 360 384 441 472 490 501 582
-  595 617 671 679 697 703 757 762 797 821 826 845 934 957 964 970 974 1017
-  1020 1022 1025 1027 1075 1078 1084 1091 1101 1127 1154 1180 1229 1257 1258
-  1278 1288 1313 1339 1388 1393 1402 1488 1489 1524 1555 1556 1699 1749 1754
-  1776 1778 1884 1907 1911 1912 1921 1933, and 1834.
-- flex-tight: 7 33 48 56 76 115 183 194 196 235 253 271 294 323 338 346 358
-  383 390 414 446 449 462 464 468 474 476 522 525 594 603 615 655 675 679 689
-  703 756 767 797 826 832 837 842 882 928 951 969 976 1002 1030 1049 1058 1061
-  1077 1158 1180 1207 1225 1241 1264 1288 1313 1315 1352 1358 1359 1365 1429
-  1503 1507 1524 1536 1557 1559 1592 1593 1614 1629 1638 1651 1654 1666 1693
-  1695 1703 1707 1771 1778 1856 1860 1895 1901 1915 1933 1950, and 936 (class
-  claim) and 1079 (I5), which fail on main too.
-- flex-backup: 60 140 144 164 192 214 215 218 294 360 382 403 425 435 490 492
-  560 576 630 719 736 753 757 821 833 882 934 947 974 997 1020 1021 1025 1246
-  1289 1304 1340 1364 1373 1399 1502 1552 1559 1621 1631 1752 1759 1767 1781
-  1884 1911 1924 1925 1933, and 596 (class D, `tail_done_skipped`), which
-  fails on main too.
-
-After the C2 follow-up (same sweeps; flex 20 to 7, flex-crash 73 to 56,
-flex-tight 98 to 86, flex-backup 55 to 39; the guards `sticky-ttl`,
-`long-delegated+unsettled`, `long-delegated-late-answers+commit` and
-`delegated-root-deposed-delegate-dies` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
-are as on main, 0, 0, 0 and 1 (seed 1678)):
-
-- flex: 214 215 490 685 934 1340 1911.
-- flex-crash: 201 215 225 246 253 267 353 360 384 441 490 501 582 595 617 679
-  697 797 821 826 844 934 957 964 970 1017 1022 1027 1075 1084 1091 1127 1154
-  1180 1257 1258 1278 1306 1339 1388 1393 1402 1429 1488 1489 1556 1699 1749
-  1776 1778 1884 1907 1911 1912 1933, and 1834.
-- flex-tight: 33 56 72 79 163 196 209 246 253 271 288 294 394 414 446 449 459
-  462 464 468 525 581 655 675 679 742 745 756 782 792 797 826 832 837 912 922
-  944 969 976 1002 1023 1030 1046 1049 1061 1101 1129 1157 1158 1164 1180 1225
-  1253 1285 1306 1313 1335 1358 1372 1377 1380 1436 1507 1519 1614 1637 1666
-  1693 1695 1730 1753 1771 1778 1802 1856 1879 1895 1915 1933 1950 1974, and
-  91, 476 and 936 (class claim: an answer says group, the journal row is a
-  singleton; 936 fails on main too, 476 failed an unsettled `EIO` there, 91
-  passed), and 1267 (I5, see below).
-- flex-backup: 60 164 192 214 218 382 403 425 435 490 492 560 576 630 719 833
-  882 934 947 974 997 1021 1025 1246 1289 1340 1364 1373 1399 1502 1621 1752
-  1767 1781 1911 1924 1925 1933, and 596.
-
-The set moves with the schedule: the rule fixes 14, 20, 51 and 16 of main's
-seeds and 1, 3, 39 and 0 seeds that passed on main now fail. The new ones are
-all unsettled `EIO`s with a sequencer reachable for a few hundred ms of the
-window (the same shape as the residuals), two class claims (91 and 476, the
-shape of 936: a settle that main ended in doubt is now answered, and the
-answer meets that older hole) and one I5; none is a new kind of failure. A
-seed-level cause that was found and kept: a settle that main left idle in
-`Backoff` or `AcquireRetry` while the epoch that refused writes ended answered,
-by the lease path's deadline extension for a claim that falls due; the
-follow-up's grace now sends such a settle at once, and the extension for a
-claim stays as on main (widening it for settles in `Forwarded` or `Backoff` was
-tried: flex-tight 98 to 113). The I5 of flex-tight 1267 is the
-subscriber-stranding shape of a hold epoch (a subscriber outside the epoch
-holds an acknowledged row ungated; a later epoch's marker that arrives before
-the re-shipped tail strands it): a separate hole in the subscriber's side,
-fixed on its own, that the schedule of this rule exposes; it is not caused by
-settling. What is left is reachabilities of a few hundred ms, the lease-path
-floor (`min_p2p_ms` 0 for `LeasePath`; flex-tight 196 reaches it for 190 ms),
-and a root that comes up inside the last ticks.
-
-Three causes. (1) *The window of a frozen epoch's settle* (the maintainer's
-cap, M3): the `EIO` comes one settle window after the freeze, and some windows
-end with the sequencer reachable for part of them, because the requester that
-has no holder to ask and no S3 to read the lease from (flex 736: the epoch's
-owner reachable for 2.7 s of the 3 s window, the requester routing through the
-inbox) did not find it in time; the follow-up above asks the reachable nodes
-and closes that shape. With the settle left to the client deadline
-(twice the lease TTL) the same code fails 27 flex-crash seeds instead of 73
-(201 225 353 384 441 582 595 617 697 797 957 970 1022 1075 1084 1127 1154 1257
-1258 1402 1699 1749 1776 1834 1907 1912). Short reachabilities
-(lease path for 100 to 150 ms, the root for a second) are most of the
-residuals, and flex-tight 76 (lease path reachable for 118 ms of a 3 s window)
-is the live witness `m03_a_reachable_sequencers_requester_is_not_isolated`
-pins. (2) *An `EIO` of a row that is not behind a lost chunk*, which the first
-oracle absorbed on evidence of the whole run (a chunk lost and a drop
-somewhere in it): flex-crash 201 and 353 are two (the requester said nothing,
-no plan held the row at the `EIO`, no drop followed it, and the row shipped by
-itself seconds later). They are violations now. (3) *Pre-existing*: flex-crash 1834, an I4 late landing
-(rid 3:15 answered in doubt at tick 139, completed at segment 31), fails
-identically on b4e9b722, before this ADR: it is class E of the M1.4 baseline
-(an in-doubt op the operator's `drop-held` replayed after later ops), not a
-consequence of C2.
+**Rejected**: keeping the configuration and the spans across the gap (they
+would outlive a journal another tenure rolled back and block forever); a span
+at a tenure's start that caps the whole journal's answers.
 
 **May revert**: no.
 
-See: `crates/authority/src/core/holder.rs` (`settle_refusal`),
-`crates/authority/src/core/inbox.rs` (the inbox settle),
-`crates/authority/src/core/client.rs` (`refuse_on_lease_path`, `settle_route`,
-`settle_hold_backoff`), `crates/authority/src/core/readindex.rs`
-(`on_held_reply_timer`), `crates/meta/src/store/held.rs`.
+See: `crates/authority/src/core/backup.rs` (`sync_cfg_spans`,
+`unsettled_root_row`), `crates/authority/src/core/client.rs`
+(`settled_outcome`), [DESIGN](DESIGN.md) ("Acknowledgement and durability").
 
 ## ADR-54: Placement grants a far dominant writer a sticky subtree and recalls placed grants only after a long dwell
 
@@ -4563,372 +4331,6 @@ longer be final); a new dominance threshold for far writers (the window already
 smooths a burst); judging a link by its last sample (load inflates it).
 
 **May revert**: yes, by `CONSTELLATION_DELEGATION_STICKY_PLACEMENT=off`.
-
-## ADR-57: A node never answers a read from a state that lacks an acknowledged row it rolled back
-
-**Status**: decided by the maintainer (a read of a held key fails with `EIO` after
-the derived `read_hold_span`; it never blocks indefinitely and is never served
-stale). Landed as the persisted read hold set, the per-row releases, the holds
-of the rebuild and the takeover gate, and the hold phase of the session wait.
-Complements [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
-(a delegate acknowledges only committed rows) and
-[ADR-48](#adr-48-every-protocol-bound-is-derived-in-one-module) (the bound is
-derived).
-
-**Context**: a deposition, a segment's strand, a rebuild from the log and a
-takeover gate take committed rows out of a node's namespace until a successor
-re-ships them. Reads of their keys were held per call site, in memory, with a
-5 s cap after which the read was answered without the row; a restart dropped
-every hold, a delegate row's hold ended only with its generation (a sticky
-generation lives long), the release guard probed a slot a delegate row never
-has, and a rebuild and a gate held nothing (`sticky-root-designee-inbox` seed
-745: a node read its own acknowledged rename's target absent 1 ms after its
-deposition).
-
-**Decision**: the rows a node takes out of its served state while the log lacks
-them and their clients were told they are committed are recorded in the store
-(`read_hold:{slot}:{first}`), in the transaction that takes them out, and leave
-in the transaction that puts them back or makes them final: the drop rules of
-the member copy, the generation's log index reaching the row, the row's rid completed here
-(the log carries it under any identity, or this node ran the client's retry
-itself: a delegate row this root appended that the delegate re-executed, an
-own row the client retried), the generation's end (in the transaction that
-applies the end, an orphan end, or a rebuild whose log ended it; a row of an
-ended generation is not held), the tail re-apply of a takeover gate, an
-operator's abandon. Every local
-read checks the set at the session wait, whatever the session budget or the
-read's mode; a read that touches it waits, up to `read_hold_span` (ADR-48:
-the client deadline, the takeover window and a forward round), then fails with
-`EIO`. No read is forwarded and none is answered stale. No read grant is made
-over a held key. A recall drops only rows nobody was told were committed, so it
-takes no hold (the sim asserts it: `recall_dropped_acked`).
-
-The hold is indexed in memory before the strand commits, so that no reader
-meets the rolled-back namespace without it; a dropped transaction's hold is
-taken out at the thread's next flush or, at the latest, before a read is
-refused (`Meta::reconcile_read_holds`). A read re-checks the hold epoch after
-it read (`Meta::hold_raced`) and waits and reads again when a hold on its keys
-came in between (lookup, getattr, open, readlink, xattrs, the readdirplus
-entries; a listing page already begun is not re-read). A read waiting for a
-held row ends with `EINTR` when its caller is interrupted. A lock grant waits
-for its floor only (`session_wait_floor`): every read under the grant checks
-the holds itself.
-
-**Consequences**: read-your-writes and close-to-open hold across a deposition,
-a rebuild and a restart. Reads of held keys pay the re-ship latency; others pay
-one atomic load. A node with no live successor for a lease cycle fails reads of
-held keys instead of serving them stale (`status.ack.read_holds_refused`). A
-hold that is never released is a bug the sim's quiescence check finds
-(`read_holds_gone`), not a degraded read. A node's own acknowledged write binds
-its reads in every incarnation of the node (the sim's check).
-
-A hold ends with the copy that carries it, so a copy that no claim will re-ship
-must go: the rows past a sealed `through` (`TailFollowsThrough`) and, for a claim
-that carries no tail at all (every `through` of its marker is 0), the rows of
-the epochs below the ones its marker names, whose own claim never landed its
-marker (`locks-unlinked-delegated-dcrash-pause` seeds 651, 3994, 5767). Every
-replica drops them where it applies the marker (`member_rules_tx`); the
-claimant, which never applies its own marker, runs the same rules at its gate,
-in the re-ship's transaction (`StrandArgs::marker`). Before, those copies stayed
-for good (a silent leak without the holds) and their holds failed reads of their
-keys at the bound.
-
-The rule is a stored fact, not only a segment-time rule: a marker with no tail
-raises `local["member_settled_below"]` to the lowest epoch it names
-(`note_log_tail_tx`), and a copy whose identity epoch is below it (and that no
-marker named with a `through`) is settled wherever this replica meets it
-(`log_settled_tx`): a namespace rebuilt from a log that carries the marker
-adopts the fact (`adopt_log_tail_facts_tx`), so the rebuild's own strand keeps
-no older copy and no hold (`locks-unlinked-delegated-dcrash-pause` seed 558's
-rebuild lane). An acknowledged row the rule drops is counted
-`read_holds_abandoned` and warned of: it only happens after a lossy claim.
-The claimant's marker is persisted next to its orphan proof before it ships and
-its gate strand uses that, not a recomputation. The model's `marker_keeps`
-(`crates/model/src/backup.rs`) has the rule, and `tests/marker_parity.rs`
-compares it with the product's on the marker cases.
-
-The lazy reap of holds whose rid is completed never takes a hold whose
-transaction has not committed (the strand that indexes the hold removes the
-`completed` row in the same transaction, and a reader's snapshot still has it),
-and re-checks the row inside its write transaction.
-
-`copy_file_range` waits on its source's hold (it writes what a read of the
-source answers as a new acknowledged write, so a stale read would be durable),
-on the pool thread the copy runs on.
-
-*Not covered*: a `read` on a file handle opened before a
-deposition does not consult the holds (a read runs on an io_uring ring thread,
-which must not wait): close-to-open holds (the open is the check), but
-read-your-writes through an fd that stays open across a deposition does not,
-for a rolled-back write manifest. Records without keys (`Snap*`, `SetQuota`)
-are read through synthetic paths and `statfs`, which do not wait.
-
-**Rejected**: serving stale at the bound (the old cap); forwarding the read to
-the root (no data-carrying read RPC exists, and the root lacks a delegate's row
-until the delegate re-streams it); blocking until released (a leak would be a
-silent hang).
-
-**May revert**: no.
-
-See: `crates/meta/src/store/member.rs` (`hold_row_tx`, `release_*_tx`),
-`crates/meta/src/session.rs` (the hold phase of `SessionState::wait_with_holds`),
-`crates/authority/src/deadlines.rs` (`read_hold_span`, D16).
-
-## ADR-59: A directory's merged attributes order nothing (part A)
-
-**Status**: decided by the maintainer on 2026-11-11 (parent-directory key
-tainting; the `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751).
-Refines the ship rule of plan 30 M4. Part A is the ship rule and the drop's
-dependency walk; part B (below) is the drop that redoes in place what does not
-need the lost content.
-
-**Context**: in those seeds Group-acknowledged namespace rows sat in the
-holder's journal, held behind a seed (a `WriteManifest` naming a chunk whose
-uploader was lost for good). `repair drop-held` rolled them back and replayed
-them by rid; after a takeover some landed later and some were refused (an
-`unlink` answered `ENOENT` after it was acknowledged). An acknowledged effect
-was lost to an operator command. The false dependency entered through three
-key sources, not one: the planner's `named.shared` (`inode(P)` of every
-create, unlink, link and rename parent), and the captured before-images of
-`inode(P)` and of `P`'s own name in its parent, which every directory carries
-as an attribute copy and `put_inode_record` rewrites. One held transaction in
-a directory held every later one in it, and the drop rolled all of them back.
-
-**Decision (part A)**:
-
-- **A key is written exclusively or by a merge.** A directory's `mtime`/`ctime`
-  (`max`), `nlink` (`+=`) and the copy of them its name carries change by the
-  commutative M12 merge whenever a child comes, goes or moves. The capture
-  records, per key and transaction, whether every write of it was such a
-  merge (`spec::MergeEntry`). `held::conflicts(access, taint)` is the one rule:
-  two accesses of a key conflict unless neither is exclusive. The planner,
-  the blame walk, the drop's dependency walk and the property test's model
-  all call it. A create, unlink, link or rename of another name ships past
-  a held operation in the same directory; an explicit `utimes`, `chmod`,
-  `rmdir` or rename of the directory itself, and an operation on the same
-  name, still wait. A refusal's observation of a merged directory orders
-  nothing. No journaled answer and no record's effect is a function of a
-  directory's times or link count (audit in the capture commit).
-- **The publisher applies the shipped merge.** A transaction that merged a key
-  a held one also merged is a `Foreign` row the substitution can no longer
-  skip: the view applies its merge to the held row's before-image
-  (`LogPrefixView::merge_shipped`), so the publish stays the log prefix
-  instead of deferring for as long as anything in the directory is held. A
-  shipped row the view cannot place (it wrote or merged a key an older
-  outstanding row wrote exclusively) is a planner violation: counted
-  (`Meta::publish_unplaced`), logged, a `debug_assert!`, and the publish
-  defers.
-- **The drop follows the rule.** `repair drop-held` walks the seeds and the
-  held transactions that depend on them by the same rule, so a sibling that
-  only merges the directory is no longer reached by it. Of what depends on
-  the seeds by key, part B rolls back only what needs the lost content and
-  redoes the rest in place (a rename, chmod or unlink of the damaged file, a
-  create of a name it vacated). Only the node whose rows reach the log by
-  right decides a drop of them (part B, D1); any other node's command is
-  refused.
-
-**Part B: a drop's partial rollback is a decision the log makes.** A first
-implementation of the redo (the drop undoes only what needs the lost content
-and redoes the rest in place) did not converge in the simulation: it made the
-drop one local transaction, and every other copy of the dropper's state (the
-members' copies of the rolled-back rows, the successor's re-ship gate, the
-dropper's own sealed tail, a parked answer's snapshot, the kept merge's gap
-rule) learned of it by its own rule, later, and some never. Those failures
-(`drop-held-chain-backed` seeds 1714 and 1529, `flex-backup+durability` 1818)
-are one class: what a partial rollback leaves behind on other nodes and in
-parked state. Part B inverts the structure: **the drop decides nothing locally;
-it journals one decision record, and every effect, the dropper's own included,
-is the consequence of that record being in the log.**
-
-- **D1, the decision is in the log.** `LogRecord::DropHeld { ino, chunks,
-  rolled_back: [((epoch, jseq), rid)] }` (it replaces `RolledBack`) is an
-  archive-class record with no keys: it ships in the next segment ahead of
-  everything the seed holds, and its transaction changes no other state.
-  **A named row is held until the apply.** Every row the record names is a
-  held, unshipped row at the decision, and stays held in the dropper's journal
-  until the apply strands it: the ship plan holds (never skips, which would
-  break the order of the rows behind it) a transaction the pending plan names or
-  whose identity the log retired, whatever else would release it, and the apply
-  strands by journal row anything of the record it still finds.
-  **Who decides (widened by the maintainer, 2026-11-13).** The node whose rows
-  reach the log by right journals the record: the lease holder for root rows;
-  the holder of a delegation stream's grant for that stream's rows, a deposed
-  root's own sticky stream included (`far-placement+lost-chunk` 326: the
-  deposed root kept its stream with the seed in it, and no node could decide).
-  A stream holder's record is the stream's own row at the seed's index (the
-  lowest rolled-back one), with `fills` for the stream's other rolled-back
-  positions, and its identities are the stream positions
-  `(deleg_epoch(gen), idx)` its copies are kept by. It reaches the log as the
-  stream's rows do (the root appends it and counts its fills), and is fenced
-  as they are: until the apply the stream sends none of the rows it names and
-  nothing above it, a release of the stream waits for the apply, and a
-  generation that ends without the record (its row stranded unshipped)
-  cancels the drop. The holder applies it when the root's segment carrying it
-  acknowledges its row (never the seed's, which shares the position), and
-  journals the seeds' refusals as rows of its stream.
-- **D2, retired idents never land.** A replica that applies it from the log
-  (or ships it) records the identities as retired, holes its member and backup
-  copies and strands what it was streamed of them. The takeover's re-ship gate
-  skips a retired identity (`tail_retired`) and a `DropHeld` the log lacks
-  (`tail_drop_fenced`: its dropper lost the lease before deciding, the drop
-  never happened); any outcome of a rid, a refusal included, is done.
-  **A retired copy is a hole wherever it is served**: the kept merge pushes a
-  retired copy among the copies as the record-less span it covers (a member
-  that applied the record serves it so), so its sources do not disagree about
-  it and the rows above it are not past a gap; the backup tail keeps one hole
-  per span, never shrinking a wider one a resend repeats.
-- **D3, an answer is what the store says at its release.** A parked answer
-  (`Reply`, `Finish`) is released from the rid's outcome read at that
-  moment: `Executed` as it was parked releases as is, `Refused` releases the
-  refusal, no outcome aborts. The apply settles every park of a rid it refused.
-- **D4, local state follows the log.** The dropper strands the seed, redoes
-  the rest, refuses the queued seeds and removes the pending rows only when
-  it applies its own record from the log (the archive covers it). A dropper
-  deposed before the record left has a journal that differs from the members'
-  copies by the unshipped record alone, and its drop is cancelled; one deposed
-  with the record's segment out keeps the drop and, if the segment lands,
-  applies it from the log like every replica, journaling no refusal.
-- **Drop contiguity (follow-up, the maintainer's option (a)).** A drop can roll
-  back rows of a delegation stream (the root's own sticky stream: the seed's
-  index, and the indices of the rows that read its bytes) and keep the later
-  rows of that stream (redone in place, or independent). They then landed past
-  a hole in the log's stream (`stream_log_contiguous`), and a successor's cursor
-  waits at the hole for good: a deposed root's stream sends from an index that
-  is gone. The record fills each rolled-back index:
-  `DropHeld { .., fills: [(gen, idx)] }` is the log's no-op row at every stream
-  position of a transaction it rolls back, a log fact like the rest of the
-  record. Every reader of a stream's position in the log counts a fill (the
-  persisted log index, `deleg_fill:` keys; the session's stream; the sim
-  oracle), each **at its place in the stream's order**: once the stream reaches
-  the index below it, since a row the drop redid below a fill lands after the
-  record (seeds 956, 1005). Every reader that lowers a stream index (a strand
-  of a row that leaves the journal unshipped) lowers it only to below the
-  first position the log does not carry, so a fill is never taken back; the
-  root's cursor of a delegate's stream passes fills; and a fill is the retire
-  key of a delegate's own outstanding row at its position (stranded quietly:
-  the root's queue owns the replay or the refusal). **A handover opens a new
-  generation** (step 8): another node never continues a generation, since its
-  old holder may hold a drop record the root has not appended, or rows below
-  a fill, and only the old holder numbers its positions. Rejected: (b) rolling back the whole tail of
-  the stream past the first rolled-back index, which rolls back acknowledged
-  rows that do not need the lost bytes (I5).
-- **What the record names, the apply refuses, and no more.** A replay of the
-  damaged manifest that an earlier deposition queued here (the root's own,
-  `gen` 0) is named by the decision's record by its rid (`queued`: no
-  transaction, nothing retires), and only
-  the named entries are refused at the apply. A drop with no journaled seed
-  that refuses such an entry now journals a record and waits for the log like
-  any other (D1; before, it refused and listed the rid with no record: seed
-  1051's shape). A queued replay the drop leaves alone (a delegate's shadow,
-  `gen` other than 0, or an entry queued after the decision) is counted
-  (`queued_kept`) and warned of, and keeps the chunk's pending row and poison
-  mark as an op in flight does, so the row it lands as is held at once.
-
-A drop that is decided in the log whose dropper dies before applying it is
-accepted (the maintainer, 2026-11-12): no successor completes it. Counted
-(`drop_decided_unapplied`, derived from the log: the rids its `DropHeld` records
-name that it ends with neither a `Refused` nor a `Completed` of) and documented
-in the Consequences. A redone row
-that does not apply as it ran at the apply (expected never) is rolled back by
-a follow-up `DropHeld` (`drop_follow_ups`). The dropper's lease margin, the
-`kept_diverged` special case and the escalation loop of the first
-implementation are gone: D4 makes them unnecessary.
-
-**Consequences**: the sim's real-time and session-order checks keep the log as
-the witness: a tenure's rows are taken in the order it journaled them only
-where nothing but that tenure's rows lies between them (`witness_order`),
-because two names of one directory now ship out of journal order around a
-held transaction. A transaction a takeover re-shipped from its predecessor's
-tail was held by two tenures, the one that first journaled it (its `TailOf`
-identity) and the one whose journal numbers it, and by the tenures in
-between; it may precede the rows of those, not of a third. For a tenure in
-between the oracle assumes what ADR-51's gate does and the log cannot verify:
-the tenure adopted the row at its gate, before it served a row of its own, so
-the row numbers below every row of that tenure; a tenure that did not have the
-row served without it, and a conflicting row of it then fails the check (an
-acknowledged effect invisible to it). The completion-only row's observed keys
-stay exclusive (judgment (a)): a no-op completion is ordered as a write of what
-it observed because the session-order check keeps a client's program order
-across it (`flex+links` seeds 191 and 335 need a create invoked after a no-op
-rename returned to stay behind it), not because anything depends on its state;
-it is no counter-example to the matrix. A drop's acknowledged rolled-back op is
-excused by the sim only if the drop attributed it to the damaged inode.
-`Meta::set_parent_taint_conservative` (the sim's `+parent-taint-conservative`)
-restores the previous classification and drop; the five seeds above must fail
-with it and pass without. Kept rows (ADR-51): rows now ship ahead of an
-unshipped one in the same directory more often, so the log has seqs above an
-unshipped one; the kept merge dedups by `TailOf` identity and `row_in_log`
-already, as it does for rows of different directories, and a session that
-shipped a row ahead of a held one keeps it in the log across the epoch change
-(`SessionState::closed`). A member that keeps an epoch owner's held seed has
-the takeover re-ship it, and the rows behind it, once each and in order. A
-takeover's identity dedup (a later epoch's tail carrying the re-ship of an
-earlier epoch's row) is counted apart from a done rid (`tail_dedup`,
-`tail_done`). A hole (the record-less span a backup is streamed for rows the
-holder shipped ahead of a held one) is retired by the marker that follows its
-epoch: nothing else carries it. A resend from the first boundary (a holder
-that restarted) carries as one hole rows an earlier send had as transactions;
-the backup's hole supersedes the copies it spans, or its contiguous hold would
-end there and a successor drop the acknowledged rows past it.
-
-Part B's consequences. In the lost-chunk labels the failure kind of the same
-seeds shifted from `quiescence` to `stream_log_contiguous` as part B and its
-fixes landed: the run's quiescence check returns before the oracles, so a seed
-that stopped short of quiescence never reached the stream check; the fixes that
-let it quiesce exposed the hole the drop had left all along (the contiguity
-follow-up above closes it). The `kept_diverged` counter of
-`drop-held-chain-backed` 1529 and `metered-shared+links` 259 and 266 is benign:
-at one seq of the tenure the holder's sealed tail serves a hole (rows it shipped
-ahead of a held one) and the claimant's own member copy a live transaction, both
-of rows the log carries; the attempt ends and the next one completes once a ship
-covers the copy. With a holder that dies right after that ship nothing covers
-the claimant's copy and the claim needs `--force`. A merge rule that takes two
-copies of logged rows as no divergence completes such a claim at once, but in
-1529 the claimant's gate then meets its own predecessor-epoch backup tail rows
-the log already carries, before they are trimmed (`tail_done`): open, with the
-dead-holder test, for a follow-up. The merge skips every copy the log carries, whichever it keeps,
-so nothing is re-shipped or lost; only the claim waits (pinned by
-`a_hole_and_a_logged_copy_at_one_seq_only_delay_the_claim`).
-
-A drop's effect waits for its record to be archived, one
-archive round trip after an operator command, bounded by the existing
-`drop_held_await`. The one residual: a dropper that dies after the record
-shipped and before it applied the drop leaves no conflict copy and no
-`Refused` row for the seed's rid (the lost write's surviving bytes are not
-preserved as an artifact; the seed's rows are retired, so nothing lands); the
-requester's retry by rid executes afresh from its own bytes, which is the better
-artifact when it exists. A redone row told in doubt (a parked Archive or Group
-answer whose settle window ended) lands when the operator's drop releases it,
-as a queued replay lands when the drain runs it: the sim's late-landing check
-exempts it past the log head at the apply (`redone_rids`; a redone row without
-a rid is in `redone` only), and a client that retried under a new rid gets two
-effects, as with a replay. A kept in-doubt create keeps its inode allocated
-(`needs_lost_content` leaves it redone): a requester's retry under a new rid
-allocates afresh. What the drop cannot avoid undoing and may have been
-acknowledged (a seed's own acknowledged write; an operation that needs its
-bytes) is listed (`acked_lost`), warned of per rid and counted
-(`status.held.acked_lost_total`); the sim fails any acknowledged namespace op in
-what a drop rolled back (`drop_rolled_back_independent_acked`, no excuse by
-inode) and any acknowledged rolled-back rid the drop did not list
-(`drop_acked_loss_invisible`).
-
-**Rejected**: removing `named.shared` from the planner alone (the captured
-before-images re-enter the same keys); treating a seed that changes the mode
-as exclusive on it (`WriteManifest` carries no mode); shipping part B's redo
-with part A (the oracle gate it needs does not converge).
-
-**May revert**: no. `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751
-pin part A. Part B is pinned by `drop-held-chain-backed` seeds 1714, 1529 and
-1818 and by the five seeds above under the strict gate; drop contiguity by
-`far-root-writes+lost-chunk` 557 and 1005, `-paused` 464 and 1822, `-cross`
-1333 and 1523 and `far-placement+lost-chunk` 96, 829, 956, 1469, 1778, 1910,
-1932, 1943 and 1988 (`a_drop_fills_the_stream_indices_it_rolls_back`); a
-stream holder's drop by `far-placement+lost-chunk` 326
-(`a_stream_holder_drops_its_own_streams_held_rows`).
-
-See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
-`crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),
-[write-path hygiene](../reference/features/write-path-hygiene.md).
 
 ## ADR-55: A root with peers and no group writes the subtrees it dominates under its own sticky grant
 
@@ -5203,3 +4605,599 @@ See: `crates/authority/src/core/placement.rs` (`place_handover_requests`,
 `handover_tick`, `handover_grant`), `crates/authority/src/core/delegate.rs`
 (`request_handover`, `root_release_appended`, `on_handover_request`,
 `handover_progress`), `crates/model` (chunk 7, topologies H1 and H2).
+
+## ADR-57: A node never answers a read from a state that lacks an acknowledged row it rolled back
+
+**Status**: decided by the maintainer (a read of a held key fails with `EIO` after
+the derived `read_hold_span`; it never blocks indefinitely and is never served
+stale). Landed as the persisted read hold set, the per-row releases, the holds
+of the rebuild and the takeover gate, and the hold phase of the session wait.
+Complements [ADR-40](#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)
+(a delegate acknowledges only committed rows) and
+[ADR-48](#adr-48-every-protocol-bound-is-derived-in-one-module) (the bound is
+derived).
+
+**Context**: a deposition, a segment's strand, a rebuild from the log and a
+takeover gate take committed rows out of a node's namespace until a successor
+re-ships them. Reads of their keys were held per call site, in memory, with a
+5 s cap after which the read was answered without the row; a restart dropped
+every hold, a delegate row's hold ended only with its generation (a sticky
+generation lives long), the release guard probed a slot a delegate row never
+has, and a rebuild and a gate held nothing (`sticky-root-designee-inbox` seed
+745: a node read its own acknowledged rename's target absent 1 ms after its
+deposition).
+
+**Decision**: the rows a node takes out of its served state while the log lacks
+them and their clients were told they are committed are recorded in the store
+(`read_hold:{slot}:{first}`), in the transaction that takes them out, and leave
+in the transaction that puts them back or makes them final: the drop rules of
+the member copy, the generation's log index reaching the row, the row's rid completed here
+(the log carries it under any identity, or this node ran the client's retry
+itself: a delegate row this root appended that the delegate re-executed, an
+own row the client retried), the generation's end (in the transaction that
+applies the end, an orphan end, or a rebuild whose log ended it; a row of an
+ended generation is not held), the tail re-apply of a takeover gate, an
+operator's abandon. Every local
+read checks the set at the session wait, whatever the session budget or the
+read's mode; a read that touches it waits, up to `read_hold_span` (ADR-48:
+the client deadline, the takeover window and a forward round), then fails with
+`EIO`. No read is forwarded and none is answered stale. No read grant is made
+over a held key. A recall drops only rows nobody was told were committed, so it
+takes no hold (the sim asserts it: `recall_dropped_acked`).
+
+The hold is indexed in memory before the strand commits, so that no reader
+meets the rolled-back namespace without it; a dropped transaction's hold is
+taken out at the thread's next flush or, at the latest, before a read is
+refused (`Meta::reconcile_read_holds`). A read re-checks the hold epoch after
+it read (`Meta::hold_raced`) and waits and reads again when a hold on its keys
+came in between (lookup, getattr, open, readlink, xattrs, the readdirplus
+entries; a listing page already begun is not re-read). A read waiting for a
+held row ends with `EINTR` when its caller is interrupted. A lock grant waits
+for its floor only (`session_wait_floor`): every read under the grant checks
+the holds itself.
+
+**Consequences**: read-your-writes and close-to-open hold across a deposition,
+a rebuild and a restart. Reads of held keys pay the re-ship latency; others pay
+one atomic load. A node with no live successor for a lease cycle fails reads of
+held keys instead of serving them stale (`status.ack.read_holds_refused`). A
+hold that is never released is a bug the sim's quiescence check finds
+(`read_holds_gone`), not a degraded read. A node's own acknowledged write binds
+its reads in every incarnation of the node (the sim's check).
+
+A hold ends with the copy that carries it, so a copy that no claim will re-ship
+must go: the rows past a sealed `through` (`TailFollowsThrough`) and, for a claim
+that carries no tail at all (every `through` of its marker is 0), the rows of
+the epochs below the ones its marker names, whose own claim never landed its
+marker (`locks-unlinked-delegated-dcrash-pause` seeds 651, 3994, 5767). Every
+replica drops them where it applies the marker (`member_rules_tx`); the
+claimant, which never applies its own marker, runs the same rules at its gate,
+in the re-ship's transaction (`StrandArgs::marker`). Before, those copies stayed
+for good (a silent leak without the holds) and their holds failed reads of their
+keys at the bound.
+
+The rule is a stored fact, not only a segment-time rule: a marker with no tail
+raises `local["member_settled_below"]` to the lowest epoch it names
+(`note_log_tail_tx`), and a copy whose identity epoch is below it (and that no
+marker named with a `through`) is settled wherever this replica meets it
+(`log_settled_tx`): a namespace rebuilt from a log that carries the marker
+adopts the fact (`adopt_log_tail_facts_tx`), so the rebuild's own strand keeps
+no older copy and no hold (`locks-unlinked-delegated-dcrash-pause` seed 558's
+rebuild lane). An acknowledged row the rule drops is counted
+`read_holds_abandoned` and warned of: it only happens after a lossy claim.
+The claimant's marker is persisted next to its orphan proof before it ships and
+its gate strand uses that, not a recomputation. The model's `marker_keeps`
+(`crates/model/src/backup.rs`) has the rule, and `tests/marker_parity.rs`
+compares it with the product's on the marker cases.
+
+The lazy reap of holds whose rid is completed never takes a hold whose
+transaction has not committed (the strand that indexes the hold removes the
+`completed` row in the same transaction, and a reader's snapshot still has it),
+and re-checks the row inside its write transaction.
+
+`copy_file_range` waits on its source's hold (it writes what a read of the
+source answers as a new acknowledged write, so a stale read would be durable),
+on the pool thread the copy runs on.
+
+*Not covered*: a `read` on a file handle opened before a
+deposition does not consult the holds (a read runs on an io_uring ring thread,
+which must not wait): close-to-open holds (the open is the check), but
+read-your-writes through an fd that stays open across a deposition does not,
+for a rolled-back write manifest. Records without keys (`Snap*`, `SetQuota`)
+are read through synthetic paths and `statfs`, which do not wait.
+
+**Rejected**: serving stale at the bound (the old cap); forwarding the read to
+the root (no data-carrying read RPC exists, and the root lacks a delegate's row
+until the delegate re-streams it); blocking until released (a leak would be a
+silent hang).
+
+**May revert**: no.
+
+See: `crates/meta/src/store/member.rs` (`hold_row_tx`, `release_*_tx`),
+`crates/meta/src/session.rs` (the hold phase of `SessionState::wait_with_holds`),
+`crates/authority/src/deadlines.rs` (`read_hold_span`, D16).
+
+## ADR-58: Every unsettled EIO ends a settle window, and a settle's refusal waits for nothing
+
+**Status**: decided by the maintainer on 2026-11-11 (plan 46 M1.4 exit: the
+"root/job" and "takeover gate+job" classes of I4's unsettled `EIO`). Complements
+[ADR-49](#adr-49-a-late-landing-is-bounded-by-what-the-executor-itself-can-see).
+
+**Context**: the simulation reported unsettled `EIO`s told with a sequencer
+reachable, labelled "root/job" or "takeover gate+job". The labels were
+misleading: the classifier ORed the core's busy bits over the whole reachable
+run, and a writing root almost always had a job in its slot at some moment. No
+settle in the sample waited for the job slot or a busy core. Three mechanisms
+caused them: (M1) the op's own row sat in the root's journal held behind a
+chunk that exists nowhere (plan 30 section M4), where no sequencer can answer
+the rid until the operator's `repair drop-held`; (M2) the settle's own
+`Refused { rid, ABANDONED }` row was held behind the same chunk, because a
+journaled refusal records the keys of the op it refused as observed keys and
+the ship plan holds a transaction whose observed keys meet a held one; (M3) an
+op already sent reached the lease path in an epoch that refuses writes
+(frozen, or carrier-less), and `refuse_on_lease_path` told the unsettled `EIO`
+at once with no settle, so the classifier's window reached back into the time
+before the outage.
+
+**Decision**:
+
+- **C1, a settle's refusal observes nothing.** A refusal with
+  `ABANDONED_CODE` ("this op did not happen") is journaled with no observed
+  keys, at the root (`settle_refusal`) and in the inbox settle. It writes no
+  namespace key and was evaluated against no state, so shipping it ahead of
+  any transaction commutes; the reason errno refusals observe keys (the log's
+  own prefix must explain the refusal) does not apply. It is journaled only
+  when the dedup found no outcome for the rid, so the journal holds no row of
+  the rid that a drop could roll back. A dropped-code settle refusal keeps its
+  observed keys (conservative). The inbox settle's `InboxAck` is a
+  max-watermark and can now ship ahead of an earlier, held inbox-drained row;
+  that was already possible for any refusal or row on untainted keys, and the
+  watermark's ordering is unaffected.
+- **C2, no unsettled `EIO` without a settle window.** A sent op that settles
+  and finds its node's epoch refusing writes starts its settle
+  (`client_deadline`) instead of being told in doubt at once. A settle that
+  comes back to the lease path of such an epoch waits in `Backoff`
+  (`recall_hold_ms`, at least 50 ms) and is routed again; the deadline then
+  tells the unsettled `EIO` after its window. `settle_route` sends the settle
+  to the epoch's hold owner (the carrier) when this node reaches it. Never-sent ops keep `EROFS`; replays and
+  best-effort ops are unchanged. The settle of this path is bounded at one
+  settle window from the freeze (`SettleUntil::Window`: 30 s at the defaults,
+  3 s in the sim), not at the client's deadline (twice the lease TTL after the
+  submission, 120 s at the defaults, which an ordinary settle runs to): in a
+  frozen or carrier-less epoch the in-doubt answer for an op in flight comes
+  one settle window later (maintainer decision Q2). A window shorter than the
+  epoch leaves an isolated requester's `EIO`, which the classifier allows as
+  before.
+- **C2 follow-up, a settle with no holder to ask asks the reachable nodes
+  inside its window** (Q2's bound kept; the rule found by the re-review of the
+  first round). A settle of this node's own op in an epoch that refuses
+  writes used to send itself to the epoch's carrier only, and with none only
+  backed off until the window ended; a requester that could not read the lease
+  (its S3 cut) never learned who the sequencer was (flex 736). Now every
+  `ForwardBackoff` tick (`recall_hold_ms`, at least 50 ms) sends the settle to
+  one *main* candidate (`settle_ask_peers`): the node that last answered it
+  `Held`, else the carrier, else the cached holder, on every tick; and, beside
+  it, one *probe* (`settle_probe`) to the next other roster peer `reaches`
+  says is up, each once before any is probed again. With no main candidate
+  the peers take the ticks in turn. A probe's reply stands for the forward
+  unless it is `NotHolder { 0 }` or `Busy`; `NotHolder { h }` redirects to
+  `h` (the redirect budget, the attempts and the fence bounces are per
+  candidate, so a dead one does not use up the retries the holder's forwards
+  get once the epoch ends). A probe no answer reaches within a forward
+  timeout marks its peer dead for the rest of the window. A settle with no
+  cached holder on the lease path (the acquire retry of a node whose lease
+  reads fail) asks a peer in place of the route on every other retry, the
+  same way. The deadline stays `SettleUntil::Window`, plus one grace of a
+  forward timeout (`settle_forward_graces`) for a second deadline that finds a
+  forward in flight, or finds the settle idle in its backoff after the epoch
+  that refused writes ended (it is sent at once). **Bound**: a settle no node
+  answers ends at the window plus one forward timeout (30.5 s at the defaults,
+  3.5 s in the sim;
+  `a_frozen_settle_nobody_answers_ends_by_the_window_and_a_forward_timeout`);
+  one a live sequencer answers `Held` with an outwait ends at
+  `Deadlines::settle_cap_span` (69.5 s at the defaults), the bound every
+  settle already has; never twice the lease TTL. Latency of the answers of
+  such settles (`Stats::settle_frozen_answer_ms`, from the first ask, seeds
+  0..1999 of the four flex configurations): p50 2.0 to 2.25 s, p90 3.0 to
+  3.5 s, the longest past 3.75 s (a `Held` outwait, within the cap) of a 3 s
+  window.
+- **C3, `held-behind-lost-chunk`, an allowed class.** `MutateOutcome::Held`
+  gains `lost_chunk`, set by a root whose answer waits for the durability of a
+  row that the ship plan *holds* for a chunk that exists nowhere, or defers
+  behind another node's pending upload whose uploader may never return
+  (`Meta::rid_behind_lost_chunk`, from the last ship round, by the plan's
+  blame on the remote-pending rows). A row that is merely deferred for this
+  node's own upload ships by itself and does not count. A settling requester that hears it (or that is the sequencer
+  itself and finds the rid in its own plan) labels its unsettled `EIO`
+  (`take_unsettled_lost_chunk`, stat `unsettled_held_lost_chunk`); the label
+  is the last `Held`'s word. The oracle accepts it only against global truth,
+  as for ADR-47's `HolderUnreachable`, and the verdict would have been a
+  violation: the sim's chunk ledger has a chunk that exists nowhere at the
+  `EIO`, and either (a) an operator's `repair drop-held` rolled the rid back at
+  or after the `EIO` (a drop before it ran when a sequencer could settle the
+  rid), or (b) the requester said so, some node's ship plan held the rid's
+  transaction (or deferred it behind another node's pending upload) at the
+  `EIO`, and the rid's outcome reached the log only after
+  the first drop at or after the `EIO`, or never. A row that shipped by itself,
+  before any drop, makes the label a lie. It is counted apart
+  (`Report::unsettled_held_lost_chunk`), never a violation, with a ratcheting
+  ceiling of its own: it does not share the old allowed classes' ceiling. The
+  negative control is `AUTHORITY_SIM_LOST_CHUNK_LABEL_ALWAYS` (a requester
+  labels every `Held`): with the real oracle it must not lower any violation
+  count, and with `AUTHORITY_SIM_LOST_CHUNK_TRUST_LABEL` also set (an oracle
+  that takes the requester's word) it does lower them: the checks above are
+  what holds the line. An oracle unit test pins that a row deferred for the
+  node's own upload never converts. The settle is not
+  rolled back automatically (maintainer decision Q1): only the operator
+  decides, since the chunk may come back.
+- **C4, the classifier says what the core was busy with when it mattered.**
+  `Verdict::Reachable` reports the busy bits at the reachable run's last
+  instant and the OR over the run as `ever`.
+
+**Rejected**: rolling back the held dependents of a settled rid automatically
+(it puts rollback in the settle path and pre-empts the operator); C1b, letting
+`ABANDONED` refusals ship past an uncaptured held transaction (only on
+evidence; none yet); shortening the carrier-less epoch's in-doubt answer to the
+epoch's end (the classifier would have to treat such an epoch as isolation).
+
+**Consequences**: latency and errno, never safety. The settle sends nothing the
+rules of ADR-49 do not already cover, and executes nothing. An unsettled `EIO`
+in a frozen epoch arrives up to a settle window later; a settle's refusal
+behind a lost chunk is answered instead of held until the drop. Counters:
+`settles_sent`, `unsettled_held_lost_chunk`, `settle_frozen_asks`,
+`settle_forward_graces`, `settle_frozen_answer_ms`.
+
+**Residuals** (seeds 0..1999, release, `+settle+oracles+unsettled`; main fails
+flex 98, flex-crash 952, flex-tight 876, flex-backup 101 seeds, flex-crash
+1834 and flex-tight 936 and 1079 and flex-backup 596 among them). After this
+ADR: flex 20, flex-crash 73, flex-tight 98, flex-backup 55. Every one is an
+unsettled `EIO` told with a sequencer reachable, except where named:
+
+- flex: 215 490 685 736 757 821 934 974 1020 1078 1101 1278 1340 1489 1524
+  1552 1754 1759 1884 1911.
+- flex-crash: 124 197 201 215 225 246 253 267 353 360 384 441 472 490 501 582
+  595 617 671 679 697 703 757 762 797 821 826 845 934 957 964 970 974 1017
+  1020 1022 1025 1027 1075 1078 1084 1091 1101 1127 1154 1180 1229 1257 1258
+  1278 1288 1313 1339 1388 1393 1402 1488 1489 1524 1555 1556 1699 1749 1754
+  1776 1778 1884 1907 1911 1912 1921 1933, and 1834.
+- flex-tight: 7 33 48 56 76 115 183 194 196 235 253 271 294 323 338 346 358
+  383 390 414 446 449 462 464 468 474 476 522 525 594 603 615 655 675 679 689
+  703 756 767 797 826 832 837 842 882 928 951 969 976 1002 1030 1049 1058 1061
+  1077 1158 1180 1207 1225 1241 1264 1288 1313 1315 1352 1358 1359 1365 1429
+  1503 1507 1524 1536 1557 1559 1592 1593 1614 1629 1638 1651 1654 1666 1693
+  1695 1703 1707 1771 1778 1856 1860 1895 1901 1915 1933 1950, and 936 (class
+  claim) and 1079 (I5), which fail on main too.
+- flex-backup: 60 140 144 164 192 214 215 218 294 360 382 403 425 435 490 492
+  560 576 630 719 736 753 757 821 833 882 934 947 974 997 1020 1021 1025 1246
+  1289 1304 1340 1364 1373 1399 1502 1552 1559 1621 1631 1752 1759 1767 1781
+  1884 1911 1924 1925 1933, and 596 (class D, `tail_done_skipped`), which
+  fails on main too.
+
+After the C2 follow-up (same sweeps; flex 20 to 7, flex-crash 73 to 56,
+flex-tight 98 to 86, flex-backup 55 to 39; the guards `sticky-ttl`,
+`long-delegated+unsettled`, `long-delegated-late-answers+commit` and
+`delegated-root-deposed-delegate-dies` with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`
+are as on main, 0, 0, 0 and 1 (seed 1678)):
+
+- flex: 214 215 490 685 934 1340 1911.
+- flex-crash: 201 215 225 246 253 267 353 360 384 441 490 501 582 595 617 679
+  697 797 821 826 844 934 957 964 970 1017 1022 1027 1075 1084 1091 1127 1154
+  1180 1257 1258 1278 1306 1339 1388 1393 1402 1429 1488 1489 1556 1699 1749
+  1776 1778 1884 1907 1911 1912 1933, and 1834.
+- flex-tight: 33 56 72 79 163 196 209 246 253 271 288 294 394 414 446 449 459
+  462 464 468 525 581 655 675 679 742 745 756 782 792 797 826 832 837 912 922
+  944 969 976 1002 1023 1030 1046 1049 1061 1101 1129 1157 1158 1164 1180 1225
+  1253 1285 1306 1313 1335 1358 1372 1377 1380 1436 1507 1519 1614 1637 1666
+  1693 1695 1730 1753 1771 1778 1802 1856 1879 1895 1915 1933 1950 1974, and
+  91, 476 and 936 (class claim: an answer says group, the journal row is a
+  singleton; 936 fails on main too, 476 failed an unsettled `EIO` there, 91
+  passed), and 1267 (I5, see below).
+- flex-backup: 60 164 192 214 218 382 403 425 435 490 492 560 576 630 719 833
+  882 934 947 974 997 1021 1025 1246 1289 1340 1364 1373 1399 1502 1621 1752
+  1767 1781 1911 1924 1925 1933, and 596.
+
+The set moves with the schedule: the rule fixes 14, 20, 51 and 16 of main's
+seeds and 1, 3, 39 and 0 seeds that passed on main now fail. The new ones are
+all unsettled `EIO`s with a sequencer reachable for a few hundred ms of the
+window (the same shape as the residuals), two class claims (91 and 476, the
+shape of 936: a settle that main ended in doubt is now answered, and the
+answer meets that older hole) and one I5; none is a new kind of failure. A
+seed-level cause that was found and kept: a settle that main left idle in
+`Backoff` or `AcquireRetry` while the epoch that refused writes ended answered,
+by the lease path's deadline extension for a claim that falls due; the
+follow-up's grace now sends such a settle at once, and the extension for a
+claim stays as on main (widening it for settles in `Forwarded` or `Backoff` was
+tried: flex-tight 98 to 113). The I5 of flex-tight 1267 is the
+subscriber-stranding shape of a hold epoch (a subscriber outside the epoch
+holds an acknowledged row ungated; a later epoch's marker that arrives before
+the re-shipped tail strands it): a separate hole in the subscriber's side,
+fixed on its own, that the schedule of this rule exposes; it is not caused by
+settling. What is left is reachabilities of a few hundred ms, the lease-path
+floor (`min_p2p_ms` 0 for `LeasePath`; flex-tight 196 reaches it for 190 ms),
+and a root that comes up inside the last ticks.
+
+Three causes. (1) *The window of a frozen epoch's settle* (the maintainer's
+cap, M3): the `EIO` comes one settle window after the freeze, and some windows
+end with the sequencer reachable for part of them, because the requester that
+has no holder to ask and no S3 to read the lease from (flex 736: the epoch's
+owner reachable for 2.7 s of the 3 s window, the requester routing through the
+inbox) did not find it in time; the follow-up above asks the reachable nodes
+and closes that shape. With the settle left to the client deadline
+(twice the lease TTL) the same code fails 27 flex-crash seeds instead of 73
+(201 225 353 384 441 582 595 617 697 797 957 970 1022 1075 1084 1127 1154 1257
+1258 1402 1699 1749 1776 1834 1907 1912). Short reachabilities
+(lease path for 100 to 150 ms, the root for a second) are most of the
+residuals, and flex-tight 76 (lease path reachable for 118 ms of a 3 s window)
+is the live witness `m03_a_reachable_sequencers_requester_is_not_isolated`
+pins. (2) *An `EIO` of a row that is not behind a lost chunk*, which the first
+oracle absorbed on evidence of the whole run (a chunk lost and a drop
+somewhere in it): flex-crash 201 and 353 are two (the requester said nothing,
+no plan held the row at the `EIO`, no drop followed it, and the row shipped by
+itself seconds later). They are violations now. (3) *Pre-existing*: flex-crash 1834, an I4 late landing
+(rid 3:15 answered in doubt at tick 139, completed at segment 31), fails
+identically on b4e9b722, before this ADR: it is class E of the M1.4 baseline
+(an in-doubt op the operator's `drop-held` replayed after later ops), not a
+consequence of C2.
+
+**May revert**: no.
+
+See: `crates/authority/src/core/holder.rs` (`settle_refusal`),
+`crates/authority/src/core/inbox.rs` (the inbox settle),
+`crates/authority/src/core/client.rs` (`refuse_on_lease_path`, `settle_route`,
+`settle_hold_backoff`), `crates/authority/src/core/readindex.rs`
+(`on_held_reply_timer`), `crates/meta/src/store/held.rs`.
+
+## ADR-59: A directory's merged attributes order nothing (part A)
+
+**Status**: decided by the maintainer on 2026-11-11 (parent-directory key
+tainting; the `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751).
+Refines the ship rule of plan 30 M4. Part A is the ship rule and the drop's
+dependency walk; part B (below) is the drop that redoes in place what does not
+need the lost content.
+
+**Context**: in those seeds Group-acknowledged namespace rows sat in the
+holder's journal, held behind a seed (a `WriteManifest` naming a chunk whose
+uploader was lost for good). `repair drop-held` rolled them back and replayed
+them by rid; after a takeover some landed later and some were refused (an
+`unlink` answered `ENOENT` after it was acknowledged). An acknowledged effect
+was lost to an operator command. The false dependency entered through three
+key sources, not one: the planner's `named.shared` (`inode(P)` of every
+create, unlink, link and rename parent), and the captured before-images of
+`inode(P)` and of `P`'s own name in its parent, which every directory carries
+as an attribute copy and `put_inode_record` rewrites. One held transaction in
+a directory held every later one in it, and the drop rolled all of them back.
+
+**Decision (part A)**:
+
+- **A key is written exclusively or by a merge.** A directory's `mtime`/`ctime`
+  (`max`), `nlink` (`+=`) and the copy of them its name carries change by the
+  commutative M12 merge whenever a child comes, goes or moves. The capture
+  records, per key and transaction, whether every write of it was such a
+  merge (`spec::MergeEntry`). `held::conflicts(access, taint)` is the one rule:
+  two accesses of a key conflict unless neither is exclusive. The planner,
+  the blame walk, the drop's dependency walk and the property test's model
+  all call it. A create, unlink, link or rename of another name ships past
+  a held operation in the same directory; an explicit `utimes`, `chmod`,
+  `rmdir` or rename of the directory itself, and an operation on the same
+  name, still wait. A refusal's observation of a merged directory orders
+  nothing. No journaled answer and no record's effect is a function of a
+  directory's times or link count (audit in the capture commit).
+- **The publisher applies the shipped merge.** A transaction that merged a key
+  a held one also merged is a `Foreign` row the substitution can no longer
+  skip: the view applies its merge to the held row's before-image
+  (`LogPrefixView::merge_shipped`), so the publish stays the log prefix
+  instead of deferring for as long as anything in the directory is held. A
+  shipped row the view cannot place (it wrote or merged a key an older
+  outstanding row wrote exclusively) is a planner violation: counted
+  (`Meta::publish_unplaced`), logged, a `debug_assert!`, and the publish
+  defers.
+- **The drop follows the rule.** `repair drop-held` walks the seeds and the
+  held transactions that depend on them by the same rule, so a sibling that
+  only merges the directory is no longer reached by it. Of what depends on
+  the seeds by key, part B rolls back only what needs the lost content and
+  redoes the rest in place (a rename, chmod or unlink of the damaged file, a
+  create of a name it vacated). Only the node whose rows reach the log by
+  right decides a drop of them (part B, D1); any other node's command is
+  refused.
+
+**Part B: a drop's partial rollback is a decision the log makes.** A first
+implementation of the redo (the drop undoes only what needs the lost content
+and redoes the rest in place) did not converge in the simulation: it made the
+drop one local transaction, and every other copy of the dropper's state (the
+members' copies of the rolled-back rows, the successor's re-ship gate, the
+dropper's own sealed tail, a parked answer's snapshot, the kept merge's gap
+rule) learned of it by its own rule, later, and some never. Those failures
+(`drop-held-chain-backed` seeds 1714 and 1529, `flex-backup+durability` 1818)
+are one class: what a partial rollback leaves behind on other nodes and in
+parked state. Part B inverts the structure: **the drop decides nothing locally;
+it journals one decision record, and every effect, the dropper's own included,
+is the consequence of that record being in the log.**
+
+- **D1, the decision is in the log.** `LogRecord::DropHeld { ino, chunks,
+  rolled_back: [((epoch, jseq), rid)] }` (it replaces `RolledBack`) is an
+  archive-class record with no keys: it ships in the next segment ahead of
+  everything the seed holds, and its transaction changes no other state.
+  **A named row is held until the apply.** Every row the record names is a
+  held, unshipped row at the decision, and stays held in the dropper's journal
+  until the apply strands it: the ship plan holds (never skips, which would
+  break the order of the rows behind it) a transaction the pending plan names or
+  whose identity the log retired, whatever else would release it, and the apply
+  strands by journal row anything of the record it still finds.
+  **Who decides (widened by the maintainer, 2026-11-13).** The node whose rows
+  reach the log by right journals the record: the lease holder for root rows;
+  the holder of a delegation stream's grant for that stream's rows, a deposed
+  root's own sticky stream included (`far-placement+lost-chunk` 326: the
+  deposed root kept its stream with the seed in it, and no node could decide).
+  A stream holder's record is the stream's own row at the seed's index (the
+  lowest rolled-back one), with `fills` for the stream's other rolled-back
+  positions, and its identities are the stream positions
+  `(deleg_epoch(gen), idx)` its copies are kept by. It reaches the log as the
+  stream's rows do (the root appends it and counts its fills), and is fenced
+  as they are: until the apply the stream sends none of the rows it names and
+  nothing above it, a release of the stream waits for the apply, and a
+  generation that ends without the record (its row stranded unshipped)
+  cancels the drop. The holder applies it when the root's segment carrying it
+  acknowledges its row (never the seed's, which shares the position), and
+  journals the seeds' refusals as rows of its stream.
+- **D2, retired idents never land.** A replica that applies it from the log
+  (or ships it) records the identities as retired, holes its member and backup
+  copies and strands what it was streamed of them. The takeover's re-ship gate
+  skips a retired identity (`tail_retired`) and a `DropHeld` the log lacks
+  (`tail_drop_fenced`: its dropper lost the lease before deciding, the drop
+  never happened); any outcome of a rid, a refusal included, is done.
+  **A retired copy is a hole wherever it is served**: the kept merge pushes a
+  retired copy among the copies as the record-less span it covers (a member
+  that applied the record serves it so), so its sources do not disagree about
+  it and the rows above it are not past a gap; the backup tail keeps one hole
+  per span, never shrinking a wider one a resend repeats.
+- **D3, an answer is what the store says at its release.** A parked answer
+  (`Reply`, `Finish`) is released from the rid's outcome read at that
+  moment: `Executed` as it was parked releases as is, `Refused` releases the
+  refusal, no outcome aborts. The apply settles every park of a rid it refused.
+- **D4, local state follows the log.** The dropper strands the seed, redoes
+  the rest, refuses the queued seeds and removes the pending rows only when
+  it applies its own record from the log (the archive covers it). A dropper
+  deposed before the record left has a journal that differs from the members'
+  copies by the unshipped record alone, and its drop is cancelled; one deposed
+  with the record's segment out keeps the drop and, if the segment lands,
+  applies it from the log like every replica, journaling no refusal.
+- **Drop contiguity (follow-up, the maintainer's option (a)).** A drop can roll
+  back rows of a delegation stream (the root's own sticky stream: the seed's
+  index, and the indices of the rows that read its bytes) and keep the later
+  rows of that stream (redone in place, or independent). They then landed past
+  a hole in the log's stream (`stream_log_contiguous`), and a successor's cursor
+  waits at the hole for good: a deposed root's stream sends from an index that
+  is gone. The record fills each rolled-back index:
+  `DropHeld { .., fills: [(gen, idx)] }` is the log's no-op row at every stream
+  position of a transaction it rolls back, a log fact like the rest of the
+  record. Every reader of a stream's position in the log counts a fill (the
+  persisted log index, `deleg_fill:` keys; the session's stream; the sim
+  oracle), each **at its place in the stream's order**: once the stream reaches
+  the index below it, since a row the drop redid below a fill lands after the
+  record (seeds 956, 1005). Every reader that lowers a stream index (a strand
+  of a row that leaves the journal unshipped) lowers it only to below the
+  first position the log does not carry, so a fill is never taken back; the
+  root's cursor of a delegate's stream passes fills; and a fill is the retire
+  key of a delegate's own outstanding row at its position (stranded quietly:
+  the root's queue owns the replay or the refusal). **A handover opens a new
+  generation** (step 8): another node never continues a generation, since its
+  old holder may hold a drop record the root has not appended, or rows below
+  a fill, and only the old holder numbers its positions. Rejected: (b) rolling back the whole tail of
+  the stream past the first rolled-back index, which rolls back acknowledged
+  rows that do not need the lost bytes (I5).
+- **What the record names, the apply refuses, and no more.** A replay of the
+  damaged manifest that an earlier deposition queued here (the root's own,
+  `gen` 0) is named by the decision's record by its rid (`queued`: no
+  transaction, nothing retires), and only
+  the named entries are refused at the apply. A drop with no journaled seed
+  that refuses such an entry now journals a record and waits for the log like
+  any other (D1; before, it refused and listed the rid with no record: seed
+  1051's shape). A queued replay the drop leaves alone (a delegate's shadow,
+  `gen` other than 0, or an entry queued after the decision) is counted
+  (`queued_kept`) and warned of, and keeps the chunk's pending row and poison
+  mark as an op in flight does, so the row it lands as is held at once.
+
+A drop that is decided in the log whose dropper dies before applying it is
+accepted (the maintainer, 2026-11-12): no successor completes it. Counted
+(`drop_decided_unapplied`, derived from the log: the rids its `DropHeld` records
+name that it ends with neither a `Refused` nor a `Completed` of) and documented
+in the Consequences. A redone row
+that does not apply as it ran at the apply (expected never) is rolled back by
+a follow-up `DropHeld` (`drop_follow_ups`). The dropper's lease margin, the
+`kept_diverged` special case and the escalation loop of the first
+implementation are gone: D4 makes them unnecessary.
+
+**Consequences**: the sim's real-time and session-order checks keep the log as
+the witness: a tenure's rows are taken in the order it journaled them only
+where nothing but that tenure's rows lies between them (`witness_order`),
+because two names of one directory now ship out of journal order around a
+held transaction. A transaction a takeover re-shipped from its predecessor's
+tail was held by two tenures, the one that first journaled it (its `TailOf`
+identity) and the one whose journal numbers it, and by the tenures in
+between; it may precede the rows of those, not of a third. For a tenure in
+between the oracle assumes what ADR-51's gate does and the log cannot verify:
+the tenure adopted the row at its gate, before it served a row of its own, so
+the row numbers below every row of that tenure; a tenure that did not have the
+row served without it, and a conflicting row of it then fails the check (an
+acknowledged effect invisible to it). The completion-only row's observed keys
+stay exclusive (judgment (a)): a no-op completion is ordered as a write of what
+it observed because the session-order check keeps a client's program order
+across it (`flex+links` seeds 191 and 335 need a create invoked after a no-op
+rename returned to stay behind it), not because anything depends on its state;
+it is no counter-example to the matrix. A drop's acknowledged rolled-back op is
+excused by the sim only if the drop attributed it to the damaged inode.
+`Meta::set_parent_taint_conservative` (the sim's `+parent-taint-conservative`)
+restores the previous classification and drop; the five seeds above must fail
+with it and pass without. Kept rows (ADR-51): rows now ship ahead of an
+unshipped one in the same directory more often, so the log has seqs above an
+unshipped one; the kept merge dedups by `TailOf` identity and `row_in_log`
+already, as it does for rows of different directories, and a session that
+shipped a row ahead of a held one keeps it in the log across the epoch change
+(`SessionState::closed`). A member that keeps an epoch owner's held seed has
+the takeover re-ship it, and the rows behind it, once each and in order. A
+takeover's identity dedup (a later epoch's tail carrying the re-ship of an
+earlier epoch's row) is counted apart from a done rid (`tail_dedup`,
+`tail_done`). A hole (the record-less span a backup is streamed for rows the
+holder shipped ahead of a held one) is retired by the marker that follows its
+epoch: nothing else carries it. A resend from the first boundary (a holder
+that restarted) carries as one hole rows an earlier send had as transactions;
+the backup's hole supersedes the copies it spans, or its contiguous hold would
+end there and a successor drop the acknowledged rows past it.
+
+Part B's consequences. In the lost-chunk labels the failure kind of the same
+seeds shifted from `quiescence` to `stream_log_contiguous` as part B and its
+fixes landed: the run's quiescence check returns before the oracles, so a seed
+that stopped short of quiescence never reached the stream check; the fixes that
+let it quiesce exposed the hole the drop had left all along (the contiguity
+follow-up above closes it). The `kept_diverged` counter of
+`drop-held-chain-backed` 1529 and `metered-shared+links` 259 and 266 is benign:
+at one seq of the tenure the holder's sealed tail serves a hole (rows it shipped
+ahead of a held one) and the claimant's own member copy a live transaction, both
+of rows the log carries; the attempt ends and the next one completes once a ship
+covers the copy. With a holder that dies right after that ship nothing covers
+the claimant's copy and the claim needs `--force`. A merge rule that takes two
+copies of logged rows as no divergence completes such a claim at once, but in
+1529 the claimant's gate then meets its own predecessor-epoch backup tail rows
+the log already carries, before they are trimmed (`tail_done`): open, with the
+dead-holder test, for a follow-up. The merge skips every copy the log carries, whichever it keeps,
+so nothing is re-shipped or lost; only the claim waits (pinned by
+`a_hole_and_a_logged_copy_at_one_seq_only_delay_the_claim`).
+
+A drop's effect waits for its record to be archived, one
+archive round trip after an operator command, bounded by the existing
+`drop_held_await`. The one residual: a dropper that dies after the record
+shipped and before it applied the drop leaves no conflict copy and no
+`Refused` row for the seed's rid (the lost write's surviving bytes are not
+preserved as an artifact; the seed's rows are retired, so nothing lands); the
+requester's retry by rid executes afresh from its own bytes, which is the better
+artifact when it exists. A redone row told in doubt (a parked Archive or Group
+answer whose settle window ended) lands when the operator's drop releases it,
+as a queued replay lands when the drain runs it: the sim's late-landing check
+exempts it past the log head at the apply (`redone_rids`; a redone row without
+a rid is in `redone` only), and a client that retried under a new rid gets two
+effects, as with a replay. A kept in-doubt create keeps its inode allocated
+(`needs_lost_content` leaves it redone): a requester's retry under a new rid
+allocates afresh. What the drop cannot avoid undoing and may have been
+acknowledged (a seed's own acknowledged write; an operation that needs its
+bytes) is listed (`acked_lost`), warned of per rid and counted
+(`status.held.acked_lost_total`); the sim fails any acknowledged namespace op in
+what a drop rolled back (`drop_rolled_back_independent_acked`, no excuse by
+inode) and any acknowledged rolled-back rid the drop did not list
+(`drop_acked_loss_invisible`).
+
+**Rejected**: removing `named.shared` from the planner alone (the captured
+before-images re-enter the same keys); treating a seed that changes the mode
+as exclusive on it (`WriteManifest` carries no mode); shipping part B's redo
+with part A (the oracle gate it needs does not converge).
+
+**May revert**: no. `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751
+pin part A. Part B is pinned by `drop-held-chain-backed` seeds 1714, 1529 and
+1818 and by the five seeds above under the strict gate; drop contiguity by
+`far-root-writes+lost-chunk` 557 and 1005, `-paused` 464 and 1822, `-cross`
+1333 and 1523 and `far-placement+lost-chunk` 96, 829, 956, 1469, 1778, 1910,
+1932, 1943 and 1988 (`a_drop_fills_the_stream_indices_it_rolls_back`); a
+stream holder's drop by `far-placement+lost-chunk` 326
+(`a_stream_holder_drops_its_own_streams_held_rows`).
+
+See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
+`crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),
+[write-path hygiene](../reference/features/write-path-hygiene.md).

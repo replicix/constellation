@@ -1,6 +1,6 @@
 # Plan 47 P1 — results
 
-Phase P1 of `docs/plans/v1/wip/47-chunk-location-digests.md`. Every number
+Phase P1 of `docs/plans/v1/done/47-chunk-location-digests.md`. Every number
 below was produced by a run of the commands in "Reproducing"; the raw rows
 are in `raw/` (one file per suite). Nothing is estimated; where a figure is
 computed from measured ones the text says "derived" and shows the formula.

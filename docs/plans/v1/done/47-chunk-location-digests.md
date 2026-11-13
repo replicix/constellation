@@ -1,13 +1,16 @@
 # Plan 47 — Chunk-location digests: research, measure, then decide
 
-> **Status (2026-11-07): P0-P2 done, P3 implemented and reviewed; two
-> items open (section 7: the harness matrix's pre-existing failures and the
-> `addr_churn` load failure).** The maintainer's P2
-> decision (2026-11-07): keep the exact mirror, fix the range-repair livelock,
-> add delta-log replay as the first repair step with range-based repair as the
-> fallback; no storage change (`bench/coop-digest/DECISION.md` section 7). P3
-> delivered both; evidence in `bench/coop-digest/RESULTS.md` section 12. What
-> remains open before the plan can close is in section 7.
+> **Status (2026-11-12): done.** P0-P2 done, P3 implemented and reviewed. The
+> maintainer's P2 decision (2026-11-07): keep the exact mirror, fix the
+> range-repair livelock, add delta-log replay as the first repair step with
+> range-based repair as the fallback; no storage change
+> (`bench/coop-digest/DECISION.md` section 7). P3 delivered both; evidence in
+> `bench/coop-digest/RESULTS.md` section 12. The closing harness matrix
+> (2026-11-12, release, seed 42, six shards): 302 scenarios, 290 pass, 11 skip
+> (they need `CAP_SYS_ADMIN`), and the last failure, `atime-eventual`, fixed
+> (the scenario now waits for the reader's `stat` to show the file's size
+> before the cold read, since bounded close-to-open allows stale content until
+> the log catches up).
 
 Read `docs/plans/v1/CONVENTIONS.md` first.
 
@@ -194,21 +197,18 @@ the owner's log is 1.1 / 3.1 / 3.1 MB at 0.1 / 1 / 10 % churn per minute on
         another test thread can reuse the number of; not this plan's code);
         `tests/smoke.sh` and `tests/integration.sh` passed; pjdfstest 8798/8798
         on the ring (`tests/compliance.sh`, baseline empty).
-  - [ ] the full harness matrix. Latest run (2026-11-10, release, `harness
-        run --seed 42`, origin/main 1af0bb57, quiet box): 283 passed, 11
-        skipped (the `passthrough-*` scenarios need root and
-        `csi-credential-revocation` needs `versitygw`), 3 failed.
-        `delegate-partition` ("b honoured its grant for 11 s without
-        renewing") and `designation-as-delegation` ("c's write under the
-        isolated designation: Some(Io)", want EROFS) fail 3 of 3 alone; both
-        predate this plan and are open findings. `epoch-holder-retired`
-        ("C's write during the frozen epoch returned Ok(())", "A's unflushed
-        write surfaced") failed in the matrix and then 6 of 13 alone on an
-        idle box: a new, nondeterministic failure that does not touch `coop`
-        and is not load-induced; it needs its own investigation. The bullet
-        stays open until the matrix is green. Earlier failures
-        (`lock-grant-dead-generation`, `writeback-fsync`,
-        `git-under-flock-*`, `append-setattr-size`) did not recur.
+  - [x] the full harness matrix. Closing run (2026-11-12, release, `harness
+        run --seed 42`, six shards): 302 default scenarios, 290 passed, 11
+        skipped (they need `CAP_SYS_ADMIN`), 1 failed: `atime-eventual`,
+        which did not reproduce alone (3 of 3 passed). Cause: the reader read
+        0 bytes of an 11-byte file because the kernel's attribute cache still
+        held size 0 inside its 1 s TTL; bounded close-to-open allows stale
+        content until the log catches up. The scenario now waits for a `stat`
+        that shows the size; the product is unchanged. Every scenario of the
+        earlier matrix's failures (the EIO group, the cto and metered group,
+        `epoch-holder-retired`, `delegate-partition`,
+        `designation-as-delegation`, `lease-claimant-ahead`, `node-leave`)
+        passes.
   - [x] a load-induced failure of `crates/net/tests/addr_churn.rs` (the link
         did not recover for 150 s after the selected address vanished): fixed
         by 3f6f578c (the dial survives its caller's timeout; the evict hook
