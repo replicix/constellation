@@ -5044,7 +5044,10 @@ is the consequence of that record being in the log.**
   generation that ends without the record (its row stranded unshipped)
   cancels the drop. The holder applies it when the root's segment carrying it
   acknowledges its row (never the seed's, which shares the position), and
-  journals the seeds' refusals as rows of its stream.
+  journals the seeds' refusals as rows of its stream. The record and those
+  refusals carry the stream's configuration (the archive's class at the
+  generation's `DelegateNodeGroup` version), never the lease's, which a deposed
+  holder no longer has (`far-root-writes-paused+lost-chunk` 435).
 - **D2, retired idents never land.** A replica that applies it from the log
   (or ships it) records the identities as retired, holes its member and backup
   copies and strands what it was streamed of them. The takeover's re-ship gate

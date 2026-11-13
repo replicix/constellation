@@ -876,11 +876,23 @@ impl Meta {
         // Plan 46 M1.1 step 4 (review): the root's append of a delegate's
         // stream row is stamped with the generation's `DelegateNodeGroup` version
         // as this transaction reads it.
+        // So is a stream holder's `DropHeld` row (an archive row of the
+        // stream: `held::stream_drop_class`).
         let class = match (class, gen != 0 && journal::PendingClass::stream_version()) {
             (RowCommit::Singleton { .. }, true) => RowCommit::Singleton {
                 config_version: crate::delegation::read_group_tx(&*tx, self, gen)?
                     .map_or(0, |g| g.version),
             },
+            (
+                RowCommit::Group {
+                    on: GroupOn::Archive,
+                    ..
+                },
+                true,
+            ) => RowCommit::group(
+                crate::delegation::read_group_tx(&*tx, self, gen)?.map_or(0, |g| g.version),
+                GroupOn::Archive,
+            ),
             (class, _) => class,
         };
         journal::note_journaled(journal::JournaledRow {
