@@ -3259,6 +3259,37 @@ fn refused_journal_order(oracle: &check::Oracle) -> super::history::JournalOrder
     )
 }
 
+/// ADR-55/59 (lcres ruling B): every completed rid whose `Completed` the log
+/// carries as a row of a stream its root minted for itself, in a segment of
+/// another tenure than the one that first journaled the row under its lease
+/// (`Oracles::own_stream_rows`): the deposed root resumed the stream to its
+/// successor. Value: that first row, `(epoch, node, journal seq)`.
+fn resumed_own_stream_rows(
+    oracle: &check::Oracle,
+    oracles: &super::oracle::Oracles,
+) -> HashMap<Rid, (u64, u64, u64)> {
+    let own = oracles.own_stream_rows.lock().unwrap();
+    let mut out = HashMap::new();
+    for (rid, (seq, idx)) in &oracle.completed_at {
+        let Some(seg) = oracle.unfenced.get(seq) else {
+            continue;
+        };
+        let j = seg.records[..*idx]
+            .iter()
+            .filter(|rec| !matches!(rec, LogRecord::Atime { .. }))
+            .count();
+        let Some(&(gen, sidx)) = seg.origins.get(j).filter(|o| o.0 != 0) else {
+            continue;
+        };
+        if let Some(&(epoch, node, first)) = own.get(&(gen, sidx)) {
+            if (epoch, node) != (seg.epoch, seg.node) {
+                out.insert(*rid, (epoch, node, first));
+            }
+        }
+    }
+    out
+}
+
 /// The sequencer of each completed rid (`session::SequencerOf`): its
 /// row's tenure and origin generation (`seg.origins`).
 fn sequencer_order(oracle: &check::Oracle) -> super::session::SequencerOf {
@@ -6990,9 +7021,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // acknowledgements a delegation gave them before the root changed.
     // Plan 43 C2 closes that: a delegate acknowledges once its group holds
     // the row, so a root change cannot overtake an acknowledged row.)
-    if let Err(e) =
-        super::history::check_session_order(&events, &tentative, &oracle.completed_at, &journal)
-    {
+    let resumed = resumed_own_stream_rows(&oracle, &oracles);
+    if let Err(e) = super::history::check_session_order(
+        &events,
+        &tentative,
+        &oracle.completed_at,
+        &journal,
+        &resumed,
+    ) {
         history_err.get_or_insert(lin_context(e));
     }
     let observed_by_protocol = witness.observed_tentative - witness.observed_dropped;

@@ -1030,11 +1030,25 @@ pub struct Witness {
 /// this is the cross-directory rule that still holds: one node's own
 /// order. Tentative ops (rolled back, replayed by rid) are exempt. The
 /// order is [`witness_order`]'s: a tenure's rows as it journaled them.
+///
+/// ADR-55/59 (lcres ruling B), `resumed`: the documented write-back
+/// relaxation across a deposition. A row `A` of the root's own sticky stream
+/// that root `R` journaled at seq `a` while it held epoch `e`, held behind a
+/// lost chunk while `R`'s later root rows on other keys shipped past it (the
+/// ship plan's rule), reaches the log through the successor once the deposed
+/// root resumes its stream (`resumed[A] = (e, R, a)`), after rows the
+/// successor journaled meanwhile. `A` may follow a later op `X` of the session
+/// only when `X` is a row of that same tenure `(e, R)` journaled above `a`:
+/// the order the sequencer ran them in, which the log would show had `R` kept
+/// its lease. Nothing else is excused: an op the successor sequenced before it
+/// appended `A` still fails (its `deps` name the stream). The excuse is
+/// pairwise; `A` is never moved in [`witness_order`].
 pub fn check_session_order(
     events: &[HistEvt],
     tentative: &HashSet<Rid>,
     completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
     journal: &JournalOrder,
+    resumed: &std::collections::HashMap<Rid, (u64, u64, u64)>,
 ) -> Result<(), String> {
     use std::collections::HashMap;
     let mut invoke_at: HashMap<Rid, usize> = HashMap::new();
@@ -1072,29 +1086,46 @@ pub fn check_session_order(
             .or_default()
             .push((*ret, *inv, *pos, *rid));
     }
+    // Whether the resumed row `a` may follow `x` (see above).
+    let excused = |a: &Rid, x: &Rid| {
+        resumed.get(a).is_some_and(|&(e, r, first)| {
+            journal
+                .get(x)
+                .is_some_and(|&(ex, rx, jx)| (ex, rx) == (e, r) && jx > first)
+        })
+    };
     for ops in sessions.values_mut() {
         ops.sort_by_key(|(ret, ..)| *ret);
         let mut by_invoke = ops.clone();
         by_invoke.sort_by_key(|(_, inv, ..)| *inv);
         // Of the ops returned before the current one was invoked, the
-        // one furthest along the log.
+        // one furthest along the log among those not resumed (a resumed one
+        // is compared pairwise: an excused one must not stand in for the
+        // others, which would mask a violation between two of them).
         let mut furthest: Option<((u64, usize), Rid)> = None;
+        let mut resumed_returned: Vec<((u64, usize), Rid)> = Vec::new();
         let mut returned = 0;
         for (_, inv, pos, rid) in &by_invoke {
             while returned < ops.len() && ops[returned].0 < *inv {
                 let (_, _, p, r) = ops[returned];
-                if furthest.is_none_or(|(fp, _)| p > fp) {
+                if resumed.contains_key(&r) {
+                    resumed_returned.push((p, r));
+                } else if furthest.is_none_or(|(fp, _)| p > fp) {
                     furthest = Some((p, r));
                 }
                 returned += 1;
             }
-            if let Some((fp, fr)) = furthest {
-                if fp > *pos {
-                    return Err(format!(
-                        "rid {fr:?} returned to node {} before it invoked rid {rid:?}, but follows it in the log ({fp:?} after {pos:?}): the log breaks the node's program order",
-                        rid.node
-                    ));
-                }
+            let late = furthest.filter(|(fp, _)| fp > pos).or_else(|| {
+                resumed_returned
+                    .iter()
+                    .copied()
+                    .find(|(p, r)| p > pos && !excused(r, rid))
+            });
+            if let Some((fp, fr)) = late {
+                return Err(format!(
+                    "rid {fr:?} returned to node {} before it invoked rid {rid:?}, but follows it in the log ({fp:?} after {pos:?}): the log breaks the node's program order",
+                    rid.node
+                ));
             }
         }
     }
@@ -1187,6 +1218,7 @@ pub fn check_trunc_commits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn rid(seq: u64) -> Rid {
         Rid {
@@ -1225,12 +1257,33 @@ mod tests {
         ];
         let none = HashSet::new();
         let in_order = [(rid(1), (1, 0)), (rid(2), (1, 1))].into_iter().collect();
-        assert!(check_session_order(&events, &none, &in_order, &JournalOrder::new()).is_ok());
+        assert!(check_session_order(
+            &events,
+            &none,
+            &in_order,
+            &JournalOrder::new(),
+            &HashMap::new()
+        )
+        .is_ok());
         let reversed = [(rid(1), (2, 0)), (rid(2), (1, 0))].into_iter().collect();
-        let err = check_session_order(&events, &none, &reversed, &JournalOrder::new()).unwrap_err();
+        let err = check_session_order(
+            &events,
+            &none,
+            &reversed,
+            &JournalOrder::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("program order"), "{err}");
         let tentative: HashSet<Rid> = [rid(1)].into_iter().collect();
-        assert!(check_session_order(&events, &tentative, &reversed, &JournalOrder::new()).is_ok());
+        assert!(check_session_order(
+            &events,
+            &tentative,
+            &reversed,
+            &JournalOrder::new(),
+            &HashMap::new()
+        )
+        .is_ok());
         // Two ops in flight together are unordered.
         let overlapping = vec![
             events[0].clone(),
@@ -1238,7 +1291,14 @@ mod tests {
             events[1].clone(),
             events[3].clone(),
         ];
-        assert!(check_session_order(&overlapping, &none, &reversed, &JournalOrder::new()).is_ok());
+        assert!(check_session_order(
+            &overlapping,
+            &none,
+            &reversed,
+            &JournalOrder::new(),
+            &HashMap::new()
+        )
+        .is_ok());
         // Plan 45 §12 O2: one tenure journaled rid 1 first and shipped
         // rid 2 ahead of it (rid 1 deferred on a pending chunk): the
         // write-back relaxation, in both checks. Journaled the other way
@@ -1246,12 +1306,19 @@ mod tests {
         let deferred: JournalOrder = [(rid(1), (1, 1, 5)), (rid(2), (1, 1, 6))]
             .into_iter()
             .collect();
-        assert!(check_session_order(&events, &none, &reversed, &deferred).is_ok());
+        assert!(check_session_order(&events, &none, &reversed, &deferred, &HashMap::new()).is_ok());
         assert!(check_linearizable_witnessed(&events, &none, &none, &reversed, &deferred).is_ok());
         let journaled_reversed: JournalOrder = [(rid(1), (1, 1, 6)), (rid(2), (1, 1, 5))]
             .into_iter()
             .collect();
-        assert!(check_session_order(&events, &none, &reversed, &journaled_reversed).is_err());
+        assert!(check_session_order(
+            &events,
+            &none,
+            &reversed,
+            &journaled_reversed,
+            &HashMap::new()
+        )
+        .is_err());
         assert!(check_linearizable_witnessed(
             &events,
             &none,
@@ -1263,7 +1330,103 @@ mod tests {
         let other_tenure: JournalOrder = [(rid(1), (1, 1, 5)), (rid(2), (2, 2, 6))]
             .into_iter()
             .collect();
-        assert!(check_session_order(&events, &none, &reversed, &other_tenure).is_err());
+        assert!(
+            check_session_order(&events, &none, &reversed, &other_tenure, &HashMap::new()).is_err()
+        );
+    }
+
+    /// ADR-55/59 (lcres ruling B): node 1, the root, journaled `d1/a` of its
+    /// own sticky stream at seq 5 under epoch 1, then `b` in `/` at seq 6;
+    /// `b` shipped past the held `a` (epoch 1, node 1), and `a` reached the
+    /// log in the successor's segment (epoch 2, node 3) once the deposed root
+    /// resumed the stream. Excused: `b` is a row of the tenure that journaled
+    /// `a`, above it. The negative control: the successor sequenced `b`
+    /// (its own row, before it appended `a`): a product bug, still flagged;
+    /// so is `a` without the resumed origin, and a `b` of the same tenure
+    /// journaled below `a`.
+    #[test]
+    fn a_resumed_own_stream_row_may_follow_only_its_tenures_later_rows() {
+        let events = vec![
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(1),
+                op: NsOp::Create("d1/a".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(1),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(2),
+                op: NsOp::Create("b".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(2),
+                ret: NsRet::Ok,
+            },
+        ];
+        let none = HashSet::new();
+        // `b` in epoch 1's segment 1, `a` in the successor's segment 2.
+        let at = [(rid(1), (2, 0)), (rid(2), (1, 0))].into_iter().collect();
+        let journal: JournalOrder = [(rid(1), (2, 3, 9)), (rid(2), (1, 1, 6))]
+            .into_iter()
+            .collect();
+        let resumed: HashMap<Rid, (u64, u64, u64)> = [(rid(1), (1, 1, 5))].into_iter().collect();
+        assert!(check_session_order(&events, &none, &at, &journal, &resumed).is_ok());
+        assert!(check_session_order(&events, &none, &at, &journal, &HashMap::new()).is_err());
+        // The successor ran `b` before it appended `a`.
+        let by_successor: JournalOrder = [(rid(1), (2, 3, 9)), (rid(2), (2, 3, 4))]
+            .into_iter()
+            .collect();
+        let err = check_session_order(&events, &none, &at, &by_successor, &resumed).unwrap_err();
+        assert!(err.contains("program order"), "{err}");
+        // Journaled below `a` in the same tenure: not the session's order.
+        let below: JournalOrder = [(rid(1), (2, 3, 9)), (rid(2), (1, 1, 4))]
+            .into_iter()
+            .collect();
+        assert!(check_session_order(&events, &none, &at, &below, &resumed).is_err());
+    }
+
+    /// An excused resumed row does not mask a violation between two other
+    /// rows of the session (the `furthest` shortcut).
+    #[test]
+    fn a_resumed_row_does_not_hide_another_pairs_violation() {
+        let ev = |seq: u64, name: &str| {
+            [
+                HistEvt::Invoke {
+                    thread: 1,
+                    rid: rid(seq),
+                    op: NsOp::Create(name.into()),
+                },
+                HistEvt::Return {
+                    thread: 1,
+                    rid: rid(seq),
+                    ret: NsRet::Ok,
+                },
+            ]
+        };
+        let events: Vec<HistEvt> = [ev(1, "d1/a"), ev(2, "x"), ev(3, "y")].concat();
+        let none = HashSet::new();
+        // Log: y (1,0), x (1,1), a (2,0): `x` follows the later `y`.
+        let at = [(rid(1), (2, 0)), (rid(2), (1, 1)), (rid(3), (1, 0))]
+            .into_iter()
+            .collect();
+        // (`x` and `y` are later rows of the tenure that journaled `a`, so
+        // `a` is excused against both; the tenure journaled `y` before `x`,
+        // which broke the order.)
+        let journal: JournalOrder = [
+            (rid(1), (2, 3, 9)),
+            (rid(2), (1, 1, 8)),
+            (rid(3), (1, 1, 7)),
+        ]
+        .into_iter()
+        .collect();
+        let resumed: HashMap<Rid, (u64, u64, u64)> = [(rid(1), (1, 1, 5))].into_iter().collect();
+        let err = check_session_order(&events, &none, &at, &journal, &resumed).unwrap_err();
+        assert!(err.contains(&format!("{:?} returned", rid(2))), "{err}");
     }
 
     #[test]

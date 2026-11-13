@@ -3243,6 +3243,18 @@ impl Driver {
         let Ok(rows) = self.meta.journal_rows_for_audit() else {
             return;
         };
+        // (Ruling B: a row of this node's own stream journaled under its lease.)
+        {
+            let table = self.meta.delegation_table();
+            let mut own = self.oracles.own_stream_rows.lock().unwrap();
+            for row in rows
+                .iter()
+                .filter(|r| r.gen != 0 && r.epoch != 0 && table.node_of_gen(r.gen) == Some(self.id))
+            {
+                own.entry((row.gen, row.idx))
+                    .or_insert((row.epoch, self.id, row.first));
+            }
+        }
         let stores: Vec<_> = self
             .oracles
             .stores

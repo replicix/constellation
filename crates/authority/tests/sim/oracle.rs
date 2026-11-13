@@ -125,6 +125,9 @@ impl Told {
 }
 
 /// Everything the oracles share in one run (`NodeEnv::oracles`).
+/// `Oracles::own_stream_rows`'s value: `(epoch, node, journal seq)`.
+pub type OwnStreamRow = (u64, NodeId, u64);
+
 pub struct Oracles {
     pub bucket: Arc<Bucket>,
     /// Node id -> the node's current `Meta`, updated by every
@@ -213,6 +216,12 @@ pub struct Oracles {
     pub hold_members: Mutex<BTreeMap<u64, BTreeSet<NodeId>>>,
     /// Plan 46 M1.1 step 3: the row-version oracle (see [`RowVersions`]).
     pub row_versions: Arc<Mutex<RowVersions>>,
+    /// ADR-55/59 (lcres ruling B): the rows of a stream each node minted for
+    /// itself as the root, as it journaled them while it held the lease:
+    /// `(gen, idx) -> (epoch, node, journal seq)`, the first seen. A deposed
+    /// root resumes such a stream to its successor, whose segment then
+    /// carries the row (`history::check_session_order`'s resumed rows).
+    pub own_stream_rows: Mutex<HashMap<(u64, u64), OwnStreamRow>>,
     /// Plan 46 M0.3: the run's reachability history (see `reach.rs`), the
     /// op each rid submitted (to find the delegate of its keys), and every
     /// unsettled `EIO` with what the history says of it.
@@ -533,6 +542,7 @@ impl Oracles {
             streamed_seen: Mutex::new(BTreeMap::new()),
             hold_members: Mutex::new(BTreeMap::new()),
             row_versions,
+            own_stream_rows: Mutex::new(HashMap::new()),
             acks_unsourced: AtomicU64::new(0),
         })
     }

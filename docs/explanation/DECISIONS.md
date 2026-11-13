@@ -4496,6 +4496,19 @@ with `Held { yours: true }`; that word, and only the latest one, lets the delega
 it. Under a partition from the root such an op ends at its deadline instead of
 running (it is in doubt: the root may have run it).
 
+**Session order across a deposition** (amended 2026-11-13, lcres ruling B):
+a row of the root's own sticky stream held behind a lost chunk (M3 defers every
+later row of that stream, related or not) lets the root's later rows outside the
+subtree ship past it: the write-back relaxation of `durability-and-failover`.
+Deposed, the root resumes the stream to its successor, whose segment carries
+the row after its own. No order of the resume can change what shipped first.
+The simulation's session-order check excuses exactly that pair: the resumed
+row `A`, journaled at seq `a` by root `R` under epoch `e` (`Oracles::
+own_stream_rows`), may follow a later op of the session only if that op is a
+row of the same tenure `(e, R)` journaled above `a`; an op the successor
+sequenced before it appended `A` still fails, and the excuse is pairwise (not
+in `witness_order`). See ADR-59 part B.
+
 **Consequences**: the root's own ops in its subtrees run at local speed after one
 archive wait per grant (the record); ops in `/` and in other nodes' subtrees
 still wait for the archive; a root's death blocks its own sticky subtrees (they
