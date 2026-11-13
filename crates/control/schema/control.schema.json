@@ -1799,6 +1799,23 @@
           "minimum": 0,
           "type": "integer"
         },
+        "handovers": {
+          "$ref": "#/$defs/StickyHandoverStatus",
+          "default": {
+            "expired": 0,
+            "grant_dropped": 0,
+            "granted": 0,
+            "held_by_tenure": 0,
+            "holder_expired": 0,
+            "holder_given_up": 0,
+            "holder_ignored": 0,
+            "holder_released": 0,
+            "holder_waits": 0,
+            "ineligible": 0,
+            "requested": 0
+          },
+          "description": "Plan 46 M1.3 step 8 (ADR-56): the handover of sticky grants."
+        },
         "inherited": {
           "format": "uint64",
           "minimum": 0,
@@ -10320,6 +10337,80 @@
         "log",
         "readdir",
         "kernel_inval"
+      ],
+      "type": "object"
+    },
+    "StickyHandoverStatus": {
+      "description": "Plan 46 M1.3 step 8 (ADR-56): the handover of sticky grants\n(`DelegationReport::handovers`). The root's side: requests sent to a\nholder, grants made after its release row, requests it dropped\nunanswered, grants it dropped, and the candidates held back by the tenure\nor because the dominant node could not be given the subtree. The\nholder's side: requests it waited on, released, ignored (a designated\nsubtree), let expire, and releases that gave up.",
+      "properties": {
+        "expired": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grant_dropped": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "granted": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "held_by_tenure": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder_expired": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder_given_up": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder_ignored": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder_released": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder_waits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ineligible": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requested": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requested",
+        "granted",
+        "expired",
+        "grant_dropped",
+        "held_by_tenure",
+        "ineligible",
+        "holder_waits",
+        "holder_released",
+        "holder_ignored",
+        "holder_expired",
+        "holder_given_up"
       ],
       "type": "object"
     },

@@ -537,6 +537,19 @@ impl EngineControl {
                         self_sends: stats.self_sends,
                         inbox_refusals: stats.holder_inbox_refusals_own_root,
                     },
+                    handovers: api::StickyHandoverStatus {
+                        requested: stats.deleg_handovers_requested,
+                        granted: stats.place_handover_granted,
+                        expired: stats.place_handover_expired,
+                        grant_dropped: stats.place_handover_grant_dropped,
+                        held_by_tenure: stats.place_handover_tenure,
+                        ineligible: stats.place_handover_ineligible,
+                        holder_waits: stats.deleg_handover_waits,
+                        holder_released: stats.deleg_handover_released,
+                        holder_ignored: stats.deleg_handover_ignored,
+                        holder_expired: stats.deleg_handover_expired,
+                        holder_given_up: stats.deleg_handover_given_up,
+                    },
                     waiting: v
                         .waiting
                         .iter()

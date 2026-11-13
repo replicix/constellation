@@ -818,6 +818,17 @@ pub fn load_config(
                 .as_str(),
             "0" | "off" | "false"
         );
+    // Plan 46 M1.3 step 8 (ADR-56): a sticky subtree changes hands at most
+    // once per tenure, and its holder gives it up when its own ops there
+    // have been idle for the grace (`0`: only when nothing is in flight).
+    c.handover_min_tenure_ms = env_u64_zero_ok(
+        "CONSTELLATION_STICKY_HANDOVER_TENURE_MS",
+        c.handover_min_tenure_ms,
+    );
+    c.handover_grace_ms = env_u64_zero_ok(
+        "CONSTELLATION_STICKY_HANDOVER_GRACE_MS",
+        c.handover_grace_ms,
+    );
     c.placement_far_rtt_ms = env_u64_zero_ok(
         "CONSTELLATION_DELEGATION_FAR_RTT_MS",
         c.placement_far_rtt_ms,

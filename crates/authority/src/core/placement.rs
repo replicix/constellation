@@ -80,6 +80,29 @@ pub(crate) struct PlacementState {
     /// holder's earlier ops, so the holder is not granted it again before
     /// the window has turned over. Other nodes are not held back.
     pub(crate) released: BTreeMap<Ino, (NodeId, WaitMs)>,
+    /// Plan 46 M1.3 step 8 (ADR-56): when this root last changed hands of a
+    /// directory (granted it, or saw its holder's release row): the tenure
+    /// a handover request waits out.
+    pub(crate) hands: BTreeMap<Ino, WaitMs>,
+    /// ADR-56: the handovers the root asked for or is granting, by the
+    /// directory handed over (one request in flight per directory).
+    pub(crate) handover: BTreeMap<Ino, HandoverReq>,
+}
+
+/// ADR-56: a sticky subtree the root asked its holder to hand over to `to`.
+#[derive(Debug, Clone)]
+pub(crate) struct HandoverReq {
+    /// The node that dominates the subtree.
+    pub to: NodeId,
+    /// The holder's stream.
+    pub gen: u64,
+    /// When the root asked (it drops the request
+    /// [`Core::handover_patience_ms`] after).
+    pub asked: WaitMs,
+    /// `Some(until)`: the holder's release row is in the log and the grant
+    /// to `to` is made, retried every tick until `until` (a read grant under
+    /// the subtree still being recalled, the quarantine).
+    pub granting: Option<WaitMs>,
 }
 
 /// Since when a link has measured far.
@@ -242,9 +265,12 @@ impl Core {
             // Not the root any more: the counts are meaningless.
             self.pl.buckets.clear();
             self.pl.far.clear();
+            self.pl.handover.clear();
+            self.pl.hands.clear();
             return;
         }
         self.place_arm(now, out);
+        self.handover_tick(now, replica, out);
         self.place_evaluate(now, replica, out);
     }
 
@@ -636,7 +662,10 @@ impl Core {
                 self.start_recall(now, gen, out);
             }
         }
-        // 1b. Plan 46 M1.3 step 9 (ADR-55): the root's own sticky stream is
+        // 1b. Plan 46 M1.3 step 8 (ADR-56): a node that dominates a subtree a
+        // sticky stream holds is handed it, by a request to the holder.
+        self.place_handover_requests(now, &subtree, replica, out);
+        // 1c. Plan 46 M1.3 step 9 (ADR-55): the root's own sticky stream is
         // released by the root as its holder, when the root's share or rate
         // in it has failed for a whole dwell. The decision is the holder's
         // (`StickyReleaseCmd`, step 5's drain and release row): no recall,
@@ -733,7 +762,8 @@ impl Core {
             if let Some(cover) = table.covering(ns, dir) {
                 // Plan 46 M1.3 step 7 (D-g): a subtree a live sticky stream
                 // of another node covers is dominated by this one: the
-                // handover's input (step 8); counted, not acted on.
+                // handover's input (step 8, `place_handover_requests` asks
+                // the holder); counted here.
                 if self
                     .dl
                     .gens
@@ -787,6 +817,7 @@ impl Core {
                 out,
             ) {
                 Ok(gen) => {
+                    self.pl.hands.insert(dir, now.wait);
                     if node == me {
                         tracing::info!(
                             node = me,
@@ -834,5 +865,226 @@ impl Core {
         }
         self.pl.cooldown.retain(|_, until| *until > now.wait);
         self.pl.released.retain(|_, (_, until)| *until > now.wait);
+    }
+}
+
+impl Core {
+    /// ADR-56 (3.1): for each subtree a sticky stream holds that another node
+    /// dominates over the placement window, ask the holder to hand it over.
+    /// The root never ends the grant itself (H-I1): a request, one per
+    /// directory in flight, after the grant's tenure (H-I3), only for a node
+    /// the subtree can be given to (H-I4). A grant waiting for the release
+    /// row of a node that no longer dominates is dropped.
+    fn place_handover_requests(
+        &mut self,
+        now: Now,
+        subtree: &HashMap<Ino, HashMap<NodeId, u64>>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let (min_ops, dominance) = (self.cfg.placement_min_ops, self.cfg.placement_dominance_pct);
+        let me = self.cfg.node_id;
+        // A grant the holder's row has freed, whose requester stopped
+        // dominating: the ordinary proposals decide.
+        let stale: Vec<Ino> = self
+            .pl
+            .handover
+            .iter()
+            .filter(|(dir, r)| {
+                r.granting.is_some()
+                    && !subtree.get(dir).is_some_and(|by| {
+                        matches!(dominant(by, dominance), (Some(n), t) if n == r.to && t >= min_ops)
+                    })
+            })
+            .map(|(d, _)| *d)
+            .collect();
+        for dir in stale {
+            self.pl.handover.remove(&dir);
+            self.stats.place_handover_grant_dropped += 1;
+        }
+        if self.lease.gate.is_some() {
+            return;
+        }
+        let tenure = self.cfg.handover_min_tenure_ms as i64;
+        let streams: Vec<(u64, NodeId, Vec<Ino>)> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| {
+                !g.ended
+                    && g.kind() == DelegKind::Sticky
+                    && g.recall == crate::core::delegate::RecallPhase::None
+                    && !g.waiting_for_group
+                    && !g.prev_blocked
+            })
+            .map(|(gen, g)| (*gen, g.node, g.dir_list()))
+            .collect();
+        for (gen, holder, dirs) in streams {
+            for dir in dirs {
+                let Some(by_node) = subtree.get(&dir) else {
+                    continue;
+                };
+                if dir == ROOT_INO || self.pl.handover.contains_key(&dir) {
+                    continue;
+                }
+                let (Some(to), total) = dominant(by_node, dominance) else {
+                    continue;
+                };
+                if to == holder || total < min_ops {
+                    continue;
+                }
+                let g = &self.dl.gens[&gen];
+                let since = g
+                    .granted
+                    .max(g.grown_at.unwrap_or(g.granted))
+                    .max(self.pl.hands.get(&dir).copied().unwrap_or(g.granted));
+                if now.wait.since(since) < tenure && !self.cfg.handover_ignores_tenure {
+                    self.stats.place_handover_tenure += 1;
+                    continue;
+                }
+                // The root itself is always a node a subtree can go back to.
+                if to != me
+                    && !(self.place_eligible(now, to, out)
+                        && self.place_kind_for(now, to, dir, replica).is_ok())
+                {
+                    self.stats.place_handover_ineligible += 1;
+                    continue;
+                }
+                self.request_handover(now, gen, dir, to, replica, out);
+            }
+        }
+    }
+
+    /// ADR-56: each tick, the requests the root has waited too long for are
+    /// dropped, and a grant that could not be made when the holder's row came
+    /// is tried again (until it is given up).
+    fn handover_tick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let gens: std::collections::BTreeSet<u64> =
+            self.pl.handover.values().map(|r| r.gen).collect();
+        for gen in gens {
+            let live = self.dl.gens.get(&gen).is_some_and(|g| !g.ended);
+            if !live {
+                // The stream is over: the requests with it (a grant waiting
+                // for a row that ended the stream is still made).
+                self.pl
+                    .handover
+                    .retain(|_, r| r.gen != gen || r.granting.is_some());
+            } else {
+                self.handover_expire(now, gen, out);
+            }
+        }
+        let granting: Vec<(Ino, WaitMs)> = self
+            .pl
+            .handover
+            .iter()
+            .filter_map(|(d, r)| r.granting.map(|u| (*d, u)))
+            .collect();
+        for (dir, until) in granting {
+            if now.wait >= until {
+                self.pl.handover.remove(&dir);
+                self.stats.place_handover_grant_dropped += 1;
+                continue;
+            }
+            self.handover_grant(now, dir, replica, out);
+        }
+    }
+
+    /// ADR-56 (3.3): the holder's release row for `dir` is in this log (its
+    /// ops the root held have run): note the change of hands, and grant
+    /// `dir` to the node that was asked for.
+    pub(crate) fn handover_released(
+        &mut self,
+        now: Now,
+        dir: Ino,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let until = now.wait.plus(self.cfg.placement_window_ms);
+        let Some(r) = self.pl.handover.get_mut(&dir) else {
+            return;
+        };
+        r.granting = Some(until);
+        self.pl.hands.insert(dir, now.wait);
+        self.handover_grant(now, dir, replica, out);
+    }
+
+    /// Grant `dir` to the node its handover was asked for, by the placement's
+    /// kind rule: a far node a sticky grant, one with a group a placed grant;
+    /// the root itself its own sticky grant (ADR-55) or, when it cannot hold
+    /// one, the keys of the root. Refused by `delegate_dir` (read grants
+    /// under `dir` being recalled, the quarantine): kept for the next tick.
+    pub(crate) fn handover_grant(
+        &mut self,
+        now: Now,
+        dir: Ino,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(r) = self.pl.handover.get(&dir).cloned() else {
+            return;
+        };
+        let me = self.cfg.node_id;
+        let ns = replica.namespace();
+        // Granted by the placement's own proposal meanwhile: done.
+        if replica
+            .delegation_table()
+            .covering(ns, dir)
+            .is_some_and(|c| c.node == r.to && c.gen != r.gen)
+        {
+            self.pl.handover.remove(&dir);
+            return;
+        }
+        let kind = if r.to == me {
+            match self.place_kind_for(now, me, dir, replica) {
+                Ok(k) => k,
+                Err(_) => {
+                    // The subtree is the root's: its keys.
+                    self.pl.handover.remove(&dir);
+                    self.stats.place_handover_granted += 1;
+                    return;
+                }
+            }
+        } else {
+            if !self.place_eligible(now, r.to, out) {
+                return;
+            }
+            match self.place_kind_for(now, r.to, dir, replica) {
+                Ok(k) => k,
+                Err(_) => return,
+            }
+        };
+        match self.delegate_dir_from(
+            super::delegate::GrantSource::Handover,
+            now,
+            dir,
+            r.to,
+            kind,
+            replica,
+            out,
+        ) {
+            Ok(gen) => {
+                self.pl.handover.remove(&dir);
+                self.pl.hands.insert(dir, now.wait);
+                self.stats.place_handover_granted += 1;
+                if kind == DelegKind::Sticky && r.to != me {
+                    self.stats.place_sticky += 1;
+                }
+                tracing::info!(
+                    node = me,
+                    dir,
+                    delegate = r.to,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    ?kind,
+                    "a handed-over subtree is granted to the node that dominates it"
+                );
+            }
+            Err(why) => tracing::debug!(
+                node = me,
+                dir,
+                delegate = r.to,
+                why,
+                "a handed-over subtree is not granted yet"
+            ),
+        }
     }
 }

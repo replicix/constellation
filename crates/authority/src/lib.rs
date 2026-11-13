@@ -45,7 +45,7 @@ pub use action::{
 };
 pub use core::{
     beat_sent_ms, lease_may_carry, resolve_epoch_claims, Config, Core, DelegRenewCert,
-    EpochClaimView, EpochState, InboxView, LockView, ShipState, Stats, ABANDONED_CODE,
+    EpochClaimView, EpochState, HandEvent, InboxView, LockView, ShipState, Stats, ABANDONED_CODE,
     DELEG_READ_EPOCH_BASE,
 };
 pub use event::{

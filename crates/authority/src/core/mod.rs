@@ -99,6 +99,22 @@ pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
 /// Plan 46 M1.3 step 9 (ADR-55): the rounds of self-delivery one step runs
 /// before it leaves the rest for the next.
 const SELF_SEND_DEPTH: u32 = 64;
+
+/// What the root did in a handover (ADR-56), for the simulation's oracles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandEvent {
+    /// The holder of `dir` was asked to hand it to `to`.
+    Requested {
+        dir: constellation_fs_core::Ino,
+        to: NodeId,
+    },
+    /// `dir` was granted to `to`; `handover`: after its holder's release row.
+    Granted {
+        dir: constellation_fs_core::Ino,
+        to: NodeId,
+        handover: bool,
+    },
+}
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{backup_claim_grace_ms, LeaseState, PendingGate, Plan, ReconfigDoubt};
@@ -634,6 +650,21 @@ pub struct Config {
     /// none of its own ops is in flight there, or its own ops there have
     /// been idle for this long. `0`: only when nothing is in flight.
     pub handover_grace_ms: u64,
+    /// ADR-56, `CONSTELLATION_STICKY_HANDOVER_TENURE_MS` (30 s): the root
+    /// asks the holder of a sticky subtree to hand it over only when the
+    /// grant has been with its holder at least this long (a grant changes
+    /// hands at most once per tenure: no ping-pong).
+    pub handover_min_tenure_ms: u64,
+    /// Fault knobs of ADR-56 (tests only; each must fail the check named).
+    /// `handover_ends_sticky`: the root recalls the sticky stream instead of
+    /// asking its holder (`sticky_ends_only_by_holder_or_operator`).
+    pub handover_ends_sticky: bool,
+    /// `handover_ignores_tenure`: the root asks inside the tenure
+    /// (`handover_tenure`).
+    pub handover_ignores_tenure: bool,
+    /// `handover_grants_before_release`: the root grants the requester in the
+    /// request's event, over the holder's live subtree (I2).
+    pub handover_grants_before_release: bool,
     /// ADR-56: the driver mirrors the delegate fast path's view after every
     /// step and reports what it has in flight ([`Core::deleg_note_local`]);
     /// a holder's release waits for that report. Off: no fast path (the
@@ -840,6 +871,10 @@ impl Config {
             placement_dwell_ms: 300_000,
             placement_cooldown_ms: 30_000,
             handover_grace_ms: 5_000,
+            handover_min_tenure_ms: 30_000,
+            handover_ends_sticky: false,
+            handover_ignores_tenure: false,
+            handover_grants_before_release: false,
             fast_path_sampled: false,
             placement_sticky: true,
             placement_far_rtt_ms: 20,
@@ -1417,6 +1452,20 @@ pub struct Stats {
     /// releases that gave up (the wait went back).
     pub deleg_handover_expired: u64,
     pub deleg_handover_given_up: u64,
+    /// ADR-56, the root's side: requests sent (`deleg_handovers_requested`,
+    /// and `place_handover_requested` by the placement), those it dropped
+    /// unanswered (`_expired`), grants made after the release row
+    /// (`_granted`), grants dropped (`_grant_dropped`: the requester stopped
+    /// dominating, or the wait ran out), candidates held back by the tenure
+    /// (`_tenure`) or because the dominant node cannot be given the subtree
+    /// (`_ineligible`).
+    pub deleg_handovers_requested: u64,
+    pub place_handover_requested: u64,
+    pub place_handover_expired: u64,
+    pub place_handover_granted: u64,
+    pub place_handover_grant_dropped: u64,
+    pub place_handover_tenure: u64,
+    pub place_handover_ineligible: u64,
     pub deleg_sticky_ended_abandoned: u64,
     /// Plan 46 M1.3 step 13: `repair abandon` of non-stealable streams:
     /// commands accepted, those that waited for read delegations, streams
@@ -2808,6 +2857,9 @@ pub struct Core {
     /// Releases sent to this node itself, for the simulation's oracle
     /// ([`Core::take_self_releases`]).
     self_releases: Vec<(u64, bool, Vec<constellation_fs_core::Ino>)>,
+    /// Plan 46 M1.3 step 8 (ADR-56): what the root asked and granted, for the
+    /// simulation's oracles ([`Core::take_hand_events`]).
+    hand_events: Vec<HandEvent>,
     /// Plan 30 §M11 phase 2b: the placement window (the root).
     pl: placement::PlacementState,
     /// Plan 30 §M14.
@@ -2913,6 +2965,7 @@ impl Core {
             lane_cell: crate::lane::LaneCell::new(),
             self_inbox: Vec::new(),
             self_releases: Vec::new(),
+            hand_events: Vec::new(),
             pl: placement::PlacementState::default(),
             lk: locks::LockState::default(),
             mode: AuthorityMode {
@@ -3407,6 +3460,13 @@ impl Core {
             self.self_releases
                 .push((*gen, note.end_at.is_some(), note.dirs.clone()));
         }
+    }
+
+    /// The handover requests and the grants this root made since the last
+    /// call: the simulation's oracles (`handover_tenure`,
+    /// `one_off_no_handover`).
+    pub fn take_hand_events(&mut self) -> Vec<HandEvent> {
+        std::mem::take(&mut self.hand_events)
     }
 
     /// The releases this node sent to itself since the last call

@@ -1091,6 +1091,10 @@ pub fn placement_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.placement_root_sticky = std::env::var("AUTHORITY_SIM_ROOT_STICKY").as_deref() != Ok("off");
     c.placement_far_rtt_ms = 20;
     c.placement_far_dwell_ms = 1_000;
+    // Plan 46 M1.3 step 8 (ADR-56): the handover's tenure and grace scaled to
+    // the short workload (production: 30 s and 5 s).
+    c.handover_min_tenure_ms = 3_000;
+    c.handover_grace_ms = 500;
     c
 }
 
