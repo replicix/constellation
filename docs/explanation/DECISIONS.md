@@ -4784,8 +4784,14 @@ is the consequence of that record being in the log.**
   persisted log index, `deleg_fill:` keys; the session's stream; the sim
   oracle), each **at its place in the stream's order**: once the stream reaches
   the index below it, since a row the drop redid below a fill lands after the
-  record (seeds 956, 1005). The dropper's apply restores the counts its strand
-  took back for the filled rows. Rejected: (b) rolling back the whole tail of
+  record (seeds 956, 1005). Every reader that lowers a stream index (a strand
+  of a row that leaves the journal unshipped) lowers it only to below the
+  first position the log does not carry, so a fill is never taken back; the
+  root's cursor of a delegate's stream passes fills; and a fill is the retire
+  key of a delegate's own outstanding row at its position (stranded quietly:
+  the root's queue owns the replay or the refusal). A generation is never
+  continued below a recorded fill by a handover (step 8: the cut is at least
+  the highest fill, or the handover opens a new generation). Rejected: (b) rolling back the whole tail of
   the stream past the first rolled-back index, which rolls back acknowledged
   rows that do not need the lost bytes (I5).
 - **What the record names, the apply refuses, and no more.** A replay of the
@@ -4857,7 +4863,12 @@ follow-up above closes it). The `kept_diverged` counter of
 at one seq of the tenure the holder's sealed tail serves a hole (rows it shipped
 ahead of a held one) and the claimant's own member copy a live transaction, both
 of rows the log carries; the attempt ends and the next one completes once a ship
-covers the copy. The merge skips every copy the log carries, whichever it keeps,
+covers the copy. With a holder that dies right after that ship nothing covers
+the claimant's copy and the claim needs `--force`. A merge rule that takes two
+copies of logged rows as no divergence completes such a claim at once, but in
+1529 the claimant's gate then meets its own predecessor-epoch backup tail rows
+the log already carries, before they are trimmed (`tail_done`): open, with the
+dead-holder test, for a follow-up. The merge skips every copy the log carries, whichever it keeps,
 so nothing is re-shipped or lost; only the claim waits (pinned by
 `a_hole_and_a_logged_copy_at_one_seq_only_delay_the_claim`).
 

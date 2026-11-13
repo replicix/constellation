@@ -3584,8 +3584,9 @@ pub(crate) fn settle_deleg_idx_at_log_tx(
 
 /// `local` key prefix of the stream positions a `DropHeld` of the log fills
 /// (ADR-59 part B, drop contiguity): `deleg_fill:` + gen + idx, big-endian.
-/// Kept for good (a few bytes per rolled-back stream row): a log index taken
-/// back below a fill and raised again passes it again.
+/// Kept for good (a few bytes per rolled-back stream row; a generation's
+/// stream state is never cleaned): a log index taken back below a fill and
+/// raised again passes it again.
 pub(crate) const DELEG_FILL_PREFIX: &[u8] = b"deleg_fill:";
 
 fn deleg_fill_key(gen: u64, idx: u64) -> Vec<u8> {
@@ -3659,11 +3660,12 @@ impl Meta {
             let (k, _) = guard.into_inner()?;
             let rest = &k[DELEG_FILL_PREFIX.len()..];
             let (Ok(gen), Ok(idx)) = (
-                <[u8; 8]>::try_from(&rest[..8.min(rest.len())]).map(u64::from_be_bytes),
-                <[u8; 8]>::try_from(&rest[8.min(rest.len())..]).map(u64::from_be_bytes),
+                <[u8; 8]>::try_from(rest.get(..8).unwrap_or_default()),
+                <[u8; 8]>::try_from(rest.get(8..).unwrap_or_default()),
             ) else {
                 continue;
             };
+            let (gen, idx) = (u64::from_be_bytes(gen), u64::from_be_bytes(idx));
             any = true;
             self.session.note_stream_fill(gen, idx);
         }
