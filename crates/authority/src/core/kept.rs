@@ -860,6 +860,18 @@ impl Core {
                                     all.insert(tx.first, tx);
                                 }
                             }
+                            // A hole from one source and a live copy from another
+                            // at one seq, both of rows the log carries (the
+                            // holder's sealed tail holes the rows it shipped
+                            // ahead of a held one; the claimant's member copy
+                            // still has the transaction until a ship covers
+                            // it), are counted here too, and the attempt ends
+                            // and is retried. Benign: the merge below skips
+                            // every copy the log carries, whichever is kept, so
+                            // nothing is re-shipped or lost; only the claim
+                            // waits for the next attempt (ADR-59 part B's
+                            // `kept_diverged` residual: `drop-held-chain-backed`
+                            // 1529, `metered-shared+links` 259 and 266).
                             Some(old)
                                 if old.last != tx.last
                                     || old.origin != tx.origin

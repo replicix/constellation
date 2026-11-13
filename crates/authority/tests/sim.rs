@@ -21105,6 +21105,48 @@ fn a_drop_fills_the_stream_indices_it_rolls_back() {
     }
 }
 
+/// ADR-59 part B, the `kept_diverged` residual (benign): a claim's kept merge
+/// met, at one journal seq of the tenure, a hole from the holder's sealed tail
+/// (the rows it shipped ahead of a held one) and a live copy from the
+/// claimant's own member copy, both of rows the log carries. It counts a
+/// divergence and ends the attempt; the next attempt completes once a ship
+/// covers the copy. Nothing is re-shipped or lost: the merge skips every
+/// copy the log carries, whichever it keeps. Pinned: the runs pass, no
+/// operator force is needed, and the counter is what the sweeps report
+/// (`drop-held-chain-backed` 1529, `metered-shared+links` 259 and 266).
+#[test]
+fn a_hole_and_a_logged_copy_at_one_seq_only_delay_the_claim() {
+    let cases: [(&str, SimConfig, u64); 3] = [
+        (
+            "drop-held-chain-backed",
+            drop_held_chain_backed_config(),
+            1529,
+        ),
+        (
+            "metered-shared+links",
+            config_variant(metered_shared_config(), "links"),
+            259,
+        ),
+        (
+            "metered-shared+links",
+            config_variant(metered_shared_config(), "links"),
+            266,
+        ),
+    ];
+    for (label, cfg, seed) in cases {
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+        let st = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+            r.stats.values().map(f).sum()
+        };
+        assert!(
+            st(|s| s.kept_diverged) > 0,
+            "{label} seed {seed}: the shape is gone"
+        );
+        assert_eq!(st(|s| s.kept_forced), 0, "{label} seed {seed}");
+        assert_eq!(st(|s| s.kept_past_gap), 0, "{label} seed {seed}");
+    }
+}
+
 /// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
 /// backup budget) that dominates a subtree is granted a sticky one: it
 /// executes there and its answers are final, with no rollback, no sticky

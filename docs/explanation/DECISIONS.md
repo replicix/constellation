@@ -4847,7 +4847,21 @@ that restarted) carries as one hole rows an earlier send had as transactions;
 the backup's hole supersedes the copies it spans, or its contiguous hold would
 end there and a successor drop the acknowledged rows past it.
 
-Part B's consequences. A drop's effect waits for its record to be archived, one
+Part B's consequences. In the lost-chunk labels the failure kind of the same
+seeds shifted from `quiescence` to `stream_log_contiguous` as part B and its
+fixes landed: the run's quiescence check returns before the oracles, so a seed
+that stopped short of quiescence never reached the stream check; the fixes that
+let it quiesce exposed the hole the drop had left all along (the contiguity
+follow-up above closes it). The `kept_diverged` counter of
+`drop-held-chain-backed` 1529 and `metered-shared+links` 259 and 266 is benign:
+at one seq of the tenure the holder's sealed tail serves a hole (rows it shipped
+ahead of a held one) and the claimant's own member copy a live transaction, both
+of rows the log carries; the attempt ends and the next one completes once a ship
+covers the copy. The merge skips every copy the log carries, whichever it keeps,
+so nothing is re-shipped or lost; only the claim waits (pinned by
+`a_hole_and_a_logged_copy_at_one_seq_only_delay_the_claim`).
+
+A drop's effect waits for its record to be archived, one
 archive round trip after an operator command, bounded by the existing
 `drop_held_await`. The one residual: a dropper that dies after the record
 shipped and before it applied the drop leaves no conflict copy and no
