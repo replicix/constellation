@@ -82224,6 +82224,44 @@ mod step8_handover_root {
         assert_eq!(owner(&h, dirs[0]), Some((2, SubtreeKind::Sticky)));
     }
 
+    /// Design rule (drop-fill review, MUST-2): a handover never continues the
+    /// old holder's generation for the new holder. A record's origin match is
+    /// by (gen, idx), so two holders sharing a generation could let the old
+    /// holder's unappended record match the new one's row. The requester gets a
+    /// generation of its own: a new one, or its own live stream grown.
+    #[test]
+    fn a_handover_never_continues_the_old_holders_generation() {
+        for requester_holds_one in [false, true] {
+            let (mut h, dirs) = far_root();
+            let gen = holds_sticky(&mut h, dirs[0], 2);
+            let own3 = requester_holds_one.then(|| {
+                let mut out = Vec::new();
+                h.core
+                    .delegate_dir(h.clk(), dirs[1], 3, DelegKind::Sticky, &h.meta, &mut out)
+                    .expect("node 3 holds w2");
+                h.meta.delegation_table().get(dirs[1]).unwrap().gen
+            });
+            ticks_for(&mut h, 31_000);
+            note(&mut h, 3, dirs[0], 40);
+            assert_eq!(requests(&tick(&mut h)).len(), 1);
+            release_row(&mut h, gen, 2, dirs[0]);
+            let granted = h
+                .meta
+                .delegation_table()
+                .get(dirs[0])
+                .expect("granted to 3");
+            assert_eq!(granted.node, 3);
+            assert_ne!(
+                granted.gen, gen,
+                "the old holder's generation was continued"
+            );
+            if let Some(g3) = own3 {
+                assert_eq!(granted.gen, g3, "node 3's own stream is grown");
+            }
+            assert!(h.core.dl.gens[&gen].node == 2);
+        }
+    }
+
     /// A recall of the stream (an operator's undelegate) decides: the
     /// requests waiting for the holder go, the recall is the recall's.
     #[test]
