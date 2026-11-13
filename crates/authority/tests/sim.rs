@@ -315,6 +315,8 @@ fn replay_seed() {
         }
         Ok("sticky-handover-root") => sticky_handover_root_config(),
         Ok("sticky-handover-crash") => sticky_handover_crash_config(),
+        Ok("sticky-handover-busy") => sticky_handover_busy_config(),
+        Ok("sticky-handover-busy-patient") => sticky_handover_busy_patient_config(),
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
@@ -2136,9 +2138,43 @@ fn sticky_handover_root_config() -> SimConfig {
         shared_dir: true,
         cross_ratio: 0.0,
         faults: Vec::new(),
-        writer_phases: vec![(2, 500, 3_000), (1, 4_000, 12_000)],
+        // Node 2 holds it, then the root takes it (it is handed over to the
+        // root), then node 2 dominates it again and the root, now the
+        // holder, hands it back (the root as the holder of a handover).
+        writer_phases: vec![(2, 500, 3_000), (1, 4_000, 12_000), (2, 13_000, 20_000)],
         strict_lone: true,
         ..far_config()
+    }
+}
+
+/// ADR-56 (plan §3 "sim reach", the holder's wait for its own ops): the
+/// ping-pong base with node 2, the first holder, writing a trickle of its own
+/// (one op per 250 ms until 6.9 s) while node 3 comes to dominate the subtree.
+/// The simulation has no engine fast path, so an own op counts as in flight
+/// for `fast_inflight_ms` after it ran (`Config::emulated_inflight_ms`, the
+/// sample the engine reports in production): the holder is asked while its op
+/// is in flight (the wait: `deleg_handover_waits`), releases once it is not
+/// (`handover_inflight` strict: never inside the window), and the root's request
+/// (patience 1.3 s here) outlasts the 800 ms wait. The negative control
+/// `handover_ignores_inflight` releases at once and fails `handover_inflight`.
+fn sticky_handover_busy_config() -> SimConfig {
+    SimConfig {
+        writer_phases: vec![(3, 4_500, 12_000)],
+        trickle: vec![(2, 1_000, 6_900, 250)],
+        fast_inflight_ms: 800,
+        ..sticky_handover_ping_pong_config()
+    }
+}
+
+/// ADR-56: as `sticky-handover-busy` with the op in flight for 3 s: longer
+/// than the root's patience, so the root drops the request
+/// (`place_handover_expired`) and asks again, the holder's wait expires
+/// (`deleg_handover_expired`) and is made again, and the handover completes
+/// once the op is no longer in flight.
+fn sticky_handover_busy_patient_config() -> SimConfig {
+    SimConfig {
+        fast_inflight_ms: 3_000,
+        ..sticky_handover_busy_config()
     }
 }
 
@@ -7457,6 +7493,8 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-handover-ping-pong-root-writes" => sticky_handover_ping_pong_root_writes_config(),
         "sticky-handover-root" => sticky_handover_root_config(),
         "sticky-handover-crash" => sticky_handover_crash_config(),
+        "sticky-handover-busy" => sticky_handover_busy_config(),
+        "sticky-handover-busy-patient" => sticky_handover_busy_patient_config(),
         "sticky-holder-dies" => sticky_holder_dies_config(),
         "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-holder-restarts" => sticky_holder_restarts_config(),
@@ -21238,9 +21276,15 @@ fn the_handover_configurations_hand_subtrees_over_and_stay_strict() {
         ),
         ("sticky-handover-root", sticky_handover_root_config()),
         ("sticky-handover-crash", sticky_handover_crash_config()),
+        ("sticky-handover-busy", sticky_handover_busy_config()),
+        (
+            "sticky-handover-busy-patient",
+            sticky_handover_busy_patient_config(),
+        ),
     ];
     for (label, config) in cases {
         let (mut requested, mut granted, mut judged, mut released) = (0, 0, 0, 0);
+        let (mut waits, mut root_expired, mut holder_expired) = (0, 0, 0);
         for seed in 0..24 {
             let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
                 panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
@@ -21249,7 +21293,24 @@ fn the_handover_configurations_hand_subtrees_over_and_stay_strict() {
             granted += r.handover_core[1];
             released += r.handover_core[7];
             judged += r.handover_core[11];
+            waits += r.handover_core[6];
+            root_expired += r.handover_core[2];
+            holder_expired += r.handover_core[9];
             assert_eq!(r.sticky_ended_unexcused, 0, "{label} seed {seed}");
+        }
+        if label.starts_with("sticky-handover-busy") {
+            assert!(
+                waits > 0,
+                "{label}: the holder never waited for an op of its own"
+            );
+        }
+        if label == "sticky-handover-busy-patient" {
+            // (The holder's own wait is refreshed by every repeat of the
+            // request, so it expires only when the root stops asking: rare.)
+            assert!(
+                root_expired > 0,
+                "{label}: no request outlasted the patience (root {root_expired}, holder {holder_expired})"
+            );
         }
         assert!(
             requested > 0,
@@ -21270,7 +21331,7 @@ fn the_handover_configurations_hand_subtrees_over_and_stay_strict() {
 /// two sequencers for the subtree).
 #[test]
 fn the_handover_controls_fail_the_oracles() {
-    let controls: [(&str, SimConfig, &[&str]); 3] = [
+    let controls: [(&str, SimConfig, &[&str]); 4] = [
         (
             "handover_ends_sticky",
             SimConfig {
@@ -21294,6 +21355,14 @@ fn the_handover_controls_fail_the_oracles() {
                 ..sticky_handover_ping_pong_config()
             },
             &["handover_tenure"],
+        ),
+        (
+            "handover_ignores_inflight",
+            SimConfig {
+                handover_ignores_inflight: true,
+                ..sticky_handover_busy_patient_config()
+            },
+            &["handover_inflight"],
         ),
         (
             "handover_grants_before_release",
