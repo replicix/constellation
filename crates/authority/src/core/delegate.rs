@@ -9855,7 +9855,9 @@ impl Core {
             .copied()
             .partition(|d| sticky_open || handover.contains(d));
         debug_assert!(
-            !sticky_open || asked.iter().all(|d| handover.contains(d)),
+            !sticky_open
+                || self.cfg.handover_grants_before_release
+                || asked.iter().all(|d| handover.contains(d)),
             "a sticky stream is releasing a subtree that no handover asked for: {asked:?} {handover:?}"
         );
         Some(ReleaseDirs {
