@@ -82211,8 +82211,7 @@ mod step8_handover_root {
         assert_eq!(requests(&tick(&mut h)).len(), 1);
         // The row reached the root's bookkeeping, then the drop retired it:
         // the table still lists the subtree under node 2's stream.
-        h.core.pl.handover.get_mut(&dirs[0]).unwrap().granting =
-            Some(h.clk().wait.plus(30_000));
+        h.core.pl.handover.get_mut(&dirs[0]).unwrap().granting = Some(h.clk().wait.plus(30_000));
         h.core.pl.hands.insert(dirs[0], h.clk().wait);
         let mut out = Vec::new();
         h.core.handover_after_drop(&h.meta, &mut out);
