@@ -1941,11 +1941,17 @@ impl Meta {
     /// appends it) and is fenced as they are (a generation that ends without
     /// it cancels the drop). Its identities are the stream positions
     /// `(deleg_epoch(gen), idx)`, the keys the stream's copies are kept by.
+    /// `remote` is `--remote`'s, as for the sequencer: a delegate's stream row
+    /// deferred on another node's pending chunks whose owner is gone for good
+    /// is that stream holder's to drop (`far-root-writes+lost-chunk` seed
+    /// 1051: only the root could run the remote form, the delegate's row
+    /// waited for the chunk forever).
     #[allow(clippy::too_many_arguments)]
     pub fn drop_held_in_stream(
         &self,
         ino: Ino,
         now_unix: i64,
+        remote: bool,
         unanswered: &dyn Fn(crate::rid::Rid) -> bool,
         live_ops: &dyn Fn(&ChunkHash) -> Vec<crate::rid::Rid>,
         sessions: &LiveSessions,
@@ -1954,7 +1960,7 @@ impl Meta {
         self.drop_held_decide(
             ino,
             now_unix,
-            false,
+            remote,
             unanswered,
             live_ops,
             sessions,
@@ -3883,7 +3889,7 @@ mod tests {
         let no_ops = |_: &ChunkHash| Vec::new();
         let sessions = LiveSessions::default();
         let decided = meta
-            .drop_held_in_stream(files[1], 0, &none, &no_ops, &sessions, &|g| g == gen)
+            .drop_held_in_stream(files[1], 0, false, &none, &no_ops, &sessions, &|g| g == gen)
             .unwrap();
         assert!(decided.pending.is_some(), "{decided:?}");
         // The stream sends index 1 and the record at index 2, nothing more.
@@ -3930,6 +3936,56 @@ mod tests {
             .map(|t| t.idx)
             .collect();
         assert_eq!(sent, vec![3, 5]);
+    }
+
+    /// `far-root-writes+lost-chunk` seed 1051: a delegate's stream row deferred
+    /// on a chunk another node forwarded as pending, whose owner lost it, is
+    /// the stream holder's to drop with `--remote` (D1 widened): the remote
+    /// form marks the chunk unrecoverable and decides the drop in the stream,
+    /// as the plain form does for a held row. Before, only the sequencer could
+    /// run the remote form and the delegate's row waited forever.
+    #[test]
+    fn a_stream_holder_drops_its_row_deferred_on_a_gone_nodes_chunk() {
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(2).unwrap();
+        let file = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap().ino;
+        let gen = (1u64 << 32) | 1;
+        let away = ChunkHash::of(b"only on the node that lost it");
+        let manifest = Manifest {
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, away)])),
+        }
+        .encode();
+        meta.enroll_remote_chunks(file, &[away], 1).unwrap();
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_with_base(file, None, &manifest, 7, None, None)
+                .unwrap();
+        }
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        let holds = |g: u64| g == gen;
+        assert!(
+            meta.drop_held_in_stream(file, 0, false, &none, &no_ops, &sessions, &holds)
+                .is_err(),
+            "deferred, not held: the plain form has nothing to drop"
+        );
+        let decided = meta
+            .drop_held_in_stream(file, 0, true, &none, &no_ops, &sessions, &holds)
+            .unwrap();
+        assert!(decided.pending.is_some(), "{decided:?}");
+        let sent = meta.delegate_txs_from(gen, 1, usize::MAX).unwrap();
+        assert!(
+            sent.iter().any(|t| t
+                .records
+                .iter()
+                .any(|r| matches!(r, LogRecord::DropHeld { .. }))),
+            "the record is the stream's row: {sent:?}"
+        );
     }
 
     /// `far-root-writes-paused+lost-chunk` seed 435 (`row_version_matches_config`):
@@ -4009,7 +4065,7 @@ mod tests {
         let lease_class = RowCommit::group(7, GroupOn::Archive);
         let decided = {
             let _class = journal::PendingClass::set(lease_class);
-            meta.drop_held_in_stream(files[1], 0, &none, &no_ops, &sessions, &|g| g == gen)
+            meta.drop_held_in_stream(files[1], 0, false, &none, &no_ops, &sessions, &|g| g == gen)
                 .unwrap()
         };
         let record_seq = decided.pending.expect("decided");
@@ -4108,7 +4164,7 @@ mod tests {
         let sessions = LiveSessions::default();
         for ino in [files[0], files[2]] {
             let decided = meta
-                .drop_held_in_stream(ino, 0, &none, &no_ops, &sessions, &|g| g == gen)
+                .drop_held_in_stream(ino, 0, false, &none, &no_ops, &sessions, &|g| g == gen)
                 .unwrap();
             assert!(decided.pending.is_some(), "{decided:?}");
         }
@@ -4183,7 +4239,7 @@ mod tests {
         let none = |_: crate::rid::Rid| false;
         let no_ops = |_: &ChunkHash| Vec::new();
         let sessions = LiveSessions::default();
-        meta.drop_held_in_stream(files[1], 0, &none, &no_ops, &sessions, &|g| g == gen)
+        meta.drop_held_in_stream(files[1], 0, false, &none, &no_ops, &sessions, &|g| g == gen)
             .unwrap();
         let sent = meta.delegate_txs_from(gen, 1, usize::MAX).unwrap();
         let record = sent[1].records.clone();
