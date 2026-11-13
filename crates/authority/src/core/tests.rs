@@ -81673,3 +81673,492 @@ mod root_own_sticky {
         }
     }
 }
+
+/// Plan 46 M1.3 step 8 (ADR-56), C4: the root's side of a sticky grant's
+/// handover. The placement asks the holder (a request, never a recall), the
+/// holder's release row is the only thing that moves the subtree, and the
+/// requester is granted it after that row.
+mod step8_handover_root {
+    use super::*;
+    use crate::core::delegate::{DelegKind, RecallPhase};
+    use crate::replica::Replica;
+    use constellation_fs_core::Ino;
+    use constellation_meta::SubtreeKind;
+
+    /// The root (node 1) with far peers 2 and 3 on its roster and two
+    /// directories `w1`, `w2`. The far dwell is short; the tenure is the
+    /// default (30 s).
+    fn far_root() -> (Harness, Vec<Ino>) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.placement = true;
+        h.core.cfg.placement_min_ops = 20;
+        h.core.cfg.placement_far_dwell_ms = 2_000;
+        h.hold(1, None);
+        let mut dirs = Vec::new();
+        for name in ["w1", "w2"] {
+            let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+            let rec = LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            };
+            Replica::apply_segment(&h.meta, dirs.len() as u64 + 1, 1, 0, &[], &[], &[rec]).unwrap();
+            dirs.push(ino);
+        }
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
+        links(&mut h, 500);
+        (h, dirs)
+    }
+
+    fn links(h: &mut Harness, rtt: u64) {
+        let link = |node| crate::event::PeerLink {
+            node,
+            connected: true,
+            last_seen: Some(w(h.now)),
+            rtt_ms: Some(rtt),
+            since: Some(w(h.now)),
+        };
+        let links = vec![link(2), link(3)];
+        h.step(Event::Peers {
+            registry_complete: true,
+            links,
+            lapses: 0,
+        });
+    }
+
+    fn tick(h: &mut Harness) -> Vec<Action> {
+        h.hold(1, None);
+        let (now, mut out) = (h.now, Vec::new());
+        h.core
+            .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+        out
+    }
+
+    /// Placement ticks for `ms`, the far links re-measured at each.
+    fn ticks_for(h: &mut Harness, ms: u64) -> Vec<Action> {
+        let tick_ms = h.core.placement_tick_ms();
+        let mut all = Vec::new();
+        let mut left = ms;
+        while left > 0 {
+            let step = tick_ms.min(left);
+            h.advance(step);
+            left -= step;
+            links(h, 500);
+            all.extend(tick(h));
+        }
+        all
+    }
+
+    fn note(h: &mut Harness, node: NodeId, dir: Ino, n: u32) {
+        for _ in 0..n {
+            h.core.place_note(node, [dir]);
+        }
+    }
+
+    /// Node `node` holds `dir` as a sticky grant, the links far and the
+    /// placement armed.
+    fn holds_sticky(h: &mut Harness, dir: Ino, node: NodeId) -> u64 {
+        tick(h);
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir(h.clk(), dir, node, DelegKind::Sticky, &h.meta, &mut out)
+            .expect("the sticky grant");
+        h.meta.delegation_table().get(dir).unwrap().gen
+    }
+
+    /// The `ReleaseRequest`s in `out`: (to, dirs, why).
+    fn requests(out: &[Action]) -> Vec<(NodeId, Vec<Ino>, ReleaseWhy)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::ReleaseRequest { dirs, why, .. } => Some((to, dirs.clone(), *why)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The holder's `SubtreeReleased` row for `dir` reaches the root's log:
+    /// the table forgets the subtree, and the root's delegation state is told.
+    fn release_row(h: &mut Harness, gen: u64, node: NodeId, dir: Ino) -> Vec<Action> {
+        h.hold(1, None);
+        Replica::apply_records_journaled(
+            &h.meta,
+            &[LogRecord::SubtreeReleased {
+                node,
+                gen,
+                dir,
+                at: 0,
+            }],
+            None,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core
+            .root_release_appended(h.clk(), gen, &[dir], false, None, &h.meta, &mut out);
+        out
+    }
+
+    fn owner(h: &Harness, dir: Ino) -> Option<(NodeId, SubtreeKind)> {
+        h.meta.delegation_table().get(dir).map(|d| (d.node, d.kind))
+    }
+
+    /// Test 1. Fails on the parent: a subtree a sticky stream covers is only
+    /// counted (`place_sticky_contended`) and no request goes to its holder.
+    #[test]
+    fn a_dominant_writer_into_a_sticky_subtree_gets_a_handover_request() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        let out = tick(&mut h);
+        assert_eq!(
+            requests(&out),
+            vec![(2, vec![dirs[0]], ReleaseWhy::Handover)],
+            "{out:?}"
+        );
+        // A request: no recall of the stream, no "other" recall counted, the
+        // grant stays with its holder until its row is in the log.
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        assert_eq!(h.core.stats.deleg_handovers_requested, 1);
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        assert_eq!(owner(&h, dirs[0]), Some((2, SubtreeKind::Sticky)));
+        // One request in flight per directory.
+        note(&mut h, 3, dirs[0], 40);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.deleg_handovers_requested, 1);
+    }
+
+    /// Test 2: a one-off write forwards without a handover; neither does a
+    /// node that is not dominant, or the holder itself.
+    #[test]
+    fn a_one_off_write_forwards_without_a_handover() {
+        let (mut h, dirs) = far_root();
+        holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 5);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        // Dominant, but the holder's own writes.
+        note(&mut h, 2, dirs[0], 40);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        // The share is not dominant: 3 writes 40 of 100.
+        note(&mut h, 2, dirs[0], 60);
+        note(&mut h, 3, dirs[0], 35);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.deleg_handovers_requested, 0);
+    }
+
+    /// H-I3: inside the grant's tenure nothing is asked, and the tenure is
+    /// counted; the knob `handover_ignores_tenure` asks anyway.
+    #[test]
+    fn no_handover_is_asked_within_the_tenure() {
+        let (mut h, dirs) = far_root();
+        holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 10_000);
+        note(&mut h, 3, dirs[0], 40);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert!(h.core.stats.place_handover_tenure >= 1);
+        h.core.cfg.handover_ignores_tenure = true;
+        let out = tick(&mut h);
+        assert_eq!(requests(&out).len(), 1, "{out:?}");
+    }
+
+    /// Test 3: after a handover to 3, node 2 dominating again inside the
+    /// tenure asks nothing; after the tenure it asks the new holder.
+    #[test]
+    fn no_second_handover_within_the_tenure() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        release_row(&mut h, gen, 2, dirs[0]);
+        assert_eq!(owner(&h, dirs[0]), Some((3, SubtreeKind::Sticky)));
+        // 2 dominates again, inside the tenure of 3's grant.
+        ticks_for(&mut h, 10_000);
+        note(&mut h, 2, dirs[0], 300);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert!(h.core.stats.place_handover_tenure >= 1);
+        // Past it: one request, to the new holder.
+        note(&mut h, 2, dirs[0], 300);
+        let out = ticks_for(&mut h, 25_000);
+        assert_eq!(
+            requests(&out),
+            vec![(3, vec![dirs[0]], ReleaseWhy::Handover)],
+            "{out:?}"
+        );
+    }
+
+    /// Test 7 (fail-before: the subtree is covered by the old stream and
+    /// nothing is ever granted to the requester). The grant to 3 is journaled
+    /// in the event of 2's release row, not before; the knob
+    /// `handover_grants_before_release` grants in the request's event.
+    #[test]
+    fn the_root_grants_the_handed_over_subtree_after_the_release_row() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        // Before the row: still 2's, and nothing more is journaled for 3.
+        ticks_for(&mut h, 1_000);
+        assert_eq!(owner(&h, dirs[0]), Some((2, SubtreeKind::Sticky)));
+        assert_eq!(h.core.stats.place_handover_granted, 0);
+        let gens_before = h.core.dl.gens.len();
+        release_row(&mut h, gen, 2, dirs[0]);
+        assert_eq!(
+            owner(&h, dirs[0]),
+            Some((3, SubtreeKind::Sticky)),
+            "not granted in the event of the row"
+        );
+        assert_eq!(h.core.stats.place_handover_granted, 1);
+        assert_eq!(h.core.dl.gens.len(), gens_before + 1);
+        assert!(h.core.pl.handover.is_empty());
+        assert!(h.core.pl.hands.contains_key(&dirs[0]));
+        // The old holder's stream does not hold it any more.
+        assert!(!h.core.dl.gens[&gen].dirs.contains_key(&dirs[0]));
+        // The control: the grant does not wait for the row.
+        let (mut h, dirs) = far_root();
+        h.core.cfg.handover_grants_before_release = true;
+        holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        tick(&mut h);
+        assert_eq!(
+            h.core.stats.place_handover_granted, 1,
+            "the knob did not grant in the request's event"
+        );
+    }
+
+    /// Test 8: a read delegation under the subtree still outstanding when the
+    /// row comes delays the grant, never breaks close-to-open; the grant is
+    /// made on the tick that finds it gone, and the wait is dropped when the
+    /// requester stops dominating.
+    #[test]
+    fn a_handover_grant_waits_for_read_grants_under_the_dir() {
+        let (mut h, dirs) = far_root();
+        h.core.cfg.recall_before_ack = true;
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        // Read grants granted before this tenure may still be honoured.
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().set_quarantine(until);
+        release_row(&mut h, gen, 2, dirs[0]);
+        assert_eq!(owner(&h, dirs[0]), None, "granted over the quarantine");
+        assert_eq!(h.core.stats.place_handover_granted, 0);
+        assert!(h.core.pl.handover[&dirs[0]].granting.is_some());
+        // Ticks while it lasts: still refused, the writer keeps dominating.
+        note(&mut h, 3, dirs[0], 40);
+        ticks_for(&mut h, 3_000);
+        assert_eq!(owner(&h, dirs[0]), None);
+        // Gone: granted.
+        note(&mut h, 3, dirs[0], 40);
+        ticks_for(&mut h, 3_100);
+        assert_eq!(owner(&h, dirs[0]), Some((3, SubtreeKind::Sticky)));
+        assert_eq!(h.core.stats.place_handover_granted, 1);
+        // A requester that stops dominating while it waits is dropped.
+        let (mut h, dirs) = far_root();
+        h.core.cfg.recall_before_ack = true;
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        let until = h.clk().wait.plus(60_000);
+        h.meta.read_delegations().set_quarantine(until);
+        release_row(&mut h, gen, 2, dirs[0]);
+        ticks_for(&mut h, 31_000);
+        assert!(h.core.pl.handover.is_empty());
+        assert!(h.core.stats.place_handover_grant_dropped >= 1);
+    }
+
+    /// Test 11: a request the holder did not answer is dropped after the
+    /// patience, never turned into a recall of the stream, even through the
+    /// resend timer; the next tick may ask again.
+    #[test]
+    fn an_unanswered_handover_is_dropped_not_escalated() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        // The resend timer sends the request again, as a handover, many
+        // times over: never a recall.
+        let mut asks = 0;
+        for _ in 0..6 {
+            h.advance(600);
+            let mut out = Vec::new();
+            h.core.on_release_resend(h.clk(), gen, &mut out);
+            for (_, d, why) in requests(&out) {
+                assert_eq!(why, ReleaseWhy::Handover);
+                assert_eq!(d, vec![dirs[0]]);
+                asks += 1;
+            }
+            assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        }
+        assert!(asks >= 1, "the request was never sent again");
+        let patience = h.core.handover_patience_ms() as u64;
+        h.advance(patience + 1);
+        let mut out = Vec::new();
+        h.core.on_release_resend(h.clk(), gen, &mut out);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.place_handover_expired, 1);
+        assert!(h.core.dl.gens[&gen].releasing.is_empty());
+        assert!(h.core.pl.handover.is_empty());
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        assert_eq!(owner(&h, dirs[0]), Some((2, SubtreeKind::Sticky)));
+        // Asked again on a later tick (tenure unchanged).
+        note(&mut h, 3, dirs[0], 40);
+        let out = tick(&mut h);
+        assert_eq!(requests(&out).len(), 1, "{out:?}");
+        assert_eq!(h.core.stats.deleg_handovers_requested, 2);
+    }
+
+    /// A recall of the stream (an operator's undelegate) decides: the
+    /// requests waiting for the holder go, the recall is the recall's.
+    #[test]
+    fn a_recall_of_the_stream_ends_its_waiting_handover() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        let out = h.step(Event::Control {
+            op: OpId(901),
+            req: Control::Undelegate { dir: dirs[0] },
+        });
+        assert!(h.core.pl.handover.is_empty());
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+        let reqs = requests(&out);
+        assert!(reqs.iter().all(|(_, _, why)| *why == ReleaseWhy::Recall));
+        assert_eq!(h.core.stats.place_handover_expired, 0);
+    }
+
+    /// The fault knob `handover_ends_sticky` recalls the stream instead of
+    /// asking: the "other" recall the oracle flags.
+    #[test]
+    fn the_knob_handover_ends_sticky_recalls_the_stream() {
+        let (mut h, dirs) = far_root();
+        h.core.cfg.handover_ends_sticky = true;
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        let out = tick(&mut h);
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 1, "{out:?}");
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::Sent);
+    }
+
+    /// H-I4: a dominant node the subtree cannot be given to (a designation
+    /// pending on it, a designated stream) is not asked for; the holder is
+    /// left alone and the skip is counted.
+    #[test]
+    fn a_handover_is_not_asked_for_a_node_the_subtree_cannot_go_to() {
+        let (mut h, dirs) = far_root();
+        holds_sticky(&mut h, dirs[0], 2);
+        h.core.dl.designating.insert(dirs[1], 3);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert!(h.core.stats.place_handover_ineligible >= 1);
+        // A node that is not connected.
+        let (mut h, dirs) = far_root();
+        holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: vec![],
+            lapses: 0,
+        });
+        note(&mut h, 3, dirs[0], 40);
+        let out = tick(&mut h);
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert!(h.core.stats.place_handover_ineligible >= 1);
+    }
+
+    /// The root as the requester: its writes dominate a far node's subtree;
+    /// the holder is asked, and when its row is in the log the root's own
+    /// sticky grant (ADR-55) is made by the same grant path, or, when the
+    /// root cannot hold one, the subtree goes back to the root's keys.
+    #[test]
+    fn the_root_dominating_a_subtree_is_handed_it() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 1, dirs[0], 40);
+        let out = tick(&mut h);
+        assert_eq!(
+            requests(&out),
+            vec![(2, vec![dirs[0]], ReleaseWhy::Handover)],
+            "{out:?}"
+        );
+        release_row(&mut h, gen, 2, dirs[0]);
+        // The root has far peers only and commits by the archive: its own
+        // sticky grant, or (if its rule refuses) the root's keys.
+        match owner(&h, dirs[0]) {
+            Some((n, SubtreeKind::Sticky)) => assert_eq!(n, 1),
+            None => {}
+            other => panic!("granted to someone else: {other:?}"),
+        }
+        assert!(h.core.pl.handover.is_empty());
+        assert_eq!(h.core.stats.place_handover_granted, 1);
+    }
+
+    /// The root as the holder (ADR-55): the request to itself is delivered
+    /// inline like every message of its family (no driver sees it), and the
+    /// holder side answers it as any holder does (ADR-56 3.2): here nothing
+    /// of its own is in flight, so a release is made at once.
+    #[test]
+    fn a_handover_from_the_roots_own_grant_goes_through_its_own_holder_side() {
+        let (mut h, dirs) = far_root();
+        h.core.cfg.placement_far_dwell_ms = 1_000;
+        tick(&mut h);
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir_from(
+                crate::core::delegate::GrantSource::Placement,
+                h.clk(),
+                dirs[0],
+                1,
+                DelegKind::Sticky,
+                &h.meta,
+                &mut out,
+            )
+            .expect("the root's own sticky grant");
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        h.advance(h.core.placement_tick_ms());
+        links(&mut h, 500);
+        h.hold(1, None);
+        let id = h.core.pl.timer.expect("the placement tick is armed");
+        let out = h.step(Event::Timer { id });
+        assert!(
+            sends(&out).iter().all(|(to, _)| *to != 1),
+            "a message to itself reached the driver: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_handovers_requested, 1);
+        assert!(
+            h.core.stats.self_sends >= 1,
+            "{:?}",
+            h.core.stats.self_sends
+        );
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        assert!(
+            h.core.stats.deleg_handover_released == 1 || h.core.stats.deleg_handover_waits == 1,
+            "the holder side did not take the request"
+        );
+    }
+}

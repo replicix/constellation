@@ -590,6 +590,8 @@ means the default; for `_MIN_OPS`, `_DOMINANCE` and `_LEAVE`,
 | `CONSTELLATION_DELEGATION_ROOT_STICKY` | on | boolean | the root itself is granted a sticky subtree it dominates ([ADR-55](../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)) while it has a write-eligible peer and no backup (its own ops would otherwise wait for the archive): its ops there are answered final at its own node, one archive wait per grant. Never `/`. Off: the root's own ops wait for the archive. Needs sticky placement |
 | `CONSTELLATION_DELEGATION_FAR_RTT_MS` | `20` | milliseconds; `0` accepted | a link is far when every round trip over `CONSTELLATION_DELEGATION_FAR_DWELL_MS` is at least this (and above the backup RTT budget). Between the budget and this the writer stays forwarded: a LAN under load is not given a sticky subtree |
 | `CONSTELLATION_DELEGATION_FAR_DWELL_MS` | `30000` | milliseconds | how long a link must measure far, with no lower sample, before a sticky grant to its node is made. One lower sample starts it over |
+| `CONSTELLATION_STICKY_HANDOVER_TENURE_MS` | `30000` | milliseconds; `0` accepted | a sticky grant is handed to a dominant writer ([ADR-56](../explanation/DECISIONS.md#adr-56-a-sticky-grant-changes-hands-only-by-its-holders-release-asked-for-a-dominant-writer)) only after it has been with its holder this long: a subtree changes hands at most once per tenure (no ping-pong). Decided at the root |
+| `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` | `5000` | milliseconds; `0` accepted | a holder asked to hand a sticky subtree over releases it at once when none of its own ops is in flight there, else once its own ops there have been idle this long. Forwarded ops never count. `0`: only when nothing is in flight. Also sets how long a request lives (`handover_patience`, `grace + 2F`) |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | milliseconds | a recalled directory is not placed again for this long |
 
 ### The S3 inbox
@@ -1360,6 +1362,7 @@ rewrites it).
 | `D` | write-delegation TTL (unset: `max(K, 5000)`) | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
 | `K` | lock TTL | `CONSTELLATION_LOCK_TTL_MS` |
 | `F` | forward timeout | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `grace` | handover grace (default 5000) | `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` |
 | `T` | backup takeover window | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
 | `k` | delegation stream tick (fixed, 50) | fixed |
 | `A` | client deadline, row `client_deadline` | `REPLICIX_LEASE_TTL_MS` |
@@ -1395,6 +1398,8 @@ rewrites it).
 | `archive_put` | 500 | `F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `own_first_op_wait` | 550 | `F + k` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `own_cross_release_wait` | 5600 | `5000 + F + 2k` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
+| `handover_patience` | 6000 | `grace + 2F` | `CONSTELLATION_FORWARD_TIMEOUT_MS`, `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` |
+| `held_forward_wait` | 6000 | `5000 + 2F` | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `inherit_slack` | 1500 | `T` | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
 | `abandon_read_wait` | 6000 | `R + m` | `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `abandon_heard_window` | 20000 | `D` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |

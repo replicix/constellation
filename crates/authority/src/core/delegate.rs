@@ -112,7 +112,6 @@ pub enum RecallPhase {
 pub(crate) enum GrantSource {
     Operator,
     Placement,
-    #[allow(dead_code)] // step 8 C4: the handover's grant
     Handover,
 }
 
@@ -9730,6 +9729,12 @@ impl Core {
         // Every subtree of the stream (plan 46 M1.2 step 10: a recall of the
         // generation is a request for all of them).
         g.releasing = g.dirs.keys().copied().collect();
+        // ADR-56: a recall of the stream decides; a handover request still
+        // waiting for the holder's row is over (one whose row is in the log
+        // goes on to its grant).
+        self.pl
+            .handover
+            .retain(|_, r| r.gen != gen || r.granting.is_some());
         // The slot closes at the transition, in this step (plan 41 R1,
         // rule 2): no renewal is granted from here, whoever answers it.
         self.dw.close_for_recall(gen);
@@ -9773,13 +9778,29 @@ impl Core {
         self.send_release_request(now, gen, out);
     }
 
+    /// The delegate of `gen` and the subtrees its release request names:
+    /// those to release as a recall, and those asked for a handover (ADR-56:
+    /// the holder answers when it is quiet, `why: Handover`).
+    fn release_request_dirs(&self, gen: u64) -> Option<(NodeId, Vec<Ino>, Vec<Ino>)> {
+        let g = self.dl.gens.get(&gen)?;
+        let handover = self.handover_asked(gen);
+        let (asked, recall): (Vec<Ino>, Vec<Ino>) = g
+            .releasing
+            .iter()
+            .copied()
+            .partition(|d| handover.contains(d));
+        Some((g.node, recall, asked))
+    }
+
     /// Send `gen`'s release request for its `releasing` subtrees: a new
     /// attempt under a new request id, with its resend timer (L3).
     fn send_release_request(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        let Some((to, dirs, handover)) = self.release_request_dirs(gen) else {
+            return;
+        };
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
-        let (to, dirs) = (g.node, g.releasing.iter().copied().collect::<Vec<_>>());
         let had_timer = g.recall_resend.take();
         let req = self.op_id();
         let back_off = self.deleg_request_timeout_ms();
@@ -9807,19 +9828,159 @@ impl Core {
             node = self.me(),
             gen = %constellation_meta::delegation::GenLabel::of(gen),
             ?dirs,
+            ?handover,
             delegate = to,
             "asking a delegate to release subtrees"
         );
-        out.push(Action::Send {
-            to,
-            msg: PeerMsg::ReleaseRequest {
-                req,
-                gen,
-                dirs,
-                why: ReleaseWhy::Recall,
-            },
-        });
+        if !dirs.is_empty() {
+            out.push(Action::Send {
+                to,
+                msg: PeerMsg::ReleaseRequest {
+                    req,
+                    gen,
+                    dirs,
+                    why: ReleaseWhy::Recall,
+                },
+            });
+        }
+        if !handover.is_empty() {
+            out.push(Action::Send {
+                to,
+                msg: PeerMsg::ReleaseRequest {
+                    req,
+                    gen,
+                    dirs: handover,
+                    why: ReleaseWhy::Handover,
+                },
+            });
+        }
         self.arm_gen_expiry(now, gen, out);
+    }
+
+    /// The subtrees of stream `gen` the root asked its holder to hand over
+    /// and has not yet seen the release row for (ADR-56).
+    pub(crate) fn handover_asked(&self, gen: u64) -> BTreeSet<Ino> {
+        self.pl
+            .handover
+            .iter()
+            .filter(|(_, r)| r.gen == gen && r.granting.is_none())
+            .map(|(d, _)| *d)
+            .collect()
+    }
+
+    /// ADR-56, the root: ask the holder of sticky stream `gen` to hand
+    /// subtree `dir` over to `to`, a node that dominates it. A *request*:
+    /// the stream is not recalled, its slot stays open, and nothing is
+    /// counted as the root ending a sticky grant (H-I1); the holder
+    /// releases by its own row when it is quiet there, and only then does
+    /// [`Self::root_release_appended`] grant `dir` to `to`.
+    pub(crate) fn request_handover(
+        &mut self,
+        now: Now,
+        gen: u64,
+        dir: Ino,
+        to: NodeId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.cfg.handover_ends_sticky {
+            // Negative control: the root takes the sticky stream back.
+            self.start_recall_for(now, gen, RecallCause::Other, out);
+            return;
+        }
+        let me = self.me();
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        if g.ended || g.recall != RecallPhase::None || g.kind() != DelegKind::Sticky {
+            return;
+        }
+        let holder = g.node;
+        g.releasing.insert(dir);
+        self.pl.handover.insert(
+            dir,
+            super::placement::HandoverReq {
+                to,
+                gen,
+                asked: now.wait,
+                granting: None,
+            },
+        );
+        self.stats.deleg_handovers_requested += 1;
+        self.stats.place_handover_requested += 1;
+        self.hand_events
+            .push(super::HandEvent::Requested { dir, to });
+        tracing::info!(
+            node = me,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            dir,
+            holder,
+            requester = to,
+            "asking the holder of a sticky subtree to hand it over to the node that dominates it"
+        );
+        if self.cfg.handover_grants_before_release {
+            // Negative control: the grant does not wait for the row.
+            self.handover_grant(now, dir, replica, out);
+        }
+        // (When the root is the holder, ADR-55, the message to itself is
+        // delivered inline by `Core::handle`, as every message of the family.)
+        self.send_release_request(now, gen, out);
+    }
+
+    /// ADR-56, the root: the requests for `gen` that have waited
+    /// [`Self::handover_patience_ms`] for the holder's row are dropped (not
+    /// escalated to a recall): the holder may be busy for ever, and the next
+    /// placement tick may ask again.
+    pub(crate) fn handover_expire(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
+        let patience = self.handover_patience_ms();
+        let due: Vec<Ino> = self
+            .pl
+            .handover
+            .iter()
+            .filter(|(_, r)| {
+                r.gen == gen && r.granting.is_none() && now.wait.since(r.asked) >= patience
+            })
+            .map(|(d, _)| *d)
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for d in &due {
+            self.pl.handover.remove(d);
+            self.stats.place_handover_expired += 1;
+            if let Some(g) = self.dl.gens.get_mut(&gen) {
+                g.releasing.remove(d);
+            }
+        }
+        tracing::info!(
+            node = self.me(),
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            dirs = ?due,
+            "the holder did not hand the subtrees over in time; the requests are dropped"
+        );
+        self.release_wait_idle(gen, out);
+    }
+
+    /// A stream with nothing left to release forgets its request's
+    /// bookkeeping and timer (a recall's is cleared by its row).
+    fn release_wait_idle(&mut self, gen: u64, out: &mut Vec<Action>) {
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        if !g.releasing.is_empty() || g.recall != RecallPhase::None {
+            return;
+        }
+        let tries = std::mem::take(&mut g.recall_tries);
+        g.recall_req = None;
+        g.release_resends = 0;
+        g.recall_started = None;
+        let timer = g.recall_resend.take();
+        for r in tries {
+            self.dl.by_req.remove(&r);
+        }
+        if let Some(t) = timer {
+            self.cancel_timer(t, out);
+        }
     }
 
     /// The release request's resend timer: a request nobody answered (no
@@ -9839,6 +10000,15 @@ impl Core {
             return;
         };
         g.recall_resend = None;
+        // ADR-56: a handover request the root has waited long enough for is
+        // dropped, not escalated.
+        self.handover_expire(now, gen, out);
+        let Some((_, recall_dirs, _)) = self.release_request_dirs(gen) else {
+            return;
+        };
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
         if g.ended
             || g.releasing.is_empty()
             || matches!(g.recall, RecallPhase::Drained(_) | RecallPhase::Sealing)
@@ -9846,6 +10016,7 @@ impl Core {
             return;
         }
         if g.recall == RecallPhase::None
+            && !recall_dirs.is_empty()
             && g.release_resends >= PARTIAL_RESENDS_BEFORE_RECALL
             && g.recall_started
                 .is_some_and(|at| now.wait.since(at) >= patience as i64)
@@ -9860,15 +10031,13 @@ impl Core {
                 return;
             }
         }
+        let Some((to, dirs, handover)) = self.release_request_dirs(gen) else {
+            return;
+        };
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
-        let (to, dirs, mut back_off, gate_recalled) = (
-            g.node,
-            g.releasing.iter().copied().collect::<Vec<_>>(),
-            g.recall_backoff_ms,
-            g.gate_recalled,
-        );
+        let (mut back_off, gate_recalled) = (g.recall_backoff_ms, g.gate_recalled);
         // ADR-44: a recall the gate started on demand is sent again inside
         // the gate too (L3); any other waits for the open.
         let gate_ok = gate_recalled && self.root_gated_shippable(now);
@@ -9878,7 +10047,7 @@ impl Core {
             let g = self.dl.gens.get_mut(&gen).expect("present");
             g.recall_req = Some(req);
             g.recall_tries.push(req);
-            if g.recall == RecallPhase::None {
+            if g.recall == RecallPhase::None && !dirs.is_empty() {
                 g.release_resends += 1;
                 self.stats.deleg_release_partial_resent += 1;
             }
@@ -9888,18 +10057,32 @@ impl Core {
                 node = self.me(),
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
                 ?dirs,
+                ?handover,
                 delegate = to,
                 "sending an unanswered release request again"
             );
-            out.push(Action::Send {
-                to,
-                msg: PeerMsg::ReleaseRequest {
-                    req,
-                    gen,
-                    dirs,
-                    why: ReleaseWhy::Recall,
-                },
-            });
+            if !dirs.is_empty() {
+                out.push(Action::Send {
+                    to,
+                    msg: PeerMsg::ReleaseRequest {
+                        req,
+                        gen,
+                        dirs,
+                        why: ReleaseWhy::Recall,
+                    },
+                });
+            }
+            if !handover.is_empty() {
+                out.push(Action::Send {
+                    to,
+                    msg: PeerMsg::ReleaseRequest {
+                        req,
+                        gen,
+                        dirs: handover,
+                        why: ReleaseWhy::Handover,
+                    },
+                });
+            }
         } else {
             tracing::debug!(
                 node = self.me(),
@@ -9958,6 +10141,23 @@ impl Core {
                 }
             }
         }
+        // ADR-56: the subtrees of this release the root asked for (a row
+        // that ends the stream, or a cut, gives up all it still held).
+        let handed: Vec<Ino> = self
+            .pl
+            .handover
+            .iter()
+            .filter(|(d, r)| {
+                r.gen == gen
+                    && r.granting.is_none()
+                    && (whole || cut.is_some() || dirs.contains(*d))
+            })
+            .map(|(d, _)| *d)
+            .collect();
+        let handed_only = !handed.is_empty()
+            && !whole
+            && cut.is_none()
+            && dirs.iter().all(|d| handed.contains(d));
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -10024,7 +10224,7 @@ impl Core {
             // (A stream released whole is timed when it ends.)
             if end.is_none() {
                 g.release_resends = 0;
-                if let Some(at) = g.recall_started.take() {
+                if let Some(at) = g.recall_started.take().filter(|_| !handed_only) {
                     let ms = now.wait.since(at).max(0) as u64;
                     self.stats.deleg_recalls_timed += 1;
                     self.stats.deleg_recall_ms_sum += ms;
@@ -10046,6 +10246,12 @@ impl Core {
             self.deleg_release_seal_round(now, gen, true, replica, out);
         }
         self.deleg_wait_done(now, wait_id(gen), replica, out);
+        // ADR-56: the holder's row is in the log, and the ops the root held
+        // for the subtrees have run: the subtrees go to the node that
+        // dominates them (H-I2: after the row, never before).
+        for dir in handed {
+            self.handover_released(now, dir, replica, out);
+        }
         self.root_progress(now, replica, out);
     }
 
@@ -10349,6 +10555,8 @@ impl Core {
         for gen in gens {
             self.start_recall_for(now, gen, RecallCause::Epoch, out);
         }
+        // ADR-56: no handover outlives the epoch it was asked in.
+        self.pl.handover.clear();
     }
 
     /// Whether the TTL leaves a grant of this kind alone: every non-stealable
@@ -12186,6 +12394,28 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, String> {
+        let granted = self.delegate_dir_checked(source, now, dir, node, kind, replica, out);
+        if granted.is_ok() {
+            self.hand_events.push(super::HandEvent::Granted {
+                dir,
+                to: node,
+                handover: source == GrantSource::Handover,
+            });
+        }
+        granted
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn delegate_dir_checked(
+        &mut self,
+        source: GrantSource,
+        now: Now,
+        dir: Ino,
+        node: NodeId,
+        kind: DelegKind,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Result<u64, String> {
         // ADR-55 R-I1: the root directory is the root sequencer's, whoever
         // asks and whatever the kind.
         if dir == ROOT_INO && !self.cfg.root_sticky_on_slash {
@@ -12310,10 +12540,14 @@ impl Core {
         }
         let table = replica.delegation_table();
         if let Some(d) = table.covering(replica.namespace(), dir) {
-            return Err(format!(
-                "directory {dir} is under delegation {} (gen {})",
-                d.dir, d.gen
-            ));
+            // (The fault knob `handover_grants_before_release` grants over
+            // the holder's live subtree: H-I2's negative control.)
+            if !(source == GrantSource::Handover && self.cfg.handover_grants_before_release) {
+                return Err(format!(
+                    "directory {dir} is under delegation {} (gen {})",
+                    d.dir, d.gen
+                ));
+            }
         }
         // A delegation on a descendant of `dir` would be shadowed.
         if table
@@ -13608,7 +13842,7 @@ impl Core {
     /// the request, and a release now would leave the subtree to the root's
     /// keys (no `pl.handover` to grant from) for nothing.
     pub(crate) fn handover_patience_ms(&self) -> i64 {
-        self.cfg.handover_grace_ms as i64 + 2 * self.cfg.forward_timeout_ms as i64
+        self.dl_t().handover_patience as i64
     }
 
     /// An op of this node's own ran in stream `gen` (the core's path): note

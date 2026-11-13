@@ -346,6 +346,28 @@ pub struct RootOwnStatus {
     pub inbox_refusals: u64,
 }
 
+/// Plan 46 M1.3 step 8 (ADR-56): the handover of sticky grants
+/// (`DelegationReport::handovers`). The root's side: requests sent to a
+/// holder, grants made after its release row, requests it dropped
+/// unanswered, grants it dropped, and the candidates held back by the tenure
+/// or because the dominant node could not be given the subtree. The
+/// holder's side: requests it waited on, released, ignored (a designated
+/// subtree), let expire, and releases that gave up.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct StickyHandoverStatus {
+    pub requested: u64,
+    pub granted: u64,
+    pub expired: u64,
+    pub grant_dropped: u64,
+    pub held_by_tenure: u64,
+    pub ineligible: u64,
+    pub holder_waits: u64,
+    pub holder_released: u64,
+    pub holder_ignored: u64,
+    pub holder_expired: u64,
+    pub holder_given_up: u64,
+}
+
 /// Plan 30 §M11: this node's delegation state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DelegationReport {
@@ -392,6 +414,9 @@ pub struct DelegationReport {
     /// of `mine` and `gens` whose node is this one.
     #[serde(default)]
     pub root_own: RootOwnStatus,
+    /// Plan 46 M1.3 step 8 (ADR-56): the handover of sticky grants.
+    #[serde(default)]
+    pub handovers: StickyHandoverStatus,
     pub executed: u64,
     /// Ops the FUSE fast path executed here as the delegate (not
     /// counted in `executed`, which is the core's).

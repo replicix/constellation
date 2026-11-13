@@ -145,6 +145,17 @@ pub struct Deadlines {
     /// the two ticks that carry it: `5000 + F + 2k`. Below the attempts
     /// window (D18).
     pub own_cross_release_wait: u64,
+    /// ADR-56 (plan 46 M1.3 step 8): how long a handover request stays alive
+    /// at the root and at the holder: the holder's grace and two forward
+    /// timeouts (`handover_grace_ms + 2F`). The root drops an unanswered
+    /// request then (never escalating it), and the holder lets a wait expire
+    /// that long after the root last asked.
+    pub handover_patience: u64,
+    /// ADR-56: the longest a forward waits held at a sticky holder whose
+    /// release drains: the hold (`STICKY_HOLD_MAX_MS`), one re-route
+    /// (`F`) and the root's archive wait (`F`). Below the client deadline
+    /// (D19).
+    pub held_forward_wait: u64,
     pub inherit_slack: u64,
     pub abandon_read_wait: u64,
     pub abandon_heard_window: u64,
@@ -335,6 +346,8 @@ impl Deadlines {
             archive_put: f,
             own_first_op_wait: f + tick,
             own_cross_release_wait: crate::core::STICKY_HOLD_MAX_MS as u64 + f + 2 * tick,
+            handover_patience: cfg.handover_grace_ms + 2 * f,
+            held_forward_wait: crate::core::STICKY_HOLD_MAX_MS as u64 + 2 * f,
             inherit_slack: t,
             abandon_read_wait: r + m,
             abandon_heard_window: d,
@@ -535,6 +548,16 @@ impl Deadlines {
                 self.own_cross_release_wait, self.attempts
             ),
         );
+        fail(
+            "D19",
+            Class::Warn,
+            self.held_forward_wait < a,
+            format!(
+                "a forward held at a sticky holder during a release's drain waits {} ms (the hold, \
+                 a re-route and the root's archive wait), not below the client deadline ({a})",
+                self.held_forward_wait
+            ),
+        );
         v
     }
 
@@ -709,6 +732,8 @@ impl Deadlines {
                 self.own_cross_release_wait,
                 "5000 + F + 2k",
             ),
+            ("handover_patience", self.handover_patience, "grace + 2F"),
+            ("held_forward_wait", self.held_forward_wait, "5000 + 2F"),
             ("inherit_slack", self.inherit_slack, "T"),
             ("abandon_read_wait", self.abandon_read_wait, "R + m"),
             ("abandon_heard_window", self.abandon_heard_window, "D"),
@@ -915,6 +940,8 @@ mod tests {
                 ("archive_put", 500),
                 ("own_first_op_wait", 550),
                 ("own_cross_release_wait", 5600),
+                ("handover_patience", 6000),
+                ("held_forward_wait", 6000),
                 ("inherit_slack", 1_500),
                 // 5000 + 1000.
                 ("abandon_read_wait", 6_000),
@@ -988,6 +1015,8 @@ mod tests {
                 ("archive_put", 500),
                 ("own_first_op_wait", 550),
                 ("own_cross_release_wait", 5600),
+                ("handover_patience", 6000),
+                ("held_forward_wait", 6000),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 6_000),
                 ("abandon_heard_window", 20_000),
@@ -1054,6 +1083,8 @@ mod tests {
                 ("archive_put", 400),
                 ("own_first_op_wait", 450),
                 ("own_cross_release_wait", 5500),
+                ("handover_patience", 5800),
+                ("held_forward_wait", 5800),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 5_000),
@@ -1131,6 +1162,8 @@ mod tests {
                 ("archive_put", 400),
                 ("own_first_op_wait", 450),
                 ("own_cross_release_wait", 5500),
+                ("handover_patience", 5800),
+                ("held_forward_wait", 5800),
                 ("inherit_slack", 1_500),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 20_000),
@@ -1194,6 +1227,8 @@ mod tests {
                 ("archive_put", 400),
                 ("own_first_op_wait", 450),
                 ("own_cross_release_wait", 5500),
+                ("handover_patience", 5800),
+                ("held_forward_wait", 5800),
                 ("inherit_slack", 1_000),
                 ("abandon_read_wait", 5_500),
                 ("abandon_heard_window", 5_000),
@@ -1263,6 +1298,8 @@ mod tests {
                 ("archive_put", 3_000),
                 ("own_first_op_wait", 3001),
                 ("own_cross_release_wait", 8002),
+                ("handover_patience", 11_000),
+                ("held_forward_wait", 11_000),
                 ("inherit_slack", 8),
                 ("abandon_read_wait", 100),
                 ("abandon_heard_window", 50),
@@ -1498,6 +1535,7 @@ mod tests {
     const DELEG: &str = "CONSTELLATION_DELEGATION_TTL_MS";
     const LOCK: &str = "CONSTELLATION_LOCK_TTL_MS";
     const FORWARD: &str = "CONSTELLATION_FORWARD_TIMEOUT_MS";
+    const HANDOVER_GRACE: &str = "CONSTELLATION_STICKY_HANDOVER_GRACE_MS";
     const TAKEOVER: &str = "CONSTELLATION_BACKUP_TAKEOVER_MS";
     const S3_LESS: &str = "CONSTELLATION_S3_LESS_OP_DEADLINE_MS";
     const PROMISE: &str = "CONSTELLATION_PROMISE_TTL_S";
@@ -1517,6 +1555,7 @@ mod tests {
         ),
         ("K", "lock TTL", &[LOCK]),
         ("F", "forward timeout", &[FORWARD]),
+        ("grace", "handover grace (default 5000)", &[HANDOVER_GRACE]),
         ("T", "backup takeover window", &[TAKEOVER]),
         ("k", "delegation stream tick (fixed, 50)", &[]),
         ("A", "client deadline, row `client_deadline`", &[LEASE]),
