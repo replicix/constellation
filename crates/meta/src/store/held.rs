@@ -738,19 +738,19 @@ fn names_any(manifest: &[u8], missing: &BTreeSet<ChunkHash>) -> bool {
     }
 }
 
-/// The chunks of `missing` that `manifest` names (all of them when it cannot
-/// tell: a spilled or undecodable manifest, as [`names_any`]).
-fn named_missing(manifest: &[u8], missing: &BTreeSet<ChunkHash>) -> Vec<ChunkHash> {
+/// Add to `into` the chunks of `missing` that `manifest` names (all of them
+/// when it cannot tell: a spilled or undecodable manifest, as [`names_any`]).
+fn add_named_missing(
+    manifest: &[u8],
+    missing: &BTreeSet<ChunkHash>,
+    into: &mut BTreeSet<ChunkHash>,
+) {
     match Manifest::decode(manifest) {
         Ok(Manifest {
             chunks: ChunkInfo::Inline(chunks),
             ..
-        }) => chunks
-            .values()
-            .filter(|h| missing.contains(h))
-            .copied()
-            .collect(),
-        _ => missing.iter().copied().collect(),
+        }) => into.extend(chunks.values().filter(|h| missing.contains(h))),
+        _ => into.extend(missing),
     }
 }
 
@@ -1911,10 +1911,14 @@ impl Meta {
     ) -> Result<DroppedHeld, MetaError> {
         let _ = now_unix;
         // A drop is a decision of the log (ADR-59 part B, D1): only the
-        // sequencer in force can journal it. A node without the lease decides
-        // nothing and changes nothing; its held rows are what a deposition
-        // strands anyway, and the successor re-ships their copies. The seed
-        // comes back to the sequencer, where the drop is a decision.
+        // sequencer in force can journal it, so a node without the lease
+        // decides nothing and changes nothing. Its root rows a deposition
+        // strands, and the successor re-ships their copies; but the held rows
+        // of a sticky stream it still holds (a deposed root keeps its own
+        // stream, R-I5) stay in that stream, where neither the successor nor
+        // this node can drop them (`far-placement+lost-chunk` 326: a delegate's
+        // drop would need the record as a row of its stream, an open design
+        // question).
         if !sequencer {
             return Err(MetaError::Invalid(format!(
                 "this node is not the sequencer in force: nothing was dropped; run `repair \
@@ -2495,7 +2499,7 @@ impl Meta {
                     .iter()
                     .any(|(key, rid)| *key == queued.queue_seq && *rid == queued.rid)
             {
-                queued_names.extend(named_missing(manifest, &missing));
+                add_named_missing(manifest, &missing, &mut queued_names);
                 queued_kept += 1;
                 tracing::warn!(
                     ino,

@@ -5599,7 +5599,8 @@ impl Meta {
             local::bump_log_idx_tx(&mut tx, self, *gen, *idx)?;
         }
         // ADR-59 part B (drop contiguity): a `DropHeld` is the log's no-op
-        // row at each stream position it fills.
+        // row at each stream position it fills. (The dropper meeting its own
+        // segment notes them in `own_drop_segment` too: idempotent.)
         for rec in records {
             self.note_drop_fills_tx(&mut tx, rec.stream_fills())?;
         }
