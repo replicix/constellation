@@ -2110,10 +2110,12 @@ impl Meta {
             tx.commit()?;
             return self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions, true);
         }
-        // A stream holder's record is its stream's row at the seed's index.
+        // A stream holder's record is its stream's row at the seed's index,
+        // of the stream's configuration (`stream_drop_class`).
         let _own = stream.map(|(gen, at)| {
             journal::PendingDelegate::set_own_at(gen, at, crate::session::Position::ZERO)
         });
+        let _class = stream.map(|_| stream_drop_class());
         let local = self.begin_local(&tx)?;
         let jseq = journal::append_tx(
             &mut tx,
@@ -2695,6 +2697,9 @@ impl Meta {
             let _own = plan.stream.map(|(gen, _)| {
                 journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO)
             });
+            // (Of the stream's configuration, as the record: seed 435's next
+            // row.)
+            let _class = plan.stream.map(|_| stream_drop_class());
             let local = self.begin_local(&tx)?;
             let now_ms = now_unix.saturating_mul(1000);
             for rid in &refused_rids {
@@ -2910,6 +2915,7 @@ impl Meta {
         let _own = stream.map(|(gen, at)| {
             journal::PendingDelegate::set_own_at(gen, at, crate::session::Position::ZERO)
         });
+        let _class = stream.map(|_| stream_drop_class());
         let local = self.begin_local(&tx)?;
         let jseq = journal::append_tx(
             &mut tx,
@@ -3376,6 +3382,20 @@ fn needs_lost_content(tx: &Tx, lost: &mut HashSet<Ino>, missing: &BTreeSet<Chunk
         }
     }
     needs
+}
+
+/// The class of a stream holder's `DropHeld` row (ADR-59 part B, D1), and of
+/// the `Refused` rows its apply journals into the stream: the archive's, since
+/// the drop takes effect when the log carries the record (D4), at the
+/// stream's own configuration, the generation's
+/// `DelegateNodeGroup` version as the journaling transaction reads it (0: no
+/// group, `Meta::finish_local`). Not the lease's: a deposed root decides the
+/// drop of its own sticky stream holding no lease, and a stream row journaled
+/// with no lease is the delegate's (`row_version_matches_config`,
+/// `far-root-writes-paused+lost-chunk` seed 435: the core's archive class at
+/// the lease version it last held).
+fn stream_drop_class() -> journal::PendingClassGuard {
+    journal::PendingClass::set_stream_version(crate::store::local::RowCommit::ARCHIVE)
 }
 
 #[cfg(test)]
@@ -3910,6 +3930,122 @@ mod tests {
             .map(|t| t.idx)
             .collect();
         assert_eq!(sent, vec![3, 5]);
+    }
+
+    /// `far-root-writes-paused+lost-chunk` seed 435 (`row_version_matches_config`):
+    /// a deposed root decides the drop of its own sticky stream holding no
+    /// lease, and the core around the call stamps the archive's class at the
+    /// lease version it last held. The stream's `DropHeld` row and the
+    /// refusals its apply journals into the stream carry the stream's own
+    /// configuration instead: the archive's, at the generation's
+    /// `DelegateNodeGroup` version (none here: 0). Fails on the parent: both
+    /// rows carry version 7.
+    #[test]
+    fn a_stream_holders_drop_rows_carry_the_streams_configuration() {
+        use crate::mutate::MutateOp;
+        use crate::store::local::{GroupOn, RowCommit};
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        let files: Vec<Ino> = (1..=2)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let gen = (1u64 << 32) | 1;
+        let chmod = MutateOp::Setattr {
+            ino: files[0],
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, &chmod, None).unwrap();
+        }
+        let hash = ChunkHash::of(b"lost");
+        let manifest = Manifest {
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_dirty(files[1], None, &manifest, 7, None, None, &[hash])
+                .unwrap();
+        }
+        // A write that reads the lost bytes: rolled back and refused.
+        let truncate = MutateOp::Setattr {
+            ino: files[1],
+            mode: None,
+            uid: None,
+            gid: None,
+            size: Some(3),
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            let rid = crate::rid::Rid {
+                node: 1,
+                incarnation: 1,
+                seq: 3,
+            };
+            crate::mutate::execute(&meta, &truncate, Some(rid)).unwrap();
+        }
+        meta.note_unrecoverable_chunks(&[(hash, files[1])], false)
+            .unwrap();
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        // The core's class around a deposed dropper's call.
+        let lease_class = RowCommit::group(7, GroupOn::Archive);
+        let decided = {
+            let _class = journal::PendingClass::set(lease_class);
+            meta.drop_held_in_stream(files[1], 0, &none, &no_ops, &sessions, &|g| g == gen)
+                .unwrap()
+        };
+        let record_seq = decided.pending.expect("decided");
+        let class_at = |first: u64| {
+            meta.journal_rows_for_audit()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.first == first)
+                .map(|r| (r.gen, r.class))
+        };
+        assert_eq!(
+            class_at(record_seq),
+            Some((gen, RowCommit::ARCHIVE)),
+            "the record: the stream's configuration, not the lease's"
+        );
+        let sent = meta.delegate_txs_from(gen, 2, usize::MAX).unwrap();
+        let record = sent[0].records.clone();
+        meta.apply_segment_rows(1, 1, 0, &[50], &[(gen, 2)], &record, &Default::default())
+            .unwrap();
+        let applied = {
+            let _class = journal::PendingClass::set(lease_class);
+            meta.drop_held_apply(files[1], 0, &none, &no_ops, &sessions, false)
+                .unwrap()
+        };
+        assert_eq!(applied.refused.len(), 1, "{applied:?}");
+        let rows = meta.journal_rows_for_audit().unwrap();
+        let refusals: Vec<RowCommit> = rows
+            .iter()
+            .filter(|r| r.gen == gen && r.first > record_seq)
+            .map(|r| r.class)
+            .collect();
+        assert_eq!(
+            refusals,
+            vec![RowCommit::ARCHIVE],
+            "the apply's refusal, of the stream's configuration: {rows:?}"
+        );
     }
 
     /// ADR-59 part B, landing review MUST-1: a stream with two decided drops.

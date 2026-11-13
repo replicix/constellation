@@ -21140,6 +21140,22 @@ fn an_inbox_ever_refusal_under_a_designation_is_journaled() {
     }
 }
 
+/// `row_version_matches_config`: a deposed root that decides the drop of its
+/// own sticky stream's rows holds no lease; the `DropHeld` row and the
+/// refusals its apply journals into the stream were stamped with the archive's
+/// class at the lease version it last held, where a stream row journaled with
+/// no lease carries the stream's configuration. Failed on 7665d4d0.
+#[test]
+fn a_stream_holders_drop_rows_carry_the_streams_configuration() {
+    for seed in [297, 435, 458, 611, 682, 1333, 1935] {
+        run_seed(
+            seed,
+            config_variant(far_root_writes_paused_config(), "lost-chunk"),
+        )
+        .unwrap_or_else(|e| panic!("far-root-writes-paused+lost-chunk seed {seed}: {e}"));
+    }
+}
+
 /// ADR-59 part B, the `kept_diverged` residual (benign): a claim's kept merge
 /// met, at one journal seq of the tenure, a hole from the holder's sealed tail
 /// (the rows it shipped ahead of a held one) and a live copy from the
