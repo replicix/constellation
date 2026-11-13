@@ -82198,6 +82198,33 @@ mod step8_handover_root {
         assert_eq!(owner(&h, dirs[0]), Some((1, SubtreeKind::Sticky)));
     }
 
+    /// ADR-56 review S5 (ADR-59 part B): a `DropHeld` that retired the
+    /// holder's release row and the grant behind it leaves a request whose row
+    /// the table does not carry: the apply drops the request with its
+    /// bookkeeping, recalls nothing, and the holder's stream is the table's.
+    #[test]
+    fn a_drop_that_retired_the_release_row_ends_the_handover() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        // The row reached the root's bookkeeping, then the drop retired it:
+        // the table still lists the subtree under node 2's stream.
+        h.core.pl.handover.get_mut(&dirs[0]).unwrap().granting =
+            Some(h.clk().wait.plus(30_000));
+        h.core.pl.hands.insert(dirs[0], h.clk().wait);
+        let mut out = Vec::new();
+        h.core.handover_after_drop(&h.meta, &mut out);
+        assert!(h.core.pl.handover.is_empty());
+        assert!(h.core.pl.hands.is_empty());
+        assert!(h.core.dl.gens[&gen].releasing.is_empty());
+        assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        assert_eq!(h.core.stats.place_handover_grant_dropped, 1);
+        assert_eq!(owner(&h, dirs[0]), Some((2, SubtreeKind::Sticky)));
+    }
+
     /// A recall of the stream (an operator's undelegate) decides: the
     /// requests waiting for the holder go, the recall is the recall's.
     #[test]
