@@ -2549,6 +2549,299 @@ pub fn auto_placement(_seed: u64) -> Result<()> {
     result
 }
 
+/// Plan 46 M1.3 step 8 (ADR-56): the placement and handover settings the two
+/// handover scenarios share: sticky placement for a far writer (the link
+/// measured far for 5 s), a 5 s window with a floor of 20 ops, a minimum
+/// tenure of 10 s and a grace of 2 s.
+const HANDOVER_ENV: &[(&str, &str)] = &[
+    ("CONSTELLATION_CTO", "strict"),
+    ("CONSTELLATION_DELEGATION_PLACEMENT", ""),
+    ("CONSTELLATION_DELEGATION_STICKY_PLACEMENT", "on"),
+    ("CONSTELLATION_DELEGATION_WINDOW_MS", "5000"),
+    ("CONSTELLATION_DELEGATION_MIN_OPS", "20"),
+    ("CONSTELLATION_DELEGATION_FAR_DWELL_MS", "5000"),
+    ("CONSTELLATION_DELEGATION_DWELL_MS", "600000"),
+    ("CONSTELLATION_STICKY_HANDOVER_TENURE_MS", "10000"),
+    ("CONSTELLATION_STICKY_HANDOVER_GRACE_MS", "2000"),
+    ("CONSTELLATION_BACKUPS", "0"),
+];
+
+/// The handover scenarios need the far links of `CONSTELLATION_HARNESS_LOAD=net-wan`
+/// (a sticky grant goes to a far writer only); off it they say so and pass.
+fn handover_needs_wan(name: &str) -> bool {
+    let wan = crate::load::label().as_deref() == Some("net-wan");
+    if !wan {
+        eprintln!("    {name}: runs only under CONSTELLATION_HARNESS_LOAD=net-wan (a sticky grant goes to a far writer); skipped");
+    }
+    wan
+}
+
+/// What one writing phase of [`sticky_handover_alternating`] saw: the files
+/// written, the latencies of the writes before the root's table named the new
+/// holder and after, and the time that took.
+struct HandoverPhase {
+    names: Vec<String>,
+    before: Vec<Duration>,
+    after: Vec<Duration>,
+    handed: Duration,
+}
+
+/// The client whose node holds the lease (the root): the first mount is not
+/// always the one that took it.
+fn root_of(clients: &[Client]) -> Result<&Client> {
+    let holder = lease_of(&clients[0])?["holder"]
+        .as_u64()
+        .context("no lease holder")?;
+    for c in clients {
+        if node_id(c)? == holder {
+            return Ok(c);
+        }
+    }
+    anyhow::bail!("no client is node {holder}, the lease holder")
+}
+
+/// The root's counters of the handover (`status.delegation.handovers`).
+fn handovers_of(clients: &[Client]) -> Result<serde_json::Value> {
+    Ok(deleg_of(root_of(clients)?)?["handovers"].clone())
+}
+
+/// Plan 46 M1.3 step 8 (ADR-56): a sticky subtree follows its dominant writer.
+/// Under net-wan `b` writes `/h` until it holds it sticky; then `c` writes it
+/// for 20 s (its writes are forwarded to `b` at the WAN round trip, final)
+/// until the root has asked `b` to hand it over and `c` holds it (writes at
+/// the local speed); then `b` writes again and the subtree returns. At most
+/// one change of hands per phase, no write fails, and every file is on every
+/// node. The latencies of each writer per phase and the time from `c`'s first
+/// write to its install are printed.
+pub fn sticky_handover_alternating(_seed: u64) -> Result<()> {
+    const NAME: &str = "sticky-handover-alternating";
+    if !handover_needs_wan(NAME) {
+        return Ok(());
+    }
+    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], HANDOVER_ENV, 0)?;
+    let result = (|| -> Result<()> {
+        let (a, b, c) = (&clients[0], &clients[1], &clients[2]);
+        let (b_id, c_id) = (node_id(b)?, node_id(c)?);
+        std::fs::create_dir(a.mnt.join("h"))?;
+        for x in [b, c] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("h").is_dir());
+                Ok(())
+            })?;
+        }
+        let owner = || -> Result<Option<u64>> {
+            let d = deleg_of(a)?;
+            Ok(d["table"]
+                .as_array()
+                .and_then(|t| t.iter().find(|e| e["path"] == "/h").map(|e| n(e, "node"))))
+        };
+        // One phase: `who` writes `/h` from `WRITERS` threads (a forwarded
+        // write takes the WAN round trip, so one thread cannot reach the
+        // floor) until the root's table names `want` as its holder and `min`
+        // has passed since; the names written, the latencies before and after
+        // the table changed, and the time it took.
+        const WRITERS: usize = 6;
+        let phase = |who: &Client,
+                     tag: &str,
+                     want: u64,
+                     min: Duration,
+                     limit: Duration|
+         -> Result<HandoverPhase> {
+            let t0 = Instant::now();
+            let stop = AtomicBool::new(false);
+            let handed_at = std::sync::Mutex::new(None::<Duration>);
+            let results = std::thread::scope(|sc| -> Result<Vec<(String, Duration, Duration)>> {
+                let workers: Vec<_> = (0..WRITERS)
+                    .map(|w| {
+                        let (stop, mnt) = (&stop, who.mnt.clone());
+                        sc.spawn(move || -> Result<Vec<(String, Duration, Duration)>> {
+                            let mut out = Vec::new();
+                            let mut i = 0;
+                            while !stop.load(Ordering::Relaxed) {
+                                let name = format!("h/{tag}-{w}-{i}");
+                                let at = t0.elapsed();
+                                let lat = write_timed(&mnt.join(&name), name.as_bytes())?;
+                                out.push((name, at, lat));
+                                i += 1;
+                                // (A pace: at local speed the six threads would
+                                // write tens of thousands of files.)
+                                std::thread::sleep(Duration::from_millis(150));
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                let mut verdict = Ok(());
+                while t0.elapsed() < limit {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let mut h = handed_at.lock().unwrap();
+                    if h.is_none() {
+                        match owner() {
+                            Ok(o) if o == Some(want) => *h = Some(t0.elapsed()),
+                            Ok(_) => {}
+                            Err(e) => {
+                                verdict = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                    if h.is_some_and(|at| t0.elapsed() >= at + min) {
+                        break;
+                    }
+                }
+                if verdict.is_ok() && handed_at.lock().unwrap().is_none() {
+                    verdict = Err(anyhow::anyhow!(
+                        "/h did not reach node {want} within {limit:?} (owner {:?})",
+                        owner()
+                    ));
+                }
+                stop.store(true, Ordering::Relaxed);
+                let mut all = Vec::new();
+                for w in workers {
+                    all.extend(w.join().map_err(|_| anyhow::anyhow!("writer panicked"))??);
+                }
+                verdict?;
+                Ok(all)
+            })?;
+            let handed = handed_at.lock().unwrap().expect("checked above");
+            let names = results.iter().map(|(n, _, _)| n.clone()).collect();
+            let before = results
+                .iter()
+                .filter(|(_, at, _)| *at < handed)
+                .map(|(_, _, l)| *l)
+                .collect();
+            let after = results
+                .iter()
+                .filter(|(_, at, _)| *at >= handed)
+                .map(|(_, _, l)| *l)
+                .collect();
+            Ok(HandoverPhase {
+                names,
+                before,
+                after,
+                handed,
+            })
+        };
+        let first = phase(
+            b,
+            "b1",
+            b_id,
+            Duration::from_secs(8),
+            Duration::from_secs(60),
+        )?;
+        let (mut all, placed_b) = (first.names, first.handed);
+        eprintln!("    {NAME}: /h placed on b (sticky) after {placed_b:?}");
+        wait_installed(b, "/h", Duration::from_secs(20))?;
+        let requested_after_b = n(&handovers_of(&clients)?, "requested");
+        // c dominates: forwarded to b at the WAN round trip, then the root
+        // asks b, and c holds it.
+        let second = phase(
+            c,
+            "c",
+            c_id,
+            Duration::from_secs(20),
+            Duration::from_secs(90),
+        )?;
+        let (c_fwd, c_local, took_c) = (second.before, second.after, second.handed);
+        all.extend(second.names);
+        wait_installed(c, "/h", Duration::from_secs(30))?;
+        eprintln!(
+            "    {NAME}: c's first write to its install {took_c:?}; c while forwarded p50 {:?} p90 {:?} ({} writes), after p50 {:?} p90 {:?} ({} writes)",
+            pct(&c_fwd, 50),
+            pct(&c_fwd, 90),
+            c_fwd.len(),
+            pct(&c_local, 50),
+            pct(&c_local, 90),
+            c_local.len()
+        );
+        // b again.
+        let third = phase(
+            b,
+            "b2",
+            b_id,
+            Duration::from_secs(20),
+            Duration::from_secs(90),
+        )?;
+        let (b_fwd, b_local, took_b) = (third.before, third.after, third.handed);
+        all.extend(third.names);
+        eprintln!(
+            "    {NAME}: back on b after {took_b:?}; b while forwarded p50 {:?} ({} writes), after p50 {:?} ({} writes)",
+            pct(&b_fwd, 50),
+            b_fwd.len(),
+            pct(&b_local, 50),
+            b_local.len()
+        );
+        let h = handovers_of(&clients)?;
+        print_deleg(NAME, "root", &deleg_of(root_of(&clients)?)?);
+        let requested = n(&h, "requested");
+        anyhow::ensure!(
+            requested > requested_after_b && requested <= requested_after_b + 4,
+            "handover requests: {h} (after b's placement {requested_after_b})"
+        );
+        anyhow::ensure!(n(&h, "granted") >= 2, "handovers granted: {h}");
+        // (Every 24th name, and the last: a read of each of thousands of
+        // files from three nodes at the WAN's round trip takes longer than the
+        // scenario; the files are unique, so a handover that lost a write
+        // loses it at an index that is as likely to be sampled.)
+        let mut sampled: Vec<String> = all.iter().step_by(24).cloned().collect();
+        sampled.extend(all.last().cloned());
+        for x in [a, b, c] {
+            all_visible(x, &sampled, Duration::from_secs(90))?;
+        }
+        ensure_no_conflicts(&[a, b, c])
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// Plan 46 M1.3 step 8 (ADR-56): a one-off write by another node forwards
+/// without a handover. Under net-wan `b` holds `/h` sticky (the operator's
+/// grant); `c` creates one file in it: final at the WAN round trip, and the
+/// root asks nobody to hand `/h` over, however long it waits.
+pub fn sticky_handover_one_off(_seed: u64) -> Result<()> {
+    const NAME: &str = "sticky-handover-one-off";
+    if !handover_needs_wan(NAME) {
+        return Ok(());
+    }
+    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], HANDOVER_ENV, 0)?;
+    let result = (|| -> Result<()> {
+        let (a, b, c) = (&clients[0], &clients[1], &clients[2]);
+        let b_id = node_id(b)?;
+        std::fs::create_dir(a.mnt.join("h"))?;
+        for x in [b, c] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("h").is_dir());
+                Ok(())
+            })?;
+        }
+        a.control(
+            "designation.delegate",
+            serde_json::json!({"path": "/h", "node": b_id, "sticky": true}),
+        )
+        .context("delegating --sticky /h to b")?;
+        wait_installed(b, "/h", Duration::from_secs(20))?;
+        let (mut names, _) = write_files(b, "h", "b", 40)?;
+        let lat = write_timed(&c.mnt.join("h/c-once"), b"h/c-once")?;
+        names.push("h/c-once".into());
+        eprintln!("    {NAME}: c's one write into b's /h took {lat:?}");
+        // Past the placement window and the tenure: no request.
+        std::thread::sleep(Duration::from_secs(15));
+        let h = handovers_of(&clients)?;
+        anyhow::ensure!(
+            n(&h, "requested") == 0,
+            "a handover was asked for a one-off: {h}"
+        );
+        for x in [a, b, c] {
+            all_visible(x, &names, Duration::from_secs(60))?;
+        }
+        ensure_no_conflicts(&[a, b, c])
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
 /// Phase 2b: an offline designation (plans 03–05) as a delegation. b
 /// runs `offline /site`; the root's table gets a designated generation
 /// for b; c's writes under it are forwarded to b; the root's own client

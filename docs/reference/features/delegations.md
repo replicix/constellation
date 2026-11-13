@@ -743,6 +743,17 @@ and node, and evaluates it every tenth of the window:
   SC'15): move metadata to its dominant writer rather than spreading it.
 - **Grant a far writer a sticky subtree**: see the far-writer paragraph
   above. Placement never recalls a sticky grant.
+- **Hand a sticky subtree to its dominant writer** ([ADR-56](../../explanation/DECISIONS.md#adr-56-a-sticky-grant-changes-hands-only-by-its-holders-release-asked-for-a-dominant-writer)):
+  when another node dominates a subtree a sticky stream holds, and the grant has
+  been with its holder for the tenure, the root asks the holder
+  (`ReleaseRequest` with `why: Handover`, not a recall); the holder releases by its
+  own row when none of its own ops is in flight there, or they have been idle for
+  the grace (forwarded ops never count); the root grants the subtree to the
+  requester after that row. Until then the writer's ops are forwarded to the holder
+  (final, at the round trip: the "forwarded-latency phase"); after, they are local.
+  A request nobody answers is dropped after `grace + 2F`, never escalated.
+  `status.delegation.handovers` counts requests, grants, drops and the holder's
+  side. A placed grant is not moved this way (it keeps the long-dwell recall).
 - **Grant the root itself a sticky subtree** ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)): while the
   root's own ops commit by the archive (it has a write-eligible peer and no
   backup), the same rule proposes the root for a subtree it dominates, never
@@ -1253,6 +1264,8 @@ dies: no acknowledged write is lost) and the causal-cut oracle.
 | `CONSTELLATION_DELEGATION_DWELL_MS` | `300000` | recall dwell |
 | `CONSTELLATION_DELEGATION_STICKY_PLACEMENT` | on | a dominant far writer is granted a sticky subtree |
 | `CONSTELLATION_DELEGATION_ROOT_STICKY` | on | the root itself is granted a sticky subtree it dominates while its own ops commit by the archive ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)); off: its own ops wait for the archive. Needs sticky placement |
+| `CONSTELLATION_STICKY_HANDOVER_TENURE_MS` | `30000` | a sticky grant is handed to a dominant writer only after it has been with its holder this long |
+| `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` | `5000` | a holder asked to hand a subtree over releases it at once when none of its own ops is in flight there, else once they have been idle this long (`0`: only when nothing is in flight) |
 | `CONSTELLATION_DELEGATION_FAR_RTT_MS` | `20` | a link is far when every round trip of the far dwell is at least this |
 | `CONSTELLATION_DELEGATION_FAR_DWELL_MS` | `30000` | how long a link must measure far |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | cool-down after a recall |

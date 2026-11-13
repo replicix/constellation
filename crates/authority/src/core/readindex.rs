@@ -771,6 +771,9 @@ impl Core {
         {
             return None;
         }
+        if self.own_stream_covers(dir, replica) {
+            return None;
+        }
         self.lease.held.as_ref()?;
         let left = self.lease.honour_left_ms(now, &self.cfg)?;
         let ttl = self.dl_t().read_grant_ttl(left);
@@ -842,6 +845,9 @@ impl Core {
         }
         // ADR-57: no grant over keys a pending acknowledged row touches.
         if replica.read_hold_touches_ino(ino) {
+            return None;
+        }
+        if self.own_stream_covers(ino, replica) {
             return None;
         }
         if self

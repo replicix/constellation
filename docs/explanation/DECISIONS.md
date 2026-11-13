@@ -5014,3 +5014,89 @@ See: `crates/authority/src/core/delegate.rs` (`delegate_dir_from`,
 `crates/authority/src/core/placement.rs` (`place_kind_for_root`),
 `crates/authority/src/core/mod.rs` (`handle`, `take_self_sends`),
 `crates/model` chunk 14.
+
+## ADR-56: A sticky grant changes hands only by its holder's release, asked for a dominant writer
+
+**Status**: decided by the maintainer on 2026-11-01 (plan 46 §11 Q4, amended) and
+built as plan 46 M1.3 step 8 (the order 7, 9, 8). The numbering follows the
+landing order ([ADR-54](#adr-54-placement-grants-a-far-dominant-writer-a-sticky-subtree-and-recalls-placed-grants-only-after-a-long-dwell)
+is step 7, [ADR-55](#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)
+step 9).
+
+**Context**: after ADR-54 a far writer holds a sticky subtree that the root never
+takes back, so another node that comes to dominate the subtree is forwarded to
+the holder (final, at the round trip) for as long as the holder keeps the grant.
+A sticky grant may end only by its holder's release or an operator's action
+(`sticky_ends_only_by_holder_or_operator`).
+
+**Decision**: the root *asks* the holder.
+
+- **When the root asks** (a pass of the placement tick, after the recalls of
+  placed grants): for each subtree a live sticky stream holds, if another node
+  dominates it over the placement window (the same share and ops floor as a
+  grant), the grant has been with its holder for the minimum tenure (30 s;
+  counted from the grant, the stream's last growth or the last change of hands
+  of the directory, so a new root counts from when it learned the grant), and the
+  node can be given the subtree (`place_eligible` and `place_kind_for` accept it;
+  the root itself always can), the root sends `ReleaseRequest { why: Handover }`
+  for that directory. One request per directory is in flight. It is a request: the
+  stream is not recalled, its slot stays open, nothing is counted as the root
+  ending a sticky grant. The resend timer repeats it as a handover, never as a
+  recall of the stream. A request nobody answered within `handover_patience`
+  (grace + 2 forward timeouts, a derived bound) is dropped, not escalated; the
+  next tick may ask again.
+- **When the holder releases** (H-I5): at once when none of its own ops is in
+  flight in the subtree (a parked own op, or an op admitted by the engine's fast
+  path), else once its own ops there have been idle for the grace (5 s). Ops
+  forwarded by other nodes never count. The release is the holder's own, by step
+  5's drain: the subtree leaves the fast path's view at the step that makes the
+  command and the row goes only once a sample the driver took after that step
+  shows no admitted op under it. A wait expires `handover_patience` after the
+  root last asked. A designated stream ignores the request.
+- **The grant** (H-I2): the root grants the subtree to the requester only after
+  the holder's release row is in its log, and after the ops it held for the
+  subtree have run, by the placement's kind rule (sticky for a far node, placed
+  for one with a group, the root's own sticky grant for the root itself, else the
+  root's keys). A grant the read delegations under the subtree or the quarantine
+  refuse is retried every tick until the placement window runs out or the
+  requester stops dominating. Forwards routed by the old holder's generation that
+  arrive after its row are fenced there (ADR-47 rule 1) and re-routed.
+- **The root as the holder or the requester** goes through the same paths as any
+  other node: the root's request to its own stream is a message to itself
+  delivered inline (ADR-55), and the grant to the root is its own sticky grant.
+- **Read delegations** (close-to-open, [ADR-46](#adr-46-a-restarted-holders-writes-wait-for-the-read-delegations-its-previous-process-granted)):
+  the holder's release row, and the grant to the requester, each wait for the read
+  delegations under the subtree to be recalled. The requester keeps reading the
+  subtree (every write is a lookup), so no read delegation is granted under it
+  from the request on: not by the root path (under a subtree it asked its holder
+  to hand over, or under its own stream's, released or not), not by a stream for a
+  subtree it released, and not under the directory of a sticky grant whose
+  read delegations are being recalled (as a growing stream already did). Found by
+  the harness: without it the handover of a root's own subtree never completed.
+- **Settings**: `CONSTELLATION_STICKY_HANDOVER_TENURE_MS` (30 s) and
+  `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` (5 s). Test-only faults:
+  `handover_ends_sticky` (the root recalls the stream instead of asking),
+  `handover_ignores_tenure`, `handover_grants_before_release`.
+
+**Consequences**: no root-initiated end of a sticky grant is added; at most one
+change of hands per tenure per subtree; a writer that moves is forwarded (final,
+WAN round trip) for up to a window plus the tenure plus the grace; a holder that
+keeps writing keeps its subtree; the engine no longer stops the fast path on a
+handover request. The simulation checks `handover_tenure` and
+`one_off_no_handover` strictly on every configuration. Found by the simulation:
+a root's own client op that had been forwarded to the old holder is the root's
+own stream's once the root is handed the subtree, not the root path's.
+
+**Deferred**: a placed grant moving by handover too (it keeps the 50 % leave
+term and `CONSTELLATION_DELEGATION_LEAVE`); a request for a placed grant is
+answered by the holder as a recall would be, after the drain.
+
+**Rejected**: a root-side recall after a timeout (it breaks the guarantee that the
+root never takes a sticky grant back); a first-write trigger (ping-pong).
+
+**May revert**: the tenure can be raised to stop handovers in practice.
+
+See: `crates/authority/src/core/placement.rs` (`place_handover_requests`,
+`handover_tick`, `handover_grant`), `crates/authority/src/core/delegate.rs`
+(`request_handover`, `root_release_appended`, `on_handover_request`,
+`handover_progress`), `crates/model` (chunk 7, topologies H1 and H2).

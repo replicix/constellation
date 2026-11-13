@@ -207,3 +207,82 @@ systems (the largest, `rename` 1.22/1.23 on xfs and btrfs, is 83 to 101 us and
 sample per run, and the other way round on two file systems; the one 1.40
 (tmpfs `root-own` `write`, 159 to 222 us) is the tmpfs's own spread, 1.01 to
 1.01 on the three other file systems, where the cell is the fsync.
+
+## Plan 46 M1.3 step 8, the sticky handover (ADR-56): topologies 3 and 7, and the fast path's admission
+
+A = `origin/main` before the step (`77b3a43a`), B = the step's tip; ABBA (A B, B A),
+two rounds, 100 samples per op and run, one box that other jobs share at times (the
+1-minute load before each run: 0.04 to 2.4), the harness's own daemons, each file system
+as the `TMPDIR` (`ext4` and `xfs` on loop images, `btrfs` the box's root, `tmpfs`).
+Topology 7 (`7-wan-sticky`) runs under `net-wan`. Median over the runs of p50 / p90 (us);
+B/A of the p50. The ops on the delegate's fast path (topology 3 `delegate`, topology 7
+`sticky`) are the ones the handover's per-subtree activity record could touch; they are
+neutral within the noise of two runs on every file system (0.78 to 1.21 for 100 us ops on
+the sticky holder in topology 7, both ways; the tmpfs and ext4 rows above 1.1 are within
+that noise, and the same ops with the handover off in both are neutral, below). In B the
+forwarding writer's ops of topology 7 (`forward-to-sticky`, not tabulated) take 50 to 200
+us where A's take the 120 ms round trip: consistent with the writer dominating the
+holder's subtree for the length of the run and being handed it, the handover being on at
+its defaults here (an A row of 58 ms for `sticky create` on ext4 is a slow run of A).
+
+| file system | topology / actor / op | A | B | B/A |
+|---|---|---|---|---|
+| tmpfs | 3 delegate chmod | 662 / 841 | 661 / 862 | 1.00 |
+| tmpfs | 3 delegate create | 695 / 823 | 685 / 839 | 0.99 |
+| tmpfs | 3 delegate rename | 695 / 835 | 693 / 818 | 1.00 |
+| tmpfs | 3 delegate unlink | 665 / 828 | 676 / 849 | 1.02 |
+| tmpfs | 3 delegate write | 760 / 917 | 730 / 880 | 0.96 |
+| tmpfs | 7 sticky chmod | 73 / 113 | 87 / 131 | 1.19 |
+| tmpfs | 7 sticky create | 104 / 135 | 122 / 142 | 1.17 |
+| tmpfs | 7 sticky first_under_grant | 298 / 298 | 234 / 234 | 0.79 |
+| tmpfs | 7 sticky rename | 155 / 206 | 160 / 201 | 1.03 |
+| tmpfs | 7 sticky unlink | 114 / 150 | 119 / 150 | 1.04 |
+| tmpfs | 7 sticky write | 182 / 321 | 215 / 335 | 1.18 |
+| ext4 | 3 delegate chmod | 664 / 838 | 673 / 854 | 1.01 |
+| ext4 | 3 delegate create | 727 / 837 | 699 / 853 | 0.96 |
+| ext4 | 3 delegate rename | 715 / 860 | 704 / 849 | 0.98 |
+| ext4 | 3 delegate unlink | 676 / 806 | 698 / 837 | 1.03 |
+| ext4 | 3 delegate write | 7112 / 12257 | 7164 / 12313 | 1.01 |
+| ext4 | 7 sticky chmod | 76 / 104 | 92 / 125 | 1.21 |
+| ext4 | 7 sticky create | 58600 / 68483 | 122 / 158 | 0.00 |
+| ext4 | 7 sticky first_under_grant | 67618 / 67618 | 275 / 275 | 0.00 |
+| ext4 | 7 sticky rename | 134 / 167 | 143 / 188 | 1.07 |
+| ext4 | 7 sticky unlink | 92 / 123 | 116 / 150 | 1.26 |
+| ext4 | 7 sticky write | 6504 / 9548 | 6550 / 12235 | 1.01 |
+| xfs | 3 delegate chmod | 690 / 861 | 681 / 859 | 0.99 |
+| xfs | 3 delegate create | 693 / 824 | 707 / 849 | 1.02 |
+| xfs | 3 delegate rename | 709 / 859 | 729 / 856 | 1.03 |
+| xfs | 3 delegate unlink | 675 / 815 | 689 / 833 | 1.02 |
+| xfs | 3 delegate write | 6761 / 8690 | 6842 / 8701 | 1.01 |
+| xfs | 7 sticky chmod | 87 / 129 | 90 / 129 | 1.03 |
+| xfs | 7 sticky create | 116 / 148 | 111 / 154 | 0.96 |
+| xfs | 7 sticky first_under_grant | 343 / 343 | 228 / 228 | 0.66 |
+| xfs | 7 sticky rename | 128 / 184 | 105 / 142 | 0.82 |
+| xfs | 7 sticky unlink | 127 / 163 | 127 / 172 | 1.00 |
+| xfs | 7 sticky write | 6226 / 8766 | 6149 / 8658 | 0.99 |
+| btrfs | 3 delegate chmod | 646 / 814 | 644 / 828 | 1.00 |
+| btrfs | 3 delegate create | 726 / 844 | 688 / 809 | 0.95 |
+| btrfs | 3 delegate rename | 695 / 844 | 713 / 866 | 1.03 |
+| btrfs | 3 delegate unlink | 689 / 869 | 690 / 837 | 1.00 |
+| btrfs | 3 delegate write | 3690 / 3884 | 3708 / 3924 | 1.00 |
+| btrfs | 7 sticky chmod | 92 / 139 | 92 / 118 | 1.00 |
+| btrfs | 7 sticky create | 110 / 154 | 103 / 126 | 0.94 |
+| btrfs | 7 sticky first_under_grant | 242 / 242 | 214 / 214 | 0.88 |
+| btrfs | 7 sticky rename | 160 / 208 | 158 / 215 | 0.99 |
+| btrfs | 7 sticky unlink | 131 / 166 | 122 / 166 | 0.93 |
+| btrfs | 7 sticky write | 3189 / 3801 | 3130 / 3721 | 0.98 |
+
+With the handover off in both (`CONSTELLATION_STICKY_HANDOVER_TENURE_MS=100000000`, four
+rounds, topology 7): tmpfs, the holder's ops 0.78 to 1.05 (p50), the forwarded ones 0.99 to
+1.03; ext4, the holder's ops 0.83 to 1.12 (create 1.06, rename 1.12, unlink 0.83, write
+0.99; 82 to 163 us), the forwarded ones 0.99 to 1.03: both directions, so the noise of
+100 us ops on this box, not a cost.
+
+The delegate fast path's admission itself (`DelegateView::admit_for`, an ignored
+microbenchmark, `cargo test --release -p constellation-engine --lib admit_for_threads --
+--ignored --nocapture`), A = the same test on the parent, three rounds ABBA, ns per
+admission per thread (median): 1 thread A 337, B 343 (1.018); 16 threads A 14377, B 14663
+(1.020, the entries lock is the whole cost, as in A); 64 threads A 64338, B 65960
+(1.025). The cost B adds is a lookup in the per-subtree record and two atomics under the
+lock the admission holds anyway (the earlier third global mutex of the first version
+is gone): about 7 ns on an admission that precedes a 600 us op.

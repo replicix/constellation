@@ -1143,6 +1143,14 @@ lease and one log
   those back while the stream's rows stay);
   a deposed root that is alive keeps the grant and streams it to the next root
   ([ADR-55](DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)).
+  A sticky subtree follows its dominant writer by *handover*: when another node
+  dominates it, and the grant has been with its holder for the minimum tenure
+  (30 s), the root asks the holder to release it; the holder does at once when
+  none of its own ops is in flight there, else once they have been idle for the
+  grace (5 s), and the root grants the subtree to the requester after the
+  holder's release row. The root never ends a sticky grant itself; the writer is
+  forwarded (final, at the round trip) meanwhile
+  ([ADR-56](DECISIONS.md#adr-56-a-sticky-grant-changes-hands-only-by-its-holders-release-asked-for-a-dominant-writer)).
 - **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
   clock stamps (a peer's stamp more than `CONSTELLATION_HLC_SKEW_TOLERANCE_S`
   ahead is applied but not followed by the clock) merged by `max` and

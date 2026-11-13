@@ -710,6 +710,69 @@ mod tests {
         );
     }
 
+    /// ADR-56 review P1 (`cargo test --release -p constellation-engine --lib
+    /// admit_for_threads -- --ignored --nocapture`): the delegate fast path's
+    /// admission under 1, 16 and 64 threads of one view, a create in a
+    /// delegated directory admitted and dropped in a loop. The cost of the
+    /// handover's per-subtree activity record (kept under the entries lock the
+    /// admission takes anyway) shows as the ns per admission; compare two builds
+    /// with the same test.
+    #[test]
+    #[ignore = "a microbenchmark"]
+    fn admit_for_threads() {
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::{LogRecord, Meta, MutateOp};
+        let meta = Meta::open_in_memory().unwrap();
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        meta.apply_records(&[
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino: dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Sticky),
+        ])
+        .unwrap();
+        let view = DelegateView::default();
+        view.mirror(&constellation_authority::core::DelegView {
+            mine: vec![(vec![dir], 7, i64::MAX / 2, false, 0, 0, 0, String::new())],
+            ..Default::default()
+        });
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let now = Now::same(0);
+        const PER_THREAD: u64 = 200_000;
+        for threads in [1u64, 16, 64] {
+            let t0 = std::time::Instant::now();
+            std::thread::scope(|sc| {
+                for _ in 0..threads {
+                    sc.spawn(|| {
+                        for _ in 0..PER_THREAD {
+                            let a = view.admit_for(&meta, &op, now);
+                            std::hint::black_box(&a);
+                        }
+                    });
+                }
+            });
+            let ns = t0.elapsed().as_nanos() as u64;
+            eprintln!(
+                "ADMIT threads {threads}: {} ns per admission per thread, {:.0} k admissions/s",
+                ns / PER_THREAD,
+                (threads * PER_THREAD) as f64 / (ns as f64 / 1e9) / 1e3
+            );
+        }
+    }
+
     /// ADR-56: the engine does not stop the fast path on a handover request
     /// (nor ask the caller to wait for it); a recall does.
     #[test]
@@ -1060,7 +1123,11 @@ impl DelegateView {
         let act = acts.entry((gen, d.dir)).or_default().clone();
         act.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        act.noted.store(true, std::sync::atomic::Ordering::Relaxed);
+        // (Written only when it is not set: the line is shared by every thread
+        // that admits under the subtree.)
+        if !act.noted.load(std::sync::atomic::Ordering::Relaxed) {
+            act.noted.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         drop(g);
         Some(DelegateAdmission {
             gen,
