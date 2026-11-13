@@ -27,10 +27,6 @@ pub struct CloneNode {
     pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
-/// ADR-59 part B (D1): the identity a `DropHeld` names a refused queued
-/// replay by: no transaction (journal seqs start at 1), so nothing retires.
-pub const QUEUED_REPLAY_IDENT: (u64, u64) = (0, 0);
-
 /// One metadata operation.
 ///
 /// Externally tagged so the same `Serialize` impl works for postcard
@@ -373,15 +369,15 @@ pub enum LogRecord {
     /// the stream's order: once the stream reaches the index below it (a row
     /// the drop redid below a fill lands after the record).
     ///
-    /// A `rolled_back` entry whose identity is [`QUEUED_REPLAY_IDENT`]
-    /// names a queued replay of the dropper's (a row an earlier deposition
-    /// took out of its journal) that the drop refuses: there is no
-    /// transaction to retire, only the rid.
+    /// `queued` are the rids of the queued replays of the dropper's (rows an
+    /// earlier deposition took out of its journal) that the drop refuses:
+    /// there is no transaction to retire, only the rid.
     DropHeld {
         ino: Ino,
         chunks: Vec<replicix_chunkfmt::ChunkHash>,
         rolled_back: Vec<((u64, u64), Option<Rid>)>,
         fills: Vec<(u64, u64)>,
+        queued: Vec<Rid>,
     },
     /// Plan 46 M1.2 step 8a (§5.2): the root grants `node` the subtrees
     /// `dirs` under generation `gen`: the generation opens with its first

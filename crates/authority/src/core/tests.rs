@@ -66838,6 +66838,7 @@ mod kept_fetch {
                     chunks: Vec::new(),
                     rolled_back: vec![((1, txs[0].first), None)],
                     fills: Vec::new(),
+                    queued: Vec::new(),
                 }],
                 &Default::default(),
             )
@@ -67706,6 +67707,7 @@ mod kept_fetch {
                     chunks: Vec::new(),
                     rolled_back: vec![((7, 40), None)],
                     fills: Vec::new(),
+                    queued: Vec::new(),
                 }],
                 &Default::default(),
             )

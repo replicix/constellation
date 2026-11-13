@@ -1770,12 +1770,9 @@ pub(crate) fn rolled_back_idents<'a>(
     records
         .into_iter()
         .filter_map(|rec| match rec {
-            LogRecord::DropHeld { rolled_back, .. } => Some(
-                rolled_back
-                    .iter()
-                    .map(|(ident, _)| *ident)
-                    .filter(|ident| *ident != crate::record::QUEUED_REPLAY_IDENT),
-            ),
+            LogRecord::DropHeld { rolled_back, .. } => {
+                Some(rolled_back.iter().map(|(ident, _)| *ident))
+            }
             _ => None,
         })
         .flatten()
@@ -1799,16 +1796,10 @@ impl Meta {
         tx: &mut SingleWriterWriteTx,
         idents: &BTreeSet<(u64, u64)>,
     ) {
-        // (A refused queued replay's entry names no transaction.)
-        let mut any = false;
         for (epoch, jseq) in idents {
-            if (*epoch, *jseq) == crate::record::QUEUED_REPLAY_IDENT {
-                continue;
-            }
             tx.insert(&self.local, retired_key(*epoch, *jseq), Vec::new());
-            any = true;
         }
-        if any {
+        if !idents.is_empty() {
             self.any_retired
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
