@@ -310,6 +310,11 @@ fn replay_seed() {
         Ok("far-placement-release") => far_placement_release_config(),
         Ok("sticky-idle-release") => sticky_idle_release_config(),
         Ok("sticky-handover-ping-pong") => sticky_handover_ping_pong_config(),
+        Ok("sticky-handover-ping-pong-root-writes") => {
+            sticky_handover_ping_pong_root_writes_config()
+        }
+        Ok("sticky-handover-root") => sticky_handover_root_config(),
+        Ok("sticky-handover-crash") => sticky_handover_crash_config(),
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
@@ -2064,22 +2069,96 @@ fn sticky_idle_release_config() -> SimConfig {
     }
 }
 
-/// Plan 46 M1.3 step 0, a stub. Once step 5 lands: two nodes alternate
-/// writes in one subtree with gaps above the grace; the grant changes hands
-/// at most once per minimum tenure and a one-off write forwards without a
-/// handover (the oracle reports the handover count). Today: one shared
-/// directory, placement on, every pair far.
+/// Plan 46 M1.3 step 8 (ADR-56): three nodes, every pair far, one shared
+/// subtree. Nodes 2 and 3 write it in turn (windows of 4 s with gaps above
+/// the grace, `writer_phases`); the first writer is granted it sticky by the
+/// placement, and each time the other comes to dominate it the root asks the
+/// holder to hand it over, which the holder does once it is quiet. The root
+/// writes nothing here (`sticky-handover-ping-pong-root-writes`: two one-op
+/// writes, the one-offs `one_off_no_handover` judges: never a handover to the
+/// root). Strict: `handover_tenure` (a subtree changes hands at most once
+/// per minimum tenure), `one_off_no_handover`,
+/// `sticky_ends_only_by_holder_or_operator`, `acked_at_or_below_cut`, I1, I2
+/// and I5 (a `Final` answer is never rolled back).
 fn sticky_handover_ping_pong_config() -> SimConfig {
     SimConfig {
-        core: std::sync::Arc::new(sim::run::placement_core_config),
-        ..SimConfig {
-            nodes: 2,
-            dirs: vec!["shared".into()],
-            delegations: Vec::new(),
-            sticky_delegations: Vec::new(),
-            shared_dir: true,
-            ..far_root_writes_config()
-        }
+        core: std::sync::Arc::new(sim::run::placement_backup_core_config),
+        nodes: 3,
+        clients_per_node: 1,
+        // (Only the windows below write.)
+        ops_per_client: 0,
+        names: 4,
+        random_faults: 0,
+        dirs: vec!["shared".into()],
+        delegations: Vec::new(),
+        sticky_delegations: Vec::new(),
+        shared_dir: true,
+        cross_ratio: 0.0,
+        faults: Vec::new(),
+        writer_phases: vec![
+            (2, 1_000, 5_000),
+            (3, 7_500, 11_500),
+            (2, 14_000, 18_000),
+            (3, 20_500, 24_500),
+            (2, 27_000, 31_000),
+        ],
+        one_off_nodes: vec![1],
+        strict_lone: true,
+        ..far_config()
+    }
+}
+
+/// ADR-56: `sticky-handover-ping-pong` with node 1 (the root) writing the
+/// subtree in two windows of its own; the root's one-offs are the ping-pong's.
+fn sticky_handover_ping_pong_root_writes_config() -> SimConfig {
+    let mut config = sticky_handover_ping_pong_config();
+    config.writer_phases.push((1, 6_000, 6_100));
+    config.writer_phases.push((1, 19_000, 19_100));
+    config
+}
+
+/// ADR-56: two nodes, far. Node 2 holds `d1` sticky and writes it for 2.5 s;
+/// then the root becomes the dominant writer of `d1` (its ops are forwarded
+/// to node 2, answered final at the round trip). The root asks node 2, which
+/// is idle by then, and takes the subtree back as its own sticky grant
+/// (ADR-55), the same grant path as any other requester.
+fn sticky_handover_root_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::placement_backup_core_config),
+        nodes: 2,
+        clients_per_node: 1,
+        ops_per_client: 0,
+        names: 4,
+        random_faults: 0,
+        dirs: vec!["d1".into()],
+        delegations: Vec::new(),
+        sticky_delegations: vec![("d1".into(), 2)],
+        shared_dir: true,
+        cross_ratio: 0.0,
+        faults: Vec::new(),
+        writer_phases: vec![(2, 500, 3_000), (1, 4_000, 12_000)],
+        strict_lone: true,
+        ..far_config()
+    }
+}
+
+/// ADR-56: the ping-pong with node 2, the first holder, crashed with its
+/// journal at 9.1 s (about when node 3, the second writer, has come to
+/// dominate and the root asks for the handover) and back 2.5 s later. No
+/// grant to node 3 without node 2's release row; the handover completes after
+/// node 2's return or the request is dropped (`place_handover_expired`) and
+/// asked again.
+fn sticky_handover_crash_config() -> SimConfig {
+    SimConfig {
+        faults: vec![ScheduledFault {
+            at_ms: 9_100,
+            kind: FaultKind::CrashNode {
+                node: 2,
+                restart_ms: Some(2_500),
+                keep_journal: true,
+            },
+        }],
+        ..sticky_handover_ping_pong_config()
     }
 }
 
@@ -7375,6 +7454,9 @@ fn base_config(label: &str) -> SimConfig {
         "far-placement-release" => far_placement_release_config(),
         "sticky-idle-release" => sticky_idle_release_config(),
         "sticky-handover-ping-pong" => sticky_handover_ping_pong_config(),
+        "sticky-handover-ping-pong-root-writes" => sticky_handover_ping_pong_root_writes_config(),
+        "sticky-handover-root" => sticky_handover_root_config(),
+        "sticky-handover-crash" => sticky_handover_crash_config(),
         "sticky-holder-dies" => sticky_holder_dies_config(),
         "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-holder-restarts" => sticky_holder_restarts_config(),
@@ -9700,6 +9782,11 @@ struct OracleTotals {
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
+    /// ADR-56: the core's handover counters and the handovers the oracle
+    /// judged (`Report::handover_core`), and the shortest gap between a grant
+    /// and the handover grant after it (0: none).
+    handover_core: [u64; 12],
+    handover_min_gap_ms: u64,
     sticky_release_rows_judged: u64,
     /// Plan 46 M1.3 step 13: I5's operator branch (rows of abandoned streams
     /// rolled back past their cut), and the seeds with one.
@@ -10105,6 +10192,15 @@ impl OracleTotals {
         for (t, c) in self.sticky_driver.iter_mut().zip(r.sticky_driver) {
             *t += c;
         }
+        for (t, c) in self.handover_core.iter_mut().zip(r.handover_core) {
+            *t += c;
+        }
+        if r.handover_min_gap_ms > 0 {
+            self.handover_min_gap_ms = match self.handover_min_gap_ms {
+                0 => r.handover_min_gap_ms,
+                m => m.min(r.handover_min_gap_ms),
+            };
+        }
         self.i4 += r.late_landings;
         self.i4_settled += r.settled_landings;
         self.isolated_s3[0] += r.landings_isolated_from_s3;
@@ -10324,6 +10420,27 @@ impl OracleTotals {
             self.root_own_core[12],
             self.root_own_core[13],
             self.root_own_core[14]
+        );
+        eprintln!(
+            "HANDOVER-TOTALS {label} seeds {}/{seeds}: requested {} (`deleg_handovers_requested`), granted after the row {} (`place_handover_granted`), \
+             grants judged by the oracle {}, shortest gap between a grant and the next handover grant {} ms, dropped unanswered {} (`place_handover_expired`), \
+             held back by the tenure {}, by eligibility {}, grants dropped {}; holder: waits {}, released {}, ignored {}, expired {}, given up {}; \
+             inbox-only forwards refused in the root's own stream {}",
+            self.seeds,
+            self.handover_core[0],
+            self.handover_core[1],
+            self.handover_core[11],
+            self.handover_min_gap_ms,
+            self.handover_core[2],
+            self.handover_core[3],
+            self.handover_core[4],
+            self.handover_core[5],
+            self.handover_core[6],
+            self.handover_core[7],
+            self.handover_core[8],
+            self.handover_core[9],
+            self.handover_core[10],
+            self.root_own_core[9]
         );
         eprintln!(
             "QUARANTINE-TOTALS {label} seeds {}/{seeds}: restart quarantines {}, own writes parked {}, forwards answered Held {}, \
@@ -21099,6 +21216,123 @@ fn far_root_writes_and_the_sticky_stubs_run_in_report_mode() {
                 panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
             });
         }
+    }
+}
+
+/// ADR-56: the handover configurations run strict on 24 seeds each, and
+/// reach what they are written for: grants after a holder's release row
+/// (the ping-pong and the root's), requests the holder was quiet for, and
+/// the crash variant's requests dropped or completed after the holder's
+/// return. `handover_tenure`, `one_off_no_handover` and
+/// `sticky_ends_only_by_holder_or_operator` are strict on every configuration.
+#[test]
+fn the_handover_configurations_hand_subtrees_over_and_stay_strict() {
+    let cases = [
+        (
+            "sticky-handover-ping-pong",
+            sticky_handover_ping_pong_config(),
+        ),
+        (
+            "sticky-handover-ping-pong-root-writes",
+            sticky_handover_ping_pong_root_writes_config(),
+        ),
+        ("sticky-handover-root", sticky_handover_root_config()),
+        ("sticky-handover-crash", sticky_handover_crash_config()),
+    ];
+    for (label, config) in cases {
+        let (mut requested, mut granted, mut judged, mut released) = (0, 0, 0, 0);
+        for seed in 0..24 {
+            let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            requested += r.handover_core[0];
+            granted += r.handover_core[1];
+            released += r.handover_core[7];
+            judged += r.handover_core[11];
+            assert_eq!(r.sticky_ended_unexcused, 0, "{label} seed {seed}");
+        }
+        assert!(
+            requested > 0,
+            "{label}: the root never asked for a handover"
+        );
+        assert!(
+            released > 0 && granted > 0 && judged > 0,
+            "{label}: no handover completed (requested {requested}, released {released}, \
+             granted {granted}, judged {judged})"
+        );
+    }
+}
+
+/// ADR-56: the negative controls. The root recalls the sticky stream instead
+/// of asking (`handover_ends_sticky`: `sticky_ends_only_by_holder_or_operator`),
+/// asks inside the tenure (`handover_ignores_tenure`: `handover_tenure`), and
+/// grants the requester before the holder's row (`handover_grants_before_release`:
+/// two sequencers for the subtree).
+#[test]
+fn the_handover_controls_fail_the_oracles() {
+    let controls: [(&str, SimConfig, &[&str]); 3] = [
+        (
+            "handover_ends_sticky",
+            SimConfig {
+                handover_ends_sticky: true,
+                ..sticky_handover_ping_pong_config()
+            },
+            &["sticky_ends_only_by_holder_or_operator"],
+        ),
+        (
+            "handover_ignores_tenure",
+            // (Writers that swap faster than the tenure, 3 s here: asked in
+            // time, the handover waits for it; with the knob it does not.)
+            SimConfig {
+                handover_ignores_tenure: true,
+                writer_phases: vec![
+                    (2, 1_000, 2_500),
+                    (3, 2_500, 5_500),
+                    (2, 5_500, 8_500),
+                    (3, 8_500, 11_500),
+                ],
+                ..sticky_handover_ping_pong_config()
+            },
+            &["handover_tenure"],
+        ),
+        (
+            "handover_grants_before_release",
+            SimConfig {
+                handover_grants_before_release: true,
+                ..sticky_handover_ping_pong_config()
+            },
+            &[
+                "I1",
+                "I2",
+                "I5",
+                "linearizab",
+                "per-key",
+                "converge",
+                "unexpected client outcome",
+                "did not reach quiescence",
+            ],
+        ),
+    ];
+    for (name, config, expect) in controls {
+        let (mut failed, mut named) = (0, 0);
+        for seed in 0..120 {
+            if let Err(e) = run_seed(seed, config.clone()) {
+                assert!(
+                    expect.iter().any(|x| e.contains(x)),
+                    "{name} seed {seed} failed something else: {e}"
+                );
+                failed += 1;
+                named += usize::from(e.contains(expect[0]));
+            }
+        }
+        assert!(failed > 0, "{name}: no seed failed an oracle");
+        // (The last control's two sequencers show as whichever of the list
+        // the schedule reaches first: it need not be the first.)
+        assert!(
+            named > 0 || name == "handover_grants_before_release",
+            "{name}: no seed failed {}",
+            expect[0]
+        );
     }
 }
 

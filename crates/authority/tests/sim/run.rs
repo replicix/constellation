@@ -540,6 +540,15 @@ pub struct SimConfig {
     /// Negative control (`Config::own_stream_honours_on_record`, ADR-55): R-H without its second half: the root's own stream is honoured when the archive carries its record, whatever root rows of its keys are unshipped; a deposition then rolls such a row back after the stream's rows and I5 / the per-key order must fail the run.
     /// `AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD=1` sets it on every configuration.
     pub own_stream_honours_on_record: bool,
+    /// Negative control (`Config::handover_ends_sticky`, ADR-56): the root recalls a sticky stream instead of asking its holder to hand a subtree over; sticky_ends_only_by_holder_or_operator must fail the run.
+    /// `AUTHORITY_SIM_HANDOVER_ENDS_STICKY=1` sets it on every configuration.
+    pub handover_ends_sticky: bool,
+    /// Negative control (`Config::handover_ignores_tenure`, ADR-56): the root asks for a handover inside the grant's minimum tenure; handover_tenure must fail the run.
+    /// `AUTHORITY_SIM_HANDOVER_IGNORES_TENURE=1` sets it on every configuration.
+    pub handover_ignores_tenure: bool,
+    /// Negative control (`Config::handover_grants_before_release`, ADR-56): the root grants the requester in the request's event, over the holder's live subtree; I2 / the per-key order must fail the run.
+    /// `AUTHORITY_SIM_HANDOVER_GRANTS_BEFORE_RELEASE=1` sets it on every configuration.
+    pub handover_grants_before_release: bool,
     /// Negative control (`Config::kept_fetch_skipped`, ADR-51): a takeover
     /// never collects the kept rows of the tenure it ends.
     /// `AUTHORITY_SIM_KEPT_FETCH_SKIPPED=1` sets it on every configuration;
@@ -789,6 +798,15 @@ pub struct SimConfig {
     /// `ops_per_client` they would have (the draws stay the same), so one
     /// node can write early and another late.
     pub client_plan: Vec<(NodeId, u64, usize)>,
+    /// Plan 46 M1.3 step 8 (ADR-56): `(node, start_ms, end_ms)`: that node's
+    /// clients write only inside these windows of the run (they sleep until a
+    /// window opens and skip what is left of it once it closes), at a
+    /// steady pace; with `shared_dir` the writers of different windows
+    /// alternate in one subtree. A node with no window writes as before.
+    pub writer_phases: Vec<(NodeId, u64, u64)>,
+    /// ADR-56 (`one_off_no_handover`): nodes whose writes in the shared
+    /// subtree are one-offs; the root must never ask for a handover to one.
+    pub one_off_nodes: Vec<NodeId>,
     /// Plan 43 C7-F F-a0 L3: only the clients of these nodes take locks
     /// (`lock_ratio`); empty: every node's do. A node whose clients take
     /// none sends its tenure no lock request, which would mark its lease
@@ -1241,6 +1259,14 @@ impl Default for SimConfig {
                 "AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD",
             )
             .is_some_and(|v| v == "1"),
+            handover_ends_sticky: std::env::var_os("AUTHORITY_SIM_HANDOVER_ENDS_STICKY")
+                .is_some_and(|v| v == "1"),
+            handover_ignores_tenure: std::env::var_os("AUTHORITY_SIM_HANDOVER_IGNORES_TENURE")
+                .is_some_and(|v| v == "1"),
+            handover_grants_before_release: std::env::var_os(
+                "AUTHORITY_SIM_HANDOVER_GRANTS_BEFORE_RELEASE",
+            )
+            .is_some_and(|v| v == "1"),
             kept_fetch_skipped: std::env::var_os("AUTHORITY_SIM_KEPT_FETCH_SKIPPED")
                 .is_some_and(|v| v == "1"),
             parent_taint_conservative: std::env::var_os("AUTHORITY_SIM_PARENT_TAINT_CONSERVATIVE")
@@ -1308,6 +1334,8 @@ impl Default for SimConfig {
             holder_beats: HolderBeats::Off,
             reader_nodes: Vec::new(),
             client_plan: Vec::new(),
+            writer_phases: Vec::new(),
+            one_off_nodes: Vec::new(),
             lock_nodes: Vec::new(),
             live_holder: false,
             beats_lost: false,
@@ -1627,6 +1655,16 @@ pub struct Report {
     /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
     /// (`wait`), unanswered or refused (`wait`), granted again.
     pub sticky_driver: [u64; 4],
+    /// ADR-56, the core's counters summed over the nodes: handover requests
+    /// sent, grants after a release row, requests dropped unanswered,
+    /// candidates held back by the tenure, by eligibility, grants dropped,
+    /// the holder's waits, releases, ignored requests, expired waits, releases
+    /// that gave up; and, last, the handovers the oracle judged (grants by
+    /// handover in the run's record).
+    pub handover_core: [u64; 12],
+    /// `handover_tenure`: the shortest time between a grant of a directory and
+    /// the handover grant that followed it (ms; `0`: no handover).
+    pub handover_min_gap_ms: u64,
     /// Release rows of holders the drain oracle judged against the root's
     /// appended index (`Oracles::note_release_rows`).
     pub sticky_release_rows_judged: u64,
@@ -2218,6 +2256,9 @@ async fn panic_watch() -> String {
 const STATERIGHT_EVENT_BOUND: usize = 80;
 const STATERIGHT_TENTATIVE_BOUND: usize = 6;
 
+/// ADR-56 (`SimConfig::writer_phases`): the pace of a phased writer, ms per op.
+const PHASE_PACE_MS: u64 = 80;
+
 /// One step of a simulated client.
 #[derive(Clone, Debug)]
 pub enum Step {
@@ -2228,6 +2269,12 @@ pub enum Step {
     PacedRead(String),
     /// `SimConfig::client_plan`: the client starts after this many ms.
     Delay(u64),
+    /// `SimConfig::writer_phases`: sleep until the run's clock reads this many
+    /// ms (not at all if it does already), and clear the window below.
+    SleepUntil(u64),
+    /// `SimConfig::writer_phases`: the writes that follow are skipped once the
+    /// run's clock reads this many ms, up to the next `SleepUntil`.
+    Until(u64),
     /// Fix "capture under an epoch hold": write the file (a manifest
     /// naming one fresh chunk, dirty on this node).
     Write(String),
@@ -2427,7 +2474,16 @@ async fn client_thread(
     strict: bool,
     ignore_fence: bool,
 ) {
+    let mut window_end: Option<u64> = None;
     for step in steps {
+        if let (Some(end), Step::Op(_)) = (window_end, &step) {
+            let now = SIM_START
+                .with(|t| t.get())
+                .map_or(0, |t| t.elapsed().as_millis() as u64);
+            if now >= end {
+                continue;
+            }
+        }
         let (op, write) = match step {
             Step::Op(op) => (Some(op), None),
             Step::Write(name) => (None, Some(name)),
@@ -2445,6 +2501,18 @@ async fn client_thread(
             }
             Step::Delay(ms) => {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
+                continue;
+            }
+            Step::SleepUntil(at) => {
+                window_end = None;
+                let now = SIM_START
+                    .with(|t| t.get())
+                    .map_or(0, |t| t.elapsed().as_millis() as u64);
+                tokio::time::sleep(Duration::from_millis(at.saturating_sub(now))).await;
+                continue;
+            }
+            Step::Until(end) => {
+                window_end = Some(end);
                 continue;
             }
             Step::PacedRead(name) => {
@@ -2631,7 +2699,13 @@ async fn client_thread(
                         }
                         history.ret(thread, rid, ret);
                     }
-                    Err(e) => failures.lock().unwrap().push(e),
+                    Err(e) => failures.lock().unwrap().push(format!(
+                        "{e} (rid({},{},{}), {op:?}, node {node}, t={} ms)",
+                        rid.node,
+                        rid.incarnation,
+                        rid.seq,
+                        cluster.env.clock.elapsed_ms()
+                    )),
                 },
                 // Production answers `EIO` and the application retries with a
                 // new operation, a fresh rid (`mutate_op_rebasable`; only an
@@ -5387,6 +5461,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         deposed_root_strands_own_stream: cfg.deposed_root_strands_own_stream,
         root_executes_under_own_grant: cfg.root_executes_under_own_grant,
         own_stream_honours_on_record: cfg.own_stream_honours_on_record,
+        handover_ends_sticky: cfg.handover_ends_sticky,
+        handover_ignores_tenure: cfg.handover_ignores_tenure,
+        handover_grants_before_release: cfg.handover_grants_before_release,
         kept_fetch_skipped: cfg.kept_fetch_skipped,
         parent_taint_conservative: cfg.parent_taint_conservative,
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
@@ -5485,6 +5562,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             };
             let plan = cfg.client_plan.iter().find(|(n, _, _)| *n == node);
             let mut ops = ops;
+            // ADR-56: the windows this node writes in (`writer_phases`), at a
+            // steady pace, from a generator of their own (the draws above
+            // stay as they were).
+            let phases: Vec<(u64, u64)> = cfg
+                .writer_phases
+                .iter()
+                .filter(|(n, _, _)| *n == node)
+                .map(|(_, a, b)| (*a, *b))
+                .collect();
+            let phase_ops = |a: u64, b: u64| (b.saturating_sub(a) / PHASE_PACE_MS).max(1) as usize;
+            if !phases.is_empty() {
+                let total: usize = phases.iter().map(|(a, b)| phase_ops(*a, *b)).sum();
+                let mut phase_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x9ba5);
+                ops = gen_ops_unique(&mut phase_rng, total as u64, cfg.names, &home, node);
+            }
             if cfg.trunc_commit_ratio > 0.0 {
                 // (The draws above stay as they were: the workload is
                 // replaced after them.)
@@ -5501,10 +5593,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     .map(|i| NsOp::Create(pool[i % pool.len()].clone()))
                     .collect();
             }
-            if let Some((_, _, n)) = plan {
+            if let (Some((_, _, n)), true) = (plan, phases.is_empty()) {
                 ops.truncate(*n);
             }
             let pace = rng.random_range(20..400);
+            let pace = if phases.is_empty() {
+                pace
+            } else {
+                PHASE_PACE_MS
+            };
             // Reads draw from their own generator, so a config without
             // reads replays exactly the schedules it had before M6.
             let mut read_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x5e55);
@@ -5546,6 +5643,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             };
             if let Some((_, start, _)) = plan {
                 steps.insert(0, Step::Delay(*start));
+            }
+            if !phases.is_empty() {
+                let mut windowed = Vec::with_capacity(steps.len() + 2 * phases.len());
+                let mut rest = steps.into_iter();
+                for (a, b) in &phases {
+                    windowed.push(Step::SleepUntil(*a));
+                    windowed.push(Step::Until(*b));
+                    windowed.extend(rest.by_ref().take(phase_ops(*a, *b)));
+                }
+                steps = windowed;
             }
             if cfg.idle_gaps {
                 // (Its own generator: the other configurations' schedules
@@ -7528,7 +7635,31 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.quarantine_core[4] += s.deleg_read_grants_quarantined;
         report.quarantine_core[5] += s.deleg_restart_q_voided;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
+        for (t, v) in report.handover_core.iter_mut().zip([
+            s.deleg_handovers_requested,
+            s.place_handover_granted,
+            s.place_handover_expired,
+            s.place_handover_tenure,
+            s.place_handover_ineligible,
+            s.place_handover_grant_dropped,
+            s.deleg_handover_waits,
+            s.deleg_handover_released,
+            s.deleg_handover_ignored,
+            s.deleg_handover_expired,
+            s.deleg_handover_given_up,
+        ]) {
+            *t += v;
+        }
     }
+    // ADR-56 (`handover_tenure`, `one_off_no_handover`): judged from what the
+    // run saw the root ask and grant, dated by the run's clock.
+    let handover = judge_handover(
+        &oracles.hand_events.lock().unwrap(),
+        (cfg.core)(1, 1).handover_min_tenure_ms,
+        &cfg.one_off_nodes,
+    );
+    report.handover_core[11] = handover.handovers;
+    report.handover_min_gap_ms = handover.min_gap_ms;
     report.sticky_driver = *cluster.sticky_driver.lock().unwrap();
     // The holder's release waits for its drain (plan 46 M1.3 step 5), judged
     // from the root's side: the root had appended the stream through the row
@@ -7629,6 +7760,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             "sticky_ends_only_by_holder_or_operator",
             &found.sticky,
         ),
+        // ADR-56: strict on every configuration (they judge nothing without
+        // a handover).
+        (true, "handover_tenure", &handover.tenure),
+        (true, "one_off_no_handover", &handover.one_off),
         (cfg.strict_commit, "I1", &found.i1),
         (cfg.strict_commit, "class claim", &found.class_claim),
         (cfg.strict_commit, "row version", &found.row_version),
@@ -8426,4 +8561,70 @@ mod exec_identity_tests {
         );
         assert!(exec_identity(&norow).is_empty());
     }
+}
+
+/// What the run's handover record says (ADR-56).
+#[derive(Debug, Default)]
+pub struct HandoverFindings {
+    /// Grants made after a holder's release row.
+    pub handovers: u64,
+    /// The shortest gap between a grant of a directory and the handover grant
+    /// that followed it (ms; `0`: none).
+    pub min_gap_ms: u64,
+    /// `handover_tenure`: a handover grant inside the minimum tenure of the
+    /// grant before it.
+    pub tenure: Vec<String>,
+    /// `one_off_no_handover`: a handover requested for a one-off writer.
+    pub one_off: Vec<String>,
+}
+
+/// Judge the root's handover record, `(run ms, node, event)` in order.
+///
+/// `handover_tenure` (H-I3): the grants of one directory; a grant that follows
+/// its holder's release row (`handover`) comes at least the minimum tenure
+/// after the previous grant of that directory, whoever made it. The clocks of
+/// the nodes run within `rate_budget_ppm` of the run's (twice that between
+/// two grants), so the bound is the tenure less that error; the request the
+/// grant answers was itself a round trip later.
+pub fn judge_handover(
+    events: &[(u64, NodeId, constellation_authority::HandEvent)],
+    tenure_ms: u64,
+    one_off: &[NodeId],
+) -> HandoverFindings {
+    use constellation_authority::HandEvent;
+    let mut f = HandoverFindings::default();
+    let bound = tenure_ms.saturating_sub(tenure_ms / 250);
+    let mut last: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut min_gap: Option<u64> = None;
+    for (ms, node, e) in events {
+        match *e {
+            HandEvent::Requested { dir, to } => {
+                if one_off.contains(&to) {
+                    f.one_off.push(format!(
+                        "one_off_no_handover: node {node} asked the holder of directory {dir} \
+                         to hand it to node {to}, a one-off writer, at t={ms} ms"
+                    ));
+                }
+            }
+            HandEvent::Granted { dir, to, handover } => {
+                if handover {
+                    f.handovers += 1;
+                    if let Some(prev) = last.get(&dir) {
+                        let gap = ms.saturating_sub(*prev);
+                        min_gap = Some(min_gap.map_or(gap, |m: u64| m.min(gap)));
+                        if gap < bound {
+                            f.tenure.push(format!(
+                                "handover_tenure: directory {dir} was handed to node {to} at \
+                                 t={ms} ms, {gap} ms after it was last granted (the minimum \
+                                 tenure is {tenure_ms} ms)"
+                            ));
+                        }
+                    }
+                }
+                last.insert(dir, *ms);
+            }
+        }
+    }
+    f.min_gap_ms = min_gap.unwrap_or(0);
+    f
 }

@@ -527,6 +527,12 @@ pub struct NodeEnv {
     pub root_executes_under_own_grant: bool,
     /// See `SimConfig::own_stream_honours_on_record`.
     pub own_stream_honours_on_record: bool,
+    /// See `SimConfig::handover_ends_sticky`.
+    pub handover_ends_sticky: bool,
+    /// See `SimConfig::handover_ignores_tenure`.
+    pub handover_ignores_tenure: bool,
+    /// See `SimConfig::handover_grants_before_release`.
+    pub handover_grants_before_release: bool,
     /// See `SimConfig::kept_fetch_skipped`.
     pub kept_fetch_skipped: bool,
     /// See `SimConfig::parent_taint_conservative`.
@@ -888,6 +894,9 @@ impl NodeHandle {
         cfg.deposed_root_strands_own_stream = env.deposed_root_strands_own_stream;
         cfg.root_executes_under_own_grant = env.root_executes_under_own_grant;
         cfg.own_stream_honours_on_record = env.own_stream_honours_on_record;
+        cfg.handover_ends_sticky = env.handover_ends_sticky;
+        cfg.handover_ignores_tenure = env.handover_ignores_tenure;
+        cfg.handover_grants_before_release = env.handover_grants_before_release;
         cfg.kept_fetch_skipped = env.kept_fetch_skipped;
         cfg.restart_skips_write_quarantine = env.restart_skips_write_quarantine;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
@@ -4029,6 +4038,13 @@ impl Driver {
     fn dispatch(&mut self, actions: Vec<Action>) {
         // ADR-55: a release the root's holder side sent to its root side is
         // a release by the holder like any other.
+        // ADR-56: the root's handover requests and grants, dated by the run.
+        let hand = self.core.take_hand_events();
+        if !hand.is_empty() {
+            let at_ms = self.clock.elapsed_ms();
+            let mut events = self.oracles.hand_events.lock().unwrap();
+            events.extend(hand.into_iter().map(|e| (at_ms, self.id, e)));
+        }
         for (gen, whole, dirs) in self.core.take_self_releases() {
             let mut sent = self.oracles.sticky_released.lock().unwrap();
             let e = sent.entry(gen).or_default();
