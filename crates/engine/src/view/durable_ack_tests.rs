@@ -14,6 +14,12 @@ use replicix_objcas::lease::now_unix_ms;
 use replicix_objcas::{Lease, LeaseMode, LeaseStore};
 use tempfile::TempDir;
 
+/// How long a test thread may take to reach a state it waits for (a row
+/// journaled, a task parked) before the test calls it hung. A bound on
+/// liveness only: on a host loaded with builds a thread can wait for a CPU
+/// for seconds, which is not a failure of what the test checks.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(60);
+
 /// A holder's filesystem: the lease view is held with the durability
 /// gate `gated`; the core's side of the channel is returned (kept
 /// open, never answered — nothing here goes through the core).
@@ -225,7 +231,7 @@ fn a_close_stuck_in_its_drain_holds_no_write_shard() {
                 Ok(_) => {}
                 Err(_) => {
                     assert!(
-                        started.elapsed() < Duration::from_secs(5),
+                        started.elapsed() < LIVENESS_DEADLINE,
                         "the close never asked for its drain"
                     );
                     std::thread::sleep(Duration::from_millis(5));
@@ -254,7 +260,7 @@ fn a_close_stuck_in_its_drain_holds_no_write_shard() {
         // whatever happened: a write still waiting would never end.
         fn done_soon<T>(h: &std::thread::ScopedJoinHandle<'_, T>) -> bool {
             let started = std::time::Instant::now();
-            while !h.is_finished() && started.elapsed() < Duration::from_secs(5) {
+            while !h.is_finished() && started.elapsed() < LIVENESS_DEADLINE {
                 std::thread::sleep(Duration::from_millis(1));
             }
             h.is_finished()
@@ -283,7 +289,7 @@ fn a_close_stuck_in_its_drain_holds_no_write_shard() {
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    assert!(started.elapsed() < Duration::from_secs(5));
+                    assert!(started.elapsed() < LIVENESS_DEADLINE);
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -326,7 +332,7 @@ fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
                     break tip;
                 }
                 assert!(
-                    started.elapsed() < Duration::from_secs(5),
+                    started.elapsed() < LIVENESS_DEADLINE,
                     "the manifest commit never journaled"
                 );
                 std::thread::sleep(Duration::from_millis(1));
@@ -397,10 +403,7 @@ fn close_with_the_gate_going_off_across(
             if tip > session.durable_jseq() {
                 break tip;
             }
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "never journaled"
-            );
+            assert!(started.elapsed() < LIVENESS_DEADLINE, "never journaled");
             std::thread::sleep(Duration::from_millis(1));
         };
         // Journaled under the class the core published with the gate.
@@ -479,10 +482,7 @@ fn journaled_past_durable(meta: &Meta) -> u64 {
         if tip > session.durable_jseq() {
             return tip;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "never journaled"
-        );
+        assert!(started.elapsed() < LIVENESS_DEADLINE, "never journaled");
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -1868,10 +1868,7 @@ fn delegate_create(dir: Ino, seq: u64) -> (constellation_meta::MutateOp, constel
 fn journaled_stream_row(meta: &Meta, n: u64) {
     let started = std::time::Instant::now();
     while meta.delegate_idx(DELEG_GEN).unwrap() < n {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "never journaled"
-        );
+        assert!(started.elapsed() < LIVENESS_DEADLINE, "never journaled");
         std::thread::sleep(Duration::from_millis(1));
     }
 }
