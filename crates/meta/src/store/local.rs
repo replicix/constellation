@@ -1496,13 +1496,18 @@ impl Meta {
         let mut pending = crate::store::remote::PendingView::new(&r, self)?;
         let mut out = Vec::new();
         let mut rows = 0usize;
-        // ADR-59 part B: a drop this node decided as the stream's holder. The
-        // rows its record names are never sent (the record stands at the
-        // seed's index, and fills the rest), and nothing above the record
-        // until the apply strands them.
-        let drop = super::held::stream_drops_tx(&r, self)?
-            .into_iter()
-            .find(|(g, _, _)| *g == gen);
+        // ADR-59 part B: the drops this node decided as the stream's holder.
+        // The rows their records name are never sent (each record stands at
+        // its seed's index, and fills the rest), and nothing above the lowest
+        // record until its apply strands them (then the next lowest governs).
+        let mut named: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut lowest: Option<u64> = None;
+        for (g, at, rows) in super::held::stream_drops_tx(&r, self)? {
+            if g == gen {
+                named.extend(rows);
+                lowest = Some(lowest.map_or(at, |low| low.min(at)));
+            }
+        }
         // In index order from `from_idx`, read by origin
         // (`journal_origin`): the cost is the batch's, not the whole
         // outstanding stream's (a delegate far ahead of the log read
@@ -1524,13 +1529,11 @@ impl Meta {
             if row.gen != gen || row.idx < from_idx {
                 continue;
             }
-            if let Some((_, at, named)) = &drop {
-                if named.contains(&first) {
-                    continue;
-                }
-                if row.idx > *at {
-                    break;
-                }
+            if named.contains(&first) {
+                continue;
+            }
+            if lowest.is_some_and(|at| row.idx > at) {
+                break;
             }
             self.note_local_rows_read(1);
             let records: Vec<LogRecord> = journal_records(&r, self, first, row.last)?
