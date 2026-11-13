@@ -88,6 +88,25 @@ impl Core {
         code == Code::ReadOnly && touched_gen != 0 && !self.cfg.root_ignores_touched
     }
 
+    /// ADR-47 rule 2 for an untouched rid that was ever in an inbox (rule
+    /// 3: the root decides it): its refusal under an unreachable designation
+    /// is journaled (`Refused { rid, EROFS }`, as the drain's own refusal of
+    /// it is) and answered once committed. Its batch may still be in the
+    /// bucket, and a drain runs it once the generation ends (the holder
+    /// tick's leftover run, a later poll, a successor's gate): the batch's
+    /// run must find the refusal by dedup. Before, the refusal was
+    /// unjournaled and final, and the batch later executed the rid the
+    /// client had been told was refused (`far-root-writes-shared+lost-chunk`
+    /// seeds 617, 1477: a real-time order violation).
+    pub(crate) fn root_journals_inbox_ever(
+        &self,
+        code: Code,
+        touched_gen: u64,
+        inbox_ever: bool,
+    ) -> bool {
+        code == Code::ReadOnly && inbox_ever && !self.root_holds_touched(code, touched_gen)
+    }
+
     /// The generation of `keys` a refusal names (informational: the
     /// non-stealable one of a single grant, the first of a cross set).
     fn refused_gen(&self, keys: &TouchSet, replica: &dyn Replica) -> u64 {
@@ -557,6 +576,44 @@ impl Core {
                     super::delegate::RecallPlan::None
                 } else {
                     self.deleg_recall_plan(now, false, &keys, replica, out)
+                };
+                // An untouched inbox-ever rid's refusal is journaled first
+                // (`root_journals_inbox_ever`), then answered from it below
+                // like a drain's. A journal that fails answers `Busy`.
+                let has_outcome = match plan {
+                    super::delegate::RecallPlan::Refuse(code)
+                        if !has_outcome
+                            && self.root_journals_inbox_ever(
+                                code,
+                                fence.touched_gen,
+                                fence.inbox_ever,
+                            ) =>
+                    {
+                        if !self.record_refusal(rid, code, Some(&op), super::Asker::Remote, replica)
+                        {
+                            if req != OpId(0) {
+                                out.push(Action::Send {
+                                    to: from,
+                                    msg: PeerMsg::MutateReply {
+                                        req,
+                                        outcome: MutateOutcome::Busy,
+                                        base: None,
+                                        position: Position::ZERO,
+                                        gen: 0,
+                                        own_chunks: OwnChunks::None,
+                                        own_rows: None,
+                                        committed: false,
+                                        non_stealable: false,
+                                    },
+                                });
+                            }
+                            return;
+                        }
+                        self.note_final_nonholder_refusal(rid, code, true);
+                        self.stats.inbox_ever_refusals_journaled += 1;
+                        true
+                    }
+                    _ => has_outcome,
                 };
                 let wait = match plan {
                     super::delegate::RecallPlan::None => Default::default(),

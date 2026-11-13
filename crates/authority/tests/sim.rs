@@ -21118,6 +21118,28 @@ fn a_stream_holder_drops_its_own_streams_held_rows() {
         .unwrap_or_else(|e| panic!("far-placement+lost-chunk seed 326: {e}"));
 }
 
+/// ADR-47 rule 2 for an inbox-ever rid: the root told an untouched rid that
+/// was ever in an inbox `EROFS` under an unreachable sticky holder, unjournaled
+/// and final (a requester's forward, 1477, 1510; the root's own op on the
+/// lease path, 389, 617, 1133), while the rid's batch was still in the bucket;
+/// a drain ran the batch once the grant ended, and the rid the client had been
+/// told was refused took effect (the real-time check: it "returned" before ops
+/// its effect follows in the log). The refusal is journaled now and answered
+/// once committed; the batch's run dedups to it. 1206 pins the sibling rule: a
+/// hold instead of the refusal sent the settle to the sticky holder, which
+/// refused it `ABANDONED` beside the drain's `EROFS` (I1). All but 1206 failed
+/// on 7665d4d0.
+#[test]
+fn an_inbox_ever_refusal_under_a_designation_is_journaled() {
+    for seed in [389, 617, 1133, 1206, 1477, 1510] {
+        run_seed(
+            seed,
+            config_variant(far_root_writes_shared_config(), "lost-chunk"),
+        )
+        .unwrap_or_else(|e| panic!("far-root-writes-shared+lost-chunk seed {seed}: {e}"));
+    }
+}
+
 /// ADR-59 part B, the `kept_diverged` residual (benign): a claim's kept merge
 /// met, at one journal seq of the tenure, a hole from the holder's sealed tail
 /// (the rows it shipped ahead of a held one) and a live copy from the
