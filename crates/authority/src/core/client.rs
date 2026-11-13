@@ -2420,6 +2420,47 @@ impl Core {
         }
     }
 
+    /// The op may be this node's own to execute as a delegate (a delegation
+    /// of its subtree installed while the op was away, or handed to this node
+    /// since it was forwarded: ADR-56): offered to the delegate path, which
+    /// dedups by rid. `true`: the delegate path has the op (it answers).
+    fn offer_to_own_delegation(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.cfg.delegation {
+            return false;
+        }
+        let Some((op, deps, settle, tag)) = self
+            .clients
+            .get(&rid)
+            .map(|c| (c.op.clone(), c.deps, c.settle, c.tag.clone()))
+        else {
+            return false;
+        };
+        let taken = self.delegate_try_execute(
+            now,
+            0,
+            None,
+            rid,
+            &op,
+            deps,
+            0,
+            &tag,
+            settle,
+            Fence::default(),
+            replica,
+            out,
+        );
+        if taken {
+            self.stats.deleg_retry_executed += 1;
+        }
+        taken
+    }
+
     pub(crate) fn on_forward_backoff(
         &mut self,
         now: Now,
@@ -2480,35 +2521,8 @@ impl Core {
         // while the forward was held: the root answers `Held` to a
         // delegate's own op until the delegate's table carries the
         // grant). The delegate path dedups by rid.
-        if self.cfg.delegation {
-            let own = self
-                .clients
-                .get(&rid)
-                .map(|c| (c.op.clone(), c.deps, c.settle));
-            if let Some((op, deps, settle)) = own {
-                let tag = self
-                    .clients
-                    .get(&rid)
-                    .map(|c| c.tag.clone())
-                    .unwrap_or_default();
-                if self.delegate_try_execute(
-                    now,
-                    0,
-                    None,
-                    rid,
-                    &op,
-                    deps,
-                    0,
-                    &tag,
-                    settle,
-                    Fence::default(),
-                    replica,
-                    out,
-                ) {
-                    self.stats.deleg_retry_executed += 1;
-                    return;
-                }
-            }
+        if self.offer_to_own_delegation(now, rid, replica, out) {
+            return;
         }
         // Plan 46 M0.3 (B): an op the root answered `Held` is asked again
         // there, also when this node dropped its cached holder meanwhile
@@ -3394,7 +3408,36 @@ impl Core {
                     super::delegate::RecallPlan::Gated => return MutateOutcome::Busy,
                     // ADR-55: the root's own stream; the delegate executor
                     // takes the op once it is honoured.
-                    super::delegate::RecallPlan::Hold(_) => return MutateOutcome::Busy,
+                    // ADR-56: an op that was away (forwarded to a holder the
+                    // subtree was handed over from) comes back through here
+                    // when the stream is this node's own; `submit`'s order:
+                    // the stream takes it, the client is answered from there.
+                    super::delegate::RecallPlan::Hold(_) => {
+                        if !self.offer_to_own_delegation(now, rid, replica, out) {
+                            // The stream does not take it yet (the op was sent
+                            // to a sequencer that may have run it, or the stream
+                            // is not honoured): asked again after a back-off,
+                            // which finds the sequencer's row, or the stream.
+                            if let Some(c) = self.clients.get_mut(&rid) {
+                                c.phase = Phase::Backoff;
+                            }
+                            let delay = self.cfg.forward_backoff_ms.max(1);
+                            let timer = self.set_timer_wait(
+                                now.wait.plus(delay),
+                                Timer::ForwardBackoff(rid),
+                                out,
+                            );
+                            if let Some(c) = self.clients.get_mut(&rid) {
+                                c.timer = Some(timer);
+                            }
+                        }
+                        return MutateOutcome::Held {
+                            retry_ms: 0,
+                            outwait_ms: None,
+                            lost_chunk: false,
+                            yours: false,
+                        };
+                    }
                 }
             };
             let deps_wait = (!settle && !replica.reaches_streams(&deps)).then_some(deps);
@@ -5786,6 +5829,18 @@ impl Core {
                 let b = ((ms / 250) as usize).min(self.stats.settle_frozen_answer_ms.len() - 1);
                 self.stats.settle_frozen_answer_ms[b] += 1;
             }
+        }
+        // The op is parked in this node's own stream (ADR-55, `Hold`): the
+        // stream executes it and answers; a refusal to execute here is not
+        // an answer.
+        if !is_answer(&outcome)
+            && self
+                .dl
+                .mine
+                .values()
+                .any(|d| d.parked.iter().any(|p| p.from == 0 && p.rid == rid))
+        {
+            return;
         }
         // Held for a lost dependency (`hold_for_lost_deps`): its backoff
         // timer drives it on.

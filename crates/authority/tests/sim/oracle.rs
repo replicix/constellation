@@ -236,6 +236,10 @@ pub struct Oracles {
     /// release (a note on its stream: a row, or the cut a rowless release
     /// ends at; the latter leaves nothing in the log).
     pub sticky_released: Mutex<BTreeMap<u64, super::sticky::SentRelease>>,
+    /// ADR-56: the root's handover requests and grants, stamped with the
+    /// run's clock (`Core::take_hand_events`): `handover_tenure` and
+    /// `one_off_no_handover` judge them.
+    pub hand_events: Mutex<Vec<(u64, u64, constellation_authority::HandEvent)>>,
     /// The delegation table as the lease holder had it, each time it changed
     /// (`(at_ms, holder, table)`): the generation history (install, recall,
     /// end) that decides who owns an op's keys at each instant.
@@ -503,6 +507,7 @@ impl Oracles {
             release_drain: Mutex::new(ReleaseDrain::default()),
             causal_cut: Mutex::new(Vec::new()),
             sticky_released: Mutex::new(BTreeMap::new()),
+            hand_events: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
             rolled_back_nodes: Mutex::new(BTreeMap::new()),
             bucket,
