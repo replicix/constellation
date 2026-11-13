@@ -2202,6 +2202,23 @@ impl Meta {
         Ok(out)
     }
 
+    /// Tests: a stream holder's drop of `ino` decided at index `at` of `gen`
+    /// (the plan alone, no record), for the core's gates.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn put_stream_drop_plan_for_tests(&self, ino: Ino, gen: u64, at: u64) {
+        let plan = DropPlan {
+            stream: Some((gen, at)),
+            ..DropPlan::default()
+        };
+        let mut tx = self.db.write_tx();
+        tx.insert(
+            &self.local,
+            drop_plan_key(ino),
+            postcard::to_allocvec(&plan).unwrap(),
+        );
+        tx.commit().unwrap();
+    }
+
     /// ADR-59 part B: whether this node decided a drop as the holder of
     /// stream `gen` that is not applied yet (it holds the stream's release).
     pub fn stream_drop_pending(&self, gen: u64) -> bool {

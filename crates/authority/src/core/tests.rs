@@ -74779,6 +74779,32 @@ mod step5_sticky_release {
         assert!(h.core.dl.handovers.is_empty());
     }
 
+    /// ADR-59 part B × ADR-56: a drop decided by the holder of a stream that is
+    /// being handed over. The handover's release waits while the drop is
+    /// pending (its record reaches the log through the stream, the release
+    /// row would end the subtree before the drop's apply), and goes once the
+    /// drop is applied (the plan is gone). The handover's release goes through
+    /// `release_subtrees`, whose drop gate (0b3e0f34's) covers it: a pin.
+    #[test]
+    fn a_handover_release_waits_for_the_holders_pending_drop() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        h.meta.put_stream_drop_plan_for_tests(99, 7, 1);
+        sample(&mut h, &[], &[]);
+        handover_request(&mut h, dirs.clone(), crate::event::ReleaseWhy::Handover);
+        sample(&mut h, &[], &[]);
+        release_tick(&mut h, 200);
+        assert!(!last_is_release(&h), "released with the drop pending");
+        assert!(h.core.stats.deleg_release_drop_pending >= 1);
+        assert_eq!(h.core.stats.deleg_handover_released, 1, "agreed, not made");
+        // The drop is applied: its plan goes, and the release is made.
+        h.meta.drop_held_cancel(99).unwrap();
+        sample(&mut h, &[], &[]);
+        let out = release_tick(&mut h, 200);
+        assert!(last_is_release(&h), "not released after the apply: {out:?}");
+        assert_eq!(h.core.stats.deleg_sticky_releases, 1);
+    }
+
     /// ADR-56 review M1: the release waits for a sample taken after the
     /// step that made the command, however many times the core looks again
     /// in between (every `deleg_after_event` of a step does, and so does
