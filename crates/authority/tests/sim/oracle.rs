@@ -1085,6 +1085,17 @@ struct ArchiveInner {
     /// skips for good).
     stream_top: HashMap<u64, u64>,
     stream_holes: Vec<String>,
+    /// The stream positions the log's `DropHeld` records fill.
+    stream_fills: BTreeSet<(u64, u64)>,
+}
+
+/// `top` raised over the consecutive fills of `gen` right above it.
+fn past_fills(fills: &BTreeSet<(u64, u64)>, gen: u64, top: u64) -> u64 {
+    let mut at = top;
+    while fills.contains(&(gen, at + 1)) {
+        at += 1;
+    }
+    at
 }
 
 impl Default for ArchiveIndex {
@@ -1151,6 +1162,22 @@ impl ArchiveIndex {
                         }
                     }
                 }
+                // ADR-59 part B (drop contiguity): a `DropHeld` is the log's
+                // no-op row at each stream position it fills, at its place in
+                // the stream's order (the rows the drop redid below it land
+                // after the record): it counts once the stream reaches it.
+                for (gen, idx) in seg
+                    .records
+                    .iter()
+                    .flat_map(|rec| rec.stream_fills().iter().copied())
+                {
+                    g.stream_fills.insert((gen, idx));
+                    let top = g.stream_top.get(&gen).copied().unwrap_or(0);
+                    if top + 1 >= idx {
+                        let top = past_fills(&g.stream_fills, gen, top.max(idx));
+                        g.stream_top.insert(gen, top);
+                    }
+                }
                 for (gen, idx) in seg.origins.iter().copied() {
                     if gen == 0 {
                         continue;
@@ -1161,7 +1188,8 @@ impl ArchiveIndex {
                             "stream_log_contiguous: stream {gen:#x} index {idx} is in segment {seq} but the log carries it only through {top}"
                         ));
                     }
-                    g.stream_top.insert(gen, top.max(idx));
+                    let top = past_fills(&g.stream_fills, gen, top.max(idx));
+                    g.stream_top.insert(gen, top);
                 }
                 g.max_epoch = g.max_epoch.max(seg.epoch);
             }
@@ -3721,6 +3749,7 @@ mod tests {
             ino: 9,
             chunks: Vec::new(),
             rolled_back: vec![((1, 3), Some(r))],
+            fills: Vec::new(),
         }
     }
 

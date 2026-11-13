@@ -3563,6 +3563,85 @@ pub(crate) fn settle_deleg_idx_at_log_tx(
     Ok(())
 }
 
+/// `local` key prefix of the stream positions a `DropHeld` of the log fills
+/// (ADR-59 part B, drop contiguity): `deleg_fill:` + gen + idx, big-endian.
+/// Kept for good (a few bytes per rolled-back stream row): a log index taken
+/// back below a fill and raised again passes it again.
+pub(crate) const DELEG_FILL_PREFIX: &[u8] = b"deleg_fill:";
+
+fn deleg_fill_key(gen: u64, idx: u64) -> Vec<u8> {
+    let mut k = DELEG_FILL_PREFIX.to_vec();
+    k.extend_from_slice(&gen.to_be_bytes());
+    k.extend_from_slice(&idx.to_be_bytes());
+    k
+}
+
+/// ADR-59 part B (drop contiguity): the log carries a `DropHeld` whose no-op
+/// row stands at `(gen, idx)`. Recorded; and the log index of `gen` counts it
+/// as soon as it reaches `idx - 1` (here, or at the raise that brings it
+/// there: [`bump_log_idx_tx`]). A fill is a row at its place in the stream's
+/// order: the rows the drop redid below it land after the record.
+pub(crate) fn note_stream_fill_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    gen: u64,
+    idx: u64,
+) -> Result<(), MetaError> {
+    if gen == 0 || idx == 0 {
+        return Ok(());
+    }
+    tx.insert(&meta.local, deleg_fill_key(gen, idx), Vec::new());
+    meta.any_stream_fill
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let cur = kv_get_tx(&*tx, &meta.local, &deleg_log_idx_key(gen))?
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if cur + 1 >= idx {
+        bump_log_idx_tx(tx, meta, gen, idx)?;
+    }
+    Ok(())
+}
+
+/// The highest index reached from `idx` over the consecutive fills of `gen`
+/// above it.
+fn past_stream_fills(r: &impl Readable, meta: &Meta, gen: u64, idx: u64) -> Result<u64, MetaError> {
+    let mut at = idx;
+    if !meta
+        .any_stream_fill
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(at);
+    }
+    while r.get(&meta.local, deleg_fill_key(gen, at + 1))?.is_some() {
+        at += 1;
+    }
+    Ok(at)
+}
+
+impl Meta {
+    /// Every stream position a `DropHeld` of the log fills, into the
+    /// session (open).
+    pub(crate) fn load_stream_fills(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        let mut any = false;
+        for guard in r.prefix(&self.local, DELEG_FILL_PREFIX) {
+            let (k, _) = guard.into_inner()?;
+            let rest = &k[DELEG_FILL_PREFIX.len()..];
+            let (Ok(gen), Ok(idx)) = (
+                <[u8; 8]>::try_from(&rest[..8.min(rest.len())]).map(u64::from_be_bytes),
+                <[u8; 8]>::try_from(&rest[8.min(rest.len())..]).map(u64::from_be_bytes),
+            ) else {
+                continue;
+            };
+            any = true;
+            self.session.note_stream_fill(gen, idx);
+        }
+        self.any_stream_fill
+            .store(any, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// Raise the persisted log index of `gen` to `idx`.
 ///
 /// The one place that raises it, so the place the rows a deposition held
@@ -3583,6 +3662,9 @@ pub(crate) fn bump_log_idx_tx(
     let cur = kv_get_tx(tx, local, &key)?
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    // ADR-59 part B (drop contiguity): the fills right above are the
+    // stream's rows too.
+    let idx = past_stream_fills(&*tx, meta, gen, idx.max(cur))?;
     meta.release_through_tx(tx, super::backup::deleg_epoch(gen), idx.max(cur))?;
     if idx > cur {
         kv_set_tx(tx, local, &key, &idx.to_string());

@@ -4771,6 +4771,23 @@ is the consequence of that record being in the log.**
   copies by the unshipped record alone, and its drop is cancelled; one deposed
   with the record's segment out keeps the drop and, if the segment lands,
   applies it from the log like every replica, journaling no refusal.
+- **Drop contiguity (follow-up, the maintainer's option (a)).** A drop can roll
+  back rows of a delegation stream (the root's own sticky stream: the seed's
+  index, and the indices of the rows that read its bytes) and keep the later
+  rows of that stream (redone in place, or independent). They then landed past
+  a hole in the log's stream (`stream_log_contiguous`), and a successor's cursor
+  waits at the hole for good: a deposed root's stream sends from an index that
+  is gone. The record fills each rolled-back index:
+  `DropHeld { .., fills: [(gen, idx)] }` is the log's no-op row at every stream
+  position of a transaction it rolls back, a log fact like the rest of the
+  record. Every reader of a stream's position in the log counts a fill (the
+  persisted log index, `deleg_fill:` keys; the session's stream; the sim
+  oracle), each **at its place in the stream's order**: once the stream reaches
+  the index below it, since a row the drop redid below a fill lands after the
+  record (seeds 956, 1005). The dropper's apply restores the counts its strand
+  took back for the filled rows. Rejected: (b) rolling back the whole tail of
+  the stream past the first rolled-back index, which rolls back acknowledged
+  rows that do not need the lost bytes (I5).
 
 A drop that is decided in the log whose dropper dies before applying it is
 accepted (the maintainer, 2026-11-12): no successor completes it. Counted
@@ -4848,7 +4865,10 @@ with part A (the oracle gate it needs does not converge).
 
 **May revert**: no. `flex-crash+durability` seeds 26, 283, 860, 1258 and 1751
 pin part A. Part B is pinned by `drop-held-chain-backed` seeds 1714, 1529 and
-1818 and by the five seeds above under the strict gate.
+1818 and by the five seeds above under the strict gate; drop contiguity by
+`far-root-writes+lost-chunk` 557 and 1005, `-paused` 464 and 1822, `-cross`
+1333 and 1523 and `far-placement+lost-chunk` 96, 829, 956, 1469, 1778, 1910,
+1932, 1943 and 1988 (`a_drop_fills_the_stream_indices_it_rolls_back`).
 
 See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
 `crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),

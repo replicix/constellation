@@ -2298,6 +2298,7 @@ fn a_replay_of_a_re_shipped_row_whose_identity_was_retired_journals_without_it()
             ino: 9,
             chunks: Vec::new(),
             rolled_back: vec![((1, 3), None)],
+            fills: Vec::new(),
         }],
         &Default::default(),
     )

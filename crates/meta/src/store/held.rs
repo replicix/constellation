@@ -1917,6 +1917,7 @@ impl Meta {
             strand_all,
             missing: missing.iter().copied().collect(),
             idents: walked.idents.iter().map(|(ident, _)| *ident).collect(),
+            fills: walked.fills.clone(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
             s_deps: walked.dependents.iter().map(|(seq, _, _)| *seq).collect(),
             redone: walked.redone.iter().map(|(seq, _)| *seq).collect(),
@@ -1960,6 +1961,7 @@ impl Meta {
                 ino,
                 chunks: missing.iter().copied().collect(),
                 rolled_back: walked.idents.clone(),
+                fills: walked.fills.clone(),
             },
         )?;
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
@@ -1978,6 +1980,7 @@ impl Meta {
             dropped = walked.seeds.len(),
             requeued = walked.dependents.len(),
             redone = walked.redone.len(),
+            fills = ?walked.fills,
             "drop-held decided: a DropHeld record is journaled; the drop takes effect when the \
              log carries it"
         );
@@ -2045,15 +2048,21 @@ impl Meta {
     /// `DropHeld`.
     pub fn own_drop_segment(&self, records: &[LogRecord], rows: &[u64]) -> Result<bool, MetaError> {
         let mut found = false;
+        let mut all_fills: Vec<(u64, u64)> = Vec::new();
         let mut tx = self.db.write_tx();
         for rec in records {
             let LogRecord::DropHeld {
-                ino, rolled_back, ..
+                ino,
+                rolled_back,
+                fills,
+                ..
             } = rec
             else {
                 continue;
             };
             found = true;
+            self.note_drop_fills_tx(&mut tx, fills)?;
+            all_fills.extend(fills.iter().copied());
             let idents: BTreeSet<(u64, u64)> =
                 rolled_back.iter().map(|(ident, _)| *ident).collect();
             if let Some(raw) = tx.get(&self.local, drop_plan_key(*ino))? {
@@ -2075,8 +2084,50 @@ impl Meta {
         }
         if found {
             tx.commit()?;
+            self.note_drop_fills(&all_fills);
         }
         Ok(found)
+    }
+
+    /// ADR-59 part B (drop contiguity): a `DropHeld` whose `fills` the log
+    /// carries is the stream's row at each of them: the persisted log index
+    /// of each generation counts it at its place in the stream's order
+    /// ([`local::note_stream_fill_tx`]), in the caller's transaction (the
+    /// session follows with [`Self::note_drop_fills`] once it commits).
+    pub(crate) fn note_drop_fills_tx(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx,
+        fills: &[(u64, u64)],
+    ) -> Result<(), MetaError> {
+        for (gen, idx) in fills {
+            local::note_stream_fill_tx(tx, self, *gen, *idx)?;
+        }
+        Ok(())
+    }
+
+    /// `(gen, log index, session index)` of each generation `fills` names,
+    /// in the caller's transaction.
+    fn stream_counts_tx(
+        &self,
+        tx: &impl Readable,
+        fills: &[(u64, u64)],
+    ) -> Result<Vec<(u64, u64, u64)>, MetaError> {
+        let gens: BTreeSet<u64> = fills.iter().map(|(gen, _)| *gen).collect();
+        let mut out = Vec::with_capacity(gens.len());
+        for gen in gens {
+            let log_idx = super::kv_get_tx(tx, &self.local, &local::deleg_log_idx_key(gen))?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            out.push((gen, log_idx, self.session.stream_applied(gen)));
+        }
+        Ok(out)
+    }
+
+    /// The session half of [`Self::note_drop_fills_tx`].
+    pub(crate) fn note_drop_fills(&self, fills: &[(u64, u64)]) {
+        for (gen, idx) in fills {
+            self.session.note_stream_fill(*gen, *idx);
+        }
     }
 
     /// Whether the decided drop of `ino` has its record shipped from this node.
@@ -2174,6 +2225,11 @@ impl Meta {
         let mut seqs: HashSet<u64> = walked.dependents.iter().map(|(seq, _, _)| *seq).collect();
         seqs.extend(walked.seeds.iter().map(|(_, seq, _)| *seq));
         let staged = UsageTracker::staging();
+        // The strand takes a stranded stream row's index back in the log's
+        // count and the session's (it leaves the journal unshipped); a row
+        // the record fills is in the log as the record, and the rows the drop
+        // keeps above it keep theirs: both counts are restored after it.
+        let streams_before = self.stream_counts_tx(&tx, &plan.fills)?;
         let (_, redo_skipped) = spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
         if !redo_skipped.is_empty() {
             // A row redone in place did not apply as it did: it is rolled
@@ -2197,6 +2253,16 @@ impl Meta {
             "the apply of the drop of inode {ino} left {leftovers} journal transaction(s) the \
              DropHeld names"
         );
+        // The strand took back the log index of each stream row it removed;
+        // the record the log carries is the stream's row there (a no-op): the
+        // index stands. (Not for the offline forms, whose record has not
+        // shipped: its ack counts it.)
+        for (gen, log_idx, _) in &streams_before {
+            local::bump_log_idx_tx(&mut tx, self, *gen, *log_idx)?;
+        }
+        if plan.shipped {
+            self.note_drop_fills_tx(&mut tx, &plan.fills)?;
+        }
         if leftovers > 0 {
             tracing::warn!(
                 ino,
@@ -2459,6 +2525,12 @@ impl Meta {
         )?;
         tx.remove(&self.local, drop_plan_key(ino));
         tx.commit()?;
+        for (gen, _, session_idx) in &streams_before {
+            self.session.note_stream(*gen, *session_idx);
+        }
+        if plan.shipped {
+            self.note_drop_fills(&plan.fills);
+        }
         self.acked_lost.store(lost_total, Ordering::Relaxed);
         self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
@@ -2568,12 +2640,14 @@ impl Meta {
                 ino,
                 chunks: Vec::new(),
                 rolled_back: walked.idents.clone(),
+                fills: walked.fills.clone(),
             },
         )?;
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
         self.finish_local(&mut tx, local)?;
         plan.idents
             .extend(walked.idents.iter().map(|(ident, _)| *ident));
+        plan.fills.extend(walked.fills.iter().copied());
         plan.redone.retain(|s| !moved.contains(s));
         plan.s_deps.extend(moved.iter().copied());
         plan.jseq = jseq;
@@ -2691,6 +2765,10 @@ struct DropPlan {
     /// plan holds these transactions until the apply strands them
     /// ([`Named`]).
     idents: Vec<(u64, u64)>,
+    /// The stream positions the record fills (`DropHeld::fills`): the
+    /// apply counts them in the log again after its strand of the rows
+    /// that held them (which takes a stranded row's index back).
+    fills: Vec<(u64, u64)>,
     /// `spec_seq`s of the seed transactions.
     seeds: Vec<u64>,
     /// `spec_seq`s of the dependents rolled back with them.
@@ -2743,6 +2821,9 @@ struct Walked {
     /// The identity of every transaction the drop rolls back, as a member
     /// keys it, and the rid it completes.
     idents: Vec<((u64, u64), Option<crate::rid::Rid>)>,
+    /// The delegation stream positions of the rolled-back transactions
+    /// (`DropHeld::fills`), in walk order.
+    fills: Vec<(u64, u64)>,
     unidentified: usize,
 }
 
@@ -2767,6 +2848,7 @@ fn walk_drop(
         dependents: Vec::new(),
         redone: Vec::new(),
         idents: Vec::new(),
+        fills: Vec::new(),
         unidentified: 0,
     };
     for (t, seed_inos, keys) in held.held {
@@ -2811,6 +2893,12 @@ fn walk_drop(
         if !in_s {
             out.redone.push((spec_seq, rid));
             continue;
+        }
+        // The stream position the transaction holds (if it is a row of a
+        // delegation stream): the record fills it, so the stream's later
+        // rows the drop keeps land contiguous.
+        if let Some(row) = row.as_ref().filter(|row| row.gen != 0) {
+            out.fills.push((row.gen, row.idx));
         }
         let placeholder = placeholder_keys(&t, &keys);
         let records: Vec<LogRecord> = t.rows.iter().map(|(_, rec)| rec.clone()).collect();
@@ -3080,6 +3168,147 @@ mod tests {
         meta.cancel_pending_upload(&hash, files[1]).unwrap();
         shipped(3);
         assert!(meta.delegate_rows_for_audit(gen).unwrap().is_empty());
+    }
+
+    /// ADR-59 part B (drop contiguity, option (a)): a drop that rolls back
+    /// rows of a delegation stream fills each of their indices with the
+    /// `DropHeld` record's no-op row, so the rows of the stream it keeps land
+    /// contiguous behind it. The root's own stream (the sim's
+    /// `far-placement+lost-chunk` 96, `far-root-writes+lost-chunk` 557, ...):
+    /// index 2 is the seed (its chunk is lost), index 3 changes the file's
+    /// mode (redone in place: it does not need the lost bytes), index 4
+    /// truncates it (rolled back: it does), index 5 is on another file. The
+    /// log then carries index 1, the record (fills 2 and 4), then 3 and 5;
+    /// a replica's index of the stream reaches 2 at the record and 5 at the
+    /// last row, the fill at 4 counting once 3 is there (the 956 shape).
+    /// Fails on the parent (no fills: the log skips 2 and 4).
+    #[test]
+    fn a_drop_fills_the_stream_indices_it_rolls_back() {
+        use crate::mutate::MutateOp;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        let replica = Meta::open_in_memory().unwrap();
+        replica.set_node_prefix(2).unwrap();
+        let files: Vec<Ino> = (1..=3)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let gen = (1u64 << 32) | 1;
+        // Ship what the plan releases, into the replica as a segment; the
+        // stream positions the log carries, in order.
+        let positions = std::cell::RefCell::new(Vec::<u64>::new());
+        let next_seq = std::cell::Cell::new(1u64);
+        let ship = || -> Vec<LogRecord> {
+            let rows = meta.take_shippable(usize::MAX).unwrap();
+            if rows.is_empty() {
+                return Vec::new();
+            }
+            let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+            let origins = meta.journal_origins(&seqs).unwrap();
+            let records: Vec<LogRecord> = rows.into_iter().map(|(_, r)| r).collect();
+            let seq = next_seq.get();
+            next_seq.set(seq + 1);
+            replica
+                .apply_segment_rows(
+                    seq,
+                    1,
+                    *seqs.iter().max().unwrap(),
+                    &seqs,
+                    &origins,
+                    &records,
+                    &Default::default(),
+                )
+                .unwrap();
+            meta.ack_journal_rows_at(&seqs, seq).unwrap();
+            let mut p = positions.borrow_mut();
+            p.extend(origins.iter().filter(|(g, _)| *g == gen).map(|(_, i)| *i));
+            for rec in &records {
+                p.extend(
+                    rec.stream_fills()
+                        .iter()
+                        .filter(|(g, _)| *g == gen)
+                        .map(|(_, i)| *i),
+                );
+            }
+            records
+        };
+        ship();
+        let setattr = |ino: Ino, mode: Option<u32>, size: Option<u64>| MutateOp::Setattr {
+            ino,
+            mode,
+            uid: None,
+            gid: None,
+            size,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        let run = |op: &MutateOp| {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, op, None).unwrap();
+        };
+        run(&setattr(files[0], Some(0o600), None));
+        let hash = ChunkHash::of(b"lost");
+        let manifest = Manifest {
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_dirty(files[1], None, &manifest, 7, None, None, &[hash])
+                .unwrap();
+        }
+        run(&setattr(files[1], Some(0o600), None));
+        run(&setattr(files[1], None, Some(3)));
+        run(&setattr(files[2], Some(0o600), None));
+        assert_eq!(meta.delegate_idx(gen).unwrap(), 5);
+        meta.note_unrecoverable_chunks(&[(hash, files[1])], false)
+            .unwrap();
+        ship();
+        assert_eq!(
+            *positions.borrow(),
+            vec![1],
+            "only index 1 ships ahead of the seed"
+        );
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        let decided = meta
+            .drop_held_knowing(files[1], 0, false, &none, &no_ops, &sessions, true)
+            .unwrap();
+        assert!(decided.pending.is_some(), "{decided:?}");
+        // The decision ships alone: the record, with its fills.
+        let records = ship();
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, LogRecord::DropHeld { .. })),
+            "{records:?}"
+        );
+        assert_eq!(*positions.borrow(), vec![1, 2, 4]);
+        assert_eq!(
+            replica.log_stream_idx(gen).unwrap(),
+            2,
+            "the fill at 4 waits for index 3"
+        );
+        meta.drop_held_apply(files[1], 0, &none, &no_ops, &sessions, true)
+            .unwrap();
+        ship();
+        assert_eq!(*positions.borrow(), vec![1, 2, 4, 3, 5]);
+        assert!(meta.delegate_rows_for_audit(gen).unwrap().is_empty());
+        // Every index of the stream is in the log, once.
+        let mut sorted = positions.borrow().clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 2, 3, 4, 5]);
+        assert_eq!(replica.log_stream_idx(gen).unwrap(), 5);
+        // The dropper's own count of the log's index.
+        assert_eq!(meta.log_stream_idx(gen).unwrap(), 5);
     }
 
     /// ADR-58 M1 (review): a transaction waiting for this node's own upload is
