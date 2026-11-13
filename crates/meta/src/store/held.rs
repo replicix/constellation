@@ -3887,6 +3887,80 @@ mod tests {
         assert_eq!(sent, vec![3, 5]);
     }
 
+    /// ADR-59 part B, landing review MUST-1: a stream with two decided drops.
+    /// The stream sends the lower record first, whichever inode it is for:
+    /// here the lower inode's seed is at the higher index (5) and the higher
+    /// inode's at index 3. Fails on the parent: the sender took the first plan
+    /// by inode (the record at 5) and stopped at the other seed at 3, so
+    /// neither record shipped and the stream stalled for good.
+    #[test]
+    fn a_stream_with_two_drops_sends_the_lower_record_first() {
+        use crate::mutate::MutateOp;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        let files: Vec<Ino> = (1..=3)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let gen = (1u64 << 32) | 1;
+        let chmod = |ino: Ino| MutateOp::Setattr {
+            ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        let run = |op: &MutateOp| {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, op, None).unwrap();
+        };
+        let lost_write = |ino: Ino, tag: &[u8]| {
+            let hash = ChunkHash::of(tag);
+            let manifest = Manifest {
+                layout: replicix_chunkfmt::ChunkLayout::new(4096),
+                file_len: 7,
+                chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+            }
+            .encode();
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_dirty(ino, None, &manifest, 7, None, None, &[hash])
+                .unwrap();
+            hash
+        };
+        run(&chmod(files[1]));
+        run(&chmod(files[1]));
+        let high = lost_write(files[2], b"lost at 3");
+        run(&chmod(files[1]));
+        let low = lost_write(files[0], b"lost at 5");
+        assert_eq!(meta.delegate_idx(gen).unwrap(), 5);
+        meta.note_unrecoverable_chunks(&[(high, files[2]), (low, files[0])], false)
+            .unwrap();
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        for ino in [files[0], files[2]] {
+            let decided = meta
+                .drop_held_in_stream(ino, 0, &none, &no_ops, &sessions, &|g| g == gen)
+                .unwrap();
+            assert!(decided.pending.is_some(), "{decided:?}");
+        }
+        let sent = meta.delegate_txs_from(gen, 1, usize::MAX).unwrap();
+        let idx: Vec<u64> = sent.iter().map(|t| t.idx).collect();
+        assert_eq!(idx, vec![1, 2, 3], "{sent:?}");
+        assert!(
+            matches!(&sent[2].records[..], [LogRecord::DropHeld { ino, .. }] if *ino == files[2]),
+            "index 3 is the higher inode's record: {:?}",
+            sent[2].records
+        );
+    }
+
     /// ADR-58 M1 (review): a transaction waiting for this node's own upload is
     /// not behind a lost chunk. The refusal of an op that touched a file
     /// whose chunk is still uploading here is merely deferred: it ships by
