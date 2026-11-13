@@ -1826,8 +1826,8 @@ fn strand_local_tx(
     // in, the lowest of them sets the index. As `forget_recent` below, the
     // session side is in memory: a failed commit leaves it lower than the
     // store, which only makes a wait, never an early execution.
-    if local::retract_log_idx_tx(tx, &meta.local, row.gen, row.idx)? {
-        meta.session.retract_stream(row.gen, row.idx - 1);
+    if let Some(to) = local::retract_log_idx_tx(tx, meta, row.gen, row.idx)? {
+        meta.session.retract_stream(row.gen, to);
     }
     for (seq, _) in &rows {
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
@@ -1907,7 +1907,11 @@ fn strand_local_tx(
             .deleg_append_replay
             .load(std::sync::atomic::Ordering::SeqCst)
     {
-        if strand.recall || strand.superseded {
+        // ADR-59 part B (D2, drop contiguity): a row a `DropHeld` of the log
+        // retired never lands; the record fills its stream position. Nothing
+        // to keep or hold for a successor.
+        let ident = crate::store::member::tail_identity(&records).unwrap_or((row.epoch, first));
+        if strand.recall || strand.superseded || meta.row_retired_tx(&*tx, ident.0, ident.1)? {
             #[cfg(any(test, feature = "test-util"))]
             if let (true, Some(hook), Some(rid)) =
                 (strand.recall, meta.recall_drop_hook.get(), row.rid)

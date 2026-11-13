@@ -2644,6 +2644,71 @@ fn a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect() {
     assert_eq!(raw_ns(&meta), raw_ns(&reference));
 }
 
+/// ADR-59 part B (drop contiguity), review MUST-1: a deposed root's strand of
+/// an appended stream row takes the generation's log index back only below the
+/// first position the log does not carry. Here the log carries row 1 (shipped)
+/// and a `DropHeld` that fills index 2 (the record of a drop that rolled the
+/// appended row back, shipped before the deposition); the strand of row 2 must
+/// leave the index, and the session's stream, at 2: lowered to 1, this node,
+/// re-elected, would inherit the stream with its cursor at 1 and wait for a
+/// row 2 that never comes. Fails on the parent: both go back to 1.
+#[test]
+fn a_strand_keeps_a_stream_index_the_log_fills() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let append = |i: u64| {
+        let name = ["a", "b"][i as usize - 1];
+        meta.apply_delegate_tx(
+            &[create(name, ino(i), 10 + i as i64), completed(rid(i))],
+            Some(rid(i)),
+            5,
+            i,
+            Position::ZERO,
+        )
+        .unwrap();
+        meta.session().note_stream(5, i);
+    };
+    append(1);
+    let rows: Vec<u64> = meta
+        .take_journal_grouped(10_000)
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, b)| b)
+        .map(|(seq, _)| seq)
+        .collect();
+    meta.ack_journal_rows_at(&rows, 1).unwrap();
+    append(2);
+    assert_eq!(meta.log_stream_idx(5).unwrap(), 2);
+    let row2 = meta
+        .journal_txs_from(1, 1000)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.origin == (5, 2))
+        .expect("row 2 is in the journal")
+        .first;
+    assert!(meta
+        .own_drop_segment(
+            &[LogRecord::DropHeld {
+                ino: 9,
+                chunks: Vec::new(),
+                rolled_back: vec![((1, row2), Some(rid(2)))],
+                fills: vec![(5, 2)],
+                queued: Vec::new(),
+            }],
+            &[],
+        )
+        .unwrap());
+    assert!(meta.row_retired(1, row2), "row 2 ({row2}) is not retired");
+    meta.strand_deposed(2).unwrap();
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    assert_eq!(
+        meta.log_stream_idx(5).unwrap(),
+        2,
+        "the strand took back an index the log fills"
+    );
+    assert_eq!(meta.session().stream_applied(5), 2);
+}
+
 /// Plan 46 M1.2 step 7 (c3-spec §6.1, D12): a deposed root keeps the delegate
 /// rows it appended as a member copy of their generation
 /// (`backup_tail[DELEG_BACKUP_BASE + gen]`, verbatim), in the strand's own

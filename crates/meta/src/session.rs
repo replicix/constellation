@@ -1238,9 +1238,17 @@ impl SessionState {
     /// recall strand): stream `gen` goes back to `to`. Only lowered, and
     /// only from what the store counted (`local::retract_log_idx_tx`);
     /// no wake-up, lowering satisfies no wait.
+    ///
+    /// ADR-59 part B (drop contiguity): never below a fill the log carries
+    /// right above `to` (the store's retraction passes them too).
     pub fn retract_stream(&self, gen: u64, to: u64) {
         let mut g = self.inner.lock().unwrap();
-        if let Some(cur) = g.streams.get_mut(&gen) {
+        let inner = &mut *g;
+        let mut to = to;
+        while !inner.fills.is_empty() && inner.fills.contains(&(gen, to + 1)) {
+            to += 1;
+        }
+        if let Some(cur) = inner.streams.get_mut(&gen) {
             if *cur > to {
                 *cur = to;
             }

@@ -3690,31 +3690,39 @@ pub(crate) fn bump_log_idx_tx(
 /// Take the persisted log index of `gen` back below `idx`: the row at
 /// `idx` was appended in this root's journal (`bump_log_idx_tx` counted
 /// it) and now leaves the journal without a segment carrying it. Lowered
-/// only when the index counted that row (`idx` at or below it); true
-/// when it did. A row a segment carried retired with the segment's own
+/// only when the index counted that row (`idx` at or below it). A row a segment carried retired with the segment's own
 /// bump, so every journal row of `gen` sits above what the log holds,
 /// and a delegate's own row still in the journal sits above it too (one
 /// this node shipped itself was counted at its ack, and is no longer
 /// there; a row held back while a later one ships is the exception, as on
 /// every replica that applies the segment).
+///
+/// ADR-59 part B (drop contiguity): the fills right above `idx - 1` are in the
+/// log whatever leaves the journal (a `DropHeld` of the log is the stream's
+/// row there), so the index is lowered only to below the first position the
+/// log does not carry. Returns the index it was set to, if it was lowered.
 pub(crate) fn retract_log_idx_tx(
     tx: &mut SingleWriterWriteTx,
-    local: &SingleWriterTxKeyspace,
+    meta: &Meta,
     gen: u64,
     idx: u64,
-) -> Result<bool, MetaError> {
+) -> Result<Option<u64>, MetaError> {
     if gen == 0 || idx == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let key = deleg_log_idx_key(gen);
-    let cur = kv_get_tx(tx, local, &key)?
+    let cur = kv_get_tx(tx, &meta.local, &key)?
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     if cur < idx {
-        return Ok(false);
+        return Ok(None);
     }
-    kv_set_tx(tx, local, &key, &(idx - 1).to_string());
-    Ok(true)
+    let to = past_stream_fills(&*tx, meta, gen, idx - 1)?;
+    if to >= cur {
+        return Ok(None);
+    }
+    kv_set_tx(tx, &meta.local, &key, &to.to_string());
+    Ok(Some(to))
 }
 
 /// Raise the persisted cut of the ended generation `gen` to `through`
