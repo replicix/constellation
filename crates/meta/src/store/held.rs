@@ -2665,8 +2665,16 @@ impl Meta {
         // the log. The `DropHeld` record is in the log already (this apply
         // runs when it is); its `Refused` rows follow.
         // (A stream holder's apply journals them as rows of its stream: they
-        // follow the record there.)
-        if !refused_rids.is_empty() && (sequencer || plan.stream.is_some()) {
+        // follow the record there. Not into a stream that ended since: the
+        // end stranded what the holder had of it, and the record's rids are
+        // the log's answer.)
+        let stream_live = match plan.stream {
+            Some((gen, _)) => {
+                super::kv_get_tx(&tx, &self.local, &local::deleg_void_cut_key(gen))?.is_none()
+            }
+            None => false,
+        };
+        if !refused_rids.is_empty() && (sequencer || stream_live) {
             let _own = plan.stream.map(|(gen, _)| {
                 journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO)
             });
@@ -2804,7 +2812,7 @@ impl Meta {
             pending_epoch: 0,
             follow_ups: plan.follow_ups as usize,
             leftovers,
-            deposed: !sequencer && plan.stream.is_none(),
+            deposed: !sequencer && !stream_live,
             applied_seq: self.applied_seq()?,
         };
         {
@@ -3958,6 +3966,106 @@ mod tests {
             matches!(&sent[2].records[..], [LogRecord::DropHeld { ino, .. }] if *ino == files[2]),
             "index 3 is the higher inode's record: {:?}",
             sent[2].records
+        );
+    }
+
+    /// ADR-59 part B, landing review SHOULD-1: the root appended a stream
+    /// holder's record and row 3 and the generation then ended (a recall, the
+    /// holder cut off) before the holder applied it. The end strands every row
+    /// of the stream the holder still has (the seed included: it is queued
+    /// under the generation), so the apply finds nothing to refuse and leaves
+    /// no row in the ended stream; it reports itself deposed, journaling
+    /// nothing into a stream it no longer holds (the record's `rolled_back`
+    /// rids are the log's answer). The parent also left no row, but called the
+    /// apply not deposed.
+    #[test]
+    fn a_stream_holders_apply_journals_nothing_into_an_ended_stream() {
+        use crate::mutate::MutateOp;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        let files: Vec<Ino> = (1..=3)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let gen = (1u64 << 32) | 1;
+        let chmod = |ino: Ino| MutateOp::Setattr {
+            ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        let rid = |seq: u64| crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        };
+        let run = |op: &MutateOp, seq: u64| {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, op, Some(rid(seq))).unwrap();
+        };
+        run(&chmod(files[0]), 1);
+        let hash = ChunkHash::of(b"lost");
+        let manifest = Manifest {
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_dirty(files[1], None, &manifest, 7, None, None, &[hash])
+                .unwrap();
+        }
+        run(&chmod(files[2]), 3);
+        meta.note_unrecoverable_chunks(&[(hash, files[1])], false)
+            .unwrap();
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        meta.drop_held_in_stream(files[1], 0, &none, &no_ops, &sessions, &|g| g == gen)
+            .unwrap();
+        let sent = meta.delegate_txs_from(gen, 1, usize::MAX).unwrap();
+        let record = sent[1].records.clone();
+        // The root appended the record (its segment) and row 3, then ended the
+        // stream at its cursor.
+        meta.apply_segment_rows(1, 1, 0, &[50], &[(gen, 2)], &record, &Default::default())
+            .unwrap();
+        meta.apply_segment_rows(
+            2,
+            1,
+            0,
+            &[51],
+            &[(0, 0)],
+            &[LogRecord::DelegateNodeEnded {
+                node: 1,
+                gen,
+                through: 3,
+            }],
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(meta.drop_plan_shipped(files[1]));
+        let applied = meta
+            .drop_held_apply(files[1], 0, &none, &no_ops, &sessions, false)
+            .unwrap();
+        assert!(applied.deposed, "{applied:?}");
+        let rows: Vec<u64> = meta
+            .delegate_rows_for_audit(gen)
+            .unwrap()
+            .into_iter()
+            .map(|(idx, ..)| idx)
+            .collect();
+        assert!(
+            rows.iter().all(|idx| *idx <= 3),
+            "a row was journaled into the ended stream: {rows:?}"
         );
     }
 
