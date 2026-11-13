@@ -524,6 +524,14 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         Skip::Local(&[CTO_STRICT, PLACEMENT, "unmounts a local daemon and reads its log"]),
     ),
     (
+        "sticky-handover-alternating",
+        Skip::Local(&[CTO_STRICT, NODES3, PLACEMENT, "needs the WAN delay of CONSTELLATION_HARNESS_LOAD=net-wan"]),
+    ),
+    (
+        "sticky-handover-one-off",
+        Skip::Local(&[CTO_STRICT, NODES3, PLACEMENT, "needs the WAN delay of CONSTELLATION_HARNESS_LOAD=net-wan"]),
+    ),
+    (
         "sticky-release-on-unmount",
         Skip::Local(&[CTO_STRICT, NODES3, "unmounts a local daemon and reads its log"]),
     ),

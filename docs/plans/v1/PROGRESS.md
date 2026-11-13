@@ -69747,3 +69747,62 @@ instances of one question: what may the root's own stream rest on at a depositio
 - Not done: the sim control (above); a per-directory honour on growth (honoured per generation, as decided); the core case of
   the design's S2 (a deferred row, a later row shipped, a deposition, the re-stream not skipped) is carried by the plan's
   test T5 and the oracle `stream_log_contiguous`, not by a core test.
+
+## Plan 46 M1.3 step 8: the cooperative handover of a sticky grant (ADR-56, 2026-11-12)
+
+Chunks C1 to C3 (model, wire, holder side) landed earlier; this round is C4, C5 and C7 (C6, placed grants also moving by
+handover, is deferred and noted in ADR-56). Commits on top of `77b3a43a` (ADR-54 and ADR-55 landed): C4 the root's side, C5
+the simulation, C7 the harness scenarios, the read-delegation fixes they found, and the documentation.
+
+- **C4, the root.** A placement pass asks the holder of a sticky subtree (`ReleaseRequest { why: Handover }`) when another
+  node dominates it over the window, the grant has been with its holder for the minimum tenure (`CONSTELLATION_STICKY_HANDOVER_TENURE_MS`,
+  30 s), and the node can be given it (`place_eligible`, `place_kind_for`; the root itself always). The request is not a recall
+  (no `deleg_sticky_recalled_other`, the slot stays open); the resend timer repeats it as a handover; an unanswered one is dropped
+  after `handover_patience` (`grace + 2F`, a derived bound, D19 for the forward held at a draining holder), never escalated.
+  `root_release_appended` grants the subtree to the requester after the holder's row and after the ops the root held ran
+  (sticky for a far node, placed with a group, the root's own sticky grant for the root, else the root's keys); a grant that
+  `delegate_dir` refuses is retried every tick for a window. The root as the holder is a message to itself delivered inline
+  (ADR-55); no special serving. Fail-before (the parent plus the config/stat/state fields): 11 of the 12 root tests of
+  `step8_handover_root` fail (the 12th, a one-off write asks nothing, passes on the parent for the trivial reason). Status block
+  `status.delegation.handovers`; stats; fault knobs `handover_ends_sticky`, `handover_ignores_tenure`,
+  `handover_grants_before_release`. The review items of C1 to C3 that were open were already in `c6cc46fe` (S3 the view filter
+  and the sample gate on every sticky command, S4 give-ups counted and the wait put back, S5 the holder's wait expires
+  `handover_patience` after the last request, S6 the busy wait starts the grace); the P1 mutex is gone (the activity is a
+  record per (stream, subtree) under the entries lock the admission holds).
+- **C5, the simulation.** `sticky-handover-ping-pong` (+ `-root-writes`), `sticky-handover-root`, `sticky-handover-crash`;
+  `SimConfig::writer_phases` and `one_off_nodes`; oracles `handover_tenure` and `one_off_no_handover` (strict on every
+  configuration, judged from the requests and grants the root reported, dated by the run); `HANDOVER-TOTALS` in the sweep
+  report. Controls: `handover_ends_sticky` fails `sticky_ends_only_by_holder_or_operator`, `handover_ignores_tenure` fails
+  `handover_tenure` (swapping writers faster than the tenure), `handover_grants_before_release` fails a run (two
+  sequencers: a client outcome `Busy`, no quiescence). Found by the first run of `sticky-handover-root` (fail-before, seed 0):
+  the root's own client op that had been forwarded to the old holder came back through the root path, which answered `Busy`
+  under the root's own stream (`RecallPlan::Hold`); it is now offered to the stream.
+- **C7, the harness.** `sticky-handover-alternating` and `sticky-handover-one-off` (net-wan; off it they say so and pass).
+  The alternating scenario found that a handover from the root's own stream never completed with a reader writing: the release row
+  and the new grant wait for the read delegations under the subtree to be recalled, and the new owner keeps reading it, so new
+  ones were granted behind the recalls. Fixed at the three places (the root path under its own stream and under a subtree
+  it asked to hand over; a stream for a subtree it released; the directory of a sticky grant whose read delegations are being
+  recalled); core tests `the_root_grants_no_read_under_its_own_stream_being_released` and `a_holder_grants_no_read_under_a_subtree_it_released`
+  fail without. Printed on the run: /h placed on b after 2.4 s; c's first write to its install 5.9 s (forwarded writes p50 0.65 s,
+  after the handover p50 4 ms); back on b after 5.6 s (forwarded p50 0.64 s, after 3 ms). ADR-56, DESIGN.md, delegations.md,
+  configuration.md.
+- **Gate** (box 2, release where stated): fmt; clippy `--workspace --all-targets -D warnings`; debug `--workspace --lib
+  --no-fail-fast` 0 FAILED (one earlier run failed `platform::linux::own_flock_is_found_in_proc_locks`, passing alone on the
+  parent and on the rerun: it reads `/proc/locks` beside other jobs' locks); release `-p constellation-authority
+  --no-fail-fast`: 1558 lib and 520 sim tests, 0 FAILED.
+- **Sweeps x2,000, 0 failing, 0 panics**, on the tip and on `77b3a43a`: all 20 `far-root-writes*` variants, `sticky-ttl`,
+  `sticky-idle-release`, `sticky-holder-returns`, `placement-hot+commit`, `far-placement+commit`; the four new handover
+  configurations plain and `+commit` (no counterpart on the parent). `flex+settle+oracles+unsettled`: the same 7 failing seeds as
+  the parent (214, 215, 490, 934, 1340, 1524, 1911). Coverage (`HANDOVER-TOTALS`, 2,000 seeds): ping-pong 7,752 requests, 7,752
+  grants after the row, shortest gap between grants 3,015 ms (tenure 3,000); crash 7,693 requested, 141 dropped unanswered, 7,552
+  granted; root 1,983; `far-placement+commit` 307 requested with 35 dropped; `far-root-writes` 11. **Not covered by the simulation:
+  the holder's wait for its own ops (`deleg_handover_waits` is 0 in every sweep, the holder is idle when asked)**; core tests 4 to 6
+  of C3 carry it.
+- **Harness smoke** (release, seed 42): `delegate-crash`, `delegated-subtrees`, `sticky-abandon`, `takeover-loss-two-node`,
+  `sticky-release-on-unmount`, `root-own-sticky`, `root-own-sticky-unmount`, and under net-wan `sticky-handover-alternating`
+  (785 s, mostly its check that sampled files are on every node over the WAN) and `sticky-handover-one-off` pass.
+- **Perf**: `bench/commit-rule/RESULTS.md` (topologies 3 and 7 ABBA on ext4, xfs, btrfs and tmpfs; the admission microbenchmark
+  1.018, 1.020, 1.025 at 1, 16, 64 threads, about 7 ns per admission).
+- Not done / judgment calls: C6; the busy-holder wait in the simulation (above); `handover_pending` per generation in the
+  status (a block of counters instead); the perf runs shared the box with other jobs at times, so the p50s of 100 us ops move by
+  10 to 20 % between two runs in both builds.

@@ -72994,6 +72994,52 @@ mod step4_sticky {
         assert!(ask(&mut h).is_none(), "served under an ended stream");
     }
 
+    /// ADR-56: a holder grants no read delegation under a subtree it has
+    /// released (its release row waits for the grants it recalled; a reader
+    /// that goes on reading there, as a new owner's writes do, would be
+    /// granted new ones behind the recalls, for ever). Another subtree of the
+    /// stream is granted as before. Fails without the `still_held` check.
+    #[test]
+    fn a_holder_grants_no_read_under_a_subtree_it_released() {
+        let (mut h, dirs) = holder_of(
+            true,
+            &[(SubtreeKind::Sticky, "a"), (SubtreeKind::Sticky, "b")],
+        );
+        h.core.cfg.read_delegations = true;
+        h.advance(10);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.dl.mine.get_mut(&7).unwrap().answered_sent = h.clk().honour;
+        // (`None`: not served by this stream at all, which grants nothing.)
+        let ask = |h: &mut Harness, dir| match h.deleg_read_index(h.clk(), 2, dir, Some("x")) {
+            Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => grant,
+            None => None,
+            other => panic!("{other:?}"),
+        };
+        assert!(ask(&mut h, dirs[0]).is_some(), "granted before the release");
+        // The stream released `a` (the row waits for the recalls).
+        h.core
+            .dl
+            .mine
+            .get_mut(&7)
+            .unwrap()
+            .dirs
+            .retain(|d| *d != dirs[0]);
+        assert!(
+            ask(&mut h, dirs[0]).is_none(),
+            "granted under a released subtree"
+        );
+        assert!(
+            ask(&mut h, dirs[1]).is_some(),
+            "the other subtree is still granted"
+        );
+        h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+        assert!(
+            ask(&mut h, dirs[1]).is_none(),
+            "granted by a stopped stream"
+        );
+    }
+
     /// A delegate grants a read delegation only to a reader in the roster or
     /// the links: the abandon's void goes to those, so a grant to any other
     /// node (net admission lets one in before the core hears of it) could
@@ -82115,6 +82161,92 @@ mod step8_handover_root {
         }
         assert!(h.core.pl.handover.is_empty());
         assert_eq!(h.core.stats.place_handover_granted, 1);
+    }
+
+    /// ADR-56: the root as the holder of a subtree it is asked to hand over:
+    /// once its stream has released the subtree (stopped, the row not in the
+    /// log yet) the root path grants no read delegation under it. A reader
+    /// that goes on writing there (every write is a lookup) would otherwise be
+    /// granted new ones behind the recalls the release row waits for, and the
+    /// row would never be shipped. Fails without `own_stream_covers`.
+    #[test]
+    fn the_root_grants_no_read_under_its_own_stream_being_released() {
+        let (mut h, dirs) = far_root();
+        h.core.cfg.read_delegations = true;
+        h.core.cfg.placement_far_dwell_ms = 1_000;
+        tick(&mut h);
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir_from(
+                crate::core::delegate::GrantSource::Placement,
+                h.clk(),
+                dirs[0],
+                1,
+                DelegKind::Sticky,
+                &h.meta,
+                &mut out,
+            )
+            .expect("the root's own sticky grant");
+        let gen = h.meta.delegation_table().get(dirs[0]).unwrap().gen;
+        let op = MutateOp::Create {
+            parent: dirs[0],
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dirs[0]).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        // The stream released the subtree (whole): stopped, nothing held.
+        if let Some(d) = h.core.dl.mine.get_mut(&gen) {
+            d.stopped = true;
+        }
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::ReadIndex {
+                req: OpId(77),
+                ino,
+                dir: false,
+                name: None,
+                ahead: crate::event::ReadAhead::None,
+            },
+        });
+        let outcome = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::ReadIndexReply { outcome, .. } if to == 3 => Some(outcome.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: None, .. })
+            ),
+            "a read delegation was granted under the root's own released stream: {outcome:?}"
+        );
+        // And on the directory itself (a lookup in it).
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::ReadIndex {
+                req: OpId(78),
+                ino: dirs[0],
+                dir: true,
+                name: Some("f".into()),
+                ahead: crate::event::ReadAhead::None,
+            },
+        });
+        let outcome = sends(&out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::ReadIndexReply { outcome, .. } if to == 3 => Some(outcome.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(
+                outcome,
+                Some(crate::event::ReadIndexOutcome::Ok { grant: None, .. })
+            ),
+            "a read delegation was granted on the released subtree's directory: {outcome:?}"
+        );
     }
 
     /// The root as the holder (ADR-55): the request to itself is delivered

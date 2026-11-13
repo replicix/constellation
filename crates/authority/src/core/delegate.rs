@@ -9272,8 +9272,19 @@ impl Core {
         // Only a reader the stream's void reaches (`void_audience`) gets a
         // grant: one the directory has not shown this core yet reads
         // through, and gets one on a later read, once it is known.
+        // ADR-56: and none under a subtree this stream has released (or a
+        // stream that is released whole): the release row waits for the
+        // grants it recalled, and a reader that goes on reading there (every
+        // write of a new owner is a lookup) would be granted new ones behind
+        // the recalls, for ever.
+        let still_held = !d.stopped
+            && matches!(
+                replica.resolve_ownership(&keys),
+                Ownership::Delegated(t) if d.dirs.contains(&t.dir)
+            );
         let grant = if self.cfg.read_delegations
             && from != self.cfg.node_id
+            && still_held
             && self.void_audience().is_some_and(|a| a.contains(&from))
         {
             let margin = self.cfg.expiry_margin_ms as i64;
@@ -9357,6 +9368,27 @@ impl Core {
     /// [`Self::deleg_read_owner`] with the generation of the delegation
     /// that owns the keys, which a redirect names (a designee is no lease
     /// holder: the requester must not cache it).
+    /// Whether `ino` (a read of it, or of its children) falls under a
+    /// delegation of this node's own stream, honoured or not: the root path
+    /// grants no read delegation there. A stream being released (its subtree
+    /// left `mine`, the release row not in the log yet) is still the table's
+    /// owner of the subtree, and the root's own executor must not be chased by
+    /// grants made behind the recalls its release waits for (ADR-56: the
+    /// root as the holder of a handed-over subtree, with a reader writing).
+    pub(crate) fn own_stream_covers(&self, ino: Ino, replica: &dyn Replica) -> bool {
+        if !self.cfg.delegation || replica.delegation_table().is_empty() {
+            return false;
+        }
+        // (The inode itself, and, for a directory, its entries: a grant on a
+        // directory covers the lookups in it.)
+        [None, Some("")].into_iter().any(|name| {
+            matches!(
+                replica.resolve_ownership(&Self::read_keys(ino, name)),
+                Ownership::Delegated(d) if d.node == self.cfg.node_id
+            )
+        })
+    }
+
     pub(crate) fn deleg_read_owner_gen(
         &self,
         now: Now,
@@ -12626,6 +12658,15 @@ impl Core {
             if !read_grants.grants.is_empty() {
                 if designating {
                     self.dl.designating.insert(dir, node);
+                } else {
+                    // Nothing more is granted under `dir` while the ones there
+                    // are recalled (until the latest of them would lapse): a
+                    // reader that goes on reading, as the requester of a
+                    // handover does, would be granted new ones behind the
+                    // recalls, and the grant would never be made.
+                    if let Some(until) = read_grants.grants.iter().map(|g| g.until).max() {
+                        self.dl.growing.insert(dir, (node, until));
+                    }
                 }
                 let n = read_grants.grants.len();
                 self.start_recalls(now, read_grants, out);
@@ -12643,6 +12684,7 @@ impl Core {
                 ));
             }
             self.dl.designating.remove(&dir);
+            self.dl.growing.remove(&dir);
         }
         if let Some(gen) = live_stream {
             let grown = self.grow_generation(now, gen, dir, kind, replica, out);
@@ -12954,10 +12996,16 @@ impl Core {
         replica: &dyn Replica,
     ) -> bool {
         let ns = replica.namespace();
-        self.dl
-            .designating
-            .keys()
-            .any(|dir| is_under(ns, ino, *dir))
+        // ADR-56: and under a subtree this root asked its holder to hand over
+        // (when the holder is the root itself, the grants it makes behind the
+        // recalls its release waits for would keep the release row, and so the
+        // handover, for ever).
+        self.pl.handover.keys().any(|dir| is_under(ns, ino, *dir))
+            || self
+                .dl
+                .designating
+                .keys()
+                .any(|dir| is_under(ns, ino, *dir))
             || self
                 .dl
                 .growing

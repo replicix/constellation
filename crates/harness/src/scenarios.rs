@@ -1357,6 +1357,20 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::root_own_sticky_unmount,
     },
     Scenario {
+        name: "sticky-handover-alternating",
+        desc: "plan 46 M1.3 step 8 (ADR-56; runs under CONSTELLATION_HARNESS_LOAD=net-wan): b writes /h until it holds it sticky, then c writes it for 20 s (forwarded to b at the WAN round trip, final) until the root has asked b to hand it over and c holds it (local speed), then b writes again and the subtree returns; at most a handful of requests, no write fails, every file on every node; per-phase latencies and the time from c's first write to its install are printed",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_handover_alternating,
+    },
+    Scenario {
+        name: "sticky-handover-one-off",
+        desc: "plan 46 M1.3 step 8 (ADR-56; runs under CONSTELLATION_HARNESS_LOAD=net-wan): b holds /h sticky; c creates one file in it, final at the WAN round trip, and the root asks nobody to hand /h over in the 15 s after (tenure and window passed); every file on every node",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_handover_one_off,
+    },
+    Scenario {
         name: "sticky-release-on-unmount",
         desc: "plan 46 M1.3 step 7: the sticky holder of d1 (b) unmounts cleanly after writing 40 files; it releases the subtree before it exits, so d1 leaves the root's table at once, c's write into d1 succeeds well inside the time a dead sticky holder's subtree stays read-only, and b's files are on every node",
         requires: &[],
