@@ -10071,6 +10071,43 @@ impl Core {
         }
     }
 
+    /// ADR-56 / ADR-59 part B: after a `DropHeld` was applied, a handover whose
+    /// holder's release row is in the root's bookkeeping (`granting`) but whose
+    /// subtree the table still lists under the holder's stream lost its row
+    /// (the drop retired it, and the grant behind it): there is nothing to
+    /// grant from. The request is dropped with its bookkeeping (the holder's
+    /// stream is the table's, H-I1) and the change of hands is forgotten; the
+    /// placement asks again if the writer still dominates.
+    pub(crate) fn handover_after_drop(&mut self, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let ns = replica.namespace();
+        let table = replica.delegation_table();
+        let lost: Vec<(Ino, u64)> = self
+            .pl
+            .handover
+            .iter()
+            .filter(|(dir, r)| {
+                r.granting.is_some()
+                    && table
+                        .covering(ns, **dir)
+                        .is_some_and(|c| c.gen == r.gen && c.node != r.to)
+            })
+            .map(|(d, r)| (*d, r.gen))
+            .collect();
+        let mut gens = BTreeSet::new();
+        for (dir, gen) in lost {
+            self.pl.handover.remove(&dir);
+            self.pl.hands.remove(&dir);
+            self.stats.place_handover_grant_dropped += 1;
+            if let Some(g) = self.dl.gens.get_mut(&gen) {
+                g.releasing.remove(&dir);
+            }
+            gens.insert(gen);
+        }
+        for gen in gens {
+            self.release_wait_idle(gen, out);
+        }
+    }
+
     /// A stream with nothing left to release forgets its request's
     /// bookkeeping and timer (a recall's is cleared by its row).
     fn release_wait_idle(&mut self, gen: u64, out: &mut Vec<Action>) {

@@ -1296,6 +1296,9 @@ impl Core {
                     return;
                 }
                 self.stats.drops_applied += 1;
+                // ADR-56 (review S5): a drop that rolled back a release row of
+                // a holder, and the grant behind it, leaves no handover to finish.
+                self.handover_after_drop(replica, out);
                 if dropped.deposed {
                     self.stats.drops_applied_deposed += 1;
                 }
