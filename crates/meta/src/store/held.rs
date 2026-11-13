@@ -2175,20 +2175,21 @@ impl Meta {
         Ok(())
     }
 
-    /// `(gen, log index, session index)` of each generation `fills` names,
-    /// in the caller's transaction.
+    /// `(gen, log index)` of each generation `fills` names, in the caller's
+    /// transaction.
+    #[cfg(debug_assertions)]
     fn stream_counts_tx(
         &self,
         tx: &impl Readable,
         fills: &[(u64, u64)],
-    ) -> Result<Vec<(u64, u64, u64)>, MetaError> {
+    ) -> Result<Vec<(u64, u64)>, MetaError> {
         let gens: BTreeSet<u64> = fills.iter().map(|(gen, _)| *gen).collect();
         let mut out = Vec::with_capacity(gens.len());
         for gen in gens {
             let log_idx = super::kv_get_tx(tx, &self.local, &local::deleg_log_idx_key(gen))?
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            out.push((gen, log_idx, self.session.stream_applied(gen)));
+            out.push((gen, log_idx));
         }
         Ok(out)
     }
@@ -2295,10 +2296,11 @@ impl Meta {
         let mut seqs: HashSet<u64> = walked.dependents.iter().map(|(seq, _, _)| *seq).collect();
         seqs.extend(walked.seeds.iter().map(|(_, seq, _)| *seq));
         let staged = UsageTracker::staging();
-        // The strand takes a stranded stream row's index back in the log's
-        // count and the session's (it leaves the journal unshipped); a row
-        // the record fills is in the log as the record, and the rows the drop
-        // keeps above it keep theirs: both counts are restored after it.
+        // A stranded stream row's index is taken back only below the first
+        // position the log does not carry (`local::retract_log_idx_tx`): a row
+        // the record fills is in the log as the record, so the strand leaves
+        // the counts of a shipped record's streams as they were.
+        #[cfg(debug_assertions)]
         let streams_before = self.stream_counts_tx(&tx, &plan.fills)?;
         let (_, redo_skipped) = spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
         if !redo_skipped.is_empty() {
@@ -2323,13 +2325,21 @@ impl Meta {
             "the apply of the drop of inode {ino} left {leftovers} journal transaction(s) the \
              DropHeld names"
         );
-        // The strand took back the log index of each stream row it removed;
-        // the record the log carries is the stream's row there (a no-op): the
-        // index stands. (Not for the offline forms, whose record has not
-        // shipped: its ack counts it.)
-        for (gen, log_idx, _) in &streams_before {
-            local::bump_log_idx_tx(&mut tx, self, *gen, *log_idx)?;
+        #[cfg(debug_assertions)]
+        if plan.shipped {
+            for ((gen, before), (_, after)) in streams_before
+                .iter()
+                .zip(self.stream_counts_tx(&tx, &plan.fills)?)
+            {
+                debug_assert!(
+                    after >= *before,
+                    "the apply of the drop of inode {ino} took the log index of stream {gen} \
+                     back from {before} to {after} below a fill the log carries"
+                );
+            }
         }
+        // (The offline forms' record has not shipped: its ack counts the
+        // fills.)
         if plan.shipped {
             self.note_drop_fills_tx(&mut tx, &plan.fills)?;
         }
@@ -2621,9 +2631,6 @@ impl Meta {
         )?;
         tx.remove(&self.local, drop_plan_key(ino));
         tx.commit()?;
-        for (gen, _, session_idx) in &streams_before {
-            self.session.note_stream(*gen, *session_idx);
-        }
         if plan.shipped {
             self.note_drop_fills(&plan.fills);
         }
