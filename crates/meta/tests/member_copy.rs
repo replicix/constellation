@@ -2158,5 +2158,6 @@ fn drop_held_rec(idents: Vec<(u64, u64)>) -> LogRecord {
         chunks: Vec::new(),
         rolled_back: idents.into_iter().map(|i| (i, None)).collect(),
         fills: Vec::new(),
+        queued: Vec::new(),
     }
 }

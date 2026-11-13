@@ -2038,7 +2038,7 @@ fn a_queued_shadow_the_drop_leaves_alone_keeps_the_chunks_marks() {
 /// left (an earlier drop kept the chunk's marks for an op that still named
 /// it) that refuses a replay of the damaged manifest an earlier deposition
 /// queued here decides it in the log (D1): a `DropHeld` names the rid (no
-/// transaction: `QUEUED_REPLAY_IDENT`), and the refusal waits for the
+/// transaction: `DropHeld::queued`), and the refusal waits for the
 /// apply. Before, the seedless path applied at once with no record: the
 /// rid was refused and listed lost while nothing in the log named it
 /// (`drop_acked_loss_unrecorded`, the shape of seed 1051). Fails on the
@@ -2092,15 +2092,15 @@ fn a_seedless_drop_names_the_queued_replays_it_refuses() {
     let named: Vec<_> = rows
         .iter()
         .filter_map(|(_, rec)| match rec {
-            LogRecord::DropHeld { rolled_back, .. } => Some(rolled_back.clone()),
+            LogRecord::DropHeld {
+                rolled_back,
+                queued,
+                ..
+            } => Some((rolled_back.clone(), queued.clone())),
             _ => None,
         })
-        .flatten()
         .collect();
-    assert_eq!(
-        named,
-        vec![(constellation_meta::QUEUED_REPLAY_IDENT, Some(rid_of(1, 7)))]
-    );
+    assert_eq!(named, vec![(Vec::new(), vec![rid_of(1, 7)])]);
     // Not refused before the log carries the record.
     let queued = meta.pending_replays().unwrap();
     assert!(
@@ -2418,6 +2418,7 @@ fn a_replay_of_a_re_shipped_row_whose_identity_was_retired_journals_without_it()
             chunks: Vec::new(),
             rolled_back: vec![((1, 3), None)],
             fills: Vec::new(),
+            queued: Vec::new(),
         }],
         &Default::default(),
     )

@@ -2821,7 +2821,7 @@ pub fn survivors_of_drop(log: &super::check::Oracle, dropped: &BTreeSet<Rid>) ->
 }
 
 /// ADR-59 part B: the rids the unfenced `DropHeld` records of the log name in
-/// `rolled_back`. The decision that caused a rollback is the artifact: durable,
+/// `rolled_back` and `queued`. The decision that caused a rollback is the artifact: durable,
 /// operator-visible and written before the loss takes effect. What a node said
 /// afterwards (`acked_lost`) is no source of it: a dropper that stays dead
 /// reports nothing.
@@ -2829,12 +2829,19 @@ pub fn drop_named_rids(log: &super::check::Oracle) -> BTreeSet<Rid> {
     log.unfenced
         .values()
         .flat_map(|seg| seg.records.iter())
-        .filter_map(|rec| match rec {
-            LogRecord::DropHeld { rolled_back, .. } => Some(rolled_back),
-            _ => None,
+        .flat_map(|rec| match rec {
+            // (And the queued replays it refuses: no transaction, a rid.)
+            LogRecord::DropHeld {
+                rolled_back,
+                queued,
+                ..
+            } => rolled_back
+                .iter()
+                .filter_map(|(_, rid)| *rid)
+                .chain(queued.iter().copied())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         })
-        .flatten()
-        .filter_map(|(_, rid)| *rid)
         .collect()
 }
 
@@ -3750,6 +3757,7 @@ mod tests {
             chunks: Vec::new(),
             rolled_back: vec![((1, 3), Some(r))],
             fills: Vec::new(),
+            queued: Vec::new(),
         }
     }
 

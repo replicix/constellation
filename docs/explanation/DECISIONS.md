@@ -4790,8 +4790,8 @@ is the consequence of that record being in the log.**
   rows that do not need the lost bytes (I5).
 - **What the record names, the apply refuses, and no more.** A replay of the
   damaged manifest that an earlier deposition queued here (the root's own,
-  `gen` 0) is named by the decision's record by its rid, under the identity
-  `QUEUED_REPLAY_IDENT` (`(0, 0)`: no transaction, nothing retires), and only
+  `gen` 0) is named by the decision's record by its rid (`queued`: no
+  transaction, nothing retires), and only
   the named entries are refused at the apply. A drop with no journaled seed
   that refuses such an entry now journals a record and waits for the log like
   any other (D1; before, it refused and listed the rid with no record: seed

@@ -2003,15 +2003,9 @@ impl Meta {
         }
         // The replays of this inode's manifest an earlier deposition queued
         // here (the root's own: `gen` 0) are refused by this drop too, so the
-        // record names them (D1): by rid, under `QUEUED_REPLAY_IDENT` (the
-        // row left this journal; nothing retires).
+        // record names them (D1), by rid (`DropHeld::queued`: the row left
+        // this journal; nothing retires). O(queue): an operator's path.
         plan.queued = queued_namers(&tx, self, ino, &missing)?;
-        let mut rolled_back = walked.idents.clone();
-        rolled_back.extend(
-            plan.queued
-                .iter()
-                .map(|(_, rid)| (crate::record::QUEUED_REPLAY_IDENT, Some(*rid))),
-        );
         if walked.seeds.is_empty() && plan.queued.is_empty() {
             // Nothing to carry in the log: a run after an earlier drop kept a
             // lost chunk's rows because an op or a write session still named
@@ -2035,8 +2029,9 @@ impl Meta {
             &LogRecord::DropHeld {
                 ino,
                 chunks: missing.iter().copied().collect(),
-                rolled_back,
+                rolled_back: walked.idents.clone(),
                 fills: walked.fills.clone(),
+                queued: plan.queued.iter().map(|(_, rid)| *rid).collect(),
             },
         )?;
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
@@ -2744,6 +2739,7 @@ impl Meta {
                 chunks: Vec::new(),
                 rolled_back: walked.idents.clone(),
                 fills: walked.fills.clone(),
+                queued: Vec::new(),
             },
         )?;
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
@@ -2874,7 +2870,7 @@ struct DropPlan {
     fills: Vec<(u64, u64)>,
     /// `spec_seq`s of the seed transactions.
     seeds: Vec<u64>,
-    /// The queued replays the record names (`QUEUED_REPLAY_IDENT`), by queue
+    /// The queued replays the record names (`DropHeld::queued`), by queue
     /// key and rid: the apply refuses these and no other.
     queued: Vec<(u64, crate::rid::Rid)>,
     /// `spec_seq`s of the dependents rolled back with them.
