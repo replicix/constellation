@@ -361,6 +361,8 @@ pub struct StickyHandoverStatus {
     pub grant_dropped: u64,
     pub held_by_tenure: u64,
     pub ineligible: u64,
+    /// Handovers to the root that ended on the root's keys.
+    pub root_keys: u64,
     pub holder_waits: u64,
     pub holder_released: u64,
     pub holder_ignored: u64,

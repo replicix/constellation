@@ -1812,7 +1812,8 @@
             "holder_released": 0,
             "holder_waits": 0,
             "ineligible": 0,
-            "requested": 0
+            "requested": 0,
+            "root_keys": 0
           },
           "description": "Plan 46 M1.3 step 8 (ADR-56): the handover of sticky grants."
         },
@@ -10397,6 +10398,12 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "root_keys": {
+          "description": "Handovers to the root that ended on the root's keys.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -10406,6 +10413,7 @@
         "grant_dropped",
         "held_by_tenure",
         "ineligible",
+        "root_keys",
         "holder_waits",
         "holder_released",
         "holder_ignored",

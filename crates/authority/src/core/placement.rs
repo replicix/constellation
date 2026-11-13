@@ -265,7 +265,7 @@ impl Core {
             // Not the root any more: the counts are meaningless.
             self.pl.buckets.clear();
             self.pl.far.clear();
-            self.pl.handover.clear();
+            self.handover_drop_all(out);
             self.pl.hands.clear();
             return;
         }
@@ -933,7 +933,9 @@ impl Core {
                 if to == holder || total < min_ops {
                     continue;
                 }
-                let g = &self.dl.gens[&gen];
+                let Some(g) = self.dl.gens.get(&gen) else {
+                    break;
+                };
                 let since = g
                     .granted
                     .max(g.grown_at.unwrap_or(g.granted))
@@ -964,15 +966,22 @@ impl Core {
         for gen in gens {
             let live = self.dl.gens.get(&gen).is_some_and(|g| !g.ended);
             if !live {
-                // The stream is over: the requests with it (a grant waiting
-                // for a row that ended the stream is still made).
+                // The stream is over (its TTL lapsed, its state dropped): the
+                // requests with it (a grant waiting for a row that ended the
+                // stream is still made).
+                let before = self.pl.handover.len();
                 self.pl
                     .handover
                     .retain(|_, r| r.gen != gen || r.granting.is_some());
+                self.stats.place_handover_expired += (before - self.pl.handover.len()) as u64;
             } else {
                 self.handover_expire(now, gen, out);
             }
         }
+        // A change of hands older than the tenure changes nothing any more
+        // (`since` falls back to the grant's own time).
+        let tenure = self.cfg.handover_min_tenure_ms as i64;
+        self.pl.hands.retain(|_, at| now.wait.since(*at) < tenure);
         let granting: Vec<(Ino, WaitMs)> = self
             .pl
             .handover
@@ -1038,9 +1047,17 @@ impl Core {
             match self.place_kind_for(now, me, dir, replica) {
                 Ok(k) => k,
                 Err(_) => {
-                    // The subtree is the root's: its keys.
+                    // A skip that passes (the root's own stream is releasing
+                    // or being recalled, the quarantine of a release of its
+                    // own) is waited out until the window closes; any other
+                    // leaves the subtree on the root's keys.
+                    if r.granting.is_some_and(|until| now.wait < until)
+                        && self.root_skip_is_transient(now, dir, replica)
+                    {
+                        return;
+                    }
                     self.pl.handover.remove(&dir);
-                    self.stats.place_handover_granted += 1;
+                    self.stats.place_handover_root_keys += 1;
                     return;
                 }
             }
@@ -1086,5 +1103,26 @@ impl Core {
                 "a handed-over subtree is not granted yet"
             ),
         }
+    }
+}
+
+impl Core {
+    /// Whether `place_kind_for_root` refused `dir` for a reason that passes:
+    /// the root's own stream is releasing a subtree or being recalled, or a
+    /// release the root made itself is inside its quarantine on an ancestor
+    /// or descendant of `dir` (ADR-56: a handover to the root waits these out).
+    fn root_skip_is_transient(&self, now: Now, dir: Ino, replica: &dyn Replica) -> bool {
+        let me = self.cfg.node_id;
+        let ns = replica.namespace();
+        self.dl.gens.values().any(|g| {
+            !g.ended
+                && g.node == me
+                && (g.recall != crate::core::delegate::RecallPhase::None || !g.releasing.is_empty())
+        }) || self.pl.released.iter().any(|(d, (n, until))| {
+            *n == me
+                && *until > now.wait
+                && (super::delegate::is_under(ns, *d, dir)
+                    || super::delegate::is_under(ns, dir, *d))
+        })
     }
 }

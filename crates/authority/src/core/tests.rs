@@ -73040,6 +73040,40 @@ mod step4_sticky {
         );
     }
 
+    /// ADR-56 review S3 (read-your-writes across one log round): a holder
+    /// that released a subtree (its row is not in the table yet) does not
+    /// answer a read of it, whoever routes it by the old generation: the reader
+    /// asks the root, which has the writes it made after a `Fenced`.
+    #[test]
+    fn a_holder_does_not_answer_a_read_of_a_subtree_it_released() {
+        let (mut h, dirs) = holder_of(
+            true,
+            &[(SubtreeKind::Sticky, "a"), (SubtreeKind::Sticky, "b")],
+        );
+        h.advance(10);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.deleg_read_index(h.clk(), 2, dirs[0], Some("x")).is_some(),
+            "served before the release"
+        );
+        h.core
+            .dl
+            .mine
+            .get_mut(&7)
+            .unwrap()
+            .dirs
+            .retain(|d| *d != dirs[0]);
+        assert!(
+            h.deleg_read_index(h.clk(), 2, dirs[0], Some("x")).is_none(),
+            "a read of a released subtree was answered from the old position"
+        );
+        assert!(
+            h.deleg_read_index(h.clk(), 2, dirs[1], Some("x")).is_some(),
+            "the other subtree is still served"
+        );
+    }
+
     /// A delegate grants a read delegation only to a reader in the roster or
     /// the links: the abandon's void goes to those, so a grant to any other
     /// node (net admission lets one in before the core hears of it) could
@@ -82073,6 +82107,97 @@ mod step8_handover_root {
         assert_eq!(h.core.stats.deleg_handovers_requested, 2);
     }
 
+    /// ADR-56 review M1 (H-I1): a root that is not usable for one placement
+    /// tick (its lease's time is in doubt until the next renewal, a gate, the
+    /// handoff pause) drops its pending handover with its bookkeeping. It
+    /// does not leave the subtree in `releasing`, where the resend timer would
+    /// send it as a recall of a subtree of a sticky stream and, after the
+    /// patience, a recall of the stream. Fails before: every request sent
+    /// after the tick is a `Recall`, and the stream is recalled.
+    #[test]
+    fn a_transient_unusable_root_does_not_turn_a_handover_into_a_recall() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 3, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        // One tick with the lease unrenewed past its usable time.
+        h.advance(h.core.cfg.ttl_ms + 1_000);
+        assert!(!h.core.root_usable(h.clk()), "the root is still usable");
+        let (now, mut out) = (h.now, Vec::new());
+        h.core
+            .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
+        // Usable again; the resend timer fires well past the patience.
+        h.hold(1, None);
+        for _ in 0..5 {
+            h.advance(h.core.handover_patience_ms() as u64);
+            let mut out = Vec::new();
+            h.core.on_release_resend(h.clk(), gen, &mut out);
+            for (_, _, why) in requests(&out) {
+                assert_eq!(why, ReleaseWhy::Handover, "{out:?}");
+            }
+            assert_eq!(h.core.dl.gens[&gen].recall, RecallPhase::None);
+        }
+        assert!(h.core.dl.gens[&gen].releasing.is_empty());
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        assert!(h.core.pl.handover.is_empty());
+        assert!(h.core.stats.place_handover_expired >= 1);
+        assert_eq!(owner(&h, dirs[0]), Some((2, SubtreeKind::Sticky)));
+    }
+
+    /// ADR-56 review S1: a handover to the root that meets a skip that passes
+    /// (the root's own stream is releasing a subtree) is retried until the
+    /// window closes, not ended on the root's keys and counted granted.
+    #[test]
+    fn a_handover_to_the_root_waits_out_a_transient_skip() {
+        let (mut h, dirs) = far_root();
+        let gen = holds_sticky(&mut h, dirs[0], 2);
+        ticks_for(&mut h, 31_000);
+        note(&mut h, 1, dirs[0], 40);
+        assert_eq!(requests(&tick(&mut h)).len(), 1);
+        // The root's own stream is busy releasing something else.
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir_from(
+                crate::core::delegate::GrantSource::Placement,
+                h.clk(),
+                dirs[1],
+                1,
+                DelegKind::Sticky,
+                &h.meta,
+                &mut out,
+            )
+            .expect("the root's own sticky grant on w2");
+        let own = *h
+            .core
+            .dl
+            .gens
+            .iter()
+            .find(|(g, s)| **g != gen && s.node == 1)
+            .map(|(g, _)| g)
+            .expect("the root's stream");
+        h.core
+            .dl
+            .gens
+            .get_mut(&own)
+            .unwrap()
+            .releasing
+            .insert(dirs[1]);
+        release_row(&mut h, gen, 2, dirs[0]);
+        assert!(
+            h.core.pl.handover.contains_key(&dirs[0]),
+            "the handover was ended on a skip that passes"
+        );
+        assert_eq!(h.core.stats.place_handover_granted, 0);
+        assert_eq!(h.core.stats.place_handover_root_keys, 0);
+        // The skip passes: the grant is made.
+        h.core.dl.gens.get_mut(&own).unwrap().releasing.clear();
+        ticks_for(&mut h, 3_000);
+        assert!(h.core.pl.handover.is_empty());
+        assert_eq!(h.core.stats.place_handover_granted, 1);
+        assert_eq!(owner(&h, dirs[0]), Some((1, SubtreeKind::Sticky)));
+    }
+
     /// A recall of the stream (an operator's undelegate) decides: the
     /// requests waiting for the holder go, the recall is the recall's.
     #[test]
@@ -82160,7 +82285,10 @@ mod step8_handover_root {
             other => panic!("granted to someone else: {other:?}"),
         }
         assert!(h.core.pl.handover.is_empty());
-        assert_eq!(h.core.stats.place_handover_granted, 1);
+        assert_eq!(
+            h.core.stats.place_handover_granted + h.core.stats.place_handover_root_keys,
+            1
+        );
     }
 
     /// ADR-56: the root as the holder of a subtree it is asked to hand over:
@@ -82246,6 +82374,73 @@ mod step8_handover_root {
                 Some(crate::event::ReadIndexOutcome::Ok { grant: None, .. })
             ),
             "a read delegation was granted on the released subtree's directory: {outcome:?}"
+        );
+    }
+
+    /// ADR-56 review S3: the root path grants no read delegation under the
+    /// root's own stream (`own_stream_covers`), so the readers of a subtree
+    /// the root holds get theirs from the stream: a reader that asks the root
+    /// is served by the stream (this node as the delegate) and granted there
+    /// while the stream is honoured, and not at all once it is stopped.
+    #[test]
+    fn a_reader_of_the_roots_own_honoured_stream_is_granted_by_the_stream() {
+        let (mut h, dirs) = far_root();
+        h.core.cfg.read_delegations = true;
+        h.core.cfg.placement_far_dwell_ms = 1_000;
+        tick(&mut h);
+        let mut out = Vec::new();
+        h.core
+            .delegate_dir_from(
+                crate::core::delegate::GrantSource::Placement,
+                h.clk(),
+                dirs[0],
+                1,
+                DelegKind::Sticky,
+                &h.meta,
+                &mut out,
+            )
+            .expect("the root's own sticky grant");
+        let gen = h.meta.delegation_table().get(dirs[0]).unwrap().gen;
+        let op = MutateOp::Create {
+            parent: dirs[0],
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dirs[0]).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        h.core.dl.mine.get_mut(&gen).unwrap().answered_sent = h.clk().honour;
+        let ask = |h: &mut Harness, req| {
+            let out = h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::ReadIndex {
+                    req: OpId(req),
+                    ino,
+                    dir: false,
+                    name: None,
+                    ahead: crate::event::ReadAhead::None,
+                },
+            });
+            sends(&out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::ReadIndexReply {
+                    outcome: crate::event::ReadIndexOutcome::Ok { grant, .. },
+                    ..
+                } if to == 3 => Some(*grant),
+                _ => None,
+            })
+        };
+        assert!(
+            matches!(ask(&mut h, 90), Some(Some(_))),
+            "the stream did not grant its reader"
+        );
+        h.core.dl.mine.get_mut(&gen).unwrap().stopped = true;
+        assert!(
+            matches!(ask(&mut h, 91), Some(None)),
+            "a reader was granted behind a stopped own stream"
         );
     }
 
