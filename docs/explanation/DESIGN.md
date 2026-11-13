@@ -2143,7 +2143,8 @@ the node not yet journaled, or an open write session, still names keeps its
 pending row and marks (no row means durable to every manifest composition),
 or its manifest would ship naming a chunk S3 never received. The drop journals
 `DropHeld { ino, chunks, rolled_back, fills }` ahead of its refusals, naming each transaction it
-rolled back as a member keys it and filling each delegation-stream index it rolled back with its no-op row,
+rolled back as a member keys it (and each queued replay it refuses, by request
+id) and filling each delegation-stream index it rolled back with its no-op row,
 counted at its place in the stream's order, so the stream's later rows land
 without a hole ([ADR-59](DECISIONS.md#adr-59-a-directorys-merged-attributes-order-nothing-part-a)); a member that was streamed those as committed
 rolls its copy back without a replay, and backups' tails and member copies
