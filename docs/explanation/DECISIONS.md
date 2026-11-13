@@ -3590,7 +3590,14 @@ The rules:
    answer once the holder is reachable or its stream has ended, or, at the
    op's deadlines, in doubt (the settle's unsettled `EIO`, ADR-45's I4
    exception, now decided by the root from the request). The root's own client
-   ops under such a grant follow the same rule. `EXDEV` for a cross-subtree op
+   ops under such a grant follow the same rule. An untouched rid that was ever
+   in an inbox (amended 2026-11-13, `far-root-writes-shared+lost-chunk` seeds
+   617, 1477) is refused with its refusal journaled (`Refused { rid, EROFS }`,
+   as the drain journals its own refusal of it) and answered once that row is
+   committed, as a settle's refusal is: its batch may still be in the bucket,
+   and a drain runs it once the generation ends, so an unjournaled `EROFS` was
+   not final; the batch's run now dedups to the refusal
+   (`root_journals_inbox_ever`, `inbox_ever_refusals_journaled`). `EXDEV` for a cross-subtree op
    stays final: a non-stealable range shrinks only by the holder's own release
    or an end that appended its rows (so a run rid has an outcome at the root),
    or by the operator's abandon (operator I5, not I1).

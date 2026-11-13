@@ -78848,7 +78848,10 @@ mod route_fence_root {
             (4, true, TOUCHED_UNKNOWN),
         ] {
             let op = create_in(&h, d1, &format!("f{seq}"));
-            let out = forward_ever(&mut h, 2, seq, seq, op, false, (0, touched), ever);
+            let mut out = forward_ever(&mut h, 2, seq, seq, op, false, (0, touched), ever);
+            // (The untouched rid's refusal is journaled: answered once the
+            // archive carries it, `root_journals_inbox_ever`.)
+            out.extend(h.archive_lands());
             let got = outcome_to(&out, 2);
             match (ever, touched) {
                 (true, 0) => assert_eq!(got, Some(MutateOutcome::Errno(Code::ReadOnly)), "{out:?}"),
@@ -78857,6 +78860,60 @@ mod route_fence_root {
         }
         assert_eq!(h.core.stats.inbox_ever_redirects, 2);
         assert_eq!(h.core.stats.root_touched_holds, 0);
+    }
+
+    /// ADR-47 rule 2 for an inbox-ever rid (`far-root-writes-shared+lost-chunk`
+    /// seeds 617, 1477): the root refuses an untouched inbox-ever rid under an
+    /// unreachable designation for good, but its batch may still be in the
+    /// bucket and a drain runs it once the grant ends. The refusal is
+    /// journaled now (the batch's run dedups to it) and answered once the
+    /// archive carries it; a later drain of the batch runs nothing. Fails on
+    /// the parent: `EROFS` at once with nothing journaled, and the drain after
+    /// the grant ended created the name the client was told was refused.
+    #[test]
+    fn an_untouched_inbox_ever_refusal_is_journaled_before_its_answer() {
+        let (mut h, d1, gen) = sticky_root();
+        h.core.track_fence_audit();
+        let op = create_in(&h, d1, "f1");
+        let out = forward_ever(&mut h, 2, 1, 1, op.clone(), false, (0, 0), true);
+        assert_eq!(
+            outcome_to(&out, 2),
+            None,
+            "answered before the row: {out:?}"
+        );
+        assert!(has_outcome(&h, 2, 1), "the refusal is journaled");
+        assert!(h.core.rid_refused_here(rid_of(2, 1), &h.meta));
+        let out = h.archive_lands();
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Errno(Code::ReadOnly)),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.inbox_ever_refusals_journaled, 1);
+        let refused = h.core.take_final_nonholder_refusals();
+        assert_eq!(refused, vec![(rid_of(2, 1), Code::ReadOnly, true)]);
+        // The grant ends; the batch is drained: it runs nothing.
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            9,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        drain_poll(&mut h, batch_of(&op, 1, 0, false));
+        assert!(
+            h.meta.child_ino(d1, "f1").unwrap().is_none(),
+            "the drain ran a rid the client was told was refused"
+        );
     }
 
     /// Fence C9 (G1), two cores: node 3 holds the lease and is the designee
@@ -78881,7 +78938,8 @@ mod route_fence_root {
             // The successor: the same rid, inbox-ever, untouched.
             let (mut b, d1, _gen) = sticky_root();
             let op = create_in(&b, d1, "f1");
-            let out = forward_ever(&mut b, 2, 2, 1, op, false, (0, 0), true);
+            let mut out = forward_ever(&mut b, 2, 2, 1, op, false, (0, 0), true);
+            out.extend(b.archive_lands());
             let b_refused = outcome_to(&out, 2) == Some(MutateOutcome::Errno(Code::ReadOnly));
             assert!(b_refused, "{out:?}");
             if knob {

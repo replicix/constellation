@@ -3338,6 +3338,10 @@ impl Core {
             self.park_exec_local(now, Default::default(), None, rid, true);
             return MutateOutcome::Busy;
         }
+        // ADR-47 rule 2 for an untouched inbox-ever op of this node's under an
+        // unreachable designation: its refusal is journaled and answered like
+        // a settle's (`root_journals_inbox_ever`).
+        let mut refused_here: Option<Code> = None;
         // Plan 30 §M11: as the root, recall the write delegations the
         // op's keys fall under first, and wait for its `deps`; `finish`
         // skips this rid until the parked continuation executes it.
@@ -3401,8 +3405,20 @@ impl Core {
                                 return MutateOutcome::Busy;
                             }
                         }
-                        self.note_final_nonholder_refusal(rid, code, false);
-                        return MutateOutcome::Errno(code);
+                        // (ADR-47 rule 2 for an untouched inbox-ever op of
+                        // this node's: journaled, `root_journals_inbox_ever`;
+                        // the answer waits for the row like any refusal's.)
+                        let (touched, inbox_ever) = self
+                            .clients
+                            .get(&rid)
+                            .map_or((TOUCHED_UNKNOWN, true), |c| (c.touched_gen, c.inbox_ever));
+                        if self.root_journals_inbox_ever(code, touched, inbox_ever) {
+                            refused_here = Some(code);
+                            Default::default()
+                        } else {
+                            self.note_final_nonholder_refusal(rid, code, false);
+                            return MutateOutcome::Errno(code);
+                        }
                     }
                     // The gate recalls nothing (ADR-42): retried once it opens.
                     super::delegate::RecallPlan::Gated => return MutateOutcome::Busy,
@@ -3473,7 +3489,7 @@ impl Core {
         // node answers this node's rid from the log (the backup-strict
         // seeds 892, 894 of `+unsettled` settled `EIO` otherwise: parked
         // through a long quarantine, past the client's settle window).
-        let touched = if !settle && self.cfg.recall_before_ack {
+        let touched = if !settle && refused_here.is_none() && self.cfg.recall_before_ack {
             replica.recall_inos_of_op(&op)
         } else {
             Vec::new()
@@ -3487,7 +3503,7 @@ impl Core {
                 return MutateOutcome::Busy;
             }
         }
-        if !settle {
+        if !settle && refused_here.is_none() {
             self.audit_root_path_execution(&op, replica);
         }
         if self.cfg.placement && self.cfg.delegation {
@@ -3498,7 +3514,15 @@ impl Core {
         // Plan 43 C2 (§5.3 item 5): this node settles its own op as the root
         // (`resolve_in_doubt_then_execute` found no outcome): refused for
         // good, answered once the refusal's row is committed (below).
-        let outcome = if settle {
+        let outcome = if let Some(code) = refused_here {
+            if !self.record_refusal(rid, code, Some(&op), super::Asker::Remote, replica) {
+                return MutateOutcome::Busy;
+            }
+            self.note_final_nonholder_refusal(rid, code, true);
+            self.stats.inbox_ever_refusals_journaled += 1;
+            self.nudge(now, out);
+            (MutateOutcome::Errno(code), None)
+        } else if settle {
             match self.settle_refusal(rid, Some(&op), super::Asker::Own, replica) {
                 // (Not journaled: the requester retries the settle.)
                 MutateOutcome::Busy => return MutateOutcome::Busy,
@@ -3586,8 +3610,9 @@ impl Core {
             streams: Default::default(),
         };
         // (A settle's refusal waits for its commit like another node's
-        // answer: never the lone shortcut, `settle_refusal`.)
-        let durable = if settle {
+        // answer: never the lone shortcut, `settle_refusal`; so does a
+        // journaled inbox-ever refusal, whose batch a successor may drain.)
+        let durable = if settle || refused_here.is_some() {
             let shipped = replica.journal_acked_seq().unwrap_or(0);
             let class = self.root_commit(super::Asker::Remote);
             self.answer_need(&position, class, super::Asker::Remote, shipped)

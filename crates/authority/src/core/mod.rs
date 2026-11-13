@@ -1407,6 +1407,10 @@ pub struct Stats {
     /// ADR-55 (Q4): of them, those refused in the root's own stream (the
     /// revisit rule counts them outside partitions).
     pub holder_inbox_refusals_own_root: u64,
+    /// ADR-47 rule 2: the root's refusals under an unreachable designation
+    /// of an untouched inbox-ever rid, journaled (`root_journals_inbox_ever`)
+    /// so that the rid's batch, drained later, dedups to them.
+    pub inbox_ever_refusals_journaled: u64,
     /// Fence C9.3: touched inbox-ever rids the root sent to a live
     /// non-stealable holder.
     pub inbox_ever_redirects: u64,
