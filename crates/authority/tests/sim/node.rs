@@ -529,6 +529,10 @@ pub struct NodeEnv {
     pub own_stream_honours_on_record: bool,
     /// See `SimConfig::handover_ends_sticky`.
     pub handover_ends_sticky: bool,
+    /// See `SimConfig::handover_ignores_inflight`.
+    pub handover_ignores_inflight: bool,
+    /// See `SimConfig::fast_inflight_ms`.
+    pub fast_inflight_ms: u64,
     /// See `SimConfig::handover_ignores_tenure`.
     pub handover_ignores_tenure: bool,
     /// See `SimConfig::handover_grants_before_release`.
@@ -895,6 +899,8 @@ impl NodeHandle {
         cfg.root_executes_under_own_grant = env.root_executes_under_own_grant;
         cfg.own_stream_honours_on_record = env.own_stream_honours_on_record;
         cfg.handover_ends_sticky = env.handover_ends_sticky;
+        cfg.handover_ignores_inflight = env.handover_ignores_inflight;
+        cfg.emulated_inflight_ms = env.fast_inflight_ms;
         cfg.handover_ignores_tenure = env.handover_ignores_tenure;
         cfg.handover_grants_before_release = env.handover_grants_before_release;
         cfg.kept_fetch_skipped = env.kept_fetch_skipped;

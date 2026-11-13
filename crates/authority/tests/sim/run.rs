@@ -807,6 +807,20 @@ pub struct SimConfig {
     /// ADR-56 (`one_off_no_handover`): nodes whose writes in the shared
     /// subtree are one-offs; the root must never ask for a handover to one.
     pub one_off_nodes: Vec<NodeId>,
+    /// ADR-56 (`sticky-handover-busy`): `(node, start_ms, end_ms, pace_ms)`:
+    /// that node's clients write in the window at their own pace, a trickle
+    /// beside the other writers (as `writer_phases`, with a pace of its own).
+    pub trickle: Vec<(NodeId, u64, u64, u64)>,
+    /// ADR-56 (`Config::emulated_inflight_ms`): an own op of a holder counts as
+    /// in flight in its subtree for this many ms after it ran, as the engine's
+    /// fast-path sample would report; `handover_inflight` judges a handover
+    /// release made inside it. `0`: none.
+    pub fast_inflight_ms: u64,
+    /// Negative control (`Config::handover_ignores_inflight`, ADR-56): the holder
+    /// releases without looking at its ops in flight; `handover_inflight` must
+    /// fail the run. `AUTHORITY_SIM_HANDOVER_IGNORES_INFLIGHT=1` sets it on every
+    /// configuration.
+    pub handover_ignores_inflight: bool,
     /// Plan 43 C7-F F-a0 L3: only the clients of these nodes take locks
     /// (`lock_ratio`); empty: every node's do. A node whose clients take
     /// none sends its tenure no lock request, which would mark its lease
@@ -1336,6 +1350,10 @@ impl Default for SimConfig {
             client_plan: Vec::new(),
             writer_phases: Vec::new(),
             one_off_nodes: Vec::new(),
+            trickle: Vec::new(),
+            fast_inflight_ms: 0,
+            handover_ignores_inflight: std::env::var_os("AUTHORITY_SIM_HANDOVER_IGNORES_INFLIGHT")
+                .is_some_and(|v| v == "1"),
             lock_nodes: Vec::new(),
             live_holder: false,
             beats_lost: false,
@@ -5462,6 +5480,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         root_executes_under_own_grant: cfg.root_executes_under_own_grant,
         own_stream_honours_on_record: cfg.own_stream_honours_on_record,
         handover_ends_sticky: cfg.handover_ends_sticky,
+        handover_ignores_inflight: cfg.handover_ignores_inflight,
+        fast_inflight_ms: cfg.fast_inflight_ms,
         handover_ignores_tenure: cfg.handover_ignores_tenure,
         handover_grants_before_release: cfg.handover_grants_before_release,
         kept_fetch_skipped: cfg.kept_fetch_skipped,
@@ -5565,13 +5585,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // ADR-56: the windows this node writes in (`writer_phases`), at a
             // steady pace, from a generator of their own (the draws above
             // stay as they were).
+            let trickle = cfg.trickle.iter().find(|(n, ..)| *n == node);
             let phases: Vec<(u64, u64)> = cfg
                 .writer_phases
                 .iter()
                 .filter(|(n, _, _)| *n == node)
                 .map(|(_, a, b)| (*a, *b))
+                .chain(trickle.map(|(_, a, b, _)| (*a, *b)))
                 .collect();
-            let phase_ops = |a: u64, b: u64| (b.saturating_sub(a) / PHASE_PACE_MS).max(1) as usize;
+            let phase_pace = trickle.map_or(PHASE_PACE_MS, |(.., p)| *p);
+            let phase_ops = |a: u64, b: u64| (b.saturating_sub(a) / phase_pace).max(1) as usize;
             if !phases.is_empty() {
                 let total: usize = phases.iter().map(|(a, b)| phase_ops(*a, *b)).sum();
                 let mut phase_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x9ba5);
@@ -5597,11 +5620,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 ops.truncate(*n);
             }
             let pace = rng.random_range(20..400);
-            let pace = if phases.is_empty() {
-                pace
-            } else {
-                PHASE_PACE_MS
-            };
+            let pace = if phases.is_empty() { pace } else { phase_pace };
             // Reads draw from their own generator, so a config without
             // reads replays exactly the schedules it had before M6.
             let mut read_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x5e55);
@@ -7657,6 +7676,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &oracles.hand_events.lock().unwrap(),
         (cfg.core)(1, 1).handover_min_tenure_ms,
         &cfg.one_off_nodes,
+        cfg.fast_inflight_ms,
     );
     report.handover_core[11] = handover.handovers;
     report.handover_min_gap_ms = handover.min_gap_ms;
@@ -7764,6 +7784,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         // a handover).
         (true, "handover_tenure", &handover.tenure),
         (true, "one_off_no_handover", &handover.one_off),
+        (true, "handover_inflight", &handover.inflight),
         (cfg.strict_commit, "I1", &found.i1),
         (cfg.strict_commit, "class claim", &found.class_claim),
         (cfg.strict_commit, "row version", &found.row_version),
@@ -8576,6 +8597,10 @@ pub struct HandoverFindings {
     pub tenure: Vec<String>,
     /// `one_off_no_handover`: a handover requested for a one-off writer.
     pub one_off: Vec<String>,
+    /// `handover_inflight` (H-I5): a holder released a subtree for a handover
+    /// while an op of its own in it was still in flight (inside
+    /// `fast_inflight_ms` of the op).
+    pub inflight: Vec<String>,
 }
 
 /// Judge the root's handover record, `(run ms, node, event)` in order.
@@ -8590,14 +8615,31 @@ pub fn judge_handover(
     events: &[(u64, NodeId, constellation_authority::HandEvent)],
     tenure_ms: u64,
     one_off: &[NodeId],
+    inflight_ms: u64,
 ) -> HandoverFindings {
     use constellation_authority::HandEvent;
     let mut f = HandoverFindings::default();
     let bound = tenure_ms.saturating_sub(tenure_ms / 250);
     let mut last: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut own_op: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
     let mut min_gap: Option<u64> = None;
     for (ms, node, e) in events {
         match *e {
+            HandEvent::OwnOp { dir } => {
+                own_op.insert((*node, dir), *ms);
+            }
+            HandEvent::HandoverReleased { dir } => {
+                if let Some(at) = own_op.get(&(*node, dir)) {
+                    if *ms < at + inflight_ms {
+                        f.inflight.push(format!(
+                            "handover_inflight: node {node} released directory {dir} for a \
+                             handover at t={ms} ms, {} ms after an op of its own in it \
+                             (in flight for {inflight_ms} ms)",
+                            ms - at
+                        ));
+                    }
+                }
+            }
             HandEvent::Requested { dir, to } => {
                 if one_off.contains(&to) {
                     f.one_off.push(format!(

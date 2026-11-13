@@ -5087,6 +5087,33 @@ handover request. The simulation checks `handover_tenure` and
 a root's own client op that had been forwarded to the old holder is the root's
 own stream's once the root is handed the subtree, not the root path's.
 
+A deposition between the request and the row costs the requester one window on
+the root's keys: the holder releases at once when it is quiet, so its row can be in
+its journal before the new root exists; the new root has no handover to grant from
+and appends the row to the root's keys (the holder is quarantined for a window), and
+the ordinary proposal grants the requester on a later tick. H-I1 and H-I2 hold. A
+holder answers a handover request only from the root it streams to.
+A root that is not usable for one placement tick (the lease's time in doubt, a gate)
+drops its pending requests with their bookkeeping and asks again on a later tick; a
+sticky stream is never asked for a subtree by a recall, and never recalled by the
+resend timer (the request is dropped, not escalated).
+A handover to the root that meets a skip that passes (its own stream is releasing or
+being recalled, the quarantine of a release of its own) waits for the window; one that
+does not pass leaves the subtree on the root's keys (`place_handover_root_keys`, not
+counted granted).
+Where the table forgets a subtree: for a far holder at the append of its row; for the
+root's own stream when the row is journaled (its replica applies it then), before it ships.
+A read of a subtree a holder released is not answered by it (`deleg_read_index`
+serves only subtrees the stream still holds, `my_generation_for`), so a reader that
+routes by the old generation asks the root, which has the writes it made after a
+`Fenced`: read-your-writes across the log round holds.
+ADR-59 part B (not on main yet): a root record (the grant to the requester) is a
+key-dependent of a stream row (the holder's release), so a `DropHeld` that names the
+held stream rows retires the grant too. Part B's apply must run the root's handover
+cleanup for a retired `DelegateNode` (drop `hands[D]`, nothing else is pending) and
+`drop_delegate_state` on the requester if it installed from the journal copy;
+`sticky-handover-ping-pong+lost-chunk` belongs in its sweep list.
+
 **Deferred**: a placed grant moving by handover too (it keeps the 50 % leave
 term and `CONSTELLATION_DELEGATION_LEAVE`); a request for a placed grant is
 answered by the holder as a recall would be, after the drain.
