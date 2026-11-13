@@ -226,6 +226,14 @@ replay (this node's queue owns the replay or the refusal). A parked answer
 of a request id the drop refused is settled with the refusal, and any parked
 answer is what the store says when it is released, never a snapshot.
 
+A rolled-back transaction that was a row of a delegation stream (the root's
+own sticky stream, say) leaves its index behind, while the drop keeps the
+stream's later rows: the record *fills* each such index (`fills`), as the
+stream's no-op row there. Every replica counts a fill in its index of the
+stream once the stream reaches the index below it (a row the drop redid below
+a fill lands after the record), so the log's stream stays contiguous and a
+successor's cursor never waits at an index that is gone.
+
 **A dropper without the lease decides nothing, and follows the log for a record
 that was put.** The command on a node that is not the sequencer in force is
 refused before anything changes ("run it on the holder"): its held rows are

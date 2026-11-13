@@ -552,6 +552,12 @@ struct Inner {
     /// Plan 30 §M11: per delegation generation, the stream index this
     /// replica holds (applied, executed or appended).
     streams: std::collections::BTreeMap<u64, u64>,
+    /// ADR-59 part B (drop contiguity): the stream positions a `DropHeld`
+    /// of the log fills with its no-op row. A fill counts in `streams` once
+    /// the stream reaches the index below it: it stands at its place in the
+    /// stream's order, whatever segment carried the record (the rows the
+    /// drop redid below it land after it).
+    fills: std::collections::BTreeSet<(u64, u64)>,
     /// Plan 30 §M11: generations whose `DelegateNodeEnded` this replica applied:
     /// any dependency on them is satisfied (void past the cut).
     voided: std::collections::BTreeSet<u64>,
@@ -1195,14 +1201,36 @@ impl SessionState {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        let cur = g.streams.entry(gen).or_insert(0);
+        let inner = &mut *g;
+        let cur = inner.streams.entry(gen).or_insert(0);
         if idx > *cur {
             *cur = idx;
+        }
+        while !inner.fills.is_empty() && inner.fills.contains(&(gen, *cur + 1)) {
+            *cur += 1;
         }
         let applied = g.applied_position();
         g.covering.retain(|(_, p)| !applied.dominates(p));
         drop(g);
         self.cv.notify_all();
+    }
+
+    /// ADR-59 part B (drop contiguity): the log carries a `DropHeld` whose
+    /// no-op row stands at `(gen, idx)` of a stream. It counts as the
+    /// stream's row there once the stream reaches `idx - 1` (now, or when a
+    /// later row brings it there: [`Self::note_stream`]).
+    pub fn note_stream_fill(&self, gen: u64, idx: u64) {
+        if gen == 0 || idx == 0 {
+            return;
+        }
+        let reached = {
+            let mut g = self.inner.lock().unwrap();
+            g.fills.insert((gen, idx));
+            g.streams.get(&gen).copied().unwrap_or(0) + 1 >= idx
+        };
+        if reached {
+            self.note_stream(gen, idx);
+        }
     }
 
     /// The inverse of [`Self::note_stream`] for a root's journal append
@@ -2957,6 +2985,30 @@ mod tests {
             s.note_stream(g, 1);
         }
         assert!(s.ready(&k, 0, false, &floor));
+    }
+
+    /// ADR-59 part B (drop contiguity): a `DropHeld`'s fill counts in the
+    /// stream at its place in the stream's order: a fill right above what
+    /// the replica holds raises it at once, one above a gap once the gap's
+    /// rows arrive (the rows the drop redid below it land after the record),
+    /// and a run of fills is passed in one raise.
+    #[test]
+    fn a_stream_fill_counts_once_the_stream_reaches_it() {
+        let s = SessionState::default();
+        s.note_stream(7, 1);
+        s.note_stream_fill(7, 2);
+        assert_eq!(s.stream_applied(7), 2);
+        s.note_stream_fill(7, 4);
+        s.note_stream_fill(7, 5);
+        assert_eq!(s.stream_applied(7), 2, "index 3 is not there yet");
+        s.note_stream(7, 3);
+        assert_eq!(s.stream_applied(7), 5);
+        s.note_stream(7, 6);
+        assert_eq!(s.stream_applied(7), 6);
+        // Another stream's fill is no row of this one.
+        s.note_stream_fill(8, 1);
+        assert_eq!(s.stream_applied(8), 1);
+        assert_eq!(s.stream_applied(7), 6);
     }
 
     /// Review of chunk metered-own-rows: `observed` keeps a stream entry

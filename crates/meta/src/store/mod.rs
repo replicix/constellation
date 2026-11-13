@@ -712,6 +712,10 @@ pub struct Meta {
     /// `DropHeld` applied or shipped): the copy stores consult the set only
     /// then (one atomic read per batch otherwise).
     pub(crate) any_retired: std::sync::atomic::AtomicBool,
+    /// ADR-59 part B (drop contiguity): some stream position is filled by a
+    /// `DropHeld` (`deleg_fill:` keys): a raise of a generation's log index
+    /// looks for a fill above it only then.
+    pub(crate) any_stream_fill: std::sync::atomic::AtomicBool,
     /// The index of the persisted read holds (`read_hold:` keys,
     /// `store::member::HeldCopy`, ADR-57): what [`Meta::member_copy_touches`]
     /// consults.
@@ -1388,6 +1392,7 @@ impl Meta {
             backup_tail_top: std::sync::Mutex::new(None),
             any_member_copy: std::sync::atomic::AtomicBool::new(false),
             any_retired: std::sync::atomic::AtomicBool::new(false),
+            any_stream_fill: std::sync::atomic::AtomicBool::new(false),
             held_copies: std::sync::Mutex::new(Vec::new()),
             any_held_copy: std::sync::atomic::AtomicBool::new(false),
             read_hold_span_ms: AtomicU64::new(member::DEFAULT_READ_HOLD_SPAN_MS),
@@ -1449,6 +1454,7 @@ impl Meta {
         meta.bootstrap()?;
         meta.refresh_member_copy_flag()?;
         meta.refresh_retired_flag()?;
+        meta.load_stream_fills()?;
         meta.load_read_holds()?;
         meta.refresh_holder_append_tip()?;
         meta.build_pending_by_ino()?;

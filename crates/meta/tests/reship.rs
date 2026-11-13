@@ -872,6 +872,7 @@ fn drop_held(idents: &[(u64, u64)]) -> LogRecord {
         ino: 9,
         chunks: Vec::new(),
         rolled_back: idents.iter().map(|i| (*i, None)).collect(),
+        fills: Vec::new(),
     }
 }
 

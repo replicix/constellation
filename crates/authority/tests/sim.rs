@@ -21068,6 +21068,43 @@ fn a_subtree_with_a_held_root_row_is_not_granted_to_a_far_writer() {
     }
 }
 
+/// ADR-59 part B, drop contiguity (option (a)): `repair drop-held` on the
+/// root rolled back rows of its own sticky stream that need the lost chunk
+/// (the seed's index and the indices of the rows that read its bytes) and
+/// kept the later rows, which landed past a hole in the log's stream
+/// (`stream_log_contiguous`; a successor's cursor waits there for good).
+/// The `DropHeld` record now fills each rolled-back index with its no-op
+/// row, counted at its place in the stream's order (956, 1005: a row the
+/// drop redid lies between two fills). All failed on 642f2057.
+#[test]
+fn a_drop_fills_the_stream_indices_it_rolls_back() {
+    type Case = (&'static str, fn() -> SimConfig, &'static [u64]);
+    let cases: [Case; 4] = [
+        ("far-root-writes", far_root_writes_config, &[557, 1005]),
+        (
+            "far-root-writes-paused",
+            far_root_writes_paused_config,
+            &[464, 1822],
+        ),
+        (
+            "far-root-writes-cross",
+            far_root_writes_cross_config,
+            &[1333, 1523],
+        ),
+        (
+            "far-placement",
+            far_placement_config,
+            &[96, 829, 956, 1469, 1778, 1910, 1932, 1943, 1988],
+        ),
+    ];
+    for (label, config, seeds) in cases {
+        for &seed in seeds {
+            run_seed(seed, config_variant(config(), "lost-chunk"))
+                .unwrap_or_else(|e| panic!("{label}+lost-chunk seed {seed}: {e}"));
+        }
+    }
+}
+
 /// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
 /// backup budget) that dominates a subtree is granted a sticky one: it
 /// executes there and its answers are final, with no rollback, no sticky

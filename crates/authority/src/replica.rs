@@ -1386,6 +1386,11 @@ impl Replica for Meta {
                 self.session().note_void_cut(*gen, *idx);
             }
         }
+        // ADR-59 part B (drop contiguity): a `DropHeld`'s fills are the log's
+        // rows of their streams, each at its place in the stream's order.
+        for (gen, idx) in records.iter().flat_map(|rec| rec.stream_fills()) {
+            self.session().note_stream_fill(*gen, *idx);
+        }
         for rec in records {
             let gen = match rec {
                 // Plan 43 C2: the record carries the cut: every replica

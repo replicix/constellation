@@ -357,10 +357,23 @@ pub enum LogRecord {
     ///
     /// Appended at the end of the enum, as the postcard ordering comment on
     /// this type requires.
+    ///
+    /// `fills` are the delegation stream positions `(gen, idx)` of the
+    /// rolled-back transactions that had one: the record is the log's row
+    /// at each of them, a no-op row of that stream. A stream's index order
+    /// is contiguous in the log (ADR-55), and the drop keeps the later rows
+    /// of the stream it does not roll back (redone in place, acknowledged:
+    /// I5); without the fills they would land past a hole the successor's
+    /// cursor waits at for good. Every reader of a stream's position in the
+    /// log counts them ([`LogRecord::stream_fills`]), each at its place in
+    /// the stream's order: once the stream reaches the index below it (a row
+    /// the drop redid below a fill lands after the record).
+
     DropHeld {
         ino: Ino,
         chunks: Vec<replicix_chunkfmt::ChunkHash>,
         rolled_back: Vec<((u64, u64), Option<Rid>)>,
+        fills: Vec<(u64, u64)>,
     },
     /// Plan 46 M1.2 step 8a (§5.2): the root grants `node` the subtrees
     /// `dirs` under generation `gen`: the generation opens with its first
@@ -453,6 +466,17 @@ impl LogRecord {
             node,
             gen,
             dirs: vec![SubtreeGrant { dir, kind }],
+        }
+    }
+
+    /// ADR-59 part B (drop contiguity): the delegation stream positions
+    /// `(gen, idx)` this record is the log's no-op row at (a `DropHeld`'s
+    /// `fills`); empty for every other record. A replica that holds a
+    /// segment counts them with the segment's own origins.
+    pub fn stream_fills(&self) -> &[(u64, u64)] {
+        match self {
+            LogRecord::DropHeld { fills, .. } => fills,
+            _ => &[],
         }
     }
 

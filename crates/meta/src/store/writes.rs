@@ -123,14 +123,19 @@ impl Meta {
         // record (every ship but one) pays this one read.
         if crate::store::counter_get(tx, &self.local, crate::store::KV_DROP_HELD_UNSHIPPED)? > 0 {
             let mut retired = std::collections::BTreeSet::new();
+            let mut fills: Vec<(u64, u64)> = Vec::new();
             let mut shipped = 0i64;
             for seq in journal_seqs {
                 if let Some(v) = tx.get(&self.journal_ks, crate::store::journal::seq_key(*seq))? {
                     if let LogRecord::DropHeld {
-                        ino, rolled_back, ..
+                        ino,
+                        rolled_back,
+                        fills: filled,
+                        ..
                     } = LogRecord::from_postcard(&v)?
                     {
                         retired.extend(rolled_back.iter().map(|(ident, _)| *ident));
+                        fills.extend(filled);
                         self.note_drop_shipped_tx(tx, ino, *seq)?;
                         shipped += 1;
                     }
@@ -138,6 +143,11 @@ impl Meta {
             }
             if shipped > 0 {
                 self.retire_and_hole_tx(tx, &retired)?;
+                // (The shipper applies no segment of its own: the stream
+                // positions the record fills are in the log from here on.
+                // The session already holds them: the rows were executed
+                // here.)
+                self.note_drop_fills_tx(tx, &fills)?;
                 crate::store::counter_add_tx(
                     tx,
                     &self.local,

@@ -5553,6 +5553,11 @@ impl Meta {
         for (gen, idx) in origins {
             local::bump_log_idx_tx(&mut tx, self, *gen, *idx)?;
         }
+        // ADR-59 part B (drop contiguity): a `DropHeld` is the log's no-op
+        // row at each stream position it fills.
+        for rec in records {
+            self.note_drop_fills_tx(&mut tx, rec.stream_fills())?;
+        }
         if origins.iter().any(|o| o.0 != 0) {
             tracing::trace!(
                 seq,
