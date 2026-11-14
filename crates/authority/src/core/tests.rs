@@ -58750,7 +58750,15 @@ mod c2g_settle {
             });
             let id = requester.core.clients[&rid].deadline;
             requester.advance(requester.core.dl_t().settle_window);
-            let out = requester.step(Event::Timer { id });
+            let mut out = requester.step(Event::Timer { id });
+            // (ADR-58 C5: a lost chunk's `Held` is asked once more at the
+            // deadline; the root still holds it, and that answer ends it.)
+            if let Some(PeerMsg::MutateRequest {
+                req, settle: true, ..
+            }) = forward_to_1(&out)
+            {
+                out = requester.step(lost_chunk_held_reply(req, true));
+            }
             assert!(
                 replies(&out)
                     .iter()
@@ -58764,6 +58772,186 @@ mod c2g_settle {
         };
         assert_eq!(run(true), (true, 1));
         assert_eq!(run(false), (false, 0));
+    }
+
+    /// The root's `Held` answer to a settle (`retry_ms` 10).
+    fn lost_chunk_held_reply(req: OpId, lost_chunk: bool) -> Event {
+        Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Held {
+                    retry_ms: 10,
+                    outwait_ms: None,
+                    lost_chunk,
+                    yours: false,
+                },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+                non_stealable: false,
+            },
+        }
+    }
+
+    /// ADR-58 C5 (flex-crash: the operator's `drop-held` lands between the
+    /// root's last `Held { lost_chunk }` and the settle's next ask): a settle
+    /// whose last answer was a live root's `Held` behind a lost chunk asks
+    /// the root once more at its second deadline and waits a forward timeout
+    /// for the answer, instead of telling the unsettled `EIO` at once. The
+    /// root's answer then settles it; a root that still holds it is not asked
+    /// again, and the next deadline tells the (labelled) unsettled `EIO`. A
+    /// plain `Held` gets no final ask.
+    #[test]
+    fn a_settle_held_behind_a_lost_chunk_asks_the_root_once_more_at_its_deadline() {
+        // The settle sent, answered `Held` by root 1 (`lost_chunk` as given),
+        // and its second deadline fired.
+        let at_deadline = |lost_chunk: bool| {
+            let (_holder, mut requester) = pair();
+            requester.core.track_unsettled_designation();
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("x"),
+                tag: Default::default(),
+            });
+            let first = deadline_timer(&requester, &out);
+            let cfg = requester.core.config().clone();
+            requester
+                .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+            let out = requester.step(Event::Timer { id: first });
+            let Some(PeerMsg::MutateRequest {
+                req, settle: true, ..
+            }) = forward_to_1(&out)
+            else {
+                panic!("no settle: {out:?}");
+            };
+            requester.step(lost_chunk_held_reply(req, lost_chunk));
+            let id = requester.core.clients[&rid].deadline;
+            requester.advance(requester.core.dl_t().settle_window);
+            let out = requester.step(Event::Timer { id });
+            (requester, rid, out)
+        };
+        let in_doubt = |out: &[Action], rid: Rid| {
+            replies(out)
+                .iter()
+                .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt))
+        };
+
+        // The drop landed: the final ask is answered and settles the op.
+        let (mut requester, rid, out) = at_deadline(true);
+        assert!(
+            !in_doubt(&out, rid),
+            "told EIO without the final ask: {out:?}"
+        );
+        let Some(PeerMsg::MutateRequest {
+            req, settle: true, ..
+        }) = forward_to_1(&out)
+        else {
+            panic!("no final ask at the deadline: {out:?}");
+        };
+        assert_eq!(requester.core.stats.settle_final_asks, 1);
+        assert!(
+            requester.core.clients[&rid].forward_grace,
+            "the frozen-epoch grace must not add a second forward timeout"
+        );
+        let forward_timeout = requester.core.config().forward_timeout_ms;
+        assert_eq!(
+            requester.core.clients[&rid].settle_until,
+            WaitMs(requester.now.plus(forward_timeout).0),
+            "the deadline waits one forward timeout for the answer"
+        );
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Abandoned,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+                non_stealable: false,
+            },
+        });
+        assert!(
+            replies(&out)
+                .iter()
+                .any(|(x, a)| *x == rid
+                    && matches!(a, ClientReply::Outcome(MutateOutcome::Abandoned))),
+            "the root's answer settles the op: {out:?}"
+        );
+        assert!(!requester.core.take_unsettled_lost_chunk(rid));
+
+        // Still held: the final ask's answer tells the labelled unsettled
+        // `EIO` at once (a drop landing before the moved deadline would leave
+        // the root able to answer, unasked).
+        let (mut requester, rid, out) = at_deadline(true);
+        let Some(PeerMsg::MutateRequest { req, .. }) = forward_to_1(&out) else {
+            panic!("no final ask at the deadline: {out:?}");
+        };
+        requester.advance(20);
+        let out = requester.step(lost_chunk_held_reply(req, true));
+        assert!(in_doubt(&out, rid), "{out:?}");
+        assert!(forward_to_1(&out).is_none(), "asked twice: {out:?}");
+        assert_eq!(requester.core.stats.settle_final_asks, 1);
+        assert_eq!(requester.core.stats.settle_final_asks_held, 1);
+        assert!(requester.core.take_unsettled_lost_chunk(rid));
+
+        // No answer: the moved deadline tells the labelled unsettled `EIO`.
+        let (mut requester, rid, _) = at_deadline(true);
+        let id = requester.core.clients[&rid].deadline;
+        requester.advance(forward_timeout);
+        let out = requester.step(Event::Timer { id });
+        assert!(in_doubt(&out, rid), "{out:?}");
+        assert!(forward_to_1(&out).is_none(), "asked twice: {out:?}");
+        assert!(requester.core.take_unsettled_lost_chunk(rid));
+
+        // An ask in flight at the deadline (sent by the backoff before the
+        // drop, flex-crash 89): asked afresh, the old request let go.
+        let (_holder, mut requester) = pair();
+        let rid = requester.rid(1);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: requester.create("x"),
+            tag: Default::default(),
+        });
+        let first = deadline_timer(&requester, &out);
+        let cfg = requester.core.config().clone();
+        requester
+            .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+        let out = requester.step(Event::Timer { id: first });
+        let Some(PeerMsg::MutateRequest { req, .. }) = forward_to_1(&out) else {
+            panic!("no settle: {out:?}");
+        };
+        requester.step(lost_chunk_held_reply(req, true));
+        let backoff = requester.core.clients[&rid].timer.expect("backoff");
+        requester.advance(10);
+        let out = requester.step(Event::Timer { id: backoff });
+        let Some(PeerMsg::MutateRequest { req: in_flight, .. }) = forward_to_1(&out) else {
+            panic!("no retry: {out:?}");
+        };
+        let id = requester.core.clients[&rid].deadline;
+        requester.advance(requester.core.dl_t().settle_window - 10);
+        let out = requester.step(Event::Timer { id });
+        assert!(!in_doubt(&out, rid), "{out:?}");
+        let Some(PeerMsg::MutateRequest { req: last, .. }) = forward_to_1(&out) else {
+            panic!("no final ask with an ask in flight: {out:?}");
+        };
+        assert_ne!(last, in_flight);
+        assert_eq!(requester.core.stats.settle_final_asks, 1);
+
+        // A plain `Held`: no final ask.
+        let (requester, rid, out) = at_deadline(false);
+        assert!(in_doubt(&out, rid), "{out:?}");
+        assert!(forward_to_1(&out).is_none(), "{out:?}");
+        assert_eq!(requester.core.stats.settle_final_asks, 0);
     }
 
     /// ADR-58 S4: the label is the last answer's word: a settle that heard

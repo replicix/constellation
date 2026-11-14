@@ -22216,6 +22216,28 @@ fn adr58_followup_a_settle_with_no_holder_asks_a_reachable_peer() {
     }
 }
 
+/// ADR-58 C5: a settle whose last answer was a live root's `Held` behind a
+/// lost chunk asks the root once more at its deadline. `flex-crash` seed 89:
+/// node 3's settle of rid 3:10 was told `Held { lost_chunk }` by root 2 every
+/// 420 ms; the operator's `drop-held` at t=23000 released the row, and the
+/// deadline at t=23172 told the unsettled `EIO` with the next ask still in
+/// flight (sent before the drop): an I4 violation, "Root(2) during [20170,
+/// 23172] ms". The final ask is answered after the drop and settles it.
+/// Fails on the parent.
+#[test]
+fn adr58_c5_a_settle_held_behind_a_lost_chunk_asks_once_more_at_its_deadline() {
+    let seed = 89;
+    let r = run_seed(
+        seed,
+        strict(base_config("flex-crash"), "settle+oracles+unsettled"),
+    )
+    .unwrap_or_else(|e| panic!("flex-crash+settle+oracles+unsettled seed {seed}: {e}"));
+    // (The strict run above is the check: it fails the seed's I4 violation.
+    // This only says the rule fired.)
+    let asks: u64 = r.stats.values().map(|s| s.settle_final_asks).sum();
+    assert!(asks > 0, "seed {seed}: no settle asked once more");
+}
+
 /// ADR-58 C3: an op whose row waits behind a chunk that exists nowhere is
 /// told an unsettled `EIO` that is labelled `held-behind-lost-chunk`: allowed,
 /// counted apart, and checked against the sim's chunk ledger. Fails on the

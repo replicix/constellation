@@ -308,6 +308,15 @@ pub(crate) struct ClientOp {
     /// deadline fired, and the deadline was moved one more window for the
     /// row to land (`client_deadline`; once).
     pub durable_grace: bool,
+    /// ADR-58 C5: the settle's last answer was a live root's `Held` behind a
+    /// lost chunk, and the second deadline asked it once more before telling
+    /// the unsettled `EIO` (`client_deadline`; once).
+    pub final_ask: bool,
+    /// ADR-58 C5: the root (generation 0) whose `Held` was the settle's last
+    /// answer and said the row waits behind a lost chunk (the answer's own
+    /// word, never the negative control's label,
+    /// `Config::lost_chunk_label_always`).
+    pub last_held_lost_chunk: Option<NodeId>,
     /// ADR-44: this settle waits in `Backoff` for a recall this node's
     /// shippable gate sent on demand; the backoff routes it as a settle
     /// again (`settle_route`), where the gate answers it after the cut.
@@ -892,6 +901,8 @@ impl Core {
                 settle_until: WaitMs(0),
                 settle_cap: WaitMs(0),
                 durable_grace: false,
+                final_ask: false,
+                last_held_lost_chunk: None,
                 gate_recall_wait: false,
                 designation_held: false,
                 lost_chunk_held: false,
@@ -1896,6 +1907,7 @@ impl Core {
                 c.unsay_mine();
                 if c.settle {
                     c.lost_chunk_held = false;
+                    c.last_held_lost_chunk = None;
                 }
             }
         }
@@ -2146,7 +2158,30 @@ impl Core {
                     }
                     if c.settle {
                         c.lost_chunk_held = lost_chunk || self.cfg.lost_chunk_label_always;
+                        c.last_held_lost_chunk = (lost_chunk && gen == 0).then_some(from);
                     }
+                }
+                // ADR-58 C5: the answer to the settle's final ask is the root's
+                // `Held` behind a lost chunk again: the settle ends now, in
+                // doubt and labelled, not at the deadline a forward timeout
+                // later (an operator's `drop-held` landing meanwhile would
+                // leave the root able to answer, unasked).
+                if lost_chunk
+                    && gen == 0
+                    && self
+                        .clients
+                        .get(&rid)
+                        .is_some_and(|c| c.settle && c.final_ask)
+                {
+                    self.stats.in_doubt += 1;
+                    self.stats.settle_final_asks_held += 1;
+                    tracing::debug!(
+                        node = self.cfg.node_id,
+                        ?rid,
+                        "final ask answered held behind a lost chunk: op goes in doubt"
+                    );
+                    self.finish_in_doubt(now, rid, replica, out);
+                    return;
                 }
                 // Plan 30 §M8: executed; the holder is recalling read
                 // delegations before it acknowledges. Ask again (same
@@ -4562,6 +4597,40 @@ impl Core {
             }
             self.stats.acks_aborted += 1;
         }
+        // ADR-58 C5: the settle's last answer was a live root's `Held` behind
+        // a lost chunk, and its next ask is due later (its backoff) or was
+        // sent before now (in flight). The operator's `drop-held` may have
+        // landed since, and the root can answer the rid now: it is asked once
+        // more at once (an ask in flight is let go: the root answers the rid
+        // from its dedup either way), and the deadline waits one forward
+        // timeout for the answer. A root that still holds it answers `Held`
+        // behind the lost chunk again, which tells the unsettled `EIO`
+        // (labelled) at once; no answer, by the moved deadline. (Not when the
+        // log already answers the rid: that answer is told below. The move is
+        // not capped by `settle_cap`: it happens once.)
+        if let Some(root) = second
+            .then(|| self.settle_final_ask_root(now, rid, replica))
+            .flatten()
+        {
+            let at = now.wait.plus(self.cfg.forward_timeout_ms);
+            if self.extend_settle_deadline(rid, at, Some(now.wait), out) {
+                let c = self.clients.get_mut(&rid).expect("present");
+                c.final_ask = true;
+                // (The frozen-epoch grace is spent too: the moved deadline
+                // ends the settle, one forward timeout in all.)
+                c.forward_grace = true;
+                if let Phase::Forwarded { req, .. } = c.phase {
+                    self.by_req.remove(&req);
+                }
+                c.phase = Phase::Backoff;
+                if let Some(t) = c.timer.take() {
+                    self.cancel_timer(t, out);
+                }
+                self.stats.settle_final_asks += 1;
+                self.send_forward(now, rid, root, 0, replica, out);
+                return;
+            }
+        }
         // ADR-58 follow-up: a settle that asked a node in a frozen epoch and
         // has a forward in flight (sent less than a forward timeout ago: its
         // timer is armed) waits for the answer, once.
@@ -5029,6 +5098,36 @@ impl Core {
             self.cancel_timer(t, out);
         }
         self.send_forward(now, rid, holder, 0, replica, out);
+    }
+
+    /// ADR-58 C5: the root the settle of `rid` asks once more at its second
+    /// deadline: the log does not answer the rid already, its last answer was
+    /// that root's `Held` behind a lost chunk, it has not asked so already,
+    /// it waits in its backoff or for its ask to that root, and this node
+    /// still reaches the root.
+    fn settle_final_ask_root(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+    ) -> Option<NodeId> {
+        if self.settled_outcome(rid, replica).is_some() {
+            return None;
+        }
+        let root = self
+            .clients
+            .get(&rid)
+            .filter(|c| c.settle && !c.final_ask)
+            .and_then(|c| {
+                let root = c.last_held_lost_chunk?;
+                match c.phase {
+                    Phase::Backoff => Some(root),
+                    Phase::Forwarded { holder, .. } if holder == root => Some(root),
+                    _ => None,
+                }
+            })
+            .filter(|root| *root != self.cfg.node_id)?;
+        self.reaches(now, root).then_some(root)
     }
 
     /// Move a settle's second deadline to `at` (the wait clock): cancels the
