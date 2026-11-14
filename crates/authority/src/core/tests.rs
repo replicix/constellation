@@ -71796,8 +71796,8 @@ mod step9_one_stream_per_node {
     /// The delegate side of Leave: a node that holds a stream releases it
     /// (`StreamReleased`, as the next row of the stream) when it is
     /// leaving, and its leave is not answered until the root has appended
-    /// the release row (it then ends the stream, whatever the roster says
-    /// of this node). On the parent the leave goes straight to the flush and
+    /// the release row and the log shows the root's end of the stream (the
+    /// root ends it, whatever the roster says of this node). On the parent the leave goes straight to the flush and
     /// the registry, with the grant live (the roster-only singleton test
     /// then sees a node off the roster that still holds one: M1.1 review
     /// SHOULD-2).
@@ -71851,6 +71851,27 @@ mod step9_one_stream_per_node {
         let out = h.step(stream_ack(1, batch, round, last));
         assert!(control_answer(&out, 77).is_none(), "{out:?}");
         let out = h.step(leave_note_ack(1, note_req, false));
+        // (Plan 46 M1.3 step 14: and not before the log ends the stream, the
+        // root's generation being live until its `DelegateNodeEnded`.)
+        assert!(control_answer(&out, 77).is_none(), "{out:?}");
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: 2,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.advance(600);
+        out.extend(h.step(Event::Slack { epoch_slack: 0 }));
         let answer = control_answer(&out, 77).unwrap_or_else(|| panic!("not answered: {out:?}"));
         assert!(answer.is_ok(), "{answer:?}");
     }
