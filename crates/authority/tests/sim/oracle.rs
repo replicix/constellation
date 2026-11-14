@@ -373,10 +373,12 @@ impl Unsettled {
             super::reach::Verdict::Isolated { .. } => "isolated".into(),
             super::reach::Verdict::NoSequencerInTime { why } => {
                 use super::reach::{
-                    CAUSE_NO_LEASE_READ_RETRY, CAUSE_UNDER_ASK_CYCLE, WHY_NO_LEASE_READ_RETRY,
-                    WHY_UNDER_ASK_CYCLE,
+                    CAUSE_HOLDER_NOT_USABLE, CAUSE_NO_LEASE_READ_RETRY, CAUSE_UNDER_ASK_CYCLE,
+                    WHY_HOLDER_NOT_USABLE, WHY_NO_LEASE_READ_RETRY, WHY_UNDER_ASK_CYCLE,
                 };
-                if why.contains(WHY_UNDER_ASK_CYCLE) {
+                if why.contains(WHY_HOLDER_NOT_USABLE) {
+                    CAUSE_HOLDER_NOT_USABLE.into()
+                } else if why.contains(WHY_UNDER_ASK_CYCLE) {
                     CAUSE_UNDER_ASK_CYCLE.into()
                 } else if why.contains(WHY_NO_LEASE_READ_RETRY) {
                     CAUSE_NO_LEASE_READ_RETRY.into()

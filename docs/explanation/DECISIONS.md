@@ -5004,6 +5004,29 @@ reachable for the last 1.2 s of the window). Seeds 0..1999, release,
 `+settle+oracles+unsettled`, against the parent: flex 3 to 3, flex-crash 43
 to 41, flex-tight 85 to 62, flex-backup 10 to 10; no seed newly failing.
 
+**Amendment, 2026-11-13: a holder whose lease is not usable is no root**
+(decided by the maintainer 2026-11-14, "accept, counted": it turns violations
+into allowed `EIO`s, so they have a ceiling column of their own). The
+reachability history notes a holder as `Held::Lease` only while its own lease
+is `usable()` at its latest step (`LeaseState::usable`: not lost, more than
+the expiry margin left on its honour clock), and as `Held::LeaseLapsed`
+otherwise. A lapsed holder admits nothing new by design (a forward wall step
+lapses its lease, P4; a renewal late on a slow S3 leaves it inside the
+margin): it answers a forward `NotHolder` or `Busy`, never from its dedup. It
+still holds the lease (it re-adopts it on a restart, and the body is not
+claimable before it runs out). An unsettled `EIO` that judging the lapsed
+holder as a root, as before, finds reachable is `no_sequencer_in_time` with
+its own cause, "holder's lease not usable", in a ratchet column of its own (no
+margin: flex-tight 1, the count of seeds 0..99 measured on this commit, 0
+elsewhere); every other verdict keeps its old label (a requester cut from the
+lapsed holder is isolated, as before). The judgement is per step (the view the
+holder published last), so a lease that lapses between steps counts as a root
+until the next step: stricter than the product, never looser. Seeds (as above,
+against the floor): flex-backup 10 to 2 (164, 382, 435, 560, 1502, 1621, 1781
+and 1924: a holder lapsed by a forward wall step); flex, flex-crash and
+flex-tight unchanged; the classifier floor's flex-tight entry goes from 1 to 0
+(its one EIO was a lapsed holder's run, in the new column now).
+
 **May revert**: no.
 
 See: `crates/authority/src/core/holder.rs` (`settle_refusal`),
