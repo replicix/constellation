@@ -7104,11 +7104,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                                 || (j.class == Some(super::oracle::Judged::Group)
                                     && confirmed.contains(&t.origin.0))
                         }) && j.tx.as_ref().is_some_and(|t| {
-                                let (g, idx) = t.origin;
-                                g != 0
-                                    && cuts.abandoned.contains(&g)
-                                    && cuts.cut.get(&g).is_some_and(|cut| idx > *cut)
-                            })
+                            let (g, idx) = t.origin;
+                            g != 0
+                                && cuts.abandoned.contains(&g)
+                                && cuts.cut.get(&g).is_some_and(|cut| idx > *cut)
+                        })
                     })
             })
         };
