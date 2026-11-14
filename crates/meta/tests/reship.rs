@@ -279,6 +279,207 @@ fn a_row_two_epochs_tails_carry_is_a_dedup_not_a_done_rid() {
     assert_eq!(txs_in_journal(&meta), 1);
 }
 
+/// Successors re-shipped transactions of epoch 1 and the log carries their
+/// segments, `segments`, each of epoch 2 and on; then a later claim reads
+/// epoch 1's tail again and holds epoch 1's row 1-2, `local`, itself.
+fn reshipped_and_read_again(segments: &[&[LogRecord]], local: Vec<LogRecord>) -> Meta {
+    let meta = Meta::open_in_memory().unwrap();
+    for (i, segment) in (1u64..).zip(segments) {
+        meta.apply_segment_rows(i, EPOCH_PREV + i, 0, &[], &[], segment, &Default::default())
+            .unwrap();
+    }
+    assert!(meta.backup_append(EPOCH_PREV, &[tx(1, 2, local)]).is_ok());
+    meta
+}
+
+/// The gate over epoch 1's tail alone, through row 2.
+fn reship_stored(meta: &Meta) -> constellation_meta::ReshipReport {
+    meta.reship_at_takeover(
+        None,
+        Some(constellation_meta::TailArgs {
+            epoch: EPOCH_PREV,
+            through: 2,
+            config_version: 3,
+            class: None,
+        }),
+    )
+    .unwrap()
+}
+
+fn tail_of(jseq: u64) -> LogRecord {
+    LogRecord::TailOf {
+        epoch: EPOCH_PREV,
+        jseq,
+    }
+}
+
+/// Epoch 1's row 1-2: a create and the rid's outcome.
+fn row(ino_n: u64) -> Vec<LogRecord> {
+    vec![
+        create(ROOT_INO, "x", ino(ino_n)),
+        LogRecord::Completed { rid: rid(2, 1) },
+    ]
+}
+
+fn inbox_ack() -> LogRecord {
+    LogRecord::InboxAck {
+        epoch: EPOCH_PREV,
+        node: 2,
+        n: 1,
+        i: 0,
+    }
+}
+
+/// A re-ship of identity `jseq` carrying `body`.
+fn reshipped(jseq: u64, body: Vec<LogRecord>) -> Vec<LogRecord> {
+    let mut r = vec![tail_of(jseq)];
+    r.extend(body);
+    r
+}
+
+/// What the gate made of the row: `(tail_in_log, tail_done, tail_applied)`.
+type Verdict = (usize, usize, usize);
+
+fn judged(report: &constellation_meta::ReshipReport) -> Verdict {
+    (report.tail_in_log, report.tail_done, report.tail_applied)
+}
+
+const IN_LOG: Verdict = (1, 0, 0);
+const DONE: Verdict = (0, 1, 0);
+
+/// The row's rid is done here by the re-ship the log carried, and that
+/// re-ship names the row's identity with its whole transaction: the row is in
+/// the log (`tail_in_log`), not a done rid under another identity
+/// (`tail_done`, which the sim fails a seed for: `drop-held-chain-backed`
+/// seed 1529). Fail before: `tail_done` 1.
+#[test]
+fn a_tail_row_the_log_carries_as_its_reship_is_in_the_log_not_a_done_rid() {
+    let meta = reshipped_and_read_again(&[&reshipped(1, row(7))], row(7));
+    let journal = meta.journal_len().unwrap();
+    assert_eq!(judged(&reship_stored(&meta)), IN_LOG);
+    assert_eq!(meta.journal_len().unwrap(), journal);
+}
+
+/// What the gate makes of the row against the log's re-ships: each case is
+/// the segments the log carried, the local row, and the verdict. Only the
+/// re-ship of the row's own identity with the row's whole transaction (its
+/// records through the outcome and the inbox acknowledgements behind it)
+/// makes it `tail_in_log`; anything else stays the done rid it was.
+#[test]
+fn only_a_reship_of_the_rows_identity_and_whole_transaction_carries_it() {
+    let ack_row = |n| {
+        let mut r = row(n);
+        r.push(inbox_ack());
+        r
+    };
+    let mut then_other = reshipped(1, row(7));
+    then_other.extend([
+        create(ROOT_INO, "y", ino(8)),
+        LogRecord::Completed { rid: rid(3, 1) },
+    ]);
+    let mut two = reshipped(1, row(7));
+    two.extend(reshipped(
+        3,
+        vec![
+            create(ROOT_INO, "y", ino(8)),
+            LogRecord::Completed { rid: rid(2, 2) },
+        ],
+    ));
+    let other = reshipped(
+        1,
+        vec![
+            create(ROOT_INO, "z", ino(9)),
+            LogRecord::Completed { rid: rid(2, 1) },
+        ],
+    );
+    // (What the case is, the log's segments, the local row, the verdict.)
+    type Case = (&'static str, Vec<Vec<LogRecord>>, Vec<LogRecord>, Verdict);
+    let cases: Vec<Case> = vec![
+        (
+            "the re-ship of a later identity, at the epoch's mark, above the row",
+            vec![reshipped(3, row(7))],
+            row(7),
+            DONE,
+        ),
+        (
+            "this identity with other records",
+            vec![reshipped(1, row(8))],
+            row(7),
+            DONE,
+        ),
+        (
+            "the log's transaction goes on with an inbox acknowledgement the row lacks",
+            vec![reshipped(1, ack_row(7))],
+            row(7),
+            DONE,
+        ),
+        (
+            "the row goes on with an inbox acknowledgement the log's lacks",
+            vec![reshipped(1, row(7))],
+            ack_row(7),
+            DONE,
+        ),
+        (
+            "both with the inbox acknowledgement",
+            vec![reshipped(1, ack_row(7))],
+            ack_row(7),
+            IN_LOG,
+        ),
+        (
+            "the re-ship followed by the successor's own transaction",
+            vec![then_other],
+            row(7),
+            IN_LOG,
+        ),
+        ("two re-ships in one segment", vec![two], row(7), IN_LOG),
+        (
+            "two re-ships of the identity with different records: poisoned",
+            vec![reshipped(1, row(7)), other],
+            row(7),
+            DONE,
+        ),
+    ];
+    for (what, segments, local, verdict) in cases {
+        let segments: Vec<&[LogRecord]> = segments.iter().map(Vec::as_slice).collect();
+        let meta = reshipped_and_read_again(&segments, local);
+        let report = reship_stored(&meta);
+        assert_eq!(judged(&report), verdict, "{what}: {report:?}");
+    }
+}
+
+/// A chain (A to B to C): B's tail holds A's row as B re-shipped it, its
+/// `TailOf` first, and C's re-ship keeps A's identity. The gate over B's tail
+/// meets the row with A's identity and finds C's re-ship of it.
+#[test]
+fn a_chained_reship_keeps_the_first_identity_and_is_in_the_log() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_segment_rows(
+        1,
+        EPOCH_PREV + 2,
+        0,
+        &[],
+        &[],
+        &reshipped(1, row(7)),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(meta
+        .backup_append(EPOCH_PREV + 1, &[tx(1, 3, reshipped(1, row(7)))])
+        .is_ok());
+    let report = meta
+        .reship_at_takeover(
+            None,
+            Some(constellation_meta::TailArgs {
+                epoch: EPOCH_PREV + 1,
+                through: 3,
+                config_version: 3,
+                class: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(judged(&report), IN_LOG, "{report:?}");
+}
+
 /// A node that takes the lease again after its own tenure (a claimant asked
 /// for its tail, the claim failed, it won the lease itself) reads its own
 /// sealed tail back while its own journal still holds the very rows (a root's

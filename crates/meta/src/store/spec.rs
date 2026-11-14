@@ -6441,6 +6441,24 @@ impl Meta {
         self.reship_epochs_at_takeover(strand, tail.as_slice())
     }
 
+    /// Whether the log carried a re-ship of identity `ident` whose
+    /// transaction is `records` (less a `TailOf` of their own), through its
+    /// outcome and the inbox acknowledgements behind it
+    /// (`member::log_carries_reship_tx`, kept per re-shipped identity when
+    /// the segment applied), never an epoch's re-ship mark.
+    fn reship_in_log_tx(
+        &self,
+        tx: &impl Readable,
+        ident: (u64, u64),
+        records: &[LogRecord],
+    ) -> Result<bool, MetaError> {
+        let body = match records.first() {
+            Some(LogRecord::TailOf { .. }) => &records[1..],
+            _ => records,
+        };
+        super::member::log_carries_reship_tx(tx, self, ident, body)
+    }
+
     /// [`Self::reship_at_takeover`] for the tails of several epochs, ascending
     /// (ADR-51: a claim that took the rows a hold journaled under the
     /// tenure's epoch and under the one a handover moved it to): the strand
@@ -6627,6 +6645,25 @@ impl Meta {
                             }
                         }
                     }
+                }
+                // The rid's outcome here may be this very transaction, by a
+                // re-ship: a successor re-journaled it under its own epoch
+                // with its identity (`TailOf`) and was sealed in turn, and
+                // this claim reads the identity's own epoch's tail again (the
+                // claim's kept rows). Proved by the identity and the
+                // transaction's records through its outcome, never by an
+                // epoch's re-ship mark: the log carried a re-ship naming this
+                // identity with this transaction (`drop-held-chain-backed`
+                // seed 1529).
+                if done && self.reship_in_log_tx(&tx, ident, &bt.records)? {
+                    tracing::info!(
+                        epoch = t.epoch,
+                        first = bt.first,
+                        ident = ?ident,
+                        "a row of the sealed tail is in the log as its re-ship; not re-shipped"
+                    );
+                    report.tail_in_log += 1;
+                    continue;
                 }
                 if done {
                     tracing::warn!(
