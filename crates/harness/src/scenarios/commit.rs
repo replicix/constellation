@@ -43,6 +43,14 @@
 //!    and a local commit, the bound of topology 3's delegate; `first_op`: the
 //!    record's archive wait, once per subtree) and its ops in `/`
 //!    (`root-slash`: the archive wait, documented). Runs under net-wan only.
+//! 9. `9-two-subtrees`: three nodes, `/d1` and `/d2` delegated to `b` (one
+//!    grant, one stream over two subtrees; plan 46 M1.2 step 15, the
+//!    successor of plan 30's `two-gens-ack-cost`) with a backup: four threads
+//!    on `b` create files, two per subtree (`delegate-4w-two-subtrees`), then
+//!    four in `/d1` alone (`delegate-4w-one-subtree`, the comparison: the
+//!    two must not differ beyond the run-to-run spread); and a rename of a
+//!    file from `/d1` into `/d2` (`delegate` `rename-across`, which no
+//!    cross-subtree hazard delays: the stream owns both parents).
 //!
 //! One JSON document on stdout:
 //! `{"scenario":"ack-latency","load":…,"results":[{"topology","actor","op","n","p50_us","p90_us","p99_us"}]}`.
@@ -280,12 +288,13 @@ pub fn ack_latency(_seed: u64) -> Result<()> {
             all.push(topology_wan_root_own(n)?);
         }
     } else {
-        let runs: [(u32, Topology); 5] = [
+        let runs: [(u32, Topology); 6] = [
             (1, topology_single),
             (2, topology_backup),
             (3, topology_delegated),
             (4, topology_delegated_backup),
             (6, topology_ack_s3),
+            (9, topology_two_subtrees),
         ];
         for (t, run) in runs {
             if want(t) {
@@ -424,6 +433,101 @@ fn topology_delegated_backup(n: usize) -> Result<Rows> {
             &c.mnt.join("d1/lk"),
             n,
         )?;
+        Ok(rows)
+    })();
+    unmount_all(&mut clients);
+    result
+}
+
+fn topology_two_subtrees(n: usize) -> Result<Rows> {
+    const NAME: &str = "ack-latency-9-two-subtrees";
+    const WRITERS: usize = 4;
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b", "c"],
+        &[("CONSTELLATION_DELEGATION_PLACEMENT", "off")],
+        0,
+    )?;
+    let result = (|| -> Result<Rows> {
+        let mut rows = Rows::new("9-two-subtrees");
+        let (a, b, c) = (&clients[0], &clients[1], &clients[2]);
+        wait_for_backup(a, Duration::from_secs(60))?;
+        for d in ["d1", "d2"] {
+            std::fs::create_dir(a.mnt.join(d))?;
+        }
+        for x in [b, c] {
+            eventually("dirs visible", Duration::from_secs(30), || {
+                ensure!(x.mnt.join("d1").is_dir() && x.mnt.join("d2").is_dir());
+                Ok(())
+            })?;
+        }
+        let b_id = node_id(b)?;
+        delegate(a, "/d1", b_id)?;
+        delegate(a, "/d2", b_id)?;
+        let g1 = wait_installed(b, "/d1", Duration::from_secs(30))?;
+        let g2 = wait_installed(b, "/d2", Duration::from_secs(30))?;
+        ensure!(g1 == g2, "9-two-subtrees: /d1 is generation {g1}, /d2 {g2}");
+        eventually(
+            "b has one stream and a backup",
+            Duration::from_secs(30),
+            || {
+                super::onestream::one_stream(b)?;
+                let d = b.control_status()?["delegation"].clone();
+                ensure!(
+                    d["backups"].as_array().is_some_and(|v| !v.is_empty()),
+                    "9-two-subtrees: the delegate has no backup yet: {d}"
+                );
+                Ok(())
+            },
+        )?;
+        // `n` creates per writer, four writers at once.
+        let run = |dirs: [&str; WRITERS], tag: &str| -> Result<Vec<Duration>> {
+            let handles: Vec<_> = dirs
+                .iter()
+                .enumerate()
+                .map(|(w, dir)| {
+                    let dir = b.mnt.join(dir);
+                    let tag = format!("{tag}{w}");
+                    std::thread::spawn(move || -> Result<Vec<Duration>> {
+                        let mut lat = Vec::with_capacity(n);
+                        for i in 0..n {
+                            let p = dir.join(format!("{tag}-{i}"));
+                            let t = Instant::now();
+                            let f = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&p)
+                                .with_context(|| format!("creating {}", p.display()))?;
+                            lat.push(t.elapsed());
+                            drop(f);
+                        }
+                        Ok(lat)
+                    })
+                })
+                .collect();
+            let mut all = Vec::new();
+            for h in handles {
+                all.extend(h.join().map_err(|_| anyhow::anyhow!("writer panicked"))??);
+            }
+            Ok(all)
+        };
+        rows.add(
+            "delegate-4w-two-subtrees",
+            "create",
+            run(["d1", "d2", "d1", "d2"], "x")?,
+        );
+        rows.add(
+            "delegate-4w-one-subtree",
+            "create",
+            run(["d1", "d1", "d1", "d1"], "y")?,
+        );
+        let targets = prepare(&b.mnt.join("d1"), "across", n)?;
+        let mut across = Vec::with_capacity(n);
+        for (i, p) in targets.iter().enumerate() {
+            let to = b.mnt.join("d2").join(format!("across-{i}"));
+            across.push(timed(|| std::fs::rename(p, &to), "rename across")?);
+        }
+        rows.add("delegate", "rename-across", across);
         Ok(rows)
     })();
     unmount_all(&mut clients);

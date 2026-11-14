@@ -73,6 +73,8 @@ mod m7;
 mod m8;
 /// Plan 30 §M9: backup peers, seal-based failover, `ack=s3`.
 mod m9;
+/// Plan 46 M1.2 step 15: a node's two subtrees, one stream, a rename between them.
+mod onestream;
 /// The OVH real-S3 run's findings: the create race, a non-owner's
 /// per-op S3 round trip.
 mod ovh;
@@ -1670,6 +1672,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: delegroot::takeover_loss_two_node,
+    },
+    Scenario {
+        name: "two-subtrees-one-stream-rename",
+        desc: "plan 46 M1.2 step 15: two nodes, b the root's backup and the delegate of both /d1 and /d2 (one grant, one stream over two subtrees) renaming files between them round after round; the root is kill -9ed in the middle and b takes it over by seal: every acknowledged rename stands (each file in the subtree its last acknowledged rename left it in, once, byte-exact, on both nodes after the old root rejoins), no rename fails, no conflict copy",
+        requires: &[],
+        caps: &[],
+        run: onestream::two_subtrees_one_stream_rename,
     },
     Scenario {
         name: "auto-placement",
