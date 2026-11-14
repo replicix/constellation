@@ -9907,10 +9907,13 @@ impl Core {
         g.recall = RecallPhase::Sent;
         g.recall_cause = Some(cause);
         g.gate_recalled = gated;
+        if cause == RecallCause::LeaveNote {
+            self.stats.deleg_leave_note_recalls += 1;
+        }
         if g.kind() == DelegKind::Sticky {
             match cause {
                 RecallCause::Undelegate | RecallCause::Leave => {}
-                RecallCause::LeaveNote => self.stats.deleg_leave_note_recalls += 1,
+                RecallCause::LeaveNote => {}
                 RecallCause::Epoch => self.stats.deleg_sticky_recalled_epoch += 1,
                 RecallCause::Other => self.stats.deleg_sticky_recalled_other += 1,
             }
