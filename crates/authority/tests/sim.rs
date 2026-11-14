@@ -9844,8 +9844,9 @@ struct OracleTotals {
     /// Plan 46 M1.3 step 4: sticky streams in the log, ended by release, by
     /// abandon, unexcused; the core's counters (grants made, ended by
     /// reason: released, abandoned, other).
-    sticky: [u64; 5],
+    sticky: [u64; 4],
     sticky_core: [u64; 16],
+    claim_core: [u64; 4],
     root_own_core: [u64; 15],
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
@@ -10233,11 +10234,13 @@ impl OracleTotals {
         self.sticky[1] += r.sticky_ended_released as u64;
         self.sticky[2] += r.sticky_ended_abandoned as u64;
         self.sticky[3] += r.sticky_ended_unexcused as u64;
-        self.sticky[4] += r.sticky_ended_claimed as u64;
         for (t, c) in self.ll_core.iter_mut().zip(r.ll_core) {
             *t += c;
         }
         for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
+            *t += c;
+        }
+        for (t, c) in self.claim_core.iter_mut().zip(r.claim_core) {
             *t += c;
         }
         for (i, (t, c)) in self
@@ -10427,14 +10430,13 @@ impl OracleTotals {
             self.seeds, self.cut.0, self.cut.1, self.cut.4, self.cut.2, self.cut.3
         );
         eprintln!(
-            "SWEEP-STICKY-TOTALS {label} seeds {}/{seeds}: sticky streams in the log {} (ended by release {}, by abandon {}, by the holder's own claim {}, unexcused {}); \
+            "SWEEP-STICKY-TOTALS {label} seeds {}/{seeds}: sticky streams in the log {} (ended by release {}, by abandon {}, unexcused {}); \
              core: grants made {}, ended released {}, abandoned {}, other {}, by undelegate {}, recalled {}; recalls by a continuation epoch {}; \
              holder's releases journaled {} (of some subtrees {}), ops held by a drain {}, given up {}; idle tracker: requested {}, answered {}, unanswered {}, granted again {}; release rows judged against the root's append {}",
             self.seeds,
             self.sticky[0],
             self.sticky[1],
             self.sticky[2],
-            self.sticky[4],
             self.sticky[3],
             self.sticky_core[0],
             self.sticky_core[1],
@@ -10452,6 +10454,10 @@ impl OracleTotals {
             self.sticky_driver[2],
             self.sticky_driver[3],
             self.sticky_release_rows_judged
+        );
+        eprintln!(
+            "SWEEP-CLAIM-RELEASE-TOTALS {label} seeds {}/{seeds}: claims that journaled the stream's release {}, with no row to journal {}, ends that waited for the stream's rows {}, ended ahead of held rows when the wait ran out {}",
+            self.seeds, self.claim_core[0], self.claim_core[1], self.claim_core[2], self.claim_core[3]
         );
         eprintln!(
             "SWEEP-ABANDON-TOTALS {label} seeds {}/{seeds}: repair abandon commands {}, with a read wait {}, \
@@ -21828,6 +21834,36 @@ fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the
     assert!(answered > 0, "no `wait` release was answered");
     assert!(again > 0, "no grant was made again after a release");
     assert!(held > 0, "no op was held by a drain");
+}
+
+/// Plan 46 M1.3 step 12 (claim = release): a sticky holder that claims the
+/// lease journals its stream's release, and the sim no longer excuses an end
+/// by the holder's own claim. The knob `claim_ends_silently`
+/// (`AUTHORITY_SIM_CLAIM_ENDS_SILENTLY=1`) is the old behaviour: the run
+/// fails on seeds where a holder claims, by
+/// `sticky_ends_only_by_holder_or_operator`; without it the same seeds pass
+/// and journal the release.
+#[test]
+fn a_claim_that_ends_the_stream_silently_fails_the_run() {
+    let silent = SimConfig {
+        claim_ends_silently: true,
+        ..far_root_writes_config()
+    };
+    let (mut failed, mut released) = (0, 0);
+    for seed in 0..12u64 {
+        if let Err(e) = run_seed(seed, silent.clone()) {
+            assert!(
+                e.contains("sticky_ends_only_by_holder_or_operator"),
+                "seed {seed}: {e}"
+            );
+            failed += 1;
+        }
+        let r = run_seed(seed, far_root_writes_config())
+            .unwrap_or_else(|e| panic!("far-root-writes seed {seed}: {e}"));
+        released += r.claim_core[0];
+    }
+    assert!(failed > 0, "no seed had a holder claim the lease silently");
+    assert!(released > 0, "no claim journaled a release");
 }
 
 /// The knob `holder_releases_before_drain`

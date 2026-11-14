@@ -8,8 +8,9 @@
 //! one `StreamReleased`, in its own stream before the root's
 //! `DelegateNodeEnded`; or a release note the sim saw it send that covers
 //! every granted subtree, or carries `end_at`: a rowless release leaves
-//! nothing in the log), the holder's own claim of the root lease (claim =
-//! release, C11), or the operator's `GroupAbandoned` of the generation.
+//! nothing in the log), or the operator's `GroupAbandoned` of the generation.
+//! The holder's own claim of the root lease is no excuse since plan 46 M1.3
+//! step 12 (claim = release, C11): the claim journals the release row.
 //! Otherwise it ended by something else (the TTL, a placement round): the
 //! violation. This part cannot tell WHY a holder released: a holder that
 //! releases because the root recalled it is excused here like any release.
@@ -69,8 +70,6 @@ pub struct StickyFindings {
     pub ended_released: usize,
     /// Of them, ended by the operator's abandon.
     pub ended_abandoned: usize,
-    /// Of them, ended by the holder itself as the root (it claimed the lease).
-    pub ended_claimed: usize,
     /// One description per sticky stream that ended otherwise.
     pub violations: Vec<String>,
 }
@@ -147,9 +146,9 @@ impl StickyEnds {
             ));
         }
         for (gen, dirs) in &self.granted {
-            let Some(ender) = self.ended.get(gen) else {
+            if !self.ended.contains_key(gen) {
                 continue;
-            };
+            }
             let released = self.released_whole.contains(gen)
                 || holder_sent_release
                     .get(gen)
@@ -160,8 +159,6 @@ impl StickyEnds {
                     .is_some_and(|r| dirs.iter().all(|d| r.contains(d)));
             if released {
                 f.ended_released += 1;
-            } else if self.holder.get(gen) == Some(ender) {
-                f.ended_claimed += 1;
             } else if self.abandoned.contains(gen) {
                 f.ended_abandoned += 1;
             } else {
@@ -273,9 +270,11 @@ mod tests {
                 .len(),
             1
         );
-        // The holder that claims the lease and ends its own stream (C11).
+        // Plan 46 M1.3 step 12: the holder that claims the lease and ends its
+        // own stream with no release row is no excuse any more (claim =
+        // release): the claim journals the release.
         let f = StickyEnds::of_records(ttl.iter().map(|r| (2, r))).judge(&none);
-        assert_eq!((f.ended_claimed, f.violations.len()), (1, 0));
+        assert_eq!(f.violations.len(), 1);
         // A live sticky stream is no violation.
         let live = [grant(2, 5, 7)];
         let f = StickyEnds::of_records(live.iter().map(|r| (9, r))).judge(&none);

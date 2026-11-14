@@ -579,6 +579,10 @@ pub struct SimConfig {
     /// `AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1` sets it on every
     /// configuration; a run that released before the drain fails.
     pub holder_releases_before_drain: bool,
+    /// Negative control (`Config::claim_ends_silently`): a holder's claim of
+    /// the lease ends its stream with no release row.
+    /// `AUTHORITY_SIM_CLAIM_ENDS_SILENTLY=1` sets it on every configuration.
+    pub claim_ends_silently: bool,
     /// Negative control (`Config::fence_accepts_unrouted`): a node runs a
     /// forward under its generation whatever generation it was routed by (no
     /// delegate fence). `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1` sets it on
@@ -1295,6 +1299,8 @@ impl Default for SimConfig {
                 "AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN",
             )
             .is_some_and(|v| v == "1"),
+            claim_ends_silently: std::env::var_os("AUTHORITY_SIM_CLAIM_ENDS_SILENTLY")
+                .is_some_and(|v| v == "1"),
             fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
                 .is_some_and(|v| v == "1"),
             holder_runs_inbox_ever: std::env::var_os("AUTHORITY_SIM_HOLDER_RUNS_INBOX_EVER")
@@ -1649,11 +1655,16 @@ pub struct Report {
     pub sticky_granted: usize,
     pub sticky_ended_released: usize,
     pub sticky_ended_abandoned: usize,
-    pub sticky_ended_claimed: usize,
     pub sticky_ended_unexcused: usize,
     /// Core counters, summed over the nodes: sticky grants made, and sticky
     /// streams ended by reason (released, abandoned, other).
     pub sticky_core: [u64; 16],
+    /// Plan 46 M1.3 step 12 (claim = release), core counters summed over the
+    /// nodes: claims that journaled the release row, claims with no row to
+    /// journal, claim ends that waited for the stream's rows, and ends that
+    /// went ahead of rows still held when `drop_held_await` ran out (a lost
+    /// chunk's row: counted, not a violation).
+    pub claim_core: [u64; 4],
     /// ADR-55 coverage: the root's own grants made, answers in its own
     /// stream, holds by its root path, the longest commit wait of a grant
     /// (ms), self-delivered messages, candidates the walk skipped for the
@@ -5553,6 +5564,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
         first_start_unsettled: cfg.first_start_unsettled,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
+        claim_ends_silently: cfg.claim_ends_silently,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
         holder_runs_inbox_ever: cfg.holder_runs_inbox_ever,
         root_ignores_touched: cfg.root_ignores_touched,
@@ -7667,8 +7679,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.sticky_granted = found.sticky_granted;
     report.sticky_ended_released = found.sticky_released;
     report.sticky_ended_abandoned = found.sticky_abandoned;
-    report.sticky_ended_claimed = found.sticky_claimed;
     let mut sticky_recalled_other = 0u64;
+    let mut claim_halted = 0u64;
     for s in report.stats.values() {
         for (t, v) in report.ll_core.iter_mut().zip([
             s.settles_withdrawn_first,
@@ -7723,6 +7735,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.quarantine_core[4] += s.deleg_read_grants_quarantined;
         report.quarantine_core[5] += s.deleg_restart_q_voided;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
+        report.claim_core[0] += s.claim_released;
+        report.claim_core[1] += s.claim_release_rowless;
+        report.claim_core[2] += s.claim_end_waits;
+        claim_halted += s.claim_own_rows_halted_non_stealable;
+        report.claim_core[3] += s.claim_end_unordered;
         for (t, v) in report.handover_core.iter_mut().zip([
             s.deleg_handovers_requested,
             s.place_handover_granted,
@@ -7774,6 +7791,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             "sticky_ends_only_by_holder_or_operator: the root started {sticky_recalled_other} \
              recall(s) of a sticky stream for a cause other than the operator's undelegate or \
              a continuation epoch"
+        ));
+    }
+    // Plan 46 M1.3 step 12: a claim ends a non-stealable stream after its
+    // release row, and after the stream's rows.
+    if claim_halted > 0 {
+        found.sticky.push(format!(
+            "claim_is_release: a claim replayed {claim_halted} non-stealable stream(s)' own rows by \
+             rid at the takeover gate: no release row follows rows the log lacks"
         ));
     }
     report.sticky_ended_unexcused = found.sticky.len();

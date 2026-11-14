@@ -2791,7 +2791,6 @@ pub struct Findings {
     pub sticky_granted: usize,
     pub sticky_released: usize,
     pub sticky_abandoned: usize,
-    pub sticky_claimed: usize,
 }
 
 impl Findings {
@@ -3402,7 +3401,6 @@ pub fn end_of_run(
     f.sticky_granted = sticky.granted;
     f.sticky_released = sticky.ended_released;
     f.sticky_abandoned = sticky.ended_abandoned;
-    f.sticky_claimed = sticky.ended_claimed;
     f.sticky = sticky.violations;
     f
 }

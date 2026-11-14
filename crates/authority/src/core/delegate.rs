@@ -13063,7 +13063,10 @@ impl Core {
             self.stats.claim_own_rows_halted_non_stealable += 1;
             return;
         }
-        if !self.dl.mine.contains_key(&gen) || self.release_row_journaled(gen, replica) {
+        if self.cfg.claim_ends_silently
+            || !self.dl.mine.contains_key(&gen)
+            || self.release_row_journaled(gen, replica)
+        {
             self.stats.claim_release_rowless += 1;
             return;
         }
@@ -13132,6 +13135,7 @@ impl Core {
             self.end_generation(now, gen, None, replica, out);
             return;
         };
+        let first = !self.dl.claim_waits.contains_key(&gen);
         let since = *self.dl.claim_waits.entry(gen).or_insert(now.wait);
         if now.wait.since(since).max(0) as u64 >= self.dl_t().drop_held_await {
             self.stats.claim_end_unordered += 1;
@@ -13145,7 +13149,7 @@ impl Core {
             self.end_generation(now, gen, None, replica, out);
             return;
         }
-        if since == now.wait {
+        if first {
             self.stats.claim_end_waits += 1;
             tracing::info!(
                 node = self.me(),

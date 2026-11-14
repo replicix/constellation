@@ -184,6 +184,12 @@ pub struct Config {
     /// journaled before the drain (`deleg_sticky_release_undrained`).
     pub holder_releases_before_drain: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine): a non-stealable holder's claim of the lease ends its
+    /// stream with no release row, as before plan 46 M1.3 step 12
+    /// (`claim_ends_silently`). The sim's `sticky_ends_only_by_holder_or_operator`
+    /// fails the run.
+    pub claim_ends_silently: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): the root ends a sticky stream when the holder releases
     /// some of its subtrees (plan 46 M1.3 step 5, MUST-1,
     /// `partial_release_ends_stream`). The sim's
@@ -746,6 +752,7 @@ impl Config {
             ttl_reclaims_sticky: false,
             restart_skips_write_quarantine: false,
             holder_releases_before_drain: false,
+            claim_ends_silently: false,
             partial_release_ends_stream: false,
             fence_accepts_unrouted: false,
             holder_runs_inbox_ever: false,
