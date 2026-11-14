@@ -75,14 +75,16 @@ pub struct LogindLifecycle {
 /// how many were given it.
 #[derive(Default)]
 struct Acks {
-    state: Mutex<(usize, Option<usize>)>,
+    /// (applied, delivered to, the `Suspending`'s deadline: what tells it from
+    /// an injected one or the previous one's late report).
+    state: Mutex<(usize, Option<usize>, Option<Instant>)>,
     changed: std::sync::Condvar,
 }
 
 impl Acks {
     /// A `Suspending` is about to be delivered.
-    fn begin(&self) {
-        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = (0, None);
+    fn begin(&self, deadline: Instant) {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = (0, None, Some(deadline));
     }
 
     /// It was delivered to `n` subscribers.
@@ -92,8 +94,11 @@ impl Acks {
     }
 
     /// One subscriber applied it.
-    fn applied(&self) {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).0 += 1;
+    fn applied(&self, deadline: Instant) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if st.2 == Some(deadline) {
+            st.0 += 1;
+        }
         self.changed.notify_all();
     }
 
@@ -219,8 +224,8 @@ impl LifecycleSource for LogindLifecycle {
     }
 
     fn applied(&self, event: &LifecycleEvent) {
-        if let (Some(acks), LifecycleEvent::Suspending { .. }) = (&self.acks, event) {
-            acks.applied();
+        if let (Some(acks), LifecycleEvent::Suspending { deadline }) = (&self.acks, event) {
+            acks.applied(*deadline);
         }
     }
 }
@@ -306,7 +311,7 @@ async fn run(
         if starting {
             let deadline = Instant::now() + delay_max(&proxy).await;
             if let Some(acks) = &acks {
-                acks.begin();
+                acks.begin(deadline);
             }
             let delivered = events.push(LifecycleEvent::Suspending { deadline });
             if let Some(acks) = &acks {
@@ -533,6 +538,33 @@ mod tests {
         });
         // The source can be pushed into too (`node.lifecycle`).
         assert!(src.manual().is_some());
+    }
+
+    /// Review: a `Suspending` that was pushed in by hand (another deadline)
+    /// does not count as the subscriber's report of logind's.
+    #[test]
+    fn an_injected_suspending_does_not_release_the_inhibitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeLogind::listen(&dir.path().join("bus"), Duration::from_secs(20)).unwrap();
+        let src = LogindLifecycle::acknowledged(Endpoint::Peer(fake.address().into())).unwrap();
+        let sub = src.subscribe();
+        fake.prepare_for_sleep(true);
+        let Ok(real @ LifecycleEvent::Suspending { .. }) = sub.recv_timeout(T) else {
+            panic!("expected Suspending");
+        };
+        let injected = LifecycleEvent::Suspending {
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        src.applied(&injected);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            fake.inhibitors()[0].held,
+            "an injected event released the inhibitor"
+        );
+        src.applied(&real);
+        wait_for("the inhibitor to be released", || {
+            !fake.inhibitors()[0].held
+        });
     }
 
     /// A source nobody subscribed to lets the host go at once.

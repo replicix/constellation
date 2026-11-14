@@ -5416,6 +5416,17 @@ ahead of rows it covers.
   `drop_held_await`. When the bound runs out the end proceeds as before and
   `claim_end_unordered` counts it: a lost chunk's row that nothing resolves is
   an operator's `repair drop-held`, not a reason to keep the subtree blocked.
+- From its release row on the claimed stream is stopped (the holder executes
+  nothing in it, its parked ops go back to the ordinary route), and the
+  placement does not grow it: `delegate_dir` refuses to grow the root's own
+  stream while it is released, stopped, partially released (transient) or its
+  claim's end waits (`far-placement-release` seeds 200 and 975 were ops held for
+  good in a grown, stopped stream; DESIGN rule 5). A ship plan that cannot be
+  read is a wait. The wait that runs out ahead of held-back rows is counted
+  (`claim_end_rows_outrun`; sound: the cut is bookkeeping, the release row
+  cannot overtake a held row of its stream, and main ends there too); one that
+  runs out ahead of a pending drop is a sim violation (ADR-59 D1 would cancel
+  the drop). No knob skips the wait, so the sim has no negative control for it.
 - The sim no longer excuses an end by the holder's claim
   (`sticky_ends_only_by_holder_or_operator`); the knob `claim_ends_silently` is
   the old behaviour as a negative control.
@@ -5425,7 +5436,8 @@ ahead of rows it covers.
   `CONSTELLATION_STICKY_IDLE_RELEASE_MS` (60 s, `0` disables) is released by the
   holder's own command, with step 5's drain and row; the idle test is ADR-56's
   H-I5 (no parked own op, none the fast path admitted, the time counted from the
-  last own op). It covers the root's own streams (ADR-55 Q5, "until they go
+  last own op; a subtree never touched starts its clock at the first look; reads
+  are no activity). It covers the root's own streams (ADR-55 Q5, "until they go
   idle"). The oracle is unchanged: the release is the holder's.
 - **The suspension inhibitor**: the Linux node takes a logind delay inhibitor
   when a system bus answers and holds it until every lifecycle subscriber

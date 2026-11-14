@@ -4294,6 +4294,9 @@ fn release_command(
 ) -> Result<()> {
     if let Some(target) = target {
         let (t, dir) = resolve_target(&target, state_dir)?;
+        if !dirs.is_empty() && matches!(&t, target::Target::Named { path: Some(_), .. }) {
+            bail!("name the subtrees with NAME:/path or with --dirs, not both");
+        }
         let paths = match (&t, dirs.is_empty()) {
             (_, false) => dirs,
             (target::Target::Named { path: Some(p), .. }, true) => vec![p.clone()],

@@ -943,6 +943,9 @@ command, with the drain and the row above):
 - a handover (ADR-56), the root's own dwell and cross-subtree ops
   (ADR-55), and a leave.
 
+Reads do not count as activity (H-I5 as specified): a read-mostly far holder
+loses its local path every idle period; that costs latency only.
+
 A holder that claims the root lease releases its non-stealable stream by
 the claim itself ([ADR-60](../../explanation/DECISIONS.md#adr-60-a-claim-of-the-lease-by-a-non-stealable-holder-is-its-release-and-ends-its-stream-after-the-streams-rows)):
 `StreamReleased` is journaled as the stream's next row, and the end the root

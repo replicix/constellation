@@ -69961,3 +69961,10 @@ covered (the holder's read grants are in the table the root path recalls from). 
 `sticky.release`, and the node's logind delay inhibitor held until the suspension sequence is done. Step 16 (self-fence)
 stays in stage 2. No change to replicix-core.
 
+Review of the above (2026-11-14): a claimed stream is stopped at its release row and not grown while its end waits; a ship
+plan that cannot be read is a wait; `claim_end_unordered` is split (rows outrun: counted; drop cancelled: a sim violation);
+the idle counter counts completed releases; the pin test, `sticky-claim` and the env override
+`AUTHORITY_SIM_STICKY_IDLE_MS` are in. Stage-1 exit item added: every sim config ×2,000 with the idle release on.
+`sticky-holder-restarts-placed` 992 and 1637 fail on main and pass on the branch because the schedule changed (the idle
+release); they were not masked and are to be classified on main.
+
