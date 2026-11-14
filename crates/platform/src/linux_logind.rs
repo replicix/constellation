@@ -65,7 +65,53 @@ pub enum Endpoint {
 /// The logind source. Dropping it stops the worker and closes the inhibitor.
 pub struct LogindLifecycle {
     events: Arc<ManualLifecycle>,
+    /// `Some` for the source whose handler waits for the subscribers to
+    /// apply the `Suspending` it delivered ([`LogindLifecycle::acknowledged`]).
+    acks: Option<Arc<Acks>>,
     _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+/// How many subscribers have applied the `Suspending` being delivered, and
+/// how many were given it.
+#[derive(Default)]
+struct Acks {
+    state: Mutex<(usize, Option<usize>)>,
+    changed: std::sync::Condvar,
+}
+
+impl Acks {
+    /// A `Suspending` is about to be delivered.
+    fn begin(&self) {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = (0, None);
+    }
+
+    /// It was delivered to `n` subscribers.
+    fn delivered(&self, n: usize) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).1 = Some(n);
+        self.changed.notify_all();
+    }
+
+    /// One subscriber applied it.
+    fn applied(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).0 += 1;
+        self.changed.notify_all();
+    }
+
+    /// Wait until every subscriber applied it, or `deadline`.
+    fn wait(&self, deadline: Instant) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while st.1.is_none_or(|n| st.0 < n) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            st = self
+                .changed
+                .wait_timeout(st, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
 }
 
 impl std::fmt::Debug for LogindLifecycle {
@@ -83,15 +129,39 @@ impl LogindLifecycle {
         Self::connect(Endpoint::System, on_suspending)
     }
 
+    /// The source a node uses (plan 46 M1.3 step 6): the inhibitor is held
+    /// until every subscriber has applied the `Suspending` it was given (the
+    /// engine reports it with [`LifecycleSource::applied`], after the node
+    /// released its sticky grants), or the delay logind allows is over. At
+    /// `endpoint`; `None` (logged) when there is no logind.
+    pub fn acknowledged(endpoint: Endpoint) -> Option<Self> {
+        let acks = Arc::new(Acks::default());
+        let waiter = acks.clone();
+        let mut source = Self::connect_with(endpoint, Some(acks.clone()), move |deadline| {
+            waiter.wait(deadline)
+        })?;
+        source.acks = Some(acks);
+        Some(source)
+    }
+
     /// As [`LogindLifecycle::system`], at `endpoint`.
     pub fn connect(
         endpoint: Endpoint,
+        on_suspending: impl Fn(Instant) + Send + Sync + 'static,
+    ) -> Option<Self> {
+        Self::connect_with(endpoint, None, on_suspending)
+    }
+
+    fn connect_with(
+        endpoint: Endpoint,
+        acks: Option<Arc<Acks>>,
         on_suspending: impl Fn(Instant) + Send + Sync + 'static,
     ) -> Option<Self> {
         let events = Arc::new(ManualLifecycle::new());
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let worker_events = events.clone();
+        let worker_acks = acks.clone();
         let handler: Arc<dyn Fn(Instant) + Send + Sync> = Arc::new(on_suspending);
         let spawned = std::thread::Builder::new()
             .name("logind".into())
@@ -106,7 +176,7 @@ impl LogindLifecycle {
                         return;
                     }
                 };
-                rt.block_on(run(endpoint, worker_events, handler, ready_tx, stop_rx));
+                rt.block_on(run(endpoint, worker_events, worker_acks, handler, ready_tx, stop_rx));
             });
         if let Err(e) = spawned {
             tracing::info!("no logind lifecycle source: cannot start its thread: {e}");
@@ -115,6 +185,7 @@ impl LogindLifecycle {
         match ready_rx.recv_timeout(CONNECT_TIMEOUT) {
             Ok(Ok(())) => Some(LogindLifecycle {
                 events,
+                acks,
                 _stop: stop_tx,
             }),
             Ok(Err(why)) => {
@@ -132,6 +203,18 @@ impl LogindLifecycle {
 impl LifecycleSource for LogindLifecycle {
     fn subscribe(&self) -> Subscription {
         self.events.subscribe()
+    }
+
+    /// The events this source delivers can also be pushed into it
+    /// (`node.lifecycle`, the harness): a logind-backed host keeps that.
+    fn manual(&self) -> Option<&ManualLifecycle> {
+        Some(&self.events)
+    }
+
+    fn applied(&self, event: &LifecycleEvent) {
+        if let (Some(acks), LifecycleEvent::Suspending { .. }) = (&self.acks, event) {
+            acks.applied();
+        }
     }
 }
 
@@ -182,6 +265,7 @@ async fn delay_max(proxy: &zbus::Proxy<'_>) -> Duration {
 async fn run(
     endpoint: Endpoint,
     events: Arc<ManualLifecycle>,
+    acks: Option<Arc<Acks>>,
     handler: Arc<dyn Fn(Instant) + Send + Sync>,
     ready: mpsc::Sender<Result<(), String>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
@@ -214,7 +298,13 @@ async fn run(
         };
         if starting {
             let deadline = Instant::now() + delay_max(&proxy).await;
-            events.push(LifecycleEvent::Suspending { deadline });
+            if let Some(acks) = &acks {
+                acks.begin();
+            }
+            let delivered = events.push(LifecycleEvent::Suspending { deadline });
+            if let Some(acks) = &acks {
+                acks.delivered(delivered);
+            }
             let h = handler.clone();
             let _ = tokio::task::spawn_blocking(move || h(deadline)).await;
             // Closing the descriptor is what lets logind go on.
@@ -408,6 +498,43 @@ mod tests {
             assert!(Instant::now() < end, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Plan 46 M1.3 step 6: the node's source holds the inhibitor until the
+    /// subscriber that was given the `Suspending` reports it applied (the
+    /// engine does, once the node released its grants), and no longer than
+    /// the delay logind allows.
+    #[test]
+    fn the_acknowledged_source_holds_the_inhibitor_until_the_subscriber_applied_the_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeLogind::listen(&dir.path().join("bus"), Duration::from_secs(20)).unwrap();
+        let src = LogindLifecycle::acknowledged(Endpoint::Peer(fake.address().into())).unwrap();
+        let sub = src.subscribe();
+        fake.prepare_for_sleep(true);
+        let Ok(event @ LifecycleEvent::Suspending { .. }) = sub.recv_timeout(T) else {
+            panic!("expected Suspending");
+        };
+        // The subscriber is still working: the host stays held back.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(fake.inhibitors()[0].held, "released before the event was applied");
+        src.applied(&event);
+        wait_for("the inhibitor to be released", || {
+            !fake.inhibitors()[0].held
+        });
+        // The source can be pushed into too (`node.lifecycle`).
+        assert!(src.manual().is_some());
+    }
+
+    /// A source nobody subscribed to lets the host go at once.
+    #[test]
+    fn the_acknowledged_source_without_subscribers_releases_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeLogind::listen(&dir.path().join("bus"), Duration::from_secs(20)).unwrap();
+        let _src = LogindLifecycle::acknowledged(Endpoint::Peer(fake.address().into())).unwrap();
+        fake.prepare_for_sleep(true);
+        wait_for("the inhibitor to be released", || {
+            !fake.inhibitors()[0].held
+        });
     }
 
     #[test]

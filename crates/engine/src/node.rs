@@ -1807,7 +1807,7 @@ impl Engine {
                 "engine profile"
             );
         }
-        lifecycle.spawn(&*host.lifecycle, stop.clone());
+        lifecycle.spawn(&host.lifecycle, stop.clone());
         Ok(Engine {
             lifecycle,
             credentials,

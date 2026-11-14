@@ -71,6 +71,12 @@ pub trait LifecycleSource: Send + Sync {
     fn manual(&self) -> Option<&ManualLifecycle> {
         None
     }
+
+    /// A subscriber has applied `event` (the engine's lifecycle thread, after
+    /// it ran the event's sequence). A source that must know when its
+    /// subscribers are done (logind's inhibitor is held until the node has
+    /// handed its grants back) waits for these; the default does not care.
+    fn applied(&self, _event: &LifecycleEvent) {}
 }
 
 /// A [`LifecycleSource`] whose events are whatever [`ManualLifecycle::push`]

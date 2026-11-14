@@ -55,6 +55,36 @@ use crate::log_buffer;
 /// building a fresh FUSE session over it fails with the same "Transport
 /// endpoint is not connected". Best-effort and quiet on the common case
 /// (no stale mount): only acts when the path actually reports `ENOTCONN`.
+/// Plan 46 M1.3 step 6: on Linux the node takes a delay inhibitor from
+/// systemd-logind, so a suspension or a shutdown waits for the node to hand
+/// its sticky grants back (the lifecycle's `Suspending` sequence), within
+/// the delay `InhibitDelayMaxSec` allows. Without a system bus (a container,
+/// a host without systemd) the host keeps its manual source and nothing
+/// changes. `CONSTELLATION_LOGIND=0` leaves logind alone;
+/// `CONSTELLATION_LOGIND_ADDRESS` names another D-Bus peer address to talk
+/// to instead of the system bus (the harness's fake logind).
+#[cfg(target_os = "linux")]
+fn with_logind(mut host: HostServices) -> HostServices {
+    use constellation_platform::linux_logind::{Endpoint, LogindLifecycle};
+    let endpoint = match (
+        std::env::var("CONSTELLATION_LOGIND").ok().as_deref(),
+        std::env::var("CONSTELLATION_LOGIND_ADDRESS"),
+    ) {
+        (Some("0"), _) => return host,
+        (_, Ok(address)) if !address.is_empty() => Endpoint::Peer(address),
+        _ => Endpoint::System,
+    };
+    if let Some(source) = LogindLifecycle::acknowledged(endpoint) {
+        host.lifecycle = Arc::new(source);
+    }
+    host
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_logind(host: HostServices) -> HostServices {
+    host
+}
+
 fn clear_stale_mount(host: &HostServices, mountpoint: &std::path::Path) {
     match std::fs::metadata(mountpoint) {
         // A live FUSE mount or an ordinary directory stats fine — leave it.
@@ -555,7 +585,7 @@ impl NodeRuntime {
             Some(r) => (r.generation, r.control),
             None => (0, None),
         };
-        let host = HostServices::native();
+        let host = with_logind(HostServices::native());
         let engines = EngineHost::start(
             rt.clone(),
             ResourceBudget {

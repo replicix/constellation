@@ -1304,7 +1304,42 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
         &[("CONSTELLATION_CTO", "strict")],
         0,
     )?;
+    // Plan 46 M1.3 step 6: a suspension arrives the way a host's does, as
+    // logind's `PrepareForSleep`: `b` talks to a fake logind of its own
+    // (`CONSTELLATION_LOGIND_ADDRESS`), takes its delay inhibitor, and holds
+    // it until its sequence has released the grants.
+    let socket = std::env::temp_dir().join(format!("cst-logind-{}-{}", scenario, std::process::id()));
+    let fake = match how {
+        Leave::Suspend => {
+            let _ = std::fs::remove_file(&socket);
+            Some(
+                constellation_platform::linux_logind::FakeLogind::listen(
+                    &socket,
+                    Duration::from_secs(20),
+                )
+                .context("starting the fake logind")?,
+            )
+        }
+        Leave::Unmount => None,
+    };
     let result = (|| -> Result<()> {
+        if let Some(fake) = &fake {
+            clients[1]
+                .unmount_exit(Duration::from_secs(60))
+                .context("remounting b against the fake logind: unmount")?;
+            clients[1].set_env("CONSTELLATION_LOGIND_ADDRESS", fake.address());
+            clients[1].mount()?;
+            let refs: Vec<&Client> = clients.iter().collect();
+            wait_for_p2p(&refs)?;
+            eventually("b holds the inhibitor", Duration::from_secs(20), || {
+                anyhow::ensure!(
+                    fake.inhibitors().iter().any(|i| i.held && i.what.contains("sleep")),
+                    "no delay inhibitor held: {:?}",
+                    fake.inhibitors()
+                );
+                Ok(())
+            })?;
+        }
         let b_id = node_id(&clients[1])?;
         std::fs::create_dir(clients[0].mnt.join("d1"))?;
         for x in [&clients[1], &clients[2]] {
@@ -1330,12 +1365,19 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
                     .context("b's clean unmount")?;
             }
             Leave::Suspend => {
-                let report = clients[1].control(
-                    "node.lifecycle",
-                    serde_json::json!({"event": {"Suspending": {"deadline_in_ms": 15_000}}}),
-                )?;
-                anyhow::ensure!(report["applied"] == true, "not applied: {report}");
-                let s = &report["status"]["last_suspend"];
+                let fake = fake.as_ref().context("no fake logind")?;
+                fake.prepare_for_sleep(true);
+                // The inhibitor is let go once the sequence is done, not
+                // before: logind then lets the host sleep.
+                eventually("b lets go of the inhibitor", Duration::from_secs(30), || {
+                    anyhow::ensure!(
+                        fake.inhibitors().iter().all(|i| !i.held),
+                        "still held: {:?}",
+                        fake.inhibitors()
+                    );
+                    Ok(())
+                })?;
+                let s = clients[1].control_status()?["lifecycle"]["last_suspend"].clone();
                 anyhow::ensure!(
                     s["within_deadline"] == true && s["lease_released"] == true,
                     "the suspension did not finish cleanly: {s}"
@@ -1383,9 +1425,7 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
             })?;
         }
         if let Leave::Suspend = how {
-            let report =
-                clients[1].control("node.lifecycle", serde_json::json!({"event": "Resumed"}))?;
-            anyhow::ensure!(report["applied"] == true, "resume not applied: {report}");
+            fake.as_ref().context("no fake logind")?.prepare_for_sleep(false);
             eventually("b sees c-after", Duration::from_secs(30), || {
                 anyhow::ensure!(std::fs::read(clients[1].mnt.join("d1/c-after"))? == b"c");
                 Ok(())
@@ -1404,6 +1444,8 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
     })();
     dump_logs_on_failure(scenario, &clients, &result);
     unmount_all(&mut clients);
+    drop(fake);
+    let _ = std::fs::remove_file(&socket);
     result
 }
 
@@ -1725,10 +1767,10 @@ pub fn sticky_release_on_unmount(_seed: u64) -> Result<()> {
     sticky_leaves("sticky-release-on-unmount", Leave::Unmount)
 }
 
-/// Plan 46 M1.3 step 7: a sticky holder released by a suspension
-/// (`sticky-suspend-inhibitor`: the lifecycle event the logind inhibitor
-/// handler delivers; the fake logind of the platform crate is not wired to
-/// a node, so the harness sends the event itself).
+/// Plan 46 M1.3 steps 6 and 7: a sticky holder released by a suspension
+/// (`sticky-suspend-inhibitor`: the fake logind of the platform crate sends
+/// `PrepareForSleep` to a node that talks to it, as a host's logind does,
+/// and the node's delay inhibitor is held until it has released the grants).
 pub fn sticky_suspend_inhibitor(_seed: u64) -> Result<()> {
     sticky_leaves("sticky-suspend-inhibitor", Leave::Suspend)
 }

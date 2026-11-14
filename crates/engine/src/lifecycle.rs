@@ -228,9 +228,15 @@ impl Lifecycle {
 
     /// Apply every event `source` delivers from now on, on a thread of its
     /// own, until `stop` (the engine's shutdown) or the source is gone.
-    pub(crate) fn spawn(self: &Arc<Self>, source: &dyn LifecycleSource, stop: Arc<AtomicBool>) {
+    pub(crate) fn spawn(
+        self: &Arc<Self>,
+        source: &Arc<dyn LifecycleSource>,
+        stop: Arc<AtomicBool>,
+    ) {
         let subscription = source.subscribe();
         let this = self.clone();
+        // (Weak: the thread ends when the source is gone, see the test.)
+        let source = Arc::downgrade(source);
         let spawned = std::thread::Builder::new()
             .name("engine-lifecycle".into())
             .spawn(move || loop {
@@ -238,7 +244,12 @@ impl Lifecycle {
                     return;
                 }
                 match subscription.recv_timeout(Duration::from_millis(500)) {
-                    Ok(event) => this.apply(event),
+                    Ok(event) => {
+                        this.apply(event);
+                        if let Some(source) = source.upgrade() {
+                            source.applied(&event);
+                        }
+                    }
                     Err(RecvTimeoutError::Timeout) => continue,
                     // The source is gone: nothing will ever arrive, and
                     // `recv_timeout` no longer waits (looping on it would
@@ -742,7 +753,8 @@ mod tests {
         let n = node(EngineProfile::default());
         let lifecycle = n.engine.lifecycle().clone();
         let before = Arc::strong_count(&lifecycle);
-        let source = constellation_platform::ManualLifecycle::new();
+        let source: Arc<dyn LifecycleSource> =
+            Arc::new(constellation_platform::ManualLifecycle::new());
         lifecycle.spawn(&source, Arc::new(AtomicBool::new(false)));
         assert_eq!(Arc::strong_count(&lifecycle), before + 1);
         drop(source);
