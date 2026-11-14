@@ -69949,3 +69949,15 @@ knew before the loop (seed 558, `lk1` routed to a locally ended generation).
 Step 7, ADR-54: `cc37a713..0976f7a9`. Step 9, ADR-55: `f7f41822`, `dfa4664e..77b3a43a` (25 commits). Step 8, ADR-56:
 `874c922d..51881848`, including the new generation opened by each handover (`0e3e414e`). Their entries are above. Open: step 9's
 sim control S2 fails no seed, so step 9 is not closed; step 8's C6 (placed grants by handover) is deferred.
+
+### M1.3 steps 12 and 6: claim = release, the release triggers (2026-11-14)
+
+[ADR-60](../../explanation/DECISIONS.md#adr-60-a-claim-of-the-lease-by-a-non-stealable-holder-is-its-release-and-ends-its-stream-after-the-streams-rows).
+Step 12: a non-stealable holder's claim journals `StreamReleased` as its stream's next row and the end cuts at it; the end
+waits (at most `drop_held_await`) for a pending drop or a held-back row of the stream; the sim no longer excuses an end by
+the holder's claim, and fails a claim whose takeover gate replayed the stream's rows by rid. The read-recall half was already
+covered (the holder's read grants are in the table the root path recalls from). Step 6: the idle release is the core's
+(`sticky_idle_release_ms`, 60 s, ADR-56's idle test, the root's own streams too), `constellation release` and
+`sticky.release`, and the node's logind delay inhibitor held until the suspension sequence is done. Step 16 (self-fence)
+stays in stage 2. No change to replicix-core.
+

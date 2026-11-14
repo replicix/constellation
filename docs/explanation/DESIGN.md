@@ -1156,6 +1156,11 @@ lease and one log
   holder's release row. The root never ends a sticky grant itself; the writer is
   forwarded (final, at the round trip) meanwhile
   ([ADR-56](DECISIONS.md#adr-56-a-sticky-grant-changes-hands-only-by-its-holders-release-asked-for-a-dominant-writer)).
+  A holder also releases a subtree its own ops have not touched for the idle
+  release time (60 s), on `constellation release`, at an unmount and before a
+  suspension; its claim of the lease is its release, and ends its stream after
+  the stream's rows
+  ([ADR-60](DECISIONS.md#adr-60-a-claim-of-the-lease-by-a-non-stealable-holder-is-its-release-and-ends-its-stream-after-the-streams-rows)).
 - **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
   clock stamps (a peer's stamp more than `CONSTELLATION_HLC_SKEW_TOLERANCE_S`
   ahead is applied but not followed by the clock) merged by `max` and

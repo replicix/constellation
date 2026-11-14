@@ -21877,7 +21877,9 @@ fn a_release_before_the_drain_fails_the_run() {
         holder_releases_before_drain: true,
         ..sticky_idle_release_config()
     };
-    for seed in [6u64, 7, 9] {
+    // (Seeds re-pinned when the idle release moved into the core, which
+    // changed when the holders release: the oracle is the same.)
+    for seed in [2u64, 3, 8] {
         let e = run_seed(seed, config.clone())
             .expect_err("a holder released before its drain and no oracle noticed");
         assert!(

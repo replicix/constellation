@@ -1352,6 +1352,9 @@ pub(crate) struct DelegationState {
     /// Plan 46 M1.3 step 6: when the idle release next looks (the earliest
     /// time a held sticky subtree can have been idle long enough).
     pub(crate) idle_due: Option<WaitMs>,
+    /// The earliest the idle release looks again (a second after a look that
+    /// found nothing to wait for), unless the streams held changed.
+    pub(crate) idle_scan_at: Option<WaitMs>,
     /// The number of streams held when `idle_due` was worked out (a stream
     /// installed since is looked at at once).
     pub(crate) idle_seen: usize,
@@ -14509,10 +14512,11 @@ impl Core {
         let idle = self.cfg.sticky_idle_release_ms;
         if idle == 0 || self.dl.mine.is_empty() {
             self.dl.idle_due = None;
+            self.dl.idle_scan_at = None;
             return;
         }
         if self.dl.idle_seen == self.dl.mine.len()
-            && self.dl.idle_due.is_some_and(|due| now.wait < due)
+            && self.dl.idle_scan_at.is_some_and(|at| now.wait < at)
         {
             return;
         }
@@ -14560,6 +14564,7 @@ impl Core {
             }
         }
         self.dl.idle_due = due;
+        self.dl.idle_scan_at = Some(due.unwrap_or(now.wait.plus(1_000)));
         if !parts.is_empty() {
             let n: u64 = parts.values().map(|p| p.len() as u64).sum();
             self.stats.deleg_sticky_released_idle += n;

@@ -911,6 +911,49 @@ renewal that the usable root marks as for good (an abandon, a recall, the
 end of the stream) stops a sticky stream like any other; one that only
 says the root cannot grant now (it is not usable) does not.
 
+What starts a release (plan 46 M1.3 step 6; every one is the holder's own
+command, with the drain and the row above):
+
+- an operator's `constellation release [FS] [--dirs PATH ...] [--wait]`
+  (control method `sticky.release`). Without a file system it acts on every
+  registered file system that has a running node here; `NAME:/path` or
+  `--dirs` name subtrees (default: all). With `--wait` it returns once the
+  root's acknowledgement covers the release row, and exits non-zero when that
+  does not happen within the core's bound (`leave_wait`); the message says
+  why, for example "drop pending": a drop the holder decided holds every
+  release of its stream until its record is in the log (ADR-59 part B), and
+  the command can be run again. The NetworkManager dispatcher script
+  (`packaging/networkmanager/50-constellation-release`) calls it before a
+  planned network change;
+- a clean unmount;
+- a suspension or a shutdown: the node takes a delay inhibitor from
+  systemd-logind and holds it until its suspension sequence has released the
+  grants (within logind's `InhibitDelayMaxSec`; `packaging/systemd` raises
+  it). Without a system bus (a container, a host without systemd) nothing is
+  taken. `CONSTELLATION_LOGIND=0` leaves logind alone;
+- idleness: a subtree whose holder's own ops have not touched it for
+  `CONSTELLATION_STICKY_IDLE_RELEASE_MS` (60 s; `0` disables) is released.
+  The test is the handover's (ADR-56 H-I5): no parked own op and none the fast
+  path admitted, with the time counted from the last own op; an op forwarded
+  from another node is no activity of the holder's. It covers the root's own
+  streams too ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant),
+  "until they go idle"); the quarantine of
+  [ADR-54](../../explanation/DECISIONS.md#adr-54-placement-grants-a-far-dominant-writer-a-sticky-subtree-and-recalls-placed-grants-only-after-a-long-dwell)
+  then keeps the placement from granting it back at once;
+- a handover (ADR-56), the root's own dwell and cross-subtree ops
+  (ADR-55), and a leave.
+
+A holder that claims the root lease releases its non-stealable stream by
+the claim itself ([ADR-60](../../explanation/DECISIONS.md#adr-60-a-claim-of-the-lease-by-a-non-stealable-holder-is-its-release-and-ends-its-stream-after-the-streams-rows)):
+`StreamReleased` is journaled as the stream's next row, and the end the root
+journals (`DelegateNodeEnded`) cuts at it. The end waits, for at most
+`drop_held_await`, while the stream holds a drop whose record the log lacks or
+one of its rows is held back from shipping (a chunk it names is lost or
+pending). Counters: `claim_released`, `claim_release_rowless`,
+`claim_end_waits`, `claim_end_unordered` (the wait ran out), and
+`claim_own_rows_halted_non_stealable` (the takeover gate replayed the
+stream's own rows by rid; the sim fails it).
+
 A designee answers its rows at once, and its commits reach the OS, not
 the disk, so a power loss can drop the end of its journal. Nothing ends
 the designation then (it renews nothing and the root never reclaims it):
@@ -1266,6 +1309,7 @@ dies: no acknowledged write is lost) and the causal-cut oracle.
 | `CONSTELLATION_DELEGATION_ROOT_STICKY` | on | the root itself is granted a sticky subtree it dominates while its own ops commit by the archive ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)); off: its own ops wait for the archive. Needs sticky placement |
 | `CONSTELLATION_STICKY_HANDOVER_TENURE_MS` | `30000` | a sticky grant is handed to a dominant writer only after it has been with its holder this long |
 | `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` | `5000` | a holder asked to hand a subtree over releases it at once when none of its own ops is in flight there, else once they have been idle this long (`0`: only when nothing is in flight) |
+| `CONSTELLATION_STICKY_IDLE_RELEASE_MS` | `60000` | a holder releases a sticky subtree its own ops have not touched for this long (`0`: never; the root's own streams too) |
 | `CONSTELLATION_DELEGATION_FAR_RTT_MS` | `20` | a link is far when every round trip of the far dwell is at least this |
 | `CONSTELLATION_DELEGATION_FAR_DWELL_MS` | `30000` | how long a link must measure far |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | cool-down after a recall |

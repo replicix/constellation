@@ -5378,3 +5378,73 @@ stream holder's drop by `far-placement+lost-chunk` 326
 See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
 `crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),
 [write-path hygiene](../reference/features/write-path-hygiene.md).
+
+## ADR-60: A claim of the lease by a non-stealable holder is its release, and ends its stream after the stream's rows
+
+**Status**: built as plan 46 M1.3 steps 12 and 6 (the spec: the 2026-11-13
+remaining-steps spec, §1 and §4). The claim = release rule is the maintainer's
+decision of 2026-11-06 (plan 46 M1.0 C11); this record fixes how it is
+carried out in the log and adds what the idle release and the suspension
+inhibitor do with ADR-55 Q5 and plan 46 §5.4.
+
+**Context**: a sticky or designated holder that claims the root lease ends its
+own generation at what it assigned, but wrote no row of its own: the log showed
+a non-stealable stream ended with no release, and the sim excused it as "the
+holder's own claim". The end (`DelegateNodeEnded`) is a keyless root row, so
+when a row of the stream is held back from shipping (a chunk it names is lost
+or pending) or the stream holds a decided drop whose record the log lacks
+([ADR-59](#adr-59-a-directorys-merged-attributes-order-nothing-part-a), D1: a
+generation that ends without the record cancels the drop), the end could ship
+ahead of rows it covers.
+
+**Decision**:
+
+- The claim journals `StreamReleased { node, gen, through }` as the stream's
+  next row (`Core::claim_releases`), through the same rule as every row of the
+  stream; the end the root journals cuts at that row. The claim ends the
+  stream; it does not convert it into a root-own stream and keep the grant
+  (that would reverse C11 and ADR-55's restart rule: the root gets the subtree
+  again by ADR-55 placement if it still dominates it).
+- No row is journaled when the takeover gate replayed the stream's own rows by
+  rid (the row would precede root rows the log lacks; counted in
+  `claim_own_rows_halted_non_stealable`, which the sim fails), when the stream
+  is not installed, when a release row is in the journal already, or when the
+  stream cannot release by a row (counted in `claim_release_rowless`).
+- The end waits (`Core::claim_end`, re-checked on every event and on the
+  holder's release timer) while the stream holds a pending drop or one of its
+  rows is held back from shipping (`journal_held_back`), at most
+  `drop_held_await`. When the bound runs out the end proceeds as before and
+  `claim_end_unordered` counts it: a lost chunk's row that nothing resolves is
+  an operator's `repair drop-held`, not a reason to keep the subtree blocked.
+- The sim no longer excuses an end by the holder's claim
+  (`sticky_ends_only_by_holder_or_operator`); the knob `claim_ends_silently` is
+  the old behaviour as a negative control.
+- **The idle release** lives in the core (`Core::idle_release_progress`), not
+  an engine module: the engine has no idle state the core lacks. A held sticky
+  subtree whose holder's own ops have not touched it for
+  `CONSTELLATION_STICKY_IDLE_RELEASE_MS` (60 s, `0` disables) is released by the
+  holder's own command, with step 5's drain and row; the idle test is ADR-56's
+  H-I5 (no parked own op, none the fast path admitted, the time counted from the
+  last own op). It covers the root's own streams (ADR-55 Q5, "until they go
+  idle"). The oracle is unchanged: the release is the holder's.
+- **The suspension inhibitor**: the Linux node takes a logind delay inhibitor
+  when a system bus answers and holds it until every lifecycle subscriber
+  reports the `Suspending` it was given applied (`LifecycleSource::applied`),
+  within the delay logind allows.
+- `constellation release [FS] [--dirs ..] [--wait]` (`sticky.release`) is the
+  operator's form; `--wait` returns once the root's acknowledgement covers the
+  row, and fails with the reason ("drop pending" among them) at the core's
+  bound.
+
+**Rejected**: converting a claimant's far sticky stream into a root-own stream
+and keeping the grant; an engine `sticky.rs` with its own idle tracker (a second
+idle rule, a second drain); folding an abandon into the leave of a dead sticky
+holder (step 14: the refusal names `repair abandon`).
+
+**May revert**: the wait bound can shrink to zero (the end then proceeds at
+once, as before), and the idle release is off with `CONSTELLATION_STICKY_IDLE_RELEASE_MS=0`.
+
+See: `crates/authority/src/core/delegate.rs` (`claim_releases`, `claim_end`,
+`idle_release_progress`), `crates/platform/src/linux_logind.rs`,
+`crates/cli/src/main.rs` (`release_command`),
+[delegations](../reference/features/delegations.md).
