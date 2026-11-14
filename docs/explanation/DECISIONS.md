@@ -5610,6 +5610,12 @@ from each row's own configuration: a deviation, sound while the operator
 forces only after confirming those nodes down. The session checks (`read_your_writes`, `monotonic_reads`) exempt the
 same rids and no others.
 
+**Open**: a root's own leave (`ReleaseGrants` on the root) never completes in the
+sim configuration `sticky-leave-root-self`: with its own sticky stream (ADR-55)
+the stream's `release_acked` stays false, so the leave waits to its deadline and
+abandons itself (safely: nothing is retired). Not built; the configuration is in
+no suite test or sweep list.
+
 **Rejected**: an admin leave that abandons the dead holder itself (the
 abandon's word that the node is down is the operator's); answering the
 holder's own leave at its release row's acknowledgement.
