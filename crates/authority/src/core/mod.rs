@@ -1493,6 +1493,9 @@ pub struct Stats {
     /// never takes back": counted whole, or as a request for some of its
     /// subtrees).
     pub deleg_sticky_recalled_epoch: u64,
+    /// Plan 46 M1.3 step 14: recalls of a sticky stream the root started on a
+    /// leaving node's own note (`RecallCause::LeaveNote`).
+    pub deleg_leave_note_recalls: u64,
     pub deleg_sticky_recalled_other: u64,
     /// Plan 46 M1.3 step 5, the holder's release (`Control::StickyRelease`):
     /// releases journaled (`_partial`: of some of the stream's subtrees

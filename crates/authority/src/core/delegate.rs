@@ -93,6 +93,13 @@ pub enum RecallCause {
     /// holds (`Control::EndGrantsOf`): an operator's action, of the same
     /// standing as `undelegate`.
     Leave,
+    /// Plan 46 M1.3 step 14: the root recalls what it granted a node whose
+    /// own leave note it has (a grant it journaled before the note, which the
+    /// node may not have seen). Not an operator's act, and not another cause:
+    /// the node's own leave is the holder's release; counted apart
+    /// (`deleg_leave_note_recalls`) because a delayed note of a leave that was
+    /// aborted also reaches it.
+    LeaveNote,
     /// Placement, a cross-subtree op, a designation, a stalled partial
     /// release: causes that never apply to a non-stealable grant.
     Other,
@@ -1133,10 +1140,12 @@ pub(super) enum ClaimWait {
 /// the root then journals `DelegateNodeEnded`: [`Core::on_control_release_grants`]);
 /// for a node that is gone, the root recalls them and ends them at the TTL
 /// ([`Core::on_control_end_grants_of`]). A holder's own leave is answered when
-/// every stream it held is stopped and the root's acknowledgement covers its
-/// release row (its own table is no witness: its journal applies the release
-/// at once); the root's, when no stream of the node is live in its table and
-/// its generations; either at the deadline with an error.
+/// every stream it held is stopped, the root's acknowledgement covers its
+/// release row and the log has ended the stream (its table keeps a released
+/// stream, with no subtree, until the root's `DelegateNodeEnded`); the root's,
+/// when no stream of the node is live in its table and its generations; either
+/// at the deadline with an error (an admin leave that runs out of time on a
+/// sticky stream names the abandon).
 #[derive(Debug)]
 pub(crate) struct LeaveWait {
     pub op: OpId,
@@ -9901,6 +9910,7 @@ impl Core {
         if g.kind() == DelegKind::Sticky {
             match cause {
                 RecallCause::Undelegate | RecallCause::Leave => {}
+                RecallCause::LeaveNote => self.stats.deleg_leave_note_recalls += 1,
                 RecallCause::Epoch => self.stats.deleg_sticky_recalled_epoch += 1,
                 RecallCause::Other => self.stats.deleg_sticky_recalled_other += 1,
             }
@@ -14737,12 +14747,16 @@ impl Core {
         self.sticky_release_arm(now, out);
     }
 
-    /// The refusal of an admin leave that would leave a non-stealable grant
-    /// live off the roster.
+    /// The refusal of an admin leave that would retire a node while the log
+    /// lists a non-stealable grant of it: the operator's way out is the
+    /// abandon, on the root; without `--force` that refuses only while the
+    /// root heard from the node or a member lately.
     fn leave_abandon_first(node: NodeId, dirs: &[Ino]) -> String {
         let dirs: Vec<String> = dirs.iter().map(|d| d.to_string()).collect();
         format!(
-            "node {node} holds a sticky grant on {}; run repair abandon --node {node} first",
+            "node {node} holds a sticky grant on {}; run repair abandon --node {node} first \
+             (add --force, the operator's word that node {node} is down, if it refuses because \
+             node {node} was heard from lately)",
             dirs.join(", ")
         )
     }
@@ -14766,7 +14780,7 @@ impl Core {
     /// may be alive is recalled and releases; one that is gone is the
     /// operator's to abandon. `None`: none such.
     fn gone_non_stealable_dirs_of(&self, now: Now, node: NodeId) -> Option<Vec<Ino>> {
-        let window = self.dl_t().abandon_heard_window as i64;
+        let window = i64::try_from(self.dl_t().abandon_heard_window).unwrap_or(i64::MAX);
         let mut dirs: Vec<Ino> = Vec::new();
         for g in self.dl.gens.values() {
             if g.node != node || g.ended || !g.non_stealable() {
@@ -14850,11 +14864,18 @@ impl Core {
                     .is_some_and(|l| l.holder == node)
             {
                 let held = self.non_stealable_table_dirs_of(node, replica);
+                let released = self.lease.last_seen.as_ref().is_some_and(|l| l.released);
                 let result = if held.is_empty() {
                     Err(format!(
                         "node {node} is the root as this node read the lease, and no node has taken \
-                         over yet: run the leave on the root once one has (this node's table cannot \
-                         tell that node {node} holds no grant)"
+                         over yet{}: run the leave on the root once one has (this node's table \
+                         cannot tell that node {node} holds no grant)",
+                        if released {
+                            " (the lease is released: a write on any node takes it, and that node \
+                             is the root)"
+                        } else {
+                            ""
+                        }
                     ))
                 } else {
                     Err(Self::leave_abandon_first(node, &held))
@@ -15056,7 +15077,7 @@ impl Core {
                         .collect();
                     held_back = !live.is_empty();
                     for gen in live {
-                        self.start_recall_for(now, gen, RecallCause::Leave, out);
+                        self.start_recall_for(now, gen, RecallCause::LeaveNote, out);
                     }
                 }
             } else {

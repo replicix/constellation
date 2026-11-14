@@ -5550,6 +5550,10 @@ alone while a holder it does not count writes. The model's property is
   live grant (`sticky-leave` with the idle release on, an operator's regrant
   racing the leave, seeds 209 and 292 of the first run); the node sends the note
   again until it is acknowledged.
+- The recall on a leave note has its own cause, `RecallCause::LeaveNote`, and
+  counter (`deleg_leave_note_recalls`): a delayed note of a leave that was
+  aborted reaches the root too and recalls what the node installed; it is
+  neither an operator's act nor another cause.
 - **An admin leave** (`Control::EndGrantsOf`) of a node holding a non-stealable
   grant it has not been heard on within `abandon_heard_window` is refused at
   once: `node N holds a sticky grant on <dirs>; run repair abandon --node N
@@ -5564,7 +5568,8 @@ alone while a holder it does not count writes. The model's property is
   a dead root's stay live in the log, and a follower's table can be behind it
   (a paused follower answered "holds no delegation of its own" and retired a
   root that held one). The follower refuses (naming the abandon when its table
-  lists a sticky stream of the root, else saying no node has taken over); the
+  lists a sticky stream of the root, else saying no node has taken over, and
+  that a released lease is taken by a write on any node); the
   operator runs the leave on the root that takes over, whose generations are
   the log's, and again if it is refused. The sim's `sticky-leave-root`
   asks any node when none holds the lease.
@@ -5582,9 +5587,11 @@ alone while a holder it does not count writes. The model's property is
   the root. That is the intended behaviour: load may cost a leave its
   latency, never integrity. The operator runs the leave again.
 - **The sim** drives leaves (`FaultKind::LeaveNode`; configurations
-  `sticky-leave`, `sticky-leave-admin`, `sticky-leave-root`) and judges
+  `sticky-leave`, `sticky-leave-admin`, `sticky-leave-root`,
+  `sticky-leave-root-self`: a root's own leave while it holds its own sticky
+  stream) and judges
   `no_live_grant_off_roster` at each retirement against the root's generations
-  and at the end of the run against the log; the knob `leave_keeps_grants`
+  and at the end of the run against the generations the root lists (as the singleton test counts them, empty streams included); the knob `leave_keeps_grants`
   (`AUTHORITY_SIM_LEAVE_KEEPS_GRANTS=1`) retires without ending grants and must
   fail it. The harness scenario is `sticky-leave`.
 
@@ -5598,7 +5605,9 @@ abandon found every node of the group (the delegate, or a delegate whose
 generation is stopped, and each strict member the root listed) gone. The
 delegations reference says it: "every row the delegate answered through the
 group and the root never appended is lost" and "rows only that group held are
-lost". The session checks (`read_your_writes`, `monotonic_reads`) exempt the
+lost". The group is read at the abandon, from the root's current listing, not
+from each row's own configuration: a deviation, sound while the operator
+forces only after confirming those nodes down. The session checks (`read_your_writes`, `monotonic_reads`) exempt the
 same rids and no others.
 
 **Rejected**: an admin leave that abandons the dead holder itself (the

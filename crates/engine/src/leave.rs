@@ -13,19 +13,40 @@ use object_store::ObjectStore;
 use std::fmt;
 use std::sync::Arc;
 
+/// The kind of a live grant that refuses a leave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantKind {
+    /// An offline designation (`designate`): `online` releases it.
+    Designation,
+}
+
+impl GrantKind {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Designation => "an offline designation",
+        }
+    }
+
+    fn way_out(self) -> &'static str {
+        match self {
+            Self::Designation => "run `online` first (or pass --force)",
+        }
+    }
+}
+
 /// Guard failures shared by self-leave and admin leave. Mapped to
 /// control-API error strings by the daemon.
 #[derive(Debug)]
 pub enum LeaveError {
     OpenEpoch,
     /// A grant of a non-stealable kind the node holds, which only its own
-    /// release (or `online` for a designation) ends. `kind` names the kind.
-    /// The core's own refusal of a sticky grant (the root's table is the
-    /// witness: `Core::on_control_end_grants_of`) reaches the operator as
+    /// release (or `online` for a designation) ends. The core's own refusal
+    /// of a sticky grant (the root's table is the witness:
+    /// `Core::on_control_end_grants_of`) reaches the operator as
     /// [`Self::Other`], unparsed.
     LiveGrant {
         node_id: u64,
-        kind: &'static str,
+        kind: GrantKind,
         dirs: Vec<String>,
     },
     StrandedJournal,
@@ -50,8 +71,10 @@ impl fmt::Display for LeaveError {
                 dirs,
             } => write!(
                 f,
-                "node {node_id} still holds a {kind} for {}; run `online` first (or pass --force)",
-                dirs.join(", ")
+                "node {node_id} still holds {} for {}; {}",
+                kind.noun(),
+                dirs.join(", "),
+                kind.way_out()
             ),
             Self::StrandedJournal => write!(
                 f,
@@ -75,7 +98,7 @@ impl LeaveError {
     fn designation(node_id: u64, path: String) -> Self {
         Self::LiveGrant {
             node_id,
-            kind: "offline designation",
+            kind: GrantKind::Designation,
             dirs: vec![path],
         }
     }

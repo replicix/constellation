@@ -69993,8 +69993,8 @@ release); they were not masked and are to be classified on main.
 ### M1.3 step 14: Leave ends grants first (2026-11-14)
 
 [ADR-61](../../explanation/DECISIONS.md#adr-61-a-node-leaves-the-roster-only-after-the-log-has-ended-every-grant-it-holds).
-An admin leave of a sticky holder the root has not heard from is refused at once naming `repair abandon --node N`; the retirement
-of a dead root refuses while the table lists a sticky stream of it (the stale "a root holds no delegation" answer); a root's
+An admin leave of a sticky holder the root has not heard from is refused at once naming `repair abandon --node N`; a node that is not the
+root never retires a dead root (the stale "a root holds no delegation" answer is gone); a root's
 recall for a leave is `RecallCause::Leave`, an allowed cause of `sticky_ends_only_by_holder_or_operator`; `LeaveError::LiveGrant`
 replaces `LiveDesignation`. The sim drives leaves (`FaultKind::LeaveNode`, configurations `sticky-leave`, `sticky-leave-admin`,
 `sticky-leave-root`) and judges `no_live_grant_off_roster` at each retirement and at the end; knob `leave_keeps_grants` fails
@@ -70003,7 +70003,6 @@ fail-before tests: the holder was answered at the root's acknowledgement of its 
 until its `DelegateNodeEnded` (`sticky-leave` seed 71); and a grant the root journaled before it had the leave note reached the
 node's table after the node was answered (idle release on, seeds 209, 292): the root now acknowledges the note only when it lists
 no live generation of the node and recalls the ones it lists. A self-leave under a pending drop can abort at its deadline: the
-intended behaviour (latency, not integrity). A non-root never retires a dead root from its own table (it can be behind the log): it refuses until a root has taken over.
-The leave driver dates its abandons; the sim's never-completed-rid allowance is tightened to `Final` rows past the cut of an
+intended behaviour (latency, not integrity). The leave driver dates its abandons; the root's leave note recall has its own cause (`LeaveNote`); `sticky-leave-root-self` covers a root's own leave; the sim's never-completed-rid allowance is tightened to `Final` rows past the cut of an
 abandoned generation (`Group` rows too, once the operator found the whole group gone), with the session checks exempting the
 same rids. No change to replicix-core.

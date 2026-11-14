@@ -328,6 +328,7 @@ fn replay_seed() {
         Ok("sticky-leave") => sticky_leave_config(),
         Ok("sticky-leave-admin") => sticky_leave_admin_config(),
         Ok("sticky-leave-root") => sticky_leave_root_config(),
+        Ok("sticky-leave-root-self") => sticky_leave_root_self_config(),
         Ok("sticky-stale-route") => sticky_stale_route_config(),
         Ok("sticky-root-designee-inbox") => sticky_root_designee_inbox_config(),
         Ok("sticky-root-designee-inbox-skew") => sticky_root_designee_inbox_skew_config(),
@@ -2402,6 +2403,26 @@ fn sticky_leave_root_config() -> SimConfig {
         // (A lease is taken on demand: late clients have a survivor take it.)
         client_plan: vec![(2, 6_000, 12), (3, 6_000, 12)],
         leave_asks_any: true,
+        ..far_root_writes_config()
+    }
+}
+
+/// The root's own leave while it holds its own sticky stream (ADR-55,
+/// `far-root-writes`): node 1 runs `ReleaseGrants` at 4 s (its own stream is
+/// released inline and ended by the log), flushes and is retired. The
+/// retirement is judged against the generations the root and the survivors list
+/// for node 1.
+fn sticky_leave_root_self_config() -> SimConfig {
+    SimConfig {
+        faults: vec![ScheduledFault {
+            at_ms: 4_000,
+            kind: FaultKind::LeaveNode {
+                node: 1,
+                admin: false,
+                within_ms: 60_000,
+            },
+        }],
+        client_plan: vec![(2, 8_000, 12), (3, 8_000, 12)],
         ..far_root_writes_config()
     }
 }
@@ -7682,6 +7703,7 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-leave" => sticky_leave_config(),
         "sticky-leave-admin" => sticky_leave_admin_config(),
         "sticky-leave-root" => sticky_leave_root_config(),
+        "sticky-leave-root-self" => sticky_leave_root_self_config(),
         "sticky-stale-route" => sticky_stale_route_config(),
         "sticky-root-designee-inbox" => sticky_root_designee_inbox_config(),
         "sticky-root-designee-inbox-skew" => sticky_root_designee_inbox_skew_config(),
@@ -10006,7 +10028,7 @@ struct OracleTotals {
     quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
     /// Plan 46 M1.3 step 14 (`Report::leave_driver`).
-    leave_driver: [u64; 4],
+    leave_driver: sim::run::LeaveDriver,
     /// ADR-56: the core's handover counters and the handovers the oracle
     /// judged (`Report::handover_core`), and the shortest gap between a grant
     /// and the handover grant after it (0: none).
@@ -10421,9 +10443,10 @@ impl OracleTotals {
         for (t, c) in self.sticky_driver.iter_mut().zip(r.sticky_driver) {
             *t += c;
         }
-        for (t, c) in self.leave_driver.iter_mut().zip(r.leave_driver) {
-            *t += c;
-        }
+        self.leave_driver.refused += r.leave_driver.refused;
+        self.leave_driver.abandons += r.leave_driver.abandons;
+        self.leave_driver.own += r.leave_driver.own;
+        self.leave_driver.admin += r.leave_driver.admin;
         for (t, c) in self.handover_core.iter_mut().zip(r.handover_core) {
             *t += c;
         }
@@ -10623,7 +10646,7 @@ impl OracleTotals {
         );
         eprintln!(
             "SWEEP-LEAVE-TOTALS {label} seeds {}/{seeds}: leaves refused at once naming the abandon {}, abandons run for a leave {}, retired by their own leave {}, retired by the admin form {}",
-            self.seeds, self.leave_driver[0], self.leave_driver[1], self.leave_driver[2], self.leave_driver[3]
+            self.seeds, self.leave_driver.refused, self.leave_driver.abandons, self.leave_driver.own, self.leave_driver.admin
         );
         eprintln!(
             "SWEEP-CLAIM-RELEASE-TOTALS {label} seeds {}/{seeds}: claims that journaled the stream's release {}, with no row to journal {}, ends that waited for the stream's rows {}, ended ahead of held rows when the wait ran out {}",
@@ -22131,16 +22154,17 @@ fn a_node_that_leaves_ends_its_grants_first() {
         ("sticky-leave", sticky_leave_config()),
         ("sticky-leave-admin", sticky_leave_admin_config()),
         ("sticky-leave-root", sticky_leave_root_config()),
+        ("sticky-leave-root-self", sticky_leave_root_self_config()),
     ] {
         for seed in 0..12 {
             let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
                 panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
             });
             assert_eq!(r.sticky_ended_unexcused, 0, "{label} seed {seed}");
-            refused += r.leave_driver[0];
-            abandons += r.leave_driver[1];
-            own += r.leave_driver[2];
-            admin += r.leave_driver[3];
+            refused += r.leave_driver.refused;
+            abandons += r.leave_driver.abandons;
+            own += r.leave_driver.own;
+            admin += r.leave_driver.admin;
         }
     }
     assert!(own > 0, "no node left by itself");
@@ -22174,6 +22198,7 @@ fn a_leave_that_keeps_the_grants_fails_the_run() {
         ("sticky-leave", sticky_leave_config()),
         ("sticky-leave-admin", sticky_leave_admin_config()),
         ("sticky-leave-root", sticky_leave_root_config()),
+        ("sticky-leave-root-self", sticky_leave_root_self_config()),
     ] {
         let config = SimConfig {
             leave_keeps_grants: true,

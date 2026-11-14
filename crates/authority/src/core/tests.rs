@@ -72303,6 +72303,31 @@ mod step9_one_stream_per_node {
         assert!(matches!(control_answer(&out, 2), Some(Err(_))), "{out:?}");
     }
 
+    /// The lease is released and still names the dead root: no node holds it
+    /// until a write takes it, so a follower cannot retire the root, and it
+    /// says why and what takes the lease.
+    #[test]
+    fn a_follower_retiring_a_root_whose_lease_is_released_says_so() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let mut lease = Lease::granted("p0", 1, 1, 5_000);
+        lease.released = true;
+        h.core.lease.note_object(&lease);
+        let out = h.step(Event::Control {
+            op: OpId(1),
+            req: Control::EndGrantsOf { node: 1 },
+        });
+        let refused = match control_answer(&out, 1) {
+            Some(Err(e)) => e,
+            other => panic!("not refused: {other:?}"),
+        };
+        assert!(
+            refused.contains("taken over") && refused.contains("lease is released"),
+            "{refused}"
+        );
+    }
+
     /// Re-review MUST-1: the root that loses its lease while an operator's
     /// leave waits on the grants of a node fails that wait ("run it again on
     /// the root"). Its table lags and its generations are gone, so the done
@@ -72434,7 +72459,15 @@ mod step9_one_stream_per_node {
             "the live generation was not recalled: {out:?}"
         );
         // Nothing is granted to the node meanwhile, and the note is refused
-        // again while the generation lives.
+        // again while the generation lives. The recall is the note's own
+        // cause, counted apart: a delayed note of an aborted leave also gets
+        // here.
+        assert_eq!(
+            r.core.dl.gens[&gen].recall_cause,
+            Some(crate::core::delegate::RecallCause::LeaveNote)
+        );
+        assert_eq!(r.core.stats.deleg_leave_note_recalls, 1);
+        assert_eq!(r.core.stats.deleg_sticky_recalled_other, 0);
         assert!(r.core.is_leaving(r.clk(), 3));
         let out = r.step(leave_note_from(3, 100, true));
         assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
@@ -73714,6 +73747,83 @@ mod step4_sticky {
             other => panic!("the retirement went on: {other:?}"),
         };
         assert!(refused.contains("repair abandon --node 1"), "{refused}");
+    }
+
+    /// The heard window's edge: a sticky holder the root heard from `window - 1`
+    /// ms ago is recalled as a live one; at `window` it is gone, and the leave
+    /// is refused naming the abandon (the abandon without `--force` refuses
+    /// by the same rule).
+    #[test]
+    fn the_leave_of_a_sticky_holder_is_refused_from_the_heard_window_on() {
+        for (after, refused) in [(0u64, false), (1, true)] {
+            let (mut h, d1, _d2) = root_with_two_dirs();
+            let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+            assert!(ok, "{out:?}");
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegationRecalled { req: OpId(77) },
+            });
+            let window = h.core.dl_t().abandon_heard_window;
+            h.advance(window - 1 + after);
+            let out = end_grants_of(&mut h, 910, 3);
+            match answer_of(&out, 910) {
+                Some(Err(e)) if refused => assert!(e.contains("repair abandon --node 3"), "{e}"),
+                None if !refused => {}
+                other => panic!("after {after}: {other:?} {out:?}"),
+            }
+        }
+    }
+
+    /// A holder heard lately is recalled and then goes silent: the leave
+    /// ends at its deadline, and says what to do (the abandon), not "run the
+    /// leave again".
+    #[test]
+    fn a_leave_that_runs_out_of_time_on_a_sticky_stream_names_the_abandon() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegationRecalled { req: OpId(77) },
+        });
+        let out = end_grants_of(&mut h, 910, 3);
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        h.advance(h.core.leave_wait_ms() as u64 + 1);
+        let out = h.step(Event::Slack { epoch_slack: 0 });
+        let e = match answer_of(&out, 910) {
+            Some(Err(e)) => e,
+            other => panic!("{other:?} {out:?}"),
+        };
+        assert!(e.contains("repair abandon --node 3"), "{e}");
+    }
+
+    /// A designated grant has no expiry either: its gone holder's leave is
+    /// refused naming the abandon.
+    #[test]
+    fn an_admin_leave_of_a_dead_designee_is_refused_naming_abandon() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::SyncDesignations {
+                entries: vec![(d1, 3)],
+            },
+        });
+        let _ = out;
+        let live = h
+            .core
+            .dl
+            .gens
+            .values()
+            .any(|g| g.node == 3 && !g.ended && g.non_stealable());
+        assert!(live, "the designation made no non-stealable generation");
+        h.advance(h.core.dl_t().abandon_heard_window + 1);
+        let out = end_grants_of(&mut h, 910, 3);
+        let e = match answer_of(&out, 910) {
+            Some(Err(e)) => e,
+            other => panic!("{other:?} {out:?}"),
+        };
+        assert!(e.contains("repair abandon --node 3"), "{e}");
     }
 
     /// The holder comes back and its release ends the stream during the

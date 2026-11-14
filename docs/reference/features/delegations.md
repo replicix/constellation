@@ -968,12 +968,17 @@ every grant it holds
   the leave is run again;
 - `leave --node-id N` on the root of a node that is gone: a sticky or
   designated grant has no expiry, so a holder the root has not heard from
-  within `delegation_ttl_ms` is refused at once with `node N holds a sticky
-  grant on <dirs>; run repair abandon --node N first` (the abandon needs
-  `--force`, the operator's word that the node is down), and the leave is run
-  again. A holder heard lately is asked to release, as a live node is;
+  within `abandon_heard_window` (the window of `repair abandon` below) is
+  refused at once with `node N holds a sticky grant on <dirs>; run repair
+  abandon --node N first (add --force, ...)`, and the leave is run again after
+  the abandon. Without `--force` the abandon refuses only while the root heard
+  from the delegate or a member lately; `--force` is the operator's word that
+  the node is down. A holder heard lately is asked to release, as a live node
+  is. A root that took over only just may not have heard from a live holder
+  yet (the abandon rule's own limit: an inherited generation starts unheard);
 - a root that is gone is not retired by a node that is not the root: it
-  refuses until a node has taken over (ADR-55 gives a root its own sticky
+  refuses until a node has taken over (with the lease released it says so: a
+  write on any node takes it; ADR-55 gives a root its own sticky
   streams, and a follower's table can be behind the log), and the leave is run
   on the new root, where the abandon comes first as above.
 

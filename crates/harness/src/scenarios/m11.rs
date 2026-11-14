@@ -1321,7 +1321,7 @@ pub fn sticky_leave(_seed: u64) -> Result<()> {
         }
         wait_installed(&clients[1], "/d1", Duration::from_secs(20))?;
         wait_installed(&clients[2], "/d2", Duration::from_secs(20))?;
-        let (names_b, _) = write_files(&clients[1], "d1", "b", 20)?;
+        write_files(&clients[1], "d1", "b", 20)?;
         let (names_c, _) = write_files(&clients[2], "d2", "c", 20)?;
         // c leaves by itself: its grant is released and ended first.
         let t = Instant::now();
@@ -1363,6 +1363,7 @@ pub fn sticky_leave(_seed: u64) -> Result<()> {
                             Instant::now() < deadline,
                             "never refused naming the abandon: {e}"
                         );
+                        std::thread::sleep(Duration::from_millis(500));
                     }
                 }
             }
@@ -1392,7 +1393,6 @@ pub fn sticky_leave(_seed: u64) -> Result<()> {
             std::fs::write(clients[0].mnt.join("d1/a-after"), b"a")?;
             Ok(())
         })?;
-        let _ = names_b;
         Ok(())
     })();
     dump_logs_on_failure(SCENARIO, &clients, &result);

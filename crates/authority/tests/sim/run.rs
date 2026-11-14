@@ -22,6 +22,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Plan 46 M1.3 step 14, the leave driver's counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeaveDriver {
+    /// Admin leaves refused at once naming the abandon.
+    pub refused: u64,
+    /// Abandons the operator ran for a leave.
+    pub abandons: u64,
+    /// Nodes retired by their own leave.
+    pub own: u64,
+    /// Nodes retired by the admin form.
+    pub admin: u64,
+}
+
 /// A fault the plan schedules at a simulated time.
 #[derive(Debug, Clone)]
 pub enum FaultKind {
@@ -1742,7 +1755,7 @@ pub struct Report {
     /// Plan 46 M1.3 step 14, the leave driver: refused at once naming the
     /// abandon, abandons run for a leave, retired by their own leave,
     /// retired by the admin form.
-    pub leave_driver: [u64; 4],
+    pub leave_driver: LeaveDriver,
     /// ADR-56, the core's counters summed over the nodes: handover requests
     /// sent, grants after a release row, requests dropped unanswered,
     /// candidates held back by the tenure, by eligibility, grants dropped,
@@ -1891,7 +1904,7 @@ pub struct Cluster {
     /// The leave driver's counters: leaves refused at once naming the
     /// abandon, abandons the operator ran for a leave, nodes retired by their
     /// own leave, nodes retired by the admin form.
-    pub leave_driver: Mutex<[u64; 4]>,
+    pub leave_driver: Mutex<LeaveDriver>,
     /// `SimConfig::leave_keeps_grants`.
     pub leave_keeps_grants: bool,
     /// `SimConfig::leave_asks_any`.
@@ -2218,39 +2231,58 @@ impl Cluster {
     }
 
     /// Plan 46 M1.3 step 14 (`no_live_grant_off_roster`), at a roster change:
-    /// `node` is retired. The root has no live generation of it, or the
-    /// roster-only singleton test (ADR-50, `Core::singleton_now`: a generation
-    /// of another node that has not ended) reads its holder as no peer.
-    /// `root` is the witness: the node the lease names when it is alive, else
-    /// the node the operator's leave went to (a follower's view lags the
-    /// root's, and says nothing of what the root has ended).
-    pub fn judge_roster(&self, node: NodeId, root: NodeId) {
-        let live: Vec<_> = self
-            .get(root)
-            .view()
-            .delegation
-            .gens
-            .iter()
-            .filter(|g| g.1 == node && !g.6)
-            .map(|g| (g.2, g.0.clone()))
-            .collect();
-        for (gen, dirs) in live {
-            self.leave_violations.lock().unwrap().push(format!(
-                "no_live_grant_off_roster: node {node} was retired from the roster while \
-                 node {root}'s generation {gen} of it has not ended (subtrees {dirs:?})"
-            ));
+    /// `node` is retired. No generation of it that has not ended may be live
+    /// at the root, or the roster-only singleton test (ADR-50,
+    /// `Core::singleton_now`: a generation of another node that has not
+    /// ended) reads its holder as no peer. The witness is the node the lease
+    /// names when it is alive (a root that has taken over), else `asked`, the
+    /// node the operator's leave went to; the leaving node's own view is read
+    /// too while it is up (a root's own sticky streams, ADR-55, are its own
+    /// generations).
+    pub async fn judge_roster(&self, node: NodeId, asked: NodeId) {
+        let lease_root = read_lease(&self.env.bucket)
+            .await
+            .map(|l| l.holder)
+            .filter(|h| *h != 0 && *h != node && self.ids().contains(h) && self.get(*h).alive());
+        let mut witnesses = vec![lease_root.unwrap_or(asked)];
+        if self.get(node).alive() {
+            witnesses.push(node);
+        }
+        for root in witnesses {
+            let live: Vec<_> = self
+                .get(root)
+                .view()
+                .delegation
+                .gens
+                .iter()
+                .filter(|g| g.1 == node && !g.6)
+                .map(|g| (g.2, g.0.clone()))
+                .collect();
+            for (gen, dirs) in live {
+                self.leave_violations.lock().unwrap().push(format!(
+                    "no_live_grant_off_roster: node {node} was retired from the roster while \
+                     node {root}'s generation {gen} of it has not ended (subtrees {dirs:?})"
+                ));
+            }
         }
     }
 
     /// Retire `node`: judged against `root`'s generations, then gone for good (a
     /// stopped process; its journal is not kept for a restart).
-    pub fn retire(&self, node: NodeId, root: NodeId, admin: bool) {
-        self.judge_roster(node, root);
+    pub async fn retire(&self, node: NodeId, root: NodeId, admin: bool) {
+        self.judge_roster(node, root).await;
         self.retired
             .lock()
             .unwrap()
             .insert(node, self.env.clock.elapsed_ms());
-        self.leave_driver.lock().unwrap()[if admin { 3 } else { 2 }] += 1;
+        {
+            let mut d = self.leave_driver.lock().unwrap();
+            if admin {
+                d.admin += 1;
+            } else {
+                d.own += 1;
+            }
+        }
         if self.get(node).alive() {
             self.crash(node);
         }
@@ -4185,7 +4217,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                     if keeps {
                         // The negative control: retired with its grants held.
                         if let Some(root) = root_of().await {
-                            cluster.retire(node, root, false);
+                            cluster.retire(node, root, false).await;
                         }
                         return;
                     }
@@ -4206,7 +4238,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                                 cluster.env.clock.elapsed_ms()
                             ));
                             if let Some(root) = root_of().await {
-                                cluster.retire(node, root, false);
+                                cluster.retire(node, root, false).await;
                             }
                             return;
                         }
@@ -4250,7 +4282,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                         continue;
                     };
                     if keeps {
-                        cluster.retire(node, target, true);
+                        cluster.retire(node, target, true).await;
                         return;
                     }
                     let h = cluster.get(target);
@@ -4265,11 +4297,11 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                                 "t={} leave --node-id {node} on {target}: {answer:?}",
                                 cluster.env.clock.elapsed_ms()
                             ));
-                            cluster.retire(node, target, true);
+                            cluster.retire(node, target, true).await;
                             return;
                         }
                         Ok(Ok(Err(e))) if e.contains("repair abandon") => {
-                            cluster.leave_driver.lock().unwrap()[0] += 1;
+                            cluster.leave_driver.lock().unwrap().refused += 1;
                             note(format!(
                                 "t={} leave --node-id {node} on {target} refused: {e}",
                                 cluster.env.clock.elapsed_ms()
@@ -4302,7 +4334,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                                     }),
                                 )
                                 .await;
-                                cluster.leave_driver.lock().unwrap()[1] += 1;
+                                cluster.leave_driver.lock().unwrap().abandons += 1;
                                 if matches!(r, Ok(Ok(Ok(_)))) {
                                     let at = cluster.env.clock.elapsed_ms();
                                     let mut m = cluster.abandoned_at.lock().unwrap();
@@ -5811,7 +5843,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         operator_failures: Mutex::new(Vec::new()),
         retired: Mutex::new(BTreeMap::new()),
         leave_violations: Mutex::new(Vec::new()),
-        leave_driver: Mutex::new([0; 4]),
+        leave_driver: Mutex::new(LeaveDriver::default()),
         leave_keeps_grants: cfg.leave_keeps_grants,
         leave_asks_any: cfg.leave_asks_any,
         budget_exceeded: Mutex::new(Vec::new()),
@@ -7098,14 +7130,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     && a.judged.as_ref().is_some_and(|j| {
                         // `Final`: the holder's own disk, the holder is the
                         // group. `Group`: only when the operator confirmed
-                        // that every node of the group was gone.
+                        // that every node of the group was gone. The group
+                        // is the one the root listed at the abandon, not
+                        // each row's own configuration (ADR-61).
                         j.tx.as_ref().is_some_and(|t| {
-                            j.class == Some(super::oracle::Judged::Final)
-                                || (j.class == Some(super::oracle::Judged::Group)
-                                    && confirmed.contains(&t.origin.0))
-                        }) && j.tx.as_ref().is_some_and(|t| {
                             let (g, idx) = t.origin;
-                            g != 0
+                            let class_ok = match j.class {
+                                Some(super::oracle::Judged::Final) => true,
+                                Some(super::oracle::Judged::Group) => confirmed.contains(&g),
+                                _ => false,
+                            };
+                            class_ok
+                                && g != 0
                                 && cuts.abandoned.contains(&g)
                                 && cuts.cut.get(&g).is_some_and(|cut| idx > *cut)
                         })
@@ -8073,25 +8109,33 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     // Plan 46 M1.3 step 14: a retired node holds no live grant, at its
     // retirement (judged there) and at the end of the run.
-    // (A grant held by a retired node, in any table of the nodes that are
-    // up: the stream the run ends with. A stream the root's later grant of
-    // its directory superseded, or one that released every subtree, holds
-    // nothing.)
+    // (The generations the run ends with that name a retired node and have
+    // not ended, as the roster-only singleton test counts them, whether or not
+    // they hold a subtree: at the root the lease names, else at every node
+    // that is up.)
     let retired_nodes: BTreeSet<u64> = cluster.retired.lock().unwrap().keys().copied().collect();
-    for id in cluster.ids() {
-        let n = cluster.get(id);
-        if !n.alive() {
-            continue;
-        }
-        for st in n.meta.delegation_table().streams() {
-            if retired_nodes.contains(&st.node) && !st.subtrees.is_empty() {
-                cluster.leave_violations.lock().unwrap().push(format!(
-                    "no_live_grant_off_roster: node {} was retired from the roster, and node {id}'s \
-                     table ends the run with its stream {} holding {:?}",
-                    st.node,
-                    st.gen,
-                    st.subtrees.iter().map(|(d, _)| *d).collect::<Vec<_>>()
-                ));
+    if !retired_nodes.is_empty() {
+        let lease_root = read_lease(&cluster.env.bucket)
+            .await
+            .map(|l| l.holder)
+            .filter(|h| *h != 0 && cluster.ids().contains(h) && cluster.get(*h).alive());
+        let witnesses: Vec<NodeId> = match lease_root {
+            Some(r) => vec![r],
+            None => cluster
+                .ids()
+                .into_iter()
+                .filter(|n| cluster.get(*n).alive())
+                .collect(),
+        };
+        for id in witnesses {
+            for g in cluster.get(id).view().delegation.gens.iter() {
+                if retired_nodes.contains(&g.1) && !g.6 {
+                    cluster.leave_violations.lock().unwrap().push(format!(
+                        "no_live_grant_off_roster: node {} was retired from the roster, and node \
+                         {id} ends the run with its generation {} live (subtrees {:?})",
+                        g.1, g.2, g.0
+                    ));
+                }
             }
         }
     }
