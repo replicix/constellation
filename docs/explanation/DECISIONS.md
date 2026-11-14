@@ -5261,16 +5261,27 @@ is the consequence of that record being in the log.**
   a held row, so its acknowledgement can cover the row of a rid that a drop
   decided and has not yet applied. One `complete_ready` pass released such a
   `Finish` as `Ok` (`Group`), and the `DropApply` later in the same pass
-  refused the rid: the client heard `Ok` while the log said `EIO`. A
-  `Reply` or `Finish` whose rid the pending plan names (`DropPlan::rids`, the
-  record's `rolled_back` rids and its `queued` ones;
-  `Meta::drop_plan_names_rid`) is not released (`Core::park_released`), and
-  the holder's answer of the rid's `completed` row waits on its row too
-  (`Core::answer_need_of`). Ordering the pass is not enough, because the
-  acknowledgement can arrive passes before the record is archived. The
-  apply then refuses the rid and settles the park. The fence cancels the
-  plan, the row stands, and the answer leaves by its own rule, so a held
-  answer still settles (I4).
+  refused the rid: the client heard `Ok` while the log said `EIO`. The rule:
+  no answer of a rid a pending plan names leaves this node. The plan names
+  the rids it rolls back (`DropPlan::rids`: the record's `rolled_back` rids
+  and those of every walked row it rolls back, extended by a follow-up), the
+  queued replays it refuses and the rows it redoes in place
+  (`redone_rids`); `Meta::drop_plan_names_rid` asks, failing closed (a plan
+  it cannot read names every rid), and costs one atomic load on a node with
+  no plan. **It is enforced at the emission gate** (`Core::emission_hold_of`,
+  `EmissionHold::DropPlan`, where every `MutateReply` and every own client's
+  answer leaves): the answer is parked, counted
+  (`answers_held_drop_plan`), and its release asks again. The paths that
+  decide early ask the same rule: `Core::completed_row_settled` (the
+  release, `park_released`; the awaiting-log, reroute and inbox answers; a
+  non-holder's `settled_outcome`) and the top of `Core::answer_need_of` (the
+  in-doubt retries and the deadline, whatever branch the row's rule takes).
+  Ordering the pass is not enough, because the acknowledgement can arrive
+  passes before the record is archived. The apply refuses the rid and
+  settles the park. The fence cancels the plan, the row stands, and the
+  answer leaves by its own rule, so a held answer still settles (I4). An
+  apply that fails (a store error) keeps the plan and the answers it holds
+  (in doubt, never `Ok`), is counted (`drop_apply_errors`) and retried.
 - **D4, local state follows the log.** The dropper strands the seed, redoes
   the rest, refuses the queued seeds and removes the pending rows only when
   it applies its own record from the log (the archive covers it). A dropper
@@ -5417,7 +5428,8 @@ stream holder's drop by `far-placement+lost-chunk` 326
 (`a_stream_holder_drops_its_own_streams_held_rows`); D3's release rule by
 `drop-held-chain-backed+commit` 4, 7, 16 and 31
 (`regression_an_answer_a_decided_drop_names_waits_for_the_apply`,
-`a_group_ack_does_not_release_an_answer_a_decided_drop_names`).
+`a_group_ack_does_not_release_an_answer_a_decided_drop_names`,
+`a_stream_holders_plan_holds_its_clients_answer_through_the_deadline`).
 
 See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
 `crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),

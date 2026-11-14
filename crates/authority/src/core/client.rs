@@ -5541,9 +5541,18 @@ impl Core {
     /// journal alone until it ships or the backups hold it (`placement-hot`
     /// 1659, `long-delegated-late-answers` 542, 992: answered `Archive`,
     /// the root then sealed by its backup).
+    ///
+    /// ADR-59 part B (D3, the release rule): a rid a decided, unapplied drop
+    /// names is not settled, whatever acknowledged its row (the group holds a
+    /// held row): the apply refuses it, or the fence cancels the drop and the
+    /// row stands. Every path that answers from a `completed` row asks this
+    /// (the release, the awaiting-log and reroute answers, the inbox, a
+    /// non-holder's `settled_outcome`); the emission gate asks again
+    /// (`Core::emission_hold_of`).
     pub(crate) fn completed_row_settled(&self, rid: Rid, replica: &dyn Replica) -> bool {
         self.unsettled_delegate_row(rid, replica).is_none()
             && self.unsettled_root_row_early(rid, replica).is_none()
+            && !replica.drop_plan_names_rid(rid)
     }
 
     /// `(gen, idx)` of `rid`'s `completed` row when it is a delegation row
@@ -5710,6 +5719,13 @@ impl Core {
         replica: &dyn Replica,
     ) -> Option<u64> {
         let first = replica.journal_class_of_rid(rid).map(|(first, _)| first);
+        // ADR-59 part B (D3, the release rule): a rid a decided, unapplied
+        // drop names waits for the apply or the fence, whatever rule its row
+        // was journaled under (a hold's, an earlier tenure's) and whether or
+        // not it has a row here (a queued replay the drop refuses has none).
+        if replica.drop_plan_names_rid(rid) {
+            return Some(first.or(position.pending.map(|p| p.jseq)).unwrap_or(0));
+        }
         if self.unsettled_delegate_row(rid, replica).is_some() {
             return Some(first.or(position.pending.map(|p| p.jseq)).unwrap_or(0));
         }
@@ -5734,13 +5750,7 @@ impl Core {
         // earlier row is gone from the journal, so no earlier row of it is
         // left to wait for.
         if let Some(first) = first {
-            // ADR-59 part B (D3, the release rule): a row a decided drop names
-            // is held in this journal until the apply; its answer waits for
-            // the apply or the fence (`park_released`), whatever has
-            // acknowledged it. Asked only of an answer that would leave now.
-            return self
-                .ack_need_at(first)
-                .or_else(|| replica.drop_plan_names_rid(rid).then_some(first));
+            return self.ack_need_at(first);
         }
         self.ack_need(position)
     }
@@ -6102,8 +6112,14 @@ impl Core {
                             self.park_stale_lease(now, rid, seq, outcome, class, replica, out);
                             return;
                         }
-                        Some(EmissionHold::Unsettled(seq)) => {
-                            self.note_held_at_emission(EmissionPath::Finish, rid, replica);
+                        Some(
+                            hold @ (EmissionHold::Unsettled(seq) | EmissionHold::DropPlan(seq)),
+                        ) => {
+                            if matches!(hold, EmissionHold::DropPlan(_)) {
+                                self.note_held_drop_plan(EmissionPath::Finish, rid);
+                            } else {
+                                self.note_held_at_emission(EmissionPath::Finish, rid, replica);
+                            }
                             self.park_finish(
                                 now,
                                 rid,

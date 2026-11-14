@@ -48,6 +48,10 @@ pub use store::backup::{
     fail_store_reads_after_on_this_thread_for_tests,
 };
 pub use store::backup::{BackupRole, BackupTx};
+#[cfg(any(test, feature = "test-util"))]
+pub use store::held::{
+    fail_drop_applies_on_this_thread_for_tests, fail_drop_plan_reads_on_this_thread_for_tests,
+};
 pub use store::held::{
     manifest_names, op_manifests_of, DroppedHeld, HeldInode, HeldSummary, LiveSessions,
     DROPPED_CODE,

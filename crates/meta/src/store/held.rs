@@ -2081,7 +2081,7 @@ impl Meta {
             strand_all,
             missing: missing.iter().copied().collect(),
             idents: idents.iter().map(|(ident, _)| *ident).collect(),
-            rids: idents.iter().filter_map(|(_, rid)| *rid).collect(),
+            rids: named_rids(&idents, &walked),
             fills: fills.clone(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
             queued: Vec::new(),
@@ -2128,11 +2128,7 @@ impl Meta {
             // it (no transaction is left to roll back, no queued replay to
             // refuse; the marks and pending rows of the chunks no longer named
             // go now).
-            tx.insert(
-                &self.local,
-                drop_plan_key(ino),
-                postcard::to_allocvec(&plan)?,
-            );
+            self.put_drop_plan_tx(&mut tx, ino, &plan)?;
             tx.commit()?;
             return self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions, true);
         }
@@ -2160,11 +2156,7 @@ impl Meta {
         self.finish_local(&mut tx, local)?;
         plan.jseq = jseq;
         plan.epoch = super::local::get_journal_tx_head(&tx, self, jseq)?.map_or(0, |h| h.epoch);
-        tx.insert(
-            &self.local,
-            drop_plan_key(ino),
-            postcard::to_allocvec(&plan)?,
-        );
+        self.put_drop_plan_tx(&mut tx, ino, &plan)?;
         tx.commit()?;
         tracing::warn!(
             ino,
@@ -2239,12 +2231,52 @@ impl Meta {
             ..DropPlan::default()
         };
         let mut tx = self.db.write_tx();
-        tx.insert(
-            &self.local,
-            drop_plan_key(ino),
-            postcard::to_allocvec(&plan).unwrap(),
-        );
+        self.put_drop_plan_tx(&mut tx, ino, &plan).unwrap();
         tx.commit().unwrap();
+    }
+
+    /// Tests: [`Self::put_stream_drop_plan_for_tests`], the plan naming `rids`
+    /// (rows it rolls back), for the release rule's gates.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn put_stream_drop_plan_naming_for_tests(
+        &self,
+        ino: Ino,
+        gen: u64,
+        at: u64,
+        rids: &[crate::rid::Rid],
+    ) {
+        let plan = DropPlan {
+            stream: Some((gen, at)),
+            rids: rids.to_vec(),
+            ..DropPlan::default()
+        };
+        let mut tx = self.db.write_tx();
+        self.put_drop_plan_tx(&mut tx, ino, &plan).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// Tests: the decided plan of `ino`'s rolled-back rids, and the
+    /// `spec_seq`s of the rows it redoes in place.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn drop_plan_rids_for_tests(&self, ino: Ino) -> (Vec<crate::rid::Rid>, Vec<u64>) {
+        self.db
+            .read_tx()
+            .get(&self.local, drop_plan_key(ino))
+            .unwrap()
+            .map(|raw| postcard::from_bytes::<DropPlan>(&raw).unwrap())
+            .map(|plan| (plan.rids, plan.redone))
+            .unwrap_or_default()
+    }
+
+    /// Tests: the follow-up decision of `ino`'s drop, as an apply that found
+    /// the redone rows `skipped` not applying as they ran takes it.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn drop_held_follow_up_for_tests(
+        &self,
+        ino: Ino,
+        skipped: &[u64],
+    ) -> Result<DroppedHeld, MetaError> {
+        self.drop_held_follow_up(ino, skipped)
     }
 
     /// ADR-59 part B: whether this node decided a drop as the holder of
@@ -2301,11 +2333,7 @@ impl Meta {
                     // record that the deposition kept.)
                     self.member_cover_own_rows_tx(&mut tx, plan.epoch, &[plan.jseq])?;
                     plan.shipped = true;
-                    tx.insert(
-                        &self.local,
-                        drop_plan_key(*ino),
-                        postcard::to_allocvec(&plan)?,
-                    );
+                    self.put_drop_plan_tx(&mut tx, *ino, &plan)?;
                     counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, -1)?;
                 }
             }
@@ -2360,6 +2388,29 @@ impl Meta {
         }
     }
 
+    /// Write `plan` as the drop plan of `ino` in `tx`, telling the readers of
+    /// [`Self::drop_plan_names_rid`] first that a plan may exist.
+    fn put_drop_plan_tx(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx,
+        ino: Ino,
+        plan: &DropPlan,
+    ) -> Result<(), MetaError> {
+        // A new generation, `maybe` set: a reader's scan that began before
+        // this write cannot clear it.
+        self.drop_plans_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                Some(((s >> 1).wrapping_add(1) << 1) | 1)
+            })
+            .ok();
+        tx.insert(
+            &self.local,
+            drop_plan_key(ino),
+            postcard::to_allocvec(plan)?,
+        );
+        Ok(())
+    }
+
     /// ADR-59 part B (D3, the release rule): whether a drop decided here and
     /// not yet applied names `rid` (a transaction it rolls back, or a queued
     /// replay it refuses). An answer resting on `rid`'s row is not given
@@ -2367,16 +2418,55 @@ impl Meta {
     /// it, or the fence cancels the drop and the row stands. One seek when
     /// there is no plan (the common case).
     pub fn drop_plan_names_rid(&self, rid: crate::rid::Rid) -> bool {
+        let state = self.drop_plans_state.load(Ordering::Acquire);
+        if state & 1 == 0 {
+            return false;
+        }
         let r = self.db.read_tx();
-        r.prefix(&self.local, DROP_PLAN_PREFIX).any(|guard| {
-            guard
-                .into_inner()
-                .ok()
-                .and_then(|(_, v)| postcard::from_bytes::<DropPlan>(&v).ok())
-                .is_some_and(|plan| {
-                    plan.rids.contains(&rid) || plan.queued.iter().any(|(_, r)| *r == rid)
-                })
-        })
+        let mut any = false;
+        for guard in r.prefix(&self.local, DROP_PLAN_PREFIX) {
+            any = true;
+            #[cfg(any(test, feature = "test-util"))]
+            let guard = drop_faults::check(&drop_faults::READ, "an injected drop-plan read fault")
+                .map(|()| guard);
+            #[cfg(not(any(test, feature = "test-util")))]
+            let guard: Result<_, MetaError> = Ok(guard);
+            let plan = guard
+                .and_then(|g| g.into_inner().map_err(MetaError::from))
+                .and_then(|(_, v)| postcard::from_bytes::<DropPlan>(&v).map_err(MetaError::from));
+            match plan {
+                Ok(plan) => {
+                    if plan.rids.contains(&rid)
+                        || plan.redone_rids.contains(&rid)
+                        || plan.queued.iter().any(|(_, r)| *r == rid)
+                    {
+                        return true;
+                    }
+                }
+                // Fail closed: a plan that cannot be read may name it. The
+                // answer waits (in doubt, never `Ok`).
+                Err(error) => {
+                    if !self.drop_plan_read_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            %error,
+                            ?rid,
+                            "a drop plan could not be read: answers of rids it may name are held"
+                        );
+                    }
+                    return true;
+                }
+            }
+        }
+        if !any {
+            // No plan: clear `maybe`, unless a plan was written meanwhile.
+            let _ = self.drop_plans_state.compare_exchange(
+                state,
+                state & !1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+        false
     }
 
     /// Whether the decided drop of `ino` has its record shipped from this node.
@@ -2403,11 +2493,7 @@ impl Meta {
             let mut plan: DropPlan = postcard::from_bytes(&raw)?;
             if plan.jseq == jseq && !plan.shipped {
                 plan.shipped = true;
-                tx.insert(
-                    &self.local,
-                    drop_plan_key(ino),
-                    postcard::to_allocvec(&plan)?,
-                );
+                self.put_drop_plan_tx(tx, ino, &plan)?;
             }
         }
         Ok(())
@@ -2449,6 +2535,8 @@ impl Meta {
         sessions: &LiveSessions,
         sequencer: bool,
     ) -> Result<DroppedHeld, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        drop_faults::check(&drop_faults::APPLY, "an injected drop-apply fault")?;
         let _class = super::journal::PendingClass::current()
             .is_none()
             .then(|| super::journal::PendingClass::set(super::local::RowCommit::ARCHIVE));
@@ -2978,7 +3066,11 @@ impl Meta {
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
         self.finish_local(&mut tx, local)?;
         plan.idents.extend(idents.iter().map(|(ident, _)| *ident));
-        plan.rids.extend(idents.iter().filter_map(|(_, rid)| *rid));
+        for rid in named_rids(&idents, &walked) {
+            if !plan.rids.contains(&rid) {
+                plan.rids.push(rid);
+            }
+        }
         plan.fills.extend(fills.iter().copied());
         if stream.is_some() {
             plan.named_firsts.extend(
@@ -2996,11 +3088,7 @@ impl Meta {
         plan.shipped = false;
         plan.epoch = super::local::get_journal_tx_head(&tx, self, jseq)?.map_or(0, |h| h.epoch);
         plan.follow_ups += 1;
-        tx.insert(
-            &self.local,
-            drop_plan_key(ino),
-            postcard::to_allocvec(&plan)?,
-        );
+        self.put_drop_plan_tx(&mut tx, ino, &plan)?;
         tx.commit()?;
         tracing::warn!(
             ino,
@@ -3149,6 +3237,64 @@ struct DropPlan {
 }
 
 const DROP_PLAN_PREFIX: &[u8] = b"drop_plan:";
+
+/// Tests only (`test-util`): fail this thread's next `n` applies of a decided
+/// drop ([`Meta::drop_held_apply`]) with an I/O error.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_drop_applies_on_this_thread_for_tests(n: u32) {
+    drop_faults::APPLY.with(|c| c.set(n));
+}
+
+/// Tests only (`test-util`): fail this thread's next `n` reads of a stored
+/// drop plan in [`Meta::drop_plan_names_rid`].
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_drop_plan_reads_on_this_thread_for_tests(n: u32) {
+    drop_faults::READ.with(|c| c.set(n));
+}
+
+#[cfg(any(test, feature = "test-util"))]
+mod drop_faults {
+    use crate::MetaError;
+
+    thread_local! {
+        pub(super) static APPLY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        pub(super) static READ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn check(
+        left: &'static std::thread::LocalKey<std::cell::Cell<u32>>,
+        what: &str,
+    ) -> Result<(), MetaError> {
+        left.with(|c| match c.get() {
+            0 => Ok(()),
+            n => {
+                c.set(n - 1);
+                Err(MetaError::Io(std::io::Error::other(what.to_string())))
+            }
+        })
+    }
+}
+
+/// The rids a drop's record rolls back: those its identities complete and
+/// those of every walked row it rolls back (`in_s`), once each.
+fn named_rids(
+    idents: &[((u64, u64), Option<crate::rid::Rid>)],
+    walked: &Walked,
+) -> Vec<crate::rid::Rid> {
+    let mut rids: Vec<crate::rid::Rid> = Vec::new();
+    for rid in idents.iter().filter_map(|(_, rid)| *rid).chain(
+        walked
+            .rows
+            .iter()
+            .filter(|row| row.in_s)
+            .filter_map(|row| row.rid),
+    ) {
+        if !rids.contains(&rid) {
+            rids.push(rid);
+        }
+    }
+    rids
+}
 
 /// ADR-59 part B: the stream holder's drops decided and not yet applied, as
 /// `(gen, record's index, first journal seqs of the rows the record names)`.

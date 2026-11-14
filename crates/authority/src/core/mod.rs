@@ -2360,6 +2360,14 @@ pub struct Stats {
     /// ADR-59 part B (D1): journal transactions a `DropHeld` names that an
     /// apply found still in the journal after stranding its rows. Expected 0.
     pub drop_apply_leftovers: u64,
+    /// ADR-59 part B: applies of a decided drop that failed (a store error).
+    /// The plan stays, so do the answers it holds (in doubt, never `Ok`),
+    /// and the apply is retried after `DROP_APPLY_RETRY_MS`.
+    pub drop_apply_errors: u64,
+    /// ADR-59 part B (D3): answers the emission gate held because a decided,
+    /// unapplied drop names their rid (released by the apply's refusal or
+    /// the fence's cancel). Expected, no assertion.
+    pub answers_held_drop_plan: u64,
     /// ADR-59 part B: tail transactions a `DropHeld` of the log retired (the
     /// drop rolled them back; a member's late copy), skipped. Normal after a
     /// drop.

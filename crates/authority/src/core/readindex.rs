@@ -338,6 +338,10 @@ struct HorizonParked {
 /// read more than this.
 const HORIZON_PARK_MS: u64 = 100;
 
+/// ADR-59 part B: the pause before a failed apply of a decided drop is tried
+/// again (`Stats::drop_apply_errors`).
+const DROP_APPLY_RETRY_MS: u64 = 1_000;
+
 /// The most strict reads held for a horizon write; past it a read is
 /// answered at once with its position alone.
 const HORIZON_PARKED_MAX: usize = 4096;
@@ -1324,12 +1328,44 @@ impl Core {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, ino, "a decided drop could not be applied");
+                // The plan stays, and so do the answers it holds: in doubt,
+                // never `Ok` (D3). The apply is tried again after a pause;
+                // the record is in the log, so it is ready then.
+                self.stats.drop_apply_errors += 1;
+                tracing::warn!(
+                    error = %e,
+                    ino,
+                    retry_ms = DROP_APPLY_RETRY_MS,
+                    "a decided drop could not be applied: answers held by an unapplied plan; \
+                     retrying"
+                );
                 if let Some(op) = op {
                     out.push(Action::ControlDone {
                         op,
-                        result: Err(e.to_string()),
+                        result: Err(format!(
+                            "{e}: the drop is decided and its record is in the log; its apply \
+                             is retried, and the answers it names wait for it"
+                        )),
                     });
+                }
+                let plan = replica
+                    .drop_plans()
+                    .ok()
+                    .and_then(|plans| plans.into_iter().find(|(i, ..)| *i == ino));
+                if let Some((_, jseq, epoch, _)) = plan {
+                    let at = now.wait.plus(DROP_APPLY_RETRY_MS);
+                    self.park(
+                        now,
+                        (BTreeSet::new(), Some(at)),
+                        Some(jseq),
+                        ParkedWhat::DropApply {
+                            op: None,
+                            ino,
+                            epoch,
+                            sessions,
+                        },
+                    );
+                    self.arm_grant_quarantine(at, out);
                 }
             }
         }

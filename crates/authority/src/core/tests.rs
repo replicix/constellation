@@ -63871,24 +63871,227 @@ mod await_retry {
         assert!(h.core.answer_parked(rid).is_none(), "settled (I4)");
     }
 
-    /// The fence (D2): a decided drop whose record never reached the log is
-    /// cancelled, its rows stand, and the answer it held is released by the
-    /// group's acknowledgement as before (I4: a held answer still settles).
+    /// The fence (D2), as `complete_ready` finds it: the log moved past the
+    /// dropper's tenure (epoch 2 applied) without the record, so the drop
+    /// never happened. The plan goes, its rows stand, and the answer it held
+    /// is released by the group's acknowledgement as before (I4: a held
+    /// answer still settles).
     #[test]
-    fn a_cancelled_drop_lets_the_answer_it_held_go() {
+    fn a_fenced_drop_lets_the_answer_it_held_go() {
         let (mut h, broken) = backed_holder_with_a_seed(0);
         let rid = own_write_parked_then_drop_decided(&mut h, broken);
         group_has_everything(&mut h);
         let mut all = Vec::new();
         h.core.complete_ready(h.clk(), &h.meta, &mut all);
         assert!(!accepted_for(&all, rid), "{all:?}");
-        h.meta.drop_held_cancel(broken).unwrap();
+        // The log carries a segment of the dropper's tenure and then one of
+        // epoch 2, neither with the record (applied by another process).
+        let now = h.clk();
+        let mut other = Core::new(h.core.cfg.clone());
+        let ours = crate::segment::encode(1, 1, 1_000, &[], &[], &[]).unwrap();
+        other
+            .apply_incoming(now, 1, &ours, &h.meta, &mut Vec::new())
+            .unwrap();
+        let theirs = crate::segment::encode(2, 2, 1_000, &[], &[], &[]).unwrap();
+        other
+            .apply_incoming(now, 2, &theirs, &h.meta, &mut Vec::new())
+            .unwrap();
+        assert_eq!(Replica::applied_epoch(&h.meta), 2);
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        assert_eq!(h.core.stats.drops_unapplied, 1, "fenced in complete_ready");
+        assert!(h.meta.drop_plans().unwrap().is_empty(), "the plan is gone");
         assert!(!h.meta.drop_plan_names_rid(rid));
         h.core.complete_ready(h.clk(), &h.meta, &mut all);
         assert!(
-            accepted_for(&all, rid),
-            "released once the drop is gone: {all:?}"
+            h.core.answer_parked(rid).is_none(),
+            "the answer settles once the drop is fenced: {all:?}"
         );
+    }
+
+    /// ADR-59 part B (D3): another node's write of the damaged file, parked
+    /// for the group (a `Reply`), and the requester's retry by rid while the
+    /// drop is decided and unapplied: neither is answered `Ok`, before or
+    /// after the group's acknowledgement; the apply refuses the rid.
+    #[test]
+    fn a_remote_answer_and_a_retry_by_rid_wait_for_the_apply() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        let rid = rid_of(2, 5);
+        let op = MutateOp::SetManifest {
+            ino: broken,
+            base_manifest: None,
+            manifest,
+            size: 19,
+            mtime_ns: None,
+            ctime_ns: None,
+        };
+        let mut all = forward_raw(&mut h, 2, 1, rid, &op);
+        assert!(reply_to(&all, 1).is_none(), "parked for the group: {all:?}");
+        all.extend(drop_held_decide_via_core(&mut h, broken));
+        assert!(h.meta.drop_plan_names_rid(rid), "the decision names it");
+        group_has_everything(&mut h);
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        all.extend(forward_raw(&mut h, 2, 2, rid, &op));
+        let ok = |out: &[Action], req: u64| {
+            matches!(
+                reply_to(out, req),
+                Some(MutateOutcome::Accepted { .. } | MutateOutcome::Exists { .. })
+            )
+        };
+        assert!(
+            !ok(&all, 1) && !ok(&all, 2),
+            "no `Ok` before the apply: {all:?}"
+        );
+        ship_round(&mut h, 100, &mut all);
+        ship_round(&mut h, 101, &mut all);
+        all.extend(forward_raw(&mut h, 2, 3, rid, &op));
+        assert!(
+            !ok(&all, 1) && !ok(&all, 2) && !ok(&all, 3),
+            "no `Ok` for a refused rid: {all:?}"
+        );
+        assert!(matches!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused { .. })
+        ));
+        assert!(h.core.answer_parked(rid).is_none(), "settled (I4)");
+    }
+
+    /// ADR-59 part B (D3, D4): the plan is persisted. A dropper restarted
+    /// after the decision (the record not shipped) still holds every answer
+    /// of the rids it names: not settled, waited on, held at emission.
+    #[test]
+    fn a_restarted_dropper_still_holds_the_answers_its_plan_names() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let rid = own_write_parked_then_drop_decided(&mut h, broken);
+        let r = restarted(h);
+        assert_eq!(r.meta.drop_plans().unwrap().len(), 1, "the plan survives");
+        assert!(r.meta.drop_plan_names_rid(rid));
+        assert!(!r.core.completed_row_settled(rid, &r.meta));
+        assert!(r
+            .core
+            .answer_need_of(rid, &constellation_meta::Position::ZERO, &r.meta)
+            .is_some());
+        assert!(matches!(
+            r.core.emission_hold_of(rid, RowCommit::ARCHIVE, &r.meta),
+            Some(crate::core::backup::EmissionHold::DropPlan(_))
+        ));
+    }
+
+    /// ADR-59 part B (D3, review S2/S3): a row the drop redoes in place is
+    /// held too (its answer waits for the apply), and a follow-up decision
+    /// that rolls it back after all adds its rid to the plan's rolled-back
+    /// rids.
+    #[test]
+    fn a_follow_up_names_the_rids_it_rolls_back() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        h.meta.set_parent_taint_conservative(false);
+        let own = rid_of(1, 6);
+        exec_as(&h, RowCommit::LONE, own, &chmod(broken, 0o600));
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        let (rids, redone) = h.meta.drop_plan_rids_for_tests(broken);
+        assert!(!rids.contains(&own), "redone, not rolled back: {rids:?}");
+        assert!(!redone.is_empty(), "the chmod is redone in place");
+        assert!(h.meta.drop_plan_names_rid(own), "a redone rid is held too");
+        h.meta
+            .drop_held_follow_up_for_tests(broken, &redone)
+            .unwrap();
+        let (rids, _) = h.meta.drop_plan_rids_for_tests(broken);
+        assert!(rids.contains(&own), "the follow-up names it: {rids:?}");
+        assert!(h.meta.drop_plan_names_rid(own));
+    }
+
+    /// ADR-59 part B (review S1): the apply of a decided drop fails (a store
+    /// error). The plan stays and so do the answers it holds: in doubt,
+    /// never `Ok`. The apply is tried again after a pause, refuses the rid
+    /// and settles the park.
+    #[test]
+    fn a_failed_apply_keeps_the_answers_held_and_is_retried() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let rid = own_write_parked_then_drop_decided(&mut h, broken);
+        group_has_everything(&mut h);
+        constellation_meta::fail_drop_applies_on_this_thread_for_tests(1);
+        let mut all = Vec::new();
+        ship_round(&mut h, 100, &mut all);
+        constellation_meta::fail_drop_applies_on_this_thread_for_tests(0);
+        assert_eq!(h.core.stats.drop_apply_errors, 1);
+        assert_eq!(h.core.stats.drops_applied, 0);
+        assert!(h.meta.drop_plan_names_rid(rid), "the plan stays");
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        assert!(!accepted_for(&all, rid), "held, never `Ok`: {all:?}");
+        assert!(h.core.answer_parked(rid).is_some());
+        h.advance(1_500);
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        ship_round(&mut h, 101, &mut all);
+        assert_eq!(h.core.stats.drops_applied, 1, "retried and applied");
+        assert!(
+            !accepted_for(&all, rid),
+            "no `Ok` for a refused rid: {all:?}"
+        );
+        assert!(matches!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused { .. })
+        ));
+        assert!(h.core.answer_parked(rid).is_none(), "settled (I4)");
+    }
+
+    /// ADR-59 part B (review S4): a plan that cannot be read may name any
+    /// rid: the answer is held (fail closed).
+    #[test]
+    fn an_unreadable_plan_holds_every_answer() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let _ = own_write_parked_then_drop_decided(&mut h, broken);
+        let other = rid_of(2, 99);
+        assert!(!h.meta.drop_plan_names_rid(other));
+        constellation_meta::fail_drop_plan_reads_on_this_thread_for_tests(1);
+        assert!(h.meta.drop_plan_names_rid(other), "fails closed");
+        assert!(
+            !h.meta.drop_plan_names_rid(other),
+            "one read failed, not all"
+        );
+    }
+
+    /// ADR-59 part B (D2, D4): the dropper loses the lease before its record
+    /// left. The drop is cancelled, and the answer it held never leaves `Ok`
+    /// from the deposed node.
+    #[test]
+    fn a_deposed_dropper_never_answers_ok_for_a_rid_its_plan_named() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let rid = own_write_parked_then_drop_decided(&mut h, broken);
+        group_has_everything(&mut h);
+        let mut all = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut all);
+        assert!(h.meta.drop_plans().unwrap().is_empty(), "cancelled");
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        assert!(!accepted_for(&all, rid), "{all:?}");
+    }
+
+    /// ADR-59 part B (review MUST-1): the rule is checked first in
+    /// `answer_need_of`, whatever branch the row's rule would take: here a row
+    /// an ended hold left (`left_by_hold`), which the group has, is waited on
+    /// while the plan names its rid, and answered once the plan is gone.
+    #[test]
+    fn answer_need_of_holds_a_named_rid_left_by_a_hold() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let rid = own_write_parked_then_drop_decided(&mut h, broken);
+        group_has_everything(&mut h);
+        h.core.ack.hold_end_tip = Some(u64::MAX / 4);
+        let first = h.meta.journal_class_of_rid(rid).unwrap().0;
+        assert!(h.core.left_by_hold(first));
+        let position = constellation_meta::Position::ZERO;
+        assert_eq!(
+            h.core.answer_need_of(rid, &position, &h.meta),
+            Some(first),
+            "held while the plan names it"
+        );
+        h.meta.drop_held_cancel(broken).unwrap();
+        assert_eq!(h.core.answer_need_of(rid, &position, &h.meta), None);
     }
 
     /// ADR-59 part B (D1, D4), B3 (iii): the drop decides nothing locally. The
@@ -82254,6 +82457,49 @@ mod root_own_sticky {
         assert!(
             cut.is_none_or(|c| c >= 3),
             "the end cuts below the release: {cut:?}"
+        );
+    }
+
+    /// ADR-59 part B (D3, review MUST-1): a stream holder's drop (the root's
+    /// own sticky stream) names the rid of the holder's own client's create
+    /// in the stream. Its answer is held at emission while the plan stands,
+    /// and the deadline answers it in doubt, never `Ok`.
+    #[test]
+    fn a_stream_holders_plan_holds_its_clients_answer_through_the_deadline() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        archive_and_step(&mut h);
+        constellation_meta::MetaStore::ack_journal(&h.meta, record).unwrap();
+        let rid = h.rid(1);
+        h.meta
+            .put_stream_drop_plan_naming_for_tests(99, d.gen, 1, &[rid]);
+        let (r, mut all) = submit_in(&mut h, 1, dirs[0], "f0");
+        assert_eq!(r, rid);
+        all.extend(archive_and_step(&mut h));
+        assert!(!accepted(&all, rid), "held by the plan: {all:?}");
+        for _ in 0..40 {
+            h.advance(500);
+            let due: Vec<TimerId> = h
+                .core
+                .timers
+                .iter()
+                .filter(|(_, (_, at))| matches!(at, TimerAt::Wait(w) if *w <= h.clk().wait))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in due {
+                all.extend(h.step(Event::Timer { id }));
+            }
+            all.extend(archive_and_step(&mut h));
+        }
+        assert!(
+            !accepted(&all, rid),
+            "never `Ok` while the plan names it: {all:?}"
+        );
+        assert!(
+            replies(&all).iter().any(|(r, _)| *r == rid),
+            "the deadline answers it (in doubt): {all:?}"
         );
     }
 

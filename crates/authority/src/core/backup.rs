@@ -760,7 +760,7 @@ pub(crate) struct AckState {
     /// drops every parked answer and client entry and ends the tenure, so
     /// the hold's rows are the startup recovery's (stranded, replayed by rid
     /// through the next lease, plan 30 M3b), never answered from here.
-    hold_end_tip: Option<u64>,
+    pub(super) hold_end_tip: Option<u64>,
     /// Plan 46 M1.4 step 1, hold owner: the highest journal seq each epoch
     /// member acknowledged holding (`PeerMsg::StreamAheadAck`), for the
     /// continuation epoch `hold_epoch`. The hold's commit rule reads it
@@ -1292,6 +1292,10 @@ pub(crate) enum EmissionHold {
     /// unusable: it waits for the archive to carry its row or a usable
     /// lease.
     StaleLease(u64),
+    /// ADR-59 part B (D3): a decided drop that is not applied names the rid
+    /// (`Replica::drop_plan_names_rid`): the answer waits for the apply,
+    /// which refuses it, or the fence, which cancels the drop.
+    DropPlan(u64),
 }
 
 pub(crate) fn is_answer(outcome: &MutateOutcome) -> bool {
@@ -2136,15 +2140,9 @@ impl Core {
         match what {
             super::readindex::ParkedWhat::Reply { rid, .. }
             | super::readindex::ParkedWhat::Finish { rid, .. } => {
-                // ADR-59 part B (D3, the release rule): an answer resting on a
-                // row a decided drop names waits for the apply (which
-                // refuses the rid and settles the park) or the fence (which
-                // cancels the drop; the row stands and the answer leaves).
-                // Whatever acknowledged the row (the group holds a held row)
-                // says nothing of an outcome the log is about to change, and
-                // the apply may run in the same pass, after this park
-                // (`drop-held-chain-backed` seed 4) or passes later.
-                self.completed_row_settled(*rid, replica) && !replica.drop_plan_names_rid(*rid)
+                // (ADR-59 part B, D3: and no decided, unapplied drop names
+                // the rid; `completed_row_settled` asks.)
+                self.completed_row_settled(*rid, replica)
             }
             _ => true,
         }
@@ -2683,8 +2681,33 @@ impl Core {
                 }
             }
         }
-        self.unsettled_hold_of(rid, replica)
-            .map(EmissionHold::Unsettled)
+        if let Some(seq) = self.unsettled_hold_of(rid, replica) {
+            return Some(EmissionHold::Unsettled(seq));
+        }
+        // ADR-59 part B (D3, the release rule): whatever path produced it, an
+        // answer of a rid a decided, unapplied drop names does not leave.
+        // One atomic load on a node with no plan.
+        replica.drop_plan_names_rid(rid).then(|| {
+            EmissionHold::DropPlan(
+                replica
+                    .journal_class_of_rid(rid)
+                    .map(|(first, _)| first)
+                    .unwrap_or(0),
+            )
+        })
+    }
+
+    /// Count an answer the emission gate held for a decided drop's plan
+    /// (`Stats::answers_held_drop_plan`): an expected outcome, no assertion.
+    pub(crate) fn note_held_drop_plan(&mut self, path: EmissionPath, rid: Rid) {
+        self.stats.answers_held_drop_plan += 1;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?rid,
+            ?path,
+            "an answer of a rid a decided drop names reached the point it leaves: held until \
+             the apply or the fence"
+        );
     }
 
     /// The I1 emission gate's delegation half: the journal seq to park
@@ -2889,8 +2912,12 @@ impl Core {
                     }
                     return;
                 }
-                if let Some(EmissionHold::Unsettled(seq)) = hold {
-                    self.note_held_at_emission(path, rid, replica);
+                if let Some(EmissionHold::Unsettled(seq) | EmissionHold::DropPlan(seq)) = hold {
+                    if matches!(hold, Some(EmissionHold::DropPlan(_))) {
+                        self.note_held_drop_plan(path, rid);
+                    } else {
+                        self.note_held_at_emission(path, rid, replica);
+                    }
                     self.park_reply(
                         now,
                         Default::default(),

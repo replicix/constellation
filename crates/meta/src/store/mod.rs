@@ -623,6 +623,16 @@ pub struct Meta {
     /// and its journal held none then. A cheap gate for
     /// [`Self::holder_append_of`]: a plain delegate never pays its seek.
     pub(crate) holder_append_tip: AtomicU64,
+    /// ADR-59 part B (D3): whether a drop plan may be stored here, as
+    /// `generation << 1 | maybe`: every write of a plan bumps the generation
+    /// and sets `maybe` before its transaction commits; a reader that finds
+    /// no plan clears `maybe` only if no write came in between. So
+    /// [`Self::drop_plan_names_rid`] costs one atomic load on a node with no
+    /// plan (every answer the emission gate lets out asks it). Starts
+    /// `maybe` (the first read after the open finds out).
+    pub(crate) drop_plans_state: AtomicU64,
+    /// Whether a failed read of the drop plans has been warned of (once).
+    pub(crate) drop_plan_read_warned: AtomicBool,
     /// Unit tests of the tree publisher only: publish `ns` as it stands
     /// though this node's unshipped journal holds uncaptured writes
     /// (`Meta::publish_basis_at`). Never set by the daemon.
@@ -1374,6 +1384,8 @@ impl Meta {
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             holder_epoch: Arc::new(AtomicU64::new(0)),
             holder_append_tip: AtomicU64::new(0),
+            drop_plans_state: AtomicU64::new(1),
+            drop_plan_read_warned: AtomicBool::new(false),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             deleg_gate: std::sync::RwLock::new(()),
