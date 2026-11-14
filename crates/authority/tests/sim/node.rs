@@ -547,6 +547,8 @@ pub struct NodeEnv {
     pub first_start_unsettled: bool,
     /// See `SimConfig::holder_releases_before_drain`.
     pub holder_releases_before_drain: bool,
+    /// See `SimConfig::sticky_idle_ms`: the core's `sticky_idle_release_ms`.
+    pub sticky_idle_release_ms: u64,
     /// See `SimConfig::claim_ends_silently`.
     pub claim_ends_silently: bool,
     /// See `SimConfig::fence_accepts_unrouted`.
@@ -908,6 +910,7 @@ impl NodeHandle {
         cfg.kept_fetch_skipped = env.kept_fetch_skipped;
         cfg.restart_skips_write_quarantine = env.restart_skips_write_quarantine;
         cfg.holder_releases_before_drain = env.holder_releases_before_drain;
+        cfg.sticky_idle_release_ms = env.sticky_idle_release_ms;
         cfg.claim_ends_silently = env.claim_ends_silently;
         cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
         cfg.holder_runs_inbox_ever = env.holder_runs_inbox_ever;

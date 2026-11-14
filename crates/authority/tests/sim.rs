@@ -2045,8 +2045,8 @@ fn far_root_writes_shared_config() -> SimConfig {
 }
 
 /// Plan 46 M1.3 step 5: sticky grants released by their holder after idle
-/// periods (the sim's idle tracker stands for the engine's, step 6;
-/// `Control::StickyRelease`, alternately with and without `wait`). Node 2
+/// periods (the core's idle release, `sticky_idle_release_ms`, as the
+/// holder's own command, step 5's drain and row). Node 2
 /// holds two subtrees in one stream, so its releases are partial (the stream
 /// must live on: MUST-1) until both are gone; node 3's one subtree ends its
 /// stream. A holder that writes again gets the grant anew. Strict:
@@ -10432,7 +10432,7 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-STICKY-TOTALS {label} seeds {}/{seeds}: sticky streams in the log {} (ended by release {}, by abandon {}, unexcused {}); \
              core: grants made {}, ended released {}, abandoned {}, other {}, by undelegate {}, recalled {}; recalls by a continuation epoch {}; \
-             holder's releases journaled {} (of some subtrees {}), ops held by a drain {}, given up {}; idle tracker: requested {}, answered {}, unanswered {}, granted again {}; release rows judged against the root's append {}",
+             holder's releases journaled {} (of some subtrees {}), ops held by a drain {}, given up {}; idle release: grants lost to it {}, (unused) {}, (unused) {}, granted again {}; release rows judged against the root's append {}",
             self.seeds,
             self.sticky[0],
             self.sticky[1],
@@ -21798,16 +21798,16 @@ fn sticky_grants_survive_the_ttl_and_end_by_the_holders_release() {
 }
 
 /// Plan 46 M1.3 step 5: sticky grants released by their holders after idle
-/// periods (`sticky-idle-release`; the sim's idle tracker, `Control::StickyRelease`
-/// with and without `wait`), some of them partial, the holder granted again
+/// periods (`sticky-idle-release`; the core's idle release setting), some
+/// of them partial, the holder granted again
 /// when it writes. Strict: `acked_at_or_below_cut`,
 /// `sticky_ends_only_by_holder_or_operator` and the release after the drain
 /// (`sticky_release_after_drain`). The coverage counters are non-zero: the
-/// holders released (of some subtrees only too), the `wait` was answered,
+/// holders released (of some subtrees only too),
 /// ops were held by a drain, grants were made again.
 #[test]
 fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the_stream() {
-    let (mut released, mut partial, mut answered, mut again, mut held) = (0, 0, 0, 0, 0);
+    let (mut released, mut partial, mut again, mut held) = (0, 0, 0, 0);
     let mut judged = 0;
     for seed in 0..40 {
         let r = run_seed(seed, sticky_idle_release_config()).unwrap_or_else(|e| {
@@ -21821,7 +21821,6 @@ fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the
         released += r.sticky_core[7];
         partial += r.sticky_core[8];
         held += r.sticky_core[9];
-        answered += r.sticky_driver[1];
         again += r.sticky_driver[3];
         judged += r.sticky_release_rows_judged;
     }
@@ -21831,7 +21830,6 @@ fn sticky_idle_release_is_released_by_the_holder_and_a_partial_release_keeps_the
     );
     assert!(released > 0, "no holder released a sticky grant");
     assert!(partial > 0, "no release was of some subtrees only");
-    assert!(answered > 0, "no `wait` release was answered");
     assert!(again > 0, "no grant was made again after a release");
     assert!(held > 0, "no op was held by a drain");
 }
