@@ -72276,11 +72276,13 @@ mod step9_one_stream_per_node {
 
     /// The operator retires the root itself from another node (the root
     /// is dead, or cut off in an epoch it carries): that node is the lease
-    /// holder as the lease object names it, and a root is no delegate, so
-    /// there is nothing to end and the retirement goes on. Another node
-    /// still is refused. Fails on the parent: "not the root".
+    /// holder as the lease object names it. The node's table can be behind
+    /// the log, so it cannot tell that the root holds no grant of its own
+    /// (ADR-55): it refuses, and the leave is run on the root that takes
+    /// over (ADR-61). Another node still is refused too. Fails on main:
+    /// "holds no delegation of its own" (`sticky-leave-root`, seed 581).
     #[test]
-    fn a_non_root_retires_the_root_itself_without_ending_grants() {
+    fn a_non_root_never_retires_the_root_itself_from_its_own_table() {
         let mut h = Harness::new(2);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
@@ -72289,7 +72291,11 @@ mod step9_one_stream_per_node {
             op: OpId(1),
             req: Control::EndGrantsOf { node: 1 },
         });
-        assert!(matches!(control_answer(&out, 1), Some(Ok(_))), "{out:?}");
+        let refused = match control_answer(&out, 1) {
+            Some(Err(e)) => e,
+            other => panic!("retired: {other:?}"),
+        };
+        assert!(refused.contains("taken over"), "{refused}");
         let out = h.step(Event::Control {
             op: OpId(2),
             req: Control::EndGrantsOf { node: 3 },

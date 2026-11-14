@@ -972,8 +972,10 @@ every grant it holds
   grant on <dirs>; run repair abandon --node N first` (the abandon needs
   `--force`, the operator's word that the node is down), and the leave is run
   again. A holder heard lately is asked to release, as a live node is;
-- retiring a root that is gone refuses the same way while the table lists a
-  sticky stream of its own (ADR-55).
+- a root that is gone is not retired by a node that is not the root: it
+  refuses until a node has taken over (ADR-55 gives a root its own sticky
+  streams, and a follower's table can be behind the log), and the leave is run
+  on the new root, where the abandon comes first as above.
 
 A designee answers its rows at once, and its commits reach the OS, not
 the disk, so a power loss can drop the end of its journal. Nothing ends

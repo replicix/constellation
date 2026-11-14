@@ -5559,10 +5559,15 @@ alone while a holder it does not count writes. The model's property is
   leave does not fold an abandon into itself (the abandon's `--force` is the
   operator's word that the node is down). A leave that runs out of time with a
   non-stealable stream of the node still live says the same.
-- **A dead root** (the lease holder as this node read it) is retired only when
-  the table lists no non-stealable stream of it: since ADR-55 a root holds its
-  own sticky streams, and a dead root's stay live in the table. The old answer
-  "a root holds no delegation of its own" is kept for a root with none.
+- **A dead root** (the lease holder as this node read it) is never retired by a
+  node that is not the root. Since ADR-55 a root holds its own sticky streams,
+  a dead root's stay live in the log, and a follower's table can be behind it
+  (a paused follower answered "holds no delegation of its own" and retired a
+  root that held one). The follower refuses (naming the abandon when its table
+  lists a sticky stream of the root, else saying no node has taken over); the
+  operator runs the leave on the root that takes over, whose generations are
+  the log's, and again if it is refused. The sim's `sticky-leave-root`
+  asks any node when none holds the lease.
 - The recall an admin leave starts is `RecallCause::Leave`, an operator's action
   of the standing of `undelegate`: `sticky_ends_only_by_holder_or_operator`
   allows it (the one oracle relaxation of the step).
@@ -5582,14 +5587,6 @@ alone while a holder it does not count writes. The model's property is
   and at the end of the run against the log; the knob `leave_keeps_grants`
   (`AUTHORITY_SIM_LEAVE_KEEPS_GRANTS=1`) retires without ending grants and must
   fail it. The harness scenario is `sticky-leave`.
-
-**Open**: a node that is not the root answers the retirement of a dead root
-from its own table, which can be behind the log (a follower that was paused):
-`sticky-leave-root` with the operator asking any node
-(`AUTHORITY_SIM_LEAVE_ASKS_ANY=1`) and the idle release on retires a root with
-its own sticky stream live (seeds 593 and 680). The sim operator asks the node
-the lease names. A fix needs the answering node to know its table is current
-(or to refuse until a root has taken over); it is not built.
 
 **Rejected**: an admin leave that abandons the dead holder itself (the
 abandon's word that the node is down is the operator's); answering the

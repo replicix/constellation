@@ -14834,17 +14834,14 @@ impl Core {
         if !self.root_usable(now) {
             // The node is the lease holder itself, as the lease object this
             // node read names it (a dead or cut-off root; inside an epoch,
-            // the carrier). A root is no delegate of anything it granted
-            // others, but since ADR-55 it holds its own sticky streams, and
-            // a dead root's stay live in the table: retiring it would leave
-            // a live grant off the roster. So the table is read, and a
-            // non-stealable stream of the node is refused as a dead
-            // holder's is (abandon ends it, on the root there is then).
-            // Nothing else is there to end: what the root granted is the
-            // next tenure's to wait out, which the retirement's fencing of
-            // its leases lets begin. Refusing it for nothing would make the
-            // one node an operator must retire when the root is gone
-            // impossible to retire.
+            // the carrier). Since ADR-55 a root holds its own sticky streams,
+            // and this node's table can be behind the log (a follower that
+            // was paused): it cannot tell that the dead root holds nothing,
+            // so it never retires it. The retirement waits for a root that
+            // has taken over, whose generations are the log's (ADR-61); the
+            // operator runs it there, and again if it is refused. When this
+            // node's table lists a sticky stream of the root already, it
+            // says so.
             if self.root_node() == Some(node)
                 && self
                     .lease
@@ -14854,9 +14851,11 @@ impl Core {
             {
                 let held = self.non_stealable_table_dirs_of(node, replica);
                 let result = if held.is_empty() {
-                    Ok(ControlOk::Text(format!(
-                        "node {node} is the root and holds no delegation of its own"
-                    )))
+                    Err(format!(
+                        "node {node} is the root as this node read the lease, and no node has taken \
+                         over yet: run the leave on the root once one has (this node's table cannot \
+                         tell that node {node} holds no grant)"
+                    ))
                 } else {
                     Err(Self::leave_abandon_first(node, &held))
                 };
