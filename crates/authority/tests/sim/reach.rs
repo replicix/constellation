@@ -135,7 +135,15 @@ pub struct LeaseSpan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Held {
     No,
+    /// The S3 lease, `usable()` (`LeaseState::usable`: not lost, more than
+    /// the expiry margin left on its honour clock).
     Lease,
+    /// The S3 lease, held but not `usable()`: its honour end is within the
+    /// margin or past (a forward wall step lapses it by design, P4; a renewal
+    /// late on a slow S3). The holder admits nothing new: it is not a root
+    /// for the classifier, though it still holds the lease (it re-adopts it
+    /// on a restart, and the body is not claimable before it runs out).
+    LeaseLapsed,
     Epoch,
 }
 
@@ -184,12 +192,14 @@ fn busy_names(b: u8) -> String {
 /// 2026-11-13, which the oracle's causes match on (`Unsettled::cause`).
 pub const WHY_UNDER_ASK_CYCLE: &str = "less than one ask cycle";
 pub const WHY_NO_LEASE_READ_RETRY: &str = "less than one lease-read retry";
+pub const WHY_HOLDER_NOT_USABLE: &str = "its own lease is not usable";
 
 /// The causes of those reasons, counted in a column of their own by the
 /// ratchet (`m03_the_configurations_at_zero_violations_stay_there`).
 pub const CAUSE_UNDER_ASK_CYCLE: &str = "no-sequencer-in-time/root run under one ask cycle";
 pub const CAUSE_NO_LEASE_READ_RETRY: &str =
     "no-sequencer-in-time/claim, no room for a lease-read retry";
+pub const CAUSE_HOLDER_NOT_USABLE: &str = "no-sequencer-in-time/holder's lease not usable";
 
 /// How a sequencer was reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +379,10 @@ struct Inner {
     /// What a finished lease claim must leave before the run's end: one
     /// lease-read retry (the settle's retry interval and a lease read).
     lease_retry_ms: u64,
+    /// Judge a holder whose lease is not usable as a root, as the classifier
+    /// did before 2026-11-13: set only while [`classify`] asks whether a
+    /// verdict was a violation then.
+    lapsed_as_root: std::cell::Cell<bool>,
     /// The protocol windows (the lease TTL, the claim grace, the margin, the
     /// reclaim horizon, the inherit slack, the recall back-off cap), as the
     /// product derives them: the configuration's, never copied here.
@@ -758,13 +772,22 @@ fn held(g: &Inner, at: u64, n: NodeId) -> Held {
 }
 
 /// Whether `n` is a sequencer for everything not delegated at `at`: it
-/// holds the lease the latest body names, or a continuation epoch.
+/// holds the lease the latest body names, `usable()` as of its latest step,
+/// or a continuation epoch.
 fn root_in_force(g: &Inner, at: u64, n: NodeId) -> bool {
     match held(g, at, n) {
         Held::Epoch => true,
         Held::Lease => lease_at(g, at).is_some_and(|l| l.holder == n),
+        Held::LeaseLapsed => {
+            g.lapsed_as_root.get() && lease_at(g, at).is_some_and(|l| l.holder == n)
+        }
         Held::No => false,
     }
+}
+
+/// Whether `n` holds the lease the latest body names, but not `usable()`.
+fn holder_lapsed(g: &Inner, at: u64, n: NodeId) -> bool {
+    held(g, at, n) == Held::LeaseLapsed && lease_at(g, at).is_some_and(|l| l.holder == n)
 }
 
 /// Whether `n` is the live delegate of generation `gen` at `at`.
@@ -824,7 +847,8 @@ fn busy_over(g: &Inner, n: NodeId, from: u64, to: u64) -> u8 {
 fn can_commit(g: &Inner, at: u64, n: NodeId) -> bool {
     match held(g, at, n) {
         Held::Epoch => true,
-        Held::Lease => {
+        Held::LeaseLapsed if !g.lapsed_as_root.get() => false,
+        Held::Lease | Held::LeaseLapsed => {
             s3_up(g, at, n)
                 || lease_at(g, at)
                     .is_some_and(|l| l.backups.iter().any(|b| *b != n && peer_up(g, at, n, *b)))
@@ -1352,7 +1376,9 @@ fn readopts_own(g: &Inner, at: u64, me: NodeId, l: &LeaseSpan) -> bool {
             .flatten()
             .rev()
             .find(|v| v.at < attach)
-            .is_some_and(|v| v.held == Held::Lease && v.busy & BUSY_LOST == 0)
+            .is_some_and(|v| {
+                matches!(v.held, Held::Lease | Held::LeaseLapsed) && v.busy & BUSY_LOST == 0
+            })
 }
 
 /// How long past its end `l` is not `me`'s to claim: the backups' claim grace
@@ -1703,9 +1729,38 @@ fn classify(g: &Inner, q: Question) -> Verdict {
     if let Some(why) = j.under_floor {
         return Verdict::NoSequencerInTime { why };
     }
+    // A holder whose lease is not usable is no root; when judging it as one
+    // (as before) finds a sequencer, the verdict was a violation then and is
+    // none in time now, under its own cause.
+    if let Some(h) = lapsed_holder_in(g, &q) {
+        g.lapsed_as_root.set(true);
+        let before = judge(g, &q);
+        g.lapsed_as_root.set(false);
+        if before.reachable.is_some() || before.under_floor.is_some() {
+            return Verdict::NoSequencerInTime {
+                why: format!(
+                    "the lease names node {h}, which holds it, but {WHY_HOLDER_NOT_USABLE} \
+                     (lapsed on its honour clock or inside the expiry margin)"
+                ),
+            };
+        }
+    }
     Verdict::Isolated {
         why: why_isolated(g, &q),
     }
+}
+
+/// The holder the lease names at some instant of `q`'s window while its own
+/// lease is not usable, if any.
+fn lapsed_holder_in(g: &Inner, q: &Question) -> Option<NodeId> {
+    let mut points = vec![q.from_ms];
+    points.extend(change_marks(g, q.from_ms, q.to_ms));
+    points.push(q.to_ms);
+    points.into_iter().find_map(|t| {
+        lease_at(g, t)
+            .map(|l| l.holder)
+            .filter(|h| *h != 0 && holder_lapsed(g, t, *h))
+    })
 }
 
 fn judge(g: &Inner, q: &Question) -> Judged {
@@ -1889,7 +1944,12 @@ fn dead_holders_lease(g: &Inner, q: &Question) -> Option<String> {
         }
     }
     let l = lease_at(g, at).filter(|l| l.holder != 0 && !l.released)?;
-    if attached(g, at, l.holder) && root_in_force(g, at, l.holder) || readopts_own(g, at, me, &l) {
+    // (A holder whose lease is not usable still holds it: not this reason,
+    // as before 2026-11-13; `classify` gives it its own.)
+    if attached(g, at, l.holder)
+        && (root_in_force(g, at, l.holder) || holder_lapsed(g, at, l.holder))
+        || readopts_own(g, at, me, &l)
+    {
         return None;
     }
     Some(format!(
@@ -1927,6 +1987,9 @@ fn why_isolated(g: &Inner, q: &Question) -> String {
     let root_state = |parts: &mut Vec<String>| {
         match lease.as_ref().filter(|l| l.holder != 0) {
             Some(l) if root_in_force(g, at, l.holder) => parts.push(state(l.holder, "root")),
+            Some(l) if holder_lapsed(g, at, l.holder) => {
+                parts.push(format!("root {}'s lease not usable", l.holder))
+            }
             Some(l) => parts.push(format!("root {} holds nothing", l.holder)),
             None => parts.push("no lease holder".into()),
         }
@@ -2359,6 +2422,42 @@ mod tests {
             ),
             "180 ms after the claim is room for a retry: {:?}",
             run(4_360)
+        );
+    }
+
+    /// A holder whose own lease is held but not `usable()` (a forward wall
+    /// step lapsed it, P4) is not a root; the requester then had no sequencer
+    /// in time, under its own label. Usable again, it is a root.
+    #[test]
+    fn a_holder_whose_lease_is_not_usable_is_no_root() {
+        let r = world();
+        r.lease_landed_at(3_500, 1, 8_000, false);
+        r.note_view_at(3_600, 1, Held::LeaseLapsed, vec![], vec![], 0);
+        let v = r.classify(q(3));
+        let Verdict::NoSequencerInTime { why } = &v else {
+            panic!("a lapsed holder is no root: {v:?}");
+        };
+        assert!(why.contains(WHY_HOLDER_NOT_USABLE), "{why}");
+        // A requester cut from the lapsed holder (S3 up) was isolated before
+        // the amendment, and still is: the amendment relabels only what was a
+        // violation.
+        let cut = world();
+        cut.lease_landed_at(3_500, 1, 8_000, false);
+        cut.note_view_at(3_600, 1, Held::LeaseLapsed, vec![], vec![], 0);
+        cut.partition_at(3_700, 3, 1, true);
+        assert!(cut.classify(q(3)).isolated(), "{:?}", cut.classify(q(3)));
+        // Usable again from 5 000 ms: a root from then on.
+        r.note_view_at(5_000, 1, Held::Lease, vec![], vec![], 0);
+        assert!(
+            matches!(
+                r.classify(q(3)),
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    from_ms: 5_000,
+                    ..
+                }
+            ),
+            "usable again, the holder is a root"
         );
     }
 

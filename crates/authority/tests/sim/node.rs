@@ -2937,8 +2937,12 @@ impl Driver {
             let at = self.oracles.reach.now_ms();
             let held = if lease.epoch_held() {
                 super::reach::Held::Epoch
-            } else if view.held_epoch.is_some() {
+            } else if view.held_epoch.is_some() && lease.usable(now, self.core.config()) {
                 super::reach::Held::Lease
+            } else if view.held_epoch.is_some() {
+                // Held but not `usable()` (a forward wall step lapsed it, P4;
+                // inside the expiry margin): it admits nothing new.
+                super::reach::Held::LeaseLapsed
             } else {
                 super::reach::Held::No
             };
