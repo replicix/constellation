@@ -1273,6 +1273,133 @@ pub fn sticky_abandon(_seed: u64) -> Result<()> {
     result
 }
 
+/// Plan 46 M1.3 step 14 ("Leave ends grants first"): a node leaves the
+/// roster once the log has ended every grant it holds. `c` holds `/d2` sticky
+/// and leaves by itself: it releases the subtree, the root ends the stream,
+/// and only then is `c` retired, so `/d2` is not in the root's table
+/// afterwards and `a` writes there at once (no TTL: a sticky grant has
+/// none). `b` holds `/d1` sticky and is killed; the root's admin leave of `b`
+/// is refused naming `repair abandon --node` (waiting for an expiry no sticky
+/// grant has would only time out), and goes through after the forced abandon.
+/// A retired `b` does not remount.
+pub fn sticky_leave(_seed: u64) -> Result<()> {
+    const SCENARIO: &str = "sticky-leave";
+    let (_env, _root, mut clients, _) = cluster(
+        SCENARIO,
+        &["a", "b", "c"],
+        &[("CONSTELLATION_CTO", "strict")],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let b_id = node_id(&clients[1])?;
+        for d in ["d1", "d2"] {
+            std::fs::create_dir(clients[0].mnt.join(d))?;
+        }
+        for x in [&clients[1], &clients[2]] {
+            eventually("dirs visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir() && x.mnt.join("d2").is_dir());
+                Ok(())
+            })?;
+        }
+        let c_id = node_id(&clients[2])?;
+        for (path, id) in [("/d1", b_id), ("/d2", c_id)] {
+            // (Refused while the read delegations under the directory are
+            // being recalled.)
+            eventually(
+                &format!("{path} is delegated"),
+                Duration::from_secs(30),
+                || {
+                    clients[0]
+                        .control(
+                            "designation.delegate",
+                            serde_json::json!({"path": path, "node": id, "sticky": true}),
+                        )
+                        .with_context(|| format!("delegating --sticky {path}"))?;
+                    Ok(())
+                },
+            )?;
+        }
+        wait_installed(&clients[1], "/d1", Duration::from_secs(20))?;
+        wait_installed(&clients[2], "/d2", Duration::from_secs(20))?;
+        let (names_b, _) = write_files(&clients[1], "d1", "b", 20)?;
+        let (names_c, _) = write_files(&clients[2], "d2", "c", 20)?;
+        // c leaves by itself: its grant is released and ended first.
+        let t = Instant::now();
+        clients[2].leave(None, false).context("c's own leave")?;
+        eprintln!("    {SCENARIO}: c's own leave took {:?}", t.elapsed());
+        anyhow::ensure!(
+            !in_table(&clients[0], "/d2")?,
+            "c is gone and /d2 is still in a's table: a grant is live off the roster"
+        );
+        let t = Instant::now();
+        eventually("a writes d2/a-after", Duration::from_secs(10), || {
+            std::fs::write(clients[0].mnt.join("d2/a-after"), b"a")?;
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            t.elapsed() < Duration::from_millis(DELEG_TTL_MS * 2),
+            "a's write into the left subtree took {:?}",
+            t.elapsed()
+        );
+        for x in [&clients[0], &clients[1]] {
+            all_visible(x, &names_c, Duration::from_secs(30))?;
+        }
+        // b is killed with its grant: the admin leave of b is refused until
+        // the operator abandons.
+        clients[1].kill9()?;
+        let refused = {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                match clients[0].leave(Some(b_id), false) {
+                    Ok(()) => anyhow::bail!("the leave of b went through with its sticky grant"),
+                    Err(e) => {
+                        let e = format!("{e:#}");
+                        if e.contains("repair abandon --node") {
+                            break e;
+                        }
+                        // (Within the root's heard-lately window it recalls b
+                        // and waits for an answer: it fails at its deadline.)
+                        anyhow::ensure!(
+                            Instant::now() < deadline,
+                            "never refused naming the abandon: {e}"
+                        );
+                    }
+                }
+            }
+        };
+        eprintln!("    {SCENARIO}: the admin leave of b was refused: {refused}");
+        anyhow::ensure!(
+            in_table(&clients[0], "/d1")?,
+            "the refused leave ended b's grant"
+        );
+        clients[0]
+            .control(
+                "repair.abandon",
+                serde_json::json!({"node": b_id, "force": true}),
+            )
+            .context("repair abandon --node b --force")?;
+        clients[0]
+            .leave(Some(b_id), false)
+            .context("the admin leave of b after the abandon")?;
+        anyhow::ensure!(
+            !in_table(&clients[0], "/d1")?,
+            "b is retired and /d1 is still in a's table"
+        );
+        // b is retired for good.
+        let remount = clients[1].mount();
+        anyhow::ensure!(remount.is_err(), "the retired node remounted");
+        eventually("a writes d1/a-after", Duration::from_secs(10), || {
+            std::fs::write(clients[0].mnt.join("d1/a-after"), b"a")?;
+            Ok(())
+        })?;
+        let _ = names_b;
+        Ok(())
+    })();
+    dump_logs_on_failure(SCENARIO, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
 /// Whether `c`'s delegation table lists `path`.
 fn in_table(c: &Client, path: &str) -> Result<bool> {
     Ok(deleg_of(c)?["table"]

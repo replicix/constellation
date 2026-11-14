@@ -1345,6 +1345,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::sticky_abandon,
     },
     Scenario {
+        name: "sticky-leave",
+        desc: "plan 46 M1.3 step 14 (leave ends grants first): c holds /d2 sticky and leaves by itself (release, the root's end of the stream, then retirement): /d2 is not in the root's table afterwards, every file c wrote is on every node and a writes /d2 at once; b holds /d1 sticky and is killed: the root's admin leave of b is refused naming `repair abandon --node`, goes through after the forced abandon, /d1 leaves the table, and the retired b does not remount",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_leave,
+    },
+    Scenario {
         name: "root-own-sticky",
         desc: "plan 46 M1.3 step 9 (ADR-55): the root (a) writes /r dominantly with a peer (b) and no backup and is granted /r as its own sticky subtree; its ops there are answered at local speed (percentiles printed beside its ops in /, which wait for the archive); a is stopped past the lease TTL, b takes the lease, a is continued: it keeps writing /r with no error, b reads every row a acknowledged, and b's write into /r is forwarded to a and final",
         requires: &[],
