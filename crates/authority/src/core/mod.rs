@@ -1449,6 +1449,23 @@ pub struct Stats {
     /// end, which the oracle `sticky_ends_only_by_holder_or_operator`
     /// fails).
     pub deleg_sticky_ended_released: u64,
+    /// Plan 46 M1.3 step 12 (claim = release): a claim of the lease by the
+    /// holder of a non-stealable stream journaled the stream's release row
+    /// (`claim_released`); had no row to journal (`claim_release_rowless`:
+    /// the stream is not installed here, or is capped or has a lost
+    /// dependency: the end cuts as before); or found the stream's own rows
+    /// above the log replayed by rid at the takeover gate
+    /// (`claim_own_rows_halted_non_stealable`: the sim fails it; the
+    /// stealable kinds' is the same count, which is normal).
+    pub claim_released: u64,
+    pub claim_release_rowless: u64,
+    pub claim_own_rows_halted_non_stealable: u64,
+    pub claim_own_rows_halted_stealable: u64,
+    /// The end of a claimed own stream waited for the stream's rows
+    /// (`_waits`), and went ahead of them when `drop_held_await` ran out
+    /// (`_unordered`: the sim fails it).
+    pub claim_end_waits: u64,
+    pub claim_end_unordered: u64,
     pub deleg_sticky_ended_operator: u64,
     pub deleg_sticky_ended_recalled: u64,
     /// Recalls of a sticky stream the root started: by a continuation epoch

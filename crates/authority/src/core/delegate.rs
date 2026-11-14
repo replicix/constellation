@@ -1106,6 +1106,16 @@ pub(crate) const STICKY_HOLD_MAX_MS: i64 = 5_000;
 /// How often the holder's releases in progress look again with no event.
 const STICKY_RELEASE_TICK_MS: i64 = 200;
 
+/// Plan 46 M1.3 step 12: what the end of a claimed own stream waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimWait {
+    /// The stream holds a drop (ADR-59) whose record the log lacks.
+    DropPending,
+    /// A row of the stream, at stream index `first` or above, is held back
+    /// from shipping.
+    RowsUnshipped { first: u64 },
+}
+
 /// Plan 46 M1.2 step 11 (maintainer decision 2026-11-06, "Leave ends grants
 /// first"): a node leaves the roster only once the log has ended every grant
 /// it holds. The holder that is alive releases them (`StreamReleased` rows,
@@ -1330,6 +1340,15 @@ pub(crate) struct DelegationState {
     /// The streams this node granted itself while it was the root (a deposed
     /// root keeps streaming them: `Stats::root_own_resumed`).
     pub(crate) own_minted: BTreeSet<u64>,
+    /// Plan 46 M1.3 step 12: the generations whose own rows the takeover
+    /// gate replayed by rid instead of re-appending them (the re-append
+    /// halted, or the tail or the log ended them); read once by the claim's
+    /// sync, which cannot journal their release row behind rows the log
+    /// does not hold.
+    pub(crate) claim_replayed: BTreeSet<u64>,
+    /// Plan 46 M1.3 step 12: the claimed own streams whose end waits for the
+    /// stream's rows (the wall time the wait began).
+    pub(crate) claim_waits: BTreeMap<u64, WaitMs>,
     /// ADR-55: this process installed a stream under a restart quarantine
     /// (it held delegations before it restarted): a stream of its own it holds
     /// waits for its claim of the lease instead of executing in the gate.
@@ -2882,6 +2901,9 @@ impl Core {
                 // is what it assigned, not the log's index alone: a lower one
                 // would void answers it gave `Final`.
                 if d.node == me {
+                    // Plan 46 M1.3 step 12 (claim = release): a non-stealable
+                    // holder's claim is its release, the stream's next row.
+                    self.claim_releases(d.gen, d.non_stealable(), replica);
                     cursor = cursor.max(replica.delegate_idx(d.gen));
                 }
                 tracing::info!(
@@ -2964,7 +2986,7 @@ impl Core {
                 if d.node == me {
                     // A predecessor delegated this subtree to the node
                     // that is now the root: the root executes it itself.
-                    self.end_generation(now, d.gen, None, replica, out);
+                    self.claim_end(now, d.gen, replica, out);
                     continue;
                 }
                 self.arm_gen_expiry(now, d.gen, out);
@@ -5738,6 +5760,7 @@ impl Core {
         self.own_honour_progress(now, replica, out);
         self.deleg_leave_progress(now, replica, out);
         self.handover_progress(now, replica, out);
+        self.claim_end_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
         self.own_release_progress(now, replica, out);
         self.abandon_progress(now, replica, out);
@@ -13012,6 +13035,158 @@ impl Core {
         Ok(gen)
     }
 
+    /// Plan 46 M1.3 step 12 (claim = release, C11): this node claimed the
+    /// lease while holding stream `gen` of the delegate it was. The claim
+    /// ends the stream at what the node assigned, and for a non-stealable
+    /// kind the end is the holder's release: `StreamReleased` is journaled as
+    /// the stream's next row (it ships in the claimant's segments, through
+    /// the same gate as every row of the stream), and the root's
+    /// `DelegateNodeEnded` then cuts at it.
+    ///
+    /// Not journaled: when the takeover gate replayed the stream's own rows
+    /// by rid (the row would precede root rows the log lacks; counted, the
+    /// sim fails it), when the stream is not installed here, when a release
+    /// row is in the journal already (a root's own release the restart
+    /// interrupted), or when the stream cannot release by a row (a lost
+    /// dependency, rows its tenure has not committed: the end cuts as
+    /// before, counted).
+    fn claim_releases(&mut self, gen: u64, non_stealable: bool, replica: &dyn Replica) {
+        let me = self.me();
+        let replayed = self.dl.claim_replayed.remove(&gen);
+        if !non_stealable {
+            if replayed {
+                self.stats.claim_own_rows_halted_stealable += 1;
+            }
+            return;
+        }
+        if replayed {
+            self.stats.claim_own_rows_halted_non_stealable += 1;
+            return;
+        }
+        if !self.dl.mine.contains_key(&gen) || self.release_row_journaled(gen, replica) {
+            self.stats.claim_release_rowless += 1;
+            return;
+        }
+        let idx = replica.delegate_idx(gen);
+        if idx > self.holder_append_cap(gen, replica) || self.deleg_find_lost(gen, replica).is_some()
+        {
+            self.stats.claim_release_rowless += 1;
+            return;
+        }
+        if let Some(d) = self.dl.mine.get_mut(&gen) {
+            Self::deleg_group_refresh_one(d, replica);
+        }
+        let rule = self.deleg_rule(gen, Asker::Remote);
+        let _row_class = constellation_meta::PendingClass::set(self.deleg_row_commit(gen, rule));
+        let records = [LogRecord::StreamReleased {
+            node: me,
+            gen,
+            through: idx,
+        }];
+        match replica.delegate_release(&records, gen, Position::ZERO) {
+            Ok(_) => self.stats.claim_released += 1,
+            Err(error) => {
+                // The end cuts at what the node assigned, as before.
+                self.stats.claim_release_rowless += 1;
+                tracing::warn!(
+                    node = me,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    %error,
+                    "could not journal a claim's release row"
+                );
+            }
+        }
+    }
+
+    /// Plan 46 M1.3 step 12: why the end of a claimed own stream is not due.
+    fn claim_end_of(&self, gen: u64, replica: &dyn Replica) -> Option<ClaimWait> {
+        // ADR-59 D1: a generation that ends without its drop record cancels
+        // the drop: the rows it names are stranded.
+        if replica.stream_drop_pending(gen) {
+            return Some(ClaimWait::DropPending);
+        }
+        // A row of the stream the ship plan holds or defers (a chunk it
+        // names is pending or poisoned) ships after later rows, the end among
+        // them: the log would end the stream below it.
+        let back = replica.journal_held_back().ok()?;
+        if back.is_empty() {
+            return None;
+        }
+        let seqs: Vec<u64> = back.into_iter().collect();
+        replica
+            .journal_origins(&seqs)
+            .iter()
+            .filter(|(g, _)| *g == gen)
+            .map(|(_, idx)| *idx)
+            .min()
+            .map(|first| ClaimWait::RowsUnshipped { first })
+    }
+
+    /// The end of stream `gen`, which this node held and now executes as the
+    /// root (it claimed the lease): at once, or after the stream's rows
+    /// (step 12, [`Self::claim_end_of`]), at most `drop_held_await` (then the
+    /// end proceeds as before, counted).
+    fn claim_end(&mut self, now: Now, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let Some(wait) = self.claim_end_of(gen, replica) else {
+            self.dl.claim_waits.remove(&gen);
+            self.end_generation(now, gen, None, replica, out);
+            return;
+        };
+        let since = *self.dl.claim_waits.entry(gen).or_insert(now.wait);
+        if now.wait.since(since).max(0) as u64 >= self.dl_t().drop_held_await {
+            self.stats.claim_end_unordered += 1;
+            tracing::warn!(
+                node = self.me(),
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                ?wait,
+                "a claimed own stream ends before its held rows: the wait ran out"
+            );
+            self.dl.claim_waits.remove(&gen);
+            self.end_generation(now, gen, None, replica, out);
+            return;
+        }
+        if since == now.wait {
+            self.stats.claim_end_waits += 1;
+            tracing::info!(
+                node = self.me(),
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                ?wait,
+                "the end of a claimed own stream waits for the stream's rows"
+            );
+        }
+        self.sticky_release_arm(now, out);
+    }
+
+    /// Every event and tick: the claimed streams whose end waits.
+    fn claim_end_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.dl.claim_waits.is_empty() {
+            return;
+        }
+        let gens: Vec<u64> = self.dl.claim_waits.keys().copied().collect();
+        for gen in gens {
+            if self.dl.gens.get(&gen).is_none_or(|g| g.ended) {
+                self.dl.claim_waits.remove(&gen);
+                continue;
+            }
+            self.claim_end(now, gen, replica, out);
+        }
+    }
+
+    /// Whether this node's journal holds a `StreamReleased` of its own stream
+    /// `gen` already.
+    fn release_row_journaled(&self, gen: u64, replica: &dyn Replica) -> bool {
+        if !replica.journal_own_gens().contains(&gen) {
+            return false;
+        }
+        let from = replica.journal_acked_seq().unwrap_or(0) + 1;
+        replica
+            .journal_txs_from(from, usize::MAX)
+            .iter()
+            .filter(|t| t.origin.0 == gen)
+            .flat_map(|t| t.records.iter())
+            .any(|r| matches!(r, LogRecord::StreamReleased { gen: g, .. } if *g == gen))
+    }
+
     /// Whether stream `gen` is one this node's own tenure granted itself (its
     /// number is minted in an epoch block of a lease this node held): the
     /// node was the root when it was made.
@@ -14295,7 +14470,9 @@ impl Core {
 
     fn sticky_release_arm(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.dl.sticky_timer.is_some()
-            || (self.dl.sticky_cmds.is_empty() && self.dl.handovers.is_empty())
+            || (self.dl.sticky_cmds.is_empty()
+                && self.dl.handovers.is_empty()
+                && self.dl.claim_waits.is_empty())
         {
             return;
         }
@@ -14314,6 +14491,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.dl.sticky_timer = None;
+        self.claim_end_progress(now, replica, out);
         self.handover_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
     }

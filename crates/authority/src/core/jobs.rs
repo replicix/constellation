@@ -2017,6 +2017,7 @@ impl Core {
                 || lost
             {
                 halted = true;
+                self.dl.claim_replayed.insert(gen);
                 continue;
             }
             // (The rid the transaction completes, as `apply_backup_tail`
@@ -2034,6 +2035,7 @@ impl Core {
                     "re-appending this node's own delegate row failed: it and the rows after it are replayed by rid"
                 );
                 halted = true;
+                self.dl.claim_replayed.insert(gen);
                 continue;
             }
             self.stats.own_deleg_rows_reappended += 1;

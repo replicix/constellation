@@ -81880,7 +81880,8 @@ mod root_own_sticky {
         let g = h.core.dl.gens.get(&d.gen);
         assert!(g.is_none_or(|g| g.ended), "the claimant keeps the stream");
         if let Some(g) = g {
-            assert_eq!(g.cursor, 2, "the stream ended below what the root assigned");
+            // (The two rows it assigned and the release row after them.)
+            assert_eq!(g.cursor, 3, "the stream ended below what the root assigned");
         }
         let cut = h.meta.void_cut(d.gen).unwrap();
         assert!(
@@ -81896,6 +81897,84 @@ mod root_own_sticky {
             "{origins:?}"
         );
         assert_eq!(h.meta.unjustified_ships(), 0);
+    }
+
+    /// Plan 46 M1.3 step 12 (claim = release): the claim of a non-stealable
+    /// holder is its release. The stream's next row after the two the root
+    /// assigned is the `StreamReleased` of it, which the end cuts at. Fails on
+    /// the parent: the claim ended the stream with no row of its own.
+    #[test]
+    fn a_claim_journals_the_streams_release_as_its_next_row() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        archive_and_step(&mut h);
+        constellation_meta::MetaStore::ack_journal(&h.meta, record).unwrap();
+        for i in 0..2 {
+            let (rid, out) = submit_in(&mut h, 1 + i, dirs[0], &format!("f{i}"));
+            assert!(accepted(&out, rid), "{out:?}");
+        }
+        let mut out = Vec::new();
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.hold(3, None);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        let tip = h.meta.journal_tip().unwrap();
+        let txs = Replica::journal_txs_from(&h.meta, record + 1, usize::MAX);
+        let release = txs.iter().find(|t| {
+            t.records
+                .iter()
+                .any(|r| matches!(r, LogRecord::StreamReleased { gen, .. } if *gen == d.gen))
+        });
+        let release = release.unwrap_or_else(|| panic!("no release row up to {tip}: {txs:?}"));
+        assert_eq!(release.origin, (d.gen, 3), "the release is the stream's next row");
+        let cut = h.meta.void_cut(d.gen).unwrap();
+        assert!(cut.is_none_or(|c| c >= 3), "the end cuts below the release: {cut:?}");
+    }
+
+    /// Plan 46 M1.3 step 12 (ADR-59 D1): the claim's end waits while the
+    /// stream holds a drop whose record the log lacks (a generation that
+    /// ends without it cancels the drop, and the rows it names are
+    /// stranded), and ends once the drop applied. Fails on the parent: the
+    /// stream ended at the claim.
+    #[test]
+    fn a_claimed_stream_ends_after_its_held_rows() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        archive_and_step(&mut h);
+        constellation_meta::MetaStore::ack_journal(&h.meta, record).unwrap();
+        let (rid, out) = submit_in(&mut h, 1, dirs[0], "f0");
+        assert!(accepted(&out, rid), "{out:?}");
+        let mut out = Vec::new();
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.meta.put_stream_drop_plan_for_tests(99, d.gen, 1);
+        h.hold(3, None);
+        assert!(h.meta.stream_drop_pending(d.gen), "the plan is not seen");
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        let ended = |h: &Harness| h.core.dl.gens.get(&d.gen).is_none_or(|g| g.ended);
+        assert!(
+            h.core.dl.gens.get(&d.gen).is_some_and(|g| !g.ended),
+            "the stream ended over its pending drop"
+        );
+        // The drop is applied: the end follows.
+        h.meta.drop_held_cancel(99).unwrap();
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert!(ended(&h), "the stream did not end after the drop applied");
     }
 
     /// ADR-55 (S8): the lease is not released over an own release row that is
