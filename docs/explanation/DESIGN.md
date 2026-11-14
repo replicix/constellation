@@ -1161,6 +1161,10 @@ lease and one log
   suspension; its claim of the lease is its release, and ends its stream after
   the stream's rows
   ([ADR-60](DECISIONS.md#adr-60-a-claim-of-the-lease-by-a-non-stealable-holder-is-its-release-and-ends-its-stream-after-the-streams-rows)).
+  A node leaves the roster only after the log has ended every grant it holds:
+  its own leave releases and waits for the root's end of the stream, and an
+  admin leave of a gone sticky holder is refused until `repair abandon`
+  ([ADR-61](DECISIONS.md#adr-61-a-node-leaves-the-roster-only-after-the-log-has-ended-every-grant-it-holds)).
 - **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
   clock stamps (a peer's stamp more than `CONSTELLATION_HLC_SKEW_TOLERANCE_S`
   ahead is applied but not followed by the clock) merged by `max` and

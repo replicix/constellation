@@ -5516,3 +5516,74 @@ See: `crates/authority/src/core/delegate.rs` (`claim_releases`, `claim_end`,
 `idle_release_progress`), `crates/platform/src/linux_logind.rs`,
 `crates/cli/src/main.rs` (`release_command`),
 [delegations](../reference/features/delegations.md).
+
+## ADR-61: A node leaves the roster only after the log has ended every grant it holds
+
+**Status**: built as plan 46 M1.3 step 14 (the spec: the 2026-11-13
+remaining-steps spec, §2). "Leave ends grants first" is the maintainer's
+decision of 2026-11-06 (plan 46 M1.0 review, SHOULD-2); M1.2 step 11 built it
+for placed grants and this record extends it to the non-stealable kinds and
+fixes where it was short.
+
+**Context**: the roster-only singleton test ([ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer))
+counts a generation of another node that has not ended
+(`Core::singleton_now`). A node retired from the roster while the log still
+lists a live generation of it is read as no peer, so the root would answer
+alone while a holder it does not count writes. The model's property is
+`no_live_grant_off_roster` (`Leave` is enabled only once the root's
+`DelegateNodeEnded` shows).
+
+**Decision**:
+
+- **A holder's own leave** (`Control::ReleaseGrants`) releases every stream and
+  is answered when the root has acknowledged the release row **and the log has
+  ended the stream** (its table keeps a released stream, with no subtree, until
+  the root's `DelegateNodeEnded` reaches it). Answering at the acknowledgement
+  left the root's generation live for the readers' recall or the root's journal
+  after the node was retired (sim `sticky-leave` seed 71, the first run of the
+  new oracle on main).
+- **An admin leave** (`Control::EndGrantsOf`) of a node holding a non-stealable
+  grant it has not been heard on within `abandon_heard_window` is refused at
+  once: `node N holds a sticky grant on <dirs>; run repair abandon --node N
+  first`. A sticky or designated generation has no expiry (`arm_gen_expiry`
+  arms none), so waiting would end at the leave's deadline with "run the leave
+  again". A holder heard lately may be alive: it is recalled, and releases. The
+  leave does not fold an abandon into itself (the abandon's `--force` is the
+  operator's word that the node is down). A leave that runs out of time with a
+  non-stealable stream of the node still live says the same.
+- **A dead root** (the lease holder as this node read it) is retired only when
+  the table lists no non-stealable stream of it: since ADR-55 a root holds its
+  own sticky streams, and a dead root's stay live in the table. The old answer
+  "a root holds no delegation of its own" is kept for a root with none.
+- The recall an admin leave starts is `RecallCause::Leave`, an operator's action
+  of the standing of `undelegate`: `sticky_ends_only_by_holder_or_operator`
+  allows it (the one oracle relaxation of the step).
+- `LeaveError::LiveDesignation` is `LeaveError::LiveGrant { node_id, kind,
+  dirs }`. The core's refusal of a sticky grant reaches the operator as its own
+  text.
+- **A self-leave under a pending drop can abort at its deadline.** A pending
+  drop holds every release of its stream until its record is in the log
+  ([ADR-59](#adr-59-a-directorys-merged-attributes-order-nothing-part-a) part
+  B), so the holder's release, and with it the leave, waits; at `leave_wait`
+  the leave aborts (`leave_self_abort`), the node takes grants again and tells
+  the root. That is the intended behaviour: load may cost a leave its
+  latency, never integrity. The operator runs the leave again.
+- **The sim** drives leaves (`FaultKind::LeaveNode`; configurations
+  `sticky-leave`, `sticky-leave-admin`, `sticky-leave-root`) and judges
+  `no_live_grant_off_roster` at each retirement against the root's generations
+  and at the end of the run against the log; the knob `leave_keeps_grants`
+  (`AUTHORITY_SIM_LEAVE_KEEPS_GRANTS=1`) retires without ending grants and must
+  fail it. The harness scenario is `sticky-leave`.
+
+**Rejected**: an admin leave that abandons the dead holder itself (the
+abandon's word that the node is down is the operator's); answering the
+holder's own leave at its release row's acknowledgement.
+
+**May revert**: the end-of-log wait of the self-leave can go back to the
+acknowledgement alone; the roster-only singleton test then reads a peer's
+generation as no peer for the readers' recall.
+
+See: `crates/authority/src/core/delegate.rs` (`on_control_end_grants_of`,
+`leave_waits_progress`), `crates/engine/src/leave.rs`,
+`crates/model/src/node_stream.rs` (`no_live_grant_off_roster`),
+[delegations](../reference/features/delegations.md).

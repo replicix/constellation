@@ -957,6 +957,24 @@ pending). Counters: `claim_released`, `claim_release_rowless`,
 `claim_own_rows_halted_non_stealable` (the takeover gate replayed the
 stream's own rows by rid; the sim fails it).
 
+**Leave ends grants first.** A node leaves the roster (`constellation leave`) only after the log has ended
+every grant it holds
+([ADR-61](../../explanation/DECISIONS.md#adr-61-a-node-leaves-the-roster-only-after-the-log-has-ended-every-grant-it-holds)):
+
+- its own leave releases its streams, and is answered when the root has
+  appended the release rows and journaled the end of each stream. Under a
+  pending drop (ADR-59 part B) the release waits for the drop's record, and a
+  leave that waits past `leave_wait` aborts: the node takes grants again and
+  the leave is run again;
+- `leave --node-id N` on the root of a node that is gone: a sticky or
+  designated grant has no expiry, so a holder the root has not heard from
+  within `delegation_ttl_ms` is refused at once with `node N holds a sticky
+  grant on <dirs>; run repair abandon --node N first` (the abandon needs
+  `--force`, the operator's word that the node is down), and the leave is run
+  again. A holder heard lately is asked to release, as a live node is;
+- retiring a root that is gone refuses the same way while the table lists a
+  sticky stream of its own (ADR-55).
+
 A designee answers its rows at once, and its commits reach the OS, not
 the disk, so a power loss can drop the end of its journal. Nothing ends
 the designation then (it renews nothing and the root never reclaims it):
