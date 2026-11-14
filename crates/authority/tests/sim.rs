@@ -7191,6 +7191,36 @@ fn flex_epochs_with_backups() {
     assert!(t.epochs > 0, "{t:?}");
 }
 
+/// The harness moved a holder's honour clock through a suspend of its host:
+/// the single-authority sampler (`flex-backup` seed 1373) and the directory
+/// ticker (`flex-backup` seed 60, `flex` seed 490) read it while the suspend
+/// ran on, and a crashed node restarted inside a suspend of its host
+/// (`flex-crash` seed 1306). HONOUR took each read as a suspend of its own and
+/// padded it by a second: the holder's lease lapsed in its own eyes, the
+/// outage's epoch carried none, every write in it was refused, and the
+/// requesters' settles ended in an unsettled `EIO` with the holder reachable.
+/// A suspended host now runs no thread and starts no process, and the sampler
+/// reads without recording (`sim::epochs::s3_lease_usable`).
+#[test]
+fn a_suspended_hosts_honour_clock_moves_only_by_its_own_suspend() {
+    for (label, seed) in [
+        ("flex-backup", 1373),
+        ("flex-backup", 60),
+        ("flex", 490),
+        ("flex-crash", 1306),
+    ] {
+        let cfg = ["settle", "oracles", "unsettled"]
+            .into_iter()
+            .fold(base_config(label), config_variant);
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!(
+                "{label} seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG={label}+settle+oracles+unsettled AUTHORITY_SIM_SEED={seed}"
+            )
+        });
+    }
+}
+
 /// `f = 0` is today's rule: two of three never form an epoch.
 #[test]
 fn flex_zero_forms_no_partial_epoch() {
@@ -17158,10 +17188,13 @@ fn a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants() {
 /// forward timeout as the daemon's, kept 21 and 91 and moved 132 to 72; ADR-51's
 /// kept phase moved 91 and 72 again: of 0 to 400, 4, 21, 215, 250, 253, 302,
 /// 327, 329, 347 and 398 fail with the mutant and the design passes them all,
-/// 21, 4 and 215 are pinned).
+/// 21, 4 and 215 are pinned; plan 46 M1.4 step 6, the harness no longer moving a
+/// suspended host's honour clock, moved 215: of 0 to 600, 4, 21, 250, 347 and
+/// 398 fail with the mutant and the design passes them all, 21, 4 and 250 are
+/// pinned).
 #[test]
 fn a_probe_that_ignores_what_it_reads_is_caught() {
-    for seed in [21u64, 4, 215] {
+    for seed in [21u64, 4, 250] {
         run_seed(seed, fixed_lane(locks_core_stall_backup_long_config()))
             .unwrap_or_else(|e| panic!("locks-core-stall-backup-long seed {seed}: {e}"));
         let e = run_seed(
@@ -20060,7 +20093,7 @@ fn a_late_seal_after_the_holders_renewal_lets_it_reclaim_at_once() {
     assert!(early > 0, "no sealed holder re-claimed early");
     assert!(
         early_of_pinned > 0,
-        "seed {SEAL_GAP_PINNED_SEED} (holder 1 sealed by peer claimant 2, re-claims epoch 3 early) no longer shows the early re-claim"
+        "seed {SEAL_GAP_PINNED_SEED} (holder 2 sealed by peer claimant 3, re-claims epoch 3 early) no longer shows the early re-claim"
     );
 }
 
@@ -20085,7 +20118,22 @@ fn a_seal_before_the_holders_renewal_never_revives_a_sealed_epoch() {
         let sum = |f: fn(&constellation_authority::core::Stats) -> u64| {
             r.stats.values().map(f).sum::<u64>()
         };
+        // The one early re-claim allowed is D7's own: a restarted holder
+        // whose re-adoption CAS landed over the epoch a peer claimant sealed
+        // meanwhile is not adopted, and claims the next epoch at once, over
+        // that very epoch (`sealed_own_early_claims_after_drop`; seed 181's
+        // node 1 since plan 46 M1.4 step 6 moved its schedule), at most once
+        // per dropped re-adoption. Any other early re-claim fails, as does a
+        // sealed epoch written again.
         assert_eq!(sum(|s| s.sealed_own_early_claims), 0, "seed {seed}");
+        for (node, s) in &r.stats {
+            assert!(
+                s.sealed_own_early_claims_after_drop <= s.sealed_own_readoptions_dropped,
+                "seed {seed} node {node}: {} early re-claim(s) after a drop, {} dropped re-adoption(s)",
+                s.sealed_own_early_claims_after_drop,
+                s.sealed_own_readoptions_dropped
+            );
+        }
         assert_eq!(sum(|s| s.sealed_own_epoch_rewrites), 0, "seed {seed}");
     }
 }
@@ -20096,8 +20144,11 @@ fn a_seal_before_the_holders_renewal_never_revives_a_sealed_epoch() {
 // pin, 400 ms and seed 79. ADR-51's kept phase sends the claimant's plain seal
 // after its promise check, 43 ms later than the claim's first seal went on
 // seed 1134: at 250 ms it misses the renewal's window, and 1134 shows the
-// early re-claim at 180 to 192 ms only (none in 5,800 seeds at 250 ms).)
-const SEAL_GAP_DELAY_MS: u64 = 186;
+// early re-claim at 180 to 192 ms only (none in 5,800 seeds at 250 ms).
+// Plan 46 M1.4 step 6: with the harness no longer moving a suspended host's
+// honour clock, 1134 shows it at 170 to 180 ms (holder 2 sealed by peer
+// claimant 3), and no seed of 0 to 6,000 at 186 ms: 175 ms.)
+const SEAL_GAP_DELAY_MS: u64 = 175;
 const SEAL_GAP_PINNED_SEED: u64 = 1134;
 const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
 
@@ -20197,7 +20248,10 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // 6 seeds fail, 98 before ADR-58 and 20 before its follow-up: the
         // settle of an op in a frozen epoch ends one window after the freeze,
         // and a few windows end with the sequencer reachable for part of
-        // them, see ADR-58's residuals.)
+        // them, see ADR-58's residuals. Plan 46 M1.4 step 6: 7 seeds failed on
+        // main before it, 3 after; the 4 it fixed were holders whose lease
+        // the harness lapsed by reading their honour clock through a
+        // suspend of their host.)
         ("flex", flex_config),
         ("delegated-crash", delegated_crash_config),
         // (0 of 2,000 seeds `+unsettled` after S5, ADR-42; 1 violation in
@@ -20313,13 +20367,21 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // otherwise, 1,270 over 2,000 seeds against main's 1,259). In 2,000 seeds
         // `+settle+oracles+unsettled` 59 seeds fail (73 before the follow-up),
         // 1834 a late landing that fails on main too, the rest an unsettled
-        // `EIO` with a sequencer reachable: see ADR-58's residuals.)
+        // `EIO` with a sequencer reachable: see ADR-58's residuals. Plan 46
+        // M1.4 step 6: the harness no longer moves a suspended host's honour
+        // clock; `held-behind-lost-chunk` measures 58 (main 60), and the
+        // column goes from 69 to 58; 43 of 2,000 seeds fail, 46 before.)
         ("flex-crash", flex_crash_config, 0, 2),
         // (ADR-58, seeds 0..99: 1 violation (seed 60: the root reachable for
         // the whole 3 s window of a frozen epoch) and no allowed one; 55 of
         // 2,000 seeds fail `+settle+oracles+unsettled` (40 after the
-        // follow-up's settle rule, 55 before it), 101 before ADR-58.)
-        ("flex-backup", flex_backup_config, 1, 0),
+        // follow-up's settle rule, 55 before it), 101 before ADR-58. Plan 46
+        // M1.4 step 6: seed 60's holder had its own lease lapsed by the
+        // harness, which read its honour clock through a suspend of its host
+        // (`a_suspended_hosts_honour_clock_moves_only_by_its_own_suspend`):
+        // none and none, 10 of 2,000 seeds fail, 38 before, the rest a
+        // holder whose forward wall step lapsed its lease by design.)
+        ("flex-backup", flex_backup_config, 0, 0),
         // (ADR-58, seeds 0..99: 10 violations in 9 seeds and 18 allowed
         // (isolated 7, none in time 11); the lease path of seed 76 is
         // reachable for 118 ms of a 3 s window. Not bounded on main, 876
@@ -20349,7 +20411,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // ADR-58's `held-behind-lost-chunk` has a column of its own (a row that
     // waits behind a chunk that exists nowhere: allowed, checked against the
     // chunk ledger and the drops). Ceilings only go down; absent: 0.
-    let held_lost_chunk_ceilings: [(&str, usize); 1] = [("flex-crash", 69)];
+    let held_lost_chunk_ceilings: [(&str, usize); 1] = [("flex-crash", 58)];
     const SEEDS: u64 = 100;
     // (label, config, the ceilings on violations, on allowed ones and on
     // ADR-58's `held-behind-lost-chunk`, a class of its own)
@@ -21228,27 +21290,27 @@ fn a_resumed_own_stream_row_keeps_its_tenures_order() {
 /// claimant's own member copy, both of rows the log carries. It counts a
 /// divergence and ends the attempt; the next attempt completes once a ship
 /// covers the copy. Nothing is re-shipped or lost: the merge skips every
-/// copy the log carries, whichever it keeps. Pinned: the runs pass, no
-/// operator force is needed, and the counter is what the sweeps report
-/// (`drop-held-chain-backed` 1529, `metered-shared+links` 259 and 266).
+/// copy the log carries, whichever it keeps. Pinned: the run passes, no
+/// operator force is needed, and the counter is what the sweeps report.
+/// (`drop-held-chain-backed` 1529 and `metered-shared+links` 266 were the
+/// pins with 259 until plan 46 M1.4 step 6's harness clock fix moved their
+/// schedules; searched again then: `metered-shared+links` 0 to 3,999 shows
+/// the shape on 259 only, `drop-held-chain-backed` 0 to 5,999 on 3022, 3063
+/// and 5172, `metered-shared` 0 to 1,999 on 359 and 1892.)
 #[test]
 fn a_hole_and_a_logged_copy_at_one_seq_only_delay_the_claim() {
     let cases: [(&str, SimConfig, u64); 3] = [
-        (
-            "drop-held-chain-backed",
-            drop_held_chain_backed_config(),
-            1529,
-        ),
         (
             "metered-shared+links",
             config_variant(metered_shared_config(), "links"),
             259,
         ),
         (
-            "metered-shared+links",
-            config_variant(metered_shared_config(), "links"),
-            266,
+            "drop-held-chain-backed",
+            drop_held_chain_backed_config(),
+            3022,
         ),
+        ("metered-shared", metered_shared_config(), 359),
     ];
     for (label, cfg, seed) in cases {
         let r = run_seed(seed, cfg).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));

@@ -2210,8 +2210,14 @@ pub struct Stats {
     /// key than the claimant read (its claim CAS could not land).
     pub seal_tail_stale_key: u64,
     /// A self-sealed holder claimed its own lease at once, because the lease
-    /// had moved off every key a sealer read (D7 amended).
+    /// had moved off every key a sealer read (D7 amended). Not counted here:
+    /// the claim that follows a dropped re-adoption of the same epoch
+    /// (`sealed_own_early_claims_after_drop`).
     pub sealed_own_early_claims: u64,
+    /// Of the early own claims, those over the epoch whose re-adoption CAS
+    /// this node dropped just before (D7: the restarted holder claims the
+    /// next epoch at once from its member copy).
+    pub sealed_own_early_claims_after_drop: u64,
     /// A claim CAS that wrote this node's own epoch although the node had
     /// sealed it (never: D7 makes it the takeover at the next epoch).
     pub sealed_own_epoch_rewrites: u64,

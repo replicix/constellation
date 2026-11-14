@@ -4251,6 +4251,7 @@ impl Core {
                 && self.bk.sealed >= sent.epoch
             {
                 self.stats.sealed_own_readoptions_dropped += 1;
+                self.bk.readoption_dropped = Some(sent.epoch);
                 tracing::warn!(
                     node = self.cfg.node_id,
                     epoch = sent.epoch,
@@ -4352,7 +4353,12 @@ impl Core {
         });
         if early_own {
             if let Some(p) = prev.as_ref() {
-                self.stats.sealed_own_early_claims += 1;
+                if self.bk.readoption_dropped == Some(p.epoch) {
+                    self.bk.readoption_dropped = None;
+                    self.stats.sealed_own_early_claims_after_drop += 1;
+                } else {
+                    self.stats.sealed_own_early_claims += 1;
+                }
                 tracing::warn!(
                     node = self.cfg.node_id,
                     epoch,

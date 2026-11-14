@@ -232,6 +232,16 @@ impl NodeClockState {
             .push((from, from + for_ms as i128 * MS_NS));
     }
 
+    /// The end (true ns) of the suspend true time `t` (ns) falls in, if it
+    /// falls in one: until then no process of the host runs.
+    pub fn suspended_through(&self, t: i128) -> Option<i128> {
+        let o = self.osc.lock().unwrap();
+        o.suspends
+            .iter()
+            .find(|(from, to)| *from <= t && t < *to)
+            .map(|(_, to)| *to)
+    }
+
     /// A new boot at true time `at` (ns): the elapsed sources restart.
     pub fn reboot(&self, at: i128) {
         self.osc.lock().unwrap().boots.push(at);
