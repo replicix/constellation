@@ -5542,6 +5542,14 @@ alone while a holder it does not count writes. The model's property is
   left the root's generation live for the readers' recall or the root's journal
   after the node was retired (sim `sticky-leave` seed 71, the first run of the
   new oracle on main).
+- **The root acknowledges a leaving node's note only when it lists no live
+  generation of the node**, and recalls the ones it lists (`RecallCause::Leave`;
+  the node releases a stream it never installed by a rowless release, the root
+  ends it). A grant journaled before the root had the note reaches the node's
+  table after the node answered its leave, so the node would be retired with a
+  live grant (`sticky-leave` with the idle release on, an operator's regrant
+  racing the leave, seeds 209 and 292 of the first run); the node sends the note
+  again until it is acknowledged.
 - **An admin leave** (`Control::EndGrantsOf`) of a node holding a non-stealable
   grant it has not been heard on within `abandon_heard_window` is refused at
   once: `node N holds a sticky grant on <dirs>; run repair abandon --node N
@@ -5574,6 +5582,14 @@ alone while a holder it does not count writes. The model's property is
   and at the end of the run against the log; the knob `leave_keeps_grants`
   (`AUTHORITY_SIM_LEAVE_KEEPS_GRANTS=1`) retires without ending grants and must
   fail it. The harness scenario is `sticky-leave`.
+
+**Open**: a node that is not the root answers the retirement of a dead root
+from its own table, which can be behind the log (a follower that was paused):
+`sticky-leave-root` with the operator asking any node
+(`AUTHORITY_SIM_LEAVE_ASKS_ANY=1`) and the idle release on retires a root with
+its own sticky stream live (seeds 593 and 680). The sim operator asks the node
+the lease names. A fix needs the answering node to know its table is current
+(or to refuse until a root has taken over); it is not built.
 
 **Rejected**: an admin leave that abandons the dead holder itself (the
 abandon's word that the node is down is the operator's); answering the
