@@ -324,6 +324,7 @@ fn replay_seed() {
         Ok("sticky-holder-fresh") => sticky_holder_fresh_config(),
         Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
+        Ok("sticky-claim") => sticky_claim_config(),
         Ok("sticky-stale-route") => sticky_stale_route_config(),
         Ok("sticky-root-designee-inbox") => sticky_root_designee_inbox_config(),
         Ok("sticky-root-designee-inbox-skew") => sticky_root_designee_inbox_skew_config(),
@@ -2279,6 +2280,32 @@ fn sticky_holder_returns_config() -> SimConfig {
         }
     }
     config
+}
+
+/// Plan 46 M1.3 step 12 (claim = release): the root crashes while node 2
+/// holds a sticky grant (`d2`) and writes there, and comes back later; a
+/// holder (node 2 or 3) takes the lease meanwhile, so the holder's claim ends
+/// its sticky stream. The claim must journal the release (the sim no longer
+/// excuses the end), and the stream must not be grown or written after it.
+fn sticky_claim_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        strict: true,
+        dirs: vec!["d1".into(), "d2".into()],
+        delegations: Vec::new(),
+        sticky_delegations: vec![("d2".into(), 2)],
+        cross_ratio: 0.1,
+        ops_per_client: 40,
+        faults: vec![ScheduledFault {
+            at_ms: 2_500,
+            kind: FaultKind::CrashNode {
+                node: 1,
+                restart_ms: Some(6_000),
+                keep_journal: true,
+            },
+        }],
+        ..delegated_config()
+    }
 }
 
 /// ADR-46: the holder of a sticky grant crashes and returns with its journal
@@ -7532,6 +7559,7 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-holder-fresh" => sticky_holder_fresh_config(),
         "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
         "sticky-ttl" => sticky_ttl_config(),
+        "sticky-claim" => sticky_claim_config(),
         "sticky-stale-route" => sticky_stale_route_config(),
         "sticky-root-designee-inbox" => sticky_root_designee_inbox_config(),
         "sticky-root-designee-inbox-skew" => sticky_root_designee_inbox_skew_config(),

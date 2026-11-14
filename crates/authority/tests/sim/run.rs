@@ -1314,7 +1314,11 @@ impl Default for SimConfig {
                 "AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM",
             )
             .is_some_and(|v| v == "1"),
-            sticky_idle_ms: None,
+            // `AUTHORITY_SIM_STICKY_IDLE_MS=<ms>` turns the core's idle release on in
+            // any configuration (plan 46 M1.3 step 6; about 1200 in sim time).
+            sticky_idle_ms: std::env::var("AUTHORITY_SIM_STICKY_IDLE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             idle_gaps: false,
             joiner_client: None,
             abandon_skips_read_recall: std::env::var_os("AUTHORITY_SIM_ABANDON_SKIPS_READ_RECALL")
@@ -7585,7 +7589,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.sticky_ended_released = found.sticky_released;
     report.sticky_ended_abandoned = found.sticky_abandoned;
     let mut sticky_recalled_other = 0u64;
-    let mut claim_halted = 0u64;
+    let (mut claim_halted, mut claim_drop_cancelled) = (0u64, 0u64);
     for s in report.stats.values() {
         for (t, v) in report.ll_core.iter_mut().zip([
             s.settles_withdrawn_first,
@@ -7644,7 +7648,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.claim_core[1] += s.claim_release_rowless;
         report.claim_core[2] += s.claim_end_waits;
         claim_halted += s.claim_own_rows_halted_non_stealable;
-        report.claim_core[3] += s.claim_end_unordered;
+        report.claim_core[3] += s.claim_end_rows_outrun;
+        claim_drop_cancelled += s.claim_end_drop_cancelled;
         for (t, v) in report.handover_core.iter_mut().zip([
             s.deleg_handovers_requested,
             s.place_handover_granted,
@@ -7704,6 +7709,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         found.sticky.push(format!(
             "claim_is_release: a claim replayed {claim_halted} non-stealable stream(s)' own rows by \
              rid at the takeover gate: no release row follows rows the log lacks"
+        ));
+    }
+    if claim_drop_cancelled > 0 {
+        found.sticky.push(format!(
+            "claim_is_release: {claim_drop_cancelled} claimed own stream(s) ended with a drop \
+             pending (ADR-59 D1 cancels it and the rows it names stay stranded)"
         ));
     }
     report.sticky_ended_unexcused = found.sticky.len();
