@@ -77,13 +77,6 @@ pub enum FaultKind {
         restart_ms: Option<u64>,
         keep_journal: bool,
     },
-    /// Plan 46 M1.3 step 14: `node`'s journal is flushed (every row it
-    /// answered is in the log), then the process is killed for good. A holder
-    /// that dies with answered rows only it holds loses them to an abandon,
-    /// the operator's price (`sticky-holder-dies` covers it, with the holder's
-    /// return); the leave configurations are about the roster, not about
-    /// that.
-    FlushThenCrash { node: NodeId },
     /// Cut P2P between two nodes for `for_ms`.
     Partition { a: NodeId, b: NodeId, for_ms: u64 },
     /// Cut one node's path to S3 for `for_ms`.
@@ -610,6 +603,10 @@ pub struct SimConfig {
     /// configuration; a run that retires a node holding a grant fails
     /// `no_live_grant_off_roster`.
     pub leave_keeps_grants: bool,
+    /// The operator's leave of a dead node goes to any node when none holds
+    /// the lease (`AUTHORITY_SIM_LEAVE_ASKS_ANY=1`): a follower that is not
+    /// the root must refuse a dead root's retirement (ADR-61).
+    pub leave_asks_any: bool,
     /// Negative control (`Config::fence_accepts_unrouted`): a node runs a
     /// forward under its generation whatever generation it was routed by (no
     /// delegate fence). `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1` sets it on
@@ -1346,6 +1343,8 @@ impl Default for SimConfig {
                 .is_some_and(|v| v == "1"),
             leave_keeps_grants: std::env::var_os("AUTHORITY_SIM_LEAVE_KEEPS_GRANTS")
                 .is_some_and(|v| v == "1"),
+            leave_asks_any: std::env::var_os("AUTHORITY_SIM_LEAVE_ASKS_ANY")
+                .is_some_and(|v| v == "1"),
             fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
                 .is_some_and(|v| v == "1"),
             holder_runs_inbox_ever: std::env::var_os("AUTHORITY_SIM_HOLDER_RUNS_INBOX_EVER")
@@ -1895,6 +1894,8 @@ pub struct Cluster {
     pub leave_driver: Mutex<[u64; 4]>,
     /// `SimConfig::leave_keeps_grants`.
     pub leave_keeps_grants: bool,
+    /// `SimConfig::leave_asks_any`.
+    pub leave_asks_any: bool,
 }
 
 impl Cluster {
@@ -4229,25 +4230,20 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                         ));
                         return;
                     }
-                    // The root, as the lease names it. With none alive the
-                    // operator waits for a survivor to take over: a node that
-                    // is not the root answers for a dead root from its own
-                    // table, which may be behind the log (a follower that was
-                    // paused), and a root retired through it can hold a live
-                    // grant of its own (`AUTHORITY_SIM_LEAVE_ASKS_ANY=1` asks
-                    // any node: `sticky-leave-root` with the idle release on,
-                    // seeds 593, 680).
+                    // The root, as the lease names it; with none alive and
+                    // `leave_asks_any`, any other node (a follower must refuse
+                    // a dead root's retirement until a root has taken over).
                     let lease_root = read_lease(&cluster.env.bucket)
                         .await
                         .map(|l| l.holder)
                         .filter(|h| *h != 0 && *h != node && cluster.get(*h).alive());
                     let target = lease_root.or_else(|| {
-                        std::env::var_os("AUTHORITY_SIM_LEAVE_ASKS_ANY").and_then(|_| {
+                        cluster.leave_asks_any.then(|| {
                             cluster
                                 .ids()
                                 .into_iter()
                                 .find(|n| *n != node && cluster.get(*n).alive())
-                        })
+                        })?
                     });
                     let Some(target) = target else {
                         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -4282,6 +4278,19 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                             // root, then leaves again. (Not the node that said
                             // it is no usable root: that one asks again.)
                             if lease_root == Some(target) {
+                                // The streams the root lists for the node: an
+                                // abandon that ends them dates them, as
+                                // `AbandonNode` does (the end-of-run
+                                // allowance of the rows only the dead node
+                                // held).
+                                let gens: Vec<u64> = h
+                                    .view()
+                                    .delegation
+                                    .gens
+                                    .iter()
+                                    .filter(|g| g.1 == node && !g.6)
+                                    .map(|g| g.2)
+                                    .collect();
                                 let r = tokio::time::timeout(
                                     Duration::from_secs(15),
                                     h.control(constellation_authority::Control::Abandon {
@@ -4294,6 +4303,13 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                                 )
                                 .await;
                                 cluster.leave_driver.lock().unwrap()[1] += 1;
+                                if matches!(r, Ok(Ok(Ok(_)))) {
+                                    let at = cluster.env.clock.elapsed_ms();
+                                    let mut m = cluster.abandoned_at.lock().unwrap();
+                                    for g in &gens {
+                                        m.insert(*g, at);
+                                    }
+                                }
                                 note(format!(
                                     "t={} repair abandon --node {node} --force on {target}: {r:?}",
                                     cluster.env.clock.elapsed_ms()
@@ -4370,30 +4386,6 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 cluster.host_resumed(node).await;
                 cluster.restart(node, keep_journal.then_some(meta));
             }
-        }
-        FaultKind::FlushThenCrash { node } => {
-            let n = cluster.get(node);
-            if !n.alive() {
-                return;
-            }
-            let flushed = tokio::time::timeout(
-                Duration::from_secs(20),
-                n.control(constellation_authority::Control::Flush),
-            )
-            .await;
-            // (The stream to the root goes on after the flush: it is given
-            // time to carry what the node answered.)
-            tokio::time::sleep(Duration::from_millis(2_000)).await;
-            note(format!(
-                "t={} flush node {node}, then crash it for good: {flushed:?}",
-                cluster.env.clock.elapsed_ms()
-            ));
-            if !cluster.get(node).alive() {
-                return;
-            }
-            let at = cluster.env.clock.elapsed_ms();
-            cluster.note_takedown(node, None, at).await;
-            cluster.crash(node);
         }
         FaultKind::Partition { a, b, for_ms } => {
             note(format!(
@@ -5821,6 +5813,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         leave_violations: Mutex::new(Vec::new()),
         leave_driver: Mutex::new([0; 4]),
         leave_keeps_grants: cfg.leave_keeps_grants,
+        leave_asks_any: cfg.leave_asks_any,
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),
         s3_cut: Mutex::new(BTreeMap::new()),

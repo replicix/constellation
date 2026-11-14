@@ -2338,11 +2338,9 @@ fn sticky_leave_config() -> SimConfig {
     }
 }
 
-/// The admin form: node 2, which has written its few rows by then, has them
-/// flushed and is killed for good at 5 s (a holder that dies with rows only it
-/// holds loses them to the abandon: that is the operator's price, and
-/// `sticky-holder-dies` covers it, with the holder's return). The operator
-/// retires it from 11 s on, past the root's heard-lately window: the root
+/// The admin form: node 2 dies at 2.5 s for good (the rows only it holds are
+/// lost to the abandon, which the oracle dates: the operator's price). The
+/// operator retires it from 9 s on, past the root's heard-lately window: the root
 /// refuses at once naming `repair abandon --node 2`, the operator abandons
 /// (it has confirmed the node is down), and the leave goes through. Before
 /// the window ends the root takes the holder for alive, recalls it, and the
@@ -2351,11 +2349,15 @@ fn sticky_leave_admin_config() -> SimConfig {
     SimConfig {
         faults: vec![
             ScheduledFault {
-                at_ms: 5_000,
-                kind: FaultKind::FlushThenCrash { node: 2 },
+                at_ms: 2_500,
+                kind: FaultKind::CrashNode {
+                    node: 2,
+                    restart_ms: None,
+                    keep_journal: true,
+                },
             },
             ScheduledFault {
-                at_ms: 11_000,
+                at_ms: 9_000,
                 kind: FaultKind::LeaveNode {
                     node: 2,
                     admin: true,
@@ -2366,28 +2368,30 @@ fn sticky_leave_admin_config() -> SimConfig {
         // A late client of node 3 keeps the cluster busy (a lease is
         // claimed and renewed on demand), so the root is usable when the
         // operator comes.
-        client_plan: vec![(2, 0, 4), (3, 10_000, 8)],
+        client_plan: vec![(3, 10_000, 8)],
         ..sticky_leave_config()
     }
 }
 
 /// The admin form for the root (`far-root-writes`): node 1, which holds its own
-/// sticky stream on `d1` since ADR-55, dies for good at 9 s, and a survivor takes
-/// the lease. The operator retires node 1 from 9.5 s on, through the node the
-/// lease names: the retirement is refused while the log lists a live stream of
-/// node 1, until the operator abandons it.
+/// sticky stream on `d1` since ADR-55, dies for good at 3 s (the rows only it
+/// holds are lost to the abandon, which the oracle dates), and the survivors'
+/// clients start at 6 s. The operator retires node 1 from 3.5 s on, asking the
+/// lease holder or, with none, any node: a follower refuses until a root has
+/// taken over (ADR-61), and the retirement is refused on the root while the log
+/// lists a live stream of node 1, until the operator abandons it.
 fn sticky_leave_root_config() -> SimConfig {
     SimConfig {
         faults: vec![
             ScheduledFault {
-                at_ms: 9_000,
+                at_ms: 3_000,
                 kind: FaultKind::CrashHolder {
                     restart_ms: None,
                     keep_journal: true,
                 },
             },
             ScheduledFault {
-                at_ms: 9_500,
+                at_ms: 3_500,
                 kind: FaultKind::LeaveNode {
                     node: 1,
                     admin: true,
@@ -2395,10 +2399,9 @@ fn sticky_leave_root_config() -> SimConfig {
                 },
             },
         ],
-        // The root's own clients are done by 9 s (what only a root that dies for
-        // good holds is lost to the abandon); late clients of the survivors
-        // (a lease is taken on demand) have one take it over.
-        client_plan: vec![(1, 0, 8), (2, 12_000, 12), (3, 12_000, 12)],
+        // (A lease is taken on demand: late clients have a survivor take it.)
+        client_plan: vec![(2, 6_000, 12), (3, 6_000, 12)],
+        leave_asks_any: true,
         ..far_root_writes_config()
     }
 }
@@ -22144,6 +22147,24 @@ fn a_node_that_leaves_ends_its_grants_first() {
     assert!(admin > 0, "no node was retired by the admin form");
     assert!(refused > 0, "no admin leave was refused naming the abandon");
     assert!(abandons > 0, "the operator abandoned no node for a leave");
+}
+
+/// Plan 46 M1.3 step 14 (ADR-61): the operator asks any node to retire the dead
+/// root before a survivor has taken over. A follower that is not the root
+/// answered "holds no delegation of its own" from a table behind the log and
+/// the root was retired with its own sticky stream live (seed 581 failed
+/// `no_live_grant_off_roster` on the first version); it refuses until a root has
+/// taken over.
+#[test]
+fn a_follower_does_not_retire_a_dead_root_from_its_own_table() {
+    let config = sticky_leave_root_config();
+    for seed in [581u64, 593, 680] {
+        run_seed(seed, config.clone()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-leave-root"
+            )
+        });
+    }
 }
 
 /// Plan 46 M1.3 step 14's negative control: with the knob `leave_keeps_grants`
