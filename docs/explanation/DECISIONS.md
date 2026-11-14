@@ -4899,6 +4899,37 @@ before the outage.
   cover); flex, flex-tight, flex-backup and the `lost-chunk`,
   `far-root-writes*`, `sticky-handover-*` and `drop-held-chain*` labels
   unchanged.
+- **C5b, the local twin of C5: a settle whose own hold ended is routed once
+  more at its deadline** (2026-11-14). When the requester is itself the
+  root, its own ship plan holds the row behind a lost chunk and it hears no
+  `Held`. At a second deadline `rid_behind_lost_chunk` is read and
+  remembered (`ClientOp::own_lost_chunk`). At a later second deadline, if
+  that hold has ended (the operator's `drop-held` landed, or the chunk came
+  back), the log does not answer the rid and `final_ask` is not spent, the
+  settle is routed once more by `settle_route`, as at its first deadline
+  (this node if it is still the root, else the holder that took over: the
+  drop may have taken the lease), and the deadline moves one forward timeout
+  for the answer. `final_ask` is shared with C5, so one settle gets one such
+  move, and the frozen-epoch grace is spent too (no stacking; not capped by
+  `settle_cap`). A row that is still held gets no route: it ends in doubt,
+  labelled, at that deadline as before. The route is the settle of ADR-58
+  C2 again, deduplicated by rid: nothing executes that its first route would
+  not, so ADR-49's late-landing rules, I1 and single apply are untouched.
+  Nothing runs on the hot path. **Bound**: one forward timeout more, only
+  for an op whose own hold ended (500 ms at the defaults, 400 ms in the
+  sim). Counter `settle_local_final_routes`. The review had proposed a
+  re-route with no added wait; in seed 384 the lease was gone by the
+  deadline (released at t=23043, taken over by another node at t=23195, the
+  deadline at t=23219), so the route goes to the new holder and needs the
+  forward timeout for its answer. Pinned by `flex-crash` seed 384
+  (`adr58_c5b_a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline`;
+  fails on the parent) and by
+  `a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline`.
+  Seeds 0..1999: flex-crash 32 to 27 (9, 384, 485, 1079, 1247 settle); no
+  seed fails that did not on the parent; flex, flex-tight, flex-backup, the
+  `lost-chunk`, `far-root-writes*`, `far-placement-release`,
+  `sticky-handover-*` and `drop-held-chain*` labels unchanged. Ceilings
+  (seeds 0..99): `flex-crash` violations 1 to 0; no ceiling raised.
 
 **Rejected**: rolling back the held dependents of a settled rid automatically
 (it puts rollback in the settle path and pre-empts the operator); C1b, letting

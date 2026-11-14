@@ -317,6 +317,12 @@ pub(crate) struct ClientOp {
     /// word, never the negative control's label,
     /// `Config::lost_chunk_label_always`).
     pub last_held_lost_chunk: Option<NodeId>,
+    /// ADR-58 C5b: this node's own plan held the settled op's row behind a
+    /// lost chunk when a second deadline fired (the requester is itself the
+    /// root, so it hears no `Held`). If the hold has ended by the next
+    /// deadline (the operator's `drop-held` landed), that deadline routes the
+    /// settle once more (`client_deadline`; once, with `final_ask`).
+    pub own_lost_chunk: bool,
     /// ADR-44: this settle waits in `Backoff` for a recall this node's
     /// shippable gate sent on demand; the backoff routes it as a settle
     /// again (`settle_route`), where the gate answers it after the cut.
@@ -903,6 +909,7 @@ impl Core {
                 durable_grace: false,
                 final_ask: false,
                 last_held_lost_chunk: None,
+                own_lost_chunk: false,
                 gate_recall_wait: false,
                 designation_held: false,
                 lost_chunk_held: false,
@@ -4501,6 +4508,12 @@ impl Core {
         };
         let second = c.settle;
         let (recalling, settle_cap) = (c.phase == Phase::Recalling, c.settle_cap);
+        // ADR-58 C5b: remember that this node's own plan holds the row behind
+        // a lost chunk (read at each second deadline; a lookup, off the hot
+        // path).
+        if second && !c.own_lost_chunk && replica.rid_behind_lost_chunk(rid) {
+            self.clients.get_mut(&rid).expect("present").own_lost_chunk = true;
+        }
         // Plan 46 M1.2 step 13 (review): a settle of this node's own op, parked
         // here as the root for the recall of a generation the root outwaits
         // (a silent delegate, an inherited generation), is kept until the
@@ -4628,6 +4641,33 @@ impl Core {
                 }
                 self.stats.settle_final_asks += 1;
                 self.send_forward(now, rid, root, 0, replica, out);
+                return;
+            }
+        }
+        // ADR-58 C5b: the local twin of C5. This node's own plan held the
+        // op's row behind a lost chunk at an earlier second deadline and no
+        // longer does (the operator's `drop-held` landed, or the chunk came
+        // back): the row can be answered now, by this node if it is still
+        // the root, else by the holder that took over, and the lease may
+        // have gone with the drop. The settle is routed once more, as at its
+        // first deadline, and the deadline waits one forward timeout for the
+        // answer (once per settle, shared with C5's `final_ask`, so the two
+        // do not stack; not capped by `settle_cap`). A row that is still held
+        // gets no ask: it ends in doubt, labelled, at this deadline.
+        if second && self.settle_local_final_route(rid, replica) {
+            let at = now.wait.plus(self.cfg.forward_timeout_ms);
+            if self.extend_settle_deadline(rid, at, Some(now.wait), out) {
+                let c = self.clients.get_mut(&rid).expect("present");
+                c.final_ask = true;
+                c.forward_grace = true;
+                if let Phase::Forwarded { req, .. } = c.phase {
+                    self.by_req.remove(&req);
+                }
+                if let Some(t) = c.timer.take() {
+                    self.cancel_timer(t, out);
+                }
+                self.stats.settle_local_final_routes += 1;
+                self.settle_route(now, rid, replica, out);
                 return;
             }
         }
@@ -5128,6 +5168,18 @@ impl Core {
             })
             .filter(|root| *root != self.cfg.node_id)?;
         self.reaches(now, root).then_some(root)
+    }
+
+    /// ADR-58 C5b: whether the settle of `rid` is routed once more at its
+    /// second deadline: its own plan held the row behind a lost chunk
+    /// (`ClientOp::own_lost_chunk`), the hold has ended, it has not been
+    /// routed so already (`final_ask`), and the log does not answer the rid.
+    fn settle_local_final_route(&mut self, rid: Rid, replica: &dyn Replica) -> bool {
+        self.clients
+            .get(&rid)
+            .is_some_and(|c| c.settle && c.own_lost_chunk && !c.final_ask)
+            && !replica.rid_behind_lost_chunk(rid)
+            && self.settled_outcome(rid, replica).is_none()
     }
 
     /// Move a settle's second deadline to `at` (the wait clock): cancels the

@@ -58954,6 +58954,104 @@ mod c2g_settle {
         assert_eq!(requester.core.stats.settle_final_asks, 0);
     }
 
+    /// ADR-58 C5b (flex-crash seed 384): a settle whose own plan held the
+    /// row behind a lost chunk (`own_lost_chunk`, set at an earlier second
+    /// deadline) and no longer does is routed once more at its second
+    /// deadline, and waits a forward timeout for the answer, instead of
+    /// telling the unsettled `EIO` at once. Without the earlier hold there
+    /// is no extra route.
+    #[test]
+    fn a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline() {
+        let at_deadline = |held_before: bool| {
+            let (_holder, mut requester) = pair();
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("x"),
+                tag: Default::default(),
+            });
+            let first = deadline_timer(&requester, &out);
+            let cfg = requester.core.config().clone();
+            requester
+                .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+            requester.step(Event::Timer { id: first });
+            requester
+                .core
+                .clients
+                .get_mut(&rid)
+                .expect("settling")
+                .own_lost_chunk = held_before;
+            let id = requester.core.clients[&rid].deadline;
+            requester.advance(requester.core.dl_t().settle_window);
+            let out = requester.step(Event::Timer { id });
+            (requester, rid, out)
+        };
+        let in_doubt = |out: &[Action], rid: Rid| {
+            replies(out)
+                .iter()
+                .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt))
+        };
+
+        let (mut requester, rid, out) = at_deadline(true);
+        assert!(
+            !in_doubt(&out, rid),
+            "told EIO without the final route: {out:?}"
+        );
+        let Some(PeerMsg::MutateRequest {
+            req, settle: true, ..
+        }) = forward_to_1(&out)
+        else {
+            panic!("no settle routed at the deadline: {out:?}");
+        };
+        assert_eq!(requester.core.stats.settle_local_final_routes, 1);
+        assert!(requester.core.clients[&rid].final_ask);
+        assert!(requester.core.clients[&rid].forward_grace);
+        let forward_timeout = requester.core.config().forward_timeout_ms;
+        assert_eq!(
+            requester.core.clients[&rid].settle_until,
+            WaitMs(requester.now.plus(forward_timeout).0),
+            "the deadline waits one forward timeout for the answer"
+        );
+        // The answer settles the op.
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Abandoned,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+                non_stealable: false,
+            },
+        });
+        assert!(
+            replies(&out)
+                .iter()
+                .any(|(x, a)| *x == rid
+                    && matches!(a, ClientReply::Outcome(MutateOutcome::Abandoned))),
+            "the answer settles the op: {out:?}"
+        );
+
+        // No answer: the moved deadline tells the unsettled `EIO`, with no
+        // further route.
+        let (mut requester, rid, _) = at_deadline(true);
+        let id = requester.core.clients[&rid].deadline;
+        requester.advance(forward_timeout);
+        let out = requester.step(Event::Timer { id });
+        assert!(in_doubt(&out, rid), "{out:?}");
+        assert!(forward_to_1(&out).is_none(), "routed twice: {out:?}");
+        assert_eq!(requester.core.stats.settle_local_final_routes, 1);
+
+        // No hold before: no extra route, the deadline tells the `EIO`.
+        let (requester, rid, out) = at_deadline(false);
+        assert!(in_doubt(&out, rid), "{out:?}");
+        assert_eq!(requester.core.stats.settle_local_final_routes, 0);
+    }
+
     /// ADR-58 S4: the label is the last answer's word: a settle that heard
     /// `Held { lost_chunk }` and is then told a plain `Held` (the row has
     /// shipped since, or another sequencer answers) is not labelled.

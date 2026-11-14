@@ -22238,6 +22238,27 @@ fn adr58_c5_a_settle_held_behind_a_lost_chunk_asks_once_more_at_its_deadline() {
     assert!(asks > 0, "seed {seed}: no settle asked once more");
 }
 
+/// ADR-58 C5b: the local twin of C5. `flex-crash` seed 384: node 3, the root,
+/// executed its own settle's op and its plan held the row behind a lost
+/// chunk; the operator's `drop-held` landed at t=23048, the lease went at
+/// t=23043 and node 2 took it over at t=23195, and the second deadline at
+/// t=23219 told the unsettled `EIO` with the op's row answerable: an I4
+/// violation, "Itself during [20213, 23043] ms". The settle is routed once
+/// more at that deadline, and node 2 answers it. Fails on the parent.
+#[test]
+fn adr58_c5b_a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline() {
+    let seed = 384;
+    let r = run_seed(
+        seed,
+        strict(base_config("flex-crash"), "settle+oracles+unsettled"),
+    )
+    .unwrap_or_else(|e| panic!("flex-crash+settle+oracles+unsettled seed {seed}: {e}"));
+    // (The strict run above is the check: it fails the seed's I4 violation.
+    // This only says the rule fired.)
+    let routes: u64 = r.stats.values().map(|s| s.settle_local_final_routes).sum();
+    assert!(routes > 0, "seed {seed}: no settle was routed once more");
+}
+
 /// ADR-58 C3: an op whose row waits behind a chunk that exists nowhere is
 /// told an unsettled `EIO` that is labelled `held-behind-lost-chunk`: allowed,
 /// counted apart, and checked against the sim's chunk ledger. Fails on the

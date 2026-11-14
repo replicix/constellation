@@ -2071,6 +2071,10 @@ pub struct Stats {
     /// ... and of those, the ones the root answered `Held` behind the lost
     /// chunk again (the settle ended in doubt at that answer).
     pub settle_final_asks_held: u64,
+    /// ADR-58 C5b: second deadlines that routed a settle once more because
+    /// this node's own plan had held its row behind a lost chunk and the hold
+    /// had ended.
+    pub settle_local_final_routes: u64,
     /// Answers a frozen-epoch settle got, by time since its first ask in
     /// 250 ms buckets (the last is open-ended).
     pub settle_frozen_answer_ms: [u64; 16],
