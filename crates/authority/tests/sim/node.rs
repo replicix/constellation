@@ -492,6 +492,8 @@ pub struct NodeEnv {
     pub beats_lost_in_lag: bool,
     /// See `SimConfig::backup_acks_unpersisted`.
     pub backup_acks_unpersisted: bool,
+    /// See `SimConfig::copies_lost_after_judged`.
+    pub copies_lost_after_judged: bool,
     /// See `SimConfig::deleg_lane`.
     pub deleg_lane: bool,
     /// See `SimConfig::roster_refresh_ms`.
@@ -1009,6 +1011,8 @@ impl NodeHandle {
             beats_lost_in_lag: env.beats_lost_in_lag,
             backup_acks_unpersisted: env.backup_acks_unpersisted,
             unpersisted_through: 0,
+            copies_lost_after_judged: env.copies_lost_after_judged,
+            judged_lost: 0,
             oracles: env.oracles.clone(),
             forwards: HashMap::new(),
             versions_seen_tip: 0,
@@ -1347,6 +1351,10 @@ struct Driver {
     /// node sealed whose copies it already lost.
     backup_acks_unpersisted: bool,
     unpersisted_through: u64,
+    /// See `SimConfig::copies_lost_after_judged`: and how many of the
+    /// oracle's judged answers this node has acted on.
+    copies_lost_after_judged: bool,
+    judged_lost: usize,
     /// Plan 43 C0: the oracles, and the rid behind each forwarded request
     /// this driver handed its core (`(requester, req)`), for I1 at the
     /// `MutateReply`'s emission.
@@ -4113,8 +4121,41 @@ impl Driver {
         self.unpersisted_through = sealed;
     }
 
+    /// The obligation's negative control
+    /// (`SimConfig::copies_lost_after_judged`): every answer the oracle
+    /// judged committed by epoch `e`'s group since this node last looked
+    /// costs this node, if it answered it or is one of the group's backups,
+    /// its tails and member copies through `e`.
+    fn lose_copies_after_judged(&mut self) {
+        if !self.copies_lost_after_judged {
+            return;
+        }
+        let judged: Vec<super::oracle::EpochGroupAnswer> = {
+            let all = self.oracles.root_group_by_epoch.lock().unwrap();
+            all.get(self.judged_lost..).unwrap_or_default().to_vec()
+        };
+        self.judged_lost += judged.len();
+        for a in judged {
+            if a.answerer != self.id && !a.backups.contains(&self.id) {
+                continue;
+            }
+            self.meta
+                .backup_trim(a.epoch.saturating_add(1), 0, &[])
+                .expect("the negative control's trim");
+            // (A read fault reads as no member copy: nothing more to lose.)
+            for e in self.meta.member_copy_epochs().unwrap_or_default() {
+                if e <= a.epoch {
+                    self.meta
+                        .member_copy_drop(e)
+                        .expect("the negative control's member copy drop");
+                }
+            }
+        }
+    }
+
     fn dispatch(&mut self, actions: Vec<Action>) {
         self.lose_unpersisted_copies();
+        self.lose_copies_after_judged();
         // ADR-55: a release the root's holder side sent to its root side is
         // a release by the holder like any other.
         // ADR-56: the root's handover requests and grants, dated by the run.

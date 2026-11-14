@@ -14571,6 +14571,11 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             backup_acks_unpersisted: true,
             ..cfg
         },
+        // Its end-of-run obligation's (`SimConfig::copies_lost_after_judged`).
+        "copies-lost-after-judged" => SimConfig {
+            copies_lost_after_judged: true,
+            ..cfg
+        },
         "identity" => SimConfig {
             strict_identity: true,
             ..cfg
@@ -19772,6 +19777,80 @@ fn c2f_a_lone_root_answers_other_nodes_from_the_archive() {
         archived += c0_count(&r.acks_by_class, "archive_waits");
     }
     assert!(archived > 0, "no answer was judged archive");
+}
+
+/// Plan 43 §4 (maintainer, 2026-11-14): the seeds whose answers RootGroup
+/// commits only by the group of the answerer's own epoch, the lease having
+/// moved past it (`root_group_by_epoch_config`). Before the I1 oracle judged
+/// by that group each failed I1 under `+commit`. 1152 needs the member-copy
+/// arm; 1635 and 870 have a successor whose fresh lease lists no backup.
+const ROOT_GROUP_BY_EPOCH_PINS: [(&str, u64); 9] = [
+    ("placement-hot", 378),
+    ("placement-hot", 606),
+    ("backup-reconfig-doubt", 880),
+    ("locks-core-stall-backup-beats", 403),
+    ("locks-core-stall-backup-beats", 1399),
+    ("locks-core-stall-backup-beats", 1849),
+    ("metered-shared", 1635),
+    ("strict-isolated-reader-beats", 870),
+    ("backup-two", 1152),
+];
+
+fn root_group_by_epoch_pin(label: &str, seed: u64, variants: &[&str]) -> Result<Report, String> {
+    run_seed(
+        seed,
+        variants
+            .iter()
+            .fold(base_config(label), |c, v| config_variant(c, v)),
+    )
+}
+
+/// The pins pass under `+commit`, each with an answer judged by its epoch's
+/// group, and the archive carries every such answer by the end of the run.
+#[test]
+fn root_group_by_epoch_commits_the_pinned_answers() {
+    for (label, seed) in ROOT_GROUP_BY_EPOCH_PINS {
+        let r = root_group_by_epoch_pin(label, seed, &["commit"])
+            .unwrap_or_else(|e| panic!("{label}+commit seed {seed}: {e}"));
+        assert!(
+            r.root_group_by_epoch_config > 0,
+            "{label}+commit seed {seed}: no answer judged by its epoch's group"
+        );
+        assert_eq!(r.root_group_by_epoch_unarchived, 0, "{label} seed {seed}");
+    }
+}
+
+/// The negative controls. `+acks-unpersisted` (a sealed backup never had
+/// the rows it acknowledged): the arm refuses the same answers, and I1
+/// fails every pin. `+copies-lost-after-judged` (the group's copies lost
+/// once an answer was judged; without `+commit`, so that I1 is counted
+/// and the end-of-run check speaks): the obligation fires on at least one
+/// pin (locks-core-stall-backup-beats 1399). Of the others, five fail an
+/// earlier end-of-run check first (`member_copies_drained`,
+/// `read_holds_gone`: a deposed answerer's member copy re-created after the
+/// loss) and three pass (the row was re-shipped before the loss).
+#[test]
+fn root_group_by_epoch_refuses_unpersisted_acks_and_its_obligation_bites() {
+    for (label, seed) in ROOT_GROUP_BY_EPOCH_PINS {
+        let e = root_group_by_epoch_pin(label, seed, &["commit", "acks-unpersisted"])
+            .err()
+            .unwrap_or_else(|| panic!("{label}+commit+acks-unpersisted seed {seed} passed"));
+        assert!(
+            e.contains("I1 acked_implies_committed") && e.contains("root-group-epoch: backup"),
+            "{label}+commit+acks-unpersisted seed {seed}: {e}"
+        );
+    }
+    let fired: Vec<(&str, u64)> = ROOT_GROUP_BY_EPOCH_PINS
+        .into_iter()
+        .filter(|(label, seed)| {
+            root_group_by_epoch_pin(label, *seed, &["copies-lost-after-judged"])
+                .is_err_and(|e| e.contains("root_group_by_epoch_archived"))
+        })
+        .collect();
+    assert!(
+        !fired.is_empty(),
+        "the obligation fired on no pin with the copies lost"
+    );
 }
 
 /// Plan 43 C7-F F-a0 (the ack side of the review's F1): a `Local` holder

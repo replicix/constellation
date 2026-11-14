@@ -2022,11 +2022,15 @@ fn classify(
 
 /// The answers of `answers` whose rid the archive does not carry with the
 /// answer's outcome, the epoch's group not abandoned by an operator
-/// (`GroupAbandoned { epoch, gen: 0 }` in an applied segment).
+/// (`GroupAbandoned { epoch, gen: 0 }` in an applied segment). A run that
+/// did not reach quiescence (`converged` false) may not have shipped it
+/// yet: there the rid must still be held somewhere with the answer's
+/// outcome (a node's journal, backup tail or member copy).
 fn epoch_group_unarchived(
     o: &Oracles,
     log: &super::check::Oracle,
     answers: &[EpochGroupAnswer],
+    converged: bool,
 ) -> Vec<String> {
     let abandoned: BTreeSet<u64> = log
         .unfenced
@@ -2043,6 +2047,7 @@ fn epoch_group_unarchived(
         .filter(|a| !abandoned.contains(&a.epoch))
         .filter(|a| seen.insert((a.rid, a.want)))
         .filter(|a| o.bucket.archive.outcome_as(a.rid, a.want).is_none())
+        .filter(|a| converged || !held_anywhere(o, a.rid, a.want))
         .map(|a| {
             let carried = o.bucket.archive.outcome_code(a.rid).map_or_else(
                 || "nothing".to_string(),
@@ -2051,16 +2056,42 @@ fn epoch_group_unarchived(
             format!(
                 "root_group_by_epoch_archived: node {} answered rid {:?} ({}) committed by \
                  epoch {}'s group {:?}, but at the end of the run the archive carries {carried} \
-                 and no GroupAbandoned names epoch {}",
+                 {}and no GroupAbandoned names epoch {}",
                 a.answerer,
                 a.rid,
                 describe_code(a.want),
                 a.epoch,
                 a.backups,
+                if converged {
+                    ""
+                } else {
+                    "(the run did not converge, and no journal, tail or member copy holds it) "
+                },
                 a.epoch
             )
         })
         .collect()
+}
+
+/// Whether any node's journal, backup tail (of any epoch a lease landed in)
+/// or member copy holds a transaction carrying `rid` as `want`.
+fn held_anywhere(o: &Oracles, rid: Rid, want: Option<Code>) -> bool {
+    let epochs: Vec<u64> = o.epoch_backups.lock().unwrap().keys().copied().collect();
+    let stores: Vec<Arc<Meta>> = o.stores.lock().unwrap().values().cloned().collect();
+    let carries = |txs: &[BackupTx]| txs.iter().any(|t| carries_as(&t.records, rid, want));
+    stores.iter().any(|m| {
+        carries(&journal_of(m))
+            || epochs
+                .iter()
+                .any(|e| m.backup_tail(*e).is_ok_and(|t| carries(&t)))
+            // (A read fault reads as no member copy: the check stays strict.)
+            || m.member_copy_epochs().unwrap_or_default().iter().any(|e| {
+                m.member_copy(*e)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(_, t)| carries(&t))
+            })
+    })
 }
 
 /// RootGroup: the lease object's holder's journal and every listed
@@ -2090,14 +2121,16 @@ enum EpochGroupJudged {
 }
 
 /// RootGroup by the answerer's epoch (plan 43 §4, maintainer 2026-11-14):
-/// the answerer's journal holds the rid's root row `T` (class
-/// `Group{on: Root}`, the answer's outcome) of its epoch `e`; the lease is
-/// past `e`; the last configuration that landed in `e` lists at least one
-/// backup; and every one of them holds `T`'s records as a copy of `e`: in
-/// its tail of `e` at or below its contiguous acknowledgement, in its member
-/// copy of `e`, or re-shipped into its own journal. Neither the row's own
-/// version nor the epoch a backup's role names is read. A configuration
-/// that lists nobody leaves the answer to the archive.
+/// the answerer's journal holds the rid's root row `T` (the answer's
+/// outcome) whose audit row is of its epoch `e` with class
+/// `Group{on: Root}`; the lease is past `e`; the last configuration that
+/// landed in `e` lists at least one backup; and every one of them holds
+/// `T`'s records at `T`'s position as a copy of `e`: in its tail of `e` at
+/// or below its contiguous acknowledgement, in its member copy of `e`, or
+/// re-shipped into its own journal under a later epoch. Neither the row's
+/// own version nor the epoch a backup's role names is read. A configuration
+/// that lists nobody is not this rule's: the answer falls through to the
+/// other classes.
 fn root_group_by_epoch(
     o: &Oracles,
     answerer: NodeId,
@@ -2113,25 +2146,31 @@ fn root_group_by_epoch(
     if l.epoch <= e {
         return Ok(NotApplicable);
     }
-    let Some(t) = find_tx(own_txs, rid, want).filter(|t| t.origin == (0, 0)) else {
+    let Some(store) = o.store(answerer) else {
         return Ok(NotApplicable);
     };
-    let root_row = o.store(answerer).is_some_and(|m| {
-        m.journal_classes_of_rid(rid).is_ok_and(|cs| {
-            cs.iter().any(|c| {
-                matches!(
-                    c,
-                    RowCommit::Group {
-                        on: constellation_meta::GroupOn::Root,
-                        ..
-                    }
-                )
+    // T: the transaction of the rid whose own audit row (by its first seq)
+    // was journaled in epoch `e` as a root group's row.
+    // (A read fault reads as no audit row: the rule judges nothing.)
+    let audit = store.journal_rows_for_audit().unwrap_or_default();
+    let Some(t) = own_txs.iter().find(|t| {
+        t.origin == (0, 0)
+            && carries_as(&t.records, rid, want)
+            && audit.iter().any(|a| {
+                a.first == t.first
+                    && a.epoch == e
+                    && matches!(
+                        a.class,
+                        RowCommit::Group {
+                            on: constellation_meta::GroupOn::Root,
+                            ..
+                        }
+                    )
             })
-        })
-    });
-    if !root_row {
+    }) else {
         return Ok(NotApplicable);
-    }
+    };
+    // (No configuration recorded for `e`: nobody listed, as for an empty one.)
     let backups = o
         .epoch_backups
         .lock()
@@ -2141,7 +2180,7 @@ fn root_group_by_epoch(
         .unwrap_or_default();
     if backups.is_empty() {
         return Err(format!(
-            "the last configuration of epoch {e} lists nobody: only the archive judges it"
+            "the last configuration of epoch {e} lists nobody: not this rule's"
         ));
     }
     for b in &backups {
@@ -2166,15 +2205,16 @@ fn root_group_by_epoch(
 }
 
 /// Whether `store` holds `t` (journal row of epoch `e`) as a copy of `e`:
-/// in its tail of `e` at or below `backup_acked(e)`, in its member copy of
-/// `e`, or in its own journal as the re-ship (`TailOf { e, t.first }`
-/// prepended, or `t`'s own identity kept from an earlier re-ship).
+/// at `t`'s position in its tail of `e` at or below `backup_acked(e)`, or in
+/// its member copy of `e`; or in its own journal as the re-ship, a row of a
+/// later epoch.
 fn holds_as_copy_of(store: &Meta, e: u64, t: &BackupTx) -> bool {
+    let same = |x: &BackupTx| x.first == t.first && x.last == t.last && x.records == t.records;
+    // (A read fault reads as nothing held: the answer is not judged by it.)
     let acked = store.backup_acked(e).unwrap_or(0);
-    let in_tail = store.backup_tail(e).is_ok_and(|tail| {
-        tail.iter()
-            .any(|x| x.last <= acked && x.records == t.records)
-    });
+    let in_tail = store
+        .backup_tail(e)
+        .is_ok_and(|tail| tail.iter().any(|x| x.last <= acked && same(x)));
     if in_tail {
         return true;
     }
@@ -2182,17 +2222,27 @@ fn holds_as_copy_of(store: &Meta, e: u64, t: &BackupTx) -> bool {
         .member_copy(e)
         .ok()
         .flatten()
-        .is_some_and(|(_, txs)| txs.iter().any(|x| x.records == t.records));
+        .is_some_and(|(_, txs)| txs.iter().any(same));
     if in_member_copy {
         return true;
     }
-    journal_of(store).iter().any(|x| is_reship_of(x, e, t))
+    // (A read fault reads as no audit row: no re-ship is counted.)
+    let audit = store.journal_rows_for_audit().unwrap_or_default();
+    journal_of(store).iter().any(|x| {
+        audit
+            .iter()
+            .any(|a| a.first == x.first && is_reship_of(x, a.epoch, e, t))
+    })
 }
 
-/// Whether `x` is the re-ship of journal row `t` of epoch `e`: its records
-/// are `t`'s, behind the identity `TailOf { e, t.first }` unless `t` already
-/// carried one (a re-ship keeps the first journal's identity).
-fn is_reship_of(x: &BackupTx, e: u64, t: &BackupTx) -> bool {
+/// Whether `x`, a journal row of epoch `x_epoch`, is the re-ship of journal
+/// row `t` of epoch `e`: journaled in a later epoch, its records `t`'s
+/// behind the identity `TailOf { e, t.first }`, or `t`'s verbatim when `t`
+/// already carried one (a re-ship keeps the first journal's identity).
+fn is_reship_of(x: &BackupTx, x_epoch: u64, e: u64, t: &BackupTx) -> bool {
+    if x_epoch <= e {
+        return false;
+    }
     if matches!(t.records.first(), Some(LogRecord::TailOf { .. })) {
         return x.records == t.records;
     }
@@ -3250,7 +3300,7 @@ pub fn end_of_run(
     {
         let answers = o.root_group_by_epoch.lock().unwrap();
         f.root_group_by_epoch = answers.len();
-        f.root_group_by_epoch_unarchived = epoch_group_unarchived(o, log, &answers);
+        f.root_group_by_epoch_unarchived = epoch_group_unarchived(o, log, &answers, converged);
     }
     {
         // (One guard: two in the literal above would deadlock.)
@@ -3963,15 +4013,21 @@ mod tests {
             origin: (0, 0),
         };
         let tail_of = |epoch, jseq| Some(LogRecord::TailOf { epoch, jseq });
-        assert!(is_reship_of(&with(tail_of(2, 40)), 2, &t));
+        // A row of epoch 3 re-shipping epoch 2's row 40.
+        assert!(is_reship_of(&with(tail_of(2, 40)), 3, 2, &t));
+        // Journaled in epoch 2 itself or earlier: no re-ship of it.
+        assert!(!is_reship_of(&with(tail_of(2, 40)), 2, 2, &t));
+        assert!(!is_reship_of(&with(tail_of(2, 40)), 1, 2, &t));
         // Another epoch's or journal seq's identity, or none: not this row's.
-        assert!(!is_reship_of(&with(tail_of(1, 40)), 2, &t));
-        assert!(!is_reship_of(&with(tail_of(2, 39)), 2, &t));
-        assert!(!is_reship_of(&with(None), 2, &t));
-        // A row that carries the first journal's identity keeps it.
+        assert!(!is_reship_of(&with(tail_of(1, 40)), 3, 2, &t));
+        assert!(!is_reship_of(&with(tail_of(2, 39)), 3, 2, &t));
+        assert!(!is_reship_of(&with(None), 3, 2, &t));
+        // A row that carries the first journal's identity keeps it, and only
+        // a later epoch's row re-ships it: not the row itself.
         let again = with(tail_of(1, 9));
-        assert!(is_reship_of(&again, 2, &again));
-        assert!(!is_reship_of(&with(tail_of(2, 3)), 2, &again));
+        assert!(is_reship_of(&again, 3, 2, &again));
+        assert!(!is_reship_of(&again, 2, 2, &again));
+        assert!(!is_reship_of(&with(tail_of(2, 3)), 3, 2, &again));
     }
 
     /// ADR-59 part B, ruling on 1547: a loss is judged by the `DropHeld` the

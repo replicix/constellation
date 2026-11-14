@@ -864,6 +864,7 @@ pub struct SimConfig {
     /// meanwhile never arrives, and the backup's lapse is followed by
     /// silence, not by a backlog of beats). Appends, which the sync lane
     /// carries, are queued and stamped at the lapse's end as before.
+    pub beats_lost_in_lag: bool,
     /// Negative control of the I1 oracle's RootGroup-by-epoch arm (plan 43
     /// §4, maintainer 2026-11-14; variant `+acks-unpersisted`): a backup
     /// acknowledged rows it never persisted, and finds out when a claimant
@@ -871,10 +872,15 @@ pub struct SimConfig {
     /// with nothing and loses its tail and member copy of the epoch, so the
     /// successor re-ships none of them. Never on in a configuration: the
     /// oracle must refuse the answers that rest on those acks once the lease
-    /// moved past the epoch, or the end of the run must find them missing
-    /// from the archive.
+    /// moved past the epoch.
     pub backup_acks_unpersisted: bool,
-    pub beats_lost_in_lag: bool,
+    /// Negative control of that arm's end-of-run obligation (variant
+    /// `+copies-lost-after-judged`): once the arm judged an answer committed
+    /// by epoch `e`'s group, the answerer and every backup of that group lose
+    /// their tails and member copies through `e`, as a disk loss after the
+    /// judgement would. Never on in a configuration: a row not yet re-shipped
+    /// then never reaches the archive, and the obligation must say so.
+    pub copies_lost_after_judged: bool,
     /// No holder drops a backup for want of acknowledgements
     /// (`backup_ack_timeouts`): lag costs no reconfiguration either.
     pub keeps_backups: bool,
@@ -1382,6 +1388,7 @@ impl Default for SimConfig {
             beats_credited: false,
             beats_lost_in_lag: false,
             backup_acks_unpersisted: false,
+            copies_lost_after_judged: false,
             keeps_backups: false,
             deleg_lane: true,
             roster_refresh_ms: 0,
@@ -5461,6 +5468,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         beats_credited: cfg.beats_credited,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         backup_acks_unpersisted: cfg.backup_acks_unpersisted,
+        copies_lost_after_judged: cfg.copies_lost_after_judged,
         deleg_lane: cfg.deleg_lane,
         roster_refresh_ms: cfg.roster_refresh_ms,
         deleg_root_lane: cfg.deleg_root_lane,
