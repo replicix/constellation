@@ -69989,3 +69989,20 @@ the idle counter counts completed releases; the pin test, `sticky-claim` and the
 `sticky-holder-restarts-placed` 992 and 1637 fail on main and pass on the branch because the schedule changed (the idle
 release); they were not masked and are to be classified on main.
 
+
+### M1.3 step 14: Leave ends grants first (2026-11-14)
+
+[ADR-61](../../explanation/DECISIONS.md#adr-61-a-node-leaves-the-roster-only-after-the-log-has-ended-every-grant-it-holds).
+An admin leave of a sticky holder the root has not heard from is refused at once naming `repair abandon --node N`; the retirement
+of a dead root refuses while the table lists a sticky stream of it (the stale "a root holds no delegation" answer); a root's
+recall for a leave is `RecallCause::Leave`, an allowed cause of `sticky_ends_only_by_holder_or_operator`; `LeaveError::LiveGrant`
+replaces `LiveDesignation`. The sim drives leaves (`FaultKind::LeaveNode`, configurations `sticky-leave`, `sticky-leave-admin`,
+`sticky-leave-root`) and judges `no_live_grant_off_roster` at each retirement and at the end; knob `leave_keeps_grants` fails
+it. The harness has `sticky-leave`. The new oracle found two holes in the self-leave that the spec did not list, both fixed with
+fail-before tests: the holder was answered at the root's acknowledgement of its release row, while the root's generation was live
+until its `DelegateNodeEnded` (`sticky-leave` seed 71); and a grant the root journaled before it had the leave note reached the
+node's table after the node was answered (idle release on, seeds 209, 292): the root now acknowledges the note only when it lists
+no live generation of the node and recalls the ones it lists. A self-leave under a pending drop can abort at its deadline: the
+intended behaviour (latency, not integrity). Open (ADR-61): a non-root answers a dead root's retirement from a table that can be
+behind the log. `sticky-leave-root` has a residual class: rows only a root killed for good held are lost to the abandon (the
+operator's price; 1 seed of 2,000, 5 with the idle release on). No change to replicix-core.
