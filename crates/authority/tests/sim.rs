@@ -14387,6 +14387,40 @@ fn locks_blips_tight_delegated_config() -> SimConfig {
     }
 }
 
+/// The M1.2 exit sweep: a client op of a delegate, parked before it ran
+/// (its grant not renewed after a suspend or a reboot), was handed back to
+/// the route when an epoch became active, the stream ended or the root
+/// recalled it. The route ended in the settle of an epoch that refuses
+/// writes, and the op's phase still read as the park's `Recalling`: an op
+/// that ran and waits for its acknowledgement. No park was left to give
+/// up, so the deadline returned without an answer, every time, and the
+/// client waited out the run's 540 s cap.
+#[test]
+fn a_delegates_unparked_own_op_is_answered() {
+    type Config = fn() -> SimConfig;
+    let cases: [(&str, Config, &[u64]); 2] = [
+        (
+            "locks-blips-tight-delegated",
+            locks_blips_tight_delegated_config,
+            &[1351, 1667],
+        ),
+        (
+            "locks-unlinked-delegated-blips",
+            locks_unlinked_blips_config,
+            &[649, 1351],
+        ),
+    ];
+    for (name, config, seeds) in cases {
+        for &seed in seeds {
+            // (The default clock faults stay: each seed's suspend or reboot
+            // is one of them.)
+            if let Err(e) = run_seed(seed, config()) {
+                panic!("{name} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={name}");
+            }
+        }
+    }
+}
+
 /// Chunk delegate-fenced-io: `locks-blips-tight-delegated` fenced 482
 /// lock I/Os in 0..4000 on main (`locks-blips-tight`: 0), every one a live
 /// holder whose grant lapsed during an S3 cut while the root renewing it
@@ -20540,7 +20574,7 @@ const FLOOR_CAUSES: [&str; 2] = [
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 14] = [
+    let strict_configs: [(&str, Config); 16] = [
         // (ADR-58, seeds 0..99: none. In 2,000 seeds `+settle+oracles+unsettled`
         // 6 seeds fail, 98 before ADR-58 and 20 before its follow-up: the
         // settle of an op in a frozen epoch ends one window after the freeze,
@@ -20570,6 +20604,19 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // knob, 5 and 2 violations before.)
         ("backup-crash", backup_crash_config),
         ("long-backup", long_backup_config),
+        // (The M1.2 exit sweep: a delegate's own op parked before it ran
+        // went unanswered after an epoch outage with a suspend or a reboot,
+        // 2 seeds of 2,000 in each, none in seeds 0..99; pinned by
+        // `a_delegates_unparked_own_op_is_answered`. Seeds 0..99
+        // `+unsettled` with the fix: no violation, 1 allowed in each.)
+        (
+            "locks-blips-tight-delegated",
+            locks_blips_tight_delegated_config,
+        ),
+        (
+            "locks-unlinked-delegated-blips",
+            locks_unlinked_blips_config,
+        ),
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
     // the list was set; lowered where seeds 0..99 of the 2,000-seed sweeps of

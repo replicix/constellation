@@ -3369,8 +3369,16 @@ impl Core {
     ) {
         self.stats.deleg_not_owner += 1;
         if p.from == 0 {
-            // Own client op: back through the ordinary route.
-            if self.clients.contains_key(&p.rid) {
+            // Own client op: back through the ordinary route. The park set it
+            // `Recalling`; nothing ran, and with the park gone that phase
+            // would read as an executed op whose acknowledgement waits: a
+            // route that ends in the deadline's settle (an epoch that refuses
+            // writes) found no park to give up and left the op unanswered
+            // for good (`locks-blips-tight-delegated` seeds 1351 and 1667).
+            if let Some(c) = self.clients.get_mut(&p.rid) {
+                if c.phase == super::client::Phase::Recalling {
+                    c.phase = super::client::Phase::Backoff;
+                }
                 self.route(now, p.rid, replica, out);
             }
             return;
