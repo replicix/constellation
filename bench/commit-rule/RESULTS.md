@@ -317,5 +317,6 @@ this step).
 
 Reading: a rename between a node's two subtrees costs one local commit with its group acknowledgement (about 0.5 ms), with no wait for a second stream. Writers spread over two subtrees create faster than the same four in
 one directory (1.25 to 1.4 ms against 1.9 to 2.5 ms at p50); both phases run on the same stream, so the difference is the
-writers' shared directory, not a wait between streams (not separately diagnosed). The ext4 tail is wider than the other
+writers' shared directory, not a wait between streams (not separately diagnosed; the one-subtree phase also runs second, with
+`/d1` already holding 600 entries, so phase order and directory size are confounded with it). The ext4 tail is wider than the other
 three file systems' (the rename-across p90 is 2.9 times its p50 against 1.2 to 1.3); not diagnosed.

@@ -2553,8 +2553,9 @@ relay of its own so requests can be attributed per role):
         one generation of one stream (`status.delegation.mine`: one live
         entry covering two directories). `b` renames 24 fsynced files
         between the two subtrees, round after round; after 60 acknowledged
-        renames `a` is `kill -9`ed and `b` takes the root over by seal, then
-        60 more renames run on the new root. No rename may fail. After `a`
+        renames `a` is `kill -9`ed and `b` takes the root over by seal; then 60 more renames run on the new root,
+        on the first 12 files only, so the other 12 stay where their last
+        pre-kill acknowledged rename put them. No rename may fail. After `a`
         remounts, both nodes list each file once, in the subtree its last
         acknowledged rename left it in, byte-exact, with no other name and
         no conflict copy. (Not in the k8s lane: it kills a client.)

@@ -1,11 +1,12 @@
 # Plan 46 — Committed or final: one stream per node, the commit rule per configuration, no server-side replay
 
-> **Status (2026-11-13): stage 0 and most of stage 1 landed; stage 1 is not
+> **Status (2026-11-14): stage 0 and most of stage 1 landed; stage 1 is not
 > closed.** Landed: stage 0 (M0.1–M0.4, 2026-11-05; plan 43 is done and closed
 > into this plan, D-4, D-5); M1.0 (the model, chunks 1–14); M1.1; M1.2 steps
 > 0–15 (step 15's harness and perf part landed 2026-11-14:
 > `two-subtrees-one-stream-rename`, `ack-latency` topology 9; step 16, the exit
-> sweep and fable review, is not built); M1.3 steps 0–5, 7,
+> sweep and fable review, is not built and owns §8's A/B/B/A of topologies 1–5
+> after M1.2, measured on the M1.2 exit build); M1.3 steps 0–5, 7,
 > 8, 9, 10, 11 and 13, route fencing (ADR-47), the restart quarantine (ADR-46),
 > the roster singleton (ADR-50), the stale-clock re-check (ADR-52), the deadline
 > module (ADR-48) and late landing (ADR-49); M1.4 steps 0–5, 6a and the kept

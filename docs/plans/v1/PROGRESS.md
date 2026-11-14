@@ -69489,7 +69489,16 @@ acknowledged rename left it in, byte-exact, with no conflict copy. Passes (debug
 the root 1.6 s). Bench: `ack-latency` topology 9 `9-two-subtrees` replaces the retired `two-gens-ack-cost` (the scenario itself
 went with the splits at M1.2 step 1): four creating threads on `b`, two per subtree, then four in one subtree, and a rename
 across; results on four file systems in `bench/commit-rule/RESULTS.md`. TESTING.md's catalogue lists both. Harness only: no
-product change.
+product change. Review fixes (2026-11-14): after the kill only the first 12 files keep renaming, so the other 12 are checked
+at the position of their last pre-kill acknowledged rename; the scenario prints `b`'s streamed index and `a`'s cursor before the kill and
+the rows `b` re-appended after it. Not asserted, because it cannot be: in this two-node topology `b`'s acknowledgement waits
+for `a`'s append (sampled every 50 ms before the kill: `a`'s cursor is never behind `b`'s streamed index), so no acknowledged
+row is missing from `a`'s log and a verbatim tail needs a delegate with a backup group of its own (the sims); the rename in
+flight at the kill is what crosses the takeover here. A `CONSTELLATION_FAULT_SHIP_DELAY_MS` on both nodes did not change it. the renamer's panic is reported at its join.
+Spec decisions: the bench name is `9-two-subtrees` (the plan's `two-subtrees-one-stream` as a bench name); §8's topologies 1–5
+A/B/B/A after M1.2 belong to step 16. The catalogue rows the status note lists already exist: `delegate-backup-handoff-failover`
+in TESTING.md's delegation scenarios, `placement-hot` and `delegated-group-switch` among the sims, and plans 40, 41, 42 and 45
+have their own sections; none needs a new row for this step.
 
 ## Plan 46 M1.3 step 7: sticky placement of far writers (ADR-54, 2026-11-11)
 
