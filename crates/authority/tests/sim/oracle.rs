@@ -372,7 +372,15 @@ impl Unsettled {
             }
             super::reach::Verdict::Isolated { .. } => "isolated".into(),
             super::reach::Verdict::NoSequencerInTime { why } => {
-                if why.contains("holds nothing") {
+                use super::reach::{
+                    CAUSE_NO_LEASE_READ_RETRY, CAUSE_UNDER_ASK_CYCLE, WHY_NO_LEASE_READ_RETRY,
+                    WHY_UNDER_ASK_CYCLE,
+                };
+                if why.contains(WHY_UNDER_ASK_CYCLE) {
+                    CAUSE_UNDER_ASK_CYCLE.into()
+                } else if why.contains(WHY_NO_LEASE_READ_RETRY) {
+                    CAUSE_NO_LEASE_READ_RETRY.into()
+                } else if why.contains("holds nothing") {
                     "no-sequencer-in-time/lease of a holder with nothing".into()
                 } else if why.contains("no member") {
                     "no-sequencer-in-time/group tail".into()
