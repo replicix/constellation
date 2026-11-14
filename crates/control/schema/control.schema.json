@@ -10422,6 +10422,25 @@
       ],
       "type": "object"
     },
+    "StickyReleaseParams": {
+      "description": "`sticky.release` (plan 46 M1.3 step 6).",
+      "properties": {
+        "paths": {
+          "default": [],
+          "description": "The sticky subtrees to release; empty: every one this node holds.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wait": {
+          "default": false,
+          "description": "Answer once the root's acknowledgement covers the release row (the\nholder has drained and the root has appended it), within the core's\nbound; an error says why not. Without it the answer is immediate.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "StreamEnd": {
       "description": "The `Ok` payload of the terminal `Response` of a streaming call that\nended cleanly. The server fills it in.",
       "properties": {
@@ -12168,6 +12187,17 @@
         "$ref": "#/$defs/StreamEnd"
       },
       "streaming": "events"
+    },
+    "sticky.release": {
+      "min_role": "operator",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/StickyReleaseParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Ack"
+      },
+      "streaming": "none"
     },
     "view.list": {
       "min_role": "viewer",

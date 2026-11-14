@@ -1172,6 +1172,34 @@ impl EngineControl {
         })
     }
 
+    /// `sticky.release` (plan 46 M1.3 step 6): this node's sticky grants
+    /// under `paths` (empty: all of them) are released by its own decision.
+    /// The core answers within `Deadlines::leave_wait`.
+    pub(crate) fn sticky_release(
+        &self,
+        paths: &[String],
+        wait: bool,
+    ) -> std::result::Result<String, String> {
+        let dirs = paths
+            .iter()
+            .map(|path| {
+                self.meta
+                    .resolve_path(path)
+                    .map_err(|e| format!("{e:#}"))?
+                    .ok_or_else(|| format!("no such directory: {path}"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(sync::SyncRequest::StickyRelease { dirs, wait, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(receive)
+                .map_err(|_| "sync task stopped".to_string())?
+        })
+    }
+
     pub(crate) fn list_delegations(&self) -> Vec<api::DelegationStatus> {
         self.meta
             .delegation_table()

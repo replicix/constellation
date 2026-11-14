@@ -75305,6 +75305,33 @@ mod step5_sticky_release {
         assert!(h.core.dl.sticky_cmds.is_empty());
     }
 
+    /// Plan 46 M1.3 step 6: `constellation release --wait` under a pending
+    /// drop of the stream waits, and at the deadline fails saying "drop
+    /// pending" (a drop holds every release of its stream, ADR-59 part B).
+    /// Fails on the parent: it answered with the drain's generic reason.
+    #[test]
+    fn a_waited_release_under_a_pending_drop_fails_saying_so() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        h.meta.put_stream_drop_plan_for_tests(99, 7, 1);
+        sample(&mut h, &[], &[]);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::StickyRelease {
+                dirs: Vec::new(),
+                wait: true,
+            },
+        });
+        assert!(answer(&out, 5).is_none(), "answered at once: {out:?}");
+        sample(&mut h, &[], &[]);
+        // Past the core's bound.
+        let out = release_tick(&mut h, 10 * 60 * 1_000);
+        let answered = answer(&out, 5).expect("no answer at the deadline");
+        let error = answered.expect_err("released under a pending drop");
+        assert!(error.contains("drop pending"), "{error}");
+        assert!(!last_is_release(&h));
+    }
+
     /// ADR-56 review M1: the release waits for a sample taken after the
     /// step that made the command, however many times the core looks again
     /// in between (every `deleg_after_event` of a step does, and so does

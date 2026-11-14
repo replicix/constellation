@@ -2822,6 +2822,19 @@ pub struct DelegateParams {
     pub sticky: bool,
 }
 
+/// `sticky.release` (plan 46 M1.3 step 6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StickyReleaseParams {
+    /// The sticky subtrees to release; empty: every one this node holds.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Answer once the root's acknowledgement covers the release row (the
+    /// holder has drained and the root has appended it), within the core's
+    /// bound; an error says why not. Without it the answer is immediate.
+    #[serde(default)]
+    pub wait: bool,
+}
+
 /// `node.leave`. `node_id: None` retires this node; `Some(id)` is admin
 /// removal of a different node via a still-mounted peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

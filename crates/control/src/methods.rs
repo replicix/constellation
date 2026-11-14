@@ -38,7 +38,7 @@
 //! | class | role | methods |
 //! |---|---|---|
 //! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/logs.flush/ops`, `*.list*`, `snapshot.refs/resolve/reclaim/space`, `snapshot.policy.check/simulate/list/show`, `snapshot.sched.status`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
-//! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `snapshot.space.verify` (a heavy read-only probe), `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
+//! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `sticky.release`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `snapshot.space.verify` (a heavy read-only probe), `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
 //! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete/delete_many`, `snapshot.policy.set/remove/pause`, `snapshot.sched.run`, `locks.*`, `repair.abandon`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
 //! `fsck.run` is admin although a dry run only reads: one method, one role,
@@ -246,6 +246,11 @@ define_methods! {
         params: DelegateParams, result: Ack }
     DesignationUndelegate { name: "designation.undelegate", role: Operator, mutating: true, stream: None,
         params: PathParams, result: Ack }
+    /// Release this node's sticky grants (plan 46 M1.3 step 6): the holder's
+    /// own decision, drained and journaled as its release row. With `wait`
+    /// it answers once the root's acknowledgement covers the row.
+    StickyRelease { name: "sticky.release", role: Operator, mutating: true, stream: None,
+        params: StickyReleaseParams, result: Ack }
     DesignationListDelegations { name: "designation.list_delegations", role: Viewer, mutating: false, stream: None,
         params: Empty, result: DelegationListing }
     /// Release this node's designation for a path.
@@ -581,11 +586,12 @@ mod tests {
         assert_eq!(unique.len(), METHODS.len(), "duplicate method names");
         assert_eq!(
             METHODS.len(),
-            74,
+            75,
             "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate \
              + snapshot.policy.list/show/set/remove/pause \
              + snapshot.resolve/delete_many + snapshot.sched.status/run \
-             + snapshot.reclaim/space/space.verify + node.logs.flush + repair.abandon"
+             + snapshot.reclaim/space/space.verify + node.logs.flush + repair.abandon \
+             + sticky.release"
         );
         for m in METHODS {
             assert!(

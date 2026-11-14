@@ -14010,12 +14010,24 @@ impl Core {
                     "a release of sticky subtrees did not complete in time; the grants stay"
                 );
                 if let Some(op) = c.op {
+                    // Plan 46 M1.3 step 6: a drop the holder decided holds
+                    // every release of its stream (ADR-59 part B): said so.
+                    let drop_pending = c
+                        .parts
+                        .keys()
+                        .any(|gen| replica.stream_drop_pending(*gen));
+                    let why = if drop_pending {
+                        "drop pending: the stream holds a decided `repair drop-held` whose \
+                         record the log lacks, and no release goes before it"
+                    } else {
+                        "the holder has not drained, or the root has not appended the release"
+                    };
                     out.push(Action::ControlDone {
                         op,
-                        result: Err("the sticky subtrees are not released yet (the holder \
-                                     has not drained, or the root has not appended the \
-                                     release); run the release again"
-                            .into()),
+                        result: Err(format!(
+                            "the sticky subtrees are not released yet ({why}); run the \
+                             release again"
+                        )),
                     });
                 }
                 continue;

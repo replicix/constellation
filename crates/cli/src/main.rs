@@ -428,6 +428,26 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Plan 46 M1.3 step 6: hand this node's sticky grants back to the root
+    /// (the holder's own release: it drains its own ops in the subtree, then
+    /// journals the release). Without a file system, every registered file
+    /// system that has a running node here; `NAME:/path` or `--dirs` name the
+    /// subtrees (default: all). With `--wait` it returns once the root's
+    /// acknowledgement covers the release row, and exits non-zero when that
+    /// does not happen in the core's bound (the reason is printed, for
+    /// example "drop pending"). An unmount and a suspension do this by
+    /// themselves; this is for a planned network change.
+    Release {
+        target: Option<String>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Subtrees to release (paths inside the file system).
+        #[arg(long, num_args = 1..)]
+        dirs: Vec<String>,
+        /// Wait for the root's acknowledgement of the release row.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Plan 30 §M11: list the live delegation table.
     Delegations {
         target: String,
@@ -1901,6 +1921,12 @@ fn run() -> Result<()> {
             ctl::<cm::DesignationUndelegate>(&rt, &dir, api::PathParams { path }, print_ack)
                 .map_err(|e| e.context(UNDELEGATE_STICKY_HINT))
         }
+        Command::Release {
+            target,
+            state_dir,
+            dirs,
+            wait,
+        } => release_command(&rt, target, state_dir, dirs, wait),
         Command::Delegations { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
             ctl::<cm::DesignationListDelegations>(&rt, &dir, Default::default(), |l| {
@@ -4253,6 +4279,52 @@ fn gen_label(gen: u64) -> String {
         gen.to_string()
     } else {
         format!("{} ({gen})", constellation_meta::delegation::GenLabel(gen))
+    }
+}
+
+/// `constellation release` (plan 46 M1.3 step 6). With a target, one node;
+/// without, every registered file system whose node answers on this host (a
+/// file system with no running node is skipped: it holds no grant).
+fn release_command(
+    rt: &tokio::runtime::Runtime,
+    target: Option<String>,
+    state_dir: Option<PathBuf>,
+    dirs: Vec<String>,
+    wait: bool,
+) -> Result<()> {
+    if let Some(target) = target {
+        let (t, dir) = resolve_target(&target, state_dir)?;
+        let paths = match (&t, dirs.is_empty()) {
+            (_, false) => dirs,
+            (target::Target::Named { path: Some(p), .. }, true) => vec![p.clone()],
+            _ => Vec::new(),
+        };
+        return ctl::<cm::StickyRelease>(rt, &dir, api::StickyReleaseParams { paths, wait }, print_ack);
+    }
+    if state_dir.is_some() {
+        bail!("--state-dir names one node: give its file system as well");
+    }
+    let mut failed = Vec::new();
+    for (name, entry) in manager().list().map_err(refusal)? {
+        if !control::socket_exists(&entry.state_dir) {
+            continue;
+        }
+        let params = api::StickyReleaseParams {
+            paths: dirs.clone(),
+            wait,
+        };
+        match rt.block_on(control::call::<cm::StickyRelease>(&entry.state_dir, params)) {
+            Ok(ack) => println!("{name}: {}", ack.detail),
+            Err(e) => {
+                eprintln!("{name}: {e:#}");
+                failed.push(name);
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        bail!("not released: {}", failed.join(", "))
     }
 }
 

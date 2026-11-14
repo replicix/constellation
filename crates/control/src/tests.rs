@@ -2342,6 +2342,7 @@ fn stub_router() -> Router {
         DesignationOffline,
         DesignationDelegate,
         DesignationUndelegate,
+        StickyRelease,
         DesignationListDelegations,
         DesignationOnline,
         DesignationList,
