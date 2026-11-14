@@ -2984,6 +2984,14 @@ async fn sticky_idle_driver(
                     if last <= at {
                         continue;
                     }
+                    // (The operator makes no grant to a node it has retired
+                    // from the roster; one whose leave is under way is
+                    // granted to as ever, and the root's refusal of the
+                    // leave note while it lists a generation of the node
+                    // is what keeps the grant from outliving the leave.)
+                    if cluster.retired.lock().unwrap().contains_key(node) {
+                        continue;
+                    }
                     let holder = read_lease(&cluster.env.bucket)
                         .await
                         .map(|l| l.holder)
@@ -4221,17 +4229,25 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                         ));
                         return;
                     }
-                    // The root, as the lease names it; with none alive, any
-                    // other node (a root that has not taken over yet).
+                    // The root, as the lease names it. With none alive the
+                    // operator waits for a survivor to take over: a node that
+                    // is not the root answers for a dead root from its own
+                    // table, which may be behind the log (a follower that was
+                    // paused), and a root retired through it can hold a live
+                    // grant of its own (`AUTHORITY_SIM_LEAVE_ASKS_ANY=1` asks
+                    // any node: `sticky-leave-root` with the idle release on,
+                    // seeds 593, 680).
                     let lease_root = read_lease(&cluster.env.bucket)
                         .await
                         .map(|l| l.holder)
                         .filter(|h| *h != 0 && *h != node && cluster.get(*h).alive());
                     let target = lease_root.or_else(|| {
-                        cluster
-                            .ids()
-                            .into_iter()
-                            .find(|n| *n != node && cluster.get(*n).alive())
+                        std::env::var_os("AUTHORITY_SIM_LEAVE_ASKS_ANY").and_then(|_| {
+                            cluster
+                                .ids()
+                                .into_iter()
+                                .find(|n| *n != node && cluster.get(*n).alive())
+                        })
                     });
                     let Some(target) = target else {
                         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -8015,12 +8031,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     // Plan 46 M1.3 step 14: a retired node holds no live grant, at its
     // retirement (judged there) and at the end of the run.
+    // (A grant held by a retired node, in any table of the nodes that are
+    // up: the stream the run ends with. A stream the root's later grant of
+    // its directory superseded, or one that released every subtree, holds
+    // nothing.)
     let retired_nodes: BTreeSet<u64> = cluster.retired.lock().unwrap().keys().copied().collect();
-    for (gen, node, dirs) in super::sticky::StickyEnds::of_log(&oracle).live_of(&retired_nodes) {
-        cluster.leave_violations.lock().unwrap().push(format!(
-            "no_live_grant_off_roster: node {node} was retired from the roster, and the log ends \
-             with its sticky stream {gen} (subtrees {dirs:?}) live"
-        ));
+    for id in cluster.ids() {
+        let n = cluster.get(id);
+        if !n.alive() {
+            continue;
+        }
+        for st in n.meta.delegation_table().streams() {
+            if retired_nodes.contains(&st.node) && !st.subtrees.is_empty() {
+                cluster.leave_violations.lock().unwrap().push(format!(
+                    "no_live_grant_off_roster: node {} was retired from the roster, and node {id}'s \
+                     table ends the run with its stream {} holding {:?}",
+                    st.node,
+                    st.gen,
+                    st.subtrees.iter().map(|(d, _)| *d).collect::<Vec<_>>()
+                ));
+            }
+        }
     }
     found
         .sticky

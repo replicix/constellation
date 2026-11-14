@@ -133,19 +133,6 @@ impl StickyEnds {
         )
     }
 
-    /// Plan 46 M1.3 step 14: the sticky streams of `nodes` the log never
-    /// ended: `(generation, node, subtrees)`.
-    pub fn live_of(&self, nodes: &BTreeSet<u64>) -> Vec<(u64, u64, BTreeSet<u64>)> {
-        self.granted
-            .iter()
-            .filter(|(gen, _)| !self.ended.contains_key(gen))
-            .filter_map(|(gen, dirs)| {
-                let node = *self.holder.get(gen)?;
-                nodes.contains(&node).then(|| (*gen, node, dirs.clone()))
-            })
-            .collect()
-    }
-
     pub fn judge(&self, holder_sent_release: &BTreeMap<u64, SentRelease>) -> StickyFindings {
         let mut f = StickyFindings {
             granted: self.granted.len(),

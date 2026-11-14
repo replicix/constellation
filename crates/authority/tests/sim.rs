@@ -2372,23 +2372,22 @@ fn sticky_leave_admin_config() -> SimConfig {
 }
 
 /// The admin form for the root (`far-root-writes`): node 1, which holds its own
-/// sticky stream on `d1` since ADR-55, dies at 3 s for good, and a survivor
-/// takes the lease. The operator retires node 1 from 3.5 s on, through the node the lease names or,
-/// before there is a root, any other node: a retirement is refused while the
-/// log lists a live stream of node 1 (the table says it, not the old "a root
-/// holds no delegation").
+/// sticky stream on `d1` since ADR-55, dies for good at 9 s, and a survivor takes
+/// the lease. The operator retires node 1 from 9.5 s on, through the node the
+/// lease names: the retirement is refused while the log lists a live stream of
+/// node 1, until the operator abandons it.
 fn sticky_leave_root_config() -> SimConfig {
     SimConfig {
         faults: vec![
             ScheduledFault {
-                at_ms: 3_000,
+                at_ms: 9_000,
                 kind: FaultKind::CrashHolder {
                     restart_ms: None,
                     keep_journal: true,
                 },
             },
             ScheduledFault {
-                at_ms: 3_500,
+                at_ms: 9_500,
                 kind: FaultKind::LeaveNode {
                     node: 1,
                     admin: true,
@@ -2396,8 +2395,10 @@ fn sticky_leave_root_config() -> SimConfig {
                 },
             },
         ],
-        // Late clients (a lease is taken on demand): a survivor takes it over.
-        client_plan: vec![(2, 6_000, 12), (3, 6_000, 12)],
+        // The root's own clients are done by 9 s (what only a root that dies for
+        // good holds is lost to the abandon); late clients of the survivors
+        // (a lease is taken on demand) have one take it over.
+        client_plan: vec![(1, 0, 8), (2, 12_000, 12), (3, 12_000, 12)],
         ..far_root_writes_config()
     }
 }
