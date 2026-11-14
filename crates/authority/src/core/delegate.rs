@@ -1349,6 +1349,12 @@ pub(crate) struct DelegationState {
     /// Plan 46 M1.3 step 12: the claimed own streams whose end waits for the
     /// stream's rows (the wall time the wait began).
     pub(crate) claim_waits: BTreeMap<u64, WaitMs>,
+    /// Plan 46 M1.3 step 6: when the idle release next looks (the earliest
+    /// time a held sticky subtree can have been idle long enough).
+    pub(crate) idle_due: Option<WaitMs>,
+    /// The number of streams held when `idle_due` was worked out (a stream
+    /// installed since is looked at at once).
+    pub(crate) idle_seen: usize,
     /// ADR-55: this process installed a stream under a restart quarantine
     /// (it held delegations before it restarted): a stream of its own it holds
     /// waits for its claim of the lease instead of executing in the gate.
@@ -1391,6 +1397,8 @@ pub(crate) struct DelegationState {
     /// progress (see [`StickyReleaseCmd`]).
     pub sticky_cmds: Vec<StickyReleaseCmd>,
     pub sticky_timer: Option<TimerId>,
+    /// When `sticky_timer` fires.
+    pub sticky_timer_at: WaitMs,
     /// ADR-56: the handover requests this holder has not answered (by its
     /// own release row) yet.
     pub handovers: Vec<HandoverWait>,
@@ -5762,6 +5770,7 @@ impl Core {
         self.handover_progress(now, replica, out);
         self.claim_end_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
+        self.idle_release_progress(now, replica, out);
         self.own_release_progress(now, replica, out);
         self.abandon_progress(now, replica, out);
         self.deleg_restart_void_round(now, replica, out);
@@ -14472,20 +14481,122 @@ impl Core {
         });
     }
 
-    fn sticky_release_arm(&mut self, now: Now, out: &mut Vec<Action>) {
-        if self.dl.sticky_timer.is_some()
-            || (self.dl.sticky_cmds.is_empty()
-                && self.dl.handovers.is_empty()
-                && self.dl.claim_waits.is_empty())
+    /// Plan 46 M1.3 step 6: a sticky subtree this node holds (a far
+    /// holder's, or the root's own stream) that its own ops have not touched
+    /// for `sticky_idle_release_ms` is released by the holder, as a command of
+    /// its own: ADR-56 H-I5's idle test (no parked own op, none the fast path
+    /// admitted, the grace measured from the last own op,
+    /// [`Self::own_in_flight`]) decides, and step 5's drain and row do the
+    /// release. A forwarded op is no activity of the holder's. The clock of a
+    /// subtree never touched starts when it is first seen here. A release
+    /// the pending drop or a stalled drain holds is retried by the tick.
+    pub(crate) fn idle_release_progress(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let idle = self.cfg.sticky_idle_release_ms;
+        if idle == 0 || self.dl.mine.is_empty() {
+            self.dl.idle_due = None;
+            return;
+        }
+        if self.dl.idle_seen == self.dl.mine.len()
+            && self.dl.idle_due.is_some_and(|due| now.wait < due)
         {
             return;
         }
-        let t = self.set_timer_wait(
-            now.wait.plus(STICKY_RELEASE_TICK_MS as u64),
-            Timer::StickyRelease,
-            out,
-        );
+        self.dl.idle_seen = self.dl.mine.len();
+        let busy: BTreeSet<(u64, Ino)> = self
+            .dl
+            .sticky_cmds
+            .iter()
+            .flat_map(|c| c.parts.iter())
+            .flat_map(|(g, dirs)| dirs.iter().map(move |d| (*g, *d)))
+            .chain(
+                self.dl
+                    .handovers
+                    .iter()
+                    .flat_map(|w| w.dirs.iter().map(move |d| (w.gen, *d))),
+            )
+            .collect();
+        let tick = now.wait.plus(STICKY_RELEASE_TICK_MS as u64);
+        let mut due: Option<WaitMs> = None;
+        let mut soonest = |at: WaitMs| due = Some(due.map_or(at, |d| d.min(at)));
+        let mut parts: BTreeMap<u64, BTreeSet<Ino>> = BTreeMap::new();
+        let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
+        for gen in gens {
+            let held = self.sticky_held(gen, replica);
+            for dir in held.into_iter().filter(|dir| !busy.contains(&(gen, *dir))) {
+                if self.own_in_flight(gen, dir, replica) {
+                    soonest(tick);
+                    continue;
+                }
+                let Some(d) = self.dl.mine.get_mut(&gen) else {
+                    continue;
+                };
+                if d.stopped || d.release.is_some() {
+                    // (Being released already: looked at again when it is done.)
+                    soonest(tick);
+                    continue;
+                }
+                let last = *d.last_own_op.entry(dir).or_insert(now.wait);
+                let at = last.plus(idle);
+                if now.wait >= at {
+                    parts.entry(gen).or_default().insert(dir);
+                } else {
+                    soonest(at);
+                }
+            }
+        }
+        self.dl.idle_due = due;
+        if !parts.is_empty() {
+            let n: u64 = parts.values().map(|p| p.len() as u64).sum();
+            self.stats.deleg_sticky_released_idle += n;
+            tracing::info!(
+                node = self.me(),
+                subtrees = n,
+                idle_ms = idle,
+                "the holder releases sticky subtrees its own ops have not touched for the idle release time"
+            );
+            self.dl.sticky_cmds.push(StickyReleaseCmd {
+                op: None,
+                started: now.wait,
+                deadline: now.wait.plus(self.leave_wait_ms() as u64),
+                parts,
+                handover: false,
+                root: 0,
+                made_at: self.dl.step,
+            });
+            self.sticky_release_progress(now, replica, out);
+        }
+        self.sticky_release_arm(now, out);
+    }
+
+    /// The timer of the holder's releases, the handovers, the claimed
+    /// streams' ends and the idle look: one tick while any command or wait is
+    /// open, else the idle release's next look ([`Self::idle_release_progress`]).
+    fn sticky_release_arm(&mut self, now: Now, out: &mut Vec<Action>) {
+        let urgent = !(self.dl.sticky_cmds.is_empty()
+            && self.dl.handovers.is_empty()
+            && self.dl.claim_waits.is_empty());
+        let want = if urgent {
+            Some(now.wait.plus(STICKY_RELEASE_TICK_MS as u64))
+        } else {
+            self.dl.idle_due.map(|at| at.max(now.wait))
+        };
+        let Some(want) = want else {
+            return;
+        };
+        if let Some(t) = self.dl.sticky_timer {
+            if self.dl.sticky_timer_at <= want {
+                return;
+            }
+            self.cancel_timer(t, out);
+        }
+        let t = self.set_timer_wait(want, Timer::StickyRelease, out);
         self.dl.sticky_timer = Some(t);
+        self.dl.sticky_timer_at = want;
     }
 
     pub(crate) fn on_sticky_release_timer(
@@ -14498,6 +14609,8 @@ impl Core {
         self.claim_end_progress(now, replica, out);
         self.handover_progress(now, replica, out);
         self.sticky_release_progress(now, replica, out);
+        self.idle_release_progress(now, replica, out);
+        self.sticky_release_arm(now, out);
     }
 
     /// `Control::EndGrantsOf { node }` (the admin form of leave, for a node

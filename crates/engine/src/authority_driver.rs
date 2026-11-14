@@ -829,6 +829,12 @@ pub fn load_config(
         "CONSTELLATION_STICKY_HANDOVER_GRACE_MS",
         c.handover_grace_ms,
     );
+    // Plan 46 M1.3 step 6: a holder releases a sticky subtree its own ops have
+    // not touched for this long (`0`: never).
+    c.sticky_idle_release_ms = env_u64_zero_ok(
+        "CONSTELLATION_STICKY_IDLE_RELEASE_MS",
+        c.sticky_idle_release_ms,
+    );
     c.placement_far_rtt_ms = env_u64_zero_ok(
         "CONSTELLATION_DELEGATION_FAR_RTT_MS",
         c.placement_far_rtt_ms,

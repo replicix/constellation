@@ -113,6 +113,8 @@ impl Harness {
         // (The ADR-51 kept phase has its own tests, `kept_fetch`; the others
         // pin the claim machinery without it.)
         cfg.kept_fetch_skipped = true;
+        // (Plan 46 M1.3 step 6: off here; the tests of the idle release set it.)
+        cfg.sticky_idle_release_ms = 0;
         cfg.ttl_ms = 10_000;
         // The lock tests' timings are written for a 5 s grant (inside
         // this 10 s lease); the production default is 20 s.
@@ -75220,6 +75222,87 @@ mod step5_sticky_release {
         let out = release_tick(&mut h, 200);
         assert!(last_is_release(&h), "not released after the apply: {out:?}");
         assert_eq!(h.core.stats.deleg_sticky_releases, 1);
+    }
+
+    /// Plan 46 M1.3 step 6: a sticky subtree the holder's own ops have not
+    /// touched for `sticky_idle_release_ms` is released by its own row, with
+    /// the drain of step 5 (the setting is the core's, not an engine
+    /// tracker's). Fails on the parent: nothing released an idle subtree.
+    #[test]
+    fn an_idle_sticky_subtree_is_released_after_the_setting() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        h.core.cfg.sticky_idle_release_ms = 1_000;
+        sample(&mut h, &[], &[]);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert!(!last_is_release(&h), "released before it was idle");
+        assert!(h.core.dl.sticky_timer.is_some(), "no timer for the idle look");
+        // Not yet idle for the setting: nothing.
+        release_tick(&mut h, 900);
+        assert!(!last_is_release(&h));
+        // Idle for the setting: the command is made, and released after the
+        // sample that follows its step.
+        release_tick(&mut h, 200);
+        sample(&mut h, &[], &[]);
+        release_tick(&mut h, 200);
+        assert!(
+            last_is_release(&h),
+            "an idle subtree was not released: {} cmds, {} idle, due {:?}, now {:?}",
+            h.core.dl.sticky_cmds.len(),
+            h.core.stats.deleg_sticky_released_idle,
+            h.core.dl.idle_due,
+            h.clk().wait
+        );
+        assert_eq!(h.core.stats.deleg_sticky_released_idle, dirs.len() as u64);
+    }
+
+    /// Plan 46 M1.3 step 6: an op the fast path admitted (in flight), or one
+    /// that ran since, keeps the subtree: the idle clock counts from the
+    /// last own op, and nothing is released under an admitted op (ADR-56
+    /// H-I5). Fails on the parent for the same reason as the test above.
+    #[test]
+    fn a_sticky_subtree_with_an_admitted_or_recent_own_op_is_not_released_idle() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        h.core.cfg.sticky_idle_release_ms = 1_000;
+        sample(&mut h, &[], &[]);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        // An admitted op, in flight for far longer than the setting.
+        for _ in 0..8 {
+            sample(&mut h, &[], &[(7, dirs[0], 1)]);
+            release_tick(&mut h, 400);
+        }
+        assert_eq!(h.core.stats.deleg_sticky_released_idle, 0);
+        // It ran and is done; the clock counts from it.
+        sample(&mut h, &[(7, dirs[0])], &[]);
+        release_tick(&mut h, 900);
+        assert_eq!(h.core.stats.deleg_sticky_released_idle, 0, "released 900 ms after an op");
+        release_tick(&mut h, 200);
+        assert_eq!(h.core.stats.deleg_sticky_released_idle, 1);
+    }
+
+    /// Plan 46 M1.3 step 6: `0` disables the idle release.
+    #[test]
+    fn a_zero_idle_release_setting_releases_nothing() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        h.core.cfg.fast_path_sampled = true;
+        h.core.cfg.sticky_idle_release_ms = 0;
+        for _ in 0..4 {
+            sample(&mut h, &[], &[]);
+            h.advance(100_000);
+            h.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            });
+        }
+        assert_eq!(h.core.stats.deleg_sticky_released_idle, 0);
+        assert!(h.core.dl.sticky_cmds.is_empty());
     }
 
     /// ADR-56 review M1: the release waits for a sample taken after the

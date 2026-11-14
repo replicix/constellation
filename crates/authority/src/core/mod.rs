@@ -664,6 +664,12 @@ pub struct Config {
     /// none of its own ops is in flight there, or its own ops there have
     /// been idle for this long. `0`: only when nothing is in flight.
     pub handover_grace_ms: u64,
+    /// Plan 46 M1.3 step 6, `CONSTELLATION_STICKY_IDLE_RELEASE_MS` (60 s): a
+    /// holder releases a sticky subtree its own ops have not touched for
+    /// this long, by the same drain and row as any release of its own
+    /// (`Core::idle_release_progress`). The root's own streams too. `0`
+    /// disables.
+    pub sticky_idle_release_ms: u64,
     /// ADR-56, `CONSTELLATION_STICKY_HANDOVER_TENURE_MS` (30 s): the root
     /// asks the holder of a sticky subtree to hand it over only when the
     /// grant has been with its holder at least this long (a grant changes
@@ -893,6 +899,7 @@ impl Config {
             placement_dwell_ms: 300_000,
             placement_cooldown_ms: 30_000,
             handover_grace_ms: 5_000,
+            sticky_idle_release_ms: 60_000,
             handover_min_tenure_ms: 30_000,
             handover_ends_sticky: false,
             handover_ignores_tenure: false,
@@ -1492,6 +1499,9 @@ pub struct Stats {
     pub deleg_sticky_release_undrained: u64,
     pub deleg_sticky_release_held: u64,
     pub deleg_sticky_releases_given_up: u64,
+    /// Plan 46 M1.3 step 6: sticky subtrees the holder released because its
+    /// own ops had been idle there for `sticky_idle_release_ms`.
+    pub deleg_sticky_released_idle: u64,
     /// Plan 46 M1.3 step 8 (ADR-56), the holder's side of a handover
     /// request: requests that waited for the holder's own ops to be quiet
     /// (`_waits`), waits that became a release (`_released`), requests for
