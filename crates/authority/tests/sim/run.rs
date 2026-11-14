@@ -6153,6 +6153,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         let all = live.iter().all(|n| {
             let v = n.view();
             v.clients_in_flight == 0
+                && v.claim_waits == 0
                 && (!cfg.await_dead_delegates
                     || v.delegation.gens.iter().all(|g| {
                         g.6 || (g.7 && cfg.abandon_after_ms.is_none()) || cluster.get(g.1).alive()

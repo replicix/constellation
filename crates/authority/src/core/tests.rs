@@ -82207,23 +82207,104 @@ mod root_own_sticky {
             own_grant_of(&h, dirs[1]).is_none(),
             "a claimed stream was grown while its end waited"
         );
-        // Nothing of the stream follows the release row.
-        let txs = Replica::journal_txs_from(&h.meta, record + 1, usize::MAX);
-        let release_idx = txs
+        let release_idx = release_row_idx(&h, gen, record).expect("no release row");
+        drive_ops_during_the_wait(&mut h, dirs[0], gen);
+        assert_no_row_after(&h, gen, record, release_idx);
+    }
+
+    /// The journal index of the stream's release row, if there is one.
+    fn release_row_idx(h: &Harness, gen: u64, from: u64) -> Option<u64> {
+        Replica::journal_txs_from(&h.meta, from + 1, usize::MAX)
             .iter()
             .find(|t| {
                 t.records
                     .iter()
                     .any(|r| matches!(r, LogRecord::StreamReleased { gen: g, .. } if *g == gen))
             })
-            .expect("no release row")
-            .origin
-            .1;
+            .map(|t| t.origin.1)
+    }
+
+    /// One own client op on the stream's subtree, and one op parked in the
+    /// stream whose dependencies are met, while the end waits: neither may
+    /// land in the stream.
+    fn drive_ops_during_the_wait(h: &mut Harness, dir: Ino, gen: u64) {
+        let rid = h.rid(70);
+        let op = create_in(h, dir, "parked");
+        h.core
+            .dl
+            .mine
+            .get_mut(&gen)
+            .expect("the stream")
+            .parked
+            .push(super::super::delegate::ParkedDeleg {
+                from: 0,
+                req: None,
+                rid,
+                op,
+                deps: constellation_meta::Position::ZERO,
+                acked_through: 0,
+                tag: Default::default(),
+                settle: false,
+                fence: Default::default(),
+                held: false,
+                arrived: WaitMs(0),
+            });
+        let _ = submit_in(h, 71, dir, "own-after-claim");
+        for _ in 0..4 {
+            h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+            if let Some(id) = h.core.dl.stream_timer {
+                h.step(Event::Timer { id });
+            }
+            activity(h);
+        }
+    }
+
+    /// No row of stream `gen` in the journal after `from` has an index above
+    /// `release_idx`.
+    fn assert_no_row_after(h: &Harness, gen: u64, from: u64, release_idx: u64) {
+        let txs = Replica::journal_txs_from(&h.meta, from + 1, usize::MAX);
         assert!(
             txs.iter()
                 .filter(|t| t.origin.0 == gen)
                 .all(|t| t.origin.1 <= release_idx),
             "a row of the stream follows its release row: {txs:?}"
+        );
+    }
+
+    /// Review round 3 (S-R1): a claim that writes no release row (here the
+    /// takeover gate replayed the stream's rows) stops the stream when its
+    /// end starts to wait, and no op lands in it meanwhile.
+    #[test]
+    fn a_rowless_claim_stops_the_stream_while_its_end_waits() {
+        let (mut h, dirs, gen, record) = restarted_root_with_own_stream();
+        h.core.dl.claim_replayed.insert(gen);
+        h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
+        let before = Replica::journal_txs_from(&h.meta, record + 1, usize::MAX)
+            .iter()
+            .filter(|t| t.origin.0 == gen)
+            .map(|t| t.origin.1)
+            .max()
+            .unwrap_or(0);
+        claim(&mut h);
+        assert_eq!(h.core.stats.claim_released, 0, "a row was journaled");
+        assert!(
+            h.core.dl.claim_waits.contains_key(&gen),
+            "the end did not wait"
+        );
+        assert!(
+            h.core.dl.mine[&gen].stopped,
+            "a rowless claim left the stream live while its end waits"
+        );
+        drive_ops_during_the_wait(&mut h, dirs[0], gen);
+        assert_no_row_after(&h, gen, record, before);
+        assert_eq!(
+            h.core.dl.mine[&gen].parked.len(),
+            1,
+            "the parked op left the stopped stream"
+        );
+        assert!(
+            h.core.dl.claim_waits.contains_key(&gen),
+            "the end did not keep waiting"
         );
     }
 

@@ -87,6 +87,8 @@ pub struct CoreView {
     pub job: Option<constellation_authority::core::JobKind>,
     pub job_phase: Option<String>,
     pub clients_in_flight: usize,
+    /// Claimed own streams whose end waits (the run is not quiescent until it ends).
+    pub claim_waits: usize,
     pub next_seq: Seq,
     pub events_handled: u64,
     pub applied_seq: Seq,
@@ -2923,6 +2925,7 @@ impl Driver {
         view.job = self.core.job();
         view.job_phase = self.core.job_phase();
         view.clients_in_flight = self.core.clients().count();
+        view.claim_waits = self.core.claim_waits();
         view.next_seq = self.core.ship().next_seq;
         view.events_handled += 1;
         view.applied_seq = Replica::applied_seq(&*self.meta).unwrap_or(0);

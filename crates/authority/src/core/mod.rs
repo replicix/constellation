@@ -3205,6 +3205,11 @@ impl Core {
         self.job.as_ref().map(|j| format!("{j:?}"))
     }
 
+    /// Claimed own streams whose end waits (plan 46 M1.3 step 12), for tests.
+    pub fn claim_waits(&self) -> usize {
+        self.dl.claim_waits.len()
+    }
+
     /// Client ops in flight (rid → phase), for tests.
     pub fn clients(&self) -> impl Iterator<Item = (Rid, ClientPhase)> + '_ {
         self.clients.iter().map(|(rid, op)| (*rid, op.phase_kind()))

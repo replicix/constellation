@@ -13187,7 +13187,8 @@ impl Core {
         let back = match held {
             Ok(back) => back,
             Err(error) => {
-                tracing::warn!(
+                // (Once per look: the caller's wait logs the stream once.)
+                tracing::debug!(
                     gen = %constellation_meta::delegation::GenLabel::of(gen),
                     %error,
                     "the ship plan of a claimed own stream could not be read: its end waits"
@@ -13236,7 +13237,23 @@ impl Core {
             self.end_generation(now, gen, None, replica, out);
             return;
         }
+        if first && matches!(wait, ClaimWait::Unknown) {
+            tracing::warn!(
+                node = self.me(),
+                gen = %constellation_meta::delegation::GenLabel::of(gen),
+                "the ship plan of a claimed own stream could not be read: its end waits"
+            );
+        }
         if first {
+            // Whatever the claim journaled (a stealable stream, a cap or a
+            // lost dependency, a failed row write: no release row), the
+            // stream executes nothing from here to its end: an op that
+            // journaled in it during the wait might fall outside the end's
+            // cut. Its ops wait on the root path, which waits on the live
+            // generation (latency only).
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                d.stopped = true;
+            }
             self.stats.claim_end_waits += 1;
             tracing::info!(
                 node = self.me(),
