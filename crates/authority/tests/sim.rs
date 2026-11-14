@@ -2407,7 +2407,7 @@ fn sticky_leave_root_config() -> SimConfig {
     }
 }
 
-/// OPEN (ADR-61): fails 2 of 3 seeds today, and is in no suite test or sweep
+/// OPEN (ADR-61): fails 204 of 300 seeds today, and is in no suite test or sweep
 /// list: a root's own leave never completes, its own stream's `release_acked`
 /// never turns true (`Core::leave_waits_progress` waits for it for ever; the
 /// leave aborts at its deadline, safely). The root's own leave while it holds
