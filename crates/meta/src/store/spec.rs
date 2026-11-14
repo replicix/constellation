@@ -6173,6 +6173,7 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
+        self.after_drop_plan_commit();
         for (gen, cut) in orphan_cuts {
             tracing::info!(
                 gen = %crate::delegation::GenLabel::of(gen),

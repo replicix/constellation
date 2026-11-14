@@ -2130,6 +2130,7 @@ impl Meta {
             // go now).
             self.put_drop_plan_tx(&mut tx, ino, &plan)?;
             tx.commit()?;
+            self.after_drop_plan_commit();
             return self.drop_held_apply(ino, now_unix, unanswered, live_ops, sessions, true);
         }
         // A stream holder's record is its stream's row at the seed's index,
@@ -2158,6 +2159,7 @@ impl Meta {
         plan.epoch = super::local::get_journal_tx_head(&tx, self, jseq)?.map_or(0, |h| h.epoch);
         self.put_drop_plan_tx(&mut tx, ino, &plan)?;
         tx.commit()?;
+        self.after_drop_plan_commit();
         tracing::warn!(
             ino,
             jseq,
@@ -2233,6 +2235,7 @@ impl Meta {
         let mut tx = self.db.write_tx();
         self.put_drop_plan_tx(&mut tx, ino, &plan).unwrap();
         tx.commit().unwrap();
+        self.after_drop_plan_commit();
     }
 
     /// Tests: [`Self::put_stream_drop_plan_for_tests`], the plan naming `rids`
@@ -2253,6 +2256,7 @@ impl Meta {
         let mut tx = self.db.write_tx();
         self.put_drop_plan_tx(&mut tx, ino, &plan).unwrap();
         tx.commit().unwrap();
+        self.after_drop_plan_commit();
     }
 
     /// Tests: the decided plan of `ino`'s rolled-back rids, and the
@@ -2341,6 +2345,7 @@ impl Meta {
         }
         if found {
             tx.commit()?;
+            self.after_drop_plan_commit();
             self.note_drop_fills(&all_fills);
         }
         Ok(found)
@@ -2397,18 +2402,43 @@ impl Meta {
         plan: &DropPlan,
     ) -> Result<(), MetaError> {
         // A new generation, `maybe` set: a reader's scan that began before
-        // this write cannot clear it.
-        self.drop_plans_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
-                Some(((s >> 1).wrapping_add(1) << 1) | 1)
-            })
-            .ok();
+        // this write cannot clear it. The commit owes a second bump
+        // (`after_drop_plan_commit`), for a reader that loaded the state
+        // after this one and scanned before the commit.
+        self.bump_drop_plans_state();
+        self.drop_plan_written.store(true, Ordering::Release);
         tx.insert(
             &self.local,
             drop_plan_key(ino),
             postcard::to_allocvec(plan)?,
         );
         Ok(())
+    }
+
+    fn bump_drop_plans_state(&self) {
+        self.drop_plans_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                Some(((s >> 1).wrapping_add(1) << 1) | 1)
+            })
+            .ok();
+    }
+
+    /// After a commit: if the transaction wrote a drop plan
+    /// ([`Self::put_drop_plan_tx`]), bump `drop_plans_state` again, so that a
+    /// reader that cleared `maybe` while the write was uncommitted does not
+    /// leave it clear over a stored plan. Every committer of a transaction
+    /// that may write a plan calls it.
+    pub(crate) fn after_drop_plan_commit(&self) {
+        if self.drop_plan_written.swap(false, Ordering::AcqRel) {
+            self.bump_drop_plans_state();
+        }
+    }
+
+    /// Tests: a reader's scan that runs between a plan's write and its
+    /// commit (the interleaving `after_drop_plan_commit` closes).
+    #[cfg(test)]
+    pub(crate) fn drop_plans_state_for_tests(&self) -> u64 {
+        self.drop_plans_state.load(Ordering::Acquire)
     }
 
     /// ADR-59 part B (D3, the release rule): whether a drop decided here and
@@ -3090,6 +3120,7 @@ impl Meta {
         plan.follow_ups += 1;
         self.put_drop_plan_tx(&mut tx, ino, &plan)?;
         tx.commit()?;
+        self.after_drop_plan_commit();
         tracing::warn!(
             ino,
             jseq,
@@ -5081,5 +5112,42 @@ mod tests {
             }
 
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_plan_state_tests {
+    use super::*;
+
+    /// ADR-59 part B (D3): a reader that scans between a plan's write and its
+    /// commit finds no plan and clears `maybe`; the commit's second bump sets
+    /// it again, so the stored plan is seen from then on.
+    #[test]
+    fn a_scan_inside_a_plans_write_does_not_hide_it_after_the_commit() {
+        let m = Meta::open_in_memory().unwrap();
+        let rid = crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 7,
+        };
+        assert!(!m.drop_plan_names_rid(rid), "no plan: `maybe` cleared");
+        assert_eq!(m.drop_plans_state_for_tests() & 1, 0);
+        let plan = DropPlan {
+            rids: vec![rid],
+            ..DropPlan::default()
+        };
+        let mut tx = m.db.write_tx();
+        m.put_drop_plan_tx(&mut tx, 5, &plan).unwrap();
+        // The reader's scan runs now: the write is not committed.
+        assert!(!m.drop_plan_names_rid(rid));
+        assert_eq!(
+            m.drop_plans_state_for_tests() & 1,
+            0,
+            "the reader cleared `maybe` over the uncommitted write"
+        );
+        tx.commit().unwrap();
+        m.after_drop_plan_commit();
+        assert_eq!(m.drop_plans_state_for_tests() & 1, 1, "set again");
+        assert!(m.drop_plan_names_rid(rid), "the stored plan is seen");
     }
 }

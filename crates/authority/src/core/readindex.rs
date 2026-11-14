@@ -1348,11 +1348,21 @@ impl Core {
                         )),
                     });
                 }
-                let plan = replica
-                    .drop_plans()
-                    .ok()
-                    .and_then(|plans| plans.into_iter().find(|(i, ..)| *i == ino));
-                if let Some((_, jseq, epoch, _)) = plan {
+                // The plan's record seq and epoch. A failed read of the
+                // plans re-parks all the same (the record is in the log: seq
+                // 0 is covered, epoch 0 is never fenced); the retry's apply
+                // finds out.
+                let plan = match replica.drop_plans() {
+                    Ok(plans) => plans
+                        .into_iter()
+                        .find(|(i, ..)| *i == ino)
+                        .map(|(_, jseq, epoch, _)| (jseq, epoch)),
+                    Err(error) => {
+                        tracing::warn!(%error, ino, "the drop plans could not be read: retrying the apply");
+                        Some((0, 0))
+                    }
+                };
+                if let Some((jseq, epoch)) = plan {
                     let at = now.wait.plus(DROP_APPLY_RETRY_MS);
                     self.park(
                         now,

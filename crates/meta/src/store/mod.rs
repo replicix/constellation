@@ -624,13 +624,21 @@ pub struct Meta {
     /// [`Self::holder_append_of`]: a plain delegate never pays its seek.
     pub(crate) holder_append_tip: AtomicU64,
     /// ADR-59 part B (D3): whether a drop plan may be stored here, as
-    /// `generation << 1 | maybe`: every write of a plan bumps the generation
-    /// and sets `maybe` before its transaction commits; a reader that finds
-    /// no plan clears `maybe` only if no write came in between. So
-    /// [`Self::drop_plan_names_rid`] costs one atomic load on a node with no
-    /// plan (every answer the emission gate lets out asks it). Starts
+    /// `generation << 1 | maybe`. Every write of a plan bumps the generation
+    /// and sets `maybe` twice: in its transaction, before the commit, and
+    /// again once the transaction has committed
+    /// ([`Self::after_drop_plan_commit`]). A reader that finds no plan clears
+    /// `maybe` only if the generation it loaded before its scan is unchanged.
+    /// So a reader may clear it while a write is in flight (its scan did not
+    /// see the uncommitted plan), but the write's second bump sets it again
+    /// before the writer returns: from then on every reader scans. Starts
     /// `maybe` (the first read after the open finds out).
+    /// [`Self::drop_plan_names_rid`] costs one atomic load on a node with no
+    /// plan (every answer the emission gate lets out asks it).
     pub(crate) drop_plans_state: AtomicU64,
+    /// A plan was written in the transaction being committed: the commit's
+    /// second bump of `drop_plans_state` is owed.
+    pub(crate) drop_plan_written: AtomicBool,
     /// Whether a failed read of the drop plans has been warned of (once).
     pub(crate) drop_plan_read_warned: AtomicBool,
     /// Unit tests of the tree publisher only: publish `ns` as it stands
@@ -1385,6 +1393,7 @@ impl Meta {
             holder_epoch: Arc::new(AtomicU64::new(0)),
             holder_append_tip: AtomicU64::new(0),
             drop_plans_state: AtomicU64::new(1),
+            drop_plan_written: AtomicBool::new(false),
             drop_plan_read_warned: AtomicBool::new(false),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
