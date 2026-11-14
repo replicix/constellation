@@ -162,6 +162,99 @@ fn reship_key(epoch: u64) -> String {
 fn through_key(epoch: u64) -> String {
     format!("member_through:{epoch}")
 }
+// - `member_reshipped:{e}:{j}`: the log carried a re-ship of identity
+//   `(e, j)`; the value is the blake3 (hex) of the re-ship's transaction
+//   (`tx_end`: through its first outcome record and the inbox
+//   acknowledgements behind it): exactly which transaction, not only how far
+//   the epoch's re-ships reached (`member_reship`). Written once: a later
+//   re-ship of the identity with other records poisons it
+//   ([`RESHIP_CONFLICT`], never matched). One key per re-shipped transaction
+//   with an outcome, written where a segment of the log is applied (a
+//   shipper's own re-ship, acknowledged rather than applied, writes none:
+//   its gate then counts such a row `tail_done`, the conservative side).
+fn reshipped_key(epoch: u64, jseq: u64) -> String {
+    format!("member_reshipped:{epoch}:{jseq}")
+}
+
+/// The value of a `member_reshipped` key that two re-ships of one identity
+/// with different records left: it matches no fingerprint.
+const RESHIP_CONFLICT: &str = "conflict";
+
+/// The end (exclusive) of the transaction `records` begins with: its first
+/// outcome record (`Completed`, `Refused`) and the inbox acknowledgements
+/// right behind it (plan 30 §M13 journals the `InboxAck` with the
+/// transaction). `None`: no outcome, nothing the gate's done check meets.
+fn tx_end(records: &[LogRecord]) -> Option<usize> {
+    let outcome = records
+        .iter()
+        .position(|r| matches!(r, LogRecord::Completed { .. } | LogRecord::Refused { .. }))?;
+    let acks = records[outcome + 1..]
+        .iter()
+        .take_while(|r| matches!(r, LogRecord::InboxAck { .. }))
+        .count();
+    Some(outcome + 1 + acks)
+}
+
+/// The fingerprint `member_reshipped` keeps of the transaction `records`
+/// begins with (`tx_end`); `None` when it has no outcome.
+fn reship_fingerprint(records: &[LogRecord]) -> Result<Option<String>, MetaError> {
+    let Some(end) = tx_end(records) else {
+        return Ok(None);
+    };
+    let bytes = postcard::to_allocvec(&records[..end])?;
+    Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
+}
+
+/// Keep the fingerprint of the re-ship of `ident` the log carried, write
+/// once: the same again changes nothing, other records poison the key.
+/// Whether the key changed.
+fn note_reship_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    ident: (u64, u64),
+    records: &[LogRecord],
+) -> Result<bool, MetaError> {
+    let Some(fingerprint) = reship_fingerprint(records)? else {
+        return Ok(false);
+    };
+    let key = reshipped_key(ident.0, ident.1);
+    match kv_get_tx(&*tx, &meta.local, &key)? {
+        None => {
+            kv_set_tx(tx, &meta.local, &key, &fingerprint);
+            Ok(true)
+        }
+        Some(kept) if kept == fingerprint || kept == RESHIP_CONFLICT => Ok(false),
+        Some(_) => {
+            tracing::warn!(
+                epoch = ident.0,
+                jseq = ident.1,
+                "the log re-shipped one identity twice with different records; \
+                 its rows are judged by their rid's outcome alone"
+            );
+            kv_set_tx(tx, &meta.local, &key, RESHIP_CONFLICT);
+            Ok(true)
+        }
+    }
+}
+
+/// Whether the log carried a re-ship of identity `ident` whose transaction
+/// is `body` (the row's own records, without a `TailOf`), whole: `body` ends
+/// where its transaction does (`tx_end`) and its fingerprint is the one
+/// the log's re-ship left.
+pub(crate) fn log_carries_reship_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    ident: (u64, u64),
+    body: &[LogRecord],
+) -> Result<bool, MetaError> {
+    let Some(kept) = kv_get_tx(r, &meta.local, &reshipped_key(ident.0, ident.1))? else {
+        return Ok(false);
+    };
+    if tx_end(body) != Some(body.len()) {
+        return Ok(false);
+    }
+    Ok(reship_fingerprint(body)?.is_some_and(|f| f == kept))
+}
 
 fn kv_u64(r: &impl Readable, meta: &Meta, key: &str) -> Result<Option<u64>, MetaError> {
     Ok(kv_get_tx(r, &meta.local, key)?.and_then(|s| s.parse().ok()))
@@ -228,10 +321,11 @@ pub(crate) fn note_log_tail_tx(
     if let Some(prev) = prev_applied.filter(|p| p.epoch < epoch) {
         changed |= kv_raise(tx, meta, &shipped_key(prev.epoch), prev.jseq)?;
     }
-    for rec in records {
+    for (i, rec) in records.iter().enumerate() {
         match rec {
             LogRecord::TailOf { epoch, jseq } => {
-                changed |= kv_raise(tx, meta, &reship_key(*epoch), *jseq)?
+                changed |= kv_raise(tx, meta, &reship_key(*epoch), *jseq)?;
+                changed |= note_reship_tx(tx, meta, (*epoch, *jseq), &records[i + 1..])?;
             }
             LogRecord::TailFollowsThrough {
                 prev_epoch,

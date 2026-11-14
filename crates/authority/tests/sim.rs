@@ -21326,6 +21326,25 @@ fn a_hole_and_a_logged_copy_at_one_seq_only_delay_the_claim() {
     }
 }
 
+/// `drop-held-chain-backed` seed 1529: node 1 took epoch 2 over, re-shipped
+/// node 2's epoch-1 row (rid 1:1, journal seq 9) under its own epoch with the
+/// row's identity (`TailOf (1, 9)`), and was sealed in turn; node 2, its
+/// backup, kept that re-ship in its epoch-2 tail. Node 2's claim of epoch 3
+/// read epoch 1's tail again (the claim's kept rows), found the rid's outcome
+/// here (the re-ship, applied from the log) and counted the row a done rid
+/// (`tail_done`, an outcome under another identity), which strict identity
+/// fails. The rid's outcome row is the re-ship naming this identity: the
+/// store now keeps, per re-shipped identity the log carried, a fingerprint of
+/// its records, and the gate counts the row `tail_in_log` only when both match
+/// (the store's tests
+/// `a_tail_row_the_log_carries_as_its_reship_is_in_the_log_not_a_done_rid`
+/// and `a_reship_of_another_identity_or_content_proves_nothing`).
+#[test]
+fn a_row_the_log_carries_by_a_reship_is_not_a_done_rid_at_the_next_claim() {
+    run_seed(1529, drop_held_chain_backed_config())
+        .unwrap_or_else(|e| panic!("drop-held-chain-backed seed 1529: {e}"));
+}
+
 /// Plan 46 M1.3 step 7 (ADR-54): a far writer (every pair out of the
 /// backup budget) that dominates a subtree is granted a sticky one: it
 /// executes there and its answers are final, with no rollback, no sticky
