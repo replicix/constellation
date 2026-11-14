@@ -5590,13 +5590,16 @@ alone while a holder it does not count writes. The model's property is
 
 The sim dates the abandon the leave driver runs (as `AbandonNode` does), and
 its end-of-run allowance for acknowledged rids the log never completed is
-tightened for every abandon configuration: a rid is excused only when its
-judged answer is `Final` for a row `(g, idx)` of a generation the log shows
-`GroupAbandoned`, with `idx` above the cut of its `DelegateNodeEnded`. A
-dead root's acknowledged own-stream rows past its cut are then the abandon's
-documented cost (`sticky-leave-root`, 0 of 2,000 with the idle release off and
-on); the same tightening fails `delegated-backup-and-delegate-die-abandon`
-(rows a dead group held, acknowledged under the group class: not excused).
+tightened for every abandon configuration. A rid is excused only when its
+judged answer is `Final` (the holder's own disk) or `Group`, for a row
+`(g, idx)` of a generation the log shows `GroupAbandoned`, with `idx` above
+the cut of its `DelegateNodeEnded`; and, for `Group`, only when the operator's
+abandon found every node of the group (the delegate, or a delegate whose
+generation is stopped, and each strict member the root listed) gone. The
+delegations reference says it: "every row the delegate answered through the
+group and the root never appended is lost" and "rows only that group held are
+lost". The session checks (`read_your_writes`, `monotonic_reads`) exempt the
+same rids and no others.
 
 **Rejected**: an admin leave that abandons the dead holder itself (the
 abandon's word that the node is down is the operator's); answering the

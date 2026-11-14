@@ -70005,5 +70005,5 @@ node's table after the node was answered (idle release on, seeds 209, 292): the 
 no live generation of the node and recalls the ones it lists. A self-leave under a pending drop can abort at its deadline: the
 intended behaviour (latency, not integrity). A non-root never retires a dead root from its own table (it can be behind the log): it refuses until a root has taken over.
 The leave driver dates its abandons; the sim's never-completed-rid allowance is tightened to `Final` rows past the cut of an
-abandoned generation, which `delegated-backup-and-delegate-die-abandon` fails on 71 of 2,000 seeds (group-class rows a dead group
-held; session guarantees and I1). No change to replicix-core.
+abandoned generation (`Group` rows too, once the operator found the whole group gone), with the session checks exempting the
+same rids. No change to replicix-core.

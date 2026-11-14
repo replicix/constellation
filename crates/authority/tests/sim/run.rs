@@ -6077,12 +6077,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // Plan 43 C1-3: the operator who abandons a group a claim has waited
     // for too long.
     let operator_abandoned: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    // The abandoned generations whose whole group (the delegate and every
+    // strict member the root listed) was dead or stopped at the abandon: the
+    // operator's `abandon --gen` after it confirmed what the command says to
+    // confirm.
+    let operator_confirmed: Arc<Mutex<BTreeSet<u64>>> = Arc::new(Mutex::new(BTreeSet::new()));
     // Plan 43 C2e review: abandons the root refused, or forced, where the
     // group was not gone: a seed failure.
     let operator_failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     if let Some(after_ms) = cfg.abandon_after_ms {
         let (cluster, stop, fault_log) = (cluster.clone(), sampler_stop.clone(), fault_log.clone());
         let operator_abandoned = operator_abandoned.clone();
+        let operator_confirmed = operator_confirmed.clone();
         let operator_failures = operator_failures.clone();
         tokio::spawn(async move {
             let mut done: BTreeSet<(NodeId, u64)> = BTreeSet::new();
@@ -6131,6 +6137,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                             .lock()
                             .unwrap()
                             .push(format!("t={now_ms} node {id}: repair abandon --gen {gen}"));
+                        // The group, as the root lists it, at the abandon: the
+                        // delegate (dead, or alive with the generation stopped)
+                        // and every strict member dead.
+                        let dead = |node: NodeId| !cluster.get(node).alive();
+                        let delegate_gone = dead(delegate)
+                            || cluster
+                                .get(delegate)
+                                .view()
+                                .delegation
+                                .mine
+                                .iter()
+                                .any(|m| m.1 == gen && m.3);
+                        let members_dead = view
+                            .delegation
+                            .waiting
+                            .iter()
+                            .filter(|w| w.gen == gen)
+                            .flat_map(|w| w.members.iter())
+                            .filter(|m| m.strict)
+                            .all(|m| dead(m.node));
+                        let group_gone = delegate_gone && members_dead;
                         let answer = |force| {
                             n.control(constellation_authority::Control::Abandon {
                                 target: constellation_authority::AbandonTarget::Gen(gen),
@@ -6152,23 +6179,6 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                                 // rebooted since its grant), and every strict
                                 // member is dead. Any other refusal of this
                                 // kind is the rule misjudging, a failure.
-                                let dead = |node: NodeId| !cluster.get(node).alive();
-                                let delegate_gone = dead(delegate)
-                                    || cluster
-                                        .get(delegate)
-                                        .view()
-                                        .delegation
-                                        .mine
-                                        .iter()
-                                        .any(|m| m.1 == gen && m.3);
-                                let members_dead = view
-                                    .delegation
-                                    .waiting
-                                    .iter()
-                                    .filter(|w| w.gen == gen)
-                                    .flat_map(|w| w.members.iter())
-                                    .filter(|m| m.strict)
-                                    .all(|m| dead(m.node));
                                 if !(delegate_gone && members_dead) {
                                     operator_failures.lock().unwrap().push(format!(
                                         "t={now_ms} node {id}: abandon --gen {gen} refused while the group \
@@ -6190,7 +6200,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         match result {
                             // The run-wide allowance: only an abandon that
                             // ended the generation.
-                            Ok(_) => operator_abandoned.lock().unwrap().push(gen),
+                            Ok(_) => {
+                                operator_abandoned.lock().unwrap().push(gen);
+                                if group_gone {
+                                    operator_confirmed.lock().unwrap().insert(gen);
+                                }
+                            }
                             // The root cannot end it now (not usable yet: its
                             // gate is open, or the end could not be journaled):
                             // the command says try again, and the operator does.
@@ -7074,14 +7089,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         // acknowledged rid is a loss.
         let cuts = super::cut::StreamCuts::of_log(&oracle);
         let acks = oracles.acks.lock().unwrap();
+        let confirmed = operator_confirmed.lock().unwrap().clone();
         let given_up = |rid: &Rid| {
             acks.iter().any(|a| {
                 a.rid == *rid
                     && a.kind == super::oracle::OutcomeKind::Ok
                     && !a.is_relay()
                     && a.judged.as_ref().is_some_and(|j| {
-                        j.class == Some(super::oracle::Judged::Final)
-                            && j.tx.as_ref().is_some_and(|t| {
+                        // `Final`: the holder's own disk, the holder is the
+                        // group. `Group`: only when the operator confirmed
+                        // that every node of the group was gone.
+                        j.tx.as_ref().is_some_and(|t| {
+                            j.class == Some(super::oracle::Judged::Final)
+                                || (j.class == Some(super::oracle::Judged::Group)
+                                    && confirmed.contains(&t.origin.0))
+                        }) && j.tx.as_ref().is_some_and(|t| {
                                 let (g, idx) = t.origin;
                                 g != 0
                                     && cuts.abandoned.contains(&g)
