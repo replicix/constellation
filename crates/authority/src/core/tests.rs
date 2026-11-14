@@ -63749,6 +63749,148 @@ mod await_retry {
         );
     }
 
+    /// An own gated `SetManifest` of `broken` (it names the lost chunk, so the
+    /// drop rolls it back) parked for the group, then the drop decided (the
+    /// record journaled, not shipped). The rid.
+    fn own_write_parked_then_drop_decided(h: &mut Harness, broken: Ino) -> Rid {
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        let rid = h.rid(7);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::SetManifest {
+                ino: broken,
+                base_manifest: None,
+                manifest,
+                size: 19,
+                mtime_ns: None,
+                ctime_ns: None,
+            },
+            tag: Default::default(),
+        });
+        assert!(
+            replies(&out).is_empty(),
+            "the answer waits for the group: {out:?}"
+        );
+        let out = drop_held_decide_via_core(h, broken);
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(
+            h.meta.drop_plan_names_rid(rid),
+            "the decision names the rid"
+        );
+        assert!(
+            h.meta.completed_outcome(rid).unwrap().is_some(),
+            "not refused before the apply"
+        );
+        rid
+    }
+
+    /// The group holds every journal row (the held seed's included), and the
+    /// harness's earlier configuration (the seed's, before the holder was
+    /// backed) has committed its end and no reconfiguration is out (the
+    /// harness's steps start one), as in the sim's seed 4: `durable_jseq` is
+    /// the group's alone.
+    fn group_has_everything(h: &mut Harness) {
+        h.core.ack.spans.clear();
+        h.core.ack.reconfig = None;
+        if let Some(peer) = h.core.ack.peers.get_mut(&3) {
+            peer.acked = u64::MAX / 2;
+            peer.counted = u64::MAX / 2;
+        }
+    }
+
+    fn accepted_for(out: &[Action], rid: Rid) -> bool {
+        replies(out).iter().any(|(r, reply)| {
+            *r == rid && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))
+        })
+    }
+
+    /// ADR-59 part B (D3, the release rule), `drop-held-chain-backed` seed 4's
+    /// earlier-pass shape: the group's acknowledgement covers a parked own
+    /// write's held row after the drop that rolls it back is decided and
+    /// before its record is archived. The answer waits for the apply, which
+    /// refuses it. Fail before: released `Ok` (`Group`) on the group's ack;
+    /// the apply then wrote `Refused(EIO)` for an acknowledged rid (I1).
+    #[test]
+    fn a_group_ack_does_not_release_an_answer_a_decided_drop_names() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let rid = own_write_parked_then_drop_decided(&mut h, broken);
+        group_has_everything(&mut h);
+        let mut all = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        assert!(
+            !accepted_for(&all, rid),
+            "no `Ok` before the apply: {all:?}"
+        );
+        assert!(
+            h.core.answer_parked(rid).is_some(),
+            "the answer waits for the apply or the fence"
+        );
+        // The record ships: the apply refuses the rid and settles its park.
+        ship_round(&mut h, 100, &mut all);
+        ship_round(&mut h, 101, &mut all);
+        assert!(
+            !accepted_for(&all, rid),
+            "no `Ok` for a refused rid: {all:?}"
+        );
+        assert!(matches!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused { .. })
+        ));
+        assert!(h.core.answer_parked(rid).is_none(), "settled (I4)");
+        assert!(!h.meta.drop_plan_names_rid(rid));
+    }
+
+    /// The same-pass shape (seed 4 as it ran): the group's acknowledgement
+    /// and the record's archive arrive before one `complete_ready` pass, in
+    /// which the answer's park (lower id) came before the `DropApply`. Fail
+    /// before: the answer left `Ok`, then the apply in the same pass refused
+    /// the rid.
+    #[test]
+    fn an_answer_and_its_drops_apply_ready_in_one_pass_never_leave_ok() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let rid = own_write_parked_then_drop_decided(&mut h, broken);
+        group_has_everything(&mut h);
+        let mut all = Vec::new();
+        ship_round(&mut h, 100, &mut all);
+        ship_round(&mut h, 101, &mut all);
+        assert!(
+            !accepted_for(&all, rid),
+            "no `Ok` for a refused rid: {all:?}"
+        );
+        assert!(matches!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused { .. })
+        ));
+        assert!(h.core.answer_parked(rid).is_none(), "settled (I4)");
+    }
+
+    /// The fence (D2): a decided drop whose record never reached the log is
+    /// cancelled, its rows stand, and the answer it held is released by the
+    /// group's acknowledgement as before (I4: a held answer still settles).
+    #[test]
+    fn a_cancelled_drop_lets_the_answer_it_held_go() {
+        let (mut h, broken) = backed_holder_with_a_seed(0);
+        let rid = own_write_parked_then_drop_decided(&mut h, broken);
+        group_has_everything(&mut h);
+        let mut all = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        assert!(!accepted_for(&all, rid), "{all:?}");
+        h.meta.drop_held_cancel(broken).unwrap();
+        assert!(!h.meta.drop_plan_names_rid(rid));
+        h.core.complete_ready(h.clk(), &h.meta, &mut all);
+        assert!(
+            accepted_for(&all, rid),
+            "released once the drop is gone: {all:?}"
+        );
+    }
+
     /// ADR-59 part B (D1, D4), B3 (iii): the drop decides nothing locally. The
     /// decision transaction carries one `DropHeld` record, alone, naming the
     /// seed (the chmod needs none of the lost content: it is redone, not

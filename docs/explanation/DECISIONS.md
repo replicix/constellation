@@ -5256,6 +5256,21 @@ is the consequence of that record being in the log.**
   (`Reply`, `Finish`) is released from the rid's outcome read at that
   moment: `Executed` as it was parked releases as is, `Refused` releases the
   refusal, no outcome aborts. The apply settles every park of a rid it refused.
+  **An answer a decided drop names waits for the apply or the fence**
+  (`drop-held-chain-backed+commit` seeds 4, 7, 16 and 31, I1). The group holds
+  a held row, so its acknowledgement can cover the row of a rid that a drop
+  decided and has not yet applied. One `complete_ready` pass released such a
+  `Finish` as `Ok` (`Group`), and the `DropApply` later in the same pass
+  refused the rid: the client heard `Ok` while the log said `EIO`. A
+  `Reply` or `Finish` whose rid the pending plan names (`DropPlan::rids`, the
+  record's `rolled_back` rids and its `queued` ones;
+  `Meta::drop_plan_names_rid`) is not released (`Core::park_released`), and
+  the holder's answer of the rid's `completed` row waits on its row too
+  (`Core::answer_need_of`). Ordering the pass is not enough, because the
+  acknowledgement can arrive passes before the record is archived. The
+  apply then refuses the rid and settles the park. The fence cancels the
+  plan, the row stands, and the answer leaves by its own rule, so a held
+  answer still settles (I4).
 - **D4, local state follows the log.** The dropper strands the seed, redoes
   the rest, refuses the queued seeds and removes the pending rows only when
   it applies its own record from the log (the archive covers it). A dropper
@@ -5399,7 +5414,10 @@ pin part A. Part B is pinned by `drop-held-chain-backed` seeds 1714, 1529 and
 1333 and 1523 and `far-placement+lost-chunk` 96, 829, 956, 1469, 1778, 1910,
 1932, 1943 and 1988 (`a_drop_fills_the_stream_indices_it_rolls_back`); a
 stream holder's drop by `far-placement+lost-chunk` 326
-(`a_stream_holder_drops_its_own_streams_held_rows`).
+(`a_stream_holder_drops_its_own_streams_held_rows`); D3's release rule by
+`drop-held-chain-backed+commit` 4, 7, 16 and 31
+(`regression_an_answer_a_decided_drop_names_waits_for_the_apply`,
+`a_group_ack_does_not_release_an_answer_a_decided_drop_names`).
 
 See: `crates/meta/src/store/held.rs` (`conflicts`, `drop_held_knowing`),
 `crates/meta/src/store/spec.rs` (`MergeEntry`, `local_before_images_from`),

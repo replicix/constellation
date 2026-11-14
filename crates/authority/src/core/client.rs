@@ -5734,7 +5734,13 @@ impl Core {
         // earlier row is gone from the journal, so no earlier row of it is
         // left to wait for.
         if let Some(first) = first {
-            return self.ack_need_at(first);
+            // ADR-59 part B (D3, the release rule): a row a decided drop names
+            // is held in this journal until the apply; its answer waits for
+            // the apply or the fence (`park_released`), whatever has
+            // acknowledged it. Asked only of an answer that would leave now.
+            return self
+                .ack_need_at(first)
+                .or_else(|| replica.drop_plan_names_rid(rid).then_some(first));
         }
         self.ack_need(position)
     }

@@ -313,6 +313,11 @@ pub trait Replica {
     /// Whether the decided drop of `ino` has its record shipped from this
     /// node (persisted by the acknowledgement of its row).
     fn drop_plan_shipped(&self, ino: Ino) -> bool;
+    /// ADR-59 part B (D3): whether a drop decided here and not yet applied
+    /// names `rid` (its row is rolled back, or its queued replay refused, at
+    /// the apply): an answer resting on the row waits for the apply or the
+    /// fence.
+    fn drop_plan_names_rid(&self, rid: Rid) -> bool;
     /// The replay queue decoded once per generation of the queue, with
     /// each entry's keys (`Meta::queue_snapshot`): what the park rules ask.
     fn queue_snapshot(
@@ -1318,6 +1323,10 @@ impl Replica for Meta {
 
     fn drop_plan_shipped(&self, ino: Ino) -> bool {
         Meta::drop_plan_shipped(self, ino)
+    }
+
+    fn drop_plan_names_rid(&self, rid: Rid) -> bool {
+        Meta::drop_plan_names_rid(self, rid)
     }
 
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {

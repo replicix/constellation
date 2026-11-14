@@ -2136,7 +2136,15 @@ impl Core {
         match what {
             super::readindex::ParkedWhat::Reply { rid, .. }
             | super::readindex::ParkedWhat::Finish { rid, .. } => {
-                self.completed_row_settled(*rid, replica)
+                // ADR-59 part B (D3, the release rule): an answer resting on a
+                // row a decided drop names waits for the apply (which
+                // refuses the rid and settles the park) or the fence (which
+                // cancels the drop; the row stands and the answer leaves).
+                // Whatever acknowledged the row (the group holds a held row)
+                // says nothing of an outcome the log is about to change, and
+                // the apply may run in the same pass, after this park
+                // (`drop-held-chain-backed` seed 4) or passes later.
+                self.completed_row_settled(*rid, replica) && !replica.drop_plan_names_rid(*rid)
             }
             _ => true,
         }

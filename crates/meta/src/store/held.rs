@@ -2081,6 +2081,7 @@ impl Meta {
             strand_all,
             missing: missing.iter().copied().collect(),
             idents: idents.iter().map(|(ident, _)| *ident).collect(),
+            rids: idents.iter().filter_map(|(_, rid)| *rid).collect(),
             fills: fills.clone(),
             seeds: walked.seeds.iter().map(|(_, seq, _)| *seq).collect(),
             queued: Vec::new(),
@@ -2357,6 +2358,25 @@ impl Meta {
         for (gen, idx) in fills {
             self.session.note_stream_fill(*gen, *idx);
         }
+    }
+
+    /// ADR-59 part B (D3, the release rule): whether a drop decided here and
+    /// not yet applied names `rid` (a transaction it rolls back, or a queued
+    /// replay it refuses). An answer resting on `rid`'s row is not given
+    /// while this holds, whatever acknowledged the row: the apply refuses
+    /// it, or the fence cancels the drop and the row stands. One seek when
+    /// there is no plan (the common case).
+    pub fn drop_plan_names_rid(&self, rid: crate::rid::Rid) -> bool {
+        let r = self.db.read_tx();
+        r.prefix(&self.local, DROP_PLAN_PREFIX).any(|guard| {
+            guard
+                .into_inner()
+                .ok()
+                .and_then(|(_, v)| postcard::from_bytes::<DropPlan>(&v).ok())
+                .is_some_and(|plan| {
+                    plan.rids.contains(&rid) || plan.queued.iter().any(|(_, r)| *r == rid)
+                })
+        })
     }
 
     /// Whether the decided drop of `ino` has its record shipped from this node.
@@ -2958,6 +2978,7 @@ impl Meta {
         counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, 1)?;
         self.finish_local(&mut tx, local)?;
         plan.idents.extend(idents.iter().map(|(ident, _)| *ident));
+        plan.rids.extend(idents.iter().filter_map(|(_, rid)| *rid));
         plan.fills.extend(fills.iter().copied());
         if stream.is_some() {
             plan.named_firsts.extend(
@@ -3086,6 +3107,10 @@ struct DropPlan {
     /// plan holds these transactions until the apply strands them
     /// ([`Named`]).
     idents: Vec<(u64, u64)>,
+    /// The rids of the transactions `idents` names (those that complete
+    /// one): an answer resting on such a row is never released until the
+    /// apply or the fence ([`Meta::drop_plan_names_rid`]).
+    rids: Vec<crate::rid::Rid>,
     /// The stream positions the record fills (`DropHeld::fills`): the
     /// apply counts them in the log again after its strand of the rows
     /// that held them (which takes a stranded row's index back).

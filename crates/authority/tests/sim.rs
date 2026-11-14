@@ -6606,6 +6606,27 @@ fn drop_held_chain_backed_regression_seeds() {
     }
 }
 
+/// ADR-59 part B (D3, the release rule): `drop-held-chain-backed+commit`
+/// seeds 4, 7, 16 and 31 (I1 `unjournaled/ok`). A root's own client's write
+/// of the damaged file was held with its lost chunk and its answer parked;
+/// the operator's drop named its rid. The group's acknowledgement, lifted by
+/// an earlier drop, covered the held row, and one `complete_ready` pass
+/// released the answer `Ok` (`Group`) before the drop's apply, later in the
+/// same pass, refused the rid (`EIO` in the log). An answer whose rid a
+/// decided, unapplied drop names now waits for the apply or the fence.
+/// Fails before: I1 on each seed.
+#[test]
+fn regression_an_answer_a_decided_drop_names_waits_for_the_apply() {
+    for seed in [4u64, 7, 16, 31] {
+        run_seed(seed, strict(drop_held_chain_backed_config(), "commit")).unwrap_or_else(|e| {
+            panic!(
+                "drop-held-chain-backed+commit seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=drop-held-chain-backed+commit AUTHORITY_SIM_SEED={seed}"
+            )
+        });
+    }
+}
+
 /// Chunk epoch-liveness-gap (sweep only): `flex`'s two-member outages
 /// (`f = 1`, the third node keeps S3) in `locks-blips-tight`'s
 /// back-to-back pairs, so a closed hold owner's fresh epoch replaces the
