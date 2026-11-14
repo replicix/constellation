@@ -4975,6 +4975,35 @@ identically on b4e9b722, before this ADR: it is class E of the M1.4 baseline
 (an in-doubt op the operator's `drop-held` replayed after later ops), not a
 consequence of C2.
 
+**Amendment, 2026-11-13: the classifier floor** (decided by the maintainer;
+I4's oracle, `crates/authority/tests/sim/reach.rs`). A sequencer counts for
+I4 only if it was there for one of the product's own ask cycles. A root
+reached over P2P must stay reachable for the old floor (the settle's retry
+interval and a P2P round trip) plus one forward retry
+(`Config::forward_backoff_ms`): 230 ms in the sim (50 + 2 × 15 + 150), 80 ms
+before. A lease claim must be done with room for one lease-read retry before
+the reachable run ends (the settle's retry interval and a lease read, 0
+before). Both are derived from the configuration the run uses, never a
+literal. A run that lasted the old floor but not the new one is
+`no_sequencer_in_time` (causes "root run under one ask cycle" and "claim, no
+room for a lease-read retry"), not a violation: the product could not have
+asked, been answered and heard the answer inside it. The amendment relabels
+only what was a violation: a run under the old floor is no run, as before,
+and the reasons allowed before (a claim that cannot finish, a generation's
+outwait, a dead holder's lease) rank ahead of the new causes. A delegate keeps
+the old floor. No other oracle changes.
+
+The ratchet (`m03_the_configurations_at_zero_violations_stay_there`) counts
+the new causes in a column of their own, with no margin: flex-tight 1, the
+count of seeds 0..99 measured on this commit (2 violations, 20 allowed in the
+old classes, whose entry stays 18 on its margin; the violations entry goes
+from 4 to 2). The live witness
+`m03_a_reachable_sequencers_requester_is_not_isolated` moves from flex-tight
+seed 196 (the lease path for 190 ms, under the floor now) to seed 2 (root 3
+reachable for the last 1.2 s of the window). Seeds 0..1999, release,
+`+settle+oracles+unsettled`, against the parent: flex 3 to 3, flex-crash 43
+to 41, flex-tight 85 to 62, flex-backup 10 to 10; no seed newly failing.
+
 **May revert**: no.
 
 See: `crates/authority/src/core/holder.rs` (`settle_refusal`),

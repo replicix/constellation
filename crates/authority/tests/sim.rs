@@ -20031,11 +20031,13 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     // (ADR-58 C2: `locks-blips-tight-long-lease` seed 0 told its EIO at once,
     // with the sequencer reachable; it is settled now. A flex-tight seed
     // whose settle window passes with the lease path reachable for a moment
-    // only is the pin: seed 76 (118 ms) is asked by the settle rule of
+    // only was the pin: seed 76 (118 ms) is asked by the settle rule of
     // ADR-58's follow-up and settled; seed 196, the lease path reachable for
-    // 190 ms of its window, stays.)
+    // 190 ms of its window, is under the classifier floor of 2026-11-13 (no
+    // room for a lease-read retry after the claim: none in time). Seed 2,
+    // root 3 reachable for the last 1.2 s of the window, is the pin.)
     let cfg = flex_tight_config;
-    let seed = 196;
+    let seed = 2;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
@@ -20222,6 +20224,13 @@ fn a_crowded_history_is_checked_in_bounded_time() {
     );
 }
 
+/// The causes (`Unsettled::cause`) of ADR-58's amendments of 2026-11-13,
+/// counted in a column of their own by the ratchet below.
+const FLOOR_CAUSES: [&str; 2] = [
+    sim::reach::CAUSE_UNDER_ASK_CYCLE,
+    sim::reach::CAUSE_NO_LEASE_READ_RETRY,
+];
+
 /// Plan 46 M0.3, the ratchet, in two halves, both over seeds 0 to 99 of each
 /// configuration without the lease-reads knob, the configurations run in
 /// parallel. The sweeps that set the lists are in PROGRESS ("Plan 43 C2h").
@@ -20390,8 +20399,11 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // 11); main measures 6 and 19 in the same seeds, so the allowed
         // entry stays 18 on its margin and the violations entry goes from 10
         // to 4. 86 of 2,000 seeds fail `+settle+oracles+unsettled`, 98
-        // before.)
-        ("flex-tight", flex_tight_config, 4, 18),
+        // before. ADR-58's amendments of 2026-11-13 (the classifier floor,
+        // which relabels only what was a violation): 2 violations, 20 allowed
+        // in the old classes (the entry stays 18, on its margin) and 1 under
+        // the floor, in its own column; 62 of 2,000 seeds fail, 85 before.)
+        ("flex-tight", flex_tight_config, 2, 18),
         // (Plan 46 M1.2 step 13: a client's settle sent to a root that
         // outwaits the generation of a delegate silent behind a partition
         // used to run out its window a second or two before the root ended
@@ -20412,10 +20424,21 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // waits behind a chunk that exists nowhere: allowed, checked against the
     // chunk ledger and the drops). Ceilings only go down; absent: 0.
     let held_lost_chunk_ceilings: [(&str, usize); 1] = [("flex-crash", 58)];
+    // ADR-58's amendments of 2026-11-13 have a column of their own: the
+    // `no_sequencer_in_time` verdicts of a run under one ask cycle (the
+    // classifier floor) and of a holder whose lease is not usable, which
+    // were violations before and must not swell the old allowed classes'
+    // ceilings (`FLOOR_CAUSES`; the classifier ranks the old allowed reasons
+    // first, so only former violations land here). Ceilings only go down;
+    // absent: 0.
+    // (The column has no margin: each entry is the measurement, seeds 0..99
+    // of the commit that added it.)
+    let floor_ceilings: [(&str, usize); 1] = [("flex-tight", 1)];
     const SEEDS: u64 = 100;
-    // (label, config, the ceilings on violations, on allowed ones and on
-    // ADR-58's `held-behind-lost-chunk`, a class of its own)
-    type Job = (String, SimConfig, Option<(usize, usize, usize)>);
+    // (label, config, the ceilings on violations, on allowed ones, on
+    // ADR-58's `held-behind-lost-chunk`, a class of its own, and on the
+    // amendments' column)
+    type Job = (String, SimConfig, Option<(usize, usize, usize, usize)>);
     let mut jobs: Vec<Job> = Vec::new();
     // The margin: two, or a tenth when that is more.
     let with_margin = |n: usize| n + (n / 10).max(2);
@@ -20429,7 +20452,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         jobs.push((
             format!("{label}+unsettled"),
             strict,
-            Some((0, with_margin(0), 0)),
+            Some((0, with_margin(0), 0, 0)),
         ));
     }
     for (label, cfg, violations, allowed) in ceilings {
@@ -20437,17 +20460,19 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             .iter()
             .find(|(l, _)| *l == label)
             .map_or(0, |(_, n)| *n);
+        let floor = floor_ceilings
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map_or(0, |(_, n)| *n);
+        let column = |n: usize| if n == 0 { 0 } else { with_margin(n) };
         jobs.push((
             label.to_string(),
             cfg(),
             Some((
                 with_margin(violations),
                 with_margin(allowed),
-                if held_lost_chunk == 0 {
-                    0
-                } else {
-                    with_margin(held_lost_chunk)
-                },
+                column(held_lost_chunk),
+                floor,
             )),
         ));
     }
@@ -20463,15 +20488,23 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
                 let Some((label, cfg, ceiling)) = jobs.get(i) else {
                     return;
                 };
-                let (mut violations, mut allowed, mut held_lost_chunk) = (0usize, 0usize, 0usize);
+                let (mut violations, mut allowed, mut held_lost_chunk, mut floor) =
+                    (0usize, 0usize, 0usize, 0usize);
                 for seed in 0..SEEDS {
                     match run_seed(seed, cfg.clone()) {
                         Ok(r) => {
+                            let amended: usize = FLOOR_CAUSES
+                                .iter()
+                                .filter_map(|c| r.unsettled_causes.get(*c))
+                                .sum();
                             violations += r.unsettled_violations;
-                            allowed += r.unsettled_isolated
+                            allowed += (r.unsettled_isolated
                                 + r.unsettled_no_sequencer_in_time
-                                + r.unsettled_generation_tail_unreachable;
+                                + r.unsettled_generation_tail_unreachable)
+                                .checked_sub(amended)
+                                .expect("the floor causes are a subset of the allowed classes");
                             held_lost_chunk += r.unsettled_held_lost_chunk;
+                            floor += amended;
                         }
                         Err(e) => {
                             failures.lock().unwrap().push(format!(
@@ -20483,9 +20516,19 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
                 }
                 eprintln!(
                     "CEILING {label}: violations {violations}, allowed {allowed}, \
-                     held-behind-lost-chunk {held_lost_chunk}"
+                     held-behind-lost-chunk {held_lost_chunk}, floor {floor}"
                 );
-                if let Some((max_violations, max_allowed, max_held_lost_chunk)) = ceiling {
+                if let Some((max_violations, max_allowed, max_held_lost_chunk, max_floor)) =
+                    ceiling
+                {
+                    if floor > *max_floor {
+                        failures.lock().unwrap().push(format!(
+                            "{label}: {floor} unsettled EIOs under the classifier floor or of a \
+                             holder whose lease is not usable in seeds 0..{SEEDS}, above the \
+                             ceiling {max_floor} (ADR-58's amendments of 2026-11-13: their own \
+                             column)"
+                        ));
+                    }
                     if violations > *max_violations {
                         failures.lock().unwrap().push(format!(
                             "{label}: {violations} unsettled EIOs with a sequencer reachable in \

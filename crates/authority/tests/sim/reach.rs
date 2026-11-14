@@ -97,6 +97,15 @@
 //! request for a lease read) is not one: no settle could have been sent,
 //! answered and heard in it. Random message loss (`SimConfig::p2p_drop`) is
 //! not an isolation: the link is up and the settle is retried.
+//!
+//! The classifier floor (the maintainer's decision of 2026-11-13, ADR-58's I4
+//! oracle): a sequencer counts only if it was there for one of the product's
+//! own ask cycles. A root reached over P2P must stay reachable for one forward
+//! retry (`Config::forward_backoff_ms`) on top of the floor above; a lease
+//! claim must be done with room left for one lease-read retry (the settle's
+//! retry interval and a lease read) before the run ends. A shorter run is
+//! `no_sequencer_in_time`, not a violation: the product could not have
+//! asked, been answered and heard the answer inside it.
 
 use constellation_authority::deadlines::Deadlines;
 use constellation_authority::NodeId;
@@ -170,6 +179,17 @@ fn busy_names(b: u8) -> String {
         names.join("+")
     }
 }
+
+/// The marks in a `no_sequencer_in_time` reason of ADR-58's amendments of
+/// 2026-11-13, which the oracle's causes match on (`Unsettled::cause`).
+pub const WHY_UNDER_ASK_CYCLE: &str = "less than one ask cycle";
+pub const WHY_NO_LEASE_READ_RETRY: &str = "less than one lease-read retry";
+
+/// The causes of those reasons, counted in a column of their own by the
+/// ratchet (`m03_the_configurations_at_zero_violations_stay_there`).
+pub const CAUSE_UNDER_ASK_CYCLE: &str = "no-sequencer-in-time/root run under one ask cycle";
+pub const CAUSE_NO_LEASE_READ_RETRY: &str =
+    "no-sequencer-in-time/claim, no room for a lease-read retry";
 
 /// How a sequencer was reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +363,12 @@ struct Inner {
     /// plain S3 request a lease read takes.
     min_p2p_ms: u64,
     min_s3_ms: u64,
+    /// The classifier floor of a root reached over P2P: `min_p2p_ms` and one
+    /// forward retry (the product's ask cycle; the module doc).
+    root_floor_ms: u64,
+    /// What a finished lease claim must leave before the run's end: one
+    /// lease-read retry (the settle's retry interval and a lease read).
+    lease_retry_ms: u64,
     /// The protocol windows (the lease TTL, the claim grace, the margin, the
     /// reclaim horizon, the inherit slack, the recall back-off cap), as the
     /// product derives them: the configuration's, never copied here.
@@ -423,8 +449,10 @@ impl Reach {
 
     /// The floors a reachability must last, the lease TTL and the allowances.
     /// A P2P reachability must last the settle's retry interval plus a round
-    /// trip; claiming a foreign lease takes a lease read (`2 x s3_latency_hi_ms`
-    /// plus what the slow lease reads add: `lease_read_extra_ms`), a TTL of the
+    /// trip, a root's one forward retry more (the ask cycle floor), and a
+    /// finished claim must leave room for one lease-read retry; claiming a
+    /// foreign lease takes a lease read (`2 x s3_latency_hi_ms` plus what the
+    /// slow lease reads add: `lease_read_extra_ms`), a TTL of the
     /// claimant's own observation and, for a lease with backups it is not
     /// listed in, `claim_grace_ms` more, then the promise check and the CAS.
     ///
@@ -441,6 +469,8 @@ impl Reach {
         let mut g = self.inner.lock().unwrap();
         g.min_p2p_ms = 2 * c.p2p_delay_hi_ms + c.settle_retry_ms;
         g.min_s3_ms = 2 * c.s3_latency_hi_ms + c.lease_read_extra_ms;
+        g.root_floor_ms = g.min_p2p_ms + c.dl.base.forward_backoff;
+        g.lease_retry_ms = c.settle_retry_ms + g.min_s3_ms;
         g.min_lease_read_ms = c.s3_latency_lo_ms + c.lease_read_extra_lo_ms;
         g.dl = DlCell(c.dl);
         g.claim_tail_ms = 2 * c.p2p_delay_hi_ms + 2 * c.s3_latency_hi_ms;
@@ -1641,7 +1671,44 @@ fn claim_done(
     Ok(done)
 }
 
+/// What the runs of a window say, before the verdict ranks the reasons.
+struct Judged {
+    reachable: Option<Verdict>,
+    tail_blocked: Option<String>,
+    claim_blocked: Option<String>,
+    not_due: Option<String>,
+    /// A run that lasted the old floor (`min_p2p_ms`, or a finished claim
+    /// for the lease path) but not one ask cycle: a violation before the
+    /// classifier floor of 2026-11-13, none in time since.
+    under_floor: Option<String>,
+}
+
 fn classify(g: &Inner, q: Question) -> Verdict {
+    let j = judge(g, &q);
+    if let Some(v) = j.reachable {
+        return v;
+    }
+    if let Some(why) = j.tail_blocked {
+        return Verdict::GenerationTailUnreachable { why };
+    }
+    // The allowed reasons of before the amendments of 2026-11-13 rank first,
+    // so that the amendments relabel only what was a violation.
+    if let Some(why) = j
+        .claim_blocked
+        .or(j.not_due)
+        .or_else(|| dead_holders_lease(g, &q))
+    {
+        return Verdict::NoSequencerInTime { why };
+    }
+    if let Some(why) = j.under_floor {
+        return Verdict::NoSequencerInTime { why };
+    }
+    Verdict::Isolated {
+        why: why_isolated(g, &q),
+    }
+}
+
+fn judge(g: &Inner, q: &Question) -> Judged {
     // Every instant at which any state changes inside the window.
     let mut marks: Vec<u64> = vec![q.from_ms, q.to_ms];
     let inside = |t: u64| t > q.from_ms && t < q.to_ms;
@@ -1681,8 +1748,8 @@ fn classify(g: &Inner, q: Question) -> Verdict {
         let (since, owner) = q.owner_at(m);
         let due = match &owner {
             Owner::Root => continue,
-            Owner::Delegate { node, gen } => gen_end_due(g, &q, *node, *gen, m, since),
-            Owner::Blocked(gens) => blocked_due(g, &q, gens, m, since),
+            Owner::Delegate { node, gen } => gen_end_due(g, q, *node, *gen, m, since),
+            Owner::Blocked(gens) => blocked_due(g, q, gens, m, since),
         };
         if inside(due) {
             dues.push(due);
@@ -1698,7 +1765,7 @@ fn classify(g: &Inner, q: Question) -> Verdict {
     let mut not_due: Option<String> = None;
     for w in marks.windows(2) {
         let (s, e) = (w[0], w[1]);
-        let via = match reach_at(g, &q, s) {
+        let via = match reach_at(g, q, s) {
             Seg::Via(via) => via,
             Seg::TailUnreachable(why) => {
                 tail_blocked.get_or_insert(why);
@@ -1720,7 +1787,7 @@ fn classify(g: &Inner, q: Question) -> Verdict {
     // An instantaneous window (or one with no segment) is judged at its
     // point.
     if marks.len() < 2 || q.from_ms == q.to_ms {
-        match reach_at(g, &q, q.to_ms) {
+        match reach_at(g, q, q.to_ms) {
             Seg::Via(via) => runs.push((via, q.to_ms, q.to_ms)),
             Seg::TailUnreachable(why) => tail_blocked = Some(why),
             Seg::NotDue(why) => not_due = Some(why),
@@ -1728,6 +1795,7 @@ fn classify(g: &Inner, q: Question) -> Verdict {
         }
     }
     let mut claim_blocked: Option<String> = None;
+    let mut under_floor: Option<String> = None;
     for (via, from, to) in runs {
         let floor = match via {
             Via::Itself => 0,
@@ -1737,11 +1805,31 @@ fn classify(g: &Inner, q: Question) -> Verdict {
         if to - from < floor {
             continue;
         }
+        // The classifier floor (2026-11-13): a root run that lasted the old
+        // floor but not one ask cycle.
+        if let Via::Root(n) = via {
+            if to - from < g.root_floor_ms {
+                under_floor.get_or_insert(format!(
+                    "root {n} was reachable only over [{from}, {to}] ms, {WHY_UNDER_ASK_CYCLE} \
+                     ({} ms: a forward retry, the settle's retry interval and a round trip)",
+                    g.root_floor_ms
+                ));
+                continue;
+            }
+        }
         let (to, node) = match via {
             Via::Itself => (to, Some(q.requester)),
             Via::Root(n) | Via::Delegate(n) => (to, Some(n)),
             Via::LeasePath => match claim_done(g, q.requester, from, q.from_ms, to) {
-                Ok(done) => match claimant_reaches_tails(g, &q, done, to) {
+                Ok(done) if to.saturating_sub(done) < g.lease_retry_ms => {
+                    under_floor.get_or_insert(format!(
+                        "its claim of the lease is done at {done} ms, {WHY_NO_LEASE_READ_RETRY} \
+                         ({} ms) before the run's end {to} ms",
+                        g.lease_retry_ms
+                    ));
+                    continue;
+                }
+                Ok(done) => match claimant_reaches_tails(g, q, done, to) {
                     Ok(()) => (done, None),
                     Err(why) => {
                         tail_blocked.get_or_insert(why);
@@ -1756,25 +1844,26 @@ fn classify(g: &Inner, q: Question) -> Verdict {
         };
         let ever = node.map_or(0, |n| busy_over(g, n, from, to));
         let busy = node.map_or(0, |n| busy_at_end(g, n, to));
-        return Verdict::Reachable {
-            via,
-            from_ms: from,
-            to_ms: to,
-            busy: busy_names(busy),
-            ever: busy_names(ever),
+        return Judged {
+            reachable: Some(Verdict::Reachable {
+                via,
+                from_ms: from,
+                to_ms: to,
+                busy: busy_names(busy),
+                ever: busy_names(ever),
+            }),
+            tail_blocked,
+            claim_blocked,
+            not_due,
+            under_floor,
         };
     }
-    if let Some(why) = tail_blocked {
-        return Verdict::GenerationTailUnreachable { why };
-    }
-    match claim_blocked
-        .or(not_due)
-        .or_else(|| dead_holders_lease(g, &q))
-    {
-        Some(why) => Verdict::NoSequencerInTime { why },
-        None => Verdict::Isolated {
-            why: why_isolated(g, &q),
-        },
+    Judged {
+        reachable: None,
+        tail_blocked,
+        claim_blocked,
+        not_due,
+        under_floor,
     }
 }
 
@@ -2180,16 +2269,97 @@ mod tests {
             ),
             "{v:?}"
         );
-        // The floor is the retry interval plus a round trip (120 ms): a run
-        // of 100 is none, one of 200 is.
+        // The floor is one ask cycle (2026-11-13): the retry interval, a
+        // round trip and one forward retry (120 + 200 = 320 ms). A root run
+        // under the old floor (119 ms) is not one, as before (isolated); one
+        // of the old floor (120 ms) up to an ask cycle less a millisecond
+        // (319 ms), a violation before, is none in time; one of an ask cycle
+        // (320 ms) is a sequencer.
+        let root_run = |ms: u64| {
+            let r = world();
+            r.lease_landed_at(3_500, 1, 8_000, false);
+            r.stopped_at(1, 3_900, 7_000 - ms);
+            r.classify(q(3))
+        };
+        assert!(root_run(119).isolated(), "{:?}", root_run(119));
+        for ms in [120, 319] {
+            let v = root_run(ms);
+            let Verdict::NoSequencerInTime { why } = &v else {
+                panic!("{ms} ms is under an ask cycle: {v:?}");
+            };
+            assert!(why.contains("less than one ask cycle (320 ms"), "{why}");
+        }
+        assert!(
+            matches!(
+                root_run(320),
+                Verdict::Reachable {
+                    via: Via::Root(1),
+                    ..
+                }
+            ),
+            "320 ms is an ask cycle: {:?}",
+            root_run(320)
+        );
+    }
+
+    /// A delegate keeps the old floor (the settle's retry interval and a round
+    /// trip, 120 ms): a run of 200 ms, under a root's ask cycle, is one.
+    #[test]
+    fn a_delegate_keeps_the_old_floor() {
         let r = world();
-        r.lease_landed_at(3_500, 1, 8_000, false);
-        r.stopped_at(1, 3_900, 6_900);
-        assert!(r.classify(q(3)).isolated(), "100 ms is under a retry");
-        let r = world();
-        r.lease_landed_at(3_500, 1, 8_000, false);
-        r.stopped_at(1, 3_900, 6_800);
-        assert!(!r.classify(q(3)).isolated());
+        r.lease_landed_at(3_500, 1, 9_000, false);
+        r.partition_at(3_000, 3, 1, true);
+        r.note_view_at(3_000, 2, Held::No, vec![(7, 9_000)], vec![], 0);
+        r.stopped_at(2, 3_900, 6_800);
+        let v = r.classify(q(3).delegated(2, 7));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::Delegate(2),
+                    from_ms: 6_800,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+    }
+
+    /// The classifier floor (2026-11-13): a lease claim done with less than
+    /// one lease-read retry (the settle's retry interval and a lease read,
+    /// 100 + 80 ms) left before the run's end is none in time; with room for
+    /// one it is a sequencer.
+    #[test]
+    fn a_claim_done_without_room_for_a_lease_read_retry_is_none_in_time() {
+        // No lease ever: node 3 claims from the window's start, done after a
+        // lease read and the claim's tail (80 + 100 ms), at 4 180.
+        let run = |to_ms: u64| {
+            let r = Reach::default();
+            r.configure(cfg(0, 0));
+            r.attached_at(0, 3, true);
+            r.classify(Question::new(3, 4_000, to_ms))
+        };
+        // 179 ms after the claim: under a retry (a violation before).
+        let Verdict::NoSequencerInTime { why } = run(4_359) else {
+            panic!("179 ms after the claim is under a lease-read retry");
+        };
+        assert!(
+            why.contains("less than one lease-read retry (180 ms)"),
+            "{why}"
+        );
+        // 180 ms: room for one.
+        assert!(
+            matches!(
+                run(4_360),
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 4_180,
+                    ..
+                }
+            ),
+            "180 ms after the claim is room for a retry: {:?}",
+            run(4_360)
+        );
     }
 
     #[test]
