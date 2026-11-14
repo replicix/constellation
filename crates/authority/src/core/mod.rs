@@ -2065,6 +2065,12 @@ pub struct Stats {
     /// second deadlines that waited a forward timeout for one in flight.
     pub settle_frozen_asks: u64,
     pub settle_forward_graces: u64,
+    /// ADR-58 C5: second deadlines that asked the root once more because the
+    /// settle's last answer was its `Held` behind a lost chunk.
+    pub settle_final_asks: u64,
+    /// ... and of those, the ones the root answered `Held` behind the lost
+    /// chunk again (the settle ended in doubt at that answer).
+    pub settle_final_asks_held: u64,
     /// Answers a frozen-epoch settle got, by time since its first ask in
     /// 250 ms buckets (the last is open-ended).
     pub settle_frozen_answer_ms: [u64; 16],

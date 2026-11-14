@@ -854,7 +854,9 @@ clocks: an op whose client heard it never executes later ([ADR-49](DECISIONS.md#
 unsettled `EIO` ends a settle window (an op in flight in an epoch that refuses
 writes settles first), a settle's `Abandoned` refusal observes no keys so a row
 held behind a lost chunk cannot hold it, and an `EIO` for a row that waits
-behind a chunk that exists nowhere is a labelled, allowed class
+behind a chunk that exists nowhere is a labelled, allowed class; a settle
+whose last answer was a live root's such `Held` asks that root once more at
+its deadline, and waits one forward timeout for the answer
 ([ADR-58](DECISIONS.md#adr-58-every-unsettled-eio-ends-a-settle-window-and-a-settles-refusal-waits-for-nothing)). A drain
 runs an inbox op only from a read it issued less than half a settle window ago
 (older bytes are discarded and read again); a replay of a row nobody

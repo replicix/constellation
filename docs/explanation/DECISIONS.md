@@ -4869,6 +4869,36 @@ before the outage.
 - **C4, the classifier says what the core was busy with when it mattered.**
   `Verdict::Reachable` reports the busy bits at the reachable run's last
   instant and the OR over the run as `ever`.
+- **C5, a settle held behind a lost chunk asks once more at its deadline**
+  (2026-11-13). A settle whose last answer was a live root's `Held` behind a
+  lost chunk (`Held::lost_chunk`, generation 0, the root still reachable)
+  asks that root once more at its second deadline, unless the log already
+  answers the rid, whether its next ask was due later (its backoff) or
+  already in flight (that request is let go: the root answers the rid from
+  its dedup), and the deadline moves one forward timeout for the answer
+  (`ClientOp::final_ask`, once per settle; not capped by `settle_cap`, since
+  it happens once). The operator's `drop-held` may have landed since the last
+  answer: the root then answers the rid (its outcome or the settle's
+  refusal) and the client hears that instead of the unsettled `EIO`. A root
+  that still holds the row answers `Held` behind the lost chunk again, and
+  that answer ends the settle in doubt at once, labelled (waiting out the
+  moved deadline would let a drop land unasked). The final ask spends the
+  frozen-epoch grace too, so the two do not stack. The rule keys on the
+  root's own word, not on the negative control's label
+  (`lost_chunk_label_always`). **Bound**: one forward timeout more for such a
+  settle's unsettled `EIO` (500 ms at the defaults, 400 ms in the sim).
+  Counters `settle_final_asks`, `settle_final_asks_held`. Pinned by
+  `flex-crash` seed 89
+  (`adr58_c5_a_settle_held_behind_a_lost_chunk_asks_once_more_at_its_deadline`:
+  the drop at t=23000, the deadline at t=23172 with the next ask, sent before
+  the drop, in flight) and by
+  `a_settle_held_behind_a_lost_chunk_asks_the_root_once_more_at_its_deadline`.
+  Seeds: flex-crash 41 to 32 (89, 224, 292, 1190, 1199, 1361, 1378, 1635,
+  1824 and 1907 settle; 384 now fails, an existing class, the requester
+  itself the root whose own plan held the row, which this rule does not
+  cover); flex, flex-tight, flex-backup and the `lost-chunk`,
+  `far-root-writes*`, `sticky-handover-*` and `drop-held-chain*` labels
+  unchanged.
 
 **Rejected**: rolling back the held dependents of a settled rid automatically
 (it puts rollback in the settle path and pre-empts the operator); C1b, letting
