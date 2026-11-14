@@ -69479,6 +69479,18 @@ the doubt configuration with slow lease reads), `held_processed_late` 0 (main: e
 Late unacknowledged turns (counted, not a failure): `locks-executor-behind` 0 to 1, `locks-executor-late` 0 to 3, doubt
 with slow lease reads 1 to 5. `locks-writer-hold-unchecked` (control) fails 1977 of 2000 on both.
 
+## 2026-11-14 Plan 46 M1.2 step 15: the harness scenario and the bench (`two-subtrees-one-stream-rename`, topology 9)
+
+Harness `two-subtrees-one-stream-rename` (`crates/harness/src/scenarios/onestream.rs`): `b`, the root's listed backup, is the
+delegate of `/d1` and `/d2` and must hold one live generation covering both directories; it renames 24 fsynced files between
+the subtrees, the root is `kill -9`ed after 60 acknowledged renames, `b` takes the root over by seal, 60 more renames run on
+the new root. No rename fails; after the old root remounts, both nodes show each file once, in the subtree its last
+acknowledged rename left it in, byte-exact, with no conflict copy. Passes (debug build, 41 s; the root's loss to `b` holding
+the root 1.6 s). Bench: `ack-latency` topology 9 `9-two-subtrees` replaces the retired `two-gens-ack-cost` (the scenario itself
+went with the splits at M1.2 step 1): four creating threads on `b`, two per subtree, then four in one subtree, and a rename
+across; results on four file systems in `bench/commit-rule/RESULTS.md`. TESTING.md's catalogue lists both. Harness only: no
+product change.
+
 ## Plan 46 M1.3 step 7: sticky placement of far writers (ADR-54, 2026-11-11)
 
 - **What**: placement grants a dominant far writer a sticky subtree (`place_kind_for`); a link is far after every round

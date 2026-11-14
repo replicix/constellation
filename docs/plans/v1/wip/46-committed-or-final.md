@@ -3,8 +3,9 @@
 > **Status (2026-11-13): stage 0 and most of stage 1 landed; stage 1 is not
 > closed.** Landed: stage 0 (M0.1–M0.4, 2026-11-05; plan 43 is done and closed
 > into this plan, D-4, D-5); M1.0 (the model, chunks 1–14); M1.1; M1.2 steps
-> 0–15 (step 15's harness and perf part, `two-subtrees-one-stream-rename`, and
-> step 16, the exit sweep and fable review, are not built); M1.3 steps 0–5, 7,
+> 0–15 (step 15's harness and perf part landed 2026-11-14:
+> `two-subtrees-one-stream-rename`, `ack-latency` topology 9; step 16, the exit
+> sweep and fable review, is not built); M1.3 steps 0–5, 7,
 > 8, 9, 10, 11 and 13, route fencing (ADR-47), the restart quarantine (ADR-46),
 > the roster singleton (ADR-50), the stale-clock re-check (ADR-52), the deadline
 > module (ADR-48) and late landing (ADR-49); M1.4 steps 0–5, 6a and the kept
@@ -957,7 +958,8 @@ measured and documented.
 `bench/commit-rule/RESULTS.md` continues: `ack-latency` topologies 1–5
 A/B/B/A on the box, on ext4, xfs, btrfs and tmpfs (the maintainer's
 no-regression rule across file systems), after M1.2, M1.3, M2.1 and
-M3.1; `two-gens-ack-cost` retired and `two-subtrees-one-stream` added;
+M3.1; `two-gens-ack-cost` retired (its scenario went with the splits, M1.2 step 1) and `ack-latency` topology 9, `9-two-subtrees`, added
+(2026-11-14: `bench/commit-rule/RESULTS.md`, four file systems);
 `placement-hot`'s throughput before and after sticky placement (fewer
 reconfigurations expected; a writer that moves waits a dwell for its
 subtree to follow — measured and documented). Topology 1 within ±3 % at

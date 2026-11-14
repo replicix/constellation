@@ -2547,6 +2547,17 @@ relay of its own so requests can be attributed per role):
         assertion fails on every such build (`ae24ef52`), and on the build
         of the loss (`05ef4c9`) the thawed `a` emptied the files on both
         nodes.
+      - `two-subtrees-one-stream-rename` (plan 46 M1.2 step 15; the
+        successor of `two-gens-ack-cost` and `cross-range-rename`): `b`, `a`'s
+        listed backup, is the delegate of both `/d1` and `/d2`, which must be
+        one generation of one stream (`status.delegation.mine`: one live
+        entry covering two directories). `b` renames 24 fsynced files
+        between the two subtrees, round after round; after 60 acknowledged
+        renames `a` is `kill -9`ed and `b` takes the root over by seal, then
+        60 more renames run on the new root. No rename may fail. After `a`
+        remounts, both nodes list each file once, in the subtree its last
+        acknowledged rename left it in, byte-exact, with no other name and
+        no conflict copy. (Not in the k8s lane: it kills a client.)
       - In the sim: `delegated_root_loss_hands_the_writes_to_a_ttl_successor`
         (`delegated-root-gone`: the root dies with no backup and comes
         back after 40 s; every submit within 15 s, none in doubt, with
@@ -3705,7 +3716,10 @@ Topologies: one node; two nodes with a backup (the holder's own ops, a
 forwarded node's); two nodes with a directory delegated to the non-root node
 (no delegate backup); three nodes with a delegate that has a backup; two nodes
 under `CONSTELLATION_HARNESS_LOAD=net-wan` (a lone root; this topology runs
-only then, the others only without it); `CONSTELLATION_ACK=s3`. A topology
+only then, the others only without it); `CONSTELLATION_ACK=s3`; three
+nodes with `/d1` and `/d2` delegated to one node (topology 9: one stream over
+two subtrees; four creating threads two per subtree, then four in one
+subtree, and a rename from one subtree into the other). A topology
 that is not the acknowledgement mode it claims (`status.ack.policy`) fails the
 scenario; nothing is asserted about the numbers. It prints one JSON document on
 stdout (`{"scenario":"ack-latency","load":…,"results":[{"topology","actor",
