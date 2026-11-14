@@ -72405,6 +72405,42 @@ mod step9_one_stream_per_node {
         assert!(!n.core.is_leaving(n.clk(), 3));
     }
 
+    /// Plan 46 M1.3 step 14: a leave note is acknowledged once the root lists
+    /// no live generation of the node. A grant the root journaled before it
+    /// had the note can reach the node's table after the node answered its
+    /// leave; the root therefore recalls what it granted the node (which the
+    /// node releases unseen) and refuses the note until the generation has
+    /// ended: the node sends it again. Fails on main: acknowledged at once
+    /// with the generation live (found by the sim's `no_live_grant_off_roster`,
+    /// `sticky-leave` with the idle release on, seeds 209 and 292, when the
+    /// operator's regrant raced the leave).
+    #[test]
+    fn a_leave_note_is_refused_while_the_root_has_a_live_generation_of_the_node() {
+        let (mut r, d1) = root_with_dir();
+        assert!(delegate(&mut r, 900, d1, 3));
+        let gen = r.meta.delegation_table().get(d1).unwrap().gen;
+        let out = r.step(leave_note_from(3, 100, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::ReleaseRequest { .. })),
+            "the live generation was not recalled: {out:?}"
+        );
+        // Nothing is granted to the node meanwhile, and the note is refused
+        // again while the generation lives.
+        assert!(r.core.is_leaving(r.clk(), 3));
+        let out = r.step(leave_note_from(3, 100, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        // The holder never answers: the generation ends at its expiry.
+        r.core.dw.set_until_for_tests(gen, w(r.now));
+        let mut out = Vec::new();
+        r.core.on_deleg_expiry(r.clk(), gen, &r.meta, &mut out);
+        assert!(r.core.dl.gens[&gen].ended, "not ended: {out:?}");
+        let out = r.step(leave_note_from(3, 100, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+    }
+
     /// Step 11 re-review 3 (SHOULD): the root's mark of a node's own note
     /// lasts the longer of three resend intervals and twice the delegation
     /// TTL, not three resend intervals (about 1.5 s) alone: a leaving node's

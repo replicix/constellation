@@ -15035,10 +15035,30 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let ok = self.cfg.delegation && self.cfg.p2p && self.root_usable(now) && note.is_some();
+        // Plan 46 M1.3 step 14: the note is acknowledged once this root lists
+        // no live generation of the node. A grant this root journaled before
+        // it had the note can reach the node's table after the node has
+        // answered its leave (it asks for what its table lists), and the node
+        // would be retired with a live grant: the root recalls what it has
+        // granted the node, which releases it unseen (a rowless release), and
+        // the note is acknowledged when the generations have ended (the node
+        // sends it again).
+        let mut held_back = false;
         if ok {
             if note.as_ref().is_some_and(|n| n.leaving) {
                 if !self.leave_note_stale(from, req) {
                     self.leave_mark(now, from, Some(req));
+                    let live: Vec<u64> = self
+                        .dl
+                        .gens
+                        .iter()
+                        .filter(|(_, g)| g.node == from && !g.ended)
+                        .map(|(gen, _)| *gen)
+                        .collect();
+                    held_back = !live.is_empty();
+                    for gen in live {
+                        self.start_recall_for(now, gen, RecallCause::Leave, out);
+                    }
                 }
             } else {
                 // (Remembered also when nothing is marked: a delayed
@@ -15063,7 +15083,7 @@ impl Core {
                 round: 0,
                 through: 0,
                 committed: 0,
-                refused: !ok,
+                refused: !ok || held_back,
                 archive_bound: false,
             },
         });
