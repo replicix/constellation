@@ -89,6 +89,10 @@ pub enum RecallCause {
     /// A continuation epoch opened: the delegates stop and the hold
     /// sequences (`recall_all`).
     Epoch,
+    /// Plan 46 M1.3 step 14: an operator's leave of the node recalls what it
+    /// holds (`Control::EndGrantsOf`): an operator's action, of the same
+    /// standing as `undelegate`.
+    Leave,
     /// Placement, a cross-subtree op, a designation, a stalled partial
     /// release: causes that never apply to a non-stealable grant.
     Other,
@@ -9896,7 +9900,7 @@ impl Core {
         g.gate_recalled = gated;
         if g.kind() == DelegKind::Sticky {
             match cause {
-                RecallCause::Undelegate => {}
+                RecallCause::Undelegate | RecallCause::Leave => {}
                 RecallCause::Epoch => self.stats.deleg_sticky_recalled_epoch += 1,
                 RecallCause::Other => self.stats.deleg_sticky_recalled_other += 1,
             }
@@ -12086,7 +12090,9 @@ impl Core {
             } else if drained {
                 match g.recall_cause {
                     None => self.stats.deleg_sticky_ended_released += 1,
-                    Some(RecallCause::Undelegate) => self.stats.deleg_sticky_ended_operator += 1,
+                    Some(RecallCause::Undelegate | RecallCause::Leave) => {
+                        self.stats.deleg_sticky_ended_operator += 1;
+                    }
                     Some(_) => self.stats.deleg_sticky_ended_recalled += 1,
                 }
             } else {
@@ -15125,8 +15131,20 @@ impl Core {
                 // (And the root has heard that this node leaves, whether it
                 // holds a stream or not: a node that holds none sends no
                 // release note, and the root would grant it again.)
+                // (And the log has ended every stream: the node's table keeps a
+                // released stream, with no subtree left, until the root's
+                // `DelegateNodeEnded` reaches it; `leave_streams_of` lists by
+                // subtree and does not see it. The retirement waits for it:
+                // the root's generation is live until then, and the
+                // roster-only singleton test, which counts a live generation
+                // of another node, must not find it off the roster
+                // (`no_live_grant_off_roster`).)
                 self.leave_told_ok(now)
                     && streams.iter().all(|g| self.dl.mine.contains_key(g))
+                    && !replica
+                        .delegation_table()
+                        .streams()
+                        .any(|st| st.node == w.who)
                     && self.dl.mine.values().all(|d| d.release_acked)
             } else {
                 streams.is_empty() && !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
@@ -15218,7 +15236,7 @@ impl Core {
                     .map(|(gen, _)| *gen)
                     .collect();
                 for gen in gens {
-                    self.start_recall(now, gen, out);
+                    self.start_recall_for(now, gen, RecallCause::Leave, out);
                 }
             }
             keep.push(w);

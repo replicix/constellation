@@ -72158,6 +72158,78 @@ mod step9_one_stream_per_node {
         assert!(answer.is_ok(), "{answer:?}");
     }
 
+    /// Plan 46 M1.3 step 14: the root's acknowledgement of the holder's
+    /// release row is not the end of the generation: the root's generation
+    /// is live until its `DelegateNodeEnded` (it waits for the readers of the
+    /// stream, or its journal), and the roster-only singleton test counts it
+    /// as a peer's. The holder's own leave is answered once the log has ended
+    /// the stream (its table lists a released stream, with no subtree, until
+    /// then), not at the acknowledgement. Fails on main: answered at the
+    /// acknowledgement (found by the sim's `no_live_grant_off_roster`,
+    /// `sticky-leave` seed 71).
+    #[test]
+    fn a_self_leave_is_answered_when_the_log_ends_the_stream_not_at_its_release_row() {
+        let (mut h, _records, _a) = delegate_learning_a_streamed_grant(true);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, req, _) = renewal_sent(&out).expect("no first renewal");
+        h.step(renewed(&h, req, 7, 5_000));
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        let (note_req, _) = leave_note_req(&out, 1).expect("the root was not told");
+        h.step(leave_note_ack(1, note_req, false));
+        // The release row is in the log, and the root acknowledged it.
+        h.core.dl.mine.get_mut(&7).unwrap().release_acked = true;
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::StreamReleased {
+                node: 3,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        assert!(
+            h.meta.delegation_table().iter().all(|t| t.node != 3),
+            "the released stream still holds a subtree"
+        );
+        for _ in 0..3 {
+            h.advance(600);
+            let out = h.step(Event::Slack { epoch_slack: 0 });
+            assert!(
+                control_answer(&out, 77).is_none(),
+                "the leave was answered before the root ended the generation: {out:?}"
+            );
+        }
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: 0,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.advance(600);
+        out.extend(h.step(Event::Slack { epoch_slack: 0 }));
+        let answer = control_answer(&out, 77).unwrap_or_else(|| panic!("not answered: {out:?}"));
+        assert!(answer.is_ok(), "{answer:?}");
+    }
+
     /// A node that is not the root cannot end another node's grants: it
     /// refuses the retirement of a node the table lists a stream for, and
     /// of one it lists none for (its table may lag the root's).
@@ -73530,6 +73602,14 @@ mod step4_sticky {
             "the live holder was not recalled: {out:?}"
         );
         assert!(h.core.is_leaving(h.clk(), 3));
+        // The recall is the operator's: not "another cause" of a sticky
+        // recall (the sim's `sticky_ends_only_by_holder_or_operator`).
+        let gen = sticky_gen_of(&h, d1);
+        assert_eq!(
+            h.core.dl.gens[&gen].recall_cause,
+            Some(crate::core::delegate::RecallCause::Leave)
+        );
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
     }
 
     /// A node that is not the root and reads the lease as the dead node's
