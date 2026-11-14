@@ -59,11 +59,31 @@ pub enum FaultKind {
         force: bool,
         within_ms: u64,
     },
+    /// Plan 46 M1.3 step 14 ("Leave ends grants first"): the operator
+    /// retires `node` from the roster, retried for `within_ms`. `admin`:
+    /// `constellation leave --node-id` on the root (the node is down): the
+    /// root's `EndGrantsOf`, then, when it refuses naming `repair abandon`,
+    /// the operator's forced abandon (it has confirmed the node is down) and
+    /// the leave again. Else the node's own leave: `ReleaseGrants`, the flush,
+    /// the stop. The retirement is judged at that moment, and again at the end
+    /// of the run: `no_live_grant_off_roster`.
+    LeaveNode {
+        node: NodeId,
+        admin: bool,
+        within_ms: u64,
+    },
     CrashNode {
         node: NodeId,
         restart_ms: Option<u64>,
         keep_journal: bool,
     },
+    /// Plan 46 M1.3 step 14: `node`'s journal is flushed (every row it
+    /// answered is in the log), then the process is killed for good. A holder
+    /// that dies with answered rows only it holds loses them to an abandon,
+    /// the operator's price (`sticky-holder-dies` covers it, with the holder's
+    /// return); the leave configurations are about the roster, not about
+    /// that.
+    FlushThenCrash { node: NodeId },
     /// Cut P2P between two nodes for `for_ms`.
     Partition { a: NodeId, b: NodeId, for_ms: u64 },
     /// Cut one node's path to S3 for `for_ms`.
@@ -583,6 +603,13 @@ pub struct SimConfig {
     /// the lease ends its stream with no release row.
     /// `AUTHORITY_SIM_CLAIM_ENDS_SILENTLY=1` sets it on every configuration.
     pub claim_ends_silently: bool,
+    /// Negative control (plan 46 M1.3 step 14): the operator's leave retires
+    /// the node without ending its grants first (the driver skips
+    /// `ReleaseGrants` / `EndGrantsOf`), so a live grant stays off the
+    /// roster. `AUTHORITY_SIM_LEAVE_KEEPS_GRANTS=1` sets it on every
+    /// configuration; a run that retires a node holding a grant fails
+    /// `no_live_grant_off_roster`.
+    pub leave_keeps_grants: bool,
     /// Negative control (`Config::fence_accepts_unrouted`): a node runs a
     /// forward under its generation whatever generation it was routed by (no
     /// delegate fence). `AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED=1` sets it on
@@ -1317,6 +1344,8 @@ impl Default for SimConfig {
             .is_some_and(|v| v == "1"),
             claim_ends_silently: std::env::var_os("AUTHORITY_SIM_CLAIM_ENDS_SILENTLY")
                 .is_some_and(|v| v == "1"),
+            leave_keeps_grants: std::env::var_os("AUTHORITY_SIM_LEAVE_KEEPS_GRANTS")
+                .is_some_and(|v| v == "1"),
             fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
                 .is_some_and(|v| v == "1"),
             holder_runs_inbox_ever: std::env::var_os("AUTHORITY_SIM_HOLDER_RUNS_INBOX_EVER")
@@ -1711,6 +1740,10 @@ pub struct Report {
     /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
     /// (`wait`), unanswered or refused (`wait`), granted again.
     pub sticky_driver: [u64; 4],
+    /// Plan 46 M1.3 step 14, the leave driver: refused at once naming the
+    /// abandon, abandons run for a leave, retired by their own leave,
+    /// retired by the admin form.
+    pub leave_driver: [u64; 4],
     /// ADR-56, the core's counters summed over the nodes: handover requests
     /// sent, grants after a release row, requests dropped unanswered,
     /// candidates held back by the tenure, by eligibility, grants dropped,
@@ -1850,6 +1883,18 @@ pub struct Cluster {
     pub abandoned_at: Mutex<BTreeMap<u64, u64>>,
     /// The operator's abandons that went wrong (a seed failure).
     pub operator_failures: Mutex<Vec<String>>,
+    /// Plan 46 M1.3 step 14: the nodes the operator retired from the roster
+    /// (`FaultKind::LeaveNode`), and when (true elapsed ms).
+    pub retired: Mutex<BTreeMap<NodeId, u64>>,
+    /// `no_live_grant_off_roster` violations: a node was retired (or stayed
+    /// retired) while the log lists a live stream of it.
+    pub leave_violations: Mutex<Vec<String>>,
+    /// The leave driver's counters: leaves refused at once naming the
+    /// abandon, abandons the operator ran for a leave, nodes retired by their
+    /// own leave, nodes retired by the admin form.
+    pub leave_driver: Mutex<[u64; 4]>,
+    /// `SimConfig::leave_keeps_grants`.
+    pub leave_keeps_grants: bool,
 }
 
 impl Cluster {
@@ -2169,6 +2214,45 @@ impl Cluster {
         self.locks.drop_node(id, self.env.clock.elapsed_ms());
         super::locks::reset_node(&node.meta, &self.locks.inos(), node.clock.now());
         node.meta.clone()
+    }
+
+    /// Plan 46 M1.3 step 14 (`no_live_grant_off_roster`), at a roster change:
+    /// `node` is retired. The root has no live generation of it, or the
+    /// roster-only singleton test (ADR-50, `Core::singleton_now`: a generation
+    /// of another node that has not ended) reads its holder as no peer.
+    /// `root` is the witness: the node the lease names when it is alive, else
+    /// the node the operator's leave went to (a follower's view lags the
+    /// root's, and says nothing of what the root has ended).
+    pub fn judge_roster(&self, node: NodeId, root: NodeId) {
+        let live: Vec<_> = self
+            .get(root)
+            .view()
+            .delegation
+            .gens
+            .iter()
+            .filter(|g| g.1 == node && !g.6)
+            .map(|g| (g.2, g.0.clone()))
+            .collect();
+        for (gen, dirs) in live {
+            self.leave_violations.lock().unwrap().push(format!(
+                "no_live_grant_off_roster: node {node} was retired from the roster while \
+                 node {root}'s generation {gen} of it has not ended (subtrees {dirs:?})"
+            ));
+        }
+    }
+
+    /// Retire `node`: judged against `root`'s generations, then gone for good (a
+    /// stopped process; its journal is not kept for a restart).
+    pub fn retire(&self, node: NodeId, root: NodeId, admin: bool) {
+        self.judge_roster(node, root);
+        self.retired
+            .lock()
+            .unwrap()
+            .insert(node, self.env.clock.elapsed_ms());
+        self.leave_driver.lock().unwrap()[if admin { 3 } else { 2 }] += 1;
+        if self.get(node).alive() {
+            self.crash(node);
+        }
     }
 
     /// A mutation was answered now — accepted or definitively refused,
@@ -4043,6 +4127,175 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 fault.at_ms
             ));
         }
+        FaultKind::LeaveNode {
+            node,
+            admin,
+            within_ms,
+        } => {
+            let t0 = cluster.env.clock.elapsed_ms();
+            let keeps = cluster.leave_keeps_grants;
+            // (The operator's repeated asks are noted once each: a refusal that
+            // lasts is one line.)
+            let mut last_asked = String::new();
+            let mut ask_note = |what: String| {
+                if last_asked != what {
+                    note(format!("t={} {what}", cluster.env.clock.elapsed_ms()));
+                    last_asked = what;
+                }
+            };
+            while cluster.env.clock.elapsed_ms() < t0 + within_ms {
+                if cluster.retired.lock().unwrap().contains_key(&node) {
+                    return;
+                }
+                if !admin {
+                    let n = cluster.get(node);
+                    if !n.alive() {
+                        note(format!(
+                            "t={} node {node} is down: it does not leave by itself",
+                            cluster.env.clock.elapsed_ms()
+                        ));
+                        return;
+                    }
+                    let root_of = || async {
+                        read_lease(&cluster.env.bucket)
+                            .await
+                            .map(|l| l.holder)
+                            .filter(|h| {
+                                *h != 0
+                                    && *h != node
+                                    && cluster.ids().contains(h)
+                                    && cluster.get(*h).alive()
+                            })
+                            .or_else(|| {
+                                cluster
+                                    .ids()
+                                    .into_iter()
+                                    .find(|x| *x != node && cluster.get(*x).alive())
+                            })
+                    };
+                    if keeps {
+                        // The negative control: retired with its grants held.
+                        if let Some(root) = root_of().await {
+                            cluster.retire(node, root, false);
+                        }
+                        return;
+                    }
+                    let r = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        n.control(constellation_authority::Control::ReleaseGrants),
+                    )
+                    .await;
+                    match r {
+                        Ok(Ok(Ok(answer))) => {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                n.control(constellation_authority::Control::Flush),
+                            )
+                            .await;
+                            note(format!(
+                                "t={} node {node} left: {answer:?}",
+                                cluster.env.clock.elapsed_ms()
+                            ));
+                            if let Some(root) = root_of().await {
+                                cluster.retire(node, root, false);
+                            }
+                            return;
+                        }
+                        other => {
+                            ask_note(format!("node {node}'s leave: {other:?} (asking again)"));
+                            // The engine's `LeaveFailed`: not leaving any more.
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                n.control(constellation_authority::Control::LeaveFailed),
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    if cluster.get(node).alive() && !keeps {
+                        // The operator retires a node it has confirmed is
+                        // down: not one that is up (a random fault restarted it).
+                        note(format!(
+                            "t={} node {node} is up: the operator does not retire it",
+                            cluster.env.clock.elapsed_ms()
+                        ));
+                        return;
+                    }
+                    // The root, as the lease names it; with none alive, any
+                    // other node (a root that has not taken over yet).
+                    let lease_root = read_lease(&cluster.env.bucket)
+                        .await
+                        .map(|l| l.holder)
+                        .filter(|h| *h != 0 && *h != node && cluster.get(*h).alive());
+                    let target = lease_root.or_else(|| {
+                        cluster
+                            .ids()
+                            .into_iter()
+                            .find(|n| *n != node && cluster.get(*n).alive())
+                    });
+                    let Some(target) = target else {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    };
+                    if keeps {
+                        cluster.retire(node, target, true);
+                        return;
+                    }
+                    let h = cluster.get(target);
+                    let r = tokio::time::timeout(
+                        Duration::from_secs(60),
+                        h.control(constellation_authority::Control::EndGrantsOf { node }),
+                    )
+                    .await;
+                    match r {
+                        Ok(Ok(Ok(answer))) => {
+                            note(format!(
+                                "t={} leave --node-id {node} on {target}: {answer:?}",
+                                cluster.env.clock.elapsed_ms()
+                            ));
+                            cluster.retire(node, target, true);
+                            return;
+                        }
+                        Ok(Ok(Err(e))) if e.contains("repair abandon") => {
+                            cluster.leave_driver.lock().unwrap()[0] += 1;
+                            note(format!(
+                                "t={} leave --node-id {node} on {target} refused: {e}",
+                                cluster.env.clock.elapsed_ms()
+                            ));
+                            // The operator abandons the dead node's streams on the
+                            // root, then leaves again. (Not the node that said
+                            // it is no usable root: that one asks again.)
+                            if lease_root == Some(target) {
+                                let r = tokio::time::timeout(
+                                    Duration::from_secs(15),
+                                    h.control(constellation_authority::Control::Abandon {
+                                        target: constellation_authority::AbandonTarget::Node {
+                                            node,
+                                            gen: None,
+                                        },
+                                        force: true,
+                                    }),
+                                )
+                                .await;
+                                cluster.leave_driver.lock().unwrap()[1] += 1;
+                                note(format!(
+                                    "t={} repair abandon --node {node} --force on {target}: {r:?}",
+                                    cluster.env.clock.elapsed_ms()
+                                ));
+                            }
+                        }
+                        other => ask_note(format!(
+                            "leave --node-id {node} on {target}: {other:?} (asking again)"
+                        )),
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            cluster.operator_failures.lock().unwrap().push(format!(
+                "t={} the leave of node {node} did not complete in {within_ms} ms",
+                fault.at_ms
+            ));
+        }
         FaultKind::CrashHolder {
             restart_ms,
             keep_journal,
@@ -4101,6 +4354,30 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 cluster.host_resumed(node).await;
                 cluster.restart(node, keep_journal.then_some(meta));
             }
+        }
+        FaultKind::FlushThenCrash { node } => {
+            let n = cluster.get(node);
+            if !n.alive() {
+                return;
+            }
+            let flushed = tokio::time::timeout(
+                Duration::from_secs(20),
+                n.control(constellation_authority::Control::Flush),
+            )
+            .await;
+            // (The stream to the root goes on after the flush: it is given
+            // time to carry what the node answered.)
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+            note(format!(
+                "t={} flush node {node}, then crash it for good: {flushed:?}",
+                cluster.env.clock.elapsed_ms()
+            ));
+            if !cluster.get(node).alive() {
+                return;
+            }
+            let at = cluster.env.clock.elapsed_ms();
+            cluster.note_takedown(node, None, at).await;
+            cluster.crash(node);
         }
         FaultKind::Partition { a, b, for_ms } => {
             note(format!(
@@ -5524,6 +5801,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         sticky_driver: Mutex::new([0; 4]),
         abandoned_at: Mutex::new(BTreeMap::new()),
         operator_failures: Mutex::new(Vec::new()),
+        retired: Mutex::new(BTreeMap::new()),
+        leave_violations: Mutex::new(Vec::new()),
+        leave_driver: Mutex::new([0; 4]),
+        leave_keeps_grants: cfg.leave_keeps_grants,
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),
         s3_cut: Mutex::new(BTreeMap::new()),
@@ -7705,6 +7986,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.handover_core[11] = handover.handovers;
     report.handover_min_gap_ms = handover.min_gap_ms;
     report.sticky_driver = *cluster.sticky_driver.lock().unwrap();
+    report.leave_driver = *cluster.leave_driver.lock().unwrap();
     // The holder's release waits for its drain (plan 46 M1.3 step 5), judged
     // from the root's side: the root had appended the stream through the row
     // before the release row when the holder journaled it
@@ -7731,6 +8013,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
              a continuation epoch"
         ));
     }
+    // Plan 46 M1.3 step 14: a retired node holds no live grant, at its
+    // retirement (judged there) and at the end of the run.
+    let retired_nodes: BTreeSet<u64> = cluster.retired.lock().unwrap().keys().copied().collect();
+    for (gen, node, dirs) in super::sticky::StickyEnds::of_log(&oracle).live_of(&retired_nodes) {
+        cluster.leave_violations.lock().unwrap().push(format!(
+            "no_live_grant_off_roster: node {node} was retired from the roster, and the log ends \
+             with its sticky stream {gen} (subtrees {dirs:?}) live"
+        ));
+    }
+    found
+        .sticky
+        .extend(cluster.leave_violations.lock().unwrap().iter().cloned());
     // Plan 46 M1.3 step 12: a claim ends a non-stealable stream after its
     // release row, and after the stream's rows.
     if claim_halted > 0 {

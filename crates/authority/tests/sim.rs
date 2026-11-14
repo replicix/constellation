@@ -325,6 +325,9 @@ fn replay_seed() {
         Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
         Ok("sticky-ttl") => sticky_ttl_config(),
         Ok("sticky-claim") => sticky_claim_config(),
+        Ok("sticky-leave") => sticky_leave_config(),
+        Ok("sticky-leave-admin") => sticky_leave_admin_config(),
+        Ok("sticky-leave-root") => sticky_leave_root_config(),
         Ok("sticky-stale-route") => sticky_stale_route_config(),
         Ok("sticky-root-designee-inbox") => sticky_root_designee_inbox_config(),
         Ok("sticky-root-designee-inbox-skew") => sticky_root_designee_inbox_skew_config(),
@@ -2305,6 +2308,97 @@ fn sticky_claim_config() -> SimConfig {
             },
         }],
         ..delegated_config()
+    }
+}
+
+/// Plan 46 M1.3 step 14 ("Leave ends grants first"): node 2, the holder of a
+/// sticky grant (`d2`) it writes to, leaves the roster by itself at 2.5 s:
+/// `ReleaseGrants` (the release row, the root's end of the stream), the flush,
+/// the stop. The retirement must find no live stream of node 2 in the log
+/// (`no_live_grant_off_roster`), and the root's recall-free end of a sticky
+/// stream is the holder's release (`sticky_ends_only_by_holder_or_operator`).
+fn sticky_leave_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        strict: true,
+        dirs: vec!["d1".into(), "d2".into()],
+        delegations: Vec::new(),
+        sticky_delegations: vec![("d2".into(), 2)],
+        cross_ratio: 0.1,
+        ops_per_client: 40,
+        faults: vec![ScheduledFault {
+            at_ms: 2_500,
+            kind: FaultKind::LeaveNode {
+                node: 2,
+                admin: false,
+                within_ms: 30_000,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// The admin form: node 2, which has written its few rows by then, has them
+/// flushed and is killed for good at 5 s (a holder that dies with rows only it
+/// holds loses them to the abandon: that is the operator's price, and
+/// `sticky-holder-dies` covers it, with the holder's return). The operator
+/// retires it from 11 s on, past the root's heard-lately window: the root
+/// refuses at once naming `repair abandon --node 2`, the operator abandons
+/// (it has confirmed the node is down), and the leave goes through. Before
+/// the window ends the root takes the holder for alive, recalls it, and the
+/// leave waits.
+fn sticky_leave_admin_config() -> SimConfig {
+    SimConfig {
+        faults: vec![
+            ScheduledFault {
+                at_ms: 5_000,
+                kind: FaultKind::FlushThenCrash { node: 2 },
+            },
+            ScheduledFault {
+                at_ms: 11_000,
+                kind: FaultKind::LeaveNode {
+                    node: 2,
+                    admin: true,
+                    within_ms: 60_000,
+                },
+            },
+        ],
+        // A late client of node 3 keeps the cluster busy (a lease is
+        // claimed and renewed on demand), so the root is usable when the
+        // operator comes.
+        client_plan: vec![(2, 0, 4), (3, 10_000, 8)],
+        ..sticky_leave_config()
+    }
+}
+
+/// The admin form for the root (`far-root-writes`): node 1, which holds its own
+/// sticky stream on `d1` since ADR-55, dies at 3 s for good, and a survivor
+/// takes the lease. The operator retires node 1 from 3.5 s on, through the node the lease names or,
+/// before there is a root, any other node: a retirement is refused while the
+/// log lists a live stream of node 1 (the table says it, not the old "a root
+/// holds no delegation").
+fn sticky_leave_root_config() -> SimConfig {
+    SimConfig {
+        faults: vec![
+            ScheduledFault {
+                at_ms: 3_000,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: None,
+                    keep_journal: true,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_500,
+                kind: FaultKind::LeaveNode {
+                    node: 1,
+                    admin: true,
+                    within_ms: 60_000,
+                },
+            },
+        ],
+        // Late clients (a lease is taken on demand): a survivor takes it over.
+        client_plan: vec![(2, 6_000, 12), (3, 6_000, 12)],
+        ..far_root_writes_config()
     }
 }
 
@@ -7581,6 +7675,9 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
         "sticky-ttl" => sticky_ttl_config(),
         "sticky-claim" => sticky_claim_config(),
+        "sticky-leave" => sticky_leave_config(),
+        "sticky-leave-admin" => sticky_leave_admin_config(),
+        "sticky-leave-root" => sticky_leave_root_config(),
         "sticky-stale-route" => sticky_stale_route_config(),
         "sticky-root-designee-inbox" => sticky_root_designee_inbox_config(),
         "sticky-root-designee-inbox-skew" => sticky_root_designee_inbox_skew_config(),
@@ -9904,6 +10001,8 @@ struct OracleTotals {
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
     sticky_driver: [u64; 4],
+    /// Plan 46 M1.3 step 14 (`Report::leave_driver`).
+    leave_driver: [u64; 4],
     /// ADR-56: the core's handover counters and the handovers the oracle
     /// judged (`Report::handover_core`), and the shortest gap between a grant
     /// and the handover grant after it (0: none).
@@ -10318,6 +10417,9 @@ impl OracleTotals {
         for (t, c) in self.sticky_driver.iter_mut().zip(r.sticky_driver) {
             *t += c;
         }
+        for (t, c) in self.leave_driver.iter_mut().zip(r.leave_driver) {
+            *t += c;
+        }
         for (t, c) in self.handover_core.iter_mut().zip(r.handover_core) {
             *t += c;
         }
@@ -10514,6 +10616,10 @@ impl OracleTotals {
             self.sticky_driver[2],
             self.sticky_driver[3],
             self.sticky_release_rows_judged
+        );
+        eprintln!(
+            "SWEEP-LEAVE-TOTALS {label} seeds {}/{seeds}: leaves refused at once naming the abandon {}, abandons run for a leave {}, retired by their own leave {}, retired by the admin form {}",
+            self.seeds, self.leave_driver[0], self.leave_driver[1], self.leave_driver[2], self.leave_driver[3]
         );
         eprintln!(
             "SWEEP-CLAIM-RELEASE-TOTALS {label} seeds {}/{seeds}: claims that journaled the stream's release {}, with no row to journal {}, ends that waited for the stream's rows {}, ended ahead of held rows when the wait ran out {}",
@@ -22007,6 +22113,67 @@ fn a_claim_that_ends_the_stream_silently_fails_the_run() {
     }
     assert!(failed > 0, "no seed had a holder claim the lease silently");
     assert!(released > 0, "no claim journaled a release");
+}
+
+/// Plan 46 M1.3 step 14: a node that leaves ends its grants first. The three
+/// leave configurations run strict (`no_live_grant_off_roster` is judged at the
+/// retirement and again at the end), and each reaches its form: node 2's own
+/// leave, the admin form refused at once naming the abandon and then done
+/// after the operator's abandon, and the dead root's retirement.
+#[test]
+fn a_node_that_leaves_ends_its_grants_first() {
+    let (mut own, mut admin, mut refused, mut abandons) = (0, 0, 0, 0);
+    for (label, config) in [
+        ("sticky-leave", sticky_leave_config()),
+        ("sticky-leave-admin", sticky_leave_admin_config()),
+        ("sticky-leave-root", sticky_leave_root_config()),
+    ] {
+        for seed in 0..12 {
+            let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            assert_eq!(r.sticky_ended_unexcused, 0, "{label} seed {seed}");
+            refused += r.leave_driver[0];
+            abandons += r.leave_driver[1];
+            own += r.leave_driver[2];
+            admin += r.leave_driver[3];
+        }
+    }
+    assert!(own > 0, "no node left by itself");
+    assert!(admin > 0, "no node was retired by the admin form");
+    assert!(refused > 0, "no admin leave was refused naming the abandon");
+    assert!(abandons > 0, "the operator abandoned no node for a leave");
+}
+
+/// Plan 46 M1.3 step 14's negative control: with the knob `leave_keeps_grants`
+/// (`AUTHORITY_SIM_LEAVE_KEEPS_GRANTS=1`) the operator's leave retires the node
+/// without ending its grants, and the run fails `no_live_grant_off_roster`.
+#[test]
+fn a_leave_that_keeps_the_grants_fails_the_run() {
+    for (label, config) in [
+        ("sticky-leave", sticky_leave_config()),
+        ("sticky-leave-admin", sticky_leave_admin_config()),
+        ("sticky-leave-root", sticky_leave_root_config()),
+    ] {
+        let config = SimConfig {
+            leave_keeps_grants: true,
+            ..config
+        };
+        let mut failed = 0;
+        for seed in 0..6u64 {
+            if let Err(e) = run_seed(seed, config.clone()) {
+                assert!(
+                    e.contains("no_live_grant_off_roster"),
+                    "{label} seed {seed}: {e}"
+                );
+                failed += 1;
+            }
+        }
+        assert!(
+            failed > 0,
+            "{label}: a leave that kept the grants was not caught"
+        );
+    }
 }
 
 /// The knob `holder_releases_before_drain`
