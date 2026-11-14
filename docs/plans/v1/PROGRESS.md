@@ -70003,6 +70003,7 @@ fail-before tests: the holder was answered at the root's acknowledgement of its 
 until its `DelegateNodeEnded` (`sticky-leave` seed 71); and a grant the root journaled before it had the leave note reached the
 node's table after the node was answered (idle release on, seeds 209, 292): the root now acknowledges the note only when it lists
 no live generation of the node and recalls the ones it lists. A self-leave under a pending drop can abort at its deadline: the
-intended behaviour (latency, not integrity). Open (ADR-61): a non-root answers a dead root's retirement from a table that can be
-behind the log. `sticky-leave-root` has a residual class: rows only a root killed for good held are lost to the abandon (the
-operator's price; 1 seed of 2,000, 5 with the idle release on). No change to replicix-core.
+intended behaviour (latency, not integrity). A non-root never retires a dead root from its own table (it can be behind the log): it refuses until a root has taken over.
+The leave driver dates its abandons; the sim's never-completed-rid allowance is tightened to `Final` rows past the cut of an
+abandoned generation, which `delegated-backup-and-delegate-die-abandon` fails on 71 of 2,000 seeds (group-class rows a dead group
+held; session guarantees and I1). No change to replicix-core.

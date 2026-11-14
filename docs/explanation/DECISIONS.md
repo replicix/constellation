@@ -5588,6 +5588,16 @@ alone while a holder it does not count writes. The model's property is
   (`AUTHORITY_SIM_LEAVE_KEEPS_GRANTS=1`) retires without ending grants and must
   fail it. The harness scenario is `sticky-leave`.
 
+The sim dates the abandon the leave driver runs (as `AbandonNode` does), and
+its end-of-run allowance for acknowledged rids the log never completed is
+tightened for every abandon configuration: a rid is excused only when its
+judged answer is `Final` for a row `(g, idx)` of a generation the log shows
+`GroupAbandoned`, with `idx` above the cut of its `DelegateNodeEnded`. A
+dead root's acknowledged own-stream rows past its cut are then the abandon's
+documented cost (`sticky-leave-root`, 0 of 2,000 with the idle release off and
+on); the same tightening fails `delegated-backup-and-delegate-die-abandon`
+(rows a dead group held, acknowledged under the group class: not excused).
+
 **Rejected**: an admin leave that abandons the dead holder itself (the
 abandon's word that the node is down is the operator's); answering the
 holder's own leave at its release row's acknowledgement.
