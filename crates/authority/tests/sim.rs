@@ -14336,6 +14336,27 @@ fn locks_blips_tight_single_config() -> SimConfig {
     }
 }
 
+/// The M1.2 exit sweep: 267 of 2,000 seeds failed "history is not
+/// linearizable", the product unchanged since before M1.2. A lone node that
+/// reboots inside an S3 cut forms an epoch that carries no lease and answers
+/// its writes `EROFS` until it holds the lease again; the sim client returns
+/// such a call `NsRet::Erofs` and retries under a fresh rid, and the generic
+/// tester's spec had no step for that return. It is a step with no effect
+/// now (`NsSpec::is_valid_step`, the maintainer's decision; see
+/// docs/explanation/DECISIONS.md, ADR-62).
+#[test]
+fn a_lone_nodes_erofs_after_its_reboot_linearizes() {
+    for seed in [9, 11] {
+        // (The default clock faults stay: the reboot is one of them.)
+        if let Err(e) = run_seed(seed, locks_blips_tight_single_config()) {
+            panic!(
+                "locks-blips-tight-single seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-blips-tight-single"
+            );
+        }
+    }
+}
+
 /// `locks-blips-tight` with a 10 s lease. Before chunk
 /// epoch-liveness-gap, a pair of cuts whose gap no re-claim reached (the
 /// hold owner closed in a short S3 window and was cut again) had no next
@@ -20781,6 +20802,15 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // (flex-tight 1; its 8 seeds of `flex-backup` are past 99). Ceilings
     // only go down; absent: 0.
     let lapsed_ceilings: [(&str, usize); 1] = [("flex-tight", 1)];
+    // ADR-62 (the maintainer's decision of 2026-11-15): strict like the
+    // configurations above, with the measurement of seeds 0..99 `+unsettled`
+    // as the ceilings and no margin (violations, allowed; measured 0 and 0).
+    let exact_strict: [(&str, Config, usize, usize); 1] = [(
+        "locks-blips-tight-single",
+        locks_blips_tight_single_config,
+        0,
+        0,
+    )];
     const SEEDS: u64 = 100;
     // (label, config, the ceilings on violations, on allowed ones, on
     // ADR-58's `held-behind-lost-chunk`, a class of its own, on the
@@ -20804,6 +20834,17 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             format!("{label}+unsettled"),
             strict,
             Some((0, with_margin(0), 0, 0, 0)),
+        ));
+    }
+    for (label, cfg, violations, allowed) in exact_strict {
+        let strict = SimConfig {
+            strict_unsettled: true,
+            ..cfg()
+        };
+        jobs.push((
+            format!("{label}+unsettled"),
+            strict,
+            Some((violations, allowed, 0, 0, 0)),
         ));
     }
     for (label, cfg, violations, allowed) in ceilings {

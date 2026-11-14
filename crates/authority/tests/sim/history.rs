@@ -131,9 +131,21 @@ impl SequentialSpec for NsSpec {
 
     /// `Link` is the one op with more than one valid answer
     /// ([`NsOp::Link`]): `ENOENT` for an inode the holder no longer has.
+    ///
+    /// A call answered `EROFS` (`NsRet::Erofs`: refused before it ran, or
+    /// refused for good) had no effect: it is a step that changes nothing,
+    /// valid in any state, as the log-witnessed check skips it. The spec
+    /// alone never answers `EROFS` (the designation table or a frozen epoch
+    /// does), so without this every history with such a return failed the
+    /// generic tester (`locks-blips-tight-single` seeds 9 and 11: a rebooted
+    /// lone node refuses writes until it holds the lease again). A refused
+    /// rid that ran anyway leaves an effect no step explains, and the
+    /// history still fails
+    /// (`an_erofs_return_is_a_step_with_no_effect_and_its_effect_fails`).
     fn is_valid_step(&mut self, op: &NsOp, ret: &NsRet) -> bool {
         match (op, ret) {
             (NsOp::Link(..), NsRet::Enoent) => true,
+            (_, NsRet::Erofs) => true,
             _ => self.invoke(op) == *ret,
         }
     }
@@ -2056,6 +2068,45 @@ mod tests {
     /// return (the answer the spec gives then, now and again replaced by
     /// another value), some left in flight, some marked tentative, some
     /// settled. Both verdicts occur.
+    /// One thread creates `a`, its unlink of `a` is answered `EROFS`, and
+    /// its create of `a` comes next. `EEXIST` is the only answer a refusal
+    /// with no effect allows; `Ok` needs the refused unlink's effect, and
+    /// both searches reject it (the negative control of the rule in
+    /// [`NsSpec::is_valid_step`]).
+    #[test]
+    fn an_erofs_return_is_a_step_with_no_effect_and_its_effect_fails() {
+        let history = |last: NsRet| {
+            let mut events = Vec::new();
+            for (seq, op, ret) in [
+                (1, NsOp::Create("a".into()), NsRet::Ok),
+                (2, NsOp::Unlink("a".into()), NsRet::Erofs),
+                (3, NsOp::Create("a".into()), last),
+            ] {
+                events.push(HistEvt::Invoke {
+                    thread: 1,
+                    rid: rid(seq),
+                    op,
+                });
+                events.push(HistEvt::Return {
+                    thread: 1,
+                    rid: rid(seq),
+                    ret,
+                });
+            }
+            events
+        };
+        let none = HashSet::new();
+        for stateright in [false, true] {
+            assert!(
+                check_linearizable_with(&history(NsRet::Eexist), &none, stateright).is_ok(),
+                "a refusal with no effect (stateright {stateright})"
+            );
+            let err = check_linearizable_with(&history(NsRet::Ok), &none, stateright)
+                .expect_err("the refused unlink's effect is visible");
+            assert_eq!(err, "history is not linearizable");
+        }
+    }
+
     #[test]
     fn the_memoized_search_agrees_with_stateright() {
         use rand::rngs::StdRng;

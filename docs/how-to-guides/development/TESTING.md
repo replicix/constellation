@@ -4941,7 +4941,8 @@ The checker design, settled in phase 2: the exact log-witnessed
 linearizability check runs on every seed; Stateright's
 `LinearizabilityTester` additionally checks the bounded histories (≤ 80
 events, ≤ 6 tentative ops) where its search finishes. A run's summary
-prints both counts.
+prints both counts. Both take a call answered `EROFS` as a step with no
+effect, valid anywhere ([ADR-62](../../explanation/DECISIONS.md#adr-62-the-history-oracle-takes-an-erofs-answer-as-a-step-with-no-effect)).
 
 Round 3 added, after the tester's gate run: `RUST_LOG=constellation::authority_driver=trace`
 prints one line per core step (`event`, `actions`, `job`, `handled_us`,

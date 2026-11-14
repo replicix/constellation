@@ -5631,3 +5631,41 @@ See: `crates/authority/src/core/delegate.rs` (`on_control_end_grants_of`,
 `leave_waits_progress`), `crates/engine/src/leave.rs`,
 `crates/model/src/node_stream.rs` (`no_live_grant_off_roster`),
 [delegations](../reference/features/delegations.md).
+
+## ADR-62: The history oracle takes an `EROFS` answer as a step with no effect
+
+**Status**: decided by the maintainer on 2026-11-15.
+
+**Context**: the simulation's history oracle has two checkers of one client
+history: the exact, log-witnessed check, which skips a call answered `EROFS`
+(`NsRet::Erofs`: a frozen or lease-less epoch's refusal before the op ran, or
+a refusal journaled for good), and the generic tester (Stateright's
+`LinearizabilityTester` and the memoized search, on histories of at most 80
+events), whose sequential spec (`NsSpec`) never answers `EROFS`. Since the sim
+client stopped resending a refused rid (its retry is a new op under a fresh
+rid, as the engine's) and returns the refused call `EROFS`, every short history
+with such a return failed the generic tester: 267 of 2,000 seeds of
+`locks-blips-tight-single`, a lone node that reboots inside an S3 cut and
+refuses writes until it holds the lease again. The product's answers are the
+same as before plan 46 M1.2, and no refused rid is in the log.
+
+**Decision** (the maintainer's, 2026-11-15): in the generic tester, a call
+answered `EROFS` is a valid step in any state and changes nothing
+(`NsSpec::is_valid_step`). This is the witnessed check's rule. It is no
+looser than the model before the client change, where the refused call stayed
+open under its rid and could still take effect: now it may take none. A refused
+rid that ran anyway leaves an effect that no step explains, and the history
+fails (the negative control
+`an_erofs_return_is_a_step_with_no_effect_and_its_effect_fails`).
+`locks-blips-tight-single` joins the zero-violation ratchet with its seeds
+0..99 measurement as the ceilings, no margin, and seeds 9 and 11 are pinned
+(`a_lone_nodes_erofs_after_its_reboot_linearizes`).
+
+**Rejected**: keeping the refused call unreturned (an in-doubt op on the
+thread that invokes the retry: not a valid concurrent history); answering it
+with a spec state (`EROFS` is the epoch's or the table's, never the
+namespace's).
+
+See: `crates/authority/tests/sim/history.rs` (`NsSpec::is_valid_step`),
+`crates/authority/tests/sim/run.rs` (the client's `EROFS` branch),
+[TESTING](../how-to-guides/development/TESTING.md), "The checker design".
