@@ -7065,12 +7065,39 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     if !operator_abandoned.lock().unwrap().is_empty()
         || !cluster.abandoned_at.lock().unwrap().is_empty()
     {
+        // Plan 46 M1.3 step 14: only a row the abandon gave up. A returned
+        // rid the log never completed is excused when its answer was `Final`
+        // (a holder's own disk) for a row `(g, idx)` of a generation the
+        // operator abandoned (`GroupAbandoned` for `g`) and `idx` lies above
+        // the cut of its end (`DelegateNodeEnded` through): the rows past the
+        // cut are what the command costs. Any other never-completed
+        // acknowledged rid is a loss.
+        let cuts = super::cut::StreamCuts::of_log(&oracle);
+        let acks = oracles.acks.lock().unwrap();
+        let given_up = |rid: &Rid| {
+            acks.iter().any(|a| {
+                a.rid == *rid
+                    && a.kind == super::oracle::OutcomeKind::Ok
+                    && !a.is_relay()
+                    && a.judged.as_ref().is_some_and(|j| {
+                        j.class == Some(super::oracle::Judged::Final)
+                            && j.tx.as_ref().is_some_and(|t| {
+                                let (g, idx) = t.origin;
+                                g != 0
+                                    && cuts.abandoned.contains(&g)
+                                    && cuts.cut.get(&g).is_some_and(|cut| idx > *cut)
+                            })
+                    })
+            })
+        };
         let lost: Vec<Rid> = history
             .returned()
             .into_iter()
+            .filter(|(rid, _)| !oracle.completed_at.contains_key(rid))
             .map(|(rid, _)| rid)
-            .filter(|rid| !oracle.completed_at.contains_key(rid))
+            .filter(|rid| given_up(rid))
             .collect();
+        drop(acks);
         report.operator_lost = lost.len();
         operator_lost_rids.extend(lost.iter().copied());
         // Rows a dead delegate group held that no client saw return.

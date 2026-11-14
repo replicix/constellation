@@ -22160,9 +22160,7 @@ fn a_follower_does_not_retire_a_dead_root_from_its_own_table() {
     let config = sticky_leave_root_config();
     for seed in [581u64, 593, 680] {
         run_seed(seed, config.clone()).unwrap_or_else(|e| {
-            panic!(
-                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-leave-root"
-            )
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-leave-root")
         });
     }
 }
