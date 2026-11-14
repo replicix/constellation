@@ -15182,12 +15182,20 @@ impl Core {
                 // roster-only singleton test, which counts a live generation
                 // of another node, must not find it off the roster
                 // (`no_live_grant_off_roster`).)
-                self.leave_told_ok(now)
-                    && streams.iter().all(|g| self.dl.mine.contains_key(g))
-                    && !replica
+                // (A root's own streams, ADR-55, are its own generations: it
+                // ends them itself, and no `DelegateNodeEnded` need reach its
+                // table first: they are judged by its generations.)
+                let ended = if self.root_usable(now) {
+                    !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
+                } else {
+                    !replica
                         .delegation_table()
                         .streams()
                         .any(|st| st.node == w.who)
+                };
+                self.leave_told_ok(now)
+                    && streams.iter().all(|g| self.dl.mine.contains_key(g))
+                    && ended
                     && self.dl.mine.values().all(|d| d.release_acked)
             } else {
                 streams.is_empty() && !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
