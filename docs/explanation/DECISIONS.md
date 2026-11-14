@@ -4911,8 +4911,21 @@ before the outage.
   drop may have taken the lease), and the deadline moves one forward timeout
   for the answer. `final_ask` is shared with C5, so one settle gets one such
   move, and the frozen-epoch grace is spent too (no stacking; not capped by
-  `settle_cap`). A row that is still held gets no route: it ends in doubt,
-  labelled, at that deadline as before. The route is the settle of ADR-58
+  `settle_cap`; it requires an earlier extension of the settle, because the
+  hold is read at a second deadline that did not end it). **No stacking**: a
+  settle that spent the frozen-epoch grace (`forward_grace`) takes neither
+  C5b nor C5 (the maintainer capped the frozen-epoch settle at one window,
+  ADR-58 M3), and a C5b route spends the durability grace too
+  (`durable_grace`), so the bound below holds in every order. The early
+  S3-less deadline only starts a settle, never ends one, so it never takes
+  C5 or C5b. The route goes out from `Backoff`, its first attempt marked
+  sent, as C5's ask does. A row that is still held gets no route: it ends in
+  doubt, labelled, at that deadline as before. "Hold ended" reads the held
+  summary, which a `drop-held` clears whole: rows still held on other
+  inodes read as not held until the next ship round re-plans them, so such
+  an op may spend the extra forward timeout (the route answers it from the
+  dedup, with a re-park or with `Held`; the label at its end reads the same
+  summary). The route is the settle of ADR-58
   C2 again, deduplicated by rid: nothing executes that its first route would
   not, so ADR-49's late-landing rules, I1 and single apply are untouched.
   Nothing runs on the hot path. **Bound**: one forward timeout more, only
@@ -4925,11 +4938,14 @@ before the outage.
   (`adr58_c5b_a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline`;
   fails on the parent) and by
   `a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline`.
-  Seeds 0..1999: flex-crash 32 to 27 (9, 384, 485, 1079, 1247 settle); no
+  A C5b-routed settle answered `Held` behind a lost chunk ends through C5's
+  branch (`final_ask` is shared) and counts in `settle_final_asks_held`.
+  Seeds 0..1999: flex-crash 32 to 27 (9, 384, 485, 1079, 1247 settle, 89 still settles under C5); no
   seed fails that did not on the parent; flex, flex-tight, flex-backup, the
   `lost-chunk`, `far-root-writes*`, `far-placement-release`,
   `sticky-handover-*` and `drop-held-chain*` labels unchanged. Ceilings
-  (seeds 0..99): `flex-crash` violations 1 to 0; no ceiling raised.
+  (seeds 0..99): `flex-crash` violations 1 to 0; its held-behind-lost-chunk
+  ceiling (58) re-measured at 58, so it stays; no ceiling raised.
 
 **Rejected**: rolling back the held dependents of a settled rid automatically
 (it puts rollback in the settle path and pre-empts the operator); C1b, letting

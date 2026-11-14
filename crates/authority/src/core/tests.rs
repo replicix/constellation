@@ -58954,6 +58954,63 @@ mod c2g_settle {
         assert_eq!(requester.core.stats.settle_final_asks, 0);
     }
 
+    /// ADR-58 M3 (one window for a frozen-epoch settle): a deadline moved by
+    /// the frozen-epoch grace (`forward_grace`) takes neither C5's final ask
+    /// nor C5b's final route: they would stack a second forward timeout.
+    #[test]
+    fn a_deadline_moved_by_the_grace_takes_neither_final_ask_nor_final_route() {
+        for c5 in [true, false] {
+            let (_holder, mut requester) = pair();
+            let rid = requester.rid(1);
+            let out = requester.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: requester.create("x"),
+                tag: Default::default(),
+            });
+            let first = deadline_timer(&requester, &out);
+            let cfg = requester.core.config().clone();
+            requester
+                .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+            let out = requester.step(Event::Timer { id: first });
+            if c5 {
+                let Some(PeerMsg::MutateRequest { req, .. }) = forward_to_1(&out) else {
+                    panic!("no settle: {out:?}");
+                };
+                requester.step(lost_chunk_held_reply(req, true));
+            } else {
+                requester
+                    .core
+                    .clients
+                    .get_mut(&rid)
+                    .expect("settling")
+                    .own_lost_chunk = true;
+            }
+            // The frozen-epoch grace was spent at an earlier deadline.
+            requester
+                .core
+                .clients
+                .get_mut(&rid)
+                .expect("settling")
+                .forward_grace = true;
+            let id = requester.core.clients[&rid].deadline;
+            requester.advance(requester.core.dl_t().settle_window);
+            let out = requester.step(Event::Timer { id });
+            assert!(
+                replies(&out)
+                    .iter()
+                    .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt)),
+                "c5 {c5}: {out:?}"
+            );
+            assert!(
+                forward_to_1(&out).is_none(),
+                "c5 {c5}: asked again: {out:?}"
+            );
+            assert_eq!(requester.core.stats.settle_final_asks, 0);
+            assert_eq!(requester.core.stats.settle_local_final_routes, 0);
+        }
+    }
+
     /// ADR-58 C5b (flex-crash seed 384): a settle whose own plan held the
     /// row behind a lost chunk (`own_lost_chunk`, set at an earlier second
     /// deadline) and no longer does is routed once more at its second
@@ -62543,6 +62600,80 @@ mod await_retry {
             held_reply(&mut h, rid_of(3, 1), 11, &chmod(broken, 0o600)),
             "the held row says nothing"
         );
+    }
+
+    /// ADR-58 C5b with the requester itself the root (flex-crash 384): its
+    /// own plan holds the op's row behind a lost chunk. The hold is read at
+    /// a second deadline. If the operator's `drop-held` lands before the
+    /// next one, the settle is routed once more there and the root answers
+    /// it (one route, no wait added here: it is answered locally); a row
+    /// still held gets no route and ends in doubt, labelled, counting in
+    /// `unsettled_held_lost_chunk`.
+    #[test]
+    fn a_root_settling_its_own_op_routes_once_more_when_its_hold_ended() {
+        let run = |dropped: bool| {
+            let (mut h, broken) = holder_with_a_seed();
+            h.core.track_unsettled_designation();
+            // (The answer waits for the archive: the row is not durable.)
+            if let Some((lease, _)) = h.core.lease.held.as_mut() {
+                lease.ack_policy = replicix_objcas::AckPolicy::S3;
+                // (A tenure that outlasts the deadlines.)
+                lease.expires_unix_ms += 100_000;
+                lease.holder_expires_ms += 100_000;
+                lease.holder_wait_ms += 100_000;
+            }
+            let rid = h.rid(1);
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op: chmod(broken, 0o600),
+                tag: Default::default(),
+            });
+            assert!(h.core.clients.contains_key(&rid), "{out:?}");
+            // (A ship round: the plan `rid_behind_lost_chunk` reads.)
+            let _ = h.meta.take_journal_grouped(usize::MAX).unwrap();
+            assert!(
+                Replica::rid_behind_lost_chunk(&h.meta, rid),
+                "the plan holds the op's row"
+            );
+            let cfg = h.core.config().clone();
+            let first = h.core.clients[&rid].deadline;
+            h.advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+            h.step(Event::Timer { id: first });
+            // The second deadline: the hold is read (and the durability
+            // wait given its window).
+            let second = h.core.clients[&rid].deadline;
+            h.advance(h.core.dl_t().settle_window);
+            let out = h.step(Event::Timer { id: second });
+            assert!(replies(&out).is_empty(), "{out:?}");
+            assert!(h.core.clients[&rid].own_lost_chunk);
+            if dropped {
+                drop_held(&h, broken);
+            }
+            let id = h.core.clients[&rid].deadline;
+            h.advance(h.core.dl_t().settle_window);
+            let out = h.step(Event::Timer { id });
+            (h, rid, out)
+        };
+        let (h, rid, out) = run(true);
+        assert_eq!(h.core.stats.settle_local_final_routes, 1, "{out:?}");
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt)),
+            "told EIO with its hold ended: {out:?}"
+        );
+
+        let (mut h, rid, out) = run(false);
+        assert_eq!(h.core.stats.settle_local_final_routes, 0);
+        assert!(
+            replies(&out)
+                .iter()
+                .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt)),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.unsettled_held_lost_chunk, 1);
+        assert!(h.core.take_unsettled_lost_chunk(rid));
     }
 
     /// R2: the drain stops at a placeholder. The entries on its keys wait

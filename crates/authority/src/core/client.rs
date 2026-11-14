@@ -4659,10 +4659,19 @@ impl Core {
             if self.extend_settle_deadline(rid, at, Some(now.wait), out) {
                 let c = self.clients.get_mut(&rid).expect("present");
                 c.final_ask = true;
+                // (The other once-only graces are spent too: the moved
+                // deadline ends the settle, one forward timeout in all.)
                 c.forward_grace = true;
+                c.durable_grace = true;
+                // (As the tail does for an executed op, and C5: the settle
+                // goes out from `Backoff`, its first attempt marked sent.)
+                if c.phase == Phase::Recalling {
+                    c.mark_sent();
+                }
                 if let Phase::Forwarded { req, .. } = c.phase {
                     self.by_req.remove(&req);
                 }
+                c.phase = Phase::Backoff;
                 if let Some(t) = c.timer.take() {
                     self.cancel_timer(t, out);
                 }
@@ -5157,7 +5166,7 @@ impl Core {
         let root = self
             .clients
             .get(&rid)
-            .filter(|c| c.settle && !c.final_ask)
+            .filter(|c| c.settle && !c.final_ask && !c.forward_grace)
             .and_then(|c| {
                 let root = c.last_held_lost_chunk?;
                 match c.phase {
@@ -5174,10 +5183,10 @@ impl Core {
     /// second deadline: its own plan held the row behind a lost chunk
     /// (`ClientOp::own_lost_chunk`), the hold has ended, it has not been
     /// routed so already (`final_ask`), and the log does not answer the rid.
-    fn settle_local_final_route(&mut self, rid: Rid, replica: &dyn Replica) -> bool {
+    fn settle_local_final_route(&self, rid: Rid, replica: &dyn Replica) -> bool {
         self.clients
             .get(&rid)
-            .is_some_and(|c| c.settle && c.own_lost_chunk && !c.final_ask)
+            .is_some_and(|c| c.settle && c.own_lost_chunk && !c.final_ask && !c.forward_grace)
             && !replica.rid_behind_lost_chunk(rid)
             && self.settled_outcome(rid, replica).is_none()
     }

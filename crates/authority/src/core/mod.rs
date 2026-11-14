@@ -2070,6 +2070,7 @@ pub struct Stats {
     pub settle_final_asks: u64,
     /// ... and of those, the ones the root answered `Held` behind the lost
     /// chunk again (the settle ended in doubt at that answer).
+    /// (A settle routed once more by ADR-58 C5b and answered so ends here too.)
     pub settle_final_asks_held: u64,
     /// ADR-58 C5b: second deadlines that routed a settle once more because
     /// this node's own plan had held its row behind a lost chunk and the hold
