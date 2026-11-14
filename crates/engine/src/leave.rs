@@ -18,10 +18,22 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub enum LeaveError {
     OpenEpoch,
-    LiveDesignation { node_id: u64, path: String },
+    /// A grant of a non-stealable kind the node holds, which only its own
+    /// release (or `online` for a designation) ends. `kind` names the kind.
+    /// The core's own refusal of a sticky grant (the root's table is the
+    /// witness: `Core::on_control_end_grants_of`) reaches the operator as
+    /// [`Self::Other`], unparsed.
+    LiveGrant {
+        node_id: u64,
+        kind: &'static str,
+        dirs: Vec<String>,
+    },
     StrandedJournal,
     SelfViaAdminForm,
-    LiveLease { node_id: u64, partition: String },
+    LiveLease {
+        node_id: u64,
+        partition: String,
+    },
     Other(String),
 }
 
@@ -32,9 +44,14 @@ impl fmt::Display for LeaveError {
                 f,
                 "cannot leave while a continuation epoch is open; wait for S3 to return and the epoch to drain"
             ),
-            Self::LiveDesignation { node_id, path } => write!(
+            Self::LiveGrant {
+                node_id,
+                kind,
+                dirs,
+            } => write!(
                 f,
-                "node {node_id} still holds an offline designation for {path}; run `online` first (or pass --force)"
+                "node {node_id} still holds a {kind} for {}; run `online` first (or pass --force)",
+                dirs.join(", ")
             ),
             Self::StrandedJournal => write!(
                 f,
@@ -49,6 +66,17 @@ impl fmt::Display for LeaveError {
                 "node {node_id} still holds a live lease on partition {partition}; wait for release/expiry (or pass --force)"
             ),
             Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl LeaveError {
+    /// The node holds an offline designation of `path`.
+    fn designation(node_id: u64, path: String) -> Self {
+        Self::LiveGrant {
+            node_id,
+            kind: "offline designation",
+            dirs: vec![path],
         }
     }
 }
@@ -82,10 +110,7 @@ pub async fn prepare_admin_leave(
         .into_iter()
         .next()
     {
-        return Err(LeaveError::LiveDesignation {
-            node_id: target,
-            path,
-        });
+        return Err(LeaveError::designation(target, path));
     }
     Ok(())
 }
@@ -106,10 +131,7 @@ pub async fn admin_leave(
             .into_iter()
             .next()
         {
-            return Err(LeaveError::LiveDesignation {
-                node_id: target,
-                path,
-            });
+            return Err(LeaveError::designation(target, path));
         }
         let held = replicix_objcas::live_leases_held_by(store.clone(), target)
             .await
@@ -173,7 +195,7 @@ pub fn pre_leave_checks(
             .into_iter()
             .next()
         {
-            return Err(LeaveError::LiveDesignation { node_id, path });
+            return Err(LeaveError::designation(node_id, path));
         }
     }
     Ok(())
@@ -450,7 +472,7 @@ mod tests {
         let err = prepare_admin_leave(&designations, b, false)
             .await
             .unwrap_err();
-        assert!(matches!(err, LeaveError::LiveDesignation { .. }), "{err}");
+        assert!(matches!(err, LeaveError::LiveGrant { .. }), "{err}");
         assert_eq!(designations_held_by(&designations, b).len(), 1);
         prepare_admin_leave(&designations, b, true).await.unwrap();
         assert!(designations_held_by(&designations, b).is_empty());

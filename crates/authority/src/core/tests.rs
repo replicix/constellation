@@ -73479,6 +73479,100 @@ mod step4_sticky {
         assert!(answer_of(&out, 916).is_none(), "{out:?}");
     }
 
+    fn end_grants_of(h: &mut Harness, op: u64, node: NodeId) -> Vec<Action> {
+        h.step(Event::Control {
+            op: OpId(op),
+            req: Control::EndGrantsOf { node },
+        })
+    }
+
+    /// Plan 46 M1.3 step 14: an admin leave of a sticky holder the root has
+    /// not heard from is refused at once, naming the abandon. A sticky grant
+    /// has no expiry, so waiting for the generation's end would wait out the
+    /// leave's deadline and then say only "run the leave again". Fails on
+    /// main (no answer until the deadline). The refusal leaves the node
+    /// unmarked: it may be granted again.
+    #[test]
+    fn an_admin_leave_of_a_dead_sticky_holder_is_refused_naming_abandon() {
+        let (mut h, gen) = root_with_a_silent_sticky_holder();
+        let out = end_grants_of(&mut h, 910, 3);
+        let refused = match answer_of(&out, 910) {
+            Some(Err(e)) => e,
+            other => panic!("not refused at once: {other:?} {out:?}"),
+        };
+        assert!(
+            refused.contains("node 3") && refused.contains("repair abandon --node 3"),
+            "{refused}"
+        );
+        assert!(h.core.dl.leave_waits.is_empty());
+        assert!(!h.core.is_leaving(h.clk(), 3), "the refused node is marked");
+        assert!(!h.core.dl.gens[&gen].ended);
+    }
+
+    /// A sticky holder this root has heard from lately may be alive: its
+    /// leave recalls the stream as ever and waits for the release.
+    #[test]
+    fn an_admin_leave_of_a_sticky_holder_heard_lately_recalls_it() {
+        let (mut h, d1, _d2) = root_with_two_dirs();
+        let (ok, out) = control_delegate(&mut h, 900, d1, 3, true);
+        assert!(ok, "{out:?}");
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegationRecalled { req: OpId(77) },
+        });
+        h.advance(500);
+        let out = end_grants_of(&mut h, 910, 3);
+        assert!(answer_of(&out, 910).is_none(), "{out:?}");
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::ReleaseRequest { .. })),
+            "the live holder was not recalled: {out:?}"
+        );
+        assert!(h.core.is_leaving(h.clk(), 3));
+    }
+
+    /// A node that is not the root and reads the lease as the dead node's
+    /// own: the node holds its own sticky stream (ADR-55), and the table
+    /// lists it. Retiring the node would leave a live grant off the roster,
+    /// so it is refused, naming the abandon. Fails on main ("holds no
+    /// delegation of its own"). A root that holds nothing is still retired.
+    #[test]
+    fn retiring_a_dead_root_with_its_own_sticky_stream_is_refused() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.note_object(&Lease::granted("p0", 1, 1, 5_000));
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::delegate_one(1, 7, dir, SubtreeKind::Sticky),
+            ],
+        )
+        .unwrap();
+        let out = end_grants_of(&mut h, 1, 1);
+        let refused = match answer_of(&out, 1) {
+            Some(Err(e)) => e,
+            other => panic!("the retirement went on: {other:?}"),
+        };
+        assert!(refused.contains("repair abandon --node 1"), "{refused}");
+    }
+
     /// The holder comes back and its release ends the stream during the
     /// wait: the abandon says so and journals no `GroupAbandoned`.
     #[test]

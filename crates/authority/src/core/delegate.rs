@@ -14731,6 +14731,67 @@ impl Core {
         self.sticky_release_arm(now, out);
     }
 
+    /// The refusal of an admin leave that would leave a non-stealable grant
+    /// live off the roster.
+    fn leave_abandon_first(node: NodeId, dirs: &[Ino]) -> String {
+        let dirs: Vec<String> = dirs.iter().map(|d| d.to_string()).collect();
+        format!(
+            "node {node} holds a sticky grant on {}; run repair abandon --node {node} first",
+            dirs.join(", ")
+        )
+    }
+
+    /// The subtrees of `node`'s non-stealable streams the table lists (a
+    /// root's own sticky streams included).
+    fn non_stealable_table_dirs_of(&self, node: NodeId, replica: &dyn Replica) -> Vec<Ino> {
+        let mut dirs: Vec<Ino> = replica
+            .delegation_table()
+            .iter()
+            .filter(|t| t.node == node && t.kind.non_stealable())
+            .map(|t| t.dir)
+            .collect();
+        dirs.sort_unstable();
+        dirs
+    }
+
+    /// The subtrees of `node`'s live non-stealable generations when this
+    /// root has not heard from the node within the abandon window (the
+    /// discriminator of `repair abandon` without `--force`): a node that
+    /// may be alive is recalled and releases; one that is gone is the
+    /// operator's to abandon. `None`: none such.
+    fn gone_non_stealable_dirs_of(&self, now: Now, node: NodeId) -> Option<Vec<Ino>> {
+        let window = self.dl_t().abandon_heard_window as i64;
+        let mut dirs: Vec<Ino> = Vec::new();
+        for g in self.dl.gens.values() {
+            if g.node != node || g.ended || !g.non_stealable() {
+                continue;
+            }
+            let heard_lately = self
+                .deleg_delegate_heard(g)
+                .is_some_and(|at| now.wait.since(at) < window);
+            if !heard_lately {
+                dirs.extend(g.dirs.keys().copied());
+            }
+        }
+        dirs.sort_unstable();
+        dirs.dedup();
+        (!dirs.is_empty()).then_some(dirs)
+    }
+
+    /// The subtrees of `node`'s live non-stealable generations.
+    fn non_stealable_live_dirs_of(&self, node: NodeId) -> Vec<Ino> {
+        let mut dirs: Vec<Ino> = self
+            .dl
+            .gens
+            .values()
+            .filter(|g| g.node == node && !g.ended && g.non_stealable())
+            .flat_map(|g| g.dirs.keys().copied())
+            .collect();
+        dirs.sort_unstable();
+        dirs.dedup();
+        dirs
+    }
+
     /// `Control::EndGrantsOf { node }` (the admin form of leave, for a node
     /// that cannot release its own grants, or any node retired by an
     /// operator): the root recalls every stream of `node` and ends it, by
@@ -14767,12 +14828,17 @@ impl Core {
         if !self.root_usable(now) {
             // The node is the lease holder itself, as the lease object this
             // node read names it (a dead or cut-off root; inside an epoch,
-            // the carrier): a root is no delegate (`on_prev_root_sealed`),
-            // so it holds no grant to end, and what it granted is the
+            // the carrier). A root is no delegate of anything it granted
+            // others, but since ADR-55 it holds its own sticky streams, and
+            // a dead root's stay live in the table: retiring it would leave
+            // a live grant off the roster. So the table is read, and a
+            // non-stealable stream of the node is refused as a dead
+            // holder's is (abandon ends it, on the root there is then).
+            // Nothing else is there to end: what the root granted is the
             // next tenure's to wait out, which the retirement's fencing of
-            // its leases lets begin. Refusing here would make the one node
-            // an operator must retire when the root is gone impossible to
-            // retire.
+            // its leases lets begin. Refusing it for nothing would make the
+            // one node an operator must retire when the root is gone
+            // impossible to retire.
             if self.root_node() == Some(node)
                 && self
                     .lease
@@ -14780,12 +14846,15 @@ impl Core {
                     .as_ref()
                     .is_some_and(|l| l.holder == node)
             {
-                out.push(Action::ControlDone {
-                    op,
-                    result: Ok(ControlOk::Text(format!(
+                let held = self.non_stealable_table_dirs_of(node, replica);
+                let result = if held.is_empty() {
+                    Ok(ControlOk::Text(format!(
                         "node {node} is the root and holds no delegation of its own"
-                    ))),
-                });
+                    )))
+                } else {
+                    Err(Self::leave_abandon_first(node, &held))
+                };
+                out.push(Action::ControlDone { op, result });
                 return;
             }
             out.push(Action::ControlDone {
@@ -14797,6 +14866,18 @@ impl Core {
                         .map(|r| format!(" (node {r})"))
                         .unwrap_or_default()
                 )),
+            });
+            return;
+        }
+        // Plan 46 M1.3 step 14: a sticky or designated grant is no one's to
+        // take back by time, so a holder that is gone ends only by an
+        // abandon. Waiting for "the generation's expiry" would wait for
+        // ever (none is armed for it): refused at once, naming the way out.
+        // A holder heard from lately is recalled as any is, and releases.
+        if let Some(held) = self.gone_non_stealable_dirs_of(now, node) {
+            out.push(Action::ControlDone {
+                op,
+                result: Err(Self::leave_abandon_first(node, &held)),
             });
             return;
         }
@@ -15061,20 +15142,29 @@ impl Core {
                 continue;
             }
             if now.wait >= w.deadline {
+                // (A non-stealable stream of the node still live ends by an
+                // abandon, not by running the leave again.)
+                let mut stuck = None;
                 if w.who != me {
                     // (The retirement does not follow: the node is not
                     // leaving, and may be granted again.)
                     self.dl.leaving.remove(&w.who);
+                    let held = self.non_stealable_live_dirs_of(w.who);
+                    if !held.is_empty() {
+                        stuck = Some(Self::leave_abandon_first(w.who, &held));
+                    }
                 } else {
                     self.leave_self_abort(now, out);
                 }
                 out.push(Action::ControlDone {
                     op: w.op,
-                    result: Err(format!(
-                        "the delegations of node {} are not ended yet (the log has not carried \
-                         their end); run the leave again",
-                        w.who
-                    )),
+                    result: Err(stuck.unwrap_or_else(|| {
+                        format!(
+                            "the delegations of node {} are not ended yet (the log has not \
+                             carried their end); run the leave again",
+                            w.who
+                        )
+                    })),
                 });
                 continue;
             }
