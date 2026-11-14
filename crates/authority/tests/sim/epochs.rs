@@ -469,6 +469,19 @@ fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
     Formation::Formed(members, !open.is_empty())
 }
 
+/// `LeaseView::usable` as the checker sees it: the honour end against the
+/// node's honour clock (plan 43 C7-H1; the one checker that reads a node
+/// clock on purpose), read with `peek_honour`, which moves nothing. A
+/// recording read here, every 25 ms, straddled every suspend of the node's
+/// host and counted each 25 ms of it as a suspend of its own, a second of
+/// `SUSPEND_PAD_MS` apiece: a 389 ms suspend left the holder's honour clock
+/// 16 s ahead, and its lease, 4 s from its end, lapsed in its own eyes
+/// (`flex-backup` seed 1373: the outage's epoch then carried no lease and
+/// refused every write for the rest of it).
+fn s3_lease_usable(clock: &super::clock::Clock, honour_end: i64, margin: i64) -> bool {
+    honour_end != 0 && clock.peek_honour().0 < honour_end - margin
+}
+
 /// Every 25 ms: no continuation-epoch hold alongside another node's
 /// usable S3 lease or another hold (plan 30 §M10's `single_authority`).
 /// A node's S3 lease is usable while its own clock reads before
@@ -491,10 +504,7 @@ pub async fn sample_authority(cluster: Arc<Cluster>) {
             }
             if let Some((epoch, honour_end, _)) = v.s3_held {
                 let margin = (cluster.env.config)(id, 1).expiry_margin_ms as i64;
-                // `LeaseView::usable`: the honour end against the node's
-                // honour clock (plan 43 C7-H1; the one checker that reads a
-                // node clock on purpose).
-                if honour_end != 0 && node.clock.honour().0 < honour_end - margin {
+                if s3_lease_usable(&node.clock, honour_end, margin) {
                     leases.push((id, epoch));
                 }
             }
@@ -507,5 +517,36 @@ pub async fn sample_authority(cluster: Arc<Cluster>) {
             tracing::error!("{what}");
             cluster.split_brains.lock().unwrap().push(what);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::clock::{Clock, NodeClockState};
+    use super::*;
+
+    /// The single-authority sampler reads a node's lease against its honour
+    /// clock every 25 ms, also while the node's host is suspended. Its reads
+    /// must not move that clock: after a 400 ms suspend the node's honour
+    /// clock is ahead of its wall by the one suspend pad HONOUR adds, not by
+    /// a pad per sample.
+    #[tokio::test(start_paused = true)]
+    async fn the_sampler_moves_no_node_clock_through_a_suspend() {
+        let state = NodeClockState::new(1, 0, false);
+        let node = Clock::start().for_node(0, state.clone(), 1, 0);
+        // A lease far from its end, read the way the sampler reads it.
+        let end = node.honour().0 + 60_000;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let from = tokio::time::Instant::now();
+        state.suspend(node.elapsed_ns(), 400);
+        while from.elapsed() < Duration::from_millis(450) {
+            assert!(s3_lease_usable(&node, end, 500));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let ahead = node.honour().0 - node.wall().0;
+        assert!(
+            ahead <= constellation_types::clock::SUSPEND_PAD_MS + 5,
+            "honour {ahead} ms ahead of wall after one suspend"
+        );
     }
 }

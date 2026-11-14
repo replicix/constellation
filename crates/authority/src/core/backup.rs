@@ -827,6 +827,10 @@ pub(crate) struct BackupState {
     pub last_heard: WaitMs,
     /// The highest epoch sealed (persisted by the replica too).
     pub sealed: Epoch,
+    /// The epoch of this node's own lease whose re-adoption CAS last landed
+    /// over its seal and was not adopted (D7): the self-sealed claim of the
+    /// next epoch that follows is that drop's (memory only).
+    pub readoption_dropped: Option<Epoch>,
     /// The lease renewal keys the claimants that sealed this node's own
     /// epoch (`sealed`) read, as their `SealTail`s named them (memory only:
     /// a restart forgets them, and the TTL rule of D7 then applies). A

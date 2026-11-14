@@ -2100,6 +2100,27 @@ impl Cluster {
         self.nodes.lock().unwrap().insert(id, Arc::new(handle));
     }
 
+    /// A suspended host starts no process (`FaultKind::Suspend`): a restart
+    /// that falls in a suspend of `id`'s host waits until it resumes. Started
+    /// mid-suspend, the new incarnation's threads read its clock while the
+    /// suspend ran on, and HONOUR counted each of those reads as a suspend
+    /// of its own, a second of pad apiece (`flex-crash` seed 1306: restarted
+    /// 2 s into a 2.2 s suspend, its honour clock ran ahead by the pads and
+    /// its lease lapsed in its own eyes).
+    pub async fn host_resumed(&self, id: NodeId) {
+        // (Back-to-back suspends: until none holds the host.)
+        loop {
+            let now = self.env.clock.elapsed_ns();
+            let Some(end) = self.env.clock_state_of(id).suspended_through(now) else {
+                return;
+            };
+            // `end > now` by `suspended_through`; a span past u64 ns is no
+            // suspend the sim schedules.
+            let left = u64::try_from(end - now).unwrap_or(u64::MAX);
+            tokio::time::sleep(Duration::from_nanos(left)).await;
+        }
+    }
+
     pub fn crash(&self, id: NodeId) -> Arc<Meta> {
         let node = self.get(id);
         node.crash(&self.env.bus);
@@ -2454,7 +2475,11 @@ async fn client_read(
         present,
         timed_out,
         ?floor,
-        held = handle.meta.read_delegations().valid(parent, handle.clock.honour()).is_some(),
+        held = handle
+            .meta
+            .read_delegations()
+            .valid(parent, handle.clock.peek_honour())
+            .is_some(),
         replays = handle.meta.pending_replays().map(|q| q.len()).unwrap_or(0),
         speculation = ?handle.meta.speculation_counts().ok(),
         "client read"
@@ -3873,6 +3898,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .await;
             let meta = cluster.crash(holder);
             tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            cluster.host_resumed(holder).await;
             cluster.restart(holder, Some(meta));
         }
         FaultKind::DelegateDir {
@@ -4105,6 +4131,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             let meta = cluster.crash(holder);
             if let Some(after) = restart_ms {
                 tokio::time::sleep(Duration::from_millis(after)).await;
+                cluster.host_resumed(holder).await;
                 cluster.restart(holder, keep_journal.then_some(meta));
             }
         }
@@ -4127,6 +4154,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             let meta = cluster.crash(node);
             if let Some(after) = restart_ms {
                 tokio::time::sleep(Duration::from_millis(after)).await;
+                cluster.host_resumed(node).await;
                 cluster.restart(node, keep_journal.then_some(meta));
             }
         }
@@ -4391,6 +4419,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             let meta = cluster.crash(backup);
             if let Some(after) = restart_ms {
                 tokio::time::sleep(Duration::from_millis(after)).await;
+                cluster.host_resumed(backup).await;
                 cluster.restart(backup, Some(meta));
             }
         }
@@ -4492,6 +4521,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .await;
             let meta = cluster.crash(node);
             tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            cluster.host_resumed(node).await;
             let state = cluster.env.clock_state_of(node);
             state
                 .step()
@@ -4533,6 +4563,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .await;
             let meta = cluster.crash(holder);
             tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            cluster.host_resumed(holder).await;
             cluster
                 .env
                 .clock_state_of(holder)
@@ -4582,6 +4613,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .await;
             let meta = cluster.crash(node);
             tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            cluster.host_resumed(node).await;
             cluster.restart(node, Some(meta));
         }
         FaultKind::PartitionLockerStepped { step_ms, dur_ms } => {
@@ -4976,6 +5008,7 @@ async fn crash_epoch_member(
                 "t={} epoch member {node} returns with its disk",
                 cluster.env.clock.elapsed_ms()
             ));
+            cluster.host_resumed(node).await;
             cluster.restart(node, Some(meta));
         }
         None => {

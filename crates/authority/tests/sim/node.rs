@@ -2134,6 +2134,18 @@ impl Driver {
                 // break (the directory's `since`).
                 let mut up_since: HashMap<NodeId, constellation_authority::WaitMs> = HashMap::new();
                 loop {
+                    // A suspended host runs no thread (`suspend_until`): the
+                    // ticker stands still until it resumes. Its clock reads
+                    // straddled the suspend, each 500 ms of it counted by
+                    // HONOUR as a suspend of its own with a second's pad: a
+                    // 1.5 s suspend left the holder's honour clock 5 s ahead
+                    // and its lease lapsed in its own eyes (`flex-backup`
+                    // seed 60).
+                    let suspended = *shared.suspended_until.lock().unwrap();
+                    if let Some(until) = suspended.filter(|u| tokio::time::Instant::now() < *u) {
+                        tokio::time::sleep_until(until).await;
+                        continue;
+                    }
                     let nodes = bus.nodes();
                     let at = clock.now().wait;
                     let due = roster_refresh_ms == 0
