@@ -1576,6 +1576,28 @@ logging never blocks a daemon thread (plan 44)";
 
 ## ADR-33: Commit is the configured group's acknowledgement (Vertical Paxos over S3)
 
+**Amended 2026-11-14** (plan 43 / I1 oracle; decided by the maintainer on
+2026-11-14): the I1 oracle's RootGroup step also judges an answer by the
+group of the answerer's own epoch, not only by the lease holder's at the
+answer. An answer is committed by this rule when all of these hold: the
+answerer's journal holds the rid's root row `T` (class `Group{on: Root}`,
+the answer's outcome) of its epoch `e`; the lease epoch is past `e`; the last
+configuration that landed in `e` lists at least one backup; and every backup
+it lists holds `T`'s records as a copy of `e`, in its `backup_tail(e)` at or
+below `backup_acked(e)`, in its `member_copy(e)`, or in its own journal as the
+re-ship. The row's own version is not read and no role-epoch alternative
+exists; a last configuration that lists nobody leaves the answer to the
+archive. Every answer judged this way is an obligation the end of the run
+checks on every configuration (not only under `strict_durability`): the
+archive carries the rid with the answer's outcome, unless a `GroupAbandoned`
+names `e` (`root_group_by_epoch_archived`; counted as
+`root_group_by_epoch_config`). Why: it aligns the oracle with plan 43 §4,
+which defines RootGroup as the journal of the epoch-`e` holder plus the tail
+of every backup listed at that version; the oracle read the current lease
+holder instead, so it was narrower than the invariant (an answer released on
+the listed backups' acks after a claimant sealed `e` and took the lease is
+committed). Negative control: the sim's `+acks-unpersisted` variant.
+
 **Amended 2026-11-08** (plan 43 Q13): a self-sealed holder whose sealer's
 claim cannot land re-claims at once, at the next epoch from its member copy;
 one whose sealer's claim can still land waits the sealer's grace, not a TTL.

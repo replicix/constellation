@@ -124,6 +124,18 @@ impl Told {
     }
 }
 
+/// An answer RootGroup committed by the group of the answerer's own epoch
+/// (`Oracles::root_group_by_epoch`): the archive must carry `rid` as `want`
+/// by the end of the run, unless an operator abandoned the group of `epoch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochGroupAnswer {
+    pub answerer: NodeId,
+    pub rid: Rid,
+    pub want: Option<Code>,
+    pub epoch: u64,
+    pub backups: Vec<NodeId>,
+}
+
 /// Everything the oracles share in one run (`NodeEnv::oracles`).
 /// `Oracles::own_stream_rows`'s value: `(epoch, node, journal seq)`.
 pub type OwnStreamRow = (u64, NodeId, u64);
@@ -164,6 +176,13 @@ pub struct Oracles {
     /// Descriptions of I1 violations, in order (judged at emission, failed
     /// at the end of the run).
     pub i1_violations: Mutex<Vec<String>>,
+    /// Plan 43 §4, RootGroup by the epoch's configuration (maintainer,
+    /// 2026-11-14): every answer committed by the group of the answerer's
+    /// own epoch after the lease moved past it (`root_group_by_epoch`), in
+    /// emission order. Each is an obligation the end of the run checks: the
+    /// archive carries the rid with the answer's outcome, unless an
+    /// operator's `GroupAbandoned` names the epoch.
+    pub root_group_by_epoch: Mutex<Vec<EpochGroupAnswer>>,
     /// ADR-47, check 1: the root's refusals of ops under a non-stealable
     /// grant, the executions of non-stealable generations and every client
     /// submission, each with the tick it happened at.
@@ -542,6 +561,7 @@ impl Oracles {
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
             i1_violations: Mutex::new(Vec::new()),
+            root_group_by_epoch: Mutex::new(Vec::new()),
             fence_audit: Mutex::new(FenceAudit::default()),
             claim_violations: Mutex::new(Vec::new()),
             appended: Mutex::new(HashMap::new()),
@@ -1884,6 +1904,21 @@ fn classify(
         (_, None) => detail.push("root-group: no transaction of the rid".into()),
         _ => detail.push("root-group: not a root row".into()),
     }
+    // 2b. RootGroup by the answerer's own epoch's configuration (plan 43
+    // §4: the holder of epoch `e` and every backup listed at its last
+    // version), once the lease moved past `e`.
+    match root_group_by_epoch(o, answerer, st, (rid, want), lease, own_txs) {
+        Ok(EpochGroupJudged::Committed(a)) => {
+            detail.push(format!(
+                "root-group-epoch: every backup {:?} of epoch {} holds it",
+                a.backups, a.epoch
+            ));
+            o.root_group_by_epoch.lock().unwrap().push(a);
+            return Some(Judged::Group);
+        }
+        Ok(EpochGroupJudged::NotApplicable) => {}
+        Err(why) => detail.push(format!("root-group-epoch: {why}")),
+    }
 
     // 3. DelegateNodeGroup.
     if let Some(t) = tx {
@@ -1985,6 +2020,49 @@ fn classify(
     Some(Judged::Singleton)
 }
 
+/// The answers of `answers` whose rid the archive does not carry with the
+/// answer's outcome, the epoch's group not abandoned by an operator
+/// (`GroupAbandoned { epoch, gen: 0 }` in an applied segment).
+fn epoch_group_unarchived(
+    o: &Oracles,
+    log: &super::check::Oracle,
+    answers: &[EpochGroupAnswer],
+) -> Vec<String> {
+    let abandoned: BTreeSet<u64> = log
+        .unfenced
+        .values()
+        .flat_map(|s| s.records.iter())
+        .filter_map(|r| match r {
+            LogRecord::GroupAbandoned { epoch, gen: 0, .. } => Some(*epoch),
+            _ => None,
+        })
+        .collect();
+    let mut seen: HashSet<(Rid, Option<Code>)> = HashSet::new();
+    answers
+        .iter()
+        .filter(|a| !abandoned.contains(&a.epoch))
+        .filter(|a| seen.insert((a.rid, a.want)))
+        .filter(|a| o.bucket.archive.outcome_as(a.rid, a.want).is_none())
+        .map(|a| {
+            let carried = o.bucket.archive.outcome_code(a.rid).map_or_else(
+                || "nothing".to_string(),
+                |(seq, code)| format!("{} (segment {seq})", describe_code(code)),
+            );
+            format!(
+                "root_group_by_epoch_archived: node {} answered rid {:?} ({}) committed by \
+                 epoch {}'s group {:?}, but at the end of the run the archive carries {carried} \
+                 and no GroupAbandoned names epoch {}",
+                a.answerer,
+                a.rid,
+                describe_code(a.want),
+                a.epoch,
+                a.backups,
+                a.epoch
+            )
+        })
+        .collect()
+}
+
 /// RootGroup: the lease object's holder's journal and every listed
 /// backup's tail hold the transaction (`Ok`), or why not.
 fn root_group(
@@ -2001,6 +2079,129 @@ fn root_group(
         ));
     };
     backups_hold(o, l.epoch, backups, ht, Some((l.holder, holder_txs)))
+}
+
+/// What [`root_group_by_epoch`] found when it judged nothing wrong.
+enum EpochGroupJudged {
+    /// The rule's preconditions do not hold (no root row of the answerer's
+    /// epoch, or the lease still at that epoch): another class judges.
+    NotApplicable,
+    Committed(EpochGroupAnswer),
+}
+
+/// RootGroup by the answerer's epoch (plan 43 §4, maintainer 2026-11-14):
+/// the answerer's journal holds the rid's root row `T` (class
+/// `Group{on: Root}`, the answer's outcome) of its epoch `e`; the lease is
+/// past `e`; the last configuration that landed in `e` lists at least one
+/// backup; and every one of them holds `T`'s records as a copy of `e`: in
+/// its tail of `e` at or below its contiguous acknowledgement, in its member
+/// copy of `e`, or re-shipped into its own journal. Neither the row's own
+/// version nor the epoch a backup's role names is read. A configuration
+/// that lists nobody leaves the answer to the archive.
+fn root_group_by_epoch(
+    o: &Oracles,
+    answerer: NodeId,
+    st: &AnswererState,
+    (rid, want): (Rid, Option<Code>),
+    lease: Option<&Lease>,
+    own_txs: &[BackupTx],
+) -> Result<EpochGroupJudged, String> {
+    use EpochGroupJudged::NotApplicable;
+    let (Some(e), Some(l)) = (st.epoch, lease) else {
+        return Ok(NotApplicable);
+    };
+    if l.epoch <= e {
+        return Ok(NotApplicable);
+    }
+    let Some(t) = find_tx(own_txs, rid, want).filter(|t| t.origin == (0, 0)) else {
+        return Ok(NotApplicable);
+    };
+    let root_row = o.store(answerer).is_some_and(|m| {
+        m.journal_classes_of_rid(rid).is_ok_and(|cs| {
+            cs.iter().any(|c| {
+                matches!(
+                    c,
+                    RowCommit::Group {
+                        on: constellation_meta::GroupOn::Root,
+                        ..
+                    }
+                )
+            })
+        })
+    });
+    if !root_row {
+        return Ok(NotApplicable);
+    }
+    let backups = o
+        .epoch_backups
+        .lock()
+        .unwrap()
+        .get(&e)
+        .cloned()
+        .unwrap_or_default();
+    if backups.is_empty() {
+        return Err(format!(
+            "the last configuration of epoch {e} lists nobody: only the archive judges it"
+        ));
+    }
+    for b in &backups {
+        let Some(store) = o.store(*b) else {
+            return Err(format!("backup {b} of epoch {e} has no registered store"));
+        };
+        if !holds_as_copy_of(&store, e, t) {
+            return Err(format!(
+                "backup {b} of epoch {e} holds journal {}..={} neither in its acknowledged \
+                 tail, nor in its member copy, nor re-shipped",
+                t.first, t.last
+            ));
+        }
+    }
+    Ok(EpochGroupJudged::Committed(EpochGroupAnswer {
+        answerer,
+        rid,
+        want,
+        epoch: e,
+        backups,
+    }))
+}
+
+/// Whether `store` holds `t` (journal row of epoch `e`) as a copy of `e`:
+/// in its tail of `e` at or below `backup_acked(e)`, in its member copy of
+/// `e`, or in its own journal as the re-ship (`TailOf { e, t.first }`
+/// prepended, or `t`'s own identity kept from an earlier re-ship).
+fn holds_as_copy_of(store: &Meta, e: u64, t: &BackupTx) -> bool {
+    let acked = store.backup_acked(e).unwrap_or(0);
+    let in_tail = store.backup_tail(e).is_ok_and(|tail| {
+        tail.iter()
+            .any(|x| x.last <= acked && x.records == t.records)
+    });
+    if in_tail {
+        return true;
+    }
+    let in_member_copy = store
+        .member_copy(e)
+        .ok()
+        .flatten()
+        .is_some_and(|(_, txs)| txs.iter().any(|x| x.records == t.records));
+    if in_member_copy {
+        return true;
+    }
+    journal_of(store).iter().any(|x| is_reship_of(x, e, t))
+}
+
+/// Whether `x` is the re-ship of journal row `t` of epoch `e`: its records
+/// are `t`'s, behind the identity `TailOf { e, t.first }` unless `t` already
+/// carried one (a re-ship keeps the first journal's identity).
+fn is_reship_of(x: &BackupTx, e: u64, t: &BackupTx) -> bool {
+    if matches!(t.records.first(), Some(LogRecord::TailOf { .. })) {
+        return x.records == t.records;
+    }
+    match x.records.split_first() {
+        Some((LogRecord::TailOf { epoch, jseq }, rest)) => {
+            *epoch == e && *jseq == t.first && rest == t.records.as_slice()
+        }
+        _ => false,
+    }
 }
 
 /// Every backup in `backups` holds `ht` in its tail of `epoch` (or of the
@@ -2742,6 +2943,13 @@ pub struct Findings {
     pub unjournaled_landed: Vec<String>,
     /// I1: the descriptions, in emission order.
     pub i1: Vec<String>,
+    /// Answers RootGroup committed by the answerer's epoch's configuration
+    /// (`Oracles::root_group_by_epoch`), and those whose rid the archive
+    /// does not carry with the answer's outcome at the end of the run while
+    /// no operator's `GroupAbandoned` names the epoch (strict on every
+    /// configuration).
+    pub root_group_by_epoch: usize,
+    pub root_group_by_epoch_unarchived: Vec<String>,
     /// Plan 43 C1-2: answers whose class claim is not borne out
     /// (`strict_commit` fails the run on one).
     pub class_claim: Vec<String>,
@@ -3039,6 +3247,11 @@ pub fn end_of_run(
         i6: o.leases.violations.lock().unwrap().clone(),
         ..Findings::default()
     };
+    {
+        let answers = o.root_group_by_epoch.lock().unwrap();
+        f.root_group_by_epoch = answers.len();
+        f.root_group_by_epoch_unarchived = epoch_group_unarchived(o, log, &answers);
+    }
     {
         // (One guard: two in the literal above would deadlock.)
         let ledger = o.identity.lock().unwrap();
@@ -3729,6 +3942,36 @@ mod tests {
         // An unacknowledged rolled-back rid (a seed never answered) is
         // nothing to list.
         assert_eq!(check(&d, &none, &none, &none, &none), None);
+    }
+
+    /// Plan 43 §4 (maintainer, 2026-11-14): a backup's re-ship of a root row
+    /// of epoch `e` is the row's records behind `TailOf { e, first }`, or the
+    /// row verbatim when it already carried an identity; nothing else is.
+    #[test]
+    fn a_reship_of_a_root_row_is_its_records_behind_its_identity() {
+        let records = vec![LogRecord::Completed { rid: rid(1, 7) }];
+        let t = BackupTx {
+            first: 40,
+            last: 41,
+            records: records.clone(),
+            origin: (0, 0),
+        };
+        let with = |head: Option<LogRecord>| BackupTx {
+            first: 3,
+            last: 4,
+            records: head.into_iter().chain(records.iter().cloned()).collect(),
+            origin: (0, 0),
+        };
+        let tail_of = |epoch, jseq| Some(LogRecord::TailOf { epoch, jseq });
+        assert!(is_reship_of(&with(tail_of(2, 40)), 2, &t));
+        // Another epoch's or journal seq's identity, or none: not this row's.
+        assert!(!is_reship_of(&with(tail_of(1, 40)), 2, &t));
+        assert!(!is_reship_of(&with(tail_of(2, 39)), 2, &t));
+        assert!(!is_reship_of(&with(None), 2, &t));
+        // A row that carries the first journal's identity keeps it.
+        let again = with(tail_of(1, 9));
+        assert!(is_reship_of(&again, 2, &again));
+        assert!(!is_reship_of(&with(tail_of(2, 3)), 2, &again));
     }
 
     /// ADR-59 part B, ruling on 1547: a loss is judged by the `DropHeld` the

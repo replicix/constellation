@@ -9857,6 +9857,10 @@ struct OracleTotals {
     /// sequenced answers by class (`Stats::ack_classes`, summed).
     mismatched: std::collections::BTreeMap<String, usize>,
     unverified_relays: usize,
+    /// Plan 43 §4 (maintainer, 2026-11-14): answers RootGroup committed by
+    /// the answerer's epoch's configuration (`root_group_by_epoch_config`),
+    /// and the seeds with one.
+    root_group_by_epoch: (usize, u64),
     unsourced: usize,
     unjournaled_landed: usize,
     /// Plan 43 C2: the clients' settles — sent, answered `Abandoned`,
@@ -10015,6 +10019,8 @@ impl OracleTotals {
         }
         let mismatched: usize = r.mismatched_acks.values().sum();
         self.unverified_relays += r.unverified_relays;
+        self.root_group_by_epoch.0 += r.root_group_by_epoch_config;
+        self.root_group_by_epoch.1 += u64::from(r.root_group_by_epoch_config > 0);
         self.class_claim.0 += r.class_claim_mismatch;
         self.class_claim.1 += u64::from(r.class_claim_mismatch > 0);
         if r.class_claim_mismatch > 0 && self.class_claim_seeds.len() < 30 {
@@ -10363,13 +10369,15 @@ impl OracleTotals {
             + r.unsettled_generation_tail_unreachable
             + r.unsettled_violations
             + r.acked_past_cut
+            + r.root_group_by_epoch_config
             > 0
         {
             eprintln!(
-                "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} i2={} i2c={} i4={} i5={} \
+                "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} root_group_by_epoch_config={} i2={} i2c={} i4={} i5={} \
                  unjournaled={unjournaled} {:?} mismatched={mismatched} {:?} relays={} \
                  unjournaled-landed={} cut={} unsettled-eio={unsettled} (isolated {}, no sequencer in time {}, generation tail unreachable {}, violations {}) rebuilds={}/{}",
                 r.uncommitted_acks,
+                r.root_group_by_epoch_config,
                 r.identity_copies,
                 r.non_verbatim,
                 r.late_landings,
@@ -10394,7 +10402,8 @@ impl OracleTotals {
         let unjournaled: usize = self.unjournaled.values().sum();
         let mismatched: usize = self.mismatched.values().sum();
         eprintln!(
-            "SWEEP-ORACLE-TOTALS {label} seeds {}/{seeds}: i1={i1} {:?} (in {} seeds) i2={} (in {}) \
+            "SWEEP-ORACLE-TOTALS {label} seeds {}/{seeds}: i1={i1} {:?} (in {} seeds) \
+             root_group_by_epoch_config={} (in {} seeds) i2={} (in {}) \
              i2c={} (in {}) i4={} (in {}) i5={} (in {}) unjournaled={unjournaled} {:?} unmapped={} \
              rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}; \
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
@@ -10404,6 +10413,8 @@ impl OracleTotals {
             self.seeds,
             self.uncommitted,
             self.seeds_with[0],
+            self.root_group_by_epoch.0,
+            self.root_group_by_epoch.1,
             self.i2,
             self.seeds_with[1],
             self.i2c,
@@ -14552,6 +14563,12 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         // count; these make a count fail the run).
         "commit" => SimConfig {
             strict_commit: true,
+            ..cfg
+        },
+        // The I1 RootGroup-by-epoch arm's negative control
+        // (`SimConfig::backup_acks_unpersisted`).
+        "acks-unpersisted" => SimConfig {
+            backup_acks_unpersisted: true,
             ..cfg
         },
         "identity" => SimConfig {

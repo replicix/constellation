@@ -864,6 +864,16 @@ pub struct SimConfig {
     /// meanwhile never arrives, and the backup's lapse is followed by
     /// silence, not by a backlog of beats). Appends, which the sync lane
     /// carries, are queued and stamped at the lapse's end as before.
+    /// Negative control of the I1 oracle's RootGroup-by-epoch arm (plan 43
+    /// §4, maintainer 2026-11-14; variant `+acks-unpersisted`): a backup
+    /// acknowledged rows it never persisted, and finds out when a claimant
+    /// seals it: a member other than the epoch's holder answers the seal
+    /// with nothing and loses its tail and member copy of the epoch, so the
+    /// successor re-ships none of them. Never on in a configuration: the
+    /// oracle must refuse the answers that rest on those acks once the lease
+    /// moved past the epoch, or the end of the run must find them missing
+    /// from the archive.
+    pub backup_acks_unpersisted: bool,
     pub beats_lost_in_lag: bool,
     /// No holder drops a backup for want of acknowledgements
     /// (`backup_ack_timeouts`): lag costs no reconfiguration either.
@@ -1371,6 +1381,7 @@ impl Default for SimConfig {
             own_lapses_unreported: false,
             beats_credited: false,
             beats_lost_in_lag: false,
+            backup_acks_unpersisted: false,
             keeps_backups: false,
             deleg_lane: true,
             roster_refresh_ms: 0,
@@ -1604,6 +1615,11 @@ pub struct Report {
     /// the log completes (D6 of C0: fails under `strict_settle`).
     pub mismatched_acks: BTreeMap<String, usize>,
     pub unverified_relays: usize,
+    /// Plan 43 §4 (maintainer, 2026-11-14): answers RootGroup committed by
+    /// the answerer's epoch's configuration after the lease moved past it,
+    /// and those the archive did not carry by the end of the run.
+    pub root_group_by_epoch_config: usize,
+    pub root_group_by_epoch_unarchived: usize,
     /// Plan 43 C1-2: answers that claim a commit no class bears out, or
     /// whose row is tagged with another class than the answer names
     /// (fails under `strict_commit`).
@@ -5444,6 +5460,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         own_lapses_unreported: cfg.own_lapses_unreported,
         beats_credited: cfg.beats_credited,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
+        backup_acks_unpersisted: cfg.backup_acks_unpersisted,
         deleg_lane: cfg.deleg_lane,
         roster_refresh_ms: cfg.roster_refresh_ms,
         deleg_root_lane: cfg.deleg_root_lane,
@@ -7568,6 +7585,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.unjournaled_refusals = found.unjournaled_refusals.clone();
     report.mismatched_acks = found.mismatched_acks.clone();
     report.unverified_relays = found.unverified_relays;
+    report.root_group_by_epoch_config = found.root_group_by_epoch;
+    report.root_group_by_epoch_unarchived = found.root_group_by_epoch_unarchived.len();
     report.class_claim_mismatch = found.class_claim.len();
     report.row_version_mismatch = found.row_version.len();
     report.row_versions_checked = oracles.row_versions.lock().unwrap().checked;
@@ -7797,6 +7816,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         (true, "one_off_no_handover", &handover.one_off),
         (true, "handover_inflight", &handover.inflight),
         (cfg.strict_commit, "I1", &found.i1),
+        // Plan 43 §4 (maintainer, 2026-11-14): an answer committed by its
+        // epoch's group after the lease moved on reaches the archive, unless
+        // the operator abandoned that group. Strict on every configuration.
+        (
+            true,
+            "root_group_by_epoch_archived",
+            &found.root_group_by_epoch_unarchived,
+        ),
         (cfg.strict_commit, "class claim", &found.class_claim),
         (cfg.strict_commit, "row version", &found.row_version),
         // Plan 43 C1-4: a durable acknowledgement policy is a commit: its

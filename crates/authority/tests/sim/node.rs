@@ -490,6 +490,8 @@ pub struct NodeEnv {
     pub beats_credited: bool,
     /// See `SimConfig::beats_lost_in_lag`.
     pub beats_lost_in_lag: bool,
+    /// See `SimConfig::backup_acks_unpersisted`.
+    pub backup_acks_unpersisted: bool,
     /// See `SimConfig::deleg_lane`.
     pub deleg_lane: bool,
     /// See `SimConfig::roster_refresh_ms`.
@@ -1005,6 +1007,8 @@ impl NodeHandle {
                 .beats_credited
                 .then(|| (env.config)(id, 1).expiry_margin_ms as i64),
             beats_lost_in_lag: env.beats_lost_in_lag,
+            backup_acks_unpersisted: env.backup_acks_unpersisted,
+            unpersisted_through: 0,
             oracles: env.oracles.clone(),
             forwards: HashMap::new(),
             versions_seen_tip: 0,
@@ -1339,6 +1343,10 @@ struct Driver {
     credit_margin: Option<i64>,
     /// See `SimConfig::beats_lost_in_lag`.
     beats_lost_in_lag: bool,
+    /// See `SimConfig::backup_acks_unpersisted`: and the highest epoch this
+    /// node sealed whose copies it already lost.
+    backup_acks_unpersisted: bool,
+    unpersisted_through: u64,
     /// Plan 43 C0: the oracles, and the rid behind each forwarded request
     /// this driver handed its core (`(requester, req)`), for I1 at the
     /// `MutateReply`'s emission.
@@ -4078,7 +4086,35 @@ impl Driver {
         self.dispatch(actions);
     }
 
+    /// The negative control (`SimConfig::backup_acks_unpersisted`): once
+    /// this node sealed an epoch (for a claimant, itself included), the rows
+    /// it acknowledged of that epoch and older are found never persisted:
+    /// its tail and member copies of them are gone before anything the seal
+    /// produced leaves the node or is re-shipped.
+    fn lose_unpersisted_copies(&mut self) {
+        if !self.backup_acks_unpersisted {
+            return;
+        }
+        // (A read fault reads as nothing sealed: the next dispatch looks again.)
+        let sealed = self.meta.backup_sealed_epoch().unwrap_or(0);
+        if sealed <= self.unpersisted_through {
+            return;
+        }
+        self.meta
+            .backup_trim(sealed.saturating_add(1), 0, &[])
+            .expect("the negative control's trim");
+        for e in self.meta.member_copy_epochs().unwrap_or_default() {
+            if e <= sealed {
+                self.meta
+                    .member_copy_drop(e)
+                    .expect("the negative control's member copy drop");
+            }
+        }
+        self.unpersisted_through = sealed;
+    }
+
     fn dispatch(&mut self, actions: Vec<Action>) {
+        self.lose_unpersisted_copies();
         // ADR-55: a release the root's holder side sent to its root side is
         // a release by the holder like any other.
         // ADR-56: the root's handover requests and grants, dated by the run.
@@ -4183,6 +4219,45 @@ impl Driver {
                             self.note_forward_answer(to, *req, outcome, *committed);
                         }
                     }
+                    // The negative control (`SimConfig::backup_acks_unpersisted`):
+                    // a member that is not the epoch's holder, sealed for a
+                    // claimant, finds none of the rows it acknowledged of the
+                    // epoch (they were never persisted): its tail and member
+                    // copy of the epoch are gone and its answer carries nothing.
+                    let msg = match msg {
+                        PeerMsg::SealedTail {
+                            req,
+                            epoch,
+                            held: true,
+                            empty,
+                            members,
+                            sealed,
+                            refused,
+                            ..
+                        } if self.backup_acks_unpersisted
+                            && self.core.lease().epoch() != Some(epoch) =>
+                        {
+                            self.meta
+                                .backup_trim(epoch.saturating_add(1), 0, &[])
+                                .expect("the negative control's trim");
+                            self.meta
+                                .member_copy_drop(epoch)
+                                .expect("the negative control's member copy drop");
+                            PeerMsg::SealedTail {
+                                req,
+                                epoch,
+                                held: true,
+                                empty,
+                                txs: Vec::new(),
+                                through: 0,
+                                next: None,
+                                members,
+                                sealed,
+                                refused,
+                            }
+                        }
+                        msg => msg,
+                    };
                     // A forwarded op's token leaves in its wire form (the time
                     // it spent here taken off what the holder said it had
                     // left) and is stamped at the receiver's receipt on its
