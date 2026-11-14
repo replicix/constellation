@@ -1476,10 +1476,16 @@ pub struct Stats {
     pub claim_own_rows_halted_non_stealable: u64,
     pub claim_own_rows_halted_stealable: u64,
     /// The end of a claimed own stream waited for the stream's rows
-    /// (`_waits`), and went ahead of them when `drop_held_await` ran out
-    /// (`_unordered`: the sim fails it).
+    /// (`_waits`), and went ahead of them when `drop_held_await` ran out:
+    /// ahead of rows held back from shipping (`_rows_outrun`: counted, sound,
+    /// the cut is bookkeeping and main ends there too), or ahead of a pending
+    /// drop (`_drop_cancelled`: ADR-59 D1 cancels the drop, the rows it names
+    /// stay stranded; the sim fails it). `claim_release_already`: the claim
+    /// found the stream's release row journaled already and added none.
     pub claim_end_waits: u64,
-    pub claim_end_unordered: u64,
+    pub claim_end_rows_outrun: u64,
+    pub claim_end_drop_cancelled: u64,
+    pub claim_release_already: u64,
     pub deleg_sticky_ended_operator: u64,
     pub deleg_sticky_ended_recalled: u64,
     /// Recalls of a sticky stream the root started: by a continuation epoch
@@ -1499,9 +1505,14 @@ pub struct Stats {
     pub deleg_sticky_release_undrained: u64,
     pub deleg_sticky_release_held: u64,
     pub deleg_sticky_releases_given_up: u64,
-    /// Plan 46 M1.3 step 6: sticky subtrees the holder released because its
-    /// own ops had been idle there for `sticky_idle_release_ms`.
+    /// Plan 46 M1.3 step 6: sticky subtrees the holder released (the command
+    /// completed) because its own ops had been idle there for
+    /// `sticky_idle_release_ms`,
     pub deleg_sticky_released_idle: u64,
+    /// ... requested (the command made) and given up (out of time: a drop the
+    /// holder decided, or a drain that did not finish).
+    pub deleg_sticky_idle_requested: u64,
+    pub deleg_sticky_idle_given_up: u64,
     /// Plan 46 M1.3 step 8 (ADR-56), the holder's side of a handover
     /// request: requests that waited for the holder's own ops to be quiet
     /// (`_waits`), waits that became a release (`_released`), requests for

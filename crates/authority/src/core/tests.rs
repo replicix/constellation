@@ -75255,11 +75255,11 @@ mod step5_sticky_release {
             last_is_release(&h),
             "an idle subtree was not released: {} cmds, {} idle, due {:?}, now {:?}",
             h.core.dl.sticky_cmds.len(),
-            h.core.stats.deleg_sticky_released_idle,
+            h.core.stats.deleg_sticky_idle_requested,
             h.core.dl.idle_due,
             h.clk().wait
         );
-        assert_eq!(h.core.stats.deleg_sticky_released_idle, dirs.len() as u64);
+        assert_eq!(h.core.stats.deleg_sticky_idle_requested, dirs.len() as u64);
     }
 
     /// Plan 46 M1.3 step 6: an op the fast path admitted (in flight), or one
@@ -75281,16 +75281,16 @@ mod step5_sticky_release {
             sample(&mut h, &[], &[(7, dirs[0], 1)]);
             release_tick(&mut h, 400);
         }
-        assert_eq!(h.core.stats.deleg_sticky_released_idle, 0);
+        assert_eq!(h.core.stats.deleg_sticky_idle_requested, 0);
         // It ran and is done; the clock counts from it.
         sample(&mut h, &[(7, dirs[0])], &[]);
         release_tick(&mut h, 900);
         assert_eq!(
-            h.core.stats.deleg_sticky_released_idle, 0,
+            h.core.stats.deleg_sticky_idle_requested, 0,
             "released 900 ms after an op"
         );
         release_tick(&mut h, 200);
-        assert_eq!(h.core.stats.deleg_sticky_released_idle, 1);
+        assert_eq!(h.core.stats.deleg_sticky_idle_requested, 1);
     }
 
     /// Plan 46 M1.3 step 6: `0` disables the idle release.
@@ -75307,7 +75307,7 @@ mod step5_sticky_release {
                 acked_seqs: Vec::new(),
             });
         }
-        assert_eq!(h.core.stats.deleg_sticky_released_idle, 0);
+        assert_eq!(h.core.stats.deleg_sticky_idle_requested, 0);
         assert!(h.core.dl.sticky_cmds.is_empty());
     }
 
@@ -82153,6 +82153,235 @@ mod root_own_sticky {
             acked_seqs: Vec::new(),
         });
         assert!(ended(&h), "the stream did not end after the drop applied");
+    }
+
+    /// The own stream of `dirs[0]`, two rows in the journal, the process
+    /// restarted over the journal and about to claim the lease again (the
+    /// claim is made by the caller's `claim`).
+    fn restarted_root_with_own_stream() -> (Harness, Vec<Ino>, u64, u64) {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        let record = h.meta.journal_tip().unwrap();
+        archive_and_step(&mut h);
+        constellation_meta::MetaStore::ack_journal(&h.meta, record).unwrap();
+        for i in 0..2 {
+            let (rid, out) = submit_in(&mut h, 1 + i, dirs[0], &format!("f{i}"));
+            assert!(accepted(&out, rid), "{out:?}");
+        }
+        let mut out = Vec::new();
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.start(h.clk(), &h.meta, &mut out);
+        (h, dirs, d.gen, record)
+    }
+
+    fn claim(h: &mut Harness) {
+        let mut out = Vec::new();
+        h.hold(3, None);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+    }
+
+    /// Plan 46 M1.3 step 12 (review M1): a claimed stream whose end waits is
+    /// released from its row on: the holder's state is stopped, the placement
+    /// does not grow it with another subtree, and no row of the stream follows
+    /// the release row. Fails on the parent: the stream stayed live.
+    #[test]
+    fn a_claimed_stream_is_stopped_and_not_grown_while_its_end_waits() {
+        let (mut h, dirs, gen, record) = restarted_root_with_own_stream();
+        h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
+        claim(&mut h);
+        assert!(
+            h.core.dl.claim_waits.contains_key(&gen),
+            "the end did not wait"
+        );
+        assert!(
+            h.core.dl.mine[&gen].stopped,
+            "the stream was not stopped at its release row"
+        );
+        regrow(&mut h, dirs[1]);
+        assert!(
+            own_grant_of(&h, dirs[1]).is_none(),
+            "a claimed stream was grown while its end waited"
+        );
+        // Nothing of the stream follows the release row.
+        let txs = Replica::journal_txs_from(&h.meta, record + 1, usize::MAX);
+        let release_idx = txs
+            .iter()
+            .find(|t| {
+                t.records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::StreamReleased { gen: g, .. } if *g == gen))
+            })
+            .expect("no release row")
+            .origin
+            .1;
+        assert!(
+            txs.iter()
+                .filter(|t| t.origin.0 == gen)
+                .all(|t| t.origin.1 <= release_idx),
+            "a row of the stream follows its release row: {txs:?}"
+        );
+    }
+
+    /// Review S3/S7: when `drop_held_await` runs out under a pending drop the
+    /// end goes ahead and is counted as a cancelled drop (the sim fails it).
+    #[test]
+    fn a_claims_wait_that_runs_out_under_a_pending_drop_ends_and_counts_it() {
+        let (mut h, _dirs, gen, _record) = restarted_root_with_own_stream();
+        h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
+        claim(&mut h);
+        assert!(h.core.dl.claim_waits.contains_key(&gen));
+        h.advance(h.core.dl_t().drop_held_await + 1_000);
+        let id = h.core.dl.sticky_timer.expect("no timer for the wait");
+        h.step(Event::Timer { id });
+        assert!(
+            h.core.dl.gens.get(&gen).is_none_or(|g| g.ended),
+            "still waiting"
+        );
+        assert_eq!(h.core.stats.claim_end_drop_cancelled, 1);
+        assert_eq!(h.core.stats.claim_end_rows_outrun, 0);
+    }
+
+    /// Review M2: a ship plan that cannot be read is a wait, not an end.
+    #[test]
+    fn a_claim_whose_ship_plan_cannot_be_read_waits() {
+        let err = constellation_meta::MetaError::Invalid("unreadable".into());
+        let wait = Core::claim_wait_from(7, false, Err(err), |_| Vec::new());
+        assert_eq!(wait, Some(super::super::delegate::ClaimWait::Unknown));
+    }
+
+    /// Review S7: a row of the stream held back from shipping is a wait; one
+    /// of another stream, or nothing held back, is not.
+    #[test]
+    fn a_claim_waits_for_a_held_back_row_of_its_own_stream_only() {
+        use super::super::delegate::ClaimWait;
+        let held = |seqs: &[u64]| Ok(seqs.iter().copied().collect());
+        let origins = |_: &[u64]| vec![(9, 4), (7, 6), (7, 5)];
+        assert_eq!(
+            Core::claim_wait_from(7, false, held(&[3, 4, 5]), origins),
+            Some(ClaimWait::RowsUnshipped { first: 5 })
+        );
+        assert_eq!(Core::claim_wait_from(8, false, held(&[3]), origins), None);
+        assert_eq!(Core::claim_wait_from(7, false, held(&[]), origins), None);
+        assert_eq!(
+            Core::claim_wait_from(7, true, held(&[]), origins),
+            Some(ClaimWait::DropPending)
+        );
+    }
+
+    /// Review S7: a release row already in the journal (the root's own release
+    /// the restart interrupted) is not journaled again by the claim.
+    #[test]
+    fn a_claim_adds_no_second_release_row() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        let mut out = Vec::new();
+        assert!(h.core.own_sticky_release(
+            h.clk(),
+            d.gen,
+            [dirs[0]].into_iter().collect(),
+            &h.meta,
+            &mut out
+        ));
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        let before = Replica::journal_txs_from(&h.meta, 1, usize::MAX);
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.start(h.clk(), &h.meta, &mut out);
+        claim(&mut h);
+        let after = Replica::journal_txs_from(&h.meta, 1, usize::MAX);
+        let releases = |txs: &[constellation_meta::BackupTx]| {
+            txs.iter()
+                .filter(|t| {
+                    t.records.iter().any(
+                        |r| matches!(r, LogRecord::StreamReleased { gen, .. } if *gen == d.gen),
+                    )
+                })
+                .count()
+        };
+        assert_eq!(releases(&before), 1);
+        assert_eq!(releases(&after), 1, "the claim journaled a second release");
+    }
+
+    /// Review S7: a stream whose own rows the takeover gate replayed by rid
+    /// gets no release row, and the sim's counter sees it.
+    #[test]
+    fn a_claim_over_replayed_own_rows_journals_no_release_and_counts_it() {
+        let (mut h, _dirs, gen, _record) = restarted_root_with_own_stream();
+        h.core.dl.claim_replayed.insert(gen);
+        claim(&mut h);
+        assert_eq!(h.core.stats.claim_own_rows_halted_non_stealable, 1);
+        assert_eq!(h.core.stats.claim_released, 0);
+    }
+
+    /// Spec 12a pin (the read-recall half of claim = release is covered by
+    /// the root path, no new mechanism): a node that claimed the lease and
+    /// holds the read grant it gave as the stream's holder recalls it before
+    /// it acknowledges a write of its own under the subtree.
+    #[test]
+    fn a_claimants_root_write_recalls_the_read_grant_it_gave_as_holder() {
+        let (mut h, dirs, _gen, _record) = restarted_root_with_own_stream();
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        claim(&mut h);
+        let (_rid, out) = submit_in(&mut h, 9, dirs[0], "after-claim");
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::Send {
+                    to: 2,
+                    msg: PeerMsg::DelegationRecall { .. }
+                }
+            )),
+            "the write did not recall the read grant: {out:?}"
+        );
+    }
+
+    /// Plan 46 M1.3 step 6 (review S7): the root's own sticky stream is
+    /// released by the idle release, and the placement does not grant it
+    /// straight back (ADR-54's quarantine).
+    #[test]
+    fn the_root_releases_its_own_idle_stream_and_the_quarantine_holds_the_regrant() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.cfg.sticky_idle_release_ms = 1_000;
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        for _ in 0..8 {
+            h.advance(500);
+            h.hold(1, None);
+            h.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            });
+            if let Some(id) = h.core.dl.sticky_timer {
+                h.step(Event::Timer { id });
+            }
+            archive_and_step(&mut h);
+        }
+        assert!(
+            h.core.stats.deleg_sticky_idle_requested >= 1,
+            "no idle release was made"
+        );
+        assert!(
+            h.meta.delegation_table().get(dirs[0]).is_none(),
+            "still granted: {d:?}"
+        );
+        // The root writes there again at once: not granted back within the window.
+        for _ in 0..40 {
+            h.core.place_note(1, [dirs[0]]);
+        }
+        tick(&mut h);
+        assert!(own_grant_of(&h, dirs[0]).is_none(), "granted straight back");
     }
 
     /// ADR-55 (S8): the lease is not released over an own release row that is

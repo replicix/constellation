@@ -1077,6 +1077,10 @@ pub(crate) struct StickyReleaseCmd {
     /// sample the driver took after that mirror (`Core::deleg_note_local`)
     /// shows no fast-path op in flight there.
     pub made_at: u64,
+    /// Plan 46 M1.3 step 6: the number of subtrees this command releases for
+    /// the idle release (`0`: not an idle release); counted released when the
+    /// command completes, given up when it runs out of time.
+    pub idle: u64,
 }
 
 /// ADR-56: the root asked this node, the holder of sticky subtrees of stream
@@ -1108,12 +1112,15 @@ const STICKY_RELEASE_TICK_MS: i64 = 200;
 
 /// Plan 46 M1.3 step 12: what the end of a claimed own stream waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaimWait {
+pub(super) enum ClaimWait {
     /// The stream holds a drop (ADR-59) whose record the log lacks.
     DropPending,
     /// A row of the stream, at stream index `first` or above, is held back
     /// from shipping.
     RowsUnshipped { first: u64 },
+    /// The journal's ship plan could not be read: nothing is known, so the
+    /// end waits (an error under load adds latency, never misorders).
+    Unknown,
 }
 
 /// Plan 46 M1.2 step 11 (maintainer decision 2026-11-06, "Leave ends grants
@@ -12792,12 +12799,16 @@ impl Core {
             // executes nothing in it any more (its ops are held for good,
             // `far-placement-release` seeds 200 and 975). The grant waits
             // until the release has shipped and the stream has ended.
+            // (Also a stream the claim of the lease is ending: its end waits
+            // for the stream's rows. Also during a partial release, where the
+            // stream lives on: the refusal is transient.)
             if own
-                && self
-                    .dl
-                    .mine
-                    .get(&gen)
-                    .is_some_and(|d| d.stopped || d.release.is_some())
+                && (self.dl.claim_waits.contains_key(&gen)
+                    || self
+                        .dl
+                        .mine
+                        .get(&gen)
+                        .is_some_and(|d| d.stopped || d.release.is_some()))
             {
                 return Err("the root's own sticky stream is being released".into());
             }
@@ -13077,7 +13088,7 @@ impl Core {
     /// interrupted), or when the stream cannot release by a row (a lost
     /// dependency, rows its tenure has not committed: the end cuts as
     /// before, counted).
-    fn claim_releases(&mut self, gen: u64, non_stealable: bool, replica: &dyn Replica) {
+    pub(super) fn claim_releases(&mut self, gen: u64, non_stealable: bool, replica: &dyn Replica) {
         let me = self.me();
         let replayed = self.dl.claim_replayed.remove(&gen);
         if !non_stealable {
@@ -13090,13 +13101,19 @@ impl Core {
             self.stats.claim_own_rows_halted_non_stealable += 1;
             return;
         }
-        if self.cfg.claim_ends_silently
-            || !self.dl.mine.contains_key(&gen)
-            || self.release_row_journaled(gen, replica)
-        {
+        if self.cfg.claim_ends_silently || !self.dl.mine.contains_key(&gen) {
             self.stats.claim_release_rowless += 1;
             return;
         }
+        if self.release_row_journaled(gen, replica) {
+            self.stats.claim_release_already += 1;
+            return;
+        }
+        // (Unlike `release_subtrees`, a stopped or rebooted stream is no
+        // reason for no row: those make a holder's release rowless because a
+        // group may hold rows the cut must wait for, and the claimant's
+        // journal is the root's: its own rows are all here, the seal has
+        // nothing to ask.)
         let idx = replica.delegate_idx(gen);
         if idx > self.holder_append_cap(gen, replica)
             || self.deleg_find_lost(gen, replica).is_some()
@@ -13115,7 +13132,18 @@ impl Core {
             through: idx,
         }];
         match replica.delegate_release(&records, gen, Position::ZERO) {
-            Ok(_) => self.stats.claim_released += 1,
+            Ok(_) => {
+                self.stats.claim_released += 1;
+                // The stream is released from this row on: the holder
+                // executes nothing in it (an op that landed after the row
+                // would be a row of the stream behind its release; the ops
+                // parked in it stay parked, and the end routes them as a
+                // dropped stream's are, once the table no longer lists the
+                // subtree: routed now they would meet the stream again).
+                if let Some(d) = self.dl.mine.get_mut(&gen) {
+                    d.stopped = true;
+                }
+            }
             Err(error) => {
                 // The end cuts at what the node assigned, as before.
                 self.stats.claim_release_rowless += 1;
@@ -13131,21 +13159,47 @@ impl Core {
 
     /// Plan 46 M1.3 step 12: why the end of a claimed own stream is not due.
     fn claim_end_of(&self, gen: u64, replica: &dyn Replica) -> Option<ClaimWait> {
-        // ADR-59 D1: a generation that ends without its drop record cancels
-        // the drop: the rows it names are stranded.
-        if replica.stream_drop_pending(gen) {
+        Self::claim_wait_from(
+            gen,
+            replica.stream_drop_pending(gen),
+            replica.journal_held_back(),
+            |seqs| replica.journal_origins(seqs),
+        )
+    }
+
+    /// The decision of [`Self::claim_end_of`] on what it read: `drop_pending`
+    /// (ADR-59 D1: a generation that ends without its drop record cancels the
+    /// drop, the rows it names are stranded); the first journal seqs the ship
+    /// plan holds or defers (`held`; a chunk a row names is pending or
+    /// poisoned, so it ships after later rows, the end among them: the log
+    /// would end the stream below it), and `origins` of them. A ship plan that
+    /// could not be read is a wait: an error under load adds latency, never
+    /// misorders.
+    pub(super) fn claim_wait_from(
+        gen: u64,
+        drop_pending: bool,
+        held: Result<std::collections::BTreeSet<u64>, constellation_meta::MetaError>,
+        origins: impl FnOnce(&[u64]) -> Vec<(u64, u64)>,
+    ) -> Option<ClaimWait> {
+        if drop_pending {
             return Some(ClaimWait::DropPending);
         }
-        // A row of the stream the ship plan holds or defers (a chunk it
-        // names is pending or poisoned) ships after later rows, the end among
-        // them: the log would end the stream below it.
-        let back = replica.journal_held_back().ok()?;
+        let back = match held {
+            Ok(back) => back,
+            Err(error) => {
+                tracing::warn!(
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    %error,
+                    "the ship plan of a claimed own stream could not be read: its end waits"
+                );
+                return Some(ClaimWait::Unknown);
+            }
+        };
         if back.is_empty() {
             return None;
         }
         let seqs: Vec<u64> = back.into_iter().collect();
-        replica
-            .journal_origins(&seqs)
+        origins(&seqs)
             .iter()
             .filter(|(g, _)| *g == gen)
             .map(|(_, idx)| *idx)
@@ -13166,7 +13220,12 @@ impl Core {
         let first = !self.dl.claim_waits.contains_key(&gen);
         let since = *self.dl.claim_waits.entry(gen).or_insert(now.wait);
         if now.wait.since(since).max(0) as u64 >= self.dl_t().drop_held_await {
-            self.stats.claim_end_unordered += 1;
+            match wait {
+                ClaimWait::DropPending => self.stats.claim_end_drop_cancelled += 1,
+                ClaimWait::RowsUnshipped { .. } | ClaimWait::Unknown => {
+                    self.stats.claim_end_rows_outrun += 1
+                }
+            }
             tracing::warn!(
                 node = self.me(),
                 gen = %constellation_meta::delegation::GenLabel::of(gen),
@@ -13933,6 +13992,7 @@ impl Core {
             handover: false,
             root: 0,
             made_at: self.dl.step,
+            idle: 0,
         });
         self.sticky_release_progress(now, replica, out);
     }
@@ -13977,6 +14037,7 @@ impl Core {
             handover: false,
             root: 0,
             made_at: self.dl.step,
+            idle: 0,
         });
         self.sticky_release_progress(now, replica, out);
         true
@@ -14004,6 +14065,7 @@ impl Core {
                 }
             }
             if c.parts.is_empty() {
+                self.stats.deleg_sticky_released_idle += c.idle;
                 if let Some(op) = c.op {
                     out.push(Action::ControlDone {
                         op,
@@ -14014,6 +14076,7 @@ impl Core {
             }
             if now.wait >= c.deadline {
                 self.stats.deleg_sticky_releases_given_up += 1;
+                self.stats.deleg_sticky_idle_given_up += c.idle;
                 if c.handover {
                     // The root asked and the holder agreed: the wait goes
                     // back (the subtree is the holder's until it releases),
@@ -14506,6 +14569,7 @@ impl Core {
             handover: true,
             root,
             made_at: self.dl.step,
+            idle: 0,
         });
     }
 
@@ -14561,6 +14625,12 @@ impl Core {
                     soonest(tick);
                     continue;
                 }
+                // A decided drop holds every release of the stream (ADR-59
+                // part B): not asked for, looked at again in a second.
+                if replica.stream_drop_pending(gen) {
+                    soonest(now.wait.plus(1_000));
+                    continue;
+                }
                 let Some(d) = self.dl.mine.get_mut(&gen) else {
                     continue;
                 };
@@ -14582,7 +14652,7 @@ impl Core {
         self.dl.idle_scan_at = Some(due.unwrap_or(now.wait.plus(1_000)));
         if !parts.is_empty() {
             let n: u64 = parts.values().map(|p| p.len() as u64).sum();
-            self.stats.deleg_sticky_released_idle += n;
+            self.stats.deleg_sticky_idle_requested += n;
             tracing::info!(
                 node = self.me(),
                 subtrees = n,
@@ -14597,6 +14667,7 @@ impl Core {
                 handover: false,
                 root: 0,
                 made_at: self.dl.step,
+                idle: n,
             });
             self.sticky_release_progress(now, replica, out);
         }
