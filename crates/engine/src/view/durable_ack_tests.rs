@@ -578,6 +578,81 @@ fn a_failed_retag_fails_the_fast_path_op() {
     assert_eq!(session.stats().fast_acks_downgraded, 0);
 }
 
+/// A fast-path create journaled under `published`, answered once the
+/// watermark covers it: what the op asked the sync task for while it waited
+/// (`nudge`, `journaled`, anything else as `other`), and the row's class.
+fn fast_path_requests_under(
+    published: constellation_meta::RowCommit,
+) -> (Vec<&'static str>, Option<constellation_meta::RowCommit>) {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let session = meta.session();
+    session.set_durable(true, meta.journal_tip().unwrap(), false, published, false);
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), true);
+    let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    let mut seen = Vec::new();
+    let class = std::thread::scope(|scope| {
+        let op = scope.spawn(|| {
+            fs.mutate_op(
+                ROOT_INO,
+                constellation_meta::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "n".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+        });
+        let tip = journaled_past_durable(&meta);
+        // What the op sent before it parked, then a while of nothing more.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!op.is_finished(), "the op waits for its row's commit");
+        while let Ok(req) = core.try_recv() {
+            seen.push(match req {
+                SyncRequest::Nudge => "nudge",
+                SyncRequest::Journaled => "journaled",
+                _ => "other",
+            });
+        }
+        // The round ships the row (or the group holds it): answered.
+        session.set_durable(true, tip, false, published, false);
+        assert_eq!(op.join().unwrap(), Ok(()));
+        meta.journal_tx_class(tip).unwrap()
+    });
+    (seen, class)
+}
+
+/// ADR-50's interim cost: a root with a write-eligible peer and no backup
+/// listed journals its own ops `Archive`, committed only by a ship. The
+/// fast path asks for that round at once (a nudge, as a close or an fsync
+/// does), and the op costs one S3 PUT rather than the next poll round's
+/// wait (one sync interval: about 200 ms in bench topology 5). Fails on
+/// the parent: the op sent `Journaled`, which starts no round.
+#[test]
+fn an_archive_bound_fast_path_op_nudges_a_ship() {
+    use constellation_meta::RowCommit;
+    let (seen, class) = fast_path_requests_under(RowCommit::ARCHIVE);
+    assert_eq!(class, Some(RowCommit::ARCHIVE));
+    assert_eq!(
+        seen.iter().filter(|r| **r == "nudge").count(),
+        1,
+        "one nudge: {seen:?}"
+    );
+}
+
+/// The same op under a group with members: its row is streamed to them on
+/// any event, so no round is started for it (a burst of small ops on a
+/// backed root starts no ship per op).
+#[test]
+fn a_group_bound_fast_path_op_starts_no_round() {
+    use constellation_meta::RowCommit;
+    let (seen, class) = fast_path_requests_under(RowCommit::ROOT_GROUP);
+    assert_eq!(class, Some(RowCommit::ROOT_GROUP));
+    assert!(!seen.contains(&"nudge"), "{seen:?}");
+    assert!(seen.contains(&"journaled"), "{seen:?}");
+}
+
 /// Plan 43 C2 (§5.4, D5): the gate goes off while a fast-path op waits, on
 /// a node that is neither lone nor holding a continuation epoch (a release
 /// or a handoff after the write): nothing committed the row and nothing lets

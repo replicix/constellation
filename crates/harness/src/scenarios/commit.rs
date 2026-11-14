@@ -27,7 +27,8 @@
 //!    has a backup: b's own ops;
 //! 5. `5-wan`: two nodes under `CONSTELLATION_HARNESS_LOAD=net-wan` (the load
 //!    profile is process-global, so this topology runs *only* then): the
-//!    lone root's own ops and a forwarded op;
+//!    root's own ops and a forwarded op (no backup in budget, and b a
+//!    write-eligible peer: the root's answers wait for the archive);
 //! 6. `6-ack-s3`: `CONSTELLATION_ACK=s3`, the holder's own ops.
 //! 7. `7-wan-sticky`: as 5, with the placement and sticky placement on
 //!    (plan 46 M1.3 step 7): `b` creates files in `/t7` until the
@@ -547,12 +548,15 @@ fn topology_wan(n: usize) -> Result<Rows> {
     let result = (|| -> Result<Rows> {
         let mut rows = Rows::new("5-wan");
         let (a, b) = (&clients[0], &clients[1]);
-        // The peers are beyond the RTT budget: the root is lone.
-        eventually("a is a lone root", Duration::from_secs(60), || {
+        // b is beyond the RTT budget, so a lists no backup; b is a
+        // write-eligible peer, so a is no singleton either (ADR-50): its own
+        // ops and b's forwards wait for the archive, one ship each (a nudged
+        // round: one S3 PUT, not the sync interval).
+        eventually("a has no backup", Duration::from_secs(60), || {
             let a = ack_of(a)?;
             ensure!(
                 a["policy"] == "local" && a["backups"].as_array().is_none_or(|v| v.is_empty()),
-                "5-wan: a is not lone: {a}"
+                "5-wan: a has a backup: {a}"
             );
             Ok(())
         })?;

@@ -762,8 +762,23 @@ impl View {
         h: &SyncHandle,
         target: AckTarget,
     ) -> Result<bool, MetaError> {
-        let _ = h.tx.send(SyncRequest::Journaled);
+        // An `Archive` row (no backup listed, ADR-50's interim cost) is
+        // committed only by a ship, which `Journaled` does not start: the
+        // answer waited for the next poll round, one sync interval (200 ms
+        // in the harness, 500 ms by default; bench topology 5). A nudge asks
+        // for the round now, as a close or an fsync does; the core coalesces
+        // nudges into one round in flight and at most one after it
+        // (`Core::nudge`), so a burst of small ops costs a ship per round,
+        // not one per op. A group's row is streamed to its members on any
+        // event and needs no round. (An op that journaled no row waits for
+        // the tip, which the published rule commits.)
         let session = self.meta.session();
+        let request = if target.archive || session.published_class().is_archive() {
+            SyncRequest::Nudge
+        } else {
+            SyncRequest::Journaled
+        };
+        let _ = h.tx.send(request);
         constellation_vfs::watch::stage("durability acknowledgement");
         match session.wait_durable(target.last, DURABLE_WAIT_BUDGET) {
             constellation_meta::DurableWait::Durable(waited) => {
