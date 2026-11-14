@@ -47,10 +47,12 @@
 //!    grant, one stream over two subtrees; plan 46 M1.2 step 15, the
 //!    successor of plan 30's `two-gens-ack-cost`) with a backup: four threads
 //!    on `b` create files, two per subtree (`delegate-4w-two-subtrees`), then
-//!    four in `/d1` alone (`delegate-4w-one-subtree`, the comparison: the
-//!    two must not differ beyond the run-to-run spread); and a rename of a
-//!    file from `/d1` into `/d2` (`delegate` `rename-across`, which no
-//!    cross-subtree hazard delays: the stream owns both parents).
+//!    four in `/d1` alone (`delegate-4w-one-subtree`, a reference and not a
+//!    bound: four writers in one directory); and a rename of a file from
+//!    `/d1` into `/d2` (`delegate` `rename-across`, which no cross-subtree
+//!    hazard delays: the stream owns both parents). Nothing is asserted
+//!    about the numbers; a node's rows no longer wait for another
+//!    generation's (ADR-39's cost is gone with the generations).
 //!
 //! One JSON document on stdout:
 //! `{"scenario":"ack-latency","load":…,"results":[{"topology","actor","op","n","p50_us","p90_us","p99_us"}]}`.

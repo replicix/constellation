@@ -286,3 +286,36 @@ admission per thread (median): 1 thread A 337, B 343 (1.018); 16 threads A 14377
 (1.025). The cost B adds is a lookup in the per-subtree record and two atomics under the
 lock the admission holds anyway (the earlier third global mutex of the first version
 is gone): about 7 ns on an admission that precedes a 600 us op.
+
+
+## Plan 46 M1.2 step 15, topology 9: `9-two-subtrees` (one stream over two subtrees)
+
+The successor of plan 30's `two-gens-ack-cost` (ADR-39: a node with two generations waited for the other generation's row;
+retired with the generations in M1.2). Three nodes, placement off, `/d1` and `/d2` delegated to `b` (one generation, one
+stream: `status.delegation.mine` has one live entry over both directories, asserted), `b` with a backup. `delegate-4w-two-subtrees`:
+four threads on `b` create files, two per subtree, 300 each; `delegate-4w-one-subtree`: four threads in `/d1` alone (a
+reference, not a bound: four writers on one directory); `delegate rename-across`: 300 renames of a file from `/d1` into `/d2`
+(one writer). One box (a quiet one, run by itself), release build, five runs per file system (`harness run ack-latency` with
+`ACK_LATENCY_TOPOLOGIES=9`, `ACK_LATENCY_SAMPLES=300`), each file system as the `TMPDIR`. Median over the runs of p50 / p90, the
+largest p99 (us). This is a new row set with no earlier build to compare, so there is no A/B (the product code is unchanged by
+this step).
+
+| file system | actor / op | p50 | p90 | max p99 | p50 over the runs |
+|---|---|--:|--:|--:|---|
+| ext4 | 4 writers, two subtrees / create | 1375 | 2367 | 3006 | 1286 to 1409 |
+| ext4 | 4 writers, one subtree / create | 2503 | 3148 | 4805 | 2432 to 2890 |
+| ext4 | delegate / rename-across | 481 | 1382 | 2045 | 467 to 567 |
+| xfs | 4 writers, two subtrees / create | 1254 | 1554 | 2127 | 1244 to 1267 |
+| xfs | 4 writers, one subtree / create | 1974 | 2326 | 2914 | 1938 to 1993 |
+| xfs | delegate / rename-across | 503 | 644 | 820 | 481 to 535 |
+| btrfs | 4 writers, two subtrees / create | 1261 | 1569 | 2149 | 1223 to 1293 |
+| btrfs | 4 writers, one subtree / create | 2021 | 2362 | 2876 | 1985 to 2065 |
+| btrfs | delegate / rename-across | 518 | 648 | 856 | 500 to 544 |
+| tmpfs | 4 writers, two subtrees / create | 1252 | 1486 | 2349 | 1193 to 1261 |
+| tmpfs | 4 writers, one subtree / create | 1931 | 2291 | 2907 | 1769 to 1995 |
+| tmpfs | delegate / rename-across | 502 | 627 | 814 | 457 to 521 |
+
+Reading: a rename between a node's two subtrees costs one local commit with its group acknowledgement (about 0.5 ms), with no wait for a second stream. Writers spread over two subtrees create faster than the same four in
+one directory (1.25 to 1.4 ms against 1.9 to 2.5 ms at p50); both phases run on the same stream, so the difference is the
+writers' shared directory, not a wait between streams (not separately diagnosed). The ext4 tail is wider than the other
+three file systems' (the rename-across p90 is 2.9 times its p50 against 1.2 to 1.3); not diagnosed.
