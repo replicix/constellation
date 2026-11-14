@@ -81892,6 +81892,61 @@ mod root_own_sticky {
         assert!(h.core.dl.gens[&d.gen].ended || h.core.dl.gens[&d.gen].dirs.is_empty());
     }
 
+    /// The root dominates `dir`: noted, and the placement ticks past its
+    /// cool-down a few times.
+    fn regrow(h: &mut Harness, dir: Ino) {
+        for _ in 0..3 {
+            h.advance(h.core.cfg.placement_cooldown_ms + 1_000);
+            h.hold(1, None);
+            for _ in 0..40 {
+                h.core.place_note(1, [dir]);
+            }
+            tick(h);
+        }
+    }
+
+    /// Plan 46 M1.3 step 6 (`far-placement-release` seeds 200 and 975): the
+    /// root that released its own sticky stream (the release row journaled,
+    /// not shipped) does not grow that stream with another subtree: the
+    /// stream's holder executes nothing in it any more, so every op under the
+    /// new subtree would be held for good. The grant waits for the stream to
+    /// end. Fails on the parent: the stream grew.
+    #[test]
+    fn a_released_own_stream_is_not_grown() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        let mut out = Vec::new();
+        assert!(h.core.own_sticky_release(
+            h.clk(),
+            d.gen,
+            [dirs[0]].into_iter().collect(),
+            &h.meta,
+            &mut out
+        ));
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert!(h.core.dl.mine[&d.gen].release.is_some(), "not released");
+        // The root dominates the other subtree now.
+        regrow(&mut h, dirs[1]);
+        assert!(
+            own_grant_of(&h, dirs[1]).is_none(),
+            "the released stream was grown by another subtree"
+        );
+        // (Control: the same placement grows a stream nobody released.)
+        let (mut c, cdirs) = root_with_peer(Some(500));
+        root_dominates(&mut c, cdirs[0]);
+        archive_and_step(&mut c);
+        regrow(&mut c, cdirs[1]);
+        assert!(
+            own_grant_of(&c, cdirs[1]).is_some(),
+            "the placement does not grow an unreleased own stream: the test proves nothing"
+        );
+    }
+
     /// Test 12 (pins today's claim; step 12 changes it): a node that claims
     /// the lease and finds a stream of its own in the table ends it, the
     /// root executing the subtree itself.

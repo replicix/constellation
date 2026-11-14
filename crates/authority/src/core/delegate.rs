@@ -12786,6 +12786,21 @@ impl Core {
             if g.recall != RecallPhase::None || g.waiting_for_group || g.prev_blocked {
                 return Err(format!("node {node}'s delegation is being recalled"));
             }
+            // Plan 46 M1.3 step 6: this node's own stream, which it released
+            // (its release row is journaled, not shipped yet) or stopped, is
+            // not grown: the new subtree would join a stream whose holder
+            // executes nothing in it any more (its ops are held for good,
+            // `far-placement-release` seeds 200 and 975). The grant waits
+            // until the release has shipped and the stream has ended.
+            if own
+                && self
+                    .dl
+                    .mine
+                    .get(&gen)
+                    .is_some_and(|d| d.stopped || d.release.is_some())
+            {
+                return Err("the root's own sticky stream is being released".into());
+            }
         } else if kind != DelegKind::Designated && self.dl.designating.values().any(|n| *n == node)
         {
             // Neither a stealable grant nor a sticky one: the designation's
