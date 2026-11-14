@@ -1308,7 +1308,8 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
     // logind's `PrepareForSleep`: `b` talks to a fake logind of its own
     // (`CONSTELLATION_LOGIND_ADDRESS`), takes its delay inhibitor, and holds
     // it until its sequence has released the grants.
-    let socket = std::env::temp_dir().join(format!("cst-logind-{}-{}", scenario, std::process::id()));
+    let socket =
+        std::env::temp_dir().join(format!("cst-logind-{}-{}", scenario, std::process::id()));
     let fake = match how {
         Leave::Suspend => {
             let _ = std::fs::remove_file(&socket);
@@ -1333,7 +1334,9 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
             wait_for_p2p(&refs)?;
             eventually("b holds the inhibitor", Duration::from_secs(20), || {
                 anyhow::ensure!(
-                    fake.inhibitors().iter().any(|i| i.held && i.what.contains("sleep")),
+                    fake.inhibitors()
+                        .iter()
+                        .any(|i| i.held && i.what.contains("sleep")),
                     "no delay inhibitor held: {:?}",
                     fake.inhibitors()
                 );
@@ -1369,14 +1372,18 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
                 fake.prepare_for_sleep(true);
                 // The inhibitor is let go once the sequence is done, not
                 // before: logind then lets the host sleep.
-                eventually("b lets go of the inhibitor", Duration::from_secs(30), || {
-                    anyhow::ensure!(
-                        fake.inhibitors().iter().all(|i| !i.held),
-                        "still held: {:?}",
-                        fake.inhibitors()
-                    );
-                    Ok(())
-                })?;
+                eventually(
+                    "b lets go of the inhibitor",
+                    Duration::from_secs(30),
+                    || {
+                        anyhow::ensure!(
+                            fake.inhibitors().iter().all(|i| !i.held),
+                            "still held: {:?}",
+                            fake.inhibitors()
+                        );
+                        Ok(())
+                    },
+                )?;
                 let s = clients[1].control_status()?["lifecycle"]["last_suspend"].clone();
                 anyhow::ensure!(
                     s["within_deadline"] == true && s["lease_released"] == true,
@@ -1425,7 +1432,9 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
             })?;
         }
         if let Leave::Suspend = how {
-            fake.as_ref().context("no fake logind")?.prepare_for_sleep(false);
+            fake.as_ref()
+                .context("no fake logind")?
+                .prepare_for_sleep(false);
             eventually("b sees c-after", Duration::from_secs(30), || {
                 anyhow::ensure!(std::fs::read(clients[1].mnt.join("d1/c-after"))? == b"c");
                 Ok(())
@@ -1773,6 +1782,91 @@ pub fn sticky_release_on_unmount(_seed: u64) -> Result<()> {
 /// and the node's delay inhibitor is held until it has released the grants).
 pub fn sticky_suspend_inhibitor(_seed: u64) -> Result<()> {
     sticky_leaves("sticky-suspend-inhibitor", Leave::Suspend)
+}
+
+/// Plan 46 M1.3 step 6: `constellation release --dirs /d1 --wait` on the
+/// sticky holder `b` of `d1` hands the subtree back while `b` stays mounted:
+/// the command exits 0 once the root has the release row, `d1` has left the
+/// root's table, `c` writes into it through the root at once, and what `b`
+/// wrote is on every node. A second `release` finds nothing to release and
+/// exits 0; one for a path `b` does not hold exits non-zero.
+pub fn sticky_release_cmd(_seed: u64) -> Result<()> {
+    const SCENARIO: &str = "sticky-release-cmd";
+    let (_env, _root, mut clients, _) = cluster(
+        SCENARIO,
+        &["a", "b", "c"],
+        &[("CONSTELLATION_CTO", "strict")],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let b_id = node_id(&clients[1])?;
+        std::fs::create_dir(clients[0].mnt.join("d1"))?;
+        for x in [&clients[1], &clients[2]] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        clients[0]
+            .control(
+                "designation.delegate",
+                serde_json::json!({"path": "/d1", "node": b_id, "sticky": true}),
+            )
+            .context("delegating --sticky /d1 to b")?;
+        wait_installed(&clients[1], "/d1", Duration::from_secs(20))?;
+        anyhow::ensure!(in_table(&clients[0], "/d1")?, "/d1 not in a's table");
+        let (names_b, _) = write_files(&clients[1], "d1", "b", 40)?;
+        let out = clients[1].release_cli(&["/d1"], true)?;
+        anyhow::ensure!(
+            out.status.success(),
+            "release --wait failed: {} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The root has the row when the command returns: no wait for a
+        // time-out.
+        anyhow::ensure!(!in_table(&clients[0], "/d1")?, "/d1 still in a's table");
+        let t = Instant::now();
+        eventually("c writes d1/c-after", Duration::from_secs(10), || {
+            std::fs::write(clients[2].mnt.join("d1/c-after"), b"c")?;
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            t.elapsed() < Duration::from_millis(DELEG_TTL_MS * 2),
+            "c's write took {:?}",
+            t.elapsed()
+        );
+        for x in [&clients[0], &clients[1], &clients[2]] {
+            eventually("b's files visible", Duration::from_secs(30), || {
+                for name in &names_b {
+                    anyhow::ensure!(
+                        std::fs::read(x.mnt.join(name))? == name.as_bytes(),
+                        "{name} on {}",
+                        x.name
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        // Nothing left to release: not an error. A path that is no grant of
+        // this node is.
+        let again = clients[1].release_cli(&[], true)?;
+        anyhow::ensure!(
+            again.status.success(),
+            "a second release failed: {}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+        let none = clients[1].release_cli(&["/"], false)?;
+        anyhow::ensure!(
+            !none.status.success(),
+            "release of a path that is no sticky grant exited 0"
+        );
+        let refs: Vec<&Client> = clients.iter().collect();
+        ensure_no_conflicts(&refs)
+    })();
+    dump_logs_on_failure(SCENARIO, &clients, &result);
+    unmount_all(&mut clients);
+    result
 }
 
 /// ADR-46: the sticky holder `b` of `d1` is killed with `kill -9` while `c`

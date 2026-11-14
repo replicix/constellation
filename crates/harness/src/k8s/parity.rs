@@ -535,7 +535,11 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         "sticky-release-on-unmount",
         Skip::Local(&[CTO_STRICT, NODES3, "unmounts a local daemon and reads its log"]),
     ),
-    ("sticky-suspend-inhibitor", Skip::Local(&[CTO_STRICT, NODES3, LIFECYCLE])),
+    (
+        "sticky-release-cmd",
+        Skip::Local(&[CTO_STRICT, NODES3, "runs the CLI against a local daemon's state dir"]),
+    ),
+    ("sticky-suspend-inhibitor", Skip::Local(&[CTO_STRICT, NODES3, LIFECYCLE, "talks to a fake logind on a local socket"])),
     ("sticky-holder-restart", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
     ("delegate-crash-default-ttl", Skip::Local(&[KILL, NODES3])),
     ("marker-order", Skip::Local(&[NODES3])),

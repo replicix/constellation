@@ -13080,7 +13080,8 @@ impl Core {
             return;
         }
         let idx = replica.delegate_idx(gen);
-        if idx > self.holder_append_cap(gen, replica) || self.deleg_find_lost(gen, replica).is_some()
+        if idx > self.holder_append_cap(gen, replica)
+            || self.deleg_find_lost(gen, replica).is_some()
         {
             self.stats.claim_release_rowless += 1;
             return;
@@ -14012,10 +14013,7 @@ impl Core {
                 if let Some(op) = c.op {
                     // Plan 46 M1.3 step 6: a drop the holder decided holds
                     // every release of its stream (ADR-59 part B): said so.
-                    let drop_pending = c
-                        .parts
-                        .keys()
-                        .any(|gen| replica.stream_drop_pending(*gen));
+                    let drop_pending = c.parts.keys().any(|gen| replica.stream_drop_pending(*gen));
                     let why = if drop_pending {
                         "drop pending: the stream holds a decided `repair drop-held` whose \
                          record the log lacks, and no release goes before it"

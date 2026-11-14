@@ -1378,8 +1378,15 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::sticky_release_on_unmount,
     },
     Scenario {
+        name: "sticky-release-cmd",
+        desc: "plan 46 M1.3 step 6: `constellation release --dirs /d1 --wait` on the sticky holder of d1 (b), which stays mounted, returns once the root has the release row: d1 has left the root's table, c writes into it at once, b's files are on every node; a second release finds nothing and exits 0, a path that is no grant exits non-zero",
+        requires: &[],
+        caps: &[],
+        run: m11::sticky_release_cmd,
+    },
+    Scenario {
         name: "sticky-suspend-inhibitor",
-        desc: "plan 46 M1.3 step 7: the sticky holder of d1 (b) is suspended (the lifecycle event the logind inhibitor delivers) after writing 40 files; it releases the subtree within the suspension, d1 leaves the root's table, c writes into d1 at once, b's files are on every node, and after the resume b sees c's file",
+        desc: "plan 46 M1.3 steps 6 and 7: the sticky holder of d1 (b), talking to a fake logind, is suspended (PrepareForSleep) after writing 40 files; it holds its delay inhibitor until it has released the subtree within the suspension, d1 leaves the root's table, c writes into d1 at once, b's files are on every node, and after the resume b sees c's file",
         requires: &[],
         caps: &[],
         run: m11::sticky_suspend_inhibitor,

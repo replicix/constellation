@@ -4299,7 +4299,12 @@ fn release_command(
             (target::Target::Named { path: Some(p), .. }, true) => vec![p.clone()],
             _ => Vec::new(),
         };
-        return ctl::<cm::StickyRelease>(rt, &dir, api::StickyReleaseParams { paths, wait }, print_ack);
+        return ctl::<cm::StickyRelease>(
+            rt,
+            &dir,
+            api::StickyReleaseParams { paths, wait },
+            print_ack,
+        );
     }
     if state_dir.is_some() {
         bail!("--state-dir names one node: give its file system as well");

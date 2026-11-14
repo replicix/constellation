@@ -591,6 +591,20 @@ impl Client {
             .output()?)
     }
 
+    /// `constellation release / --state-dir <state> [--dirs ..] [--wait]` as
+    /// a child process (plan 46 M1.3 step 6).
+    pub fn release_cli(&self, dirs: &[&str], wait: bool) -> Result<std::process::Output> {
+        let mut args = vec!["release", "/", "--state-dir", self.state.to_str().unwrap()];
+        if !dirs.is_empty() {
+            args.push("--dirs");
+            args.extend_from_slice(dirs);
+        }
+        if wait {
+            args.push("--wait");
+        }
+        Ok(self.cmd(&args).output()?)
+    }
+
     pub fn mount_view(&mut self, inner: Option<&str>, extra: &[&str]) -> Result<()> {
         self.mount_view_within(inner, extra, client_timeout())
     }

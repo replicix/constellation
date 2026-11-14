@@ -75239,7 +75239,10 @@ mod step5_sticky_release {
             acked_seqs: Vec::new(),
         });
         assert!(!last_is_release(&h), "released before it was idle");
-        assert!(h.core.dl.sticky_timer.is_some(), "no timer for the idle look");
+        assert!(
+            h.core.dl.sticky_timer.is_some(),
+            "no timer for the idle look"
+        );
         // Not yet idle for the setting: nothing.
         release_tick(&mut h, 900);
         assert!(!last_is_release(&h));
@@ -75282,7 +75285,10 @@ mod step5_sticky_release {
         // It ran and is done; the clock counts from it.
         sample(&mut h, &[(7, dirs[0])], &[]);
         release_tick(&mut h, 900);
-        assert_eq!(h.core.stats.deleg_sticky_released_idle, 0, "released 900 ms after an op");
+        assert_eq!(
+            h.core.stats.deleg_sticky_released_idle, 0,
+            "released 900 ms after an op"
+        );
         release_tick(&mut h, 200);
         assert_eq!(h.core.stats.deleg_sticky_released_idle, 1);
     }
@@ -82042,9 +82048,16 @@ mod root_own_sticky {
                 .any(|r| matches!(r, LogRecord::StreamReleased { gen, .. } if *gen == d.gen))
         });
         let release = release.unwrap_or_else(|| panic!("no release row up to {tip}: {txs:?}"));
-        assert_eq!(release.origin, (d.gen, 3), "the release is the stream's next row");
+        assert_eq!(
+            release.origin,
+            (d.gen, 3),
+            "the release is the stream's next row"
+        );
         let cut = h.meta.void_cut(d.gen).unwrap();
-        assert!(cut.is_none_or(|c| c >= 3), "the end cuts below the release: {cut:?}");
+        assert!(
+            cut.is_none_or(|c| c >= 3),
+            "the end cuts below the release: {cut:?}"
+        );
     }
 
     /// Plan 46 M1.3 step 12 (ADR-59 D1): the claim's end waits while the

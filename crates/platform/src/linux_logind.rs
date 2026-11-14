@@ -176,7 +176,14 @@ impl LogindLifecycle {
                         return;
                     }
                 };
-                rt.block_on(run(endpoint, worker_events, worker_acks, handler, ready_tx, stop_rx));
+                rt.block_on(run(
+                    endpoint,
+                    worker_events,
+                    worker_acks,
+                    handler,
+                    ready_tx,
+                    stop_rx,
+                ));
             });
         if let Err(e) = spawned {
             tracing::info!("no logind lifecycle source: cannot start its thread: {e}");
@@ -516,7 +523,10 @@ mod tests {
         };
         // The subscriber is still working: the host stays held back.
         std::thread::sleep(Duration::from_millis(300));
-        assert!(fake.inhibitors()[0].held, "released before the event was applied");
+        assert!(
+            fake.inhibitors()[0].held,
+            "released before the event was applied"
+        );
         src.applied(&event);
         wait_for("the inhibitor to be released", || {
             !fake.inhibitors()[0].held
