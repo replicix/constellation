@@ -2982,6 +2982,10 @@ pub struct Findings {
     /// I2 (c) answers the operator's `abandon-group` gave up on purpose (the
     /// rid is in the operator-lost set): counted here, not judged.
     pub i2c_operator_lost: usize,
+    /// Rids the operator's abandon gave up that a dead requester's inbox
+    /// then re-ran by rid as a new row of the root (maintainer decision
+    /// 2026-11-15; see `abandon_rerun_rids`).
+    pub i2c_abandon_rerun: usize,
     pub unjournaled_refusals: BTreeMap<String, usize>,
     /// Plan 43 C2a, I1: answers whose rid a transaction carries with
     /// another outcome (by answer kind), and relays with no judged answer
@@ -3264,12 +3268,97 @@ pub fn unlogged_delegate_rows(o: &Oracles, log: &super::check::Oracle) -> BTreeS
         .collect()
 }
 
+/// Whether the answer `a` is one the operator's abandon gave up: an OK
+/// non-relay answer for a row `(g, idx)` of a generation the log shows
+/// abandoned, `idx` past the cut of its end. `Final` is the holder's own
+/// disk; `Group` counts only when the operator confirmed every node of the
+/// group gone (the group the root listed at the abandon, ADR-61).
+pub fn ack_given_up(
+    a: &AckEntry,
+    cuts: &super::cut::StreamCuts,
+    confirmed: &BTreeSet<u64>,
+) -> bool {
+    a.kind == OutcomeKind::Ok
+        && !a.is_relay()
+        && a.judged.as_ref().is_some_and(|j| {
+            j.tx.as_ref().is_some_and(|t| {
+                let (g, idx) = t.origin;
+                let class_ok = match j.class {
+                    Some(Judged::Final) => true,
+                    Some(Judged::Group) => confirmed.contains(&g),
+                    _ => false,
+                };
+                class_ok
+                    && g != 0
+                    && cuts.abandoned.contains(&g)
+                    && cuts.cut.get(&g).is_some_and(|cut| idx > *cut)
+            })
+        })
+}
+
+/// The rids an abandon gave up that the log nevertheless completes (the
+/// maintainer decided this allowance on 2026-11-15, I2 (c)): the op was
+/// still in a dead requester's inbox, so after the abandon the root ran it
+/// by rid as a new row of its own. All must hold: the answer passes
+/// [`ack_given_up`] (Group class: every node confirmed gone, generation
+/// abandoned, `idx` past the cut); the log completes the rid in a segment
+/// after the one holding `GroupAbandoned` of the generation, whose origins
+/// are only the root's own `(0, 0)`; and the rid was never returned to a
+/// client (`returned`).
+pub fn abandon_rerun_rids(
+    o: &Oracles,
+    log: &super::check::Oracle,
+    cuts: &super::cut::StreamCuts,
+    confirmed: &BTreeSet<u64>,
+    returned: &BTreeSet<Rid>,
+) -> BTreeSet<Rid> {
+    use constellation_meta::LogRecord;
+    let abandon_seq = |g: u64| {
+        log.unfenced
+            .iter()
+            .find(|(_, s)| {
+                s.records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::GroupAbandoned { gen, .. } if *gen == g))
+            })
+            .map(|(seq, _)| *seq)
+    };
+    o.acks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|a| ack_given_up(a, cuts, confirmed))
+        .filter(|a| !returned.contains(&a.rid))
+        .filter(|a| {
+            let Some(g) = a
+                .judged
+                .as_ref()
+                .and_then(|j| j.tx.as_ref())
+                .map(|t| t.origin.0)
+            else {
+                return false;
+            };
+            let (Some(from), Some((seq, _))) = (abandon_seq(g), log.completed_at.get(&a.rid))
+            else {
+                return false;
+            };
+            *seq > from
+                && log.unfenced.get(seq).is_some_and(|s| {
+                    !s.origins.is_empty() && s.origins.iter().all(|o| *o == (0, 0))
+                })
+        })
+        .map(|a| a.rid)
+        .collect()
+}
+
 /// Tally the run's answers and run the end-of-run oracles: I2 (c) over the
 /// answers' transactions and the log, I4 over the in-doubt answers and the
 /// invocations, I5 over the rolled-back set (each rid with the tick of its
 /// latest rollback: only an answer given before it was rolled back).
 /// `operator_lost`: the rids the operator's `abandon-group` gave up (exempt
 /// from I2 (c), counted in `i2c_operator_lost`).
+/// `abandon_rerun`: the rids [`abandon_rerun_rids`] found (exempt from I2 (c),
+/// counted in `i2c_abandon_rerun`).
 /// `converged`: the run reached quiescence, so a group-answered rid the log
 /// never completed is absent for good.
 #[allow(clippy::too_many_arguments)]
@@ -3280,6 +3369,7 @@ pub fn end_of_run(
     rolled_back: &HashMap<Rid, u64>,
     dropped: &BTreeMap<Rid, Seq>,
     operator_lost: &BTreeSet<Rid>,
+    abandon_rerun: &BTreeSet<Rid>,
     abandoned_at: &BTreeMap<u64, u64>,
     converged: bool,
 ) -> Findings {
@@ -3377,6 +3467,12 @@ pub fn end_of_run(
                     // the row a `DropHeld` of the log names.
                     if verbatim_seen.insert(a.rid) {
                         f.i2c_operator_lost += 1;
+                    }
+                } else if abandon_rerun.contains(&a.rid) {
+                    // The abandon gave the row up and the dead requester's
+                    // inbox ran the op again by rid as the root's own row.
+                    if verbatim_seen.insert(a.rid) {
+                        f.i2c_abandon_rerun += 1;
                     }
                 } else if let Some(why) =
                     not_verbatim(log, a.rid, t, converged).filter(|_| !survives(&a.rid))
@@ -4116,6 +4212,7 @@ mod tests {
                 &HashMap::from([(r, 6)]),
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 &BTreeMap::new(),
                 true,
             );
@@ -4478,6 +4575,7 @@ mod tests {
             rolled_back,
             dropped,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeMap::new(),
             true,
         )
@@ -4635,6 +4733,7 @@ mod tests {
                 &HashMap::new(),
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 &BTreeMap::new(),
                 true,
             )
@@ -4658,6 +4757,7 @@ mod tests {
             &[],
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
             true,
@@ -4798,6 +4898,7 @@ mod tests {
                 &HashMap::from([(r, 6)]),
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 &at,
                 true,
             )
@@ -4838,6 +4939,7 @@ mod tests {
             &[],
             &HashMap::from([(r, 6)]),
             &BTreeMap::new(),
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeMap::from([(7, 4)]),
             true,
@@ -4911,6 +5013,7 @@ mod tests {
                 &rolled,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 &BTreeMap::new(),
                 true,
             )
@@ -4981,6 +5084,7 @@ mod tests {
             &rolled,
             &dropped,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeMap::new(),
             true,
         );
@@ -4994,6 +5098,7 @@ mod tests {
             &rolled,
             &dropped,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeMap::new(),
             true,
         );
@@ -5006,6 +5111,7 @@ mod tests {
             &[],
             &rolled,
             &dropped,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeMap::new(),
             true,
@@ -6129,6 +6235,7 @@ mod tests {
                 &HashMap::new(),
                 &BTreeMap::new(),
                 lost,
+                &BTreeSet::new(),
                 &BTreeMap::new(),
                 true,
             )
@@ -6156,6 +6263,140 @@ mod tests {
         assert_eq!(lost, BTreeSet::from([r]));
         let lost = unlogged_delegate_rows(&o, &log_with(seg(1, &[]), &[(r, (1, 0))]));
         assert!(lost.is_empty(), "{lost:?}");
+    }
+
+    /// Plan 46 M1.3, maintainer decision 2026-11-15: an op the abandon gave
+    /// up that a dead requester's inbox then ran by rid as a new row of the
+    /// root is counted in `i2c_abandon_rerun`, not as I2 (c). Each negative
+    /// control keeps counting.
+    #[test]
+    fn i2c_abandon_rerun_is_exempt_only_when_every_condition_holds() {
+        const G: u64 = 4_294_967_297;
+        const CUT: u64 = 20;
+        let r = rid(3, 1);
+        struct Case {
+            idx: u64,
+            confirmed: bool,
+            /// The completing segment's seq (the abandon's is 5).
+            done_seq: u64,
+            origins: Vec<(u64, u64)>,
+            returned: bool,
+        }
+        let ok = || Case {
+            idx: CUT + 1,
+            confirmed: true,
+            done_seq: 7,
+            origins: vec![(0, 0)],
+            returned: false,
+        };
+        // (exempt rerun count, i2c count)
+        let run = |c: Case| {
+            let tx = TxRef {
+                node: 1,
+                first: 9,
+                last: 9,
+                origin: (G, c.idx),
+                epoch: 1,
+                records: vec![LogRecord::Completed { rid: r }],
+            };
+            let o = Oracles::new(Bucket::new(1, (0, 0)));
+            *o.acks.lock().unwrap() = vec![AckEntry {
+                judged: Some(Judgement {
+                    class: Some(Judged::Group),
+                    expected: Expected::Class(Judged::Group),
+                    tx: Some(tx),
+                    detail: String::new(),
+                    mismatch: None,
+                }),
+                ..ack(2, r, 5, OutcomeKind::Ok, true)
+            }];
+            let mut log = log_with(seg(1, &[]), &[(r, (c.done_seq, 0))]);
+            log.unfenced.clear();
+            log.unfenced.insert(
+                5,
+                Arc::new(Segment {
+                    records: vec![
+                        LogRecord::DelegateNodeEnded {
+                            node: 2,
+                            gen: G,
+                            through: CUT,
+                        },
+                        LogRecord::GroupAbandoned {
+                            epoch: 1,
+                            gen: G,
+                            through_known: CUT,
+                        },
+                    ],
+                    origins: vec![(0, 0)],
+                    ..seg(1, &[])
+                }),
+            );
+            log.unfenced.insert(
+                c.done_seq,
+                Arc::new(Segment {
+                    origins: c.origins.clone(),
+                    ..seg(1, &[r])
+                }),
+            );
+            let cuts = super::super::cut::StreamCuts::of_log(&log);
+            let confirmed = if c.confirmed {
+                BTreeSet::from([G])
+            } else {
+                BTreeSet::new()
+            };
+            let returned = if c.returned {
+                BTreeSet::from([r])
+            } else {
+                BTreeSet::new()
+            };
+            let rerun = abandon_rerun_rids(&o, &log, &cuts, &confirmed, &returned);
+            let f = end_of_run(
+                &o,
+                &log,
+                &[],
+                &HashMap::new(),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &rerun,
+                &BTreeMap::new(),
+                true,
+            );
+            (f.i2c_abandon_rerun, f.i2c.len())
+        };
+        assert_eq!(run(ok()), (1, 0));
+        assert_eq!(run(Case { idx: CUT, ..ok() }), (0, 1), "idx <= cut");
+        assert_eq!(
+            run(Case {
+                confirmed: false,
+                ..ok()
+            }),
+            (0, 1),
+            "group not confirmed gone"
+        );
+        assert_eq!(
+            run(Case {
+                done_seq: 3,
+                ..ok()
+            }),
+            (0, 1),
+            "completion before the abandon"
+        );
+        assert_eq!(
+            run(Case {
+                origins: vec![(0, 0), (G + 1, 3)],
+                ..ok()
+            }),
+            (0, 1),
+            "delegate origin"
+        );
+        assert_eq!(
+            run(Case {
+                returned: true,
+                ..ok()
+            }),
+            (0, 1),
+            "returned to a client"
+        );
     }
 
     #[test]

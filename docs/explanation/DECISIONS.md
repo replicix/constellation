@@ -5615,6 +5615,21 @@ from each row's own configuration: a deviation, sound while the operator
 forces only after confirming those nodes down. The session checks (`read_your_writes`, `monotonic_reads`) exempt the
 same rids and no others.
 
+One more I2 (c) allowance follows the abandon (decided by the maintainer on
+2026-11-15, seed 1667 of `delegated-backup-and-delegate-die-abandon`). An op
+that was still in a dead requester's S3 inbox when the abandon cut its row off
+runs afterwards, by rid, as a new row of the root (origins `(0, 0)`); the log
+then completes a rid whose answer named a row of the abandoned generation, and
+the identity check cannot match. Such a rid is not counted as `non_verbatim`
+but in `Report::i2c_abandon_rerun` (the `SWEEP-ORACLES` line prints it as
+`i2c-abandon-rerun`) when all of these hold: its answer is excused by the
+abandon as above (`Group` class with every node of the group confirmed gone,
+`g` abandoned, `idx` above the cut); the log completes it in a segment after
+the one holding `GroupAbandoned` of `g`; that segment's origins are only
+`(0, 0)`; and no client ever saw the rid return. A row at or below the cut, a
+group not confirmed gone, a completion before the abandon, a delegate origin
+in the completing segment and a returned rid each still count as I2 (c).
+
 **A root's own leave** (`ReleaseGrants` on the root, holding its own sticky
 stream, ADR-55; sim `sticky-leave-root-self`, 1,352 of 2,000 seeds failed
 before this, 1,339 with the idle release on, most aborted at their deadline): the release row of its last own live generation

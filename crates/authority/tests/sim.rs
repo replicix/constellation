@@ -10517,6 +10517,7 @@ impl OracleTotals {
         if uncommitted
             + r.identity_copies
             + r.non_verbatim
+            + r.i2c_abandon_rerun
             + r.late_landings
             + r.non_lone_rollbacks
             + unjournaled
@@ -10532,13 +10533,14 @@ impl OracleTotals {
             > 0
         {
             eprintln!(
-                "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} root_group_by_epoch_config={} i2={} i2c={} i4={} i5={} \
+                "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} root_group_by_epoch_config={} i2={} i2c={} i2c-abandon-rerun={} i4={} i5={} \
                  unjournaled={unjournaled} {:?} mismatched={mismatched} {:?} relays={} \
                  unjournaled-landed={} cut={} unsettled-eio={unsettled} (isolated {}, no sequencer in time {}, generation tail unreachable {}, violations {}) rebuilds={}/{}",
                 r.uncommitted_acks,
                 r.root_group_by_epoch_config,
                 r.identity_copies,
                 r.non_verbatim,
+                r.i2c_abandon_rerun,
                 r.late_landings,
                 r.non_lone_rollbacks,
                 r.unjournaled_refusals,
@@ -12246,6 +12248,22 @@ fn delegated_backup_and_delegate_die_ends_by_the_operators_escape() {
     }
     assert_eq!(waiting, 0, "a generation was left waiting after the escape");
     assert!(abandoned > 0, "the operator never abandoned a group");
+}
+
+/// The abandon gives a row up, and a dead requester's inbox then runs the
+/// same op by rid as a root row: seed 1667 completes the create once under
+/// origins (0, 0), never returned to a client. I2 (c) counts it in
+/// `i2c_abandon_rerun`, not as `non_verbatim` (maintainer decision
+/// 2026-11-15).
+#[test]
+fn abandon_rerun_is_counted_apart_from_non_verbatim() {
+    let r = c0_run(
+        "delegated-backup-and-delegate-die-abandon",
+        1667,
+        delegated_backup_and_delegate_die_abandon_config(),
+    );
+    assert_eq!(r.non_verbatim, 0);
+    assert!(r.i2c_abandon_rerun >= 1, "{}", r.i2c_abandon_rerun);
 }
 
 /// Phase 2b: delegates with backups; acknowledgements wait for them.

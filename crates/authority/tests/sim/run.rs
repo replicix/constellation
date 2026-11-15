@@ -1711,6 +1711,9 @@ pub struct Report {
     /// in the run.
     pub hold_lifetimes_ms: Vec<u64>,
     pub non_verbatim: usize,
+    /// Rids the operator's abandon gave up that the dead requester's inbox
+    /// re-ran by rid as a root row (exempt from `non_verbatim`).
+    pub i2c_abandon_rerun: usize,
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut`: rows answered past their
     /// stream's cut, the answered rows of cut streams judged, and those an
     /// operator's abandon excuses.
@@ -7109,6 +7112,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
     }
     let mut operator_lost_rids: BTreeSet<Rid> = BTreeSet::new();
+    let mut abandon_rerun_rids: BTreeSet<Rid> = BTreeSet::new();
     if !operator_abandoned.lock().unwrap().is_empty()
         || !cluster.abandoned_at.lock().unwrap().is_empty()
     {
@@ -7123,30 +7127,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         let acks = oracles.acks.lock().unwrap();
         let confirmed = operator_confirmed.lock().unwrap().clone();
         let given_up = |rid: &Rid| {
-            acks.iter().any(|a| {
-                a.rid == *rid
-                    && a.kind == super::oracle::OutcomeKind::Ok
-                    && !a.is_relay()
-                    && a.judged.as_ref().is_some_and(|j| {
-                        // `Final`: the holder's own disk, the holder is the
-                        // group. `Group`: only when the operator confirmed
-                        // that every node of the group was gone. The group
-                        // is the one the root listed at the abandon, not
-                        // each row's own configuration (ADR-61).
-                        j.tx.as_ref().is_some_and(|t| {
-                            let (g, idx) = t.origin;
-                            let class_ok = match j.class {
-                                Some(super::oracle::Judged::Final) => true,
-                                Some(super::oracle::Judged::Group) => confirmed.contains(&g),
-                                _ => false,
-                            };
-                            class_ok
-                                && g != 0
-                                && cuts.abandoned.contains(&g)
-                                && cuts.cut.get(&g).is_some_and(|cut| idx > *cut)
-                        })
-                    })
-            })
+            acks.iter()
+                .any(|a| a.rid == *rid && super::oracle::ack_given_up(a, &cuts, &confirmed))
         };
         let lost: Vec<Rid> = history
             .returned()
@@ -7156,6 +7138,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .filter(|rid| given_up(rid))
             .collect();
         drop(acks);
+        // An op still in a dead requester's inbox runs after the abandon, by
+        // rid, as a new row of the root: the log completes it, apart from
+        // the abandoned row (maintainer decision 2026-11-15).
+        let returned: BTreeSet<Rid> = history.returned().into_iter().map(|(r, _)| r).collect();
+        abandon_rerun_rids =
+            super::oracle::abandon_rerun_rids(&oracles, &oracle, &cuts, &confirmed, &returned);
         report.operator_lost = lost.len();
         operator_lost_rids.extend(lost.iter().copied());
         // Rows a dead delegate group held that no client saw return.
@@ -7918,6 +7906,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &rolled_back_at,
         &world.dropped_head.lock().unwrap().clone(),
         &operator_lost_rids,
+        &abandon_rerun_rids,
         &cluster.abandoned_at.lock().unwrap().clone(),
         converged_checkable,
     );
@@ -7985,6 +7974,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.identity_copies_ungated = found.i2_ungated.len();
     report.identity_foreign_gated = found.i2_foreign_gated.len();
     report.non_verbatim = found.i2c.len();
+    report.i2c_abandon_rerun = found.i2c_abandon_rerun;
     report.acked_past_cut = found.cut.len();
     report.cut_rows_judged = found.cut_judged;
     report.cut_abandoned = found.cut_abandoned;

@@ -5111,7 +5111,11 @@ and owes that every acknowledged rid is held somewhere; the second has the
 operator run `repair abandon --gen G` on the root after 5 s
 (`GroupAbandoned` in the log), converges, and counts the acknowledged rows
 the dead group alone held as `Report::operator_lost`, judged tentative
-(only in a run where the operator acted). The core tests
+(only in a run where the operator acted). A rid the abandon gave up that a
+dead requester's inbox then ran again by rid as a root row (origins `(0, 0)`,
+after `GroupAbandoned`, never returned to a client) is counted apart, as
+`Report::i2c_abandon_rerun`, not as `non_verbatim` (maintainer decision
+2026-11-15; ADR text in DECISIONS.md; seed 1667 pins it). The core tests
 `the_generation_end_seals_every_backup_a_record_named` (strict members waited
 for, older named backups sealed once and never waited for),
 `an_unanswered_seal_of_the_latest_member_holds_the_end` and
