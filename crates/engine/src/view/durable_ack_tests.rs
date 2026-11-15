@@ -578,22 +578,32 @@ fn a_failed_retag_fails_the_fast_path_op() {
     assert_eq!(session.stats().fast_acks_downgraded, 0);
 }
 
-/// A fast-path create journaled under `published`, answered once the
-/// watermark covers it: what the op asked the sync task for while it waited
-/// (`nudge`, `journaled`, anything else as `other`), and the row's class.
+/// What a fast-path op asked the sync task for while it waited for its
+/// row's commit (`nudge`, `journaled`, anything else as `other`), under
+/// `published`. With `rowless` the op is an empty atime batch, which
+/// journals no row: it waits for the tip, a row another op journaled
+/// (created here, past the durable mark). Otherwise it is a create, which
+/// journals its own row; the row's class comes back too.
 fn fast_path_requests_under(
     published: constellation_meta::RowCommit,
+    rowless: bool,
 ) -> (Vec<&'static str>, Option<constellation_meta::RowCommit>) {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let session = meta.session();
     session.set_durable(true, meta.journal_tip().unwrap(), false, published, false);
     let (fs, _dir, mut core) = holder_fs(meta.clone(), true);
     let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    if rowless {
+        meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap();
+    }
     let mut seen = Vec::new();
     let class = std::thread::scope(|scope| {
         let op = scope.spawn(|| {
-            fs.mutate_op(
-                ROOT_INO,
+            let op = if rowless {
+                constellation_meta::MutateOp::AtimeBatch {
+                    entries: Vec::new(),
+                }
+            } else {
                 constellation_meta::MutateOp::Create {
                     parent: ROOT_INO,
                     name: "n".into(),
@@ -601,19 +611,32 @@ fn fast_path_requests_under(
                     mode: 0o644,
                     uid: 0,
                     gid: 0,
-                },
-            )
+                }
+            };
+            fs.mutate_op(ROOT_INO, op)
         });
         let tip = journaled_past_durable(&meta);
-        // What the op sent before it parked, then a while of nothing more.
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!op.is_finished(), "the op waits for its row's commit");
-        while let Ok(req) = core.try_recv() {
+        let mut note = |req: SyncRequest| {
             seen.push(match req {
                 SyncRequest::Nudge => "nudge",
                 SyncRequest::Journaled => "journaled",
                 _ => "other",
             });
+        };
+        // The op's first request arrives before it parks; then drain what
+        // else it sent.
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(req) = core.try_recv() {
+                note(req);
+                break;
+            }
+            assert!(started.elapsed() < LIVENESS_DEADLINE, "no request");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!op.is_finished(), "the op waits for its row's commit");
+        while let Ok(req) = core.try_recv() {
+            note(req);
         }
         // The round ships the row (or the group holds it): answered.
         session.set_durable(true, tip, false, published, false);
@@ -632,8 +655,22 @@ fn fast_path_requests_under(
 #[test]
 fn an_archive_bound_fast_path_op_nudges_a_ship() {
     use constellation_meta::RowCommit;
-    let (seen, class) = fast_path_requests_under(RowCommit::ARCHIVE);
+    let (seen, class) = fast_path_requests_under(RowCommit::ARCHIVE, false);
     assert_eq!(class, Some(RowCommit::ARCHIVE));
+    assert_eq!(
+        seen.iter().filter(|r| **r == "nudge").count(),
+        1,
+        "one nudge: {seen:?}"
+    );
+}
+
+/// An op that journals no row waits for the tip, which the published rule
+/// commits: under `Archive` that is a ship, so it nudges too (the row's
+/// class cannot say so; the published class does).
+#[test]
+fn a_rowless_fast_path_op_under_the_archive_class_nudges_a_ship() {
+    use constellation_meta::RowCommit;
+    let (seen, _) = fast_path_requests_under(RowCommit::ARCHIVE, true);
     assert_eq!(
         seen.iter().filter(|r| **r == "nudge").count(),
         1,
@@ -647,7 +684,7 @@ fn an_archive_bound_fast_path_op_nudges_a_ship() {
 #[test]
 fn a_group_bound_fast_path_op_starts_no_round() {
     use constellation_meta::RowCommit;
-    let (seen, class) = fast_path_requests_under(RowCommit::ROOT_GROUP);
+    let (seen, class) = fast_path_requests_under(RowCommit::ROOT_GROUP, false);
     assert_eq!(class, Some(RowCommit::ROOT_GROUP));
     assert!(!seen.contains(&"nudge"), "{seen:?}");
     assert!(seen.contains(&"journaled"), "{seen:?}");
