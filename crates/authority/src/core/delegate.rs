@@ -1395,6 +1395,11 @@ pub(crate) struct DelegationState {
     /// under one (the rule stays as the defence behind the honour rule).
     #[cfg(test)]
     pub(crate) test_honour_uncommitted: bool,
+    /// Tests only: the root refuses its own stream's batches, as a root that
+    /// is not usable for a moment does (back from a suspend), to pin what
+    /// it does once the refused rows have shipped (ADR-61).
+    #[cfg(test)]
+    pub(crate) test_refuse_own_batches: bool,
     /// The timer that runs `delegation_sync` again while an install waits
     /// (or a group could not be read): a segment's records are not the
     /// only way the wait ends.
@@ -1929,11 +1934,16 @@ impl Core {
         if !all_shipped || !idle || !self.cfg.delegation || !self.root_ends_recall(now, gen) {
             return;
         }
-        let (dirs, whole) = match self.dl.mine.get(&gen).and_then(|d| d.release.as_ref()) {
-            Some(r) if r.ends => (Vec::new(), true),
-            Some(r) => (r.note.dirs.clone(), false),
-            None => return,
+        let Some((note, whole)) = self
+            .dl
+            .mine
+            .get(&gen)
+            .and_then(|d| d.release.as_ref())
+            .map(|r| (r.note.clone(), r.ends))
+        else {
+            return;
         };
+        let dirs = if whole { Vec::new() } else { note.dirs.clone() };
         tracing::info!(
             node = me,
             gen = %constellation_meta::delegation::GenLabel::of(gen),
@@ -1941,13 +1951,39 @@ impl Core {
             "the root's own rows shipped before its stream appended them: appended now"
         );
         self.stats.root_own_rows_caught_up += 1;
+        // What the batch that carried the note does, in its order
+        // (`on_delegate_stream`). First the lock grants the release took out
+        // of the table (`lock_hand_back`): this root's table is the holder's,
+        // so they are nowhere else, and the generation is still inside its
+        // window. The refused batch never installed them, and no batch
+        // carries the note again (its rows left the journal): skipped, the
+        // grants were lost while their holders still held them.
+        self.lock_install_returned(now, gen, note.locks.clone(), &note.dirs, replica);
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.cursor = replica.stream_fills_past(gen, row);
         }
         self.root_release_appended(now, gen, &dirs, whole, None, replica, out);
+        // (A grant of the stream on an inode its rows took out of the subtree
+        // is in this table already, the holder's being the root's, and the
+        // release handed every grant of the stream back above: the batch's
+        // `leaving` grants and barriers have nothing to move.)
+        let appended = row.saturating_sub(cursor);
+        self.lock_take_back_left(now, gen, replica);
+        self.stats.deleg_appended_txs += appended;
+        if self.root_gated_shippable(now) {
+            self.stats.deleg_appended_gated += appended;
+        }
+        self.answer_awaiting_log(now, replica, out);
+        self.release_exec_parks_completed(now, replica, out);
+        self.lease.touch(now);
+        self.nudge(now, out);
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.streamed_through = d.streamed_through.max(row);
             d.root_committed = d.root_committed.max(row);
+        }
+        self.root_progress(now, replica, out);
+        if self.has_deps_parks() {
+            self.complete_ready(now, replica, out);
         }
     }
 
@@ -12520,6 +12556,8 @@ impl Core {
         // reclaims and seals nothing.
         let usable = (self.root_ends_recall(now, gen) || self.gated_takes_stream(now, gen))
             && self.cfg.delegation;
+        #[cfg(test)]
+        let usable = usable && !(self.dl.test_refuse_own_batches && from == self.me());
         // A root back from a restart that the lease object still names, and
         // that holds nothing yet (a restart with nothing of its own to ship
         // does not acquire on its own), refuses its delegate's batches for as

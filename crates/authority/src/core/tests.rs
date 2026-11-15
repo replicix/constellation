@@ -82725,6 +82725,162 @@ mod root_own_sticky {
         );
     }
 
+    /// Node 2 holds an exclusive lock on `dir` under the root's own stream
+    /// `gen`; its id.
+    fn lock_under_own_stream(
+        h: &Harness,
+        dir: Ino,
+        gen: u64,
+    ) -> constellation_meta::locks::GrantId {
+        let id = constellation_meta::locks::GrantId { node: 1, seq: 77 };
+        h.meta.locks().install(constellation_meta::locks::Grant {
+            id,
+            node: 2,
+            ino: dir,
+            mode: constellation_meta::locks::LockMode::Exclusive,
+            until: w(h.now).plus(600_000),
+            recalled: false,
+            gen,
+            confirmed: constellation_meta::locks::Grant::MINTED,
+            settled: false,
+        });
+        id
+    }
+
+    /// The root's own stream on `dirs[0]`, a lock grant under it, and the
+    /// root refusing its own batches (a root not usable for a moment):
+    /// returns the harness, the directories, the stream and the grant.
+    fn own_stream_refused() -> (Harness, Vec<Ino>, u64, constellation_meta::locks::GrantId) {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let gen = own_grant_of(&h, dirs[0]).expect("granted").gen;
+        archive_and_step(&mut h);
+        assert!(h.core.dl.mine.contains_key(&gen), "not installed");
+        let id = lock_under_own_stream(&h, dirs[0], gen);
+        h.core.dl.test_refuse_own_batches = true;
+        (h, dirs, gen, id)
+    }
+
+    /// The root's own leave releases its own stream (the release row
+    /// journaled at once, behind whatever the stream holds unappended), what
+    /// it sends itself delivered as the driver does.
+    fn release_own(h: &mut Harness, gen: u64) -> u64 {
+        let mut out = h.step(Event::Control {
+            op: OpId(952),
+            req: Control::ReleaseGrants,
+        });
+        out.extend(h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        }));
+        for _ in 0..8 {
+            let to_self: Vec<PeerMsg> = sends(&out)
+                .into_iter()
+                .filter(|(to, _)| *to == 1)
+                .map(|(_, m)| m.clone())
+                .collect();
+            if to_self.is_empty() {
+                break;
+            }
+            out = to_self
+                .into_iter()
+                .flat_map(|msg| h.step(Event::Peer { from: 1, msg }))
+                .collect();
+        }
+        h.core.dl.mine[&gen]
+            .release
+            .as_ref()
+            .and_then(|r| r.row)
+            .expect("the release row")
+    }
+
+    /// The journal's rows ship, except those of `(gen, keep)`; the seqs kept.
+    fn ship_except(h: &mut Harness, keep: Option<(u64, u64)>) -> Vec<u64> {
+        let batch = Replica::take_journal(&h.meta, 1_000).unwrap();
+        let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        let origins = Replica::journal_origins(&h.meta, &seqs);
+        let (kept, shipped): (Vec<(u64, (u64, u64))>, Vec<(u64, (u64, u64))>) = seqs
+            .into_iter()
+            .zip(origins)
+            .partition(|(_, o)| Some(*o) == keep);
+        let shipped: Vec<u64> = shipped.into_iter().map(|(s, _)| s).collect();
+        Replica::ack_journal(&h.meta, &shipped, 1, None).unwrap();
+        h.core.note_shipped(&shipped, 0);
+        kept.into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// ADR-61, the second cause of `sticky-leave-root-self` (seeds 8, 140,
+    /// 242): the root refused its own batch for a moment, and its rows, the
+    /// release row among them, shipped in its segments before the batch went
+    /// again. A row that left the journal is never streamed: the usable root
+    /// appends them itself, the generation ends at the release row, and the
+    /// lock grants the release took out of the table are back in it, the
+    /// holder still holding them. Fails on the parent of the catch-up (the
+    /// generation stays live), and on the catch-up without the grants'
+    /// install (node 2's grant was lost).
+    #[test]
+    fn the_roots_own_rows_shipped_before_its_batch_are_appended_with_their_lock_grants() {
+        let (mut h, dirs, gen, id) = own_stream_refused();
+        let row = release_own(&mut h, gen);
+        assert!(
+            h.meta.locks().get(id).is_none(),
+            "the release did not take the grant"
+        );
+        assert!(!h.core.dl.gens[&gen].ended, "appended while refused");
+        assert!(h.core.dl.gens[&gen].cursor < row);
+        ship_except(&mut h, None);
+        h.core.dl.test_refuse_own_batches = false;
+        archive_and_step(&mut h);
+        assert_eq!(h.core.stats.root_own_rows_caught_up, 1);
+        assert!(h.core.dl.gens[&gen].ended, "the own generation is live");
+        assert!(
+            h.core
+                .dl
+                .mine
+                .get(&gen)
+                .is_none_or(|d| d.release.is_none() && d.release_acked),
+            "the release is not acknowledged"
+        );
+        let g = h
+            .meta
+            .locks()
+            .get(id)
+            .expect("node 2's lock grant was lost");
+        assert_eq!(g.node, 2);
+        assert_eq!(g.ino, dirs[0]);
+    }
+
+    /// The catch-up's guard (ADR-60's held-back rows): a row of the stream
+    /// between the root's cursor and the release row that has not shipped
+    /// keeps the append waiting, though the release row itself has left the
+    /// journal; once it ships, the root appends.
+    #[test]
+    fn the_root_appends_its_shipped_own_rows_only_with_none_before_the_release_held() {
+        let (mut h, dirs, gen, _id) = own_stream_refused();
+        submit_in(&mut h, 1, dirs[0], "f");
+        let op_row = Replica::delegate_idx(&h.meta, gen);
+        assert!(
+            op_row > h.core.dl.gens[&gen].cursor,
+            "the op ran in no own row"
+        );
+        let row = release_own(&mut h, gen);
+        assert!(row > op_row);
+        let kept = ship_except(&mut h, Some((gen, op_row)));
+        assert!(!kept.is_empty(), "the op row was not in the journal");
+        h.core.dl.test_refuse_own_batches = false;
+        archive_and_step(&mut h);
+        assert_eq!(
+            h.core.stats.root_own_rows_caught_up, 0,
+            "appended past a row still in the journal"
+        );
+        assert!(!h.core.dl.gens[&gen].ended);
+        Replica::ack_journal(&h.meta, &kept, 2, None).unwrap();
+        h.core.note_shipped(&kept, 0);
+        archive_and_step(&mut h);
+        assert_eq!(h.core.stats.root_own_rows_caught_up, 1);
+        assert!(h.core.dl.gens[&gen].ended);
+    }
+
     /// ADR-61 (sim `sticky-leave-root-self` seed 853): a root whose own leave
     /// is under way (or answered, before it flushes and is retired) grants
     /// itself nothing: a subtree it dominates then stays the root's own path.
