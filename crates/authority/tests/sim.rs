@@ -2890,7 +2890,9 @@ fn an_unfenced_designee_fails_the_stale_route_config() {
         let e = run_seed(seed, config.clone())
             .expect_err("a designee ran an unrouted forward and no oracle noticed");
         assert!(
-            e.contains("nonholder_refused_a_designee_ran") || e.contains("refused_and_completed"),
+            e.contains("nonholder_refused_a_designee_ran")
+                || e.contains("refused_and_completed")
+                || e.contains("was refused (Erofs) but completed"),
             "seed {seed}: {e}"
         );
         run_seed(seed, sticky_stale_route_config())
@@ -2917,6 +2919,7 @@ fn a_root_that_ignores_touched_fails_sticky_ttl() {
         assert!(
             e.contains("nonholder_refused_a_designee_ran")
                 || e.contains("refused_and_completed")
+                || e.contains("was refused (Erofs) but completed")
                 || e.contains("acked_implies_committed"),
             "seed {seed}: {e}"
         );
