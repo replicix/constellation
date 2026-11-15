@@ -4067,7 +4067,9 @@ fn delegated_long_delegation_prod_config() -> SimConfig {
         }),
         strict_settle: true,
         // Plan 46 M0.3: and no unsettled `EIO` at all (0 in 2,000 seeds, with
-        // and without the lease-reads knob): the strict form of I4.
+        // and without the lease-reads knob, after the fix of the 7 seeds 54, 274, 450,
+        // 805, 1147, 1407 and 1653, an own settle the inbox rule sent back for
+        // ever): the strict form of I4.
         strict_unsettled: true,
         ..delegated_long_delegation_config()
     }
@@ -20858,9 +20860,9 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // ADR-62 (the maintainer's decision of 2026-11-15): strict like the
     // configurations above, with the measurement of seeds 0..99 `+unsettled`
     // as the ceilings and no margin (violations, allowed; measured 0 and 0).
-    // (`delegated-long-delegation-prod` joins at 0 and 0: in seeds 0..99 it
-    // had none before, but 7 seeds of 2,000 failed I4 on an own settle that
-    // the inbox rule sent back for ever; fixed, 0 of 2,000.)
+    // (`delegated-long-delegation-prod` joins at 0 and 0: seed 54 of 0..99
+    // failed I4 before (7 seeds of 2,000 did, an own settle that the inbox
+    // rule sent back for ever); fixed, 0 of 2,000.)
     let exact_strict: [(&str, Config, usize, usize); 2] = [
         (
             "locks-blips-tight-single",

@@ -3665,6 +3665,10 @@ The rules:
    withdraw wrote nothing and brought it back to the same rule, for the rest
    of its window, until an unsettled `EIO`. It goes on to the root check of
    ADR-54/55, as `send_forward` already treats it.
+   This costs no safety: a settle executes nothing. It refuses in the
+   stream, and the batch's drain halts while the generation lives (or on
+   lost deps) and dedups on that row, as for a peer's settle
+   (`forward_is_fenced`).
 4. **The drain halts.** The drain applies rule 2 to the op's own `touched_gen`
    (carried in the batch, appended last) and to the redirects its root
    recorded: an op under a non-stealable grant that is touched, or that the

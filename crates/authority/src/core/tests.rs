@@ -79348,8 +79348,9 @@ mod route_fence_executor {
             started: true,
         });
         let (deps, tag) = (c.deps, c.tag.clone());
+        let asked = h.core.stats.deleg_retry_asked_root;
         let mut out = Vec::new();
-        h.core.delegate_try_execute(
+        let taken = h.core.delegate_try_execute(
             h.clk(),
             0,
             None,
@@ -79367,6 +79368,86 @@ mod route_fence_executor {
             h.core.stats.inbox_local_withdrawals, 1,
             "the inbox rule took a withdrawing settle: {out:?}"
         );
+        // It went on to the ADR-54/55 check, which asks the root again: no
+        // backoff re-armed, no tombstone written.
+        assert!(!taken, "{out:?}");
+        assert_eq!(h.core.stats.deleg_retry_asked_root, asked + 1);
+        assert!(
+            timers(&out, TimerKind::ForwardBackoff).is_empty(),
+            "{out:?}"
+        );
+        assert!(
+            !s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::InboxTombstone { .. })),
+            "{out:?}"
+        );
+    }
+
+    /// `withdraw_lost_deps_inbox_ops` leaves a settle whose withdrawal is
+    /// under way alone: `send_forward` writes no tombstone for it, so the
+    /// call only moved it to a backoff and left another inbox batch behind
+    /// each round. Fails without the skip: the timer is cancelled and the
+    /// phase leaves `InboxWaiting`.
+    #[test]
+    fn a_withdrawing_settle_with_lost_deps_stays_in_the_inbox_wait() {
+        let (mut h, d1) = designee();
+        let rid = h.rid(1);
+        h.core.in_doubt_rids.insert(rid);
+        h.core.in_doubt_batches.insert(
+            rid,
+            vec![constellation_store_s3::inbox::InboxKey {
+                epoch: 1,
+                node: 3,
+                n: 0,
+            }],
+        );
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        // Generation 4 ended below the row the op depends on.
+        let mut streams = constellation_meta::Streams::NONE;
+        streams.raise(4, 7);
+        crate::replica::Replica::void_stream(&h.meta, 4, 0);
+        let deadline = h.clk().wait.plus(10_000);
+        let timer = crate::ids::TimerId(900);
+        let c = h.core.clients.get_mut(&rid).expect("in flight");
+        c.deps = constellation_meta::Position {
+            seq: 0,
+            pending: None,
+            streams,
+        };
+        c.settle = true;
+        c.phase = client::Phase::InboxWaiting { epoch: 1 };
+        c.timer = Some(timer);
+        c.withdraw = Some(client::SettleWithdraw {
+            in_flight: c.inbox_keys[0],
+            deadline,
+            acked_at: None,
+            retry: None,
+            route_waiting: None,
+            started: true,
+        });
+        let keys = c.inbox_keys.clone();
+        assert!(h.meta.deps_lost(&c.deps));
+        let mut out = Vec::new();
+        h.core.withdraw_lost_deps_inbox_ops(h.clk(), &h.meta, &mut out);
+        let c = &h.core.clients[&rid];
+        assert!(matches!(c.phase, client::Phase::InboxWaiting { .. }));
+        assert_eq!(c.timer, Some(timer), "{out:?}");
+        assert_eq!(c.inbox_keys, keys, "a new batch was left behind");
+        assert!(out.is_empty(), "{out:?}");
     }
 
     /// SHOULD-1: the requester's inbox hold is narrow. Held: keys of a
