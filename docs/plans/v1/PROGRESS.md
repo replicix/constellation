@@ -70036,3 +70036,19 @@ ship) from 4.8 PUT/s (base, 11 s for the burst): at most one ship per PUT latenc
 `sticky-handover-*`, `placement-hot`, `flex*`; 18 labels × 2,000) show nothing failing on either side. The sim binary is
 byte-identical (the change is in the engine only). Gates: fmt, clippy, lib debug and release, authority suite.
 
+### An own settle looped by the inbox rule (2026-11-15)
+
+`delegated-long-delegation-prod` failed I4 in 7 seeds of 2,000 (54, 274, 450, 805, 1147, 1407, 1653): an unsettled `EIO`
+while the node's own generation was reachable for seconds. A delegate that rebooted without taking its generation up
+again sent an op whose dependency was lost to the inbox; its settle began withdrawing (`settle_withdraw_first`). Once
+the root delegated the directory to the node again, each forward backoff offered the op to the node's own delegation,
+where the ADR-47 inbox rule (`inbox_ever` with batches in the inbox) sent it to withdraw. `send_forward` writes no
+tombstone for a withdrawing settle, so this only re-armed a backoff and the op came back to the rule 51 ms later, about
+950 times, until the settle deadline. `ce286da4` (ADR-50) changed the timing and exposed it; it did not cause it.
+
+Fix: the rule exempts an own settle whose withdrawal is under way (`c.settle && c.withdraw.is_some()`), as `send_forward`
+does; the ADR-54/55 check still asks the root before the settle runs or settles here. Separate cleanup:
+`withdraw_lost_deps_inbox_ops` skips such a settle, as its `send_forward` withdrew nothing and left another inbox batch
+each round. Tests: `an_own_withdrawing_settle_is_not_sent_back_by_the_inbox_rule` and the pin
+`regression_delegated_long_delegation_prod_withdrawing_settle_is_not_looped_by_the_inbox_rule` (seeds 54 and 274) fail on
+the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and 0 (seeds 0..99, which include seed 54).

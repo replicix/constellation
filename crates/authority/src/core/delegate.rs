@@ -3689,12 +3689,16 @@ impl Core {
         // inbox is not run here. Its batches are withdrawn first (the
         // tombstone; liveness): a drain read that predates it is halted, not
         // refused, because this node holds the grant (`inbox_halts_touched`).
-        // The op is offered again once the withdrawal landed.
+        // The op is offered again once the withdrawal landed. An own settle
+        // whose withdrawal is under way is exempt, as in `send_forward`: a
+        // settled answer needs no tombstone (the settle writes its own), so
+        // sending it there withdraws nothing and re-arms a backoff that
+        // brings it back to this rule, without end. The ADR-54/55 check below
+        // still asks the root before the settle runs or settles here.
         if from == 0
-            && self
-                .clients
-                .get(&rid)
-                .is_some_and(|c| c.inbox_ever && !c.inbox_keys.is_empty())
+            && self.clients.get(&rid).is_some_and(|c| {
+                c.inbox_ever && !c.inbox_keys.is_empty() && !(c.settle && c.withdraw.is_some())
+            })
         {
             self.stats.inbox_local_withdrawals += 1;
             self.send_forward(now, rid, 0, 0, replica, out);

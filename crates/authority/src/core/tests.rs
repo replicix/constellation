@@ -79301,6 +79301,74 @@ mod route_fence_executor {
         assert_eq!(h.core.stats.inbox_local_withdrawals, 1);
     }
 
+    /// An own settle whose withdrawal is under way is not sent back to
+    /// withdraw by the inbox rule: `send_forward` writes no tombstone for it,
+    /// so the rule only re-armed a backoff and the op came back to it for
+    /// ever (`delegated-long-delegation-prod` seeds 54 and 274, an unsettled
+    /// `EIO`). Fails on the parent: the rule counts a withdrawal and takes
+    /// the op.
+    #[test]
+    fn an_own_withdrawing_settle_is_not_sent_back_by_the_inbox_rule() {
+        let (mut h, d1) = designee();
+        let rid = h.rid(1);
+        h.core.in_doubt_rids.insert(rid);
+        h.core.in_doubt_batches.insert(
+            rid,
+            vec![constellation_store_s3::inbox::InboxKey {
+                epoch: 1,
+                node: 3,
+                n: 0,
+            }],
+        );
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+            tag: Default::default(),
+        });
+        assert_eq!(h.core.stats.inbox_local_withdrawals, 1);
+        let deadline = h.clk().wait.plus(10_000);
+        let c = h.core.clients.get_mut(&rid).expect("in flight");
+        assert!(c.inbox_ever && !c.inbox_keys.is_empty());
+        c.settle = true;
+        c.withdraw = Some(client::SettleWithdraw {
+            in_flight: c.inbox_keys[0],
+            deadline,
+            acked_at: None,
+            retry: None,
+            route_waiting: None,
+            started: true,
+        });
+        let (deps, tag) = (c.deps, c.tag.clone());
+        let mut out = Vec::new();
+        h.core.delegate_try_execute(
+            h.clk(),
+            0,
+            None,
+            rid,
+            &op,
+            deps,
+            0,
+            &tag,
+            true,
+            Default::default(),
+            &h.meta,
+            &mut out,
+        );
+        assert_eq!(
+            h.core.stats.inbox_local_withdrawals, 1,
+            "the inbox rule took a withdrawing settle: {out:?}"
+        );
+    }
+
     /// SHOULD-1: the requester's inbox hold is narrow. Held: keys of a
     /// stealable grant, and a root-resolved op whose routed generation the
     /// table has not applied. Put in the inbox: unknown history or a

@@ -3658,6 +3658,13 @@ The rules:
    that read the batch before the requester's tombstone processed it
    afterwards and journaled `Refused` while the designee ran the direct
    forward.
+   A node's own inbox-ever op under its own generation is withdrawn first
+   (the tombstone) before it runs there, except a settle whose withdrawal is
+   under way (amended 2026-11-15, `delegated-long-delegation-prod` seeds 54
+   and 274): a settle writes its tombstones itself, so sending it to
+   withdraw wrote nothing and brought it back to the same rule, for the rest
+   of its window, until an unsettled `EIO`. It goes on to the root check of
+   ADR-54/55, as `send_forward` already treats it.
 4. **The drain halts.** The drain applies rule 2 to the op's own `touched_gen`
    (carried in the batch, appended last) and to the redirects its root
    recorded: an op under a non-stealable grant that is touched, or that the

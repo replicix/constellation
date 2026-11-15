@@ -18956,6 +18956,23 @@ fn regression_delegated_long_delegation_no_refusal_for_an_op_that_lands() {
     }
 }
 
+/// An own settle whose withdrawal is under way is not sent back by the
+/// ADR-47 inbox rule (`send_forward` writes no tombstone for a settle, so the
+/// rule only re-armed a backoff): seeds 54 and 274 spun in it for the rest of
+/// the settle window and ended in an unsettled `EIO` (I4) while the node's own
+/// generation was reachable. Fails on the parent.
+#[test]
+fn regression_delegated_long_delegation_prod_withdrawing_settle_is_not_looped_by_the_inbox_rule() {
+    for seed in [54, 274] {
+        run_seed(seed, delegated_long_delegation_prod_config()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-long-delegation-prod seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-long-delegation-prod"
+            )
+        });
+    }
+}
+
 /// `cargo test -p constellation-authority --release --test sim -- --ignored long_locks`
 #[test]
 #[ignore]
@@ -20841,12 +20858,23 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // ADR-62 (the maintainer's decision of 2026-11-15): strict like the
     // configurations above, with the measurement of seeds 0..99 `+unsettled`
     // as the ceilings and no margin (violations, allowed; measured 0 and 0).
-    let exact_strict: [(&str, Config, usize, usize); 1] = [(
-        "locks-blips-tight-single",
-        locks_blips_tight_single_config,
-        0,
-        0,
-    )];
+    // (`delegated-long-delegation-prod` joins at 0 and 0: in seeds 0..99 it
+    // had none before, but 7 seeds of 2,000 failed I4 on an own settle that
+    // the inbox rule sent back for ever; fixed, 0 of 2,000.)
+    let exact_strict: [(&str, Config, usize, usize); 2] = [
+        (
+            "locks-blips-tight-single",
+            locks_blips_tight_single_config,
+            0,
+            0,
+        ),
+        (
+            "delegated-long-delegation-prod",
+            delegated_long_delegation_prod_config,
+            0,
+            0,
+        ),
+    ];
     const SEEDS: u64 = 100;
     // (label, config, the ceilings on violations, on allowed ones, on
     // ADR-58's `held-behind-lost-chunk`, a class of its own, on the
