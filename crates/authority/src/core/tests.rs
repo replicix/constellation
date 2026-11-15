@@ -79442,7 +79442,8 @@ mod route_fence_executor {
         let keys = c.inbox_keys.clone();
         assert!(h.meta.deps_lost(&c.deps));
         let mut out = Vec::new();
-        h.core.withdraw_lost_deps_inbox_ops(h.clk(), &h.meta, &mut out);
+        h.core
+            .withdraw_lost_deps_inbox_ops(h.clk(), &h.meta, &mut out);
         let c = &h.core.clients[&rid];
         assert!(matches!(c.phase, client::Phase::InboxWaiting { .. }));
         assert_eq!(c.timer, Some(timer), "{out:?}");
