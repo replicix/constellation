@@ -1210,6 +1210,14 @@ pub(crate) struct AbandonWait {
 /// not usable (the end is journaled once it is).
 const ABANDON_RETRY_MS: u64 = 200;
 
+/// ADR-61 (takeover seeding): the roles `deleg_group_heard_lately` names
+/// when the inheritance of the generation, not a message, is what counts
+/// its delegate or a strict member as heard.
+const ROLE_DELEGATE_TAKEN_OVER: &str =
+    "the delegate, not heard since this root took the generation over";
+const ROLE_MEMBER_TAKEN_OVER: &str =
+    "a member of its group, not heard since this root took the generation over";
+
 /// The generation number of a [`PeerMsg::DelegateStream`] that is no stream:
 /// a node tells the root it is leaving (or no longer is) with a batch of no
 /// rows and a [`constellation_meta::locks::ReleaseNote`] saying so. The
@@ -11709,6 +11717,17 @@ impl Core {
             // and cut from it only; its tail, or the delegate's rows, are not
             // lost. The operator confirms from elsewhere that the nodes are
             // down, and forces.
+            let taken_over =
+                |role: &str| role == ROLE_DELEGATE_TAKEN_OVER || role == ROLE_MEMBER_TAKEN_OVER;
+            if let (false, Some((node, role, ago))) = (force, heard.filter(|h| taken_over(h.1))) {
+                return Err(format!(
+                    "this root took generation {gen} over {ago} ms ago and has not heard from node {node} \
+                     ({role}) since, within abandon_heard_window ({} ms): it may be alive, holding rows its \
+                     clients were told are committed. Confirm from elsewhere that the delegate and the members \
+                     of its group are down, then run the command again with --force",
+                    self.dl_t().abandon_heard_window
+                ));
+            }
             if let (false, Some((node, role, ago))) = (force, heard) {
                 return Err(format!(
                     "this root heard from node {node} ({role} of generation {gen}) {ago} ms ago, within \
@@ -12089,23 +12108,65 @@ impl Core {
             .max(self.link_heard(member))
     }
 
+    /// ADR-61 (takeover seeding): a generation this root inherited from a
+    /// predecessor counts its delegate and its strict members as heard at
+    /// the inheritance (`GenState::granted`, the takeover or the sync that
+    /// found it). This root has heard nothing of them yet, and its links'
+    /// `last_seen` may not either: read as gone at once, a live sticky
+    /// holder's leave would be refused naming the abandon, and an abandon
+    /// without `--force` would accept it and lose the holder's acknowledged
+    /// rows. Conservative: only the discriminator reads it (the holder counts
+    /// as heard for `abandon_heard_window` from the takeover), never the
+    /// status's heard times.
+    fn inherited_heard_floor(g: &GenState) -> Option<WaitMs> {
+        g.inherited.then_some(g.granted)
+    }
+
+    /// The discriminator's reading of when this root last heard from `g`'s
+    /// delegate (or strict member `member`): what it heard, or the
+    /// inheritance of `g` when that is later (`inherited_heard_floor`), and
+    /// whether the inheritance is what counts.
+    fn deleg_heard_or_inherited(
+        &self,
+        g: &GenState,
+        member: Option<NodeId>,
+    ) -> (Option<WaitMs>, bool) {
+        let heard = match member {
+            None => self.deleg_delegate_heard(g),
+            Some(m) => self.deleg_member_heard(g, m),
+        };
+        match Self::inherited_heard_floor(g) {
+            Some(at) if heard.is_none_or(|h| h < at) => (Some(at), true),
+            _ => (heard, false),
+        }
+    }
+
     /// Plan 43 C2e follow-up (`repair abandon` without `--force`): the
-    /// node of `g`'s group this root heard from within `delegation_ttl_ms`
+    /// node of `g`'s group this root heard from within `abandon_heard_window`
     /// most lately — the delegate, or a strict member — as `(node, role, ms
-    /// ago)`.
+    /// ago)`. A generation this root inherited counts them as heard at its
+    /// inheritance (ADR-61, `inherited_heard_floor`; the role says so).
     fn deleg_group_heard_lately(
         &self,
         now: Now,
         g: &GenState,
     ) -> Option<(NodeId, &'static str, u64)> {
         let ago = |t: Option<WaitMs>| t.map(|t| now.wait.since(t).max(0) as u64);
-        std::iter::once((g.node, "the delegate", ago(self.deleg_delegate_heard(g))))
+        let (delegate_at, delegate_floor) = self.deleg_heard_or_inherited(g, None);
+        let delegate_role = if delegate_floor {
+            ROLE_DELEGATE_TAKEN_OVER
+        } else {
+            "the delegate"
+        };
+        std::iter::once((g.node, delegate_role, ago(delegate_at)))
             .chain(g.group.strict().iter().map(|m| {
-                (
-                    *m,
-                    "a member of its group",
-                    ago(self.deleg_member_heard(g, *m)),
-                )
+                let (at, floor) = self.deleg_heard_or_inherited(g, Some(*m));
+                let role = if floor {
+                    ROLE_MEMBER_TAKEN_OVER
+                } else {
+                    "a member of its group"
+                };
+                (*m, role, ago(at))
             }))
             .chain(g.prev_roots.iter().map(|m| {
                 (
@@ -14875,8 +14936,11 @@ impl Core {
             if g.node != node || g.ended || !g.non_stealable() {
                 continue;
             }
+            // (ADR-61: a generation inherited at a takeover counts its
+            // holder as heard at the inheritance.)
             let heard_lately = self
-                .deleg_delegate_heard(g)
+                .deleg_heard_or_inherited(g, None)
+                .0
                 .is_some_and(|at| now.wait.since(at) < window);
             if !heard_lately {
                 dirs.extend(g.dirs.keys().copied());

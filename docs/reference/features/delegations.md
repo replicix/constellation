@@ -977,8 +977,11 @@ every grant it holds
   the abandon. Without `--force` the abandon refuses only while the root heard
   from the delegate or a member lately; `--force` is the operator's word that
   the node is down. A holder heard lately is asked to release, as a live node
-  is. A root that took over only just may not have heard from a live holder
-  yet (the abandon rule's own limit: an inherited generation starts unheard);
+  is. A root that took over only just has not heard from a live holder yet:
+  a generation it inherited counts its holder and its strict members as heard
+  at the takeover, so for `abandon_heard_window` after it the leave asks the
+  holder to release and the abandon without `--force` refuses (saying that
+  the root took the generation over and has not heard from the node since);
 - a root that is gone is not retired by a node that is not the root: it
   refuses until a node has taken over (with the lease released it says so: a
   write on any node takes it; ADR-55 gives a root its own sticky
@@ -1093,7 +1096,10 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   would drop the rows of that very tail). It is also refused while the root
   has heard from the delegate or from a member of the latest group within
   `CONSTELLATION_DELEGATION_TTL_MS`: such a node may be alive and cut from
-  the root only, holding rows its clients were told are committed. The root
+  the root only, holding rows its clients were told are committed. A root
+  that took the generation over counts the delegate and the strict members as
+  heard at the takeover (it has not heard from them yet, which says nothing
+  of whether they are alive). The root
   alone cannot tell a dead node from a partitioned one, so **confirm from
   elsewhere** (another node, the hosts themselves, your orchestration) that
   the delegate and every member are down, then pass `--force`. A forced

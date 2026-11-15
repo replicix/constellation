@@ -5637,6 +5637,23 @@ waits for every own generation to end. Main before step 14 had the same gap (the
 `a_roots_own_leave_ends_its_own_sticky_stream_and_is_answered` fails on
 afc9b5f1); it had no driver for the sim's form.
 
+**Takeover seeding** (the supervisor's decision of 2026-11-15): a root that
+has just taken over has heard nothing of the holders of the generations it
+inherited, and its links' `last_seen` may not either. Read as gone, a live
+sticky holder's admin leave was refused naming `repair abandon`, and an
+abandon without `--force` accepted it, losing the acknowledged rows of a
+live holder. A generation the root inherited (`GenState::inherited`) counts
+its delegate and its strict members as heard at the inheritance
+(`GenState::granted`: the takeover, or the later sync that found it), so a
+live holder counts as heard for at least `abandon_heard_window` from the
+takeover: the abandon refuses without `--force` (saying the root took the
+generation over and has not heard from the node since) and the admin leave
+recalls the holder. Only the discriminator reads it (`deleg_group_heard_lately`,
+`gone_non_stealable_dirs_of`); the status shows what the root heard. A previous
+root of the generation is not seeded (the seal's own rule covers it). The cost:
+an operator who knows a holder is down abandons with `--force` in that window,
+or waits it out.
+
 **Rejected**: an admin leave that abandons the dead holder itself (the
 abandon's word that the node is down is the operator's); answering the
 holder's own leave at its release row's acknowledgement.

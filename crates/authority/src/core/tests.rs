@@ -73826,6 +73826,92 @@ mod step4_sticky {
         assert!(e.contains("repair abandon --node 3"), "{e}");
     }
 
+    /// ADR-61 (takeover seeding): a root that has just taken over inherits a
+    /// sticky stream of node 3 from its predecessor and has heard nothing of
+    /// node 3 yet (no message, no link). Node 3 may well be alive: the
+    /// generation counts it as heard at the inheritance, for
+    /// `abandon_heard_window`. An abandon without `--force` is refused, and
+    /// an admin leave recalls the holder rather than refusing it as gone.
+    /// Past the window the abandon goes on without `--force`, and the leave
+    /// is refused naming the abandon, as for any holder unheard that long.
+    /// Fails on the parent: the abandon went on at once (the holder's
+    /// acknowledged rows past the cut would have been lost).
+    #[test]
+    fn an_abandon_right_after_a_takeover_is_refused_without_force() {
+        let takeover = || {
+            let mut h = Harness::new(1);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+            Replica::apply_segment(
+                &h.meta,
+                1,
+                1,
+                0,
+                &[],
+                &[],
+                &[
+                    LogRecord::Mkdir {
+                        parent: ROOT_INO,
+                        name: "d".into(),
+                        ino: dir,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 1,
+                    },
+                    LogRecord::delegate_one(3, 7, dir, SubtreeKind::Sticky),
+                ],
+            )
+            .unwrap();
+            h.step(roster_ev(vec![1, 2, 3], WaitMs(i64::MAX)));
+            // Node 1 takes the lease over (epoch 2) and inherits the stream.
+            h.hold(2, None);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            let g = &h.core.dl.gens[&7];
+            assert!(g.inherited && !g.ended, "the stream was not inherited");
+            assert!(h.core.root_usable(h.clk()), "not a usable root");
+            h
+        };
+        let mut h = takeover();
+        h.advance(100);
+        let out = abandon_node(&mut h, 910, 3, None, false);
+        match answer_of(&out, 910) {
+            Some(Err(e)) => {
+                assert!(e.contains("--force"), "{e}");
+                assert!(e.contains("took generation 7 over"), "{e}");
+            }
+            other => panic!("the abandon went on right after the takeover: {other:?} {out:?}"),
+        }
+        assert!(!h.core.dl.gens[&7].ended);
+        assert_eq!(h.core.stats.groups_abandoned, 0);
+        let out = end_grants_of(&mut h, 911, 3);
+        assert!(
+            answer_of(&out, 911).is_none(),
+            "the leave of a holder counted as heard was answered: {out:?}"
+        );
+        assert_eq!(
+            h.core.dl.gens[&7].recall_cause,
+            Some(crate::core::delegate::RecallCause::Leave)
+        );
+        // With `--force` (the operator's word that node 3 is down) it goes on.
+        let mut f = takeover();
+        let out = abandon_node(&mut f, 912, 3, None, true);
+        assert!(
+            !matches!(answer_of(&out, 912), Some(Err(_))),
+            "a forced abandon was refused: {out:?}"
+        );
+        // Past the window, unheard: the abandon without `--force` goes on.
+        let mut l = takeover();
+        l.advance(l.core.dl_t().abandon_heard_window + 1);
+        let out = abandon_node(&mut l, 913, 3, None, false);
+        assert!(
+            !matches!(answer_of(&out, 913), Some(Err(_))),
+            "refused past the window: {out:?}"
+        );
+    }
+
     /// The holder comes back and its release ends the stream during the
     /// wait: the abandon says so and journals no `GroupAbandoned`.
     #[test]
