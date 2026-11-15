@@ -5071,7 +5071,9 @@ and closes that shape. With the settle left to the client deadline
 (lease path for 100 to 150 ms, the root for a second) are most of the
 residuals, and flex-tight 76 (lease path reachable for 118 ms of a 3 s window)
 is the live witness `m03_a_reachable_sequencers_requester_is_not_isolated`
-pins. (2) *An `EIO` of a row that is not behind a lost chunk*, which the first
+pins; `sticky-leave-root-self+unsettled` 756 is another (ADR-61's root leave
+exposes it: a lease path reachable for 110 ms of a 3 s settle window, under a
+suspend, a clock step and a reboot of the root). (2) *An `EIO` of a row that is not behind a lost chunk*, which the first
 oracle absorbed on evidence of the whole run (a chunk lost and a drop
 somewhere in it): flex-crash 201 and 353 are two (the requester said nothing,
 no plan held the row at the `EIO`, no drop followed it, and the row shipped by

@@ -1973,6 +1973,8 @@ impl Core {
         // is in this table already, the holder's being the root's, and the
         // release handed every grant of the stream back above: the batch's
         // `leaving` grants and barriers have nothing to move.)
+        // (The positions past the cursor, those a drop fills included,
+        // ADR-59: a count for the stat alone.)
         let appended = row.saturating_sub(cursor);
         self.lock_take_back_left(now, gen, replica);
         self.stats.deleg_appended_txs += appended;
