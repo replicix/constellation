@@ -1905,17 +1905,28 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let me = self.cfg.node_id;
-        let live_own = self
+        let Some(cursor) = self
             .dl
             .gens
             .get(&gen)
-            .is_some_and(|g| g.node == me && !g.ended && g.cursor < row);
+            .filter(|g| g.node == me && !g.ended && g.cursor < row)
+            .map(|g| g.cursor)
+        else {
+            return;
+        };
+        // Every row past the cursor through the release row has left the
+        // journal (a row held back from shipping, ADR-60, keeps this
+        // waiting).
+        let all_shipped = replica
+            .delegate_txs_from(gen, cursor + 1, 1)
+            .first()
+            .is_none_or(|t| t.idx > row);
         let idle = self
             .dl
             .mine
             .get(&gen)
             .is_some_and(|d| d.inflight.is_none() && d.release.is_some());
-        if !live_own || !idle || !self.cfg.delegation || !self.root_ends_recall(now, gen) {
+        if !all_shipped || !idle || !self.cfg.delegation || !self.root_ends_recall(now, gen) {
             return;
         }
         let (dirs, whole) = match self.dl.mine.get(&gen).and_then(|d| d.release.as_ref()) {
