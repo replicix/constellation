@@ -82799,14 +82799,17 @@ mod root_own_sticky {
         let batch = Replica::take_journal(&h.meta, 1_000).unwrap();
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         let origins = Replica::journal_origins(&h.meta, &seqs);
-        let (kept, shipped): (Vec<(u64, (u64, u64))>, Vec<(u64, (u64, u64))>) = seqs
-            .into_iter()
-            .zip(origins)
-            .partition(|(_, o)| Some(*o) == keep);
-        let shipped: Vec<u64> = shipped.into_iter().map(|(s, _)| s).collect();
+        let (mut kept, mut shipped) = (Vec::new(), Vec::new());
+        for (seq, origin) in seqs.into_iter().zip(origins) {
+            if Some(origin) == keep {
+                kept.push(seq);
+            } else {
+                shipped.push(seq);
+            }
+        }
         Replica::ack_journal(&h.meta, &shipped, 1, None).unwrap();
         h.core.note_shipped(&shipped, 0);
-        kept.into_iter().map(|(s, _)| s).collect()
+        kept
     }
 
     /// ADR-61, the second cause of `sticky-leave-root-self` (seeds 8, 140,
