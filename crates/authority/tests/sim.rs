@@ -11783,6 +11783,31 @@ fn regression_a_deposed_roots_append_does_not_reship_a_landed_rid_seed_2560() {
     });
 }
 
+/// Regression, seed 1678 of `delegated-root-deposed-delegate-dies` under slow
+/// lease reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). Node 1, the root of
+/// epoch 1, appended the delegate's rename (rid 2:1:12) as journal seq 61 and
+/// never committed it; node 2 took epoch 2 and re-executed the rid. Node 1,
+/// its backup, then skipped the streamed rename because the rid was already
+/// completed here from row 61, and the later segment stranded row 61 and
+/// applied the rename on top of the new `d1/f0`: an inode lost, a wrong
+/// commit, and a client answered Ok to a create the log already held. Fixed:
+/// the streamed-transaction install supersedes a past tenure's root append as
+/// a segment does (`superseded_root_appends_tx`), before it applies.
+#[test]
+fn regression_a_streamed_install_supersedes_a_past_roots_append_seed_1678() {
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..delegated_root_deposed_delegate_dies_config()
+    };
+    run_seed(1678, cfg).unwrap_or_else(|e| {
+        panic!(
+            "delegated-root-deposed-delegate-dies seed 1678: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=delegated-root-deposed-delegate-dies \
+             AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
+}
+
 /// I1, `long-delegated-late-answers` seed 3159 (no knob): node 3 took the
 /// lease over (epoch 3, no backup, a peer told) and drained its own inbox
 /// batch inside the takeover gate, refusing its create of `d2/f3` `EEXIST`

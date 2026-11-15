@@ -5153,6 +5153,47 @@ impl Meta {
                 Self::retract_rolled_back_tx(&mut tx, self, &staged, &rolled)?;
             }
         }
+        // Seed 1678: this node's append, as the root of an earlier
+        // tenure, of a delegate's row whose outcome the stream now carries
+        // under the new holder's own identity is superseded here, as a
+        // segment supersedes it (`superseded_root_appends_tx`): rolled back
+        // and stranded quietly, so the stream's transaction installs in
+        // log order instead of being skipped as "completed here".
+        {
+            let completes: HashSet<Rid> = records
+                .iter()
+                .filter_map(|r| match r {
+                    LogRecord::Completed { rid } => Some(*rid),
+                    _ => None,
+                })
+                .collect();
+            let refused: HashSet<Rid> = records
+                .iter()
+                .filter_map(|r| match r {
+                    LogRecord::Refused { rid, .. } => Some(*rid),
+                    _ => None,
+                })
+                .collect();
+            let origins: Vec<(u64, u64)> = if origin == (0, 0) {
+                Vec::new()
+            } else {
+                vec![origin]
+            };
+            let sup = superseded_root_appends_tx(&tx, self, epoch, &origins, &completes, &refused)?;
+            if !sup.is_empty() {
+                strand_tx(
+                    &mut tx,
+                    self,
+                    &staged,
+                    |e| matches!(e, LiveEntry::Local { first, .. } if sup.contains(first)),
+                    true,
+                    false,
+                    true,
+                    None,
+                    |e| matches!(e, LiveEntry::Local { first, .. } if sup.contains(first)),
+                )?;
+            }
+        }
         let mut adopt: Option<(u64, Rid, MutateOp, LockTag)> = None;
         for rec in records {
             if let LogRecord::Completed { rid } = rec {
