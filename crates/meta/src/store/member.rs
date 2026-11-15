@@ -49,6 +49,11 @@
 //!    this epoch nor an abandon drops the rows no one acknowledged
 //!    (`Archive`, `Lone`); a `RootGroup` row stays until coverage — it may be
 //!    the inherited tail of a tenure that has not shipped it yet (D2).
+//! 5. The first segment of a newer epoch that names this epoch's tail
+//!    drops a row whose records carry a `DropHeld` the log did not retire:
+//!    every claimant's gate fences an undecided drop and never re-ships it,
+//!    so nothing would ever cover the row, and it would pin the holes below
+//!    it (M1.2 D1, `drop-held-chain-backed`).
 
 use super::backup::tail_key;
 use super::local::RowCommit;
@@ -1836,6 +1841,26 @@ pub(crate) fn member_rules_tx(
                 out.dropped += 1;
                 continue;
             }
+            // 5. A deposed dropper's undecided `DropHeld` (the log lacks it,
+            // or coverage above had retired it): every claimant's gate fences
+            // it by class and never re-ships it (`spec.rs`, "the drop never
+            // happened"), so once a newer epoch names this epoch's tail no
+            // segment will cover it. Kept, it would pin the holes below it
+            // for good (`member_copies_drained`, drop-held-chain-backed).
+            if f.first_of_epoch
+                && f.epoch > e
+                && follows.contains(&e)
+                && row
+                    .tx
+                    .records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::DropHeld { .. }))
+            {
+                tx.remove(&meta.backup_tail, key);
+                meta.release_row_tx(tx, member_epoch(e), first);
+                out.dropped += 1;
+                continue;
+            }
             if !row.tx.records.is_empty() {
                 live_above = live_above.max(Some(first));
             }
@@ -2178,6 +2203,67 @@ mod release_tests {
         assert!(meta.member_copy_touches(&key), "not before the flush");
         meta.flush_held_releases();
         assert!(!meta.member_copy_touches(&key));
+    }
+
+    /// `drop-held-chain-backed+cut` seeds 810, 1064, 1563: a holder journals a
+    /// `DropHeld`, then seals its epoch for a claimant before the record
+    /// ships. The claimant's gate fences the record ("the drop never
+    /// happened") and names the epoch's tail; the dropper's own copy of the
+    /// record must go then, and with it the holes below it.
+    #[test]
+    fn an_undecided_drop_held_in_a_sealed_copy_goes_at_the_claim() {
+        let meta = Meta::open_in_memory().unwrap();
+        let drop_row = MemberTx {
+            tx: BackupTx {
+                first: 4,
+                last: 4,
+                records: vec![LogRecord::DropHeld {
+                    ino: 7,
+                    chunks: vec![],
+                    rolled_back: vec![((2, 1), None)],
+                    fills: vec![],
+                    queued: vec![],
+                }],
+                origin: (0, 0),
+            },
+            class: RowCommit::ARCHIVE,
+            rid: None,
+            op: None,
+            lock_tag: Default::default(),
+        };
+        let mut tx = meta.db.write_tx();
+        for first in 1..=3 {
+            assert!(put_row_tx(&mut tx, &meta, 2, &row(first)).unwrap());
+        }
+        assert!(put_row_tx(&mut tx, &meta, 2, &drop_row).unwrap());
+        tx.commit().unwrap();
+        assert_eq!(meta.member_copy_rows_total().unwrap(), 4);
+
+        let records = [LogRecord::TailFollowsThrough {
+            prev_epoch: 2,
+            through: 4,
+        }];
+        let mut tx = meta.db.write_tx();
+        member_rules_tx(
+            &mut tx,
+            &meta,
+            &Facts {
+                epoch: 3,
+                through: 0,
+                rows: &[],
+                records: &records,
+                first_of_epoch: true,
+                own: false,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        meta.flush_held_releases();
+        assert_eq!(
+            meta.member_copy_rows_total().unwrap(),
+            0,
+            "the fenced record and the holes it pinned are gone"
+        );
     }
 
     /// The release guard probes the hold itself, whatever slot it is in: a
