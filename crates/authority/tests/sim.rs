@@ -20643,9 +20643,11 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             "locks-unlinked-delegated-blips",
             locks_unlinked_blips_config,
         ),
-        // (ADR-61, the root's own leave: none in seeds 0..99 `+unsettled`,
-        // 0 of 2,000 `+unsettled`; before, 1,352 of 2,000 failed, 1,339 with
-        // the idle release on.)
+        // (ADR-61, the root's own leave: none in seeds 0..99 `+unsettled`;
+        // 1 of 2,000 `+unsettled` (seed 756, an ADR-58 residual: after the
+        // root left, a lease path was reachable for 110 ms of a settle
+        // window), none with the idle release on; before, 1,352 of 2,000
+        // failed, 1,339 with the idle release on.)
         ("sticky-leave-root-self", sticky_leave_root_self_config),
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
