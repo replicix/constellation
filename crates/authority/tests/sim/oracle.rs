@@ -3296,7 +3296,7 @@ pub fn ack_given_up(
         })
 }
 
-/// The rids an abandon gave up that the log nevertheless completes (the
+/// The Group answers (rid and the origin of the abandoned row) of an abandon that the log nevertheless completes (the
 /// maintainer decided this allowance on 2026-11-15, I2 (c)): the op was
 /// still in a dead requester's inbox, so after the abandon the root ran it
 /// by rid as a new row of its own. All must hold: the answer passes
@@ -3311,8 +3311,10 @@ pub fn abandon_rerun_rids(
     cuts: &super::cut::StreamCuts,
     confirmed: &BTreeSet<u64>,
     returned: &BTreeSet<Rid>,
-) -> BTreeSet<Rid> {
+) -> BTreeSet<(Rid, (u64, u64))> {
     use constellation_meta::LogRecord;
+    // (A `GroupAbandoned` only in a fenced segment finds nothing: the
+    // allowance then does not apply, which fails safe.)
     let abandon_seq = |g: u64| {
         log.unfenced
             .iter()
@@ -3327,6 +3329,11 @@ pub fn abandon_rerun_rids(
         .lock()
         .unwrap()
         .iter()
+        .filter(|a| {
+            a.judged
+                .as_ref()
+                .is_some_and(|j| j.class == Some(Judged::Group))
+        })
         .filter(|a| ack_given_up(a, cuts, confirmed))
         .filter(|a| !returned.contains(&a.rid))
         .filter(|a| {
@@ -3344,10 +3351,13 @@ pub fn abandon_rerun_rids(
             };
             *seq > from
                 && log.unfenced.get(seq).is_some_and(|s| {
-                    !s.origins.is_empty() && s.origins.iter().all(|o| *o == (0, 0))
+                    !s.origins.is_empty() && s.origins.iter().all(|x| *x == (0, 0))
                 })
         })
-        .map(|a| a.rid)
+        .filter_map(|a| {
+            let t = a.judged.as_ref()?.tx.as_ref()?;
+            Some((a.rid, t.origin))
+        })
         .collect()
 }
 
@@ -3357,7 +3367,7 @@ pub fn abandon_rerun_rids(
 /// latest rollback: only an answer given before it was rolled back).
 /// `operator_lost`: the rids the operator's `abandon-group` gave up (exempt
 /// from I2 (c), counted in `i2c_operator_lost`).
-/// `abandon_rerun`: the rids [`abandon_rerun_rids`] found (exempt from I2 (c),
+/// `abandon_rerun`: the (rid, origin) of the Group answers [`abandon_rerun_rids`] found (exempt from I2 (c),
 /// counted in `i2c_abandon_rerun`).
 /// `converged`: the run reached quiescence, so a group-answered rid the log
 /// never completed is absent for good.
@@ -3369,7 +3379,7 @@ pub fn end_of_run(
     rolled_back: &HashMap<Rid, u64>,
     dropped: &BTreeMap<Rid, Seq>,
     operator_lost: &BTreeSet<Rid>,
-    abandon_rerun: &BTreeSet<Rid>,
+    abandon_rerun: &BTreeSet<(Rid, (u64, u64))>,
     abandoned_at: &BTreeMap<u64, u64>,
     converged: bool,
 ) -> Findings {
@@ -3468,7 +3478,7 @@ pub fn end_of_run(
                     if verbatim_seen.insert(a.rid) {
                         f.i2c_operator_lost += 1;
                     }
-                } else if abandon_rerun.contains(&a.rid) {
+                } else if abandon_rerun.contains(&(a.rid, t.origin)) {
                     // The abandon gave the row up and the dead requester's
                     // inbox ran the op again by rid as the root's own row.
                     if verbatim_seen.insert(a.rid) {
@@ -6281,6 +6291,8 @@ mod tests {
             done_seq: u64,
             origins: Vec<(u64, u64)>,
             returned: bool,
+            /// A second Group answer of the rid under this other origin.
+            second: Option<(u64, u64)>,
         }
         let ok = || Case {
             idx: CUT + 1,
@@ -6288,6 +6300,7 @@ mod tests {
             done_seq: 7,
             origins: vec![(0, 0)],
             returned: false,
+            second: None,
         };
         // (exempt rerun count, i2c count)
         let run = |c: Case| {
@@ -6300,7 +6313,7 @@ mod tests {
                 records: vec![LogRecord::Completed { rid: r }],
             };
             let o = Oracles::new(Bucket::new(1, (0, 0)));
-            *o.acks.lock().unwrap() = vec![AckEntry {
+            let answer = |tx: TxRef, tick: u64| AckEntry {
                 judged: Some(Judgement {
                     class: Some(Judged::Group),
                     expected: Expected::Class(Judged::Group),
@@ -6308,8 +6321,13 @@ mod tests {
                     detail: String::new(),
                     mismatch: None,
                 }),
-                ..ack(2, r, 5, OutcomeKind::Ok, true)
-            }];
+                ..ack(2, r, tick, OutcomeKind::Ok, true)
+            };
+            let mut acks = vec![answer(tx.clone(), 5)];
+            if let Some(origin) = c.second {
+                acks.push(answer(TxRef { origin, ..tx }, 6));
+            }
+            *o.acks.lock().unwrap() = acks;
             let mut log = log_with(seg(1, &[]), &[(r, (c.done_seq, 0))]);
             log.unfenced.clear();
             log.unfenced.insert(
@@ -6396,6 +6414,24 @@ mod tests {
             }),
             (0, 1),
             "returned to a client"
+        );
+        assert_eq!(
+            run(Case {
+                origins: vec![],
+                ..ok()
+            }),
+            (0, 1),
+            "no origins"
+        );
+        // A second Group answer of the same rid under another origin (here
+        // a row at the cut) is not exempt: only the abandoned row's is.
+        assert_eq!(
+            run(Case {
+                second: Some((G, CUT)),
+                ..ok()
+            }),
+            (1, 1),
+            "second origin"
         );
     }
 

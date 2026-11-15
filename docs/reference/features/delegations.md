@@ -1116,9 +1116,9 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   decision was an operator's. **Consequence:** every row the delegate
   answered through the group and the root never appended is lost — the
   clients were told it was committed. They are not replayed, and a delegate
-  that comes back drops them (its recall strand). An op still in a dead requester's
-  inbox runs after the abandon, by rid, as a new row of the root. Use it only when no member
-  can ever come back; wait for one if it can.
+  that comes back drops them (its recall strand). An op still in a dead
+  requester's inbox runs after the abandon, by rid, as a new row of the root.
+  Use it only when no member can ever come back; wait for one if it can.
 - **A sticky or designated holder that is gone**: its grant is never taken
   back by a TTL, so its subtree stays `EROFS` (at the root) and `EXDEV`
   (across it) until the holder returns or the operator ends the stream on

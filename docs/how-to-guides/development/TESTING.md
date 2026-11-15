@@ -5111,7 +5111,7 @@ and owes that every acknowledged rid is held somewhere; the second has the
 operator run `repair abandon --gen G` on the root after 5 s
 (`GroupAbandoned` in the log), converges, and counts the acknowledged rows
 the dead group alone held as `Report::operator_lost`, judged tentative
-(only in a run where the operator acted). A rid the abandon gave up that a
+(only in a run where the operator acted). The `Group` answer of the abandoned row of a rid that a
 dead requester's inbox then ran again by rid as a root row (origins `(0, 0)`,
 after `GroupAbandoned`, never returned to a client) is counted apart, as
 `Report::i2c_abandon_rerun`, not as `non_verbatim` (maintainer decision

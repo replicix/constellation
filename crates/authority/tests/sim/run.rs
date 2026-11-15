@@ -7112,7 +7112,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
     }
     let mut operator_lost_rids: BTreeSet<Rid> = BTreeSet::new();
-    let mut abandon_rerun_rids: BTreeSet<Rid> = BTreeSet::new();
+    let mut abandon_rerun_rids: BTreeSet<(Rid, (u64, u64))> = BTreeSet::new();
     if !operator_abandoned.lock().unwrap().is_empty()
         || !cluster.abandoned_at.lock().unwrap().is_empty()
     {

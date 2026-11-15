@@ -5620,8 +5620,9 @@ One more I2 (c) allowance follows the abandon (decided by the maintainer on
 that was still in a dead requester's S3 inbox when the abandon cut its row off
 runs afterwards, by rid, as a new row of the root (origins `(0, 0)`); the log
 then completes a rid whose answer named a row of the abandoned generation, and
-the identity check cannot match. Such a rid is not counted as `non_verbatim`
-but in `Report::i2c_abandon_rerun` (the `SWEEP-ORACLES` line prints it as
+the identity check cannot match. The `Group` answer of that abandoned row (the
+rid and its origin; another answer of the same rid is not covered) is not
+counted as `non_verbatim` but in `Report::i2c_abandon_rerun` (the `SWEEP-ORACLES` and `SWEEP-ORACLE-TOTALS` lines print it as
 `i2c-abandon-rerun`) when all of these hold: its answer is excused by the
 abandon as above (`Group` class with every node of the group confirmed gone,
 `g` abandoned, `idx` above the cut); the log completes it in a segment after

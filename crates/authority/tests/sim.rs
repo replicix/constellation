@@ -10022,6 +10022,9 @@ struct OracleTotals {
     claimed: [u64; 4],
     i2: usize,
     i2c: usize,
+    /// The Group answers of an abandoned row the dead requester's inbox
+    /// re-ran as a root row (exempt from I2 (c)), and the seeds with one.
+    i2c_abandon_rerun: (u64, u64),
     /// Plan 46 M1.2 step 3, `acked_at_or_below_cut` (`cut.rs`): answers past
     /// their stream's cut (and the seeds with one), the answered rows of cut
     /// streams judged, the abandon-excused ones.
@@ -10414,6 +10417,8 @@ impl OracleTotals {
         }
         self.i2 += r.identity_copies;
         self.i2c += r.non_verbatim;
+        self.i2c_abandon_rerun.0 += r.i2c_abandon_rerun as u64;
+        self.i2c_abandon_rerun.1 += u64::from(r.i2c_abandon_rerun > 0);
         self.cut.0 += r.acked_past_cut;
         self.cut.1 += u64::from(r.acked_past_cut > 0);
         self.cut.2 += r.cut_rows_judged;
@@ -10565,7 +10570,7 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-ORACLE-TOTALS {label} seeds {}/{seeds}: i1={i1} {:?} (in {} seeds) \
              root_group_by_epoch_config={} (in {} seeds) i2={} (in {}) \
-             i2c={} (in {}) i4={} (in {}) i5={} (in {}) unjournaled={unjournaled} {:?} unmapped={} \
+             i2c={} (in {}) i2c-abandon-rerun={} (in {}) i4={} (in {}) i5={} (in {}) unjournaled={unjournaled} {:?} unmapped={} \
              rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}; \
              i1-mismatched={mismatched} {:?} (in {} seeds) unverified-relays={} (in {} seeds) \
              version-mismatch={} unsourced={} unjournaled-landed={}; settles \
@@ -10580,6 +10585,8 @@ impl OracleTotals {
             self.seeds_with[1],
             self.i2c,
             self.seeds_with[2],
+            self.i2c_abandon_rerun.0,
+            self.i2c_abandon_rerun.1,
             self.i4,
             self.seeds_with[3],
             self.i5,
