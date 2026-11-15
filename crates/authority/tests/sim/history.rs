@@ -2062,12 +2062,6 @@ mod tests {
         assert!(check_trunc_commits(&recs, &fin(0, None), 4096).is_ok());
     }
 
-    /// The memoized search ([`linearizable`]) and stateright's own
-    /// (`is_consistent`) decide the same on random small histories: threads
-    /// whose ops take effect at a random instant between invocation and
-    /// return (the answer the spec gives then, now and again replaced by
-    /// another value), some left in flight, some marked tentative, some
-    /// settled. Both verdicts occur.
     /// One thread creates `a`, its unlink of `a` is answered `EROFS`, and
     /// its create of `a` comes next. `EEXIST` is the only answer a refusal
     /// with no effect allows; `Ok` needs the refused unlink's effect, and
@@ -2107,12 +2101,18 @@ mod tests {
         }
     }
 
+    /// The memoized search ([`linearizable`]) and stateright's own
+    /// (`is_consistent`) decide the same on random small histories: threads
+    /// whose ops take effect at a random instant between invocation and
+    /// return (the answer the spec gives then, now and again replaced by
+    /// another value), some left in flight, some marked tentative, some
+    /// settled. Both verdicts occur.
     #[test]
     fn the_memoized_search_agrees_with_stateright() {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         let names = ["a", "b", "c"];
-        let rets = [NsRet::Ok, NsRet::Eexist, NsRet::Enoent];
+        let rets = [NsRet::Ok, NsRet::Eexist, NsRet::Enoent, NsRet::Erofs];
         let (mut yes, mut no) = (0, 0);
         for case in 0..3_000u64 {
             let mut rng = StdRng::seed_from_u64(case);
@@ -2156,7 +2156,7 @@ mod tests {
                     Some((r, _, Some(ret))) => {
                         let r = *r;
                         let ret = match rng.random_range(0..12) {
-                            0 => rets[rng.random_range(0..3)],
+                            0 => rets[rng.random_range(0..rets.len())],
                             1 => NsRet::Abandoned,
                             _ => *ret,
                         };

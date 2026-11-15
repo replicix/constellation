@@ -20829,7 +20829,8 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             ..cfg()
         };
         // (No violation, and no allowed one but the margin's: the sweep that set
-        // the list told none.)
+        // the list told none, except the two delegated labels above, which
+        // measured 1 allowed each; the ceiling is unchanged.)
         jobs.push((
             format!("{label}+unsettled"),
             strict,
