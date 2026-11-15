@@ -84162,6 +84162,40 @@ mod step8_handover_root {
         assert_eq!(h.core.stats.deleg_handovers_requested, 1);
     }
 
+    /// ADR-61: a leaving root asks no holder to hand a subtree it dominates
+    /// over to itself (it would refuse the grant when the holder's row frees
+    /// the subtree; the holder released for nothing). Fails on the parent:
+    /// the request went to node 2. (Control: the same root, not leaving,
+    /// asks.)
+    #[test]
+    fn a_leaving_root_asks_no_handover_to_itself() {
+        for leaving in [false, true] {
+            let (mut h, dirs) = far_root();
+            holds_sticky(&mut h, dirs[0], 2);
+            ticks_for(&mut h, 31_000);
+            if leaving {
+                h.step(Event::Control {
+                    op: OpId(951),
+                    req: Control::ReleaseGrants,
+                });
+                assert!(h.core.dl.leave_self);
+            }
+            note(&mut h, 1, dirs[0], 40);
+            let out = tick(&mut h);
+            let asked = requests(&out);
+            if leaving {
+                assert!(asked.is_empty(), "the leaving root asked: {asked:?}");
+                assert_eq!(h.core.stats.deleg_handovers_requested, 0);
+            } else {
+                assert_eq!(
+                    asked,
+                    vec![(2, vec![dirs[0]], ReleaseWhy::Handover)],
+                    "the test proves nothing: {out:?}"
+                );
+            }
+        }
+    }
+
     /// Test 2: a one-off write forwards without a handover; neither does a
     /// node that is not dominant, or the holder itself.
     #[test]

@@ -504,9 +504,11 @@ impl Core {
             core.stats.place_skipped_root_own += 1;
             Err(PlaceSkip::Root)
         };
+        // (ADR-61: a leaving root takes no sticky grant of its own.)
         if !self.cfg.placement_root_sticky
             || !self.root_commits_by_archive()
             || (dir == ROOT_INO && !self.cfg.root_sticky_on_slash)
+            || self.dl.leave_self
         {
             return skip(self);
         }
@@ -942,6 +944,13 @@ impl Core {
                     .max(self.pl.hands.get(&dir).copied().unwrap_or(g.granted));
                 if now.wait.since(since) < tenure && !self.cfg.handover_ignores_tenure {
                     self.stats.place_handover_tenure += 1;
+                    continue;
+                }
+                // ADR-61: not a leaving root: it takes nothing back (its
+                // grant would be refused when the row frees the subtree, and
+                // the holder released for nothing).
+                if to == me && self.dl.leave_self {
+                    self.stats.place_handover_ineligible += 1;
                     continue;
                 }
                 // The root itself is always a node a subtree can go back to.
