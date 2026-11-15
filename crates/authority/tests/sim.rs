@@ -11808,6 +11808,37 @@ fn regression_a_streamed_install_supersedes_a_past_roots_append_seed_1678() {
     });
 }
 
+/// Sim artefact, pinned: seed 1841 of `locks-stall-step-delegated` under slow
+/// lease reads. The lock client entered its critical section, then waited up
+/// to 2 s for the session watermark; the stalled root's shipping lapsed its
+/// grant meanwhile, another node legitimately took the lock, and the client
+/// was judged on an I/O it never did. Production `View::read` checks the
+/// fence after that wait; the sim client now waits, re-checks the fence, and
+/// only then enters. The run must still time out a position wait and fence an
+/// I/O, or the pin would pass vacuously.
+#[test]
+fn locks_client_rechecks_its_fence_after_the_watermark_wait_seed_1841() {
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..locks_stall_step_delegated_config()
+    };
+    let report = run_seed(1841, cfg).unwrap_or_else(|e| {
+        panic!(
+            "locks-stall-step-delegated seed 1841: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-stall-step-delegated \
+             AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
+    assert!(
+        report.locks.position_timeouts >= 1,
+        "no position wait timed out: the pin is vacuous"
+    );
+    assert!(
+        report.locks.fenced_ios >= 1,
+        "no I/O was fenced: the pin is vacuous"
+    );
+}
+
 /// I1, `long-delegated-late-answers` seed 3159 (no knob): node 3 took the
 /// lease over (epoch 3, no backup, a peer told) and drained its own inbox
 /// batch inside the takeover gate, refusing its create of `d2/f3` `EEXIST`

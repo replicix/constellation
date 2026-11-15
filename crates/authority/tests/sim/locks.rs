@@ -1362,32 +1362,48 @@ pub async fn client_lock(
             break;
         }
         if !entered {
-            ghost.enter(ino, node, thread, step.mode, clock.elapsed_ms());
+            // The read of the previous holder's turn waits for the watermark
+            // first, as FUSE's admission does, and is fenced after the wait
+            // (`View::read`: `lock_fenced` after `admit!`): no I/O while it
+            // waits, so the client enters its critical section after it.
+            let mut turn_ready = false;
             if fresh_grant && !wrote && !resumed_once {
-                let own_epoch = h.view().s3_held.map(|(e, _, _)| e);
-                ghost.check_visible(ino, node, clock.elapsed_ms(), &h.meta, own_epoch);
                 let data = ghost.data_ino(step.file, ino);
-                // A read of the data file waits for the watermark, as a
-                // FUSE read would (`session_wait_at` on its keys).
                 let keys = [ReadKey::Ino(data)];
                 let mut spent = 0;
-                let mut ready = true;
+                turn_ready = true;
                 while !h.meta.session_ready_at(&keys, &grant_position) {
                     if spent >= wait_budget_ms || !h.alive() {
-                        ready = false;
+                        turn_ready = false;
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     spent += 5;
                 }
-                if ready {
+                if !turn_ready {
+                    ghost.count(|c| c.position_timeouts += 1);
+                }
+                if h.meta.locks().fenced(ino, h.clock.now()) != Fence::Ok && !ignore_fence {
+                    ghost.count(|c| c.fenced_ios += 1);
+                    ghost.note(
+                        clock.elapsed_ms(),
+                        format!("node {node} t{thread} fenced on {ino:#x} after its read's wait"),
+                    );
+                    fenced = true;
+                    break;
+                }
+            }
+            ghost.enter(ino, node, thread, step.mode, clock.elapsed_ms());
+            if fresh_grant && !wrote && !resumed_once {
+                let own_epoch = h.view().s3_held.map(|(e, _, _)| e);
+                ghost.check_visible(ino, node, clock.elapsed_ms(), &h.meta, own_epoch);
+                if turn_ready {
+                    let data = ghost.data_ino(step.file, ino);
                     let read = constellation_meta::MetaStore::getattr(&*h.meta, data)
                         .ok()
                         .flatten()
                         .map(|a| a.mtime_ns);
                     ghost.turn_read(data, node, clock.elapsed_ms(), read);
-                } else {
-                    ghost.count(|c| c.position_timeouts += 1);
                 }
             }
             entered = true;
