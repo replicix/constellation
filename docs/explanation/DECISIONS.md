@@ -5614,8 +5614,8 @@ forces only after confirming those nodes down. The session checks (`read_your_wr
 same rids and no others.
 
 **A root's own leave** (`ReleaseGrants` on the root, holding its own sticky
-stream, ADR-55; sim `sticky-leave-root-self`, 1,353 of 2,000 seeds aborted at
-their deadline before this): the release row of its last own live generation
+stream, ADR-55; sim `sticky-leave-root-self`, 1,352 of 2,000 seeds failed
+before this, 1,339 with the idle release on, most aborted at their deadline): the release row of its last own live generation
 ends that generation inline, in the step of the batch that carries it, before
 the root's inline acknowledgement of the batch reaches the holder side. The
 holder side read its root as nobody then (`Core::holder_root` named this node
@@ -5629,14 +5629,20 @@ its segments before the batch went again; a row that left the journal is never
 streamed, so the root's cursor stayed below the release row and the generation
 stayed live. The root's own rows are in its journal, so its append of them is
 bookkeeping: once the release row has shipped and the root is usable, it
-appends them as the batch would have (cursor, release, end;
-`root_own_rows_caught_up`). Nothing is acknowledged earlier than before: the
+appends them as the batch would have (`root_own_rows_caught_up`): the lock
+grants the release handed back are installed again first (the root's table is
+the holder's, so they are nowhere else, and the generation is inside its
+window), then the cursor, the release and the end, and what a batch's append
+does after (grants taken back from the handoff, answers waiting on the log,
+parked executions). It waits while a row between the cursor and the release
+row is still in the journal (held back from shipping). Nothing is acknowledged earlier than before: the
 release still completes only once its row has shipped (`own_release_progress`),
 the end cuts at the release row, which the log carries, and the leave still
 waits for every own generation to end. A third: a root that held no own stream
 answered its leave at once, and while it flushed the placement granted it one,
 a live generation of a node retired next (seed 853). A leaving root grants
-itself nothing, as no root grants a leaving node anything. Main before step 14 had the same gap (the core test
+itself nothing, as no root grants a leaving node anything: no own grant, no
+placement of its own, and no handover asked for itself. Main before step 14 had the same gap (the core test
 `a_roots_own_leave_ends_its_own_sticky_stream_and_is_answered` fails on
 afc9b5f1); it had no driver for the sim's form.
 

@@ -7656,6 +7656,12 @@ fn base_config(label: &str) -> SimConfig {
     match label {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "delegated-designated" => delegated_designated_config(),
+        // (Replayable before, but not sweepable: a sweep of them panicked
+        // here, "NO RESULT" in every sweep table.)
+        "delegated-faults" => delegated_faults_config(),
+        "delegated-marker" => delegated_marker_config(),
+        "delegated-placement" => delegated_placement_config(),
+        "delegated-strict" => delegated_strict_config(),
         "long-delegated" => long_delegated_config(),
         "long-backup" => long_backup_config(),
         "holder-cut" => holder_cut_crash_config(true),
@@ -20637,8 +20643,9 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             "locks-unlinked-delegated-blips",
             locks_unlinked_blips_config,
         ),
-        // (ADR-61, the root's own leave: 0 of 2,000 seeds fail
-        // `+unsettled`, none in seeds 0..99; 1,353 of 2,000 failed before.)
+        // (ADR-61, the root's own leave: none in seeds 0..99 `+unsettled`,
+        // 0 of 2,000 `+unsettled`; before, 1,352 of 2,000 failed, 1,339 with
+        // the idle release on.)
         ("sticky-leave-root-self", sticky_leave_root_self_config),
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
@@ -22268,10 +22275,9 @@ fn a_node_that_leaves_ends_its_grants_first() {
     assert!(abandons > 0, "the operator abandoned no node for a leave");
 }
 
-/// ADR-61: the root's own leave while it holds its own sticky stream. Two
-/// causes kept the release of the root's own stream unacknowledged, so the
-/// leave waited to its deadline and aborted (1,353 of 2,000 seeds on the
-/// parent):
+/// ADR-61: the root's own leave while it holds its own sticky stream. Three
+/// causes kept it from ending, or retired the root with a grant live (on the
+/// parent 1,352 of 2,000 seeds failed, 1,339 with the idle release on):
 /// - the release row ended the root's last own live generation inline, the
 ///   holder side lost its root (`Core::holder_root` named nobody) and dropped
 ///   the root's acknowledgement of the row as stale (seeds 1 to 4);
@@ -22283,15 +22289,25 @@ fn a_node_that_leaves_ends_its_grants_first() {
 /// - the root answered its leave before it held any own stream, and the
 ///   placement granted it one while it flushed: retired with a live
 ///   generation, `no_live_grant_off_roster` (seed 853; 1 of 2,000 with the
-///   first two fixed).
+///   first two fixed; with the idle release on, seeds 855 and 1697).
 ///
 /// Each seed now ends with the root's own leave answered and the root retired.
 #[test]
 fn a_roots_own_leave_ends_its_own_sticky_stream() {
-    let config = sticky_leave_root_self_config();
-    for seed in [1u64, 2, 3, 4, 8, 140, 242, 853] {
+    let plain = sticky_leave_root_self_config();
+    let idle = SimConfig {
+        sticky_idle_ms: Some(1_200),
+        ..sticky_leave_root_self_config()
+    };
+    let runs = [1u64, 2, 3, 4, 8, 140, 242, 853]
+        .map(|seed| (seed, &plain, ""))
+        .into_iter()
+        .chain([855u64, 1697].map(|seed| (seed, &idle, " AUTHORITY_SIM_STICKY_IDLE_MS=1200")));
+    for (seed, config, env) in runs {
         let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
-            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-leave-root-self")
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-leave-root-self{env}"
+            )
         });
         assert_eq!(r.leave_driver.own, 1, "seed {seed}: the root did not leave");
     }
