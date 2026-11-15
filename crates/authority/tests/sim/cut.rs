@@ -12,11 +12,10 @@
 //! acknowledged row past the cut, because the abandon exports the rid
 //! (I5's operator branch); such a rid is counted apart, not as a violation.
 //!
-//! Two modes ([`CutMode`]). On main the oracle runs in `Report`: the count
-//! is in `Report::acked_past_cut` and the sweep totals, no run fails.
-//! M1.2 step 16 turns it `Strict` for every configuration by changing
-//! [`CutMode::default`]; a configuration or a sweep (`+cut`) can ask for
-//! `Strict` before then.
+//! Two modes ([`CutMode`]). The default is `Strict` (M1.2 step 16): a single
+//! acknowledged row past its cut fails the run. `Report` only counts, in
+//! `Report::acked_past_cut` and the sweep totals; a sweep's `+report` asks
+//! for it.
 
 use super::oracle::{AckEntry, OutcomeKind};
 use constellation_meta::{LogRecord, Rid};
@@ -32,9 +31,9 @@ pub enum CutMode {
 }
 
 impl Default for CutMode {
-    /// Report on main; M1.2 step 16 makes this `Strict`.
+    /// `Strict` for every configuration (M1.2 step 16).
     fn default() -> Self {
-        CutMode::Report
+        CutMode::Strict
     }
 }
 
@@ -205,7 +204,7 @@ mod tests {
         assert_eq!(f.refusals, 0);
         assert!(f.fails(CutMode::Strict), "strict mode must fail the run");
         assert!(!f.fails(CutMode::Report), "report mode only counts");
-        assert_eq!(CutMode::default(), CutMode::Report);
+        assert_eq!(CutMode::default(), CutMode::Strict);
     }
 
     #[test]

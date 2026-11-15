@@ -12440,11 +12440,11 @@ fn a_growth_streamed_as_uncommitted_is_not_executed_under_before_the_log_carries
 
 /// Plan 46 M1.2 step 3: one node holds two whole subtrees (one generation and
 /// one stream since step 9) and loses the root; its backup's sealed tail is drained and no
-/// acknowledged row is dropped. `acked_at_or_below_cut` runs in report mode.
+/// acknowledged row is dropped. `acked_at_or_below_cut` runs strict (the default).
 #[test]
 fn delegated_two_dirs_one_backed_keep_their_acknowledgements() {
     let cfg = delegated_two_dirs_one_backed_config();
-    assert_eq!(cfg.cut_mode, sim::cut::CutMode::Report);
+    assert_eq!(cfg.cut_mode, sim::cut::CutMode::Strict);
     assert!(cfg.delegations.iter().all(|(_, n)| *n == 2) && cfg.delegations.len() == 2);
     let mut judged = 0;
     for seed in 68_300..68_320 {
@@ -14887,16 +14887,17 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         },
         // Plan 46 M1.2 step 3: `acked_at_or_below_cut` strict (`cut.rs`),
         // and I2c and `member_copies_drained` strict (`strict_verbatim`):
-        // the oracles M1.2 step 16 turns on for every configuration.
+        // the oracles M1.2 step 16 turned on for every configuration.
         "cut" => SimConfig {
             cut_mode: sim::cut::CutMode::Strict,
             strict_verbatim: true,
             ..cfg
         },
-        // The default, named: a sweep's label that is not a bare
-        // configuration name (some `core_stall_check`s match the bare one).
+        // The old default, named: counts the cut oracle only and leaves I2c
+        // and `member_copies_drained` unjudged.
         "report" => SimConfig {
             cut_mode: sim::cut::CutMode::Report,
+            strict_verbatim: false,
             ..cfg
         },
         "verbatim" => SimConfig {
@@ -19335,10 +19336,13 @@ fn c0_variants_set_their_flags() {
     assert!(c.strict_commit && c.strict_identity && c.strict_settle && c.strict_lone);
     assert!(strict(SimConfig::default(), "rebuild-stub").rebuild_stub);
     // Plan 46 M1.2 step 3: `+cut` is `acked_at_or_below_cut`, I2c and
-    // `member_copies_drained` strict; by default the cut oracle only counts.
+    // `member_copies_drained` strict, and so is the default since step 16;
+    // `+report` is the old counting-only mode.
     let c = strict(SimConfig::default(), "cut");
     assert!(c.cut_mode.is_strict() && c.strict_verbatim && !c.strict_commit);
     let c = SimConfig::default();
+    assert!(c.cut_mode.is_strict() && c.strict_verbatim && !c.strict_commit);
+    let c = strict(SimConfig::default(), "report");
     assert!(!c.cut_mode.is_strict() && !c.strict_verbatim);
 }
 
@@ -20142,7 +20146,9 @@ fn root_group_by_epoch_commits_the_pinned_answers() {
 /// the rows it acknowledged): the arm refuses the same answers, and I1
 /// fails every pin. `+copies-lost-after-judged` (the group's copies lost
 /// once an answer was judged; without `+commit`, so that I1 is counted
-/// and the end-of-run check speaks): the obligation fires on at least one
+/// and the end-of-run check speaks; under `+report`, the cut oracle and
+/// `member_copies_drained` that are strict by default would fail every
+/// run first): the obligation fires on at least one
 /// pin (locks-core-stall-backup-beats 1399). Of the others, five fail an
 /// earlier end-of-run check first (`member_copies_drained`,
 /// `read_holds_gone`: a deposed answerer's member copy re-created after the
@@ -20161,7 +20167,7 @@ fn root_group_by_epoch_refuses_unpersisted_acks_and_its_obligation_bites() {
     let fired: Vec<(&str, u64)> = ROOT_GROUP_BY_EPOCH_PINS
         .into_iter()
         .filter(|(label, seed)| {
-            root_group_by_epoch_pin(label, *seed, &["copies-lost-after-judged"])
+            root_group_by_epoch_pin(label, *seed, &["report", "copies-lost-after-judged"])
                 .is_err_and(|e| e.contains("root_group_by_epoch_archived"))
         })
         .collect();
@@ -21514,6 +21520,10 @@ fn only_i5_strict(config: SimConfig) -> SimConfig {
         strict_commit_exempt: Some(
             "plan 46 M1.2 step 13 (a test that judges I5 alone: the lone-delegate control)",
         ),
+        // Alone: the cut oracle and I2c / `member_copies_drained`, strict by
+        // default, would name another failure of the injected fault first.
+        cut_mode: sim::cut::CutMode::Report,
+        strict_verbatim: false,
         ..config
     }
 }

@@ -1692,7 +1692,9 @@ re-shipped transaction opens with `LogRecord::TailOf { epoch, jseq }`, kept
 through any number of re-ships), when a marker's `TailFollowsThrough` says
 the sealer's hold did not reach it (never committed), or, for the rows
 nobody acknowledged, at the first marker of a newer epoch that announces no
-tail of theirs. A requester's shadow or hint answered as committed and a
+tail of theirs, or, for a `DropHeld` no gate would ship (every claimant's
+gate fences an undecided drop), at the first segment that names the tail
+(M1.2 D1). A requester's shadow or hint answered as committed and a
 subscriber's transaction streamed as committed survive a takeover of their
 epoch and retire by the re-ship; only `repair abandon` strands them and
 queues the copy, the one re-execution of a committed row. Rejected: replaying

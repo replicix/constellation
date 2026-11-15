@@ -70052,3 +70052,19 @@ does; the ADR-54/55 check still asks the root before the settle runs or settles 
 each round. Tests: `an_own_withdrawing_settle_is_not_sent_back_by_the_inbox_rule` and the pin
 `regression_delegated_long_delegation_prod_withdrawing_settle_is_not_looped_by_the_inbox_rule` (seeds 54 and 274) fail on
 the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and 0 (seeds 0..99, which include seed 54).
+
+### M1.2 close: B5 and D1 fixes, strict defaults (2026-11-15)
+
+- Seed 1678 of `delegated-root-deposed-delegate-dies` (slow lease reads): `install_streamed_committed` lacked the
+  supersede and strand step the segment path has (`superseded_root_appends_tx`, seed 2560). A past tenure's root append of
+  a delegate's rename was applied again, so an inode was lost and a client got a false Ok. Both paths now supersede.
+  The pin is `regression_a_streamed_install_supersedes_a_past_roots_append_seed_1678`.
+- D1 (`drop-held-chain-backed`, seeds 810, 1064, 1563): a deposed holder's undecided `DropHeld` stayed in its member copy
+  for good and pinned the holes below it. Rule 5 of `member_rules_tx` drops it at the first segment of a newer epoch that
+  names its epoch's tail. Test `an_undecided_drop_held_in_a_sealed_copy_goes_at_the_claim`.
+- Seed 1841 of `locks-stall-step-delegated` was a sim artefact: the lock client entered its critical section before the
+  watermark wait, where production `View::read` checks the fence after it. The client now waits, re-checks, then enters.
+  The pin asserts a position timeout and a fenced I/O, so it cannot pass vacuously.
+- B1: `CutMode::default()` is `Strict` and `strict_verbatim` is on, so `acked_at_or_below_cut`, I2c and
+  `member_copies_drained` fail every configuration. `+report` selects the old counting-only mode.
+- Seed 876 of `long-delegated-late-answers` (takeover gate strand) is not part of this round.

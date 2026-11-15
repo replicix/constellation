@@ -982,10 +982,11 @@ pub struct SimConfig {
     /// verbatim in the log (c), fails the run.
     pub strict_identity: bool,
     /// Plan 46 M1.2 step 3: I2c (verbatim) and `member_copies_drained` fail
-    /// the run, as under `strict_durability`, without the rest of it (`+verbatim`).
+    /// the run, as under `strict_durability`, without the rest of it. On by
+    /// default since step 16.
     pub strict_verbatim: bool,
     /// Plan 46 M1.2 step 3: whether a row acknowledged past its stream's cut
-    /// fails the run (`cut.rs`). `Report` on main, until step 16.
+    /// fails the run (`cut.rs`). `Strict` by default since step 16.
     pub cut_mode: super::cut::CutMode,
     /// I4 `unacked_fails_never_lands_late`: an op answered in doubt that
     /// lands in the log after an op its node invoked later fails the run.
@@ -1448,7 +1449,7 @@ impl Default for SimConfig {
             strict_commit: false,
             strict_commit_exempt: None,
             strict_identity: false,
-            strict_verbatim: false,
+            strict_verbatim: true,
             cut_mode: super::cut::CutMode::default(),
             strict_settle: false,
             strict_unsettled: false,
