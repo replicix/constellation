@@ -1392,6 +1392,10 @@ impl Core {
                 matches!(c.phase, Phase::InboxWaiting { .. })
                     && !c.inbox_keys.is_empty()
                     && !matches!(c.origin, Origin::Replay { .. })
+                    // A settle whose withdrawal is under way writes its own
+                    // tombstones: `send_forward` withdraws nothing for it and
+                    // each round would leave another inbox batch behind.
+                    && !(c.settle && c.withdraw.is_some())
             })
             .filter(|(_, c)| replica.deps_lost(&c.deps))
             .map(|(r, _)| *r)
