@@ -22279,13 +22279,17 @@ fn a_node_that_leaves_ends_its_grants_first() {
 ///   rows, its release row among them, shipped in its segments before the
 ///   batch went again: a row that left the journal is never streamed, and the
 ///   root never appended the release (seeds 8, 140 and 242; 10 of the first
-///   300 seeds with the first cause fixed).
+///   300 seeds with the first cause fixed);
+/// - the root answered its leave before it held any own stream, and the
+///   placement granted it one while it flushed: retired with a live
+///   generation, `no_live_grant_off_roster` (seed 853; 1 of 2,000 with the
+///   first two fixed).
 ///
 /// Each seed now ends with the root's own leave answered and the root retired.
 #[test]
 fn a_roots_own_leave_ends_its_own_sticky_stream() {
     let config = sticky_leave_root_self_config();
-    for seed in [1u64, 2, 3, 4, 8, 140, 242] {
+    for seed in [1u64, 2, 3, 4, 8, 140, 242, 853] {
         let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-leave-root-self")
         });

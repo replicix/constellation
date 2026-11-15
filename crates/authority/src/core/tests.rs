@@ -82725,6 +82725,33 @@ mod root_own_sticky {
         );
     }
 
+    /// ADR-61 (sim `sticky-leave-root-self` seed 853): a root whose own leave
+    /// is under way (or answered, before it flushes and is retired) grants
+    /// itself nothing: a subtree it dominates then stays the root's own path.
+    /// Fails on the parent: the placement granted the leaving root a sticky
+    /// subtree, a live generation of a node that is retired next.
+    #[test]
+    fn a_leaving_root_grants_itself_nothing() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.step(Event::Control {
+            op: OpId(951),
+            req: Control::ReleaseGrants,
+        });
+        assert!(h.core.dl.leave_self);
+        root_dominates(&mut h, dirs[0]);
+        assert!(
+            own_grant_of(&h, dirs[0]).is_none(),
+            "the leaving root granted itself a sticky subtree"
+        );
+        // (Control: the same placement grants it when the root is not leaving.)
+        let (mut c, cdirs) = root_with_peer(Some(500));
+        root_dominates(&mut c, cdirs[0]);
+        assert!(
+            own_grant_of(&c, cdirs[0]).is_some(),
+            "the test proves nothing"
+        );
+    }
+
     /// ADR-61 (sim `sticky-leave-root-self`): the root's own leave while it
     /// holds its own sticky stream. The release row ends the root's last own
     /// generation inline, before the root's inline acknowledgement of the

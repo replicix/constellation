@@ -5633,7 +5633,10 @@ appends them as the batch would have (cursor, release, end;
 `root_own_rows_caught_up`). Nothing is acknowledged earlier than before: the
 release still completes only once its row has shipped (`own_release_progress`),
 the end cuts at the release row, which the log carries, and the leave still
-waits for every own generation to end. Main before step 14 had the same gap (the core test
+waits for every own generation to end. A third: a root that held no own stream
+answered its leave at once, and while it flushed the placement granted it one,
+a live generation of a node retired next (seed 853). A leaving root grants
+itself nothing, as no root grants a leaving node anything. Main before step 14 had the same gap (the core test
 `a_roots_own_leave_ends_its_own_sticky_stream_and_is_answered` fails on
 afc9b5f1); it had no driver for the sim's form.
 

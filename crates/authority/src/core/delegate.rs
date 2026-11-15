@@ -12889,6 +12889,14 @@ impl Core {
         if !own && self.is_leaving(now, node) {
             return Err(format!("node {node} is leaving; nothing is granted to it"));
         }
+        // ADR-61: nor to the root itself while it leaves (its own leave may
+        // have been answered already, before it flushes and is retired): a
+        // grant journaled then would be a live generation of a node off the
+        // roster (`sticky-leave-root-self` seed 853: placement granted the
+        // leaving root a sticky subtree after its leave was answered).
+        if own && self.dl.leave_self {
+            return Err("this node is leaving; it grants itself nothing".into());
+        }
         // Plan 46 M1.2 step 13: no lone delegate. A stealable grant goes
         // only to a node with a group within budget (a peer within
         // `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, the root included); a sticky
