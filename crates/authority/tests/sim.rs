@@ -11839,6 +11839,30 @@ fn locks_client_rechecks_its_fence_after_the_watermark_wait_seed_1841() {
     );
 }
 
+/// Regression, seed 876 of `long-delegated-late-answers` under slow lease
+/// reads (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). Node 1 appended node 3's
+/// row after one of its own committed rows, crashed with both unshipped, sealed
+/// its own epoch for a claimant, and won the next epoch itself. Its takeover
+/// gate stranded the committed row to re-journal it at the journal's end and
+/// left the delegate's row in place, so the log shipped the later row first and
+/// broke node 3's program order. Fixed: the gate takes an own append that sits
+/// above such a row out as well, and the tail re-journals both in order
+/// (`Meta::appends_behind_own_committed_tx`).
+#[test]
+fn regression_a_self_reclaimed_tail_ships_in_the_tenures_order_seed_876() {
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..long_delegated_late_answers_config()
+    };
+    run_seed(876, cfg).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 876: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers \
+             AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
+}
+
 /// I1, `long-delegated-late-answers` seed 3159 (no knob): node 3 took the
 /// lease over (epoch 3, no backup, a peer told) and drained its own inbox
 /// batch inside the takeover gate, refusing its create of `d2/f3` `EEXIST`

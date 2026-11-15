@@ -474,6 +474,14 @@ impl LiveEntry {
         }
     }
 
+    /// A `Local` entry's journal identity `(epoch, first)`.
+    fn local_ident(&self) -> Option<(u64, u64)> {
+        match self {
+            LiveEntry::Local { first, epoch, .. } => Some((*epoch, *first)),
+            _ => None,
+        }
+    }
+
     /// Plan 46 M1.4 step 4: a committed streamed transaction of an earlier
     /// tenure that no tail this takeover applies names. The node holds the
     /// only copy it has (a hold member's, acknowledged to the owner), so
@@ -6483,6 +6491,49 @@ impl Meta {
         self.reship_epochs_at_takeover(strand, tail.as_slice())
     }
 
+    /// B5: this node's own appends of delegates' rows that `tails` name
+    /// (record for record, at the same epoch and journal seq) above a
+    /// committed own row of the same epoch the tails name too: the takeover
+    /// strand takes that row out and the tail re-journals it, so these go
+    /// with it, to keep the epoch's order (see `reship_epochs_at_takeover`).
+    fn appends_behind_own_committed_tx(
+        &self,
+        tx: &impl Readable,
+        tails: &[(TailArgs, Vec<crate::BackupTx>)],
+    ) -> Result<HashSet<(u64, u64)>, MetaError> {
+        let mut out = HashSet::new();
+        for (t, txs) in tails {
+            let mut committed_from: Option<u64> = None;
+            for bt in txs {
+                if bt.records.is_empty()
+                    || bt.last > t.through
+                    || crate::store::member::tail_identity(&bt.records).is_some()
+                {
+                    continue;
+                }
+                let Some(j) = local::get_journal_tx_head(tx, self, bt.first)? else {
+                    continue;
+                };
+                if j.epoch != t.epoch || j.last != bt.last {
+                    continue;
+                }
+                let own: Vec<LogRecord> = local::journal_records(tx, self, bt.first, bt.last)?
+                    .into_iter()
+                    .map(|(_, rec)| rec)
+                    .collect();
+                if own != bt.records {
+                    continue;
+                }
+                if j.gen == 0 && j.class.gated() {
+                    committed_from.get_or_insert(bt.first);
+                } else if j.gen != 0 && j.appended && committed_from.is_some() {
+                    out.insert((t.epoch, bt.first));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether the log carried a re-ship of identity `ident` whose
     /// transaction is `records` (less a `TailOf` of their own), through its
     /// outcome and the inbox acknowledgements behind it
@@ -6554,8 +6605,18 @@ impl Meta {
                     })
             })
             .collect();
+        // B5 (`long-delegated-late-answers` seed 876): a node that sealed its
+        // own epoch for a claimant and then won the lease itself reads its own
+        // tail back. The strand takes its committed own rows out and the loop
+        // below re-journals them (`TailOf`) at the journal's end, while its
+        // appends of delegates' rows stay in place: an append journaled after a
+        // committed row would ship ahead of it, and the log would break the
+        // tenure's order (a node's returned op after one it invoked later). So
+        // an own append the tail names above such a row is taken out too and
+        // re-journaled behind it, in the tail's order.
+        let follows = self.appends_behind_own_committed_tx(&tx, &tail_txs)?;
         if let Some(args) = strand {
-            part = self.strand_part_tx(&mut tx, &staged, args, &tail_idents)?;
+            part = self.strand_part_tx(&mut tx, &staged, args, &tail_idents, &follows)?;
             report.stranded = part.stranded;
         }
         let mut journaled: Vec<((u64, u64), local::JournaledTx)> = Vec::new();
@@ -6894,6 +6955,7 @@ impl Meta {
         staged: &UsageTracker,
         args: StrandArgs<'_>,
         tail_idents: &HashSet<(u64, u64)>,
+        follows: &HashSet<(u64, u64)>,
     ) -> Result<StrandPart, MetaError> {
         let StrandArgs {
             epoch,
@@ -6936,12 +6998,19 @@ impl Meta {
                     || entry.superseded_by_takeover(epoch, carried, tail_idents)
                     || entry.uncarried_by_takeover(epoch, tail_idents)
                     || abandons(entry)
+                    || entry.local_ident().is_some_and(|i| follows.contains(&i))
             },
             true,
             false,
             true,
             Some(epoch),
-            |entry| entry.superseded_by_takeover(epoch, carried, tail_idents) && !abandons(entry),
+            // (A following append is dropped from the journal, not copied:
+            // the tail re-journals it with its origin.)
+            |entry| {
+                (entry.superseded_by_takeover(epoch, carried, tail_idents)
+                    || entry.local_ident().is_some_and(|i| follows.contains(&i)))
+                    && !abandons(entry)
+            },
         )?;
         // Plan 46 M0.4 (MUST-1): this node's own delegate rows of a
         // generation the table does not list are taken out whatever the

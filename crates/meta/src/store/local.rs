@@ -4552,6 +4552,78 @@ mod verbatim_append_tests {
         assert_eq!(journal(&meta).len(), 1, "the row was journaled twice");
     }
 
+    /// B5 (`long-delegated-late-answers` seed 876): a root that sealed its own
+    /// epoch for a claimant and then won the lease itself re-ships its own
+    /// sealed tail in the tenure's order. Its committed own row (`a`, answered
+    /// once the group held it) precedes its later append of a delegate's row
+    /// (`b`): the log carries `a` first. Fail-before: the gate stranded `a` to
+    /// the member copy, left `b` in place, and re-journaled `a` behind `b`
+    /// with a `TailOf`.
+    #[test]
+    fn a_self_reclaimed_tail_keeps_the_tenures_order() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        {
+            let _c = crate::store::journal::PendingClass::set(RowCommit::ROOT_GROUP);
+            crate::mutate::execute(
+                &meta,
+                &crate::mutate::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "a".into(),
+                    ino: meta.allocate_ino(ROOT_INO).unwrap(),
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(rid(14)),
+            )
+            .unwrap();
+        }
+        let b = vec![create("b", 2), LogRecord::Completed { rid: rid(16) }];
+        assert!(meta
+            .apply_delegate_tx(&b, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        // The self-seal: the journal becomes the member copy of epoch 1 and
+        // the tail the claim carries.
+        let rows = meta.journal_member_rows_from(1).unwrap();
+        meta.member_copy_put_rows(1, 2, &rows).unwrap();
+        let txs: Vec<crate::BackupTx> = rows.into_iter().map(|m| m.tx).collect();
+        meta.backup_append(1, &txs).unwrap();
+        let through = txs.iter().map(|t| t.last).max().unwrap();
+        let carried = Default::default();
+        let proof = Default::default();
+        meta.set_holder_epoch(2);
+        meta.reship_at_takeover(
+            Some(crate::store::spec::StrandArgs {
+                epoch: 2,
+                own_gens: &[],
+                abandoned: None,
+                carried: &carried,
+                proof: &proof,
+                marker: &[],
+            }),
+            Some(crate::store::spec::TailArgs {
+                epoch: 1,
+                through,
+                config_version: 3,
+                class: None,
+            }),
+        )
+        .unwrap();
+        let at = |r: Rid| {
+            journal(&meta)
+                .iter()
+                .position(|(_, recs)| recs.contains(&LogRecord::Completed { rid: r }))
+                .unwrap_or_else(|| panic!("{r:?} is not in the journal"))
+        };
+        assert!(
+            at(rid(14)) < at(rid(16)),
+            "the tenure's committed row ships behind its later row: {:?}",
+            journal(&meta)
+        );
+    }
+
     /// Test 14: a deposed root's own stream rows are holder rows: the
     /// deposition strands the root's rows of the older epoch and leaves the
     /// stream's (neither rolled back nor member-copied).

@@ -70067,4 +70067,9 @@ the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and
   The pin asserts a position timeout and a fenced I/O, so it cannot pass vacuously.
 - B1: `CutMode::default()` is `Strict` and `strict_verbatim` is on, so `acked_at_or_below_cut`, I2c and
   `member_copies_drained` fail every configuration. `+report` selects the old counting-only mode.
-- Seed 876 of `long-delegated-late-answers` (takeover gate strand) is not part of this round.
+- Seed 876 of `long-delegated-late-answers` (slow lease reads): a node that sealed its own epoch and won the next one
+  stranded its committed own row at the takeover gate and re-journaled it behind its append of a delegate's row, so
+  the log broke the delegate's program order. The gate now takes such an append out with the row
+  (`Meta::appends_behind_own_committed_tx`); both are re-journaled in the tenure's order. A first attempt that left the
+  committed rows in place never quiesced. Test `a_self_reclaimed_tail_keeps_the_tenures_order` and the pin
+  `regression_a_self_reclaimed_tail_ships_in_the_tenures_order_seed_876`.
