@@ -5613,11 +5613,29 @@ from each row's own configuration: a deviation, sound while the operator
 forces only after confirming those nodes down. The session checks (`read_your_writes`, `monotonic_reads`) exempt the
 same rids and no others.
 
-**Open**: a root's own leave (`ReleaseGrants` on the root) never completes in the
-sim configuration `sticky-leave-root-self`: with its own sticky stream (ADR-55)
-the stream's `release_acked` stays false, so the leave waits to its deadline and
-abandons itself (safely: nothing is retired). Not built; the configuration is in
-no suite test or sweep list.
+**A root's own leave** (`ReleaseGrants` on the root, holding its own sticky
+stream, ADR-55; sim `sticky-leave-root-self`, 1,353 of 2,000 seeds aborted at
+their deadline before this): the release row of its last own live generation
+ends that generation inline, in the step of the batch that carries it, before
+the root's inline acknowledgement of the batch reaches the holder side. The
+holder side read its root as nobody then (`Core::holder_root` named this node
+only while an own stream was live), started a new round, and dropped the
+acknowledgement as stale; the release was never acknowledged and the leave
+waited for it. `holder_root` names the node also while the release of one of
+its own streams is unacknowledged and it holds the lease. A second cause had
+the same effect: back from a suspend, the root refused its own batch for a
+moment (not usable), and its own rows, the release row among them, shipped in
+its segments before the batch went again; a row that left the journal is never
+streamed, so the root's cursor stayed below the release row and the generation
+stayed live. The root's own rows are in its journal, so its append of them is
+bookkeeping: once the release row has shipped and the root is usable, it
+appends them as the batch would have (cursor, release, end;
+`root_own_rows_caught_up`). Nothing is acknowledged earlier than before: the
+release still completes only once its row has shipped (`own_release_progress`),
+the end cuts at the release row, which the log carries, and the leave still
+waits for every own generation to end. Main before step 14 had the same gap (the core test
+`a_roots_own_leave_ends_its_own_sticky_stream_and_is_answered` fails on
+afc9b5f1); it had no driver for the sim's form.
 
 **Rejected**: an admin leave that abandons the dead holder itself (the
 abandon's word that the node is down is the operator's); answering the

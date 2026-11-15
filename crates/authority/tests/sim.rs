@@ -2407,11 +2407,7 @@ fn sticky_leave_root_config() -> SimConfig {
     }
 }
 
-/// OPEN (ADR-61): fails 204 of 300 seeds today, and is in no suite test or sweep
-/// list: a root's own leave never completes, its own stream's `release_acked`
-/// never turns true (`Core::leave_waits_progress` waits for it for ever; the
-/// leave aborts at its deadline, safely). The root's own leave while it holds
-/// its own sticky stream (ADR-55,
+/// The root's own leave while it holds its own sticky stream (ADR-55,
 /// `far-root-writes`): node 1 runs `ReleaseGrants` at 4 s (its own stream is
 /// released inline and ended by the log), flushes and is retired. The
 /// retirement is judged against the generations the root and the survivors list
@@ -20598,7 +20594,7 @@ const FLOOR_CAUSES: [&str; 2] = [
 #[test]
 fn m03_the_configurations_at_zero_violations_stay_there() {
     type Config = fn() -> SimConfig;
-    let strict_configs: [(&str, Config); 16] = [
+    let strict_configs: [(&str, Config); 17] = [
         // (ADR-58, seeds 0..99: none. In 2,000 seeds `+settle+oracles+unsettled`
         // 6 seeds fail, 98 before ADR-58 and 20 before its follow-up: the
         // settle of an op in a frozen epoch ends one window after the freeze,
@@ -20641,6 +20637,9 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             "locks-unlinked-delegated-blips",
             locks_unlinked_blips_config,
         ),
+        // (ADR-61, the root's own leave: 0 of 2,000 seeds fail
+        // `+unsettled`, none in seeds 0..99; 1,353 of 2,000 failed before.)
+        ("sticky-leave-root-self", sticky_leave_root_self_config),
     ];
     // (label, config, violations, allowed unsettled EIOs in seeds 0..100 when
     // the list was set; lowered where seeds 0..99 of the 2,000-seed sweeps of
@@ -22250,6 +22249,7 @@ fn a_node_that_leaves_ends_its_grants_first() {
         ("sticky-leave", sticky_leave_config()),
         ("sticky-leave-admin", sticky_leave_admin_config()),
         ("sticky-leave-root", sticky_leave_root_config()),
+        ("sticky-leave-root-self", sticky_leave_root_self_config()),
     ] {
         for seed in 0..12 {
             let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
@@ -22266,6 +22266,31 @@ fn a_node_that_leaves_ends_its_grants_first() {
     assert!(admin > 0, "no node was retired by the admin form");
     assert!(refused > 0, "no admin leave was refused naming the abandon");
     assert!(abandons > 0, "the operator abandoned no node for a leave");
+}
+
+/// ADR-61: the root's own leave while it holds its own sticky stream. Two
+/// causes kept the release of the root's own stream unacknowledged, so the
+/// leave waited to its deadline and aborted (1,353 of 2,000 seeds on the
+/// parent):
+/// - the release row ended the root's last own live generation inline, the
+///   holder side lost its root (`Core::holder_root` named nobody) and dropped
+///   the root's acknowledgement of the row as stale (seeds 1 to 4);
+/// - back from a suspend, the root refused its own batch for a moment, and the
+///   rows, its release row among them, shipped in its segments before the
+///   batch went again: a row that left the journal is never streamed, and the
+///   root never appended the release (seeds 8, 140 and 242; 10 of the first
+///   300 seeds with the first cause fixed).
+///
+/// Each seed now ends with the root's own leave answered and the root retired.
+#[test]
+fn a_roots_own_leave_ends_its_own_sticky_stream() {
+    let config = sticky_leave_root_self_config();
+    for seed in [1u64, 2, 3, 4, 8, 140, 242] {
+        let r = run_seed(seed, config.clone()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-leave-root-self")
+        });
+        assert_eq!(r.leave_driver.own, 1, "seed {seed}: the root did not leave");
+    }
 }
 
 /// Plan 46 M1.3 step 14 (ADR-61): the operator asks any node to retire the dead
@@ -22293,6 +22318,7 @@ fn a_leave_that_keeps_the_grants_fails_the_run() {
         ("sticky-leave", sticky_leave_config()),
         ("sticky-leave-admin", sticky_leave_admin_config()),
         ("sticky-leave-root", sticky_leave_root_config()),
+        ("sticky-leave-root-self", sticky_leave_root_self_config()),
     ] {
         let config = SimConfig {
             leave_keeps_grants: true,

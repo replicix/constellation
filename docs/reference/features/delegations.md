@@ -962,7 +962,10 @@ every grant it holds
 ([ADR-61](../../explanation/DECISIONS.md#adr-61-a-node-leaves-the-roster-only-after-the-log-has-ended-every-grant-it-holds)):
 
 - its own leave releases its streams, and is answered when the root has
-  appended the release rows and journaled the end of each stream. Under a
+  appended the release rows and journaled the end of each stream. The root's
+  own leave does the same with its own sticky streams (ADR-55): it appends
+  their release rows itself, ends them, and is answered once the rows have
+  shipped. Under a
   pending drop (ADR-59 part B) the release waits for the drop's record, and a
   leave that waits past `leave_wait` aborts: the node takes grants again and
   the leave is run again;

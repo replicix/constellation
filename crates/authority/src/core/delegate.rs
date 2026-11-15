@@ -1839,17 +1839,32 @@ impl Core {
     /// The node a holder streams to and renews with: [`Self::root_node`], or
     /// this node itself while it holds the lease and a sticky stream of its
     /// own is live in its tenure (ADR-55: the root is the holder of its own
-    /// stream; its messages to itself are delivered inline).
+    /// stream; its messages to itself are delivered inline), or the release
+    /// of one is not acknowledged yet.
+    ///
+    /// ADR-61: the release row of the root's last own live stream ends the
+    /// generation inline, in the same step as the batch that carries it,
+    /// before the root's inline acknowledgement of that batch reaches the
+    /// holder side. Had the holder side lost its root then, the sync would
+    /// have started a new round and the acknowledgement would have been
+    /// stale: the release was never acknowledged, and the root's own leave
+    /// waited for it to its deadline (`sticky-leave-root-self`).
     pub(crate) fn holder_root(&self) -> Option<NodeId> {
         self.root_node().or_else(|| {
             let me = self.cfg.node_id;
+            let own = |gen: &u64| self.dl.gens.get(gen).is_some_and(|g| g.node == me);
             (self.lease.held.is_some()
                 && !self.lease.lost
-                && self
+                && (self
                     .dl
                     .gens
                     .values()
-                    .any(|g| !g.ended && g.node == me && g.non_stealable()))
+                    .any(|g| !g.ended && g.node == me && g.non_stealable())
+                    || self
+                        .dl
+                        .mine
+                        .iter()
+                        .any(|(gen, d)| d.release.is_some() && own(gen))))
             .then_some(me)
         })
     }
@@ -1861,6 +1876,60 @@ impl Core {
             .delegate_txs_from(gen, idx, 1)
             .first()
             .is_none_or(|t| t.idx > idx)
+    }
+
+    /// ADR-61: the root's own stream `gen` holds rows through its release row
+    /// `row` that shipped in this root's segments (they are in the log) before
+    /// its own batch appended them: the batch was refused while this root was
+    /// not usable for a moment (back from a suspend), and a row that left the
+    /// journal is never streamed again. The root's cursor would stay below
+    /// them, the release row would never be appended, and the generation and
+    /// its release would wait for ever. The usable root appends them as its
+    /// batch would have (its own rows are in its journal, so the append is
+    /// its bookkeeping: the cursor, the release, the end), and the holder side
+    /// counts them streamed.
+    fn own_rows_shipped_unappended(
+        &mut self,
+        now: Now,
+        gen: u64,
+        row: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.cfg.node_id;
+        let live_own = self
+            .dl
+            .gens
+            .get(&gen)
+            .is_some_and(|g| g.node == me && !g.ended && g.cursor < row);
+        let idle = self
+            .dl
+            .mine
+            .get(&gen)
+            .is_some_and(|d| d.inflight.is_none() && d.release.is_some());
+        if !live_own || !idle || !self.cfg.delegation || !self.root_ends_recall(now, gen) {
+            return;
+        }
+        let (dirs, whole) = match self.dl.mine.get(&gen).and_then(|d| d.release.as_ref()) {
+            Some(r) if r.ends => (Vec::new(), true),
+            Some(r) => (r.note.dirs.clone(), false),
+            None => return,
+        };
+        tracing::info!(
+            node = me,
+            gen = %constellation_meta::delegation::GenLabel::of(gen),
+            row,
+            "the root's own rows shipped before its stream appended them: appended now"
+        );
+        self.stats.root_own_rows_caught_up += 1;
+        if let Some(g) = self.dl.gens.get_mut(&gen) {
+            g.cursor = replica.stream_fills_past(gen, row);
+        }
+        self.root_release_appended(now, gen, &dirs, whole, None, replica, out);
+        if let Some(d) = self.dl.mine.get_mut(&gen) {
+            d.streamed_through = d.streamed_through.max(row);
+            d.root_committed = d.root_committed.max(row);
+        }
     }
 
     /// ADR-55: a release of the root's own stream completes once its row has
@@ -1890,7 +1959,16 @@ impl Core {
                 .and_then(|d| d.release.as_ref())
                 .and_then(|r| r.row)
                 .expect("pending");
-            let streamed = self.dl.mine[&gen].streamed_through;
+            let mut streamed = self.dl.mine[&gen].streamed_through;
+            if streamed < row && Self::own_row_shipped(replica, gen, row) {
+                self.own_rows_shipped_unappended(now, gen, row, replica, out);
+                // (The end may have dropped the stream's state already.)
+                let Some(d) = self.dl.mine.get(&gen) else {
+                    done = true;
+                    continue;
+                };
+                streamed = d.streamed_through;
+            }
             if streamed >= row && Self::own_row_shipped(replica, gen, row) {
                 let d = self.dl.mine.get_mut(&gen).expect("present");
                 d.release_acked |= d.release.as_ref().is_some_and(|r| r.ends);

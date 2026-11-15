@@ -1762,6 +1762,10 @@ pub struct Stats {
     /// ADR-55: rows of its own stream the node streamed to another root after
     /// it was deposed.
     pub root_own_resumed: u64,
+    /// ADR-61: releases of the root's own stream whose rows shipped in its
+    /// segments before its own batch appended them (a batch refused while
+    /// the root was not usable for a moment), appended by the root then.
+    pub root_own_rows_caught_up: u64,
     /// Plan 46 M1.3 step 9 (ADR-55): messages this node sent to itself and
     /// the core delivered inline (the root is the holder of its own stream).
     pub self_sends: u64,

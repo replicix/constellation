@@ -82639,6 +82639,66 @@ mod root_own_sticky {
         );
     }
 
+    /// ADR-61 (sim `sticky-leave-root-self`): the root's own leave while it
+    /// holds its own sticky stream. The release row ends the root's last own
+    /// generation inline, before the root's inline acknowledgement of the
+    /// batch that carried it reaches the holder side. With no own live
+    /// generation `holder_root` named nobody, the holder side started a new
+    /// round, the acknowledgement was stale, the stream's `release_acked`
+    /// never turned true, and the leave aborted at its deadline. Fails on the
+    /// parent: "not ended yet" at the deadline.
+    #[test]
+    fn a_roots_own_leave_ends_its_own_sticky_stream_and_is_answered() {
+        let answer_of = |out: &[Action]| {
+            out.iter().find_map(|a| match a {
+                Action::ControlDone { op, result } if *op == OpId(950) => Some(result.clone()),
+                _ => None,
+            })
+        };
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("granted");
+        archive_and_step(&mut h);
+        assert!(h.core.dl.mine.contains_key(&d.gen), "not installed");
+        let mut out = h.step(Event::Control {
+            op: OpId(950),
+            req: Control::ReleaseGrants,
+        });
+        let deadline = h.core.leave_wait_ms() as u64;
+        let mut waited = 0;
+        while waited < deadline && answer_of(&out).is_none() {
+            // (The root's segments ship: its journal leaves the disk.)
+            let batch = Replica::take_journal(&h.meta, 100).unwrap();
+            let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+            Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+            h.core.note_shipped(&seqs, 0);
+            out = archive_and_step(&mut h);
+            h.advance(500);
+            waited += 500;
+            // (The root keeps its lease.)
+            h.hold(1, None);
+            h.core.on_leave_wait_timer(h.clk(), &h.meta, &mut out);
+        }
+        match answer_of(&out) {
+            Some(Ok(_)) => {}
+            other => panic!(
+                "the root's own leave: {other:?} (its stream's release acknowledged: {:?})",
+                h.core.dl.mine.get(&d.gen).map(|m| m.release_acked)
+            ),
+        }
+        assert!(h.core.dl.gens[&d.gen].ended, "the own generation is live");
+        assert!(
+            h.core.dl.mine.get(&d.gen).is_none_or(|m| m.release_acked),
+            "answered before the release row was acknowledged"
+        );
+        assert!(own_grant_of(&h, dirs[0]).is_none(), "still granted");
+        // The release row is in the log (shipped), not only in the journal.
+        assert!(
+            Replica::delegate_txs_from(&h.meta, d.gen, 1, usize::MAX).is_empty(),
+            "a row of the own stream is still in the journal"
+        );
+    }
+
     /// Test 12 (pins today's claim; step 12 changes it): a node that claims
     /// the lease and finds a stream of its own in the table ends it, the
     /// root executing the subtree itself.
