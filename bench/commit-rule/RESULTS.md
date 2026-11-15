@@ -196,7 +196,9 @@ the p50.
 Reading: the root's own ops stay at local speed (60 to 220 us, and the `write`
 of the file system's fsync, 2 to 3.3 ms) with `/` loaded, in A and in B alike;
 the root-slash ops are the archive wait, unchanged (203 ms for a `rename`, 1.7
-ms for a `create` and a `write` that the archive batches). After the first op
+ms for a `create` and a `write` that the archive batches; the 203 ms was the
+next poll round, not the PUT: since 2026-11-15 the fast path nudges the ship,
+see "Archive waits nudge a ship" below; topology 8 not re-measured). After the first op
 under the grant (240 to 320 us: the one archive wait of the record, already
 there at the first honour) no op of the stream waits for any root row of `/`:
 the rule's second half looks at the rows on the stream's keys only. Topology 1
@@ -320,3 +322,44 @@ one directory (1.25 to 1.4 ms against 1.9 to 2.5 ms at p50); both phases run on 
 writers' shared directory, not a wait between streams (not separately diagnosed; the one-subtree phase also runs second, with
 `/d1` already holding 600 entries, so phase order and directory size are confounded with it). The ext4 tail is wider than the other
 three file systems' (the rename-across p90 is 2.9 times its p50 against 1.2 to 1.3); not diagnosed.
+
+## Archive waits nudge a ship (2026-11-15): topologies 1 to 5
+
+A root that has a write-eligible peer and no backup in budget answers its own fast-path ops on the archive (ADR-50's
+interim cost). Before this change the fast path started no round for such an op, so the op waited for the next poll
+round: one sync interval (200 ms in the harness) plus a PUT. The fast path now nudges the ship. Release builds on
+one quiet box (16 CPUs), base `08e264a2` against the change, A/B/B/A per file system, with TMPDIR on the file system
+measured. Topologies 1 to 4: 300 samples; topology 5 (`net-wan`): 100 samples. Each cell is the median over two runs.
+Topology 5, p50 / p90 in us, base -> fix:
+
+| fs | root chmod | root rename | root unlink | forward chmod | forward unlink | forward rename |
+|---|---|---|---|---|---|---|
+| ext4 | 202,626 / 203,130 -> 1,477 / 1,876 | 202,604 -> 1,453 | 202,682 -> 1,502 | 202,591 -> 1,508 | 202,639 -> 1,396 | 202,612 -> 106,440 |
+| xfs | 202,638 / 203,212 -> 1,417 / 1,691 | 202,538 -> 1,512 | 202,637 -> 1,456 | 202,706 -> 1,429 | 202,636 -> 1,367 | 202,662 -> 110,659 |
+| btrfs | 202,644 / 203,178 -> 1,442 / 1,788 | 202,730 -> 1,464 | 202,614 -> 1,449 | 202,683 -> 1,417 | 202,627 -> 1,378 | 202,709 -> 107,093 |
+| tmpfs | 98,532 / 132,681 -> 1,420 / 1,849 | 108,534 -> 1,466 | 98,590 -> 1,418 | 202,574 -> 1,440 | 202,694 -> 1,422 | 202,676 -> 118,800 |
+
+"forward" ops on `b` are no longer forwarded once lease placement has moved the lease to `b`, which happens during the
+forward `write` or `rename` phase. From then on `b`'s own ops take the same archive path. The forward `rename` mixes
+forwarded samples (a WAN round trip) with local ones. The tmpfs base root cells are a mix: in one base run `b` became
+`a`'s backup partway through (see below). Root `create` and `write`, forwarded `create` and `write`, and `flock` stay
+within 4 % at p50 (root `create` p90 is up to 1.22, between 1.6 and 2.0 ms).
+
+Topologies 1 to 4 do not reach the change: a lone holder's rows are `Singleton`, and a backed configuration's rows are
+`Group` and still send `Journaled`. The only addition on that path is one atomic load. Over 132 cells, 12 are above
+1.05 and 19 below 0.95. None stays above 1.05 on another file system. The largest is ext4 topology 1 holder `create`,
+69 -> 86 us; that path is not gated, so it never reaches the changed code. vfs-bench (14 benches, min over two runs)
+gives fix/base of 0.97 to 1.06 (btrfs `view/getattr/observed` 1.063, tmpfs `mock/getattr/direct` 1.041). vfs-bench
+runs no sync handle, so none of the changed code.
+
+S3 PUTs (`s3.by_area["PUT log"]`, a probe build of topology 5 on a shared box). Serial ops cost one PUT each before and
+after: each 100-op phase plus its 100 prepare creates is 200 log PUTs on both. A burst of 8 threads doing 50 `chmod`s
+each on the holder's fast path: base 53 PUTs in 11.07 s (4.8 PUT/s, 0.13 PUT/op); fix 138 PUTs in 0.49 s (281 PUT/s,
+0.35 PUT/op, 2.9 ops per ship). The coalescing (one round in flight, one pending) caps the ship rate at one per PUT
+latency, not one per op. The same burst forwarded through the core, which already nudged per op, is unchanged: 295 PUTs
+in 8.0 s before, 318 in 7.7 s after.
+
+Harness caveat: topology 5 checks only at the start that `a` lists no backup. In some runs `b` became `a`'s backup
+partway through (`ack.policy` `backup`). The root's ops were then `RootGroup`, answered after `b`'s acknowledgement (one
+WAN round trip). That is the "about one RTT" sometimes seen with a longer sync interval: with a 400 ms interval, 2 of 4
+probe runs waited about 110 ms with `b` listed, and 2 waited 405 ms with no backup.

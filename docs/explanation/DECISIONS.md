@@ -4015,7 +4015,10 @@ quarantine and abandon audience, status) asks the object.
   for the subtrees it dominates; `/` and other nodes' subtrees keep the wait.
   The remedy for a node that will not be mounted again is `leave`. The FUSE
   fast path answers alone only from a singleton's `lone_ok`, so a delegating
-  root takes its own ops through the core meanwhile.
+  root takes its own ops through the core meanwhile. The wait is one ship: a
+  fast-path op whose row waits for the archive nudges the round, as a close
+  or an fsync does (until 2026-11-15 it waited for the next poll round, one
+  sync interval: about 200 ms in the harness, 500 ms by default).
 - No roster freshness bound (Q2): a root cut from S3 cannot renew its lease,
   and the lease's TTL bounds that case; a bound would cost an offline single
   node its local answers.

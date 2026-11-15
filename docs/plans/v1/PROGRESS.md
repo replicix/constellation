@@ -63367,6 +63367,10 @@ ABBA, box 1 with other jobs, indicative), p50 / p90 ms, main -> here: forwarded 
 150.5; `rename` 113.7 / 138.5 and 114.3 / 141.5 -> 111.9 / 140.6 and 108.2 / 137.4; the root's own ops equal (create
 0.06 / 0.08, write 3.1 / 3.4-4.1). The archive wait adds a few milliseconds to a WAN round trip against a local S3;
 against a remote bucket it is one S3 PUT (§11 Q2's 28-190 ms).
+(Correction, 2026-11-15: that holds for an op the core executes, which nudges a ship. From ADR-50 (`ce286da4`) on, the
+root's own fast-path ops wait for the archive too, and nothing started a ship for them: they waited for the next poll
+round, one sync interval plus one PUT (about 202 ms in topology 5), until the fast path nudged a ship; see "Archive waits
+nudge a ship" below.)
 
 ## Plan 46 — the direction of the acknowledgement area (maintainer's decisions, 2026-11-01)
 
@@ -70006,3 +70010,29 @@ no live generation of the node and recalls the ones it lists. A self-leave under
 intended behaviour (latency, not integrity). The leave driver dates its abandons; the root's leave note recall has its own cause (`LeaveNote`); `sticky-leave-root-self` covers a root's own leave; the sim's never-completed-rid allowance is tightened to `Final` rows past the cut of an
 abandoned generation (`Group` rows too, once the operator found the whole group gone), with the session checks exempting the
 same rids. No change to replicix-core.
+
+### Archive waits nudge a ship (2026-11-15)
+
+Bench topology 5 (`net-wan`, placement off) regressed with ADR-50 (`ce286da4`): the root's own `chmod`, `rename` and
+`unlink`, and the same ops on `b` once lease placement has moved the lease there, took one sync interval plus one PUT
+(about 202 ms p50 in the harness; 500 ms by default) instead of 40 to 110 us. Cause: with no backup in budget and a
+write-eligible peer, the root journals its own fast-path rows `Archive`. `View::local_ack_durable` then waits for the
+durable watermark, but it sent only `Journaled`, which streams rows to a group and starts no round, so the row shipped
+with the next poll round. A `create` and a `write` were fast because their close and `fsync` nudge a round; an op the
+core executes (a forward, a settle) nudges at execution. When a run waited for one WAN round trip instead of the interval,
+`b` had been listed as `a`'s backup partway through the run (`ack.policy` `backup`, `backup_acks` rising): its rows were
+`RootGroup`, answered on `b`'s acknowledgement. The ship was not ending early.
+
+Fix: `local_ack_durable` sends `Nudge` when the row is `Archive` or the published rule is the archive. `Core::nudge`
+already coalesces nudges (one round in flight, at most one after it). The commit rule and what an answer waits for are
+unchanged. Test `an_archive_bound_fast_path_op_nudges_a_ship` fails on the parent (only `Journaled` was sent). The
+control `a_group_bound_fast_path_op_starts_no_round` checks that a group-bound row starts no round.
+
+Measured with A/B/B/A on one quiet box. Results are in `bench/commit-rule/RESULTS.md` under "Archive waits nudge a
+ship". Topology 5: the root's `chmod`, `rename` and `unlink`, and `b`'s once the lease is there, went from 202.6 ms to
+1.4-1.5 ms at p50 on ext4, xfs, btrfs and tmpfs (one local PUT). Topologies 1 to 4 and vfs-bench are neutral. Serial ops
+cost one PUT each, before and after. On a burst of 400 concurrent `chmod`s the ship rate rises to 281 PUT/s (2.9 ops per
+ship) from 4.8 PUT/s (base, 11 s for the burst): at most one ship per PUT latency. Sweeps (`far-root-writes*`,
+`sticky-handover-*`, `placement-hot`, `flex*`; 18 labels × 2,000) show nothing failing on either side. The sim binary is
+byte-identical (the change is in the engine only). Gates: fmt, clippy, lib debug and release, authority suite.
+
