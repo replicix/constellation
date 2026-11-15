@@ -1210,13 +1210,19 @@ pub(crate) struct AbandonWait {
 /// not usable (the end is journaled once it is).
 const ABANDON_RETRY_MS: u64 = 200;
 
-/// ADR-61 (takeover seeding): the roles `deleg_group_heard_lately` names
-/// when the inheritance of the generation, not a message, is what counts
-/// its delegate or a strict member as heard.
-const ROLE_DELEGATE_TAKEN_OVER: &str =
-    "the delegate, not heard since this root took the generation over";
-const ROLE_MEMBER_TAKEN_OVER: &str =
-    "a member of its group, not heard since this root took the generation over";
+/// The node of a generation's group the abandon's discriminator counts as
+/// heard most lately (`Core::deleg_group_heard_lately`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeardLately {
+    node: NodeId,
+    /// Its role in the generation, for the operator.
+    role: &'static str,
+    /// How long ago, on this root's wait clock.
+    ago_ms: u64,
+    /// ADR-61 (takeover seeding): this root has not heard from it since it
+    /// inherited the generation; the inheritance is what counts it as heard.
+    taken_over: bool,
+}
 
 /// The generation number of a [`PeerMsg::DelegateStream`] that is no stream:
 /// a node tells the root it is leaving (or no longer is) with a batch of no
@@ -11764,18 +11770,20 @@ impl Core {
             // and cut from it only; its tail, or the delegate's rows, are not
             // lost. The operator confirms from elsewhere that the nodes are
             // down, and forces.
-            let taken_over =
-                |role: &str| role == ROLE_DELEGATE_TAKEN_OVER || role == ROLE_MEMBER_TAKEN_OVER;
-            if let (false, Some((node, role, ago))) = (force, heard.filter(|h| taken_over(h.1))) {
+            if let (false, Some(h)) = (force, heard.filter(|h| h.taken_over)) {
                 return Err(format!(
-                    "this root took generation {gen} over {ago} ms ago and has not heard from node {node} \
-                     ({role}) since, within abandon_heard_window ({} ms): it may be alive, holding rows its \
+                    "this root took generation {gen} over {} ms ago and has not heard from node {} \
+                     ({}) since, within abandon_heard_window ({} ms): it may be alive, holding rows its \
                      clients were told are committed. Confirm from elsewhere that the delegate and the members \
                      of its group are down, then run the command again with --force",
+                    h.ago_ms,
+                    h.node,
+                    h.role,
                     self.dl_t().abandon_heard_window
                 ));
             }
-            if let (false, Some((node, role, ago))) = (force, heard) {
+            if let (false, Some(h)) = (force, heard) {
+                let (node, role, ago) = (h.node, h.role, h.ago_ms);
                 return Err(format!(
                     "this root heard from node {node} ({role} of generation {gen}) {ago} ms ago, within \
                      delegation_ttl_ms ({} ms): it may be alive and cut from this node only, holding rows its \
@@ -11790,7 +11798,7 @@ impl Core {
                 ));
             }
             if let Some(h) = heard {
-                plan.forced.insert(gen, h);
+                plan.forced.insert(gen, (h.node, h.role, h.ago_ms));
             }
             if stream {
                 plan.streams.push(gen);
@@ -12190,41 +12198,36 @@ impl Core {
 
     /// Plan 43 C2e follow-up (`repair abandon` without `--force`): the
     /// node of `g`'s group this root heard from within `abandon_heard_window`
-    /// most lately — the delegate, or a strict member — as `(node, role, ms
-    /// ago)`. A generation this root inherited counts them as heard at its
-    /// inheritance (ADR-61, `inherited_heard_floor`; the role says so).
-    fn deleg_group_heard_lately(
-        &self,
-        now: Now,
-        g: &GenState,
-    ) -> Option<(NodeId, &'static str, u64)> {
+    /// most lately — the delegate, a strict member or a previous root. A
+    /// generation this root inherited counts the delegate and the strict
+    /// members as heard at its inheritance (ADR-61, `inherited_heard_floor`;
+    /// [`HeardLately::taken_over`] says so).
+    fn deleg_group_heard_lately(&self, now: Now, g: &GenState) -> Option<HeardLately> {
         let ago = |t: Option<WaitMs>| t.map(|t| now.wait.since(t).max(0) as u64);
         let (delegate_at, delegate_floor) = self.deleg_heard_or_inherited(g, None);
-        let delegate_role = if delegate_floor {
-            ROLE_DELEGATE_TAKEN_OVER
-        } else {
-            "the delegate"
-        };
-        std::iter::once((g.node, delegate_role, ago(delegate_at)))
+        std::iter::once((g.node, "the delegate", ago(delegate_at), delegate_floor))
             .chain(g.group.strict().iter().map(|m| {
                 let (at, floor) = self.deleg_heard_or_inherited(g, Some(*m));
-                let role = if floor {
-                    ROLE_MEMBER_TAKEN_OVER
-                } else {
-                    "a member of its group"
-                };
-                (*m, role, ago(at))
+                (*m, "a member of its group", ago(at), floor)
             }))
             .chain(g.prev_roots.iter().map(|m| {
                 (
                     *m,
                     "a previous root of its generation",
                     ago(self.deleg_member_heard(g, *m)),
+                    false,
                 )
             }))
-            .filter_map(|(node, role, ago)| ago.map(|a| (node, role, a)))
-            .filter(|(_, _, a)| *a < self.dl_t().abandon_heard_window)
-            .min_by_key(|(_, _, a)| *a)
+            .filter_map(|(node, role, ago, taken_over)| {
+                ago.map(|ago_ms| HeardLately {
+                    node,
+                    role,
+                    ago_ms,
+                    taken_over,
+                })
+            })
+            .filter(|h| h.ago_ms < self.dl_t().abandon_heard_window)
+            .min_by_key(|h| h.ago_ms)
     }
 
     /// End `gen` here and now: the `DelegateNodeEnded` record journaled (the table
