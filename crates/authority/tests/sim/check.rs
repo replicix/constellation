@@ -327,6 +327,11 @@ pub fn check_exactly_once(
                     "rid {rid:?} was refused ({ret:?}) but completed {n} times in the log"
                 ))
             }
+            NsRet::Erofs if n != 0 => {
+                return Err(format!(
+                    "rid {rid:?} was refused (Erofs) but completed {n} times in the log"
+                ))
+            }
             _ => {}
         }
     }
@@ -529,5 +534,46 @@ mod inode_unique_tests {
         let second = [create(10, "b"), done(17)];
         let err = inode_numbers_unique([(1u64, &first[..]), (2u64, &second[..])]).unwrap_err();
         assert!(err.contains("seq: 14") && err.contains("seq: 17"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod exactly_once_erofs_tests {
+    use super::*;
+
+    fn oracle(completed: &[(Rid, usize)]) -> Oracle {
+        Oracle {
+            head: 0,
+            final_dump: Vec::new(),
+            at: BTreeMap::new(),
+            completed: completed.iter().copied().collect(),
+            completed_at: HashMap::new(),
+            refused_at: HashMap::new(),
+            segments: 0,
+            fenced: 0,
+            unfenced: BTreeMap::new(),
+            describe: Vec::new(),
+        }
+    }
+
+    fn rid(seq: u64) -> Rid {
+        Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// A call refused `EROFS` never ran: absent from the log passes; a
+    /// completion in the log fails (the negative control), naming the rid
+    /// and the answer.
+    #[test]
+    fn an_erofs_refusal_that_completed_in_the_log_fails() {
+        let returned = [(rid(1), NsRet::Erofs)];
+        let none = std::collections::HashSet::new();
+        assert!(check_exactly_once(&returned, &none, &oracle(&[]), true).is_ok());
+        let err = check_exactly_once(&returned, &none, &oracle(&[(rid(1), 1)]), true)
+            .expect_err("the refused rid ran");
+        assert!(err.contains("Erofs") && err.contains("seq: 1"), "{err}");
     }
 }
