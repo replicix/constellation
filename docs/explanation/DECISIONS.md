@@ -1634,9 +1634,11 @@ delegate acknowledges once its group holds the row; its fast path writes and
 then waits; the end of a generation waits for its group; a lone root answers
 other nodes from the archive; an op is settled before `EIO`, ADR-18's
 amendment), C2g′ and C2h's scenarios (the settle's classifier and the ratchet
-of plan 46 M0.3; the strict flags stay per-configuration, D9 defers the
-rest). Not yet: C3–C5 as redone under plan 46 stages 1–2. Each milestone amends this
-record; C1's rejected options are below.
+of plan 46 M0.3; the oracle `acked_at_or_below_cut`, I2c and
+`member_copies_drained` have been strict on every configuration since plan 46
+M1.2 step 16, with the sweep label `+report` as the opt-out). Not yet: C3–C5
+as redone under plan 46 stages 1–2. Each milestone amends this record; C1's
+rejected options are below.
 DESIGN.md states each part in the milestone that makes it true (plan 43
 §6).
 
@@ -5652,7 +5654,8 @@ runs afterwards, by rid, as a new row of the root (origins `(0, 0)`); the log
 then completes a rid whose answer named a row of the abandoned generation, and
 the identity check cannot match. The `Group` answer of that abandoned row (the
 rid and its origin; another answer of the same rid is not covered) is not
-counted as `non_verbatim` but in `Report::i2c_abandon_rerun` (the `SWEEP-ORACLES` and `SWEEP-ORACLE-TOTALS` lines print it as
+counted as `non_verbatim` but in `Report::i2c_abandon_rerun` (the
+`SWEEP-ORACLES` and `SWEEP-ORACLE-TOTALS` lines print it as
 `i2c-abandon-rerun`) when all of these hold: its answer is excused by the
 abandon as above (`Group` class with every node of the group confirmed gone,
 `g` abandoned, `idx` above the cut); the log completes it in a segment after

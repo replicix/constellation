@@ -3296,8 +3296,9 @@ pub fn ack_given_up(
         })
 }
 
-/// The Group answers (rid and the origin of the abandoned row) of an abandon that the log nevertheless completes (the
-/// maintainer decided this allowance on 2026-11-15, I2 (c)): the op was
+/// The Group answers (rid and the origin of the abandoned row) of an abandon
+/// that the log nevertheless completes (the maintainer decided this
+/// allowance on 2026-11-15, I2 (c)): the op was
 /// still in a dead requester's inbox, so after the abandon the root ran it
 /// by rid as a new row of its own. All must hold: the answer passes
 /// [`ack_given_up`] (Group class: every node confirmed gone, generation
@@ -3367,8 +3368,9 @@ pub fn abandon_rerun_rids(
 /// latest rollback: only an answer given before it was rolled back).
 /// `operator_lost`: the rids the operator's `abandon-group` gave up (exempt
 /// from I2 (c), counted in `i2c_operator_lost`).
-/// `abandon_rerun`: the (rid, origin) of the Group answers [`abandon_rerun_rids`] found (exempt from I2 (c),
-/// counted in `i2c_abandon_rerun`).
+/// `abandon_rerun`: the (rid, origin) of the Group answers
+/// [`abandon_rerun_rids`] found (exempt from I2 (c), counted in
+/// `i2c_abandon_rerun`).
 /// `converged`: the run reached quiescence, so a group-answered rid the log
 /// never completed is absent for good.
 #[allow(clippy::too_many_arguments)]

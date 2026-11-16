@@ -4968,14 +4968,21 @@ that makes the invariant hold (C1-4 turns `strict_lone` and the I2 checks on
 in the `strict_durability` configs; C2 `strict_commit` and `strict_settle` —
 C2f turns `strict_commit` and `strict_identity` on in `far`, where the lone
 root answers every other node from the archive; C3
-`strict_identity` on the delegated families).
+`strict_identity` on the delegated families). Three are the exception: the cut
+oracle `acked_at_or_below_cut`, I2 (c) and `member_copies_drained` are strict
+on every configuration since plan 46 M1.2 step 16 (`CutMode::default()` is
+`Strict`, `SimConfig::strict_verbatim` defaults to true). The label `+report`
+is the opt-out: it makes the cut oracle count only (`Report::acked_past_cut`)
+and leaves I2 (c) and `member_copies_drained` unjudged. `+cut` and
+`+verbatim` name the strict settings and change nothing on the default.
 
 | Oracle | Judged | Counter (`Report`) | Flag |
 |---|---|---|---|
 | I1 `acked_implies_committed` | at the answering sequencer's emission: every definitive answer (`Accepted`, `Errno`, `Exists`, `Conflict`, `LockLapsed`) of a `MutateReply` or of a node's own client reply that this node decided (`Action::Reply.source`: `Sequenced`), by reading every node's store, the bucket's lease and the log as they are then (`tests/sim/oracle.rs`, `committed_at_answer`), independently of what the core claims; what a transaction carries must be the answer's own outcome (plan 43 C2a: a completion for an acceptance, a `Refused` of the answer's code for a refusal — an `Exists` hint is `EEXIST`, a conflict `ESTALE`, a lapsed grant `ENOLCK`), and the same rid carried with another outcome by the archive, the answerer's journal or the lease holder's is a violation of its own whether or not a class holds. A requester passing another node's answer on (`Relayed`) is not judged but verified at the end of the run: an earlier judged `MutateReply` of that node with the same outcome must exist | `acks_by_class`, `uncommitted_acks` (`"{expected class}/{answer}"`), `mismatched_acks` (by answer kind), `unverified_relays`, `row_version_mismatch` (plan 46 M1.1 step 7: a row's version is not its configuration's at its position, `row_version_matches_config`; printed as `version-mismatch` in the sweep totals; must be 0), `unjournaled_refusals` (D6: a refusal that journaled no `Refused` row, e.g. a frozen epoch's `EROFS`: nothing executed, not a violation), `acks_unsourced` (an outcome no sequencer decided: a node's own error; not judged), `acks_unmapped` (must be 0); `ungated_shadows` (plan 43 C2: shadows and hints a requester installed for an answer not said to be committed, over every incarnation; a non-stealable sequencer's — a hold owner's in an open epoch, a designee's — are counted apart, `ungated_shadows_non_stealable`, and allowed; fails the run under the flag) | `strict_commit` |
 | I2 `one_identity_per_op` (b) | after every event a node handles: no rid queued for execution (`pending_replays`, the core's client map) on two nodes at once (`IdentityLedger`), judged when a queued copy stands for a committed answer (its entry's class is gated: plan 43 C1-4; a stranded committed entry, an abandoned member row); the pairs of lone-branch and delegate copies are counted apart | `identity_copies`, `identity_copies_ungated` | `strict_identity`, `strict_durability` |
-| I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (the transaction's `LogRecord::TailOf`, kept through any number of re-ships, else epoch, node and journal row; or `(gen, idx)`) and with its records as one run, ignoring the `TailOf` records of either (plan 43 C1-4, D9) | `non_verbatim` | `strict_identity`, `strict_durability` |
-| `member_copies_drained` (plan 43 C1-4) | a converged run: no node still holds a row of a member copy (the archive carries every identity, or a marker said the row was never committed) | `member_copy_rows_left` | `strict_durability` |
+| I2 (c) verbatim | end of run: an OK answered under a group class is completed in the log under the identity it was committed with (the transaction's `LogRecord::TailOf`, kept through any number of re-ships, else epoch, node and journal row; or `(gen, idx)`) and with its records as one run, ignoring the `TailOf` records of either (plan 43 C1-4, D9) | `non_verbatim` | `strict_verbatim` (default on; `+report` turns it off), `strict_identity`, `strict_durability` |
+| `member_copies_drained` (plan 43 C1-4) | a converged run: no node still holds a row of a member copy (the archive carries every identity, or a marker said the row was never committed) | `member_copy_rows_left` | `strict_verbatim` (default on; `+report` turns it off), `strict_durability` |
+| `acked_at_or_below_cut` (plan 46 M1.2 step 3, `tests/sim/cut.rs`) | end of run: every answered row of a delegate stream, the sim's form of the model's property of that name: an answer whose transaction has the origin `(gen, idx)` with `idx` above the cut that the log's `DelegateNodeEnded { gen, through }` carries was acknowledged for a row the log will never carry. Exempt: a generation the operator abandoned (the log carries a `GroupAbandoned` of it), where the abandon exports the rid (I5's operator branch); counted apart | `acked_past_cut` (of them `acked_past_cut_refusals` were refusals), `cut_rows_judged`, `cut_abandoned` (the abandon's, exempt) | `cut_mode` (`CutMode::Strict` by default; `+report` makes it count only) |
 | I4 `unacked_fails_never_lands_late` | end of run: an op answered in doubt (the first `InDoubt` answer; the sim's client resubmits, production answers `EIO` at once) that lands after an op its node invoked later; and (plan 43 C2a) a refusal that journaled no `Refused` row whose rid the log completes | `late_landings`, `unjournaled_landed` | `strict_settle` |
 | I4, strict (plan 46 M0.3) `unsettled_eio_only_when_isolated` | at each unsettled `EIO` the core counts (`client_unsettled_eio`): whether its requester could reach a sequencer for the op during its settle window, from the run's reachability history (`sim/reach.rs`) | `unsettled_isolated`, `unsettled_violations` | `strict_unsettled` (`+unsettled`) |
 | I5 `speculation_only_lone` | end of run: an OK that was rolled back whose answer was not class Lone (a rollback is what the core counts as one: a stranded replay, not a committed row kept as a member copy, and not a refusal this node never answered) | `non_lone_rollbacks` | `strict_lone`, `strict_durability` |
@@ -5111,11 +5118,12 @@ and owes that every acknowledged rid is held somewhere; the second has the
 operator run `repair abandon --gen G` on the root after 5 s
 (`GroupAbandoned` in the log), converges, and counts the acknowledged rows
 the dead group alone held as `Report::operator_lost`, judged tentative
-(only in a run where the operator acted). The `Group` answer of the abandoned row of a rid that a
-dead requester's inbox then ran again by rid as a root row (origins `(0, 0)`,
-after `GroupAbandoned`, never returned to a client) is counted apart, as
-`Report::i2c_abandon_rerun`, not as `non_verbatim` (maintainer decision
-2026-11-15; ADR text in DECISIONS.md; seed 1667 pins it). The core tests
+(only in a run where the operator acted). The `Group` answer of the abandoned
+row of a rid that a dead requester's inbox then ran again by rid as a root row
+(origins `(0, 0)`, after `GroupAbandoned`, never returned to a client) is
+counted apart, as `Report::i2c_abandon_rerun`, not as `non_verbatim`
+(maintainer decision 2026-11-15; ADR text in DECISIONS.md; seed 1667 pins
+it). The core tests
 `the_generation_end_seals_every_backup_a_record_named` (strict members waited
 for, older named backups sealed once and never waited for),
 `an_unanswered_seal_of_the_latest_member_holds_the_end` and
