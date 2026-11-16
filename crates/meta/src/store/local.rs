@@ -4658,12 +4658,31 @@ mod verbatim_append_tests {
             matches!(class_b, RowCommit::Singleton { .. }),
             "{class_b:?}"
         );
+        let first_b = {
+            let r = meta.db.read_tx();
+            read_journal_txs(&r, &meta)
+                .unwrap()
+                .into_iter()
+                .find(|(_, row)| row.gen == gen)
+                .unwrap()
+                .0
+        };
         let report = seal_and_reclaim(&meta, |txs| txs.iter().map(|t| t.last).max().unwrap());
         // A moved row keeps the class it was appended with (never the
         // tail's `Group`: the root's group did not commit it).
         let (_, row_b, _) = row_of(&meta, rid(16));
         assert_eq!(row_b.class, class_b);
         assert_eq!((row_b.gen, row_b.idx), (gen, 1));
+        // b's re-journaled row names the journal row it was (`TailOf`) and
+        // keeps its delegation origin.
+        let (_, _, recs_b) = row_of(&meta, rid(16));
+        assert_eq!(
+            recs_b.first(),
+            Some(&LogRecord::TailOf {
+                epoch: 1,
+                jseq: first_b
+            })
+        );
         let (at_a, ..) = row_of(&meta, rid(14));
         let (at_b, ..) = row_of(&meta, rid(16));
         assert!(

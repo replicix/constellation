@@ -70082,3 +70082,5 @@ the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and
   Tripwire `ReshipReport.tail_own_gated_beyond_gap` (error log, debug assert, behaviour unchanged) counts an own
   committed row past `through`, which the gate cannot re-ship; the fix for that class belongs in where `through` comes
   from and needs its own spec.
+- Review NITs: the 876 unit test asserts each rid once and the re-journaled `TailOf` and origin; the locks sim's
+  `check_visible` now runs after the watermark wait (more lenient, and it matches production admission: accepted).

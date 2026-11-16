@@ -1394,6 +1394,9 @@ pub async fn client_lock(
                 }
             }
             ghost.enter(ino, node, thread, step.mode, clock.elapsed_ms());
+            // `check_visible` runs after the watermark wait: more lenient
+            // than before the wait, and it matches production admission
+            // (a read is admitted once the watermark holds). Accepted.
             if fresh_grant && !wrote && !resumed_once {
                 let own_epoch = h.view().s3_held.map(|(e, _, _)| e);
                 ghost.check_visible(ino, node, clock.elapsed_ms(), &h.meta, own_epoch);

@@ -5172,6 +5172,7 @@ impl Meta {
         // segment supersedes it (`superseded_root_appends_tx`): rolled back
         // and stranded quietly, so the stream's transaction installs in
         // log order instead of being skipped as "completed here".
+        let mut sup_stranded = false;
         {
             let completes: HashSet<Rid> = records
                 .iter()
@@ -5194,6 +5195,7 @@ impl Meta {
             };
             let sup = superseded_root_appends_tx(&tx, self, epoch, &origins, &completes, &refused)?;
             if !sup.is_empty() {
+                sup_stranded = true;
                 strand_tx(
                     &mut tx,
                     self,
@@ -5218,6 +5220,8 @@ impl Meta {
                 // removed the file the delegate had created after it).
                 // The segment retires it by origin.
                 if tx.get(&self.completed, rid.to_key())?.is_some() {
+                    // (A marked call has no superseded root append to strand.)
+                    debug_assert!(!sup_stranded || !marked);
                     if marked {
                         tx.commit()?;
                         self.flush_held_releases();
@@ -6535,6 +6539,9 @@ impl Meta {
                 if own != bt.records {
                     continue;
                 }
+                // (Only a gated own row can precede an append here: a
+                // self-sealed group tenure's own rows are its `gen == 0`
+                // gated ones, and its appends follow its group's commits.)
                 if j.gen == 0 && j.class.gated() {
                     // A gated own row past `through` is never re-journaled,
                     // so nothing behind it needs to move.
@@ -6753,8 +6760,9 @@ impl Meta {
                 };
                 // The row is this node's own journal row, still unshipped
                 // (a root's append of a delegate's row stays through the
-                // node's own takeover, and the node reads its own sealed
-                // tail back): the same epoch and journal seq, so the same
+                // node's own takeover, unless it follows a re-journaled own
+                // committed row (`follows`), and the node reads its own
+                // sealed tail back): the same epoch and journal seq, so the same
                 // identity. It stays and ships as it is; it is not an
                 // outcome the log carried under another identity.
                 if done {

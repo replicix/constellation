@@ -1841,6 +1841,8 @@ pub(crate) fn member_rules_tx(
                 out.dropped += 1;
                 continue;
             }
+            // (Rule 5 goes together with stage 2's refuse-and-retry: it only
+            // exists for the undecided drops that retry leaves behind.)
             // 5. A deposed dropper's undecided `DropHeld` (the log lacks it,
             // or coverage above had retired it): every claimant's gate fences
             // it by class and never re-ships it (`spec.rs`, "the drop never
