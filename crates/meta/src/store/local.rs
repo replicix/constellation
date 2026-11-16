@@ -138,7 +138,7 @@ pub(crate) struct JournaledTx {
 
 /// What a [`RowCommit::Group`]'s configuration waits on: the journal's
 /// stored form of whose copies the group counts (it stays with the row
-/// encoding until M1.2 makes one stream per node).
+/// encoding, as it did after M1.2 made one stream per node).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GroupOn {
     /// No member listed: an applied, unfenced log segment (`ack=s3`, a

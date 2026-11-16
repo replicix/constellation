@@ -157,7 +157,9 @@ pub enum RecallCause {
 pub enum RecallPhase {
     None,
     Sent,
-    /// `DelegRecalled { through }` received: ends once the cursor is there.
+    /// The holder released the stream through this index (a request
+    /// answered by a release row): the generation ends once the root's
+    /// cursor is there.
     Drained(u64),
     /// Phase 2b: the delegate is silent; its backup was asked to seal
     /// and drain.

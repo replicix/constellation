@@ -463,8 +463,9 @@ pub struct SubtreeGrant {
 }
 
 impl LogRecord {
-    /// A `DelegateNode` of one subtree: what the core writes until step 9
-    /// grows a stream in place (one directory per grant).
+    /// A `DelegateNode` of one subtree: what the core writes for a grant's
+    /// first directory (a later directory grows the live stream in place,
+    /// step 9, by a record of the same generation).
     pub fn delegate_one(node: u64, gen: u64, dir: u64, kind: SubtreeKind) -> Self {
         LogRecord::DelegateNode {
             node,
