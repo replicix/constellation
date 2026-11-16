@@ -6465,6 +6465,14 @@ impl Core {
     /// of the subtree ([`Core::deleg_leaving_grants`]): they are the
     /// root's, and leave this table (a recall must not hand them back
     /// over the root's own record, which may have ended them since).
+    ///
+    /// Only the generation's own records go. A root that holds its own
+    /// stream (ADR-55) has one table for both: the root's record of the
+    /// grant is the one [`Core::lock_install_leaving`] re-tagged as the
+    /// root's in place, and taking every record on the inode left the
+    /// holder's grant in no table at all — its next renewal, now routed to
+    /// the root, was answered `Lost` and its writes discarded (`EIO`;
+    /// harness `stress-ng-fs`, single node).
     pub(crate) fn deleg_drop_left(&mut self, gen: u64, replica: &dyn Replica) {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
@@ -6476,7 +6484,9 @@ impl Core {
         for ino in &inos {
             self.lk.barriers.remove(ino);
         }
-        let gone = replica.locks().take_where(|ino| inos.contains(&ino));
+        let gone = replica
+            .locks()
+            .take_where_of_gen(gen, |ino| inos.contains(&ino));
         if !gone.is_empty() {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -6519,11 +6529,18 @@ impl Core {
                 continue;
             }
             if let Some(e) = replica.locks().get(g.id) {
-                if e.node == g.node && e.ino == g.ino && e.until < until {
+                // A record of the sending generation itself (`e.gen == gen`):
+                // this root holds that stream (ADR-55), and the table is the
+                // delegate's too. The record becomes the root's here, whatever
+                // its end, or the delegate's `deleg_drop_left` takes it with
+                // its own and the holder's grant is in no table.
+                if e.node == g.node && e.ino == g.ino && (e.until < until || e.gen == gen) {
                     // Never sooner than the record's end *now* (plan 41
                     // L1): `e` was read above, and the owner's own record
                     // of this node may have been extended since.
-                    replica.locks().install_keeping_later(Grant { until, ..e });
+                    replica
+                        .locks()
+                        .install_keeping_later(Grant { until, gen: 0, ..e });
                 }
                 continue;
             }

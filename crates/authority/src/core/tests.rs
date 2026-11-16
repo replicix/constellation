@@ -41132,6 +41132,63 @@ fn delegate_with_first_renewal_out() -> (Harness, OpId, u64) {
     (h, req, round)
 }
 
+/// A multi-node delegate's `deleg_drop_left` (the purpose of the removal:
+/// the root has the records of what left the subtree, and this table must
+/// not keep a second copy) still removes the generation's records on the
+/// inodes that left, whoever holds them, and nothing else: not a record on
+/// an inode that stayed, and not a record of another generation (the root's
+/// own, which a root holding its own stream shares the table with).
+#[test]
+fn a_delegates_drop_of_what_left_removes_its_generations_records() {
+    use constellation_meta::locks::{Grant, GrantId, LockMode};
+    let (mut h, _req, _round) = delegate_with_first_renewal_out();
+    let gen = 7;
+    assert!(h.core.dl.mine.contains_key(&gen), "not installed");
+    let left_a = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let left_b = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let stayed = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let until = WaitMs(h.now.0 + 5_000);
+    let rec = |seq: u64, node: u64, ino, gen: u64| Grant {
+        id: GrantId { node: 3, seq },
+        node,
+        ino,
+        mode: LockMode::Shared,
+        until,
+        recalled: false,
+        gen,
+        confirmed: Grant::MINTED,
+        settled: true,
+    };
+    // Two holders on one inode that left, one on another, one that stayed.
+    let (a1, a2, b1, s1) = (
+        rec(1, 1, left_a, gen),
+        rec(2, 2, left_a, gen),
+        rec(3, 1, left_b, gen),
+        rec(4, 1, stayed, gen),
+    );
+    // A record of the root's own (generation 0) on an inode that left.
+    let r0 = rec(5, 2, left_b, 0);
+    for g in [a1, a2, b1, s1, r0] {
+        h.meta.locks().install(g);
+    }
+    h.core.dl.mine.get_mut(&gen).unwrap().leaving = Some((0, vec![left_a, left_b]));
+    h.core.deleg_drop_left(gen, &h.meta);
+    for g in [a1, a2, b1] {
+        assert!(
+            h.meta.locks().get(g.id).is_none(),
+            "{:?} of the generation stayed",
+            g.id
+        );
+    }
+    assert!(h.meta.locks().get(s1.id).is_some(), "an inode that stayed");
+    assert_eq!(
+        h.meta.locks().get(r0.id).map(|g| g.gen),
+        Some(0),
+        "a record of another generation"
+    );
+    assert!(h.core.dl.mine[&gen].leaving.is_none());
+}
+
 /// A delegate (node 3, root node 1) whose replica holds the root's grant of
 /// `/d` (generation 7) as a transaction the root streamed ahead of the log,
 /// `committed` as the root's `StreamAhead` says. Returns the records (what
@@ -82239,6 +82296,77 @@ mod root_own_sticky {
         assert_eq!(d.dir, dirs[0]);
         assert!(own_grant_of(&h, dirs[1]).is_none());
         assert!(h.meta.delegation_table().get(ROOT_INO).is_none());
+    }
+
+    /// `stress-ng-fs`, single node: the root holds its own stream (ADR-55),
+    /// so the root and the generation share one lock table. A grant of the
+    /// generation on a file unlinked under its lock left the subtree with
+    /// the stream's batch: the root's `lock_install_leaving` found the
+    /// record already there and kept it the generation's, and the stream's
+    /// `deleg_drop_left`, once the batch was acknowledged, took every
+    /// record on the inode. The holder's grant was then in no table: its
+    /// next renewal, routed to the root by location, was answered `Lost`
+    /// and its writes discarded (`EIO`). Fail-before: the record is gone.
+    #[test]
+    fn a_grant_that_left_the_roots_own_stream_stays_in_the_roots_table() {
+        use constellation_meta::locks::{Grant, GrantId, LockMode};
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("the root holds a sticky grant on /w1");
+        archive_and_step(&mut h);
+        assert!(h.core.dl.mine.contains_key(&d.gen), "not installed");
+        // An inode in no subtree (unlinked under its lock): the root's.
+        let f = h.meta.allocate_ino(ROOT_INO).unwrap();
+        assert!(matches!(
+            h.meta.resolve_ownership(&Core::read_keys(f, None)),
+            constellation_meta::delegation::Ownership::Root
+        ));
+        let id = GrantId { node: 1, seq: 4242 };
+        let until = WaitMs(h.now.0 + 5_000);
+        let g = Grant {
+            id,
+            node: 1,
+            ino: f,
+            mode: LockMode::Exclusive,
+            until,
+            recalled: false,
+            gen: d.gen,
+            confirmed: Grant::MINTED,
+            settled: true,
+        };
+        h.meta.locks().install(g);
+        // The root applies the batch that carried the grant out.
+        let wire = g.to_wire(h.clk());
+        let now = h.clk();
+        h.core.lock_install_leaving(now, d.gen, vec![wire], &h.meta);
+        // The root acknowledged it: the stream drops what left its subtree.
+        h.core.dl.mine.get_mut(&d.gen).unwrap().leaving = Some((0, vec![f]));
+        h.core.deleg_drop_left(d.gen, &h.meta);
+        let kept = h
+            .meta
+            .locks()
+            .get(id)
+            .expect("the holder's grant is in no table: its renewal is answered Lost");
+        assert_eq!(kept.gen, 0, "the record is not the root's");
+        assert!(kept.until >= until, "the record was shortened");
+        // The delegate's half is unchanged for its own records: a record of
+        // the generation on an inode that left (the root's copy not made
+        // in this table, as on a delegate that is not the root) still
+        // leaves with the acknowledged batch.
+        let f2 = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let g2 = Grant {
+            id: GrantId { node: 1, seq: 4243 },
+            ino: f2,
+            ..g
+        };
+        h.meta.locks().install(g2);
+        h.core.dl.mine.get_mut(&d.gen).unwrap().leaving = Some((0, vec![f2]));
+        h.core.deleg_drop_left(d.gen, &h.meta);
+        assert!(
+            h.meta.locks().get(g2.id).is_none(),
+            "the generation's record stayed"
+        );
+        assert_eq!(h.meta.locks().get(id).map(|g| g.gen), Some(0));
     }
 
     /// Test 2: never `/`, whoever asks (R-I1); the knob's unit check.

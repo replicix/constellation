@@ -3003,6 +3003,18 @@ impl LockTables {
         taken
     }
 
+    /// [`Self::take_where`] limited to the records (and lapsed memories) of
+    /// generation `gen`. A node that is both the root and the holder of
+    /// its own stream (ADR-55) keeps the root's records and the
+    /// generation's in this one table: a delegate-side removal by inode
+    /// alone would take the root's record too.
+    pub fn take_where_of_gen(&self, gen: u64, under: impl Fn(u64) -> bool) -> Vec<Grant> {
+        let mut g = self.lock();
+        let taken = g.grants.remove_where(|e| e.gen == gen && under(e.ino));
+        g.supersede_where(|e| e.gen == gen && under(e.ino));
+        taken
+    }
+
     /// The records expired and dropped since the last call, wherever the
     /// drop happened (a conflicting request, a token check): grants their
     /// holders never released here. What such a holder was acknowledged
