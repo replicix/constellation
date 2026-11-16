@@ -1259,6 +1259,18 @@ Leaseless optimistic commits, which would remove the sequencer
 altogether, stay deferred
 ([ADR-28](DECISIONS.md#adr-28-leaseless-optimistic-commits-stay-deferred)).
 
+**Wake-ups of the driver.** Two requests to the driver carry nothing and only
+make the core look at its current state: `Journaled` (a delegate's fast-path
+write: the next step streams the journal) and `Nudge` (a sealed chunk: a sync
+round over what is pending). A view sends one only when none is queued and the
+driver clears the flag before it acts on the request (`sync::WakeCoalesce`), so
+a wake-up that races with the clear is either queued again or its row is
+already in the state the driver reads next, and none is lost. Without it, a
+single node holding its own sticky stream (ADR-55) queued one per write and one
+per sealed chunk, tens of thousands deep, and a drain or a `getlk` waited
+behind them for 30 to 60 s. A request that carries a payload or is answered
+(`DrainInode`, `Barrier`, a lock request) is never coalesced.
+
 ### The S3 inbox
 
 A requester with no P2P path to the holder (P2P off, the holder not in its

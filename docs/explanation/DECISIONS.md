@@ -4461,6 +4461,15 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   deposition starts from. `Meta::apply_delegate_tx` also notes the index of a
   `Refused` row it skips because the rid is completed here (the cursor would
   have stalled at it).
+- **One lock table for the root and its own stream.** The root and the
+  generation of its own stream share one lock table, so a grant is one record
+  there, whoever's it is. A grant that leaves the subtree with a batch
+  (the file unlinked under its lock) becomes the root's by re-tagging that record to
+  generation 0 in place, never shortening it (`Core::lock_install_leaving`);
+  when the batch is acknowledged the stream drops only its generation's
+  records (`LockTables::take_where_of_gen`), never the root's. A delegate on
+  another node has only its own generation's records on those inodes, and
+  drops all of them as before.
 - **One rule for the root's own stream across a deposition (M1, M1', M5, S1).**
   A far delegate executes on a state that reflects only the rows the log
   carries plus its own stream. The root as its own holder also sees its

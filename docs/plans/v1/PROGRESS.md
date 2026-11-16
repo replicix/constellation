@@ -70109,3 +70109,27 @@ the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and
   p99 down to x0.29; no cell above x1.02 at p50 on any file system (`bench/commit-rule/RESULTS.md`). Not done: the
   rewind itself still redoes the whole not-yet-carried window per segment; other prefix scans that start on a rewritten
   key (`clear_spilled_xattrs` on `ns`) did not show in the profile.
+
+
+### Lost locks and a stalled driver under the root's own sticky grant (2026-11-16)
+
+Since ADR-55's root-own sticky grants went on by default, the harness scenario `stress-ng-fs` failed 5 of 5 on a single
+node, loaded or not (the commit before them passed, and so did main with `CONSTELLATION_DELEGATION_ROOT_STICKY=0`). Two
+causes.
+
+Lost locks (data loss: writes discarded with `EIO`). The root and the generation of its own stream share one lock table.
+When a locked file's grant left the subtree (the file unlinked under its lock), `Core::lock_install_leaving` found the
+delegate's record already there and kept it the generation's (or did nothing), and on the batch's acknowledgement
+`Core::deleg_drop_left` took every record on the inode: the only copy. The holder's next renewal, routed to the root, was
+answered `Lost`, the holder was fenced and its writes failed. Fix: `deleg_drop_left` drops only the generation's records
+(`LockTables::take_where_of_gen`), and `lock_install_leaving` re-tags a record of the sending generation to generation 0
+in place, never shortening it. A delegate on another node is unchanged. Tests
+`root_own_sticky::a_grant_that_left_the_roots_own_stream_stays_in_the_roots_table` (fails on the parent) and
+`a_delegates_drop_of_what_left_removes_its_generations_records`.
+
+Stalled driver. A drain (`DrainInode`) or a `getlk` waited 29 to 63 s: the driver was saturated by payload-free
+wake-ups, one `Journaled` per root-own-stream write and one `Nudge` per sealed chunk, queued up to 26,000 deep. Fix:
+`sync::WakeCoalesce`: a view sends one only when none is queued, and the driver clears the flag before it acts. Both
+handlers only trigger work over the current state (checked: neither depends on a payload or a count). Tests: a flood of
+writes or nudges queues one; the ordering test for a wake-up that races with the clear; a real engine under a flood
+ships its journal and answers a drain.
