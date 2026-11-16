@@ -514,6 +514,7 @@ fn replay_seed() {
         Ok("locks-unlinked-delegated-dbackup-random") => locks_unlinked_random_config(true),
         Ok("locks-unlinked-delegated-blips") => locks_unlinked_blips_config(),
         Ok("locks-unlinked-delegated-partition") => locks_unlinked_partition_config(),
+        Ok("locks-root-own-unlinked-partition") => locks_root_own_unlinked_partition_config(),
         Ok("locks-delegated-partition") => locks_delegated_partition_config(),
         Ok("locks-released-writes") => with_lock_writes(locks_released_delegated_config(), "d2"),
         Ok("locks-failover-backup-writes") => with_lock_writes(locks_failover_backup_config(), ""),
@@ -7865,6 +7866,7 @@ fn base_config(label: &str) -> SimConfig {
         "locks-unlinked-delegated-dbackup-random" => locks_unlinked_random_config(true),
         "locks-unlinked-delegated-blips" => locks_unlinked_blips_config(),
         "locks-unlinked-delegated-partition" => locks_unlinked_partition_config(),
+        "locks-root-own-unlinked-partition" => locks_root_own_unlinked_partition_config(),
         "locks-delegated-partition" => locks_delegated_partition_config(),
         "locks-released-delegated" => locks_released_delegated_config(),
         "locks-writes" => with_lock_writes(locks_config(), ""),
@@ -18120,6 +18122,32 @@ fn locks_unlinked_partition_config() -> SimConfig {
         lock_io_ms: c.lock_io_ms,
         faults: c.faults,
         ..locks_unlinked_delegated_config()
+    }
+}
+
+/// ADR-55: the root holds its own sticky stream on `d1` (`far-root-writes`),
+/// the lock files live in it and are unlinked under their locks (a grant of
+/// the root's own generation leaves the subtree with the stream's batch, and
+/// the root and the generation share one lock table and one barrier map);
+/// a locker is cut from the others long enough to be outwaited, turns are
+/// written from the root's own stream, and the root crashes and a backup
+/// takes the lease over. Pins `Core::lock_install_leaving`'s re-tag and
+/// the barrier `Core::deleg_drop_left` leaves.
+fn locks_root_own_unlinked_partition_config() -> SimConfig {
+    let c = locks_partition_config();
+    SimConfig {
+        lock_files: c.lock_files,
+        lock_ratio: c.lock_ratio,
+        lock_dir: Some("d1".into()),
+        lock_unlink_ratio: 0.2,
+        lock_ios: c.lock_ios,
+        lock_io_ms: c.lock_io_ms,
+        faults: c
+            .faults
+            .into_iter()
+            .chain(far_root_writes_config().faults)
+            .collect(),
+        ..with_lock_writes(far_root_writes_config(), "d1")
     }
 }
 
