@@ -1261,6 +1261,18 @@ fn put(meta: &Meta, rows: &[MemberTx]) {
     meta.member_copy_put_rows(1, 3, rows).unwrap();
 }
 
+/// The copy of `epoch` as `(first, last, has records)`, after a check that it
+/// is contiguous from its first row (what `backup_acked` reads).
+fn shape(meta: &Meta, epoch: u64) -> Vec<(u64, u64, bool)> {
+    let (_, rows) = meta.member_copy_rows(epoch).unwrap().unwrap();
+    for pair in rows.windows(2) {
+        assert_eq!(pair[1].tx.first, pair[0].tx.last + 1, "a gap in the copy");
+    }
+    rows.iter()
+        .map(|r| (r.tx.first, r.tx.last, !r.tx.records.is_empty()))
+        .collect()
+}
+
 /// The archive carries a row (its identity, or its own epoch's segment): the
 /// copy is dropped.
 #[test]
@@ -1283,16 +1295,20 @@ fn the_member_copy_is_dropped_when_the_archive_carries_it() {
         .apply_segment_rows(1, 2, 2, &[1, 2], &[], &reship, &TouchSet::default())
         .unwrap();
     assert_eq!(applied.member.retired, 1);
-    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
-    assert_eq!(rows.iter().map(|r| r.tx.first).collect::<Vec<_>>(), [3, 4]);
+    // Row 1 is a hole now (D6): rows 3 and 4 with records stay above it, and
+    // the copy stays contiguous to them.
+    assert_eq!(shape(&meta, 1), [(1, 2, false), (3, 3, true), (4, 4, true)]);
     // The holder's own epoch's late segment carries the second by row.
     let late = vec![create("b", ino(2), 11)];
     let applied = meta
         .apply_segment_rows(2, 1, 3, &[3], &[], &late, &TouchSet::default())
         .unwrap();
     assert_eq!(applied.member.retired, 1);
-    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
-    assert_eq!(rows.iter().map(|r| r.tx.first).collect::<Vec<_>>(), [4]);
+    // Row 3 is a hole too; row 4 with records still stays above both.
+    assert_eq!(
+        shape(&meta, 1),
+        [(1, 2, false), (3, 3, false), (4, 4, true)]
+    );
     // The last by another re-ship; the copy is gone.
     let reship = vec![
         LogRecord::TailOf { epoch: 1, jseq: 4 },
@@ -1301,6 +1317,88 @@ fn the_member_copy_is_dropped_when_the_archive_carries_it() {
     apply_rows(&meta, 3, 2, 4, &[3, 4], &reship);
     assert_eq!(meta.member_copy(1).unwrap(), None);
     assert!(meta.member_copy_epochs().unwrap().is_empty());
+}
+
+/// Three own rows in the copy of epoch 1.
+fn put_three(meta: &Meta) {
+    put(
+        meta,
+        &[
+            mtx(1, 1, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(2, 2, RowCommit::ROOT_GROUP, vec![create("b", ino(2), 11)]),
+            mtx(3, 3, RowCommit::ROOT_GROUP, vec![create("c", ino(3), 12)]),
+        ],
+    );
+}
+
+/// The holder's own epoch confirms the row `first` (a row shipped ahead of a
+/// deferred one): the log carries it.
+fn confirm_own(meta: &Meta, seq: u64, first: u64, rec: LogRecord) {
+    apply_rows(meta, seq, 1, 0, &[first], &[rec]);
+}
+
+/// The log carries a row of epoch 1 by identity (a re-ship's `TailOf`).
+fn reship_of(meta: &Meta, seq: u64, jseq: u64, rec: LogRecord) {
+    let recs = vec![LogRecord::TailOf { epoch: 1, jseq }, rec];
+    apply_rows(meta, seq, 2, jseq, &[jseq], &recs);
+}
+
+/// M1: a row the log covers while a row with records stays above it leaves a
+/// record-less span, not a gap: the copy stays contiguous, so its
+/// `backup_acked` (a self-claim's `through`) reaches the rows above. (Fails
+/// before: the copy read `[1, 3]`.)
+#[test]
+fn a_covered_row_below_a_kept_row_leaves_a_hole() {
+    let meta = Meta::open_in_memory().unwrap();
+    put_three(&meta);
+    confirm_own(&meta, 1, 2, create("b", ino(2), 11));
+    assert_eq!(shape(&meta, 1), [(1, 1, true), (2, 2, false), (3, 3, true)]);
+}
+
+/// M2 (negative control): a covered row above every row that stays leaves
+/// nothing.
+#[test]
+fn a_covered_row_above_every_kept_row_leaves_nothing() {
+    let meta = Meta::open_in_memory().unwrap();
+    put_three(&meta);
+    confirm_own(&meta, 1, 3, create("c", ino(3), 12));
+    assert_eq!(shape(&meta, 1), [(1, 1, true), (2, 2, true)]);
+}
+
+/// M3 (quiescence): the hole goes in the same pass as the last row with
+/// records above it, and the copy with it.
+#[test]
+fn a_covered_hole_goes_with_the_last_row_above_it() {
+    let meta = Meta::open_in_memory().unwrap();
+    put_three(&meta);
+    confirm_own(&meta, 1, 2, create("b", ino(2), 11));
+    // The row above the hole is carried: the hole above row 1 goes with it.
+    reship_of(&meta, 2, 3, create("c", ino(3), 12));
+    assert_eq!(shape(&meta, 1), [(1, 1, true)]);
+    // The last row is carried: nothing is left.
+    reship_of(&meta, 3, 1, create("a", ino(1), 10));
+    assert_eq!(meta.member_copy(1).unwrap(), None);
+    assert!(meta.member_copy_epochs().unwrap().is_empty());
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+}
+
+/// M4 (hold): a row the log covers releases its read hold when it becomes a
+/// hole, whether or not the hole stays.
+#[test]
+fn a_covered_row_releases_its_hold_when_it_becomes_a_hole() {
+    let meta = Meta::open_in_memory().unwrap();
+    deposed_with_two_rows(&meta);
+    assert_eq!(meta.read_hold_stats().holds, 2);
+    let (_, rows) = meta.member_copy_rows(1).unwrap().unwrap();
+    let first = rows[0].tx.first;
+    confirm_own(&meta, 1, first, create("a", ino(1), 10));
+    // The first row is a hole below the second; its hold is gone.
+    let after = shape(&meta, 1);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(!after[0].2 && after[1].2, "{after:?}");
+    assert_eq!(meta.read_hold_stats().holds, 1);
+    assert!(!meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "a".into())]));
+    assert!(meta.member_copy_touches(&[ReadKey::Dentry(ROOT_INO, "b".into())]));
 }
 
 /// A marker's `TailFollowsThrough` drops the rows the sealer's hold did not

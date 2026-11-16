@@ -4907,6 +4907,131 @@ mod verbatim_append_tests {
         assert!(!matches!(recs.first(), Some(LogRecord::TailOf { .. })));
     }
 
+    /// The gap shape (a hole in a self-sealed copy): rows a (deferred), b (shipped
+    /// ahead), c (unshipped), all own `ROOT_GROUP`. The self-seal copies a, b, c; `cover` then
+    /// confirms b (between the seal and the claim); the claim appends the
+    /// copy and takes `backup_acked` as `through`. Returns (tip, through,
+    /// report, c carried by journal or member copy after the gate).
+    fn gap_run(
+        cover: impl FnOnce(&Meta, &[u64]),
+        deposed: u8,
+    ) -> (u64, u64, crate::ReshipReport, bool) {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        own_row(&meta, "a", 14, RowCommit::ROOT_GROUP);
+        own_row(&meta, "b", 15, RowCommit::ROOT_GROUP);
+        own_row(&meta, "c", 16, RowCommit::ROOT_GROUP);
+        let b_first = first_of(&meta, rid(15));
+        let b_last = row_of(&meta, rid(15)).1.last;
+        let b_seqs: Vec<u64> = (b_first..=b_last).collect();
+        // Self-seal (seal_tail_hold case 1): the journal from the acked
+        // watermark becomes the member copy of epoch 1.
+        let from = meta.journal_acked_seq().unwrap() + 1;
+        let rows = meta.journal_member_rows_from(from).unwrap();
+        meta.member_copy_put_rows(1, 2, &rows).unwrap();
+        if deposed == 1 {
+            meta.strand_deposed(2).unwrap();
+        }
+        cover(&meta, &b_seqs);
+        if deposed == 2 {
+            meta.strand_deposed(2).unwrap();
+        }
+        // The claim (prepare_tail_for_claim, self-sealed branch).
+        let (_, copy) = meta.member_copy(1).unwrap().unwrap();
+        let tip = copy.iter().map(|t| t.last).max().unwrap();
+        meta.backup_append(1, &copy).unwrap();
+        let through = meta.backup_acked(1).unwrap();
+        let carried = Default::default();
+        let proof = Default::default();
+        let marker = vec![LogRecord::TailFollowsThrough {
+            prev_epoch: 1,
+            through,
+        }];
+        meta.set_holder_epoch(2);
+        let report = meta
+            .reship_at_takeover(
+                Some(crate::store::spec::StrandArgs {
+                    epoch: 2,
+                    own_gens: &[],
+                    abandoned: None,
+                    carried: &carried,
+                    proof: &proof,
+                    marker: &marker,
+                }),
+                Some(crate::store::spec::TailArgs {
+                    epoch: 1,
+                    through,
+                    config_version: 3,
+                    class: None,
+                }),
+            )
+            .unwrap();
+        meta.flush_held_releases();
+        let in_journal = journal(&meta)
+            .iter()
+            .any(|(_, recs)| recs.contains(&LogRecord::Completed { rid: rid(16) }));
+        let in_copy = meta.member_copy_carries(rid(16)).unwrap();
+        (tip, through, report, in_journal || in_copy)
+    }
+
+    /// Every row past the confirmed one survives the gate: nothing is
+    /// dropped as past a gap, the whole copy is applied (c and the rows
+    /// before it), and the tripwire stays 0.
+    fn gap_assert(run: (u64, u64, crate::ReshipReport, bool), applied: usize) {
+        let (tip, through, report, kept) = run;
+        assert_eq!(through, tip, "the copy's hold reaches its tip");
+        assert_eq!(report.tail_beyond_gap, 0, "{report:?}");
+        assert_eq!(report.tail_own_gated_beyond_gap, 0, "{report:?}");
+        assert_eq!(report.tail_applied, applied, "{report:?}");
+        assert!(kept, "c, answered to its client, is lost");
+    }
+
+    /// G1 (order V1): b's confirm is the shipper's ack (`ack_rows_tx`) between
+    /// the self-seal and the claim, c still in the journal at the gate. Fails
+    /// before: b left a gap in the copy, `through` stopped below it and the
+    /// gate dropped c (a debug build trips the tripwire's assertion).
+    #[test]
+    fn a_confirm_between_self_seal_and_claim_keeps_the_rows_past_it() {
+        gap_assert(
+            gap_run(|meta, seqs| meta.ack_journal_rows_at(seqs, 1).unwrap(), 0),
+            2,
+        );
+    }
+
+    /// G2 (order V3, the core's order): the ship of b lands after the seal,
+    /// then the deposition's recovery strands a and c before the claim.
+    #[test]
+    fn a_confirm_after_the_deposition_strand_keeps_the_rows_past_it() {
+        gap_assert(
+            gap_run(|meta, seqs| meta.ack_journal_rows_at(seqs, 1).unwrap(), 2),
+            2,
+        );
+    }
+
+    /// G3 (order V2): the deposition's recovery stranded the journal first;
+    /// b's confirm comes from the log (`member_cover_own_rows_tx`, as a
+    /// segment apply of the node's own epoch does).
+    #[test]
+    fn an_own_drop_segment_cover_keeps_the_rows_past_it() {
+        gap_assert(
+            gap_run(
+                |meta, seqs| {
+                    let mut tx = meta.db.write_tx();
+                    meta.member_cover_own_rows_tx(&mut tx, 1, seqs).unwrap();
+                    tx.commit().unwrap();
+                },
+                1,
+            ),
+            2,
+        );
+    }
+
+    /// Negative control: no confirm between the seal and the claim.
+    #[test]
+    fn no_confirm_between_self_seal_and_claim_keeps_the_rows() {
+        gap_assert(gap_run(|_, _| {}, 0), 3);
+    }
+
     /// Test 14: a deposed root's own stream rows are holder rows: the
     /// deposition strands the root's rows of the older epoch and leaves the
     /// stream's (neither rolled back nor member-copied).

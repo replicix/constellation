@@ -70135,3 +70135,13 @@ wake-ups, one `Journaled` per root-own-stream write and one `Nudge` per sealed c
 handlers only trigger work over the current state (checked: neither depends on a payload or a count). Tests: a flood of
 writes or nudges queues one; the ordering test for a wake-up that races with the clear; a real engine under a flood
 ships its journal and answers a drain.
+
+- Member-copy gap (gapfix): `member_rules_tx` removed a copy row the log covers with no hole, so a row shipped ahead
+  and confirmed between a self-seal and the claim left a gap in the middle of the copy. `backup_acked`, a self-claim's
+  `through` and a later claimant's answer from the copy stopped below the gap, and the gate (rule 2) dropped the own
+  `Group{Root}` rows past it, answered ones included (found by the sim in `metered-shared` seed 218, where none had been
+  answered; the unit shapes lose an answered row). A covered row with records now leaves a record-less hole while a row
+  with records stays above it, and the hole goes in the pass of the last such row (as `backup_trim` and bce0ea2d do).
+  Tests: three orders of the confirm (`a_confirm_between_self_seal_and_claim_keeps_the_rows_past_it` and two more), the
+  hole/quiescence/hold tests in `member_copy.rs`, and the pin of seed 218. The tripwire `tail_answer_gaps` checks every
+  tail answer where the gap forms (a self-claim's copy and a fetched tail).

@@ -1717,7 +1717,14 @@ included), so the tenure's order and each stream's `idx` order hold. A moved
 append keeps the class it was journaled under (`Singleton`), never the tail's
 `Group`: the root's group never committed it, and a `Group` row in a later
 member copy would be queued for replay by rid on an abandon, the root
-re-executing a delegate's row.
+re-executing a delegate's row. A copy row the log covers while a row with
+records stays above it is kept as a record-less hole, with its read hold
+released, until the last such row retires (the member-copy twin of a backup's
+hole, D6); removed outright it left a gap in the middle of a self-sealed copy,
+so the copy's contiguous hold stopped below it, a self-claim's `through` with
+it, and the gate dropped the answered rows past the gap (`metered-shared` seed
+218). A tail answer that is not contiguous is a bug, and the sim fails a seed
+that gives one (`tail_answer_gaps`).
 
 **C2c (plan 43)**: a delegate acknowledges once its group holds the row. The
 generation's configuration is a log record, `DelegGroup { dir, gen, version,

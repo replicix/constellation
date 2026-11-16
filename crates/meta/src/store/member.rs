@@ -1747,6 +1747,9 @@ pub(crate) fn member_rules_tx(
         // Holes no row with records stays above, and the highest row with
         // records that stays (see the hole rule below).
         let mut retire_holes: Vec<(Vec<u8>, u64)> = Vec::new();
+        // Rows this pass retired by coverage, kept as holes while a row with
+        // records stays above them (their holds are released already).
+        let mut covered_holes: Vec<(Vec<u8>, u64)> = Vec::new();
         let mut live_above: Option<u64> = None;
         for row in rows_in(&*tx, meta, e)? {
             let (first, last) = (row.tx.first, row.tx.last);
@@ -1763,9 +1766,39 @@ pub(crate) fn member_rules_tx(
                         || f.rows.contains(&first)
                         || (f.through > 0 && last <= f.through)));
             if covered {
-                tx.remove(&meta.backup_tail, key);
                 meta.release_row_tx(tx, member_epoch(e), first);
-                out.retired += 1;
+                // The log carries the row, and a row with records above it
+                // may stay (one shipped ahead of a deferred one, confirmed
+                // after a self-seal): the copy stays contiguous to that row
+                // (D6, as `backup_trim` keeps a row shipped ahead), so a
+                // record-less span takes its place until nothing with
+                // records stays above it. Removed outright, the copy's
+                // contiguous hold (`backup_acked`, a self-claim's `through`)
+                // stopped below the gap and the gate dropped the answered
+                // rows past it.
+                // (A hole is not a row retired: one the copy kept from an
+                // earlier pass is not counted again.)
+                if !row.tx.records.is_empty() {
+                    out.retired += 1;
+                    let hole = MemberTx {
+                        tx: crate::BackupTx {
+                            first,
+                            last,
+                            records: Vec::new(),
+                            origin: (0, 0),
+                        },
+                        class: row.class,
+                        rid: None,
+                        op: None,
+                        lock_tag: LockTag::NONE,
+                    };
+                    tx.insert(
+                        &meta.backup_tail,
+                        key.clone(),
+                        postcard::to_allocvec(&hole)?,
+                    );
+                }
+                covered_holes.push((key, first));
                 continue;
             }
             if f.own {
@@ -1867,6 +1900,13 @@ pub(crate) fn member_rules_tx(
                 live_above = live_above.max(Some(first));
             }
             left += 1;
+        }
+        for (key, first) in covered_holes {
+            if live_above.is_some_and(|live| live > first) {
+                left += 1;
+                continue;
+            }
+            tx.remove(&meta.backup_tail, key);
         }
         for (key, first) in retire_holes {
             if live_above.is_some_and(|live| live > first) {
