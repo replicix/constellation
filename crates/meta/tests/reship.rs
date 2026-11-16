@@ -1388,9 +1388,10 @@ fn the_successors_copy_has_no_gap_below_its_top_row() {
 }
 
 /// The tail of epoch 1 the successor re-ships in the tests below: rows 1, 4
-/// and 6 with records, a hole at 2, a row whose rid is done on the successor
-/// at 3 and a hole above the top at 7. Its member copy has fillers at 2-3 and
-/// 5.
+/// and 6 move with records; row 5 has records too, but duplicates row 1's
+/// identity (a dedup), so it is a filler; a hole at 2, a row whose rid is done
+/// on the successor at 3 and a hole above the top at 7. Its member copy has
+/// fillers at 2-3 and 5, and nothing at 7.
 fn gapped_tail() -> Vec<BackupTx> {
     vec![
         tx(1, 1, row(7)),

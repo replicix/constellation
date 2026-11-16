@@ -1727,10 +1727,11 @@ it, and the gate dropped the rows past the gap, answered ones included
 is not contiguous is a bug, and the sim fails a seed that gives one
 (`tail_answer_gaps`). Member copies keep the tail's holes: a successor's copy
 of a sealed tail it re-ships holds a record-less row for every transaction of
-the sealed prefix below its top moved row that it does not keep with records (a hole, a
-delegate's row, a dedup, one the log carries or a drop-held retired), and a
-backup's copy kept at the next epoch keeps holes and delegates' rows as holes in
-`(shipped, acked]`, trimmed above its top row with records (none: no copy). A
+the sealed prefix below its top moved row that it does not keep with records
+(a hole, a delegate's row, a dedup, one the log carries or a drop-held
+retired), and a backup's copy kept at the next epoch keeps holes and delegates'
+rows as holes in `(shipped, acked]`, trimmed above its top row with records
+(none: no copy). A
 claimant that fetches the copy (`seal_tail_hold` case 3) then counts its
 contiguous hold to the top, so its gate no longer drops the answered rows past
 a missing hole (`metered-shared+links` seed 1238 with slow lease reads showed the

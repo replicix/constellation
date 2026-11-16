@@ -2387,3 +2387,64 @@ fn a_filler_the_log_settles_is_refused_and_the_copy_stays_contiguous() {
     );
     assert_eq!(shape(&meta, 1), [(3, 3, false), (4, 4, true)]);
 }
+
+/// SH1 (a): a rebuild whose log carries one row leaves the filler below a row
+/// with records that stays: the copy keeps both, contiguous to its top (what
+/// `backup_acked` reads).
+#[test]
+fn a_rebuild_keeps_the_filler_below_a_row_that_stays() {
+    let meta = Meta::open_in_memory().unwrap();
+    let foreign = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 7 },
+        create("a", ino(1), 10),
+    ];
+    meta.member_copy_put_rows(
+        2,
+        3,
+        &[
+            mtx(1, 1, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(2, 2, RowCommit::ROOT_GROUP, vec![create("b", ino(2), 11)]),
+            mtx(3, 3, RowCommit::ROOT_GROUP, foreign.clone()),
+        ],
+    )
+    .unwrap();
+    let side = Meta::open_in_memory().unwrap();
+    apply_rows(&side, 1, 3, 2, &[1, 2], &foreign);
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    // The carried row left; the filler stays below the row that remains.
+    assert_eq!(shape(&meta, 2), [(1, 1, false), (2, 2, true)]);
+    let (_, rows) = meta.member_copy_rows(2).unwrap().unwrap();
+    assert_eq!(rows.last().map(|r| r.tx.last), Some(2), "the top");
+}
+
+/// SH1 (b): an abandon whose `through_known` covers the copy keeps the rows
+/// with records at or below it and the holes below the last of them; the
+/// holes above it go. (Guards against over-dropping: the holes at 1 and 3
+/// stay.)
+#[test]
+fn an_abandon_keeps_the_holes_below_the_last_kept_row_and_drops_those_above() {
+    let meta = Meta::open_in_memory().unwrap();
+    put(
+        &meta,
+        &[
+            mtx(1, 1, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(2, 2, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(3, 3, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(4, 4, RowCommit::ROOT_GROUP, vec![create("b", ino(2), 11)]),
+            mtx(5, 5, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(6, 6, RowCommit::ROOT_GROUP, Vec::new()),
+        ],
+    );
+    let marker = vec![LogRecord::GroupAbandoned {
+        epoch: 1,
+        gen: 0,
+        through_known: 6,
+    }];
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &marker, &TouchSet::default())
+        .unwrap();
+    assert_eq!(
+        shape(&meta, 1),
+        [(1, 1, false), (2, 2, true), (3, 3, false), (4, 4, true)]
+    );
+}

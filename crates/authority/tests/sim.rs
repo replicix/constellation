@@ -7092,11 +7092,8 @@ fn regression_a_successors_member_copy_keeps_the_tails_holes_seed_1238() {
         "the seed no longer fetches a tail"
     );
     assert!(
-        report
-            .stats
-            .values()
-            .any(|s| s.seal_tail_member_copy > 0 || s.inherited_tail_fetches > 0),
-        "no member-copy or inherited-tail answer was served: the pin would pass vacuously"
+        report.stats.values().any(|s| s.seal_tail_member_copy > 0),
+        "no member-copy answer was served: the pin would pass vacuously"
     );
     for (id, stats) in &report.stats {
         assert_eq!(stats.tail_answer_gaps, 0, "node {id}");
