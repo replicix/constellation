@@ -213,13 +213,13 @@ impl WakeCoalesce {
     /// Whether a `Journaled` is queued (as far as the flag knows).
     #[cfg(test)]
     pub(crate) fn journaled_queued(&self) -> bool {
-        self.journaled.load(std::sync::atomic::Ordering::Acquire)
+        self.journaled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether a `Nudge` is queued (as far as the flag knows).
     #[cfg(test)]
     pub(crate) fn nudge_queued(&self) -> bool {
-        self.nudge.load(std::sync::atomic::Ordering::Acquire)
+        self.nudge.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

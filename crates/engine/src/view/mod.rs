@@ -270,22 +270,6 @@ pub(crate) fn kind_out(kind: InodeKind) -> FileKind {
     }
 }
 
-impl SyncHandle {
-    /// Wake the driver for a sync round, unless a wake-up is queued.
-    pub(crate) fn wake_nudge(&self) {
-        if self.coalesce.as_ref().is_none_or(|c| c.nudge_turn()) {
-            let _ = self.tx.send(SyncRequest::Nudge);
-        }
-    }
-
-    /// Wake the driver to stream the journal, unless a wake-up is queued.
-    pub(crate) fn wake_journaled(&self) {
-        if self.coalesce.as_ref().is_none_or(|c| c.journaled_turn()) {
-            let _ = self.tx.send(SyncRequest::Journaled);
-        }
-    }
-}
-
 /// A view's handle to the metadata sync task.
 pub struct SyncHandle {
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
@@ -332,6 +316,22 @@ pub struct SyncHandle {
     /// driver into the core's ack tracker so `acked_through` has no gaps
     /// for the holder to stall behind.
     pub acked: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl SyncHandle {
+    /// Wake the driver for a sync round, unless a wake-up is queued.
+    pub(crate) fn wake_nudge(&self) {
+        if self.coalesce.as_ref().is_none_or(|c| c.nudge_turn()) {
+            let _ = self.tx.send(SyncRequest::Nudge);
+        }
+    }
+
+    /// Wake the driver to stream the journal, unless a wake-up is queued.
+    pub(crate) fn wake_journaled(&self) {
+        if self.coalesce.as_ref().is_none_or(|c| c.journaled_turn()) {
+            let _ = self.tx.send(SyncRequest::Journaled);
+        }
+    }
 }
 
 /// Everything [`View::new`] needs besides the two filesystem
