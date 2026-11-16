@@ -986,7 +986,11 @@ every grant it holds
   refuses until a node has taken over (with the lease released it says so: a
   write on any node takes it; ADR-55 gives a root its own sticky
   streams, and a follower's table can be behind the log), and the leave is run
-  on the new root, where the abandon comes first as above.
+  on the new root, where the abandon comes first as above. When the gone
+  root carries a frozen continuation epoch no node can take over: a member
+  of the epoch runs the leave first, which fences the root's leases and
+  leaves the epoch without retiring it (it answers "fenced, not retired
+  yet"), and the leave is then run on the root that takes over.
 
 A designee answers its rows at once, and its commits reach the OS, not
 the disk, so a power loss can drop the end of its journal. Nothing ends

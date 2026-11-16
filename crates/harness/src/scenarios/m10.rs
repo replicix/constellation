@@ -361,11 +361,11 @@ pub fn epoch_slack_zero_unchanged(_seed: u64) -> Result<()> {
 /// (its journal is lost with it, but the write A acknowledged is on B's
 /// hold copy and survives on B and C). B gets S3 back; its epoch is frozen
 /// (A is missing) and B stays silent, so no TTL takeover can pass. The
-/// operator retires A from B: the lease is fenced (epoch bump, A in its
-/// `retired` list), B abandons the epoch and promises again; C comes back
-/// and B takes the lease over with C's promise. A's state dir can never
-/// mount again (the registry tombstone), and nothing else it had is
-/// served.
+/// operator fences A from B (`leave --node-id`: A's lease is fenced, epoch
+/// bump, A in its `retired` list; A is not retired yet): B abandons the
+/// epoch and promises again; C or B takes the lease over. The operator then
+/// retires A on the new root. A's state dir can never mount again (the
+/// registry tombstone), and nothing else it had is served.
 pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
     const NAME: &str = "epoch-holder-retired";
     let (env, root) = setup(NAME)?;
@@ -425,8 +425,20 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
         anyhow::ensure!(n(&e, "takeovers_refused_promises") > 0, "C: {e}");
         Ok(())
     })?;
-    // The operator retires A.
-    b.leave(Some(a_id), true)?;
+    // The operator fences A from B: A's leases are fenced and B leaves the
+    // epoch, but A is not retired (ADR-61: only a root retires a node).
+    let fenced = b.leave(Some(a_id), true);
+    let msg = format!(
+        "{:#}",
+        fenced
+            .as_ref()
+            .err()
+            .context("B's leave of A retired it (expected: fenced, not retired yet)")?
+    );
+    anyhow::ensure!(
+        msg.contains("fenced") && msg.contains("not retired"),
+        "{msg}"
+    );
     eventually("B abandons the epoch", Duration::from_secs(30), || {
         let e = epoch_of(&b)?;
         anyhow::ensure!(
@@ -484,6 +496,47 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
     }
     // (Its entry, not its bytes: the chunk of an epoch's write stays on the
     // node that wrote it, and died with A.)
+    // The operator retires A on the node that took over (the root).
+    let new_root = {
+        let mut found = None;
+        eventually("a root holds the lease", Duration::from_secs(30), || {
+            for x in [&b, &c] {
+                if lease_of(x)?["held"] == true {
+                    found = Some(x.name.clone());
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("no root yet: B {} C {}", lease_of(&b)?, lease_of(&c)?)
+        })?;
+        found.context("no root")?
+    };
+    let root_node = if new_root == b.name { &mut b } else { &mut c };
+    let mut abandoned = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match root_node.leave(Some(a_id), true) {
+            Ok(()) => break,
+            Err(e) => {
+                let e = format!("{e:#}");
+                if e.contains("repair abandon") && !abandoned {
+                    root_node
+                        .control(
+                            "repair.abandon",
+                            serde_json::json!({"node": a_id, "force": true}),
+                        )
+                        .context("repair abandon --node A --force")?;
+                    abandoned = true;
+                } else {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "the root never retired A: {e}"
+                    );
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+    eprintln!("    {NAME}: A retired on the root {new_root} (abandon first: {abandoned})");
     // A can never come back under its old identity.
     pa.heal();
     let mut a = node(root.path(), "a", &pa, &backend, &[])?;

@@ -667,7 +667,9 @@ The price: a TTL takeover by a node that reaches S3 now needs `f`
 promises, so `f` close to `N` can block TTL failover while a crashed
 holder stays away (`fs set` refuses `f ≥ N` and warns when
 `f > N − 2`); an admin `leave --node-id` fences the retired node's
-leases. Writes inside an epoch are acknowledged on the hold owner's disk
+leases (on a member of a frozen epoch that the dead carrier carries it
+fences without retiring, and the root that then takes over retires it:
+ADR-61). Writes inside an epoch are acknowledged on the hold owner's disk
 alone. A member that can still reach S3 declines to join. A node that
 enrolls during an epoch is a known gap.
 
@@ -5598,7 +5600,14 @@ alone while a holder it does not count writes. The model's property is
   that a released lease is taken by a write on any node); the
   operator runs the leave on the root that takes over, whose generations are
   the log's, and again if it is refused. The sim's `sticky-leave-root`
-  asks any node when none holds the lease.
+  asks any node when none holds the lease. When the dead root carries a
+  frozen continuation epoch (ADR-22) no node can take over, because the
+  members publish no promise while it is open. A member of that epoch then
+  fences the root with `leave --node-id`: its leases are fenced (no
+  tombstone), the member leaves the epoch, and the leave answers that the
+  node is fenced and not retired yet. The operator retires it on the root
+  that takes over, as above. Consequence: two commands, and the node stays
+  on the roster, fenced, until the second. The core is unchanged.
 - The recall an admin leave starts is `RecallCause::Leave`, an operator's action
   of the standing of `undelegate`: `sticky_ends_only_by_holder_or_operator`
   allows it (the one oracle relaxation of the step).

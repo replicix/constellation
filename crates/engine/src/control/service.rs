@@ -1288,6 +1288,26 @@ impl EngineControl {
     ) -> std::result::Result<String, String> {
         match node_id {
             Some(target) => {
+                // A member of a frozen epoch the target carries: no node
+                // can take over while the epoch is open, so no root can
+                // retire the target (ADR-22, ADR-61). Fence it and leave
+                // the epoch; the root that then takes over retires it.
+                if self.epochs.frozen_carrier() == Some(target) {
+                    let store = self.store.clone();
+                    let epochs = self.epochs.clone();
+                    let self_id = self.node_id;
+                    let partitions = tokio::task::block_in_place(|| {
+                        self.rt.block_on(leave::fence_frozen_carrier(
+                            store, &epochs, self_id, target, force,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                    return Err(leave::LeaveError::CarrierFenced {
+                        node_id: target,
+                        partitions,
+                    }
+                    .to_string());
+                }
                 // Leave ends grants first (plan 46 M1.2 step 11): the root
                 // ends every delegation of the node, by its release if it
                 // is alive, else at the expiry, before its registry entry

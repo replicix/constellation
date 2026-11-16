@@ -70090,3 +70090,9 @@ the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and
 - S1 review follow-ups: the tripwire skips a row the log already carries; an own gated row that carries a `TailOf`
   and lies past `through` is counted too; the moved set is computed only with a strand; tests pin the quiescence
   (no read hold left on a moved row's copy) and the tail class restored after a moved row.
+- epoch-holder-retired (ehrfix): the scenario deadlocked against ADR-61's dead-root rule (no takeover while the dead
+  carrier's epoch is open, no retirement of the carrier before a takeover). `leave --node-id` on a member of a frozen
+  epoch carried by the target now fences the carrier's leases and leaves the epoch locally (`LeaveError::CarrierFenced`:
+  fenced, not retired yet); the root that takes over retires it with the normal leave. The core and ADR-61 are unchanged.
+  Tests `a_member_leaves_an_epoch_whose_frozen_carrier_it_fenced`, `fence_frozen_carrier_fences_without_retiring`, and the
+  harness scenario.

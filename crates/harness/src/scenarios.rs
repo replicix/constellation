@@ -1304,7 +1304,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "epoch-holder-retired",
-        desc: "plan 30 M10: f = 1; A and B form an epoch carrying A's lease, A writes and is killed; B's frozen epoch keeps everyone out until the operator retires A (leave --node-id: the lease is fenced), B abandons the epoch, writes resume through a takeover with a promise, and A's state dir can never mount again",
+        desc: "plan 30 M10: f = 1; A and B form an epoch carrying A's lease, A writes and is killed; B's frozen epoch keeps everyone out until the operator fences A from B (leave --node-id: the lease is fenced, A is not retired yet), B abandons the epoch, writes resume through a takeover with a promise, the operator retires A on the new root, and A's state dir can never mount again",
         requires: &[],
         caps: &[],
         run: m10::epoch_holder_retired,

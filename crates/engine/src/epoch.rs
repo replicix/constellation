@@ -763,6 +763,36 @@ impl EpochManager {
         if roster.contains(&carrier.node) || carrier.node == self.node_id {
             return false;
         }
+        self.abandon_open_epoch(carrier.node, "its carrier was retired (admin leave)")
+    }
+
+    /// The carrier of this node's open, frozen epoch, when this node is a
+    /// member that does not own the hold (`None` otherwise): no takeover
+    /// can pass while it is open (ADR-22), so the carrier is fenced from
+    /// here.
+    pub fn frozen_carrier(&self) -> Option<u64> {
+        if !self.is_open() || !self.is_frozen() || self.claim.lock().unwrap().epoch_held {
+            return None;
+        }
+        self.carrier()
+            .0
+            .map(|c| c.node)
+            .filter(|n| *n != self.node_id)
+    }
+
+    /// This node fenced the carrier's leases (`leave --node-id` on a
+    /// member): it leaves the epoch now and may promise, so a takeover
+    /// can pass. Returns whether it abandoned.
+    pub fn abandon_for_fenced_carrier(&self, carrier: u64) -> bool {
+        if self.frozen_carrier() != Some(carrier) {
+            return false;
+        }
+        self.abandon_open_epoch(carrier, "its carrier's leases were fenced (admin leave)")
+    }
+
+    /// The shared body: a member that does not own the hold closes its
+    /// open epoch.
+    fn abandon_open_epoch(&self, carrier: u64, why: &'static str) -> bool {
         if self.claim.lock().unwrap().epoch_held {
             return false;
         }
@@ -779,9 +809,8 @@ impl EpochManager {
         }
         self.sync_flags();
         tracing::warn!(
-            carrier = carrier.node,
-            "continuation epoch abandoned: its carrier was retired (admin leave); \
-             its unflushed journal is lost"
+            carrier,
+            "continuation epoch abandoned: {why}; its unflushed journal is lost"
         );
         true
     }
@@ -1033,6 +1062,60 @@ mod tests {
         // The carrier survives a restart of the coordinator.
         let again = EpochManager::new(1, meta, constellation_net::Peers::disabled());
         assert_eq!(again.carrier().0.map(|c| c.node), Some(2));
+    }
+
+    /// A member of a frozen epoch whose carrier is dead fences it from
+    /// here (`leave --node-id`) and leaves the epoch: only a frozen
+    /// epoch, only the carrier, never the hold's owner.
+    #[tokio::test]
+    async fn a_member_leaves_an_epoch_whose_frozen_carrier_it_fenced() {
+        let (m, meta) = manager(1, 1);
+        assert!(accepted(&m.handle_propose(
+            "e".into(),
+            vec![1, 2],
+            vec![],
+            2,
+            1
+        )));
+        m.handle_activate(EpochActivation {
+            epoch_id: "e".into(),
+            members: vec![1, 2],
+            base: vec![],
+            carrier: Some(EpochCarrier {
+                node: 2,
+                epoch: 1,
+                expires_unix_ms: 5,
+            }),
+            stale_below: 1,
+        });
+        assert!(m.is_active());
+        assert_eq!(m.frozen_carrier(), None, "active: not frozen");
+        assert!(!m.abandon_for_fenced_carrier(2));
+        assert!(m.is_open());
+        // Peers are unreachable: the epoch freezes.
+        m.check_liveness().await;
+        assert!(m.is_frozen());
+        assert_eq!(m.frozen_carrier(), Some(2));
+        // Not the carrier: nothing happens.
+        assert!(!m.abandon_for_fenced_carrier(3));
+        assert!(m.is_open());
+        // The hold's owner keeps its epoch.
+        m.set_claim_view(EpochClaimView {
+            epoch_held: true,
+            ..Default::default()
+        });
+        assert_eq!(m.frozen_carrier(), None);
+        assert!(!m.abandon_for_fenced_carrier(2));
+        assert!(m.is_open());
+        m.set_claim_view(EpochClaimView::default());
+        assert!(m.abandon_for_fenced_carrier(2));
+        assert!(!m.is_open() && !m.is_frozen());
+        assert_eq!(m.frozen_carrier(), None);
+        assert!(
+            meta.promise_issue(1_000, constellation_platform::clock::protocol().now())
+                .unwrap(),
+            "promises again"
+        );
     }
 
     /// A member that reaches S3 declines a proposal and persists no

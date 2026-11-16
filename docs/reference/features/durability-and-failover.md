@@ -1274,7 +1274,8 @@ Operational rules:
 - `fs set epoch-slack` refuses `f ≥ N` and warns when `f > N − 2`: a
   single crashed holder then blocks TTL failover until it returns or is
   retired with `constellation leave --node-id`, which also fences its
-  leases.
+  leases. On a member of the frozen epoch the holder carries, the leave
+  fences without retiring; run it again on the root that takes over.
 - A node that holds delegations leaves them first. A self-leave releases
   the node's streams and waits until the root holds the release rows; the
   admin form (`leave --node-id`) is run on the node that holds the root
@@ -1559,7 +1560,8 @@ promises cannot gate it. Epochs are kept away from such leases instead:
   barrier waits one more renewal round trip.
 - A node that enrolls during an open epoch is not accounted for.
 - An epoch's hold owner that dies leaves the other members frozen until
-  it returns or is retired.
+  it returns, or a member fences it (`leave --node-id`) and the new root
+  retires it.
 - A member that dies holding the only copy of a chunk its epoch write
   named (a forwarded close; nothing reaches S3 during an epoch): other
   members reading that file get `EIO` (never other bytes), and the hold
@@ -1692,7 +1694,9 @@ A filesystem created with `--ack-policy s3` uses no backups.
 have evidence for the lease key being claimed. Either enough nodes are unreachable
 that an epoch could be holding the lease, or `f` is too large for the
 cluster. Bring nodes back, retire the dead holder with
-`constellation leave --node-id`, or lower `f`.
+`constellation leave --node-id` (on a member of its frozen epoch this fences
+the holder and leaves the epoch; run it again on the root that then takes
+over), or lower `f`.
 
 ### An application hangs in `fsync` during a bucket outage
 
