@@ -809,6 +809,10 @@ pub struct TailArgs {
     pub class: Option<RowCommit>,
 }
 
+/// Own appends that follow a re-journaled committed row (identity to the
+/// class each was journaled under): `Meta::appends_behind_own_committed_tx`.
+type FollowingAppends = HashMap<(u64, u64), RowCommit>;
+
 /// What [`Meta::reship_at_takeover`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReshipReport {
@@ -5220,7 +5224,7 @@ impl Meta {
                 // removed the file the delegate had created after it).
                 // The segment retires it by origin.
                 if tx.get(&self.completed, rid.to_key())?.is_some() {
-                    // (A marked call has no superseded root append to strand.)
+                    // (A marked call must not commit a strand and then skip the apply.)
                     debug_assert!(!sup_stranded || !marked);
                     if marked {
                         tx.commit()?;
@@ -6510,22 +6514,20 @@ impl Meta {
     /// re-journaled row keeps it), and, second, the identities of this
     /// node's own committed (`gen == 0`, gated) rows past `through`, which
     /// the tail never re-ships (the tripwire of `reship_epochs_at_takeover`).
-    #[allow(clippy::type_complexity)]
     fn appends_behind_own_committed_tx(
         &self,
         tx: &impl Readable,
         tails: &[(TailArgs, Vec<crate::BackupTx>)],
-    ) -> Result<(HashMap<(u64, u64), RowCommit>, HashSet<(u64, u64)>), MetaError> {
+    ) -> Result<(FollowingAppends, HashSet<(u64, u64)>), MetaError> {
         let mut out = HashMap::new();
         let mut own_gated_past = HashSet::new();
         for (t, txs) in tails {
             let mut committed_from: Option<u64> = None;
             for bt in txs {
-                if bt.records.is_empty()
-                    || crate::store::member::tail_identity(&bt.records).is_some()
-                {
+                if bt.records.is_empty() {
                     continue;
                 }
+                let has_ident = crate::store::member::tail_identity(&bt.records).is_some();
                 let Some(j) = local::get_journal_tx_head(tx, self, bt.first)? else {
                     continue;
                 };
@@ -6537,6 +6539,15 @@ impl Meta {
                     .map(|(_, rec)| rec)
                     .collect();
                 if own != bt.records {
+                    continue;
+                }
+                if has_ident {
+                    // An own row an earlier gate re-journaled (it carries
+                    // its `TailOf`): it starts no range, but past `through`
+                    // it is a committed row the tail cannot re-ship.
+                    if j.gen == 0 && j.class.gated() && bt.last > t.through {
+                        own_gated_past.insert((t.epoch, bt.first));
+                    }
                     continue;
                 }
                 // (Only a gated own row can precede an append here: a
@@ -6629,7 +6640,12 @@ impl Meta {
         // of the row the tail re-journals (S1), and ahead of an earlier append
         // of its own stream that moves. Computed before `tail_idents`: the
         // moved rows are re-applied by this gate, so they name a copy too.
-        let (follows, own_gated_past) = self.appends_behind_own_committed_tx(&tx, &tail_txs)?;
+        // (Only with a strand: it is the strand that takes the moved rows out.)
+        let (follows, own_gated_past) = if strand.is_some() {
+            self.appends_behind_own_committed_tx(&tx, &tail_txs)?
+        } else {
+            Default::default()
+        };
         // Only the transactions this takeover re-applies name a copy:
         // a hole names nothing, and one past the sealed prefix
         // (`bt.last > through`) is counted `tail_beyond_gap` and never
@@ -6666,7 +6682,9 @@ impl Meta {
                 }
                 let follower = follows.get(&(t.epoch, bt.first));
                 if bt.last > t.through && follower.is_none() {
-                    if strand.is_some() && own_gated_past.contains(&(t.epoch, bt.first)) {
+                    if own_gated_past.contains(&(t.epoch, bt.first))
+                        && !self.session().row_in_log(t.epoch, bt.last)
+                    {
                         // Not reached by any sweep (S1 spec 2): `through` is
                         // the sealed copy's tip for a self-sealed claim. The
                         // row was answered to its client and is lost here.
@@ -7016,7 +7034,7 @@ impl Meta {
         staged: &UsageTracker,
         args: StrandArgs<'_>,
         tail_idents: &HashSet<(u64, u64)>,
-        follows: &HashMap<(u64, u64), RowCommit>,
+        follows: &FollowingAppends,
     ) -> Result<StrandPart, MetaError> {
         let StrandArgs {
             epoch,

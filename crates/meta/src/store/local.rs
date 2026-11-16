@@ -4436,10 +4436,22 @@ mod verbatim_append_tests {
         meta: &Meta,
         through: impl FnOnce(&[crate::BackupTx]) -> u64,
     ) -> crate::ReshipReport {
+        seal_and_reclaim_as(meta, through, None, |_| {})
+    }
+
+    /// [`seal_and_reclaim`] with the class the tail's rows are re-journaled
+    /// under (`TailArgs.class`, the successor's configuration).
+    fn seal_and_reclaim_as(
+        meta: &Meta,
+        through: impl FnOnce(&[crate::BackupTx]) -> u64,
+        class: Option<RowCommit>,
+        before_gate: impl FnOnce(&Meta),
+    ) -> crate::ReshipReport {
         let rows = meta.journal_member_rows_from(1).unwrap();
         meta.member_copy_put_rows(1, 2, &rows).unwrap();
         let txs: Vec<crate::BackupTx> = rows.into_iter().map(|m| m.tx).collect();
         meta.backup_append(1, &txs).unwrap();
+        before_gate(meta);
         let through = through(&txs);
         let carried = Default::default();
         let proof = Default::default();
@@ -4457,7 +4469,7 @@ mod verbatim_append_tests {
                 epoch: 1,
                 through,
                 config_version: 3,
-                class: None,
+                class,
             }),
         )
         .unwrap()
@@ -4711,7 +4723,27 @@ mod verbatim_append_tests {
             matches!(class_b, RowCommit::Singleton { .. }),
             "{class_b:?}"
         );
-        let report = seal_and_reclaim(&meta, |txs| txs.iter().map(|t| t.last).min().unwrap());
+        // A read hold on b's epoch-1 copy row (what a strand that copied it
+        // would have set): the gate re-applies b's identity, so it must go.
+        let first_b = first_of(&meta, rid(16));
+        let report = seal_and_reclaim_as(
+            &meta,
+            |txs| txs.iter().map(|t| t.last).min().unwrap(),
+            None,
+            |m| {
+                let mut tx = m.db.write_tx();
+                m.hold_row_tx(
+                    &mut tx,
+                    crate::store::member::member_epoch(1),
+                    first_b,
+                    crate::KeySet::from_records(&b),
+                    None,
+                )
+                .unwrap();
+                tx.commit().unwrap();
+                assert_eq!(m.read_holds().len(), 1);
+            },
+        );
         // A moved row keeps the class it was appended with (never the
         // tail's `Group`: the root's group did not commit it).
         let (_, row_b, _) = row_of(&meta, rid(16));
@@ -4727,6 +4759,13 @@ mod verbatim_append_tests {
         assert_eq!(report.tail_own_gated_beyond_gap, 0);
         assert_eq!(report.tail_beyond_gap, 0);
         assert_eq!(report.tail_applied, 2);
+        // Quiescence: the hold on b's epoch-1 copy row went with the re-ship
+        // (b's identity is one the gate re-applied, past `through` too).
+        assert!(
+            meta.read_holds().is_empty(),
+            "a hold outlived the gate: {:?}",
+            meta.read_holds()
+        );
         // Exactly once: the delegate's re-stream of b dedups against the
         // re-journaled row.
         assert!(!meta
@@ -4766,6 +4805,39 @@ mod verbatim_append_tests {
         assert_eq!((r1.gen, r1.idx), (gen, 1));
         assert_eq!((r2.gen, r2.idx), (gen, 2));
         assert_eq!(meta.log_stream_idx(gen).unwrap(), 2);
+    }
+
+    /// S1 (class): with the class a successor passes (`TailArgs.class`), a
+    /// moved append keeps its own `Singleton`, and the committed rows around
+    /// it (one after it too) take the tail's class: the nested guard restores
+    /// it.
+    #[test]
+    fn a_moved_append_keeps_its_class_and_the_rows_after_it_the_tails() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        own_row(&meta, "a", 14, RowCommit::ROOT_GROUP);
+        let b = vec![create("b", 2), LogRecord::Completed { rid: rid(16) }];
+        assert!(meta
+            .apply_delegate_tx(&b, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        own_row(&meta, "c", 15, RowCommit::ROOT_GROUP);
+        let class_b = row_of(&meta, rid(16)).1.class;
+        let tail_class = RowCommit::group(3, GroupOn::Root);
+        let report = seal_and_reclaim_as(
+            &meta,
+            |txs| txs.iter().map(|t| t.last).max().unwrap(),
+            Some(tail_class),
+            |_| {},
+        );
+        assert_eq!(report.tail_applied, 3);
+        let (at_a, row_a, _) = row_of(&meta, rid(14));
+        let (at_b, row_b, _) = row_of(&meta, rid(16));
+        let (at_c, row_c, _) = row_of(&meta, rid(15));
+        assert!(at_a < at_b && at_b < at_c, "{:?}", journal(&meta));
+        assert_eq!(row_b.class, class_b);
+        assert_eq!(row_a.class, tail_class);
+        assert_eq!(row_c.class, tail_class);
     }
 
     /// Negative control: an own append past `through` with no committed own
@@ -4818,10 +4890,21 @@ mod verbatim_append_tests {
     fn an_own_committed_row_past_through_is_reported() {
         let meta = Meta::open_in_memory().unwrap();
         meta.set_holder_epoch(1);
+        let gen = 9;
         own_row(&meta, "c", 14, RowCommit::ROOT_GROUP);
+        // An append behind c stays too: a gated row past `through` starts
+        // no range.
+        let d = vec![create("d", 2), LogRecord::Completed { rid: rid(16) }];
+        assert!(meta
+            .apply_delegate_tx(&d, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        let first_before = first_of(&meta, rid(16));
         let report = seal_and_reclaim(&meta, |_| 0);
-        assert_eq!(report.tail_beyond_gap, 1);
+        assert_eq!(report.tail_beyond_gap, 2);
         assert_eq!(report.tail_own_gated_beyond_gap, 1);
+        let (_, _, recs) = row_of(&meta, rid(16));
+        assert_eq!(first_of(&meta, rid(16)), first_before);
+        assert!(!matches!(recs.first(), Some(LogRecord::TailOf { .. })));
     }
 
     /// Test 14: a deposed root's own stream rows are holder rows: the

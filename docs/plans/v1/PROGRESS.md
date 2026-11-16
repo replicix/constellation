@@ -70082,5 +70082,11 @@ the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and
   Tripwire `ReshipReport.tail_own_gated_beyond_gap` (error log, debug assert, behaviour unchanged) counts an own
   committed row past `through`, which the gate cannot re-ship; the fix for that class belongs in where `through` comes
   from and needs its own spec.
-- Review NITs: the 876 unit test asserts each rid once and the re-journaled `TailOf` and origin; the locks sim's
-  `check_visible` now runs after the watermark wait (more lenient, and it matches production admission: accepted).
+- Review NITs: the 876 unit test asserts each rid once and the re-journaled `TailOf` and origin. The locks sim's
+  `check_visible` runs after the watermark wait (landed in cac24379; more lenient, and it matches production
+  admission: accepted), and this round only comments it. `Meta::install_streamed_committed`'s early return asserts that a marked
+  call stranded nothing superseded (it must not commit a strand and then skip the apply), and rule 5 of
+  `member_rules_tx` is noted as removed together with stage 2's refuse-and-retry.
+- S1 review follow-ups: the tripwire skips a row the log already carries; an own gated row that carries a `TailOf`
+  and lies past `through` is counted too; the moved set is computed only with a strand; tests pin the quiescence
+  (no read hold left on a moved row's copy) and the tail class restored after a moved row.
