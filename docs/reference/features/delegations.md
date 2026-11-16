@@ -94,8 +94,10 @@ is left: a file system written before is recreated.
   A recalled stream is ended before the node's next grant opens another.
 - A stream never mixes grant kinds: it holds stealable grants (`Placed`, or
   a manual `delegate`), or sticky grants, or designations. A grant of
-  another kind waits until the stream is released, or, for a designation on a
-  node holding a stealable stream, until that stream is recalled.
+  another kind is refused while the stream is live (a sticky grant to a node
+  that holds stealable ones: `undelegate` them first). A designation on a node
+  holding a stealable stream recalls that stream first and is made once it
+  has ended.
 - The root directory itself is never delegated.
 - No delegation is made inside a continuation epoch. When an epoch
   opens, the root recalls every live generation; delegation resumes
@@ -153,8 +155,8 @@ through the delegate. It then:
      node's op costs one round trip to the root, and one more from the
      root to its backup when it has one, or the root's next ship when it
      has none (the root pushes the commit as it rises).
-   - With a backup recorded (a `DelegateNodeGroup` record naming it) the group is
-     the delegate and that backup, chosen by RTT to the delegate, exactly
+   - With a backup recorded (a `DelegateNodeGroup` record naming it) the group
+     is the delegate and that backup, chosen by RTT to the delegate, exactly
      like the root's (see [Durability and failover](durability-and-failover.md)).
      The root is never the delegate's backup. The delegate counts the backup
      only once *its own replica's table* records it — the record is
@@ -260,7 +262,8 @@ syncs it again every second while an install waits (the segment's records
 are not the only way the wait ends: a journal that could not be read waits
 too). The end counts as applied once the cut it carries is kept
 (`deleg_void_cut`), which applying the segment does also when the record
-was installed from the stream before and not applied again. `status.delegation.install_waiting` lists a waiting
+was installed from the stream before and not applied again.
+`status.delegation.install_waiting` lists a waiting
 install with what it waits for, `install_waits` and `install_wait_ms` count
 them, and a warning goes out after 5 s of waiting and every minute after.
 In the simulation's sweeps without a partition the wait is rare and short
@@ -741,7 +744,8 @@ acknowledgements it parked for a row past the cut are aborted (`Busy`: the
 requester retries by rid at the generation's new owner); a park at or below
 the cut releases once the log's index of the generation reaches it — the
 archive's, never "the row left this journal", which a recall's strand does
-too. 
+too.
+
 The record reaches the other tables later than it ends the
 generation at the root, under an S3 cut only after the cut. Until then
 the recalled delegate answers lock requests and renewals for the subtree
@@ -1271,22 +1275,26 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   (`root-failover-with-delegates`). The backup that takes over
   re-journals the predecessor's appends of delegate streams under their
   delegation origin, in the predecessor's order; if it was itself a
-  delegate, its own unappended transactions are rolled back and
-  replayed by rid after that tail, never shipped ahead of it. Every
-  generation the node holds is marked in that same local transaction (a
-  holed one: its stream now has a hole, the replayed rows are root
-  rows), so the node never executes in it again. The mark is also the
-  gate's fence: the strand, the tail and the replay are separate store
+  delegate, its own rows of the generation, which the gate's strand took out
+  ahead of the tail, go back into the journal after the tail, verbatim and
+  under their stream origin `(gen, idx)`, in index order
+  (`Core::reappend_own_delegate_rows`): the root's append of its own stream,
+  the row the group committed and the client was answered for, not a
+  re-execution by rid. A row the tail carries already is skipped by origin; a
+  row of a generation the tail ends, or one that does not continue the
+  stream, was never committed and its client retries by rid. The generation
+  still ends at that gate, and its stream counter is then the log's index of
+  it, past the re-appended rows (`Meta::end_own_streams_at_log`), so the
+  node never executes in it again. The mark of the end is also the gate's
+  fence: the strand, the tail and the re-append are separate store
   transactions, and the node's own writes in its subtree execute on the
-  store directly, admitted by a mirror of the delegation table that
-  lags the core by an event. A write admitted before the strand and
-  reaching the store's writer lock after it is refused there (the
-  store's `NotAdmitted`, nothing written) and goes through the core,
-  whose gate parks it until the replay is done: it lands after the
-  stranded rows, never before them under their names. The mark is never
-  cleared (generations are not reused). It ends the generation itself once its gate
-  opens; if it crashes or loses the lease first, it comes back as a
-  stopped delegate that answers a recall at the log's index of the
+  store directly, admitted by a mirror of the delegation table that lags the
+  core by an event. A write admitted before the strand and reaching the
+  store's writer lock after it is refused there (the store's `NotAdmitted`,
+  nothing written) and goes through the core, whose gate parks it until the
+  re-append is done. The mark is never cleared (generations are not reused).
+  If the node crashes or loses the lease before its gate opens, it comes back
+  as a stopped delegate that answers a recall at the log's index of the
   stream, and the next root ends it there. A generation the successor inherits is learned when its takeover gate
   opens, whichever round that is in.
   A deposed root's appends of a delegate's stream that never shipped are

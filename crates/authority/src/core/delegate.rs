@@ -19,9 +19,10 @@
 //! and the requester's `deps`, acknowledges, and streams the transactions to
 //! the root in stream order (`DelegateStream`, one batch in flight per
 //! generation). It acknowledges by the stream's configuration, not per row
-//! (`deleg_rule`): `RowCommit::Final` for a stream of sticky or designated
-//! grants, otherwise `RowCommit::Group` at the applied `DelegateNodeGroup`
-//! version, whose group is the delegate and its recorded backup, or the
+//! (`deleg_rule`, which returns a `CommitRule`; the journal stores it as a
+//! `RowCommit`): `Final` for a stream of sticky or designated grants, the
+//! archive's `Group` (no member) under `ack=s3`, otherwise `Group` at the
+//! applied `DelegateNodeGroup` version, whose group is the delegate and its recorded backup, or the
 //! delegate and the root when none is recorded (the root's append of the
 //! row, once the root's own tenure has committed it: `DelegateStreamAck`'s
 //! `committed`, ADR-41). No delegate answers from its disk alone: the root
@@ -61,9 +62,14 @@
 //! (`PARTIAL_RESENDS_BEFORE_RECALL`), and a holder that cannot release by a
 //! row answers with the cut it ends at. When the holder is silent the root
 //! outwaits a stealable grant (granted at `g`: `g + ttl + margin` on its
-//! clock) after asking the group's backup to seal and drain; a sticky grant
-//! or a designation is never taken back that way (it is refused, `EROFS` or
-//! `EXDEV`, until the holder releases or the operator abandons). The
+//! clock) after asking the group's backup to seal and drain. A cross-subtree
+//! op on a sticky grant or a designation is refused whatever the holder's
+//! reachability (`EXDEV` across the subtree, `EROFS` under it) and no
+//! `ReleaseRequest` is sent; the root's own sticky subtree is released
+//! instead (ADR-55). Such a grant ends only by the holder's release (its own
+//! leave's `LeaveNote` included), the operator's abandon, `undelegate`, an
+//! operator's leave of the node (ADR-61), a continuation epoch opening
+//! (`recall_all`), and, for a designation, `online`. The
 //! generation then *ends*: a `DelegateNodeEnded` journaled with the cut — the
 //! root's cursor, or further when the root held the generation itself — and
 //! every later stream record of it refused. A generation whose latest

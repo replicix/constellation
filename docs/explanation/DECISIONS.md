@@ -2310,7 +2310,7 @@ not by itself rule out a node holding two generations (a hand split, or a
 whole directory beside a range): a row of one that depends on a row the
 other ended without is never acknowledged, appended or drained
 ([ADR-39](#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations),
-[delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-another-generation)).
+[delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-its-generation)).
 
 *No splits under `--cto strict`.* The listing of a split directory is
 answered by one sequencer, whose position does not cover the other
@@ -2429,7 +2429,7 @@ row as it reads it for a batch and forgets them once the log carries the
 row. The drain of a sealed tail still waits for a dependency that is only
 not here yet. `Lone` and non-stealable rows are unchanged.
 
-See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-another-generation);
+See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-its-generation);
 `crates/authority/src/core/delegate.rs` (`deleg_caps`, `deleg_note_xdeps`,
 `deleg_drain_tail`).
 
@@ -2501,6 +2501,12 @@ commit rule is a property of the configuration, fixed for a tenure.
    `constellation release <fs> [--wait]`), or the operator abandons. An
    optional self-fencing timeout is a setting, off by default. Placement
    is sticky (a long dwell; recall by request).
+   *Amended by M1.3 step 14 (2026-11-16)*: the full set of causes that end a
+   sticky stream is the holder's release (its own leave's `LeaveNote`
+   counts as one), the operator's abandon, `RecallCause::Undelegate`,
+   `RecallCause::Leave` (an operator's leave of the node, ADR-61) and
+   `RecallCause::Epoch` (a continuation epoch opening, `recall_all`); a
+   designation also ends by `online`.
 5. **The epoch hold is a group {owner, one member}**: its answers wait for
    one member's acknowledgement of the stream-ahead; a one-member epoch's
    hold is final.
@@ -2592,7 +2598,7 @@ answers lone, as the model's `lone_delegate`.
 diagnosis, the design, the milestones, the per-topology behaviour, the
 open questions); [plan 43](../plans/v1/done/43-commit-rule.md) (the
 rules, the invariants I1–I5, what continues); the arbiter study;
-[DESIGN §4](DESIGN.md#metadata-plane) and [§9](DESIGN.md#failure-handling),
+[DESIGN §4](DESIGN.md#4-metadata-plane) and [§9](DESIGN.md#9-failure-handling),
 which change with the code in each stage. Public sources: CockroachDB's
 parallel commits (the "never acknowledged before committed" property),
 Lustre's recovery overview (transno, `last_committed`, the client replay
@@ -2607,6 +2613,9 @@ Rethink the Sync (OSDI 2006).
 until plan 46 M1.2's member copy lands; M1.2 may revert it (below).
 Amends [ADR-33](#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)
 and plan 43 Q16.
+
+**Kept at plan 46 M1.2 (2026-11-16)**: the member copy did not replace it
+(`root_append_cap`, `root_committed`); no longer interim.
 
 **Amended by [ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)
 (2026-11-03)**: the push runs while the root is usable *or in a takeover

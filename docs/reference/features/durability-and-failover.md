@@ -322,6 +322,12 @@ lose them. So a claimant of a `Backup` lease first asks the group:
    (`backup_claim_grace_ms`) when it sits at one, after a TTL when the holder
    has restarted and forgot its sealers. A holder whose renewal has landed
    with a newer key than the claimant read refuses the seal.
+   At that self-reclaim the takeover gate re-journals the holder's committed
+   own rows at the journal's end, together with every own append of a
+   delegate's row behind the first of them, at any position and past the
+   tail's `through` too, so the log carries them in the tenure's order
+   (a delegate's program order holds); each moved row keeps the class it
+   was journaled with (`Singleton`, not the tail's `Group`).
 
 A member whose store cannot be read (what it holds, its tail, its seal, or
 whether its journal holds rows of the epoch) does not answer a seal at all.

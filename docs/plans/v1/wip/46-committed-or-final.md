@@ -7,12 +7,14 @@
 > `two-subtrees-one-stream-rename`, `ack-latency` topology 9) and the strict
 > flip of step 16 (2026-11-15: `acked_at_or_below_cut`, I2c and
 > `member_copies_drained` judge every configuration; `+report` is the opt-out).
-> M1.2 is not closed: the rest of step 16 (the exit sweep of every label ×
-> 2,000 on the flipped defaults, the harness catalogue on the exit build, the
-> fable review's blocking items, the docs and PROGRESS entries of the exit)
-> and §8's A/B/B/A of topologies 1–5 after M1.2, measured on the M1.2 exit
-> build, are open. The fold, `MutateOp::Records` and `RebuildReplica`'s
-> non-delegation branch moved from M1.2 to M2.x (below). M1.3 steps 0–5, 7,
+> The fable review of M1.2 has run and its B1 and B5 fixes landed; the
+> harness catalogue ran on `08aa3fa3` (294 pass, 2 fail;
+> `epoch-holder-retired` is fixed on main, `b5d53fe7`); the B4 A/B/B/A of
+> topologies 1–5 has run. M1.2 is not closed: still open are the
+> topology-2 forward-unlink slowdown (tmpfs +23 % p50), the `stress-ng-fs`
+> load failure, the quiet-box `hardlink-burst` gates, and the PROGRESS "M1.2
+> exit" and RESULTS.md entries. The fold, `MutateOp::Records` and
+> `RebuildReplica`'s non-delegation branch moved from M1.2 to M2.x (below). M1.3 steps 0–5, 7,
 > 8, 9, 10, 11 and 13, route fencing (ADR-47), the restart quarantine (ADR-46),
 > the roster singleton (ADR-50), the stale-clock re-check (ADR-52), the deadline
 > module (ADR-48) and late landing (ADR-49); M1.4 steps 0–5, 6a and the kept
@@ -375,7 +377,7 @@ DelegateNodeEnded { node, gen, through }                   // root record: the g
   with no lone delegate nothing a delegate answers is ever replayed. The fold
   and `MutateOp::Records` copies did not go in M1.2: the root's own rows and
   a gate's leftovers still use them, so they leave with the replay queue in
-  M2.1 (maintainer's agreement, recorded in PROGRESS).
+  M2.1 (per the M1.2 fable review, step 16).
 - **Generation numbers (ADR-43, 2026-11-04).** `DelegateNode.gen` is minted
   by the same rule as `Delegate.gen` today: `gen = epoch << 32 | n` by the
   root tenure that grants it, in its own epoch's block, `n` from the node's

@@ -4973,7 +4973,8 @@ oracle `acked_at_or_below_cut`, I2 (c) and `member_copies_drained` are strict
 on every configuration since plan 46 M1.2 step 16 (`CutMode::default()` is
 `Strict`, `SimConfig::strict_verbatim` defaults to true). The label `+report`
 is the opt-out: it makes the cut oracle count only (`Report::acked_past_cut`)
-and leaves I2 (c) and `member_copies_drained` unjudged. `+cut` and
+and leaves I2 (c) and `member_copies_drained` unjudged (unless
+`strict_identity` or `strict_durability` judge them). `+cut` and
 `+verbatim` name the strict settings and change nothing on the default.
 
 | Oracle | Judged | Counter (`Report`) | Flag |
