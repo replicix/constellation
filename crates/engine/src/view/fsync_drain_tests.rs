@@ -17,9 +17,9 @@ use constellation_vfs::{
 use replicix_chunkfmt::ChunkHash;
 use std::sync::Arc;
 
-struct Node {
-    engine: Arc<Engine>,
-    rt: tokio::runtime::Runtime,
+pub(super) struct Node {
+    pub(super) engine: Arc<Engine>,
+    pub(super) rt: tokio::runtime::Runtime,
     _dir: tempfile::TempDir,
 }
 
@@ -29,7 +29,7 @@ impl Drop for Node {
     }
 }
 
-fn node(fsync_s3: bool, write_mode: crate::writeback::WriteMode) -> Node {
+pub(super) fn node(fsync_s3: bool, write_mode: crate::writeback::WriteMode) -> Node {
     node_with(fsync_s3, write_mode, Some(None))
 }
 
@@ -76,7 +76,7 @@ fn node_with(
     }
 }
 
-fn view(node: &Node) -> Arc<super::View> {
+pub(super) fn view(node: &Node) -> Arc<super::View> {
     node.engine
         .open_view(
             crate::ViewSpec::new("/"),
@@ -92,7 +92,7 @@ fn cx(kind: OpKind, caller: &Caller) -> OpCtx<'_> {
 
 /// Create `name`, write `data` and close it — no `fsync` — as one process
 /// (`writer`) on `view`.
-fn write_and_close(view: &super::View, writer: &Caller, name: &str, data: &[u8]) -> u64 {
+pub(super) fn write_and_close(view: &super::View, writer: &Caller, name: &str, data: &[u8]) -> u64 {
     let root = view.view_root();
     let (entry, opened) = Blocking::run(|r| {
         view.create(
@@ -144,7 +144,7 @@ fn write_and_close(view: &super::View, writer: &Caller, name: &str, data: &[u8])
 }
 
 /// Open `ino` read-only on `view` as `caller`, `fsync` it, close it.
-fn open_fsync_close(view: &super::View, caller: &Caller, ino: u64) {
+pub(super) fn open_fsync_close(view: &super::View, caller: &Caller, ino: u64) {
     try_open_fsync_close(view, caller, ino).expect("fsync");
 }
 
@@ -207,7 +207,7 @@ fn in_bucket(node: &Node, hash: &ChunkHash) -> bool {
 }
 
 /// Bytes that do not repeat at any chunk boundary (xorshift).
-fn noise(seed: u64, len: usize) -> Vec<u8> {
+pub(super) fn noise(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed | 1;
     (0..len)
         .map(|_| {

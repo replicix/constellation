@@ -173,6 +173,8 @@ mod subtree_quota;
 #[cfg(test)]
 mod vfs_tests;
 #[cfg(test)]
+mod wake_coalesce_tests;
+#[cfg(test)]
 mod zero_copy_tests;
 
 pub(crate) use flush::SessionFate;
@@ -268,9 +270,28 @@ pub(crate) fn kind_out(kind: InodeKind) -> FileKind {
     }
 }
 
+impl SyncHandle {
+    /// Wake the driver for a sync round, unless a wake-up is queued.
+    pub(crate) fn wake_nudge(&self) {
+        if self.coalesce.as_ref().is_none_or(|c| c.nudge_turn()) {
+            let _ = self.tx.send(SyncRequest::Nudge);
+        }
+    }
+
+    /// Wake the driver to stream the journal, unless a wake-up is queued.
+    pub(crate) fn wake_journaled(&self) {
+        if self.coalesce.as_ref().is_none_or(|c| c.journaled_turn()) {
+            let _ = self.tx.send(SyncRequest::Journaled);
+        }
+    }
+}
+
 /// A view's handle to the metadata sync task.
 pub struct SyncHandle {
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
+    /// Coalesces this view's `Journaled` and `Nudge` wake-ups with the
+    /// driver ([`crate::sync::WakeCoalesce`]); `None`: one per call.
+    pub coalesce: Option<Arc<crate::sync::WakeCoalesce>>,
     /// `--fsync-mode s3`: fsync() returns only once the journal is in S3.
     pub fsync_s3: bool,
     /// Plan 39: the node's `fsync` policy (hard, or the opt-in soft
@@ -1257,7 +1278,7 @@ impl View {
     /// the record ships, the sooner other nodes tail it.
     pub(crate) fn nudge_sync(&self) {
         if let Some(h) = &self.sync {
-            let _ = h.tx.send(SyncRequest::Nudge);
+            h.wake_nudge();
         }
     }
 

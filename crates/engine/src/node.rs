@@ -313,6 +313,8 @@ pub struct Engine {
     acquire_deadline: Duration,
     write_mode: Arc<writeback::WriteModeState>,
     sync_tx: tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>,
+    /// The views' coalesced wake-ups (`crate::sync::WakeCoalesce`).
+    coalesce: Arc<crate::sync::WakeCoalesce>,
     peers: constellation_net::Peers,
     epochs: Arc<epoch::EpochManager>,
     designations: Arc<designation::DesignationManager>,
@@ -1225,6 +1227,7 @@ impl Engine {
         // The driver's urgent lane and what it shares with the peer
         // service off the core's step (`authority_driver::OffCore`).
         let (urgent_tx, urgent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let coalesce = Arc::new(crate::sync::WakeCoalesce::default());
         let off_core = Arc::new(crate::authority_driver::OffCore::for_config(&core_config));
         // One `OffCore` pairs with one `Core` (the driver built below is the
         // only one that hands lapses and takes snapshots through it): that
@@ -1285,6 +1288,7 @@ impl Engine {
                     off_core: off_core.clone(),
                     urgent_rx: Some(urgent_rx),
                     urgent_tx: Some(urgent_tx.clone()),
+                    coalesce: Some(coalesce.clone()),
                 },
                 sync_tx.clone(),
                 sync_rx,
@@ -1842,6 +1846,7 @@ impl Engine {
             acquire_deadline,
             write_mode,
             sync_tx,
+            coalesce,
             peers,
             epochs,
             designations,
@@ -2008,6 +2013,7 @@ impl Engine {
                 rt: self.rt.clone(),
                 sync: Some(SyncHandle {
                     tx: self.sync_tx.clone(),
+                    coalesce: Some(self.coalesce.clone()),
                     fsync_s3: self.fsync_s3,
                     fsync: self.fsync_waits.clone(),
                     cto_strict: self.cto_strict,
@@ -2705,6 +2711,11 @@ impl Engine {
     }
     pub fn meta(&self) -> &Arc<Meta> {
         &self.meta
+    }
+    /// The views' coalesced wake-ups of the driver.
+    #[cfg(test)]
+    pub(crate) fn coalesce(&self) -> &Arc<crate::sync::WakeCoalesce> {
+        &self.coalesce
     }
     pub fn store(&self) -> &Arc<ChunkStore> {
         &self.store

@@ -72,6 +72,7 @@ pub(super) fn holder_fs(
             rt: handle,
             sync: Some(SyncHandle {
                 tx,
+                coalesce: None,
                 fsync_s3: false,
                 fsync: crate::fsync_wait::default_waits(),
                 cto_strict: false,
@@ -2323,4 +2324,62 @@ fn lone_check_cost() {
             run(threads)
         );
     }
+}
+
+/// `stress-ng-fs`, single node holding its own sticky stream (ADR-55): each
+/// delegate fast-path write sent a payload-free `Journaled`, queued tens of
+/// thousands deep behind a drain and a `getlk`. With the views' wake-ups
+/// coalesced a flood of writes queues one, whatever their number; the next
+/// one queues again once the driver has taken it.
+#[test]
+fn a_flood_of_delegate_writes_queues_one_journaled() {
+    use constellation_meta::RowCommit;
+    const WRITES: u64 = 200;
+    let (mut fs, meta, dir, _tmp, mut core) = delegate_fs(RowCommit::FINAL, 0);
+    let wake = Arc::new(crate::sync::WakeCoalesce::default());
+    fs.sync.as_mut().unwrap().coalesce = Some(wake.clone());
+    let h = fs.sync.as_ref().unwrap();
+    for seq in 1..=WRITES {
+        let (op, rid) = delegate_create(dir, seq);
+        assert!(fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok());
+    }
+    assert_eq!(h.delegates.executed(), WRITES, "every write ran here");
+    assert_eq!(meta.delegate_idx(DELEG_GEN).unwrap(), WRITES);
+    let mut queued = Vec::new();
+    while let Ok(req) = core.try_recv() {
+        queued.push(req);
+    }
+    assert_eq!(
+        queued
+            .iter()
+            .filter(|r| matches!(r, SyncRequest::Journaled))
+            .count(),
+        1,
+        "{} requests queued for {WRITES} writes",
+        queued.len()
+    );
+    // The driver takes it and acts; the next write wakes it again.
+    wake.taken(&queued[0]);
+    let (op, rid) = delegate_create(dir, WRITES + 1);
+    assert!(fs.mutate_op_rebasable_with_rid(h, dir, &op, rid).is_ok());
+    assert!(matches!(core.try_recv(), Ok(SyncRequest::Journaled)));
+    assert!(core.try_recv().is_err());
+}
+
+/// The same for the sealed chunks' `Nudge`.
+#[test]
+fn a_flood_of_nudges_queues_one() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let (mut fs, _dir, mut core) = holder_fs(meta, false);
+    let wake = Arc::new(crate::sync::WakeCoalesce::default());
+    fs.sync.as_mut().unwrap().coalesce = Some(wake.clone());
+    for _ in 0..1000 {
+        fs.nudge_sync();
+    }
+    let first = core.try_recv().expect("one nudge queued");
+    assert!(matches!(first, SyncRequest::Nudge));
+    assert!(core.try_recv().is_err(), "more than one nudge queued");
+    wake.taken(&first);
+    fs.nudge_sync();
+    assert!(matches!(core.try_recv(), Ok(SyncRequest::Nudge)));
 }

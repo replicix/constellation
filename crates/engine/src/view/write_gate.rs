@@ -570,7 +570,7 @@ impl View {
                 // any event (`deleg_after_event`); a nudge would start a
                 // sync round per write, whose upload drain races the
                 // flush's own (each chunk uploaded twice).
-                let _ = h.tx.send(SyncRequest::Journaled);
+                h.wake_journaled();
                 return match result {
                     Ok((records, idx)) => {
                         // This replica holds the stream through `idx`

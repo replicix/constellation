@@ -154,6 +154,75 @@ pub(crate) fn roster_request(
     })
 }
 
+/// The views' wake-ups of the driver that carry nothing
+/// ([`SyncRequest::Journaled`], [`SyncRequest::Nudge`]), at most one of each
+/// queued. One per write (a delegate fast path's `Journaled`) and one per
+/// sealed chunk (a `Nudge`) queued 26,000 deep on a single node holding its
+/// own sticky stream (ADR-55) under `stress-ng-fs`, and a drain or a
+/// `getlk` behind them waited 30-60 s.
+///
+/// A view sends one only when its flag was clear ([`Self::journaled_turn`],
+/// [`Self::nudge_turn`]), and the driver clears the flag before it acts on
+/// the request ([`Self::taken`]). Both requests only make the core look at
+/// its current state (a step whose events stream the journal; a round over
+/// what is pending), none carries a payload or is counted, so one wake-up
+/// stands for all that were suppressed behind it: a view that finds the flag
+/// set journaled (or sealed) before it looked, so the request still queued
+/// is acted on after that and sees it; one that finds it clear sends a new
+/// request. The flag is cleared with an acquiring swap, which pairs with
+/// the sender's swap, so the state the sender left is visible to the
+/// driver's step after the clear.
+#[derive(Debug, Default)]
+pub struct WakeCoalesce {
+    journaled: std::sync::atomic::AtomicBool,
+    nudge: std::sync::atomic::AtomicBool,
+}
+
+impl WakeCoalesce {
+    /// Whether a [`SyncRequest::Journaled`] is to be sent now (none queued).
+    #[must_use]
+    pub fn journaled_turn(&self) -> bool {
+        !self
+            .journaled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Whether a [`SyncRequest::Nudge`] is to be sent now (none queued).
+    #[must_use]
+    pub fn nudge_turn(&self) -> bool {
+        !self.nudge.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// The driver has taken `req` off its queue and is about to act on it:
+    /// a wake-up sent from now on is queued again. Any other request does
+    /// not touch the flags (a `Nudge` another sender made, outside the
+    /// views, only clears early: one more request may then queue).
+    pub fn taken(&self, req: &SyncRequest) {
+        use std::sync::atomic::Ordering::AcqRel;
+        match req {
+            SyncRequest::Journaled => {
+                self.journaled.swap(false, AcqRel);
+            }
+            SyncRequest::Nudge => {
+                self.nudge.swap(false, AcqRel);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a `Journaled` is queued (as far as the flag knows).
+    #[cfg(test)]
+    pub(crate) fn journaled_queued(&self) -> bool {
+        self.journaled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a `Nudge` is queued (as far as the flag knows).
+    #[cfg(test)]
+    pub(crate) fn nudge_queued(&self) -> bool {
+        self.nudge.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
@@ -823,6 +892,120 @@ pub enum SyncRequest {
     Flush {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+}
+
+#[cfg(test)]
+mod wake_coalesce_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// What a view does after it journaled a row: the wake-up, if it is its
+    /// turn. Whether it was sent.
+    fn view_wakes(wake: &WakeCoalesce, tx: &mpsc::UnboundedSender<SyncRequest>) -> bool {
+        if wake.journaled_turn() {
+            tx.send(SyncRequest::Journaled).unwrap();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A burst of wake-ups queues one; the driver taking it opens the next.
+    #[test]
+    fn a_burst_of_wakeups_queues_one_until_the_driver_takes_it() {
+        let wake = WakeCoalesce::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sent = (0..1000).filter(|_| view_wakes(&wake, &tx)).count();
+        assert_eq!(sent, 1);
+        assert_eq!(rx.len(), 1);
+        // The other kind has its own flag.
+        assert!(wake.nudge_turn() && !wake.nudge_turn());
+        // The driver takes the `Journaled` (and acts): the next one queues.
+        let req = rx.try_recv().unwrap();
+        wake.taken(&req);
+        assert!(!wake.journaled_queued() && wake.nudge_queued());
+        assert!(view_wakes(&wake, &tx));
+        assert!(!view_wakes(&wake, &tx));
+        assert_eq!(rx.len(), 1);
+        // A request that is not a wake-up leaves the flags as they are.
+        let (reply, _) = tokio::sync::oneshot::channel();
+        wake.taken(&SyncRequest::Flush { reply });
+        assert!(wake.journaled_queued() && wake.nudge_queued());
+    }
+
+    /// The race the order of the driver's two steps decides: a view journals
+    /// a row after the driver took the wake-up and before it cleared the
+    /// flag. Its wake-up is not sent (the flag is still set), so the row
+    /// must be visible to what the driver does after the clear. (A driver
+    /// that cleared the flag after acting would leave the row unseen until
+    /// the next write.)
+    #[test]
+    fn a_wakeup_that_races_with_the_clear_is_not_lost() {
+        let wake = WakeCoalesce::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let rows = AtomicU64::new(0);
+        // A first row and its wake-up.
+        rows.fetch_add(1, Ordering::Release);
+        assert!(view_wakes(&wake, &tx));
+        // The driver took it off the queue ...
+        let req = rx.try_recv().unwrap();
+        // ... and a second row is journaled before it clears the flag: no
+        // wake-up is sent for it.
+        rows.fetch_add(1, Ordering::Release);
+        assert!(!view_wakes(&wake, &tx));
+        assert!(rx.try_recv().is_err());
+        // The driver clears the flag, then acts over the state as it is: it
+        // streams both rows.
+        wake.taken(&req);
+        assert_eq!(rows.load(Ordering::Acquire), 2, "a row went unseen");
+        // And a row journaled after the clear is woken for again.
+        rows.fetch_add(1, Ordering::Release);
+        assert!(view_wakes(&wake, &tx));
+    }
+
+    /// The same, with real threads: writers journal and wake as fast as they
+    /// can while a driver takes, clears and acts. Once the writers are done
+    /// and the driver has drained its queue, what it last saw is every row.
+    #[test]
+    fn a_driver_that_clears_before_acting_ends_up_seeing_every_row() {
+        const WRITERS: u64 = 4;
+        const ROWS: u64 = 20_000;
+        for _ in 0..20 {
+            let wake = Arc::new(WakeCoalesce::default());
+            let rows = Arc::new(AtomicU64::new(0));
+            let (tx, mut rx) = mpsc::unbounded_channel::<SyncRequest>();
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    let (wake, rows, tx) = (wake.clone(), rows.clone(), tx.clone());
+                    std::thread::spawn(move || {
+                        for _ in 0..ROWS {
+                            rows.fetch_add(1, Ordering::Release);
+                            view_wakes(&wake, &tx);
+                        }
+                    })
+                })
+                .collect();
+            drop(tx);
+            let driver = {
+                let (wake, rows) = (wake.clone(), rows.clone());
+                std::thread::spawn(move || {
+                    let mut seen = 0;
+                    // Ends when every sender is gone and the queue is empty.
+                    while let Some(req) = rx.blocking_recv() {
+                        wake.taken(&req);
+                        seen = rows.load(Ordering::Acquire);
+                    }
+                    seen
+                })
+            };
+            for w in writers {
+                w.join().unwrap();
+            }
+            assert_eq!(driver.join().unwrap(), WRITERS * ROWS, "a wake-up was lost");
+        }
+    }
 }
 
 #[cfg(test)]

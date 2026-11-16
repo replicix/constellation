@@ -405,6 +405,9 @@ pub struct DriverDeps {
     /// renewals ([`SyncRequest::LockRenewAnswered`]); `None` without a
     /// peer service (they go on the internal channel then).
     pub urgent_tx: Option<mpsc::UnboundedSender<SyncRequest>>,
+    /// The views' coalesced wake-ups ([`crate::sync::WakeCoalesce`]): their
+    /// flags are cleared here before the driver acts on one.
+    pub coalesce: Option<Arc<crate::sync::WakeCoalesce>>,
 }
 
 /// Plan 30 §M7: frames queued for one log-stream subscriber, at most
@@ -3463,6 +3466,11 @@ impl Driver {
     // ---- requests → events ----
 
     fn on_request(&mut self, req: SyncRequest) -> Option<Internal> {
+        // Before anything acts on it: a view's wake-up sent after this
+        // queues again (`WakeCoalesce`).
+        if let Some(c) = &self.deps.coalesce {
+            c.taken(&req);
+        }
         let control = |req: Control, reply: ControlReply| Some(Internal::Control { req, reply });
         match req {
             SyncRequest::Nudge => control(Control::Nudge, ControlReply::None),
