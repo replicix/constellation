@@ -612,11 +612,11 @@ The sections below and the code use the vocabulary of Vertical Paxos and Delos
 (plan 43). The **configuration master** is the versioned register that decides
 who may order writes and with which group: for the root, the lease object
 (`Lease`: holder, epoch, `backups`, `config_version`, `ack_policy`) with
-`nodes/` and `designations/`; for a delegation, the root's log (`Delegate`,
-`Recall`; `DelegationTable`). A **configuration** is one version of it, and its
+`nodes/` and `designations/`; for a delegation, the root's log (`DelegateNode`,
+`DelegateNodeGroup`, `DelegateNodeEnded`; `DelegationTable`). A **configuration** is one version of it, and its
 **group** is the nodes that hold the sequencer's rows under it: the holder and
-its listed backups, or a delegate and its recorded backup (`durable_jseq`,
-`deleg_stream_durable`). A row is **committed** when every member of the group
+its listed backups, or a delegate stream's delegate and its recorded backup,
+the root when none is recorded (`durable_jseq`, `deleg_stream_durable`). A row is **committed** when every member of the group
 in force when it was journaled holds it, or when a log segment carrying it
 landed. A **seal** is a member's persisted refusal of any further row of a
 configuration, which fences the old sequencer before a reconfiguration
@@ -659,8 +659,9 @@ renamed for the vocabulary.
 ### Local store
 
 (Each journal row records the commit rule it was written under and the
-version of the configuration in force, `RowCommit` — `Group { config_version, on }` (`on`: what
-the group waits on; kept until plan 46 M1.2 makes it one stream per node), `Final`, or `Singleton { config_version }` — stamped when the row is journaled
+version of the configuration in force, `RowCommit` — `Group { config_version, on }` (`on`: whose
+copies the group counts, `GroupOn::{Archive, Root, Delegate, Hold}`, the journal's
+stored form; it stayed after plan 46 M1.2 made one stream per node), `Final`, or `Singleton { config_version }` — stamped when the row is journaled
 from the one lookup of the configuration (`Core::rule_of`); a row of the
 configuration in force answered without a commit while lone, and a row of any version answered in an epoch's hold, is re-tagged `Singleton`, in its own version; since plan 46 M1.1 step 5 a row of a replaced configuration keeps its rule, and a change of the lease's configuration
 commits under the old rule and the new, [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)); plan 43 C1-2, plan 46 M1.1. A holder sealed by a claimant keeps its unshipped
@@ -730,14 +731,23 @@ delegations over the one log instead, below.)
 - **Records** are the namespace operations (`mkdir`, `create`, `unlink`,
   `rename`, `link`, `symlink`, `setattr`, `write_manifest`, xattrs,
   `snap_create`, `snap_delete`, `clone`, quota, atime) plus plan 30's
-  control records: `Completed { rid }` and `Refused { rid, errno }`
-  (exactly-once, below), `InboxAck` (the S3 inbox), `Delegate` and
-  `RecallCut` (the delegation table; `Recall` in older logs), and
-  `TailFollowsThrough` (a takeover that re-ships a predecessor's tail and
-  how far its hold reached; `TailFollows` in older logs), `TailOf` (the
-  identity of a re-shipped transaction: the journal that first held it,
+  control records: `Completed { rid }` and `Refused { rid, code }`
+  (exactly-once, below), `InboxAck` (the S3 inbox), the delegation records
+  (the root's `DelegateNode`, `DelegateNodeGroup` and `DelegateNodeEnded`,
+  and the delegate's own rows `SubtreeReleased` and `StreamReleased`: the
+  delegation table, below; they replaced `Delegate`, `Recall`, `RecallCut`
+  and `DelegGroup`), and `TailFollowsThrough` (a takeover that re-ships a
+  predecessor's tail and how far its hold reached; `TailFollows` in older
+  logs), `TailOf { epoch, jseq }` (the identity of a re-shipped
+  transaction: the journal and the first journal row that first held it,
   the first record of the re-shipped transaction, kept through any number of
-  re-ships), `GroupAbandoned` (an operator gave a group's rows up; §9) and `DropHeld` (the decision of an operator's `repair drop-held`: the transactions it rolled back, which members and backups retract and no replica lets into the log; §9). The set is an append-only registry, like the manifest
+  re-ships), `GroupAbandoned { epoch, gen, through_known }` (an operator gave
+  a group's rows up: in a takeover's marker for the root group, `gen` 0, and
+  beside the `DelegateNodeEnded` of a generation, `gen` the generation; §9)
+  and `DropHeld` (the decision of an operator's `repair drop-held`: the
+  transactions it rolled back, which members and backups retract and no
+  replica lets into the log, and the stream positions it fills with a no-op
+  row; §9). The set is an append-only registry, like the manifest
   entry types.
 - **The commit chain** (plan 28,
   [28-s3-native-metadata-store.md](../plans/v1/done/28-s3-native-metadata-store.md))
@@ -1019,46 +1029,64 @@ forwards waits for one S3 commit. §9 has the failover rules.
 
 ### Delegated sub-sequencers
 
-*Being replaced in part by
-[plan 46](../plans/v1/wip/46-committed-or-final.md) stage 1
-([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
-a grant goes to a node and covers a set of subtrees under one stream
-(`DelegateNode`, `SubtreeReleased`, `DelegateNodeGroup`,
-`DelegateNodeEnded` replace `Delegate`, `Recall`, `RecallCut`,
-`DelegGroup`); the lone delegate and its bounded lead (gone, M1.2 step 13), (hash-range splits
-are already deleted), the cross-generation dependency rule
-([ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations))
-and the 30 s placement windows go; far writers hold sticky non-stealable
-grants released by the holder. The one lease, one log, the ownership walk
-and cross-subtree recall stay. This text changes with the code.*
-
 One lease and one sequencer for the whole namespace would make every
 other writer pay a round trip to it, across an ocean if need be. So the
 root delegates subtrees to their dominant writers over P2P, keeping one
 lease and one log
 ([ADR-23](DECISIONS.md#adr-23-delegated-sub-sequencers-over-one-log),
-[Delegations](../reference/features/delegations.md)):
+[Delegations](../reference/features/delegations.md)). Since plan 46 stage 1
+([ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay))
+a grant goes to a *node* and covers a set of subtrees under one stream:
 
-- `Delegate { dir, node, gen }`, `DelegGroup { dir, gen, version, backups }`
-  and `RecallCut { dir, gen, through }` records keep a replicated
-  delegation table: who sequences a subtree, the generation's
-  configuration (its recorded backups, versions rising from 1), and the end
-  of a generation, which carries its cut (`through`: the rows the root
-  appended), so every replica reads it from the log and none infers it.
-  Delegations never overlap and never nest.
+- **The records** keep a replicated delegation table: who sequences a
+  subtree, the stream's configuration and the end of its generation. The root
+  journals three of them, and the delegate writes two as rows of its own
+  stream (none touches an inode or a dentry):
+  `DelegateNode { node, gen, dirs }` opens generation `gen` of `node` with
+  its first record, and a later record of the same generation *grows* the
+  live stream's set (a node has one stream, one group and one cut, however
+  many subtrees it holds); each of `dirs` is a `SubtreeGrant { dir, kind }`
+  with kind `Placed`, `Sticky` or `Designated`.
+  `DelegateNodeGroup { node, gen, version, backups }` is the stream's
+  configuration (versions rise from 1; no record means version 0 and no
+  backup, a group of the delegate and the root).
+  `DelegateNodeEnded { node, gen, through }` ends the generation and carries
+  its cut: `through` is the highest stream index the root appended (further
+  when the root held the generation itself), and every row of the generation
+  past it is void, never in the log and never acknowledged, so every replica
+  reads the cut from the record and none infers it. In the delegate's own
+  stream the holder writes `SubtreeReleased { node, gen, dir, at }` (it
+  releases one subtree; `at` is the last stream index that touched it) and
+  `StreamReleased { node, gen, through }` (it releases every subtree: an
+  unmount, a suspension, `constellation release`); the generation itself
+  ends with the root's `DelegateNodeEnded`. The table
+  (`DelegationTable`, one `NodeStream` per `(node, gen)` with an index from
+  each subtree's directory) is these records applied in log order; a commit
+  carries it and a bootstrapped replica learns it from the head commit. A
+  stream whose set is empty stays live until the root ends it. A stream never
+  mixes grant kinds: it holds stealable grants (`Placed`, or a manual
+  delegation) only, or sticky grants only, or designations only.
+  Delegations never overlap and never nest, and the root directory is not
+  delegated.
+  These replaced `Delegate { dir, node, gen }`, `Recall`,
+  `RecallCut { dir, gen, through }` and `DelegGroup { dir, gen, version,
+  backups }`, which kept one generation per directory, in plan 46 M1.2
+  step 8a; no reader of the old records is left, and a file system written
+  before is recreated.
   A generation number is minted by the root tenure that grants it and
   carries its epoch (`gen = epoch << 32 | n`, `n` from the node's counter,
   synced before the grant leaves), so two tenures (one of them deposed
   without knowing it) never mint the same number, and nothing a node keeps
   of a grant the log never carried is read as another grant's
   ([ADR-43](DECISIONS.md#adr-43-a-generation-number-carries-the-epoch-of-the-tenure-that-minted-it)).
-  A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s), is renewed by the
-  delegate, and is capped by the root lease. A core stuck in one step (a
-  store write behind a slow disk) does not lapse it: the delegate's lane
-  sends the renewals its core cannot, and the root's P2P service answers a
-  renewal itself while the root's core is stuck, extending only a window
-  its core opened and has not closed, under the lease certificate the core
-  publishes after every step
+  A placed or manual grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s), is
+  renewed by the delegate, and is capped by the root lease; a sticky grant or
+  a designation has no TTL and no renewal. A core stuck in one step (a
+  store write behind a slow disk) does not lapse a renewed grant: the
+  delegate's lane sends the renewals its core cannot, and the root's P2P
+  service answers a renewal itself while the root's core is stuck, extending
+  only a window its core opened and has not closed, under the lease
+  certificate the core publishes after every step
   ([ADR-23](DECISIONS.md#adr-23-delegated-sub-sequencers-over-one-log),
   amended by plan 41).
 - **Ownership** is a local ancestor walk: a dentry belongs to the
@@ -1073,63 +1101,96 @@ lease and one log
   replica: no replica ever holds a record whose causes are missing.
 - **A delegate acknowledges once its group holds the row** (plan 43 C2,
   [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
-  The generation's group is the delegate and the root — the root's
+  The rule is a property of the stream's configuration, not of the row: a row
+  carries the version of the `DelegateNodeGroup` configuration it was
+  journaled under (`RowCommit::Group { config_version, .. }`; `Final` for a
+  stream of non-stealable grants, whose rows are answered at once). With no
+  backup recorded the group is the delegate and the root: the root's
   append of the row, once its own tenure has committed it (shipped, or held
   by every backup it gates on; the root's acknowledgement carries that prefix
-  as `committed` beside the appended cursor `through`), is the second copy:
-  a row only the root's journal holds does not survive a root its backup has
-  sealed ([ADR-41](DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16),
-  an interim rule until plan 46 M1.2's member copy) — until a `DelegGroup`
-  record names a backup (chosen by RTT to *the delegate*, never the root):
-  then the delegate and that backup. The delegate counts a backup only once
+  as `committed` beside the appended cursor `through`), is the second copy,
+  because a row only the root's journal holds does not survive a root its
+  backup has sealed
+  ([ADR-41](DECISIONS.md#adr-41-a-delegate-counts-the-roots-copy-only-through-rows-the-roots-tenure-has-committed-interim-rule-for-q16),
+  as amended by plan 46 M1.1: its lone-journal branch is gone, and M1.2
+  kept the rule rather than reverting it). Once a `DelegateNodeGroup` record
+  names a backup (chosen by RTT to *the delegate*, never the root), the group
+  is the delegate and that backup. The delegate counts a backup only once
   its own replica's table records it, i.e. once the record is committed in
   the log; while a change it asked for is not recorded yet, an
   acknowledgement needs the members of both versions, and a backup leaves
   the record only once every index acknowledged through it is at or below
-  the root's cursor or in the log (the transposition of the lease's
-  add-then-record and remove-when-covered rules). A node that holds
-  several generations acknowledges a row only once the row's dependencies
-  on its other generations are committed too, so no acknowledged row rests
-  on a row another generation ended without, and a generation ends before
-  the first row with such a lost dependency
-  ([ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations)).
-  The class of an answer
-  is fixed when the row is journaled, and a retry of a rid whose row is
-  still uncommitted waits for the row like the first answer did. No delegate
-  answers from its disk alone (plan 46 M1.2 step 13,
+  the root's committed prefix or in the log (the transposition of the
+  lease's add-then-record and remove-when-covered rules). The node has one
+  stream, so its rows are one total order under one group and one cut: a row
+  has no dependency on an uncommitted row of another generation of the node,
+  and nothing is acknowledged past the cut without being in the sealed tail
+  (the cross-generation rule of
+  [ADR-39](DECISIONS.md#adr-39-a-delegates-group-acknowledgement-waits-for-the-rows-dependencies-on-its-other-generations)
+  was deleted with the state it guarded, M1.2 step 12). The class of an
+  answer is fixed when the row is journaled, and a retry of a rid whose row
+  is still uncommitted waits for the row like the first answer did. No
+  delegate answers from its disk alone (plan 46 M1.2 step 13,
   [ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
   the root grants a placed or manual delegation only to a node with a group
   within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (a recorded backup, or the root
-  itself within the budget; a budget of 0 admits no peer; the link is judged by its best round trip over the last placement tick, not its latest sample), so every answer of a delegate waits for its group
-  (the root's append, when no backup is recorded) and a writer with no peer in
-  budget is forwarded to the root until a sticky grant. A sticky or designated
-  grant is final. Another node's forward always waits for the root.
+  itself within the budget; a budget of 0 admits no peer; the link is judged
+  by its best round trip over the last placement tick, not its latest
+  sample), so every answer of a delegate waits for its group (the root's
+  append, when no backup is recorded) and a writer with no peer in budget is
+  forwarded to the root until a sticky grant. A sticky or designated grant is
+  final. Another node's forward always waits for the root.
   The delegate's own FUSE fast path writes
   first and waits for the group afterwards: it journals the row with the
-  class the core has published for the generation at the moment the row is
-  journaled, and returns once the
-  generation's commit point covers the row (a designee's rows at once); a delegation lost meanwhile puts the op in doubt
-  and it goes back through the core by rid. At the end of a generation the rows past its cut
-  that nobody was answered for are dropped, not replayed (their clients retry
-  by rid at the new owner); and a generation whose latest record names a backup is not ended
-  before that backup answers its seal, since rows acknowledged through it
-  may be nowhere else. A delegate whose journal may have lost its unsynced
-  end (it held the generation before a reboot) does not take it up again,
-  so the end goes through that backup or the root's cursor
+  commit rule the core has published for the generation at the moment the row
+  is journaled, and returns once the generation's commit point covers the row
+  (a designee's rows at once); a delegation lost meanwhile puts the op in
+  doubt and it goes back through the core by rid. At the end of a generation
+  the rows past its cut that nobody was answered for are dropped, not
+  replayed (their clients retry by rid at the new owner); and a generation
+  whose latest record names a backup is not ended before that backup answers
+  its seal, since rows acknowledged through it may be nowhere else (the
+  operator's `repair abandon` ends it at the root's cursor and journals
+  `GroupAbandoned { epoch: 0, gen, through_known }` in the same transaction as
+  the `DelegateNodeEnded`, the log's permanent record that rows the group may
+  have acknowledged past the cut are lost). A delegate whose journal may have
+  lost its unsynced end (it held the generation before a reboot) does not take
+  it up again, so the end goes through that backup or the root's cursor
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
   A delegate's committed answer stays committed across a root takeover: the
   requester's shadow of it is not rolled back (the delegate re-streams the
-  row to the next root), a subscriber's stream entry of the root's append of
-  it retires by the successor's re-ship, which names it (`TailOf`), and a
+  row to the next root); the root appends a stream's rows verbatim under
+  their origin `(gen, idx)`, and a sealed stream's tail is applied verbatim in
+  one transaction (`MetaError::TailDiverged` if it does not apply); a
+  subscriber's stream entry of the root's append of a row retires by the
+  successor's re-ship, which names it (`TailOf { epoch, jseq }`, the identity
+  of a re-shipped transaction, kept through any number of re-ships); a
   delegate that takes the root over re-appends its own rows the tail lacks,
-  verbatim under their stream origin, before its generation ends, and a
-  deposed root's own journal copy of such an append retires once a later
-  tenure's segment lands every outcome it carries under another identity
+  verbatim under their stream origin, before its generation ends; a deposed
+  root keeps another node's rows it appended as a member copy, and the next
+  root seals the predecessor's stream before it ends a generation it
+  inherited with no recorded backup (`prev_roots`); the deposed root's own
+  journal copy of such an append retires once a later tenure's segment lands
+  every outcome it carries under another identity
   ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
-- **Cross-subtree ops** (renames and hard links across delegations,
-  `rmdir` or rename of a delegated root) go to the root, which *recalls*
-  the delegations involved first (the delegate drains and stops, or is
-  outwaited), then executes alone. There is no two-phase commit.
+- **Cross-subtree ops** (renames and hard links across streams, `rmdir` or
+  rename of a delegated root) go to the root, which *recalls* the
+  subtrees involved first, then executes alone. A recall is a request
+  (`ReleaseRequest`): the holder stops executing under the subtrees, hands
+  their lock grants back and journals the release as the next row of its
+  stream (`SubtreeReleased { dir, at }` per subtree, or `StreamReleased` when
+  nothing is left of its set), and the root sequences ops in the subtree only
+  after it has appended through `at`; the stream's other subtrees stay
+  delegated. A request for some subtrees that stays unanswered becomes a
+  recall of the whole stream, and a holder that cannot release by a row
+  answers with the cut it ends at. A placed grant whose holder is
+  unreachable is outwaited and ended by TTL (`DelegateNodeEnded`, after its
+  recorded backup's seal when it has one); a sticky grant or a designation is
+  never taken back that way (the op is refused, `EXDEV`, until the holder
+  releases, `online` ends a designation, or the operator abandons). A rename between two subtrees of one
+  node's stream is no cross-subtree op: it is an ordinary op of the stream.
+  The root delegates the released subtrees to the same node again after the
+  op. There is no two-phase commit.
 - **Placement** is automatic: the root sees every op's origin and
   delegates the *topmost* directory one node dominates (at least 70% of
   its ops in a 30 s window, above a rate floor), recalling a placed grant

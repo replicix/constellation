@@ -34,22 +34,25 @@ inside the root's authority, maintained over P2P.
 
 - **Root**: the node holding the root lease in S3. It is the only node
   that appends to the log.
-- **Delegate**: a node that sequences one subtree for the root.
-- **Generation (`gen`)**: one delegation's lifetime, numbered by the
+- **Delegate**: a node that sequences a set of subtrees for the root, as one
+  stream.
+- **Generation (`gen`)**: one node stream's lifetime, numbered by the
   tenure that grants it: `gen = epoch << 32 | n`, shown as `epoch:n` (the
   lease epoch of the root that minted it and that node's counter within the
   tenure), so two tenures never mint the same number
   ([ADR-43](../../explanation/DECISIONS.md#adr-43-a-generation-number-carries-the-epoch-of-the-tenure-that-minted-it)).
-  A recall ends a generation; a re-delegation starts a new one. The
+  A recall ends a generation; a re-delegation starts a new one, and a grant
+  to a node whose generation is live grows it. The
   numbers are large and sparse; the CLI's line for a generation that
   cannot end shows one as `epoch:n (number)`, the daemon's log lines as
   `epoch:n`, and `--gen` takes the number.
-- **Owner**: the node that sequences a key: the delegate whose
-  delegation contains it, else the root.
+- **Owner**: the node that sequences a key: the delegate whose stream's
+  subtrees contain it, else the root.
 - **Cross-subtree op**: an operation whose keys have two owners, such
   as a rename between two delegated subtrees.
-- **Recall**: the root taking a delegation back. The delegate drains its
-  stream and stops, or the root waits out its grant.
+- **Recall**: the root taking a delegation back. The root asks the holder to
+  release the subtrees (it answers with a row of its stream), or the root
+  waits out the grant.
 - **`deps`**: the delegate stream positions a requester has observed,
   carried with its forwarded ops so the root never appends an effect
   before its causes.
@@ -60,23 +63,45 @@ inside the root's authority, maintained over P2P.
 
 ### The delegation table
 
-`Delegate { dir, node, gen }` and `RecallCut { dir, gen, through }` log
-records maintain a replicated delegation table (a `Recall { dir, gen }` in
-a log written before the cut was in the record is still read: see
-[The generation's end](#the-generations-end-and-its-cut)). It is stored in the namespace
-(so a bootstrapped replica learns it from the head commit), and every
-node resolves ownership against its own copy.
+A grant goes to a **node** and covers a set of subtrees under one stream
+`(gen, idx)`, with one group and one cut (plan 46 stage 1,
+[ADR-40](../../explanation/DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)).
+Five log records maintain a replicated delegation table; none touches an
+inode or a dentry:
+
+| Record | Written by | Meaning |
+|---|---|---|
+| `DelegateNode { node, gen, dirs }` | the root | Generation `gen` of `node` opens with its first record; a later record of the same generation *grows* the live stream's set. Each of `dirs` is a `SubtreeGrant { dir, kind }`, `kind` being `Placed`, `Sticky` or `Designated`. A delegate learns a growth from its table, never from a message. |
+| `DelegateNodeGroup { node, gen, version, backups }` | the root | The stream's configuration at `version` (rising from 1; no record is version 0 and no backup, a group of the delegate and the root), journaled while the generation lives when the delegate asks for a different backup. |
+| `DelegateNodeEnded { node, gen, through }` | the root | The generation ended and its stream is cut at `through`; every later row of it is void. See [The generation's end](#the-generations-end-and-its-cut). |
+| `SubtreeReleased { node, gen, dir, at }` | the delegate, as a row of its own stream | The holder releases the subtree `dir`; `at` is the last stream index that touched it, so the root sequences ops in `dir` only after appending through `at`. The rest of the set stays delegated. |
+| `StreamReleased { node, gen, through }` | the delegate, as a row of its own stream | The holder releases every subtree (an unmount, a suspension, `constellation release`); `through` is the stream's last index. The generation lives on, with an empty set, until the root's `DelegateNodeEnded`. |
+
+The table (`DelegationTable`: one `NodeStream` per `(node, gen)` and an index
+from each subtree's directory) is these records applied in log order. It is
+stored in the namespace (so a bootstrapped replica learns it from the head
+commit), and every node resolves ownership against its own copy. The records
+replaced `Delegate`, `Recall`, `RecallCut` and `DelegGroup`, which kept one
+generation per directory (plan 46 M1.2 step 8a). No reader of the old records
+is left: a file system written before is recreated.
 
 - Delegations never overlap: a directory under a delegation, or one
   with a delegated descendant, cannot be delegated. There is no
   sub-delegation.
-- A node holds at most one whole-subtree delegation (plus designations).
+- A node holds one stream at a time: a grant to a node whose stream is live
+  grows it in place (the same generation), and a node's two subtrees are
+  one total order, so a rename between them is an ordinary op of the stream.
+  A recalled stream is ended before the node's next grant opens another.
+- A stream never mixes grant kinds: it holds stealable grants (`Placed`, or
+  a manual `delegate`), or sticky grants, or designations. A grant of
+  another kind waits until the stream is released, or, for a designation on a
+  node holding a stealable stream, until that stream is recalled.
 - The root directory itself is never delegated.
 - No delegation is made inside a continuation epoch. When an epoch
   opens, the root recalls every live generation; delegation resumes
   after the epoch closes.
 - Delegation needs P2P. With P2P off, or `CONSTELLATION_DELEGATION=off`,
-  no `Delegate` record is ever written.
+  no `DelegateNode` record is ever written.
 
 ### Ownership
 
@@ -128,7 +153,7 @@ through the delegate. It then:
      node's op costs one round trip to the root, and one more from the
      root to its backup when it has one, or the root's next ship when it
      has none (the root pushes the commit as it rises).
-   - With a backup recorded (a `DelegGroup` record naming it) the group is
+   - With a backup recorded (a `DelegateNodeGroup` record naming it) the group is
      the delegate and that backup, chosen by RTT to the delegate, exactly
      like the root's (see [Durability and failover](durability-and-failover.md)).
      The root is never the delegate's backup. The delegate counts the backup
@@ -200,9 +225,10 @@ The delegate's own FUSE writes under its delegation take the local fast
 path whatever the delegation's group is (plan 43 C2d): the write runs on the
 FUSE thread and journals its row with the class the core has published for
 the generation by the time the row is journaled, under the store's writer
-lock, not when the op was admitted (`Core::report_deleg_durable`:
-`NonStealable` for a designation, otherwise `DelegGroup`, or `Archive` under
-`ack=s3`). A `NonStealable` row is answered at once; a row that
+lock, not when the op was admitted (`Core::report_deleg_durable`: `Final` for
+a stream of non-stealable grants, otherwise `Group` at the applied
+`DelegateNodeGroup` version, or `Group` on the archive under `ack=s3`). A
+`Final` row is answered at once; a row that
 waits is answered once the core's commit point for the generation covers its
 stream index (`Meta::session().wait_deleg_durable`: the log carries it, or
 every member of the group, and of a requested change, holds it — the same
@@ -234,8 +260,7 @@ syncs it again every second while an install waits (the segment's records
 are not the only way the wait ends: a journal that could not be read waits
 too). The end counts as applied once the cut it carries is kept
 (`deleg_void_cut`), which applying the segment does also when the record
-was installed from the stream before and not applied again, and for an older `Recall` without a cut (kept at the log's index of
-the generation). `status.delegation.install_waiting` lists a waiting
+was installed from the stream before and not applied again. `status.delegation.install_waiting` lists a waiting
 install with what it waits for, `install_waits` and `install_wait_ms` count
 them, and a warning goes out after 5 s of waiting and every minute after.
 In the simulation's sweeps without a partition the wait is rare and short
@@ -716,9 +741,7 @@ acknowledgements it parked for a row past the cut are aborted (`Busy`: the
 requester retries by rid at the generation's new owner); a park at or below
 the cut releases once the log's index of the generation reaches it — the
 archive's, never "the row left this journal", which a recall's strand does
-too. A `Recall { dir, gen }` of an older log has no cut in it: each replica
-infers it from what it holds (as before this change).
-
+too. 
 The record reaches the other tables later than it ends the
 generation at the root, under an S3 cut only after the cut. Until then
 the recalled delegate answers lock requests and renewals for the subtree
@@ -1116,8 +1139,10 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
 
   Weigh it by `delegation.waiting` in any case: a member heard from lately,
   or one whose transport is not failing, is not gone. It ends the generation at the root's cursor and journals
-  `GroupAbandoned { gen }` next to the `RecallCut`: the log records that the
-  decision was an operator's. **Consequence:** every row the delegate
+  `GroupAbandoned { epoch: 0, gen, through_known }` in the same transaction
+  as the `DelegateNodeEnded` (`through_known`: the highest index of the
+  group the root knew of): the log records that the decision was an
+  operator's. **Consequence:** every row the delegate
   answered through the group and the root never appended is lost — the
   clients were told it was committed. They are not replayed, and a delegate
   that comes back drops them (its recall strand). An op still in a dead
