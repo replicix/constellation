@@ -6909,7 +6909,7 @@ impl Meta {
             // counts its contiguous hold (`backup_acked`) to the top, not to
             // the first such transaction: otherwise its gate would drop the
             // committed rows past it as never committed.
-            let moved_rows = moved.len();
+            report.tail_moved += moved.len();
             if let Some(top) = moved.iter().map(|m| m.last).max() {
                 let kept: HashSet<u64> = moved.iter().map(|m| m.first).collect();
                 let mut rows = moved;
@@ -6922,13 +6922,14 @@ impl Meta {
                             first: bt.first,
                             last: bt.last,
                             records: Vec::new(),
-                            origin: (0, 0),
+                            // (Its origin stays, as a covered row's hole
+                            // keeps it.)
+                            origin: bt.origin,
                         }),
                 );
                 rows.sort_unstable_by_key(|r| r.first);
                 crate::store::member::put_rows_tx(&mut tx, self, t.epoch, t.config_version, &rows)?;
             }
-            report.tail_moved += moved_rows;
         }
         if !tails.is_empty() {
             // The rows the tail carried are back in the namespace: the

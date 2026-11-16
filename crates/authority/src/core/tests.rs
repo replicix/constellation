@@ -57009,7 +57009,39 @@ mod c1_member_copy {
     /// A backup of epoch 1 holding `rows` (`first`, whether it has records,
     /// the row's origin): `keep_tail_as_member_copy`'s result, and its copy.
     fn keep_tail_of(rows: &[(u64, bool, (u64, u64))]) -> (Harness, bool) {
+        keep_tail_over(rows, &[])
+    }
+
+    /// [`keep_tail_of`] where this node's member copy of epoch 1 holds the
+    /// rows `existing` (each with records) already.
+    fn keep_tail_over(rows: &[(u64, bool, (u64, u64))], existing: &[u64]) -> (Harness, bool) {
         let mut h = Harness::new(2);
+        let own: Vec<constellation_meta::MemberTx> = existing
+            .iter()
+            .map(|&first| constellation_meta::MemberTx {
+                tx: constellation_meta::BackupTx {
+                    first,
+                    last: first,
+                    records: vec![LogRecord::Create {
+                        parent: ROOT_INO,
+                        name: format!("own{first}"),
+                        ino: (1 << 40) | (100 + first),
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 10,
+                    }],
+                    origin: (0, 0),
+                },
+                class: constellation_meta::RowCommit::ROOT_GROUP,
+                rid: None,
+                op: None,
+                lock_tag: Default::default(),
+            })
+            .collect();
+        if !own.is_empty() {
+            h.meta.member_copy_put_rows(1, 2, &own).unwrap();
+        }
         let txs: Vec<constellation_meta::BackupTx> = rows
             .iter()
             .map(|&(first, records, origin)| constellation_meta::BackupTx {
@@ -57061,6 +57093,29 @@ mod c1_member_copy {
             [(1, 1, true), (2, 2, false), (3, 3, false), (4, 4, true)]
         );
         assert_eq!(h.core.stats.tails_kept_as_member_copy, 1);
+    }
+
+    /// S5 (e): the node holds a member copy of the epoch with records at 3
+    /// already; the tail it backed has a hole there. The kept tail leaves the
+    /// copy's row with records (a filling hole never replaces it) and the
+    /// copy stays contiguous.
+    #[test]
+    fn a_kept_tail_over_a_member_copy_with_records_keeps_them() {
+        let own = (0, 0);
+        let (h, kept) = keep_tail_over(
+            &[
+                (1, true, own),
+                (2, false, own),
+                (3, false, own),
+                (4, true, own),
+            ],
+            &[3],
+        );
+        assert!(kept);
+        assert_eq!(
+            copy_shape(&h),
+            [(1, 1, true), (2, 2, false), (3, 3, true), (4, 4, true)]
+        );
     }
 
     /// A tail with no row with records (holes and a delegate's row) stores no

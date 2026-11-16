@@ -2268,6 +2268,8 @@ pub struct Stats {
     /// could not read it (`status.ack.sealed_unread` while it lasts).
     pub backup_seal_unread_reads: u64,
     pub seal_tail_backup: u64,
+    /// Tails answered from a member copy (`seal_tail_hold` case 3).
+    pub seal_tail_member_copy: u64,
     pub seal_tail_refused: u64,
     /// Seals refused because this holder's renewal had landed with a newer
     /// key than the claimant read (its claim CAS could not land).

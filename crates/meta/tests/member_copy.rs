@@ -2315,3 +2315,75 @@ fn a_retired_rows_hole_still_replaces_a_row_with_records() {
     );
     assert_eq!(shape(&meta, 1), [(3, 3, false)]);
 }
+
+/// S1: a row with records always replaces a stored filler (a record-less span,
+/// stored gated), whatever its class: a Singleton row the strand puts for the
+/// same key keeps its records. (Fails before: the gated hole stayed, the
+/// records were lost.) The reverse order keeps the record row.
+#[test]
+fn a_row_with_records_replaces_a_filler_of_any_class() {
+    for class in [RowCommit::LONE, RowCommit::ROOT_GROUP] {
+        let meta = Meta::open_in_memory().unwrap();
+        put(&meta, &[mtx(1, 1, RowCommit::ROOT_GROUP, Vec::new())]);
+        assert_eq!(shape(&meta, 1), [(1, 1, false)]);
+        put(&meta, &[mtx(1, 1, class, vec![create("a", ino(1), 10)])]);
+        assert_eq!(shape(&meta, 1), [(1, 1, true)], "{class:?}");
+    }
+    // A filler never replaces the row with records.
+    let meta = Meta::open_in_memory().unwrap();
+    put(
+        &meta,
+        &[mtx(1, 1, RowCommit::LONE, vec![create("a", ino(1), 10)])],
+    );
+    put(&meta, &[mtx(1, 1, RowCommit::ROOT_GROUP, Vec::new())]);
+    assert_eq!(shape(&meta, 1), [(1, 1, true)]);
+}
+
+/// S2: a namespace rebuild drops the rows with records whose identity the log
+/// carries (a `TailOf` of an older epoch) and the fillers below them in the
+/// same pass: no copy, no epoch info, no hold stays. (Fails before: the
+/// filler stayed until a later pass.)
+#[test]
+fn a_rebuild_drops_the_fillers_below_the_rows_it_drops() {
+    let meta = Meta::open_in_memory().unwrap();
+    let foreign = vec![
+        LogRecord::TailOf { epoch: 1, jseq: 7 },
+        create("a", ino(1), 10),
+    ];
+    meta.member_copy_put_rows(
+        2,
+        3,
+        &[
+            mtx(1, 1, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(2, 2, RowCommit::ROOT_GROUP, foreign.clone()),
+        ],
+    )
+    .unwrap();
+    let side = Meta::open_in_memory().unwrap();
+    apply_rows(&side, 1, 3, 2, &[1, 2], &foreign);
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert_eq!(meta.member_copy(2).unwrap(), None);
+    assert!(meta.member_copy_epochs().unwrap().is_empty());
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+}
+
+/// S5 (c): a filler the log settles (a re-ship names a row at or above it)
+/// is refused, and the copy still starts at the next row and stays
+/// contiguous from there.
+#[test]
+fn a_filler_the_log_settles_is_refused_and_the_copy_stays_contiguous() {
+    let meta = Meta::open_in_memory().unwrap();
+    // A re-ship of epoch 1's rows through 2 reached the log.
+    reship_of(&meta, 1, 2, create("q", ino(2), 11));
+    put(
+        &meta,
+        &[
+            mtx(1, 1, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(2, 2, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(3, 3, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(4, 4, RowCommit::ROOT_GROUP, vec![create("r", ino(3), 12)]),
+        ],
+    );
+    assert_eq!(shape(&meta, 1), [(3, 3, false), (4, 4, true)]);
+}

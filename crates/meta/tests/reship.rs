@@ -1386,3 +1386,189 @@ fn the_successors_copy_has_no_gap_below_its_top_row() {
         ]
     );
 }
+
+/// The tail of epoch 1 the successor re-ships in the tests below: rows 1, 4
+/// and 6 with records, a hole at 2, a row whose rid is done on the successor
+/// at 3 and a hole above the top at 7. Its member copy has fillers at 2-3 and
+/// 5.
+fn gapped_tail() -> Vec<BackupTx> {
+    vec![
+        tx(1, 1, row(7)),
+        tx(2, 2, Vec::new()),
+        tx(
+            3,
+            3,
+            vec![
+                create(ROOT_INO, "y", ino(8)),
+                LogRecord::Completed { rid: rid(2, 2) },
+            ],
+        ),
+        tx(
+            4,
+            4,
+            vec![
+                create(ROOT_INO, "z", ino(9)),
+                LogRecord::Completed { rid: rid(2, 3) },
+            ],
+        ),
+        tx(
+            5,
+            5,
+            vec![
+                tail_of(1),
+                create(ROOT_INO, "x", ino(7)),
+                LogRecord::Completed { rid: rid(2, 1) },
+            ],
+        ),
+        tx(
+            6,
+            6,
+            vec![
+                create(ROOT_INO, "w", ino(10)),
+                LogRecord::Completed { rid: rid(2, 4) },
+            ],
+        ),
+        tx(7, 7, Vec::new()),
+    ]
+}
+
+/// Row 3's rid is done on the successor already.
+fn done_row_3(meta: &Meta) {
+    execute_mutate(
+        meta,
+        &MutateOp::Create {
+            parent: ROOT_INO,
+            name: "y".into(),
+            ino: ino(8),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        Some(rid(2, 2)),
+    )
+    .unwrap();
+}
+
+/// The successor's copy of epoch 1 as the transactions a backup holds.
+fn copy_as_tail(meta: &Meta) -> Vec<BackupTx> {
+    let (_, rows) = meta.member_copy_rows(EPOCH_PREV).unwrap().unwrap();
+    rows.into_iter().map(|r| r.tx).collect()
+}
+
+/// A third node appends the successor's copy (fillers and all) as its backup
+/// tail: its hold reaches the top row, and its gate applies the rows past the
+/// former gap. (The copy before the fillers held rows 1, 4 and 6: the hold
+/// stopped at 1.)
+#[test]
+fn a_third_node_holds_the_successors_copy_to_its_top_and_applies_past_the_gap() {
+    let succ = Meta::open_in_memory().unwrap();
+    done_row_3(&succ);
+    reship(&succ, &gapped_tail()).unwrap();
+    let copy = copy_as_tail(&succ);
+    let top = copy.iter().map(|t| t.last).max().unwrap();
+    assert_eq!(top, 6);
+
+    let third = Meta::open_in_memory().unwrap();
+    third.backup_append(EPOCH_PREV, &copy).unwrap();
+    assert_eq!(third.backup_acked(EPOCH_PREV).unwrap(), top);
+    let report = reship(&third, &copy).unwrap();
+    // Rows 1, 4 and 6 (the row at 5 is a filler: the successor's dedup).
+    assert_eq!(report.tail_applied, 3, "{report:?}");
+    for name in ["x", "z", "w"] {
+        assert!(
+            third.lookup(ROOT_INO, name).unwrap().is_some(),
+            "{name} applied"
+        );
+    }
+    assert!(third.lookup(ROOT_INO, "y").unwrap().is_none());
+}
+
+/// The successor's own shipping pass (its journal rows carry the identities of
+/// the rows it moved) retires the rows with records and the fillers below
+/// them in the same pass: no copy and no hold stay.
+#[test]
+fn the_successors_fillers_drain_with_its_own_shipping_pass() {
+    let meta = Meta::open_in_memory().unwrap();
+    done_row_3(&meta);
+    reship(&meta, &gapped_tail()).unwrap();
+    assert_eq!(copy_as_tail(&meta).len(), 6);
+    let journal = meta.journal_txs_from(1, 1000).unwrap();
+    let seqs: Vec<u64> = journal.iter().flat_map(|t| t.first..=t.last).collect();
+    let top = *seqs.iter().max().unwrap();
+    meta.ack_journal_rows_at(&seqs, top).unwrap();
+    assert_eq!(meta.member_copy(EPOCH_PREV).unwrap(), None);
+    assert!(meta.member_copy_epochs().unwrap().is_empty());
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+}
+
+/// A restart between the gate and the re-ship's shipping pass: the copy with
+/// its fillers is read back as it was, contiguous, and drains as above.
+#[test]
+fn the_successors_fillers_survive_a_restart_and_drain_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m.db");
+    let shape = |meta: &Meta| -> Vec<(u64, u64, bool)> {
+        copy_as_tail(meta)
+            .iter()
+            .map(|t| (t.first, t.last, !t.records.is_empty()))
+            .collect()
+    };
+    let before = {
+        let meta = Meta::open(&db).unwrap();
+        done_row_3(&meta);
+        reship(&meta, &gapped_tail()).unwrap();
+        let before = shape(&meta);
+        meta.close().unwrap();
+        before
+    };
+    let meta = Meta::open(&db).unwrap();
+    assert_eq!(shape(&meta), before);
+    for pair in copy_as_tail(&meta).windows(2) {
+        assert_eq!(pair[1].first, pair[0].last + 1, "a gap in the copy");
+    }
+    let journal = meta.journal_txs_from(1, 1000).unwrap();
+    let seqs: Vec<u64> = journal.iter().flat_map(|t| t.first..=t.last).collect();
+    let top = *seqs.iter().max().unwrap();
+    meta.ack_journal_rows_at(&seqs, top).unwrap();
+    assert_eq!(meta.member_copy(EPOCH_PREV).unwrap(), None);
+    assert!(meta.read_holds().is_empty(), "{:?}", meta.read_holds());
+}
+
+/// S4: a fetched copy whose filler stands for a row the claimant holds with
+/// records in its own backup tail (a delegate's row the root appended, a done
+/// or dedup row) supersedes the claimant's stored row there: the span is a
+/// hole, the hold reaches the top. The row's carrier is the delegate's
+/// re-stream to the next root (DECISIONS, ADR-59), not this tail.
+#[test]
+fn a_filler_in_an_appended_copy_supersedes_the_claimants_stored_row() {
+    let meta = Meta::open_in_memory().unwrap();
+    let live = |first: u64, name: &str, n: u64| {
+        tx(
+            first,
+            first,
+            vec![
+                create(ROOT_INO, name, ino(n)),
+                LogRecord::Completed { rid: rid(2, n) },
+            ],
+        )
+    };
+    meta.backup_append(
+        EPOCH_PREV,
+        &[live(1, "a", 1), live(2, "d", 2), live(3, "c", 3)],
+    )
+    .unwrap();
+    // The fetched copy has a filler at 2 (and the rows around it).
+    meta.backup_append(
+        EPOCH_PREV,
+        &[live(1, "a", 1), tx(2, 2, Vec::new()), live(3, "c", 3)],
+    )
+    .unwrap();
+    let spans: Vec<(u64, u64, usize)> = meta
+        .backup_tail(EPOCH_PREV)
+        .unwrap()
+        .iter()
+        .map(|t| (t.first, t.last, t.records.len()))
+        .collect();
+    assert_eq!(spans, vec![(1, 1, 2), (2, 2, 0), (3, 3, 2)]);
+    assert_eq!(meta.backup_acked(EPOCH_PREV).unwrap(), 3);
+}

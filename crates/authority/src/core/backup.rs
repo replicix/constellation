@@ -6878,7 +6878,9 @@ impl Core {
                         first: t.first,
                         last: t.last,
                         records: Vec::new(),
-                        origin: (0, 0),
+                        // (The hole keeps the row's origin, as a covered
+                        // row's hole does.)
+                        origin: t.origin,
                     }
                 } else {
                     t

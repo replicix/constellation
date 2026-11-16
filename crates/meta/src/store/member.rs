@@ -470,6 +470,8 @@ pub(crate) fn drop_settled_rows_tx(
     let mut dropped = 0usize;
     for e in epochs_in(&*tx, meta)? {
         let mut left = 0usize;
+        let mut live_above: Option<u64> = None;
+        let mut kept_holes: Vec<u64> = Vec::new();
         for row in rows_in(&*tx, meta, e)? {
             if let Some(by_floor) = log_settled_why_tx(&*tx, meta, e, &row)? {
                 tx.remove(&meta.backup_tail, tail_key(member_epoch(e), row.tx.first));
@@ -481,9 +483,24 @@ pub(crate) fn drop_settled_rows_tx(
                     meta.release_row_tx(tx, member_epoch(e), row.tx.first);
                 }
                 dropped += 1;
+            } else if row.tx.records.is_empty() {
+                kept_holes.push(row.tx.first);
             } else {
+                live_above = live_above.max(Some(row.tx.first));
                 left += 1;
             }
+        }
+        // A hole stands for a row below one with records: with no such row
+        // left above it (the rows it covered left by identity, a foreign
+        // `TailOf`), it goes in this pass, as `member_rules_tx` retires it.
+        for first in kept_holes {
+            if live_above.is_some_and(|live| live > first) {
+                left += 1;
+                continue;
+            }
+            tx.remove(&meta.backup_tail, tail_key(member_epoch(e), first));
+            meta.release_row_tx(tx, member_epoch(e), first);
+            dropped += 1;
         }
         if left == 0 {
             tx.remove(&meta.local, member_info_key(e).into_bytes());
@@ -612,7 +629,8 @@ pub struct MemberOutcome {
     /// Rows with records retired by coverage (a hole is not counted).
     pub retired: usize,
     /// Rows dropped as never committed (past a `TailFollowsThrough`'s
-    /// `through`, or unacknowledged at a newer epoch's marker).
+    /// `through`, or unacknowledged at a newer epoch's marker), and holes
+    /// that left once no row with records stayed above them.
     pub dropped: usize,
     /// Rows an abandon queued for replay.
     pub abandoned: usize,
@@ -1675,6 +1693,10 @@ pub(crate) fn put_row_tx(
         // (A row the strand adds to a copy that holds it already carries
         // more than the snapshot did: the class says what its client was
         // told.)
+        // (A row with records always replaces a hole, whatever the class: a
+        // filler is stored gated, and a non-gated row's records must not
+        // lose to it.)
+        Some(old) if old.tx.records.is_empty() && !row.tx.records.is_empty() => row.clone(),
         Some(old) if old.class.gated() && !row.class.gated() => old,
         // (A hole that fills a copy's gap never replaces a row it holds
         // with records; a retired row's hole does, D2.)
@@ -1822,7 +1844,13 @@ pub(crate) fn member_rules_tx(
                 // in the tail the segments that follow name: it stays and
                 // retires on carry; only a copy past it replays by rid.
                 if ident.0 == e && ident.1 <= *known {
-                    left += 1;
+                    // (A hole goes once no row with records stays above it.)
+                    if row.tx.records.is_empty() {
+                        retire_holes.push((key, first));
+                    } else {
+                        live_above = live_above.max(Some(first));
+                        left += 1;
+                    }
                     continue;
                 }
                 if !row.class.is_singleton() && super::spec::queue_abandoned_tx(tx, meta, e, &row)?

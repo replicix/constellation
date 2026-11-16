@@ -290,6 +290,7 @@ impl Core {
         // claimant is told again): idempotent.
         let (_, txs) = replica.member_copy(epoch)?;
         let through = txs.iter().map(|t| t.last).max().unwrap_or(0);
+        self.stats.seal_tail_member_copy += 1;
         // (A re-ask of the holder's own sealed epoch: this claimant's CAS
         // can land too, whichever key it read.)
         if own_key && self.bk.sealed >= epoch {
@@ -1027,8 +1028,12 @@ impl Core {
         self.bk.role = Some(role);
         // (Unreadable: what it holds counts from 0, which only ever
         // acknowledges less; the holder sends again.)
-        self.bk.acked = replica.backup_acked(ch.epoch).unwrap_or(0);
-        self.check_tail_answer_contiguous("fetched", ch.epoch, self.bk.acked, &ch.txs);
+        let acked = replica.backup_acked(ch.epoch);
+        self.bk.acked = acked.unwrap_or(0);
+        // (A store read error is not a gap: only a hold that was read counts.)
+        if let Some(acked) = acked {
+            self.check_tail_answer_contiguous("fetched", ch.epoch, acked, &ch.txs);
+        }
         self.bk.held.clear();
         // The members of the old group: who held the tail a later claimant
         // may ask; this node's copy outlives the fetch.
@@ -1375,7 +1380,9 @@ impl Core {
     /// them as never committed, answered ones included. Every answer is
     /// contiguous by construction (a journal's seq gaps are holes, a
     /// backup's answer stops at what it holds, a member copy keeps a hole
-    /// for a covered row below a live one): a violation is a bug, counted
+    /// for a covered row below a live one, a successor's copy of a tail
+    /// keeps the tail's holes as fillers, and a tail kept as a member copy
+    /// keeps the spans it shipped): a violation is a bug, counted
     /// in `tail_answer_gaps` (the sim fails a seed that has one).
     fn check_tail_answer_contiguous(
         &mut self,
