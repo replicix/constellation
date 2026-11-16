@@ -1,45 +1,87 @@
-//! Plan 30 §M11: delegated sub-sequencers over one log.
+//! Plan 30 §M11, plan 46 stage 1: delegated sub-sequencers over one log.
 //!
-//! Two sides live here. **A delegate** (a node the log's
-//! `Delegate{dir, node, gen}` record names) executes every mutation whose
-//! keys fall under `dir` on its own replica — authoritative for the
-//! subtree, because every write there goes through it — journals the
-//! transaction with the generation's next stream index and the
-//! requester's `deps`, acknowledges, and streams the transactions to the
-//! root in stream order (`DelegateStream`, one batch in flight per
-//! generation). It honours its grant only while its clock is below
-//! `sent + ttl − margin` measured from its own renewal request (M8's
-//! discipline), renews at half the ttl, and stops the moment the root
-//! recalls the generation. Its journal rows are speculation like a
-//! holder's: `Meta` retires them when a segment carries their origin
-//! and strands them when the log recalls the generation (rolled back,
-//! replayed by rid through the new owner).
+//! A grant goes to a **node** and covers a set of subtrees under one
+//! stream `(gen, idx)`, with one group and one cut. The log's records are
+//! `DelegateNode { node, gen, dirs }` (the generation opens, or a later
+//! record of it grows the set; each subtree is a `SubtreeGrant` of kind
+//! `Placed`, `Sticky` or `Designated`), `DelegateNodeGroup` (the stream's
+//! configuration), `DelegateNodeEnded { node, gen, through }` (the end and its
+//! cut), and the delegate's own stream rows `SubtreeReleased { dir, at }` and
+//! `StreamReleased { through }`. They replaced `Delegate`, `Recall`,
+//! `RecallCut` and `DelegGroup`, which kept a generation per directory
+//! (M1.2 step 8a); the table they build is `constellation_meta::delegation`'s.
+//! A stream never mixes grant kinds (`DelegKind::joins`).
+//!
+//! Two sides live here. **A delegate** (a node whose stream the log's table
+//! lists) executes every mutation whose keys fall under one of its subtrees
+//! on its own replica — authoritative for them, because every write there
+//! goes through it — journals the transaction with the stream's next index
+//! and the requester's `deps`, acknowledges, and streams the transactions to
+//! the root in stream order (`DelegateStream`, one batch in flight per
+//! generation). It acknowledges by the stream's configuration, not per row
+//! (`deleg_rule`): `RowCommit::Final` for a stream of sticky or designated
+//! grants, otherwise `RowCommit::Group` at the applied `DelegateNodeGroup`
+//! version, whose group is the delegate and its recorded backup, or the
+//! delegate and the root when none is recorded (the root's append of the
+//! row, once the root's own tenure has committed it: `DelegateStreamAck`'s
+//! `committed`, ADR-41). No delegate answers from its disk alone: the root
+//! grants a stealable subtree only to a node with a group within the RTT
+//! budget (`delegate_dir`), and a far writer is forwarded to the root until it
+//! holds a sticky grant. A stealable grant is honoured only while the
+//! delegate's clock is below `sent + ttl − margin` measured from its own
+//! renewal request (M8's discipline), renewed at half the ttl (`DelegRenew`),
+//! and capped by the root lease; a sticky grant or a designation has no TTL
+//! and no renewal. The delegate's journal rows are speculation like a
+//! holder's: `Meta` retires them when a segment carries their origin, and
+//! drops the rows past a generation's cut that nobody was answered for (their
+//! clients retry by rid at the new owner; the server never replays them).
 //!
 //! **The root** (the lease holder) appends a delegate's stream in index
 //! order once the generation is live and the batch's `deps` are in its
-//! replica — no re-validation — and journals it with the delegate's
-//! origin, so the segment carries it and every replica (the delegate
-//! included) learns its per-generation applied index. Before it executes
-//! anything whose keys fall under a live delegation (a cross-subtree
-//! rename, an op forwarded by a node with a stale table, an
-//! `Undelegate`) it recalls the generation: `DelegRecall`, then the
-//! delegate's `DelegRecalled{through}` and the stream catching up to
-//! `through`, or the grant's expiry on the root's clock (granted at
-//! `g`: `g + ttl + margin`) — after which the generation *ends*: a
-//! `Recall{dir, gen}` record journaled, every later stream record of it
-//! refused. An unrenewed grant is reclaimed the same way (a crashed
-//! delegate is never recalled by an op alone). No renewal is granted
-//! once a recall or a reclaim began.
+//! replica — no re-validation — verbatim under the delegate's origin
+//! `(gen, idx)`, so the segment carries it and every replica (the delegate
+//! included) learns its per-generation applied index. A takeover applies a
+//! sealed stream's tail verbatim in one transaction, and a delegate that takes
+//! the root over re-appends its own rows the tail lacks before its generation
+//! ends; a deposed root keeps another node's rows it appended as a member
+//! copy, and its successor seals the predecessor's stream (`prev_roots`)
+//! before it ends a generation it inherited with no recorded backup.
+//!
+//! Before the root executes anything whose keys fall under a live
+//! delegation (a cross-subtree rename, an op forwarded by a node with a stale
+//! table, an `Undelegate`) it **recalls** the subtrees involved. A recall is a
+//! request (`ReleaseRequest`, `on_release_request`): the holder stops
+//! executing under the subtrees, hands their lock grants back
+//! (`ReleaseNote`, carried by the next `DelegateStream`), and journals the
+//! release as the next row of its stream — `SubtreeReleased { dir, at }` per
+//! subtree, or `StreamReleased` when nothing is left of its set — and the root
+//! sequences ops in the subtree only after it has appended through it. The
+//! stream's other subtrees stay delegated. A request for some subtrees that
+//! stays unanswered becomes a recall of the whole stream
+//! (`PARTIAL_RESENDS_BEFORE_RECALL`), and a holder that cannot release by a
+//! row answers with the cut it ends at. When the holder is silent the root
+//! outwaits a stealable grant (granted at `g`: `g + ttl + margin` on its
+//! clock) after asking the group's backup to seal and drain; a sticky grant
+//! or a designation is never taken back that way (it is refused, `EROFS` or
+//! `EXDEV`, until the holder releases or the operator abandons). The
+//! generation then *ends*: a `DelegateNodeEnded` journaled with the cut — the
+//! root's cursor, or further when the root held the generation itself — and
+//! every later stream record of it refused. A generation whose latest
+//! `DelegateNodeGroup` names a backup does not end before that backup answers
+//! its seal (`waiting_for_group`; `repair abandon` ends it at the cursor and
+//! journals a `GroupAbandoned` beside the end). An unrenewed grant is
+//! reclaimed the same way (a crashed delegate is never recalled by an op
+//! alone). No renewal is granted once a recall or a reclaim began.
 //!
 //! The rules the model made load-bearing (`crates/model/src/delegation.rs`,
-//! "Rules the model found") are each a line below: the delegate waits
-//! for `deps` too (its own readers see its speculation); a dependency on
-//! an ended generation is void (`Replica::reaches`); an acknowledgement
-//! from an ended stream is tentative (`Meta` strands the row; the
-//! requester replays by rid); the initial grant is capped like every
-//! renewal by the root lease, so an inherited grant is dead at a takeover
-//! and the successor may reclaim at once; the root reclaims an unrenewed
-//! grant on its own.
+//! "Rules the model found", and `crates/model/src/node_stream.rs`) are each
+//! a line below: the delegate waits for `deps` too (its own readers see its
+//! speculation); a dependency on an ended generation is void
+//! (`Replica::reaches`); a row past the cut of an ended stream is never
+//! acknowledged (`acked_at_or_below_cut`); the initial grant is capped like
+//! every renewal by the root lease, so an inherited grant is dead at a
+//! takeover and the successor may reclaim at once; the root reclaims an
+//! unrenewed grant on its own.
 //!
 //! Positions: a delegate's acknowledgement carries `(gen, idx)` in the
 //! position's `streams` (M6's watermark with a per-stream pending part);
@@ -49,9 +91,9 @@
 //!
 //! Continuation epochs (M10): no delegation inside an epoch. When the
 //! driver reports an active epoch the root recalls every live generation
-//! (over P2P, which an epoch has by definition) and refuses `Delegate`;
+//! (over P2P, which an epoch has by definition) and refuses grants;
 //! a delegate that learns of an epoch stops executing. Delegation resumes
-//! by an operator's `delegate` after the epoch closed.
+//! after the epoch closed.
 
 use super::backup::{FreshHold, FreshVerdict};
 use super::{Asker, CommitRule, Core, GroupOn, Timer};
