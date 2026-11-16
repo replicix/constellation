@@ -82485,7 +82485,6 @@ mod root_own_sticky {
         let wire = g.to_wire(h.clk());
         let now = h.clk();
         h.core.lock_install_leaving(now, d.gen, vec![wire], &h.meta);
-        assert!(h.core.lk.mirror_dirty, "backups still see the old tag");
         h.core.dl.mine.get_mut(&d.gen).unwrap().leaving = Some((0, vec![f]));
         h.core.deleg_drop_left(d.gen, &h.meta);
         let kept = h
@@ -82495,6 +82494,7 @@ mod root_own_sticky {
             .expect("the grant is in no table in the final window");
         assert_eq!(kept.gen, 0);
         assert_eq!(kept.until, until, "the end moved in the final window");
+        assert!(h.core.lk.mirror_dirty, "backups still see the old tag");
     }
 
     /// A record whose end is past the restamp is re-tagged, not shortened.
