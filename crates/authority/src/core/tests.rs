@@ -82179,6 +82179,7 @@ mod stale_lease {
 mod root_own_sticky {
     use super::*;
     use crate::replica::Replica;
+    use crate::LockOutcome;
     use constellation_fs_core::Ino;
     use constellation_meta::SubtreeKind;
 
