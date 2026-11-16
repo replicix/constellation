@@ -17822,6 +17822,179 @@ mod locks {
         );
     }
 
+    /// `d/turn.lock` (`f`) in a replica whose table grants `d` to node 3 as
+    /// sticky generation 7 (non-stealable: honoured from its install, without
+    /// a renewal); returns `(dir, f)`.
+    fn sticky_delegated_file(meta: &Meta) -> (Ino, Ino) {
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        let f = meta.allocate_ino(dir).unwrap();
+        crate::replica::Replica::apply_segment(
+            meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Create {
+                    parent: dir,
+                    name: "turn.lock".into(),
+                    ino: f,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 2,
+                },
+                LogRecord::delegate_one(3, 7, dir, constellation_meta::SubtreeKind::Sticky),
+            ],
+        )
+        .unwrap();
+        (dir, f)
+    }
+
+    /// Node 3, the holder of sticky stream 7 on `d`, installed.
+    fn sticky_delegate() -> (Harness, Ino) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (_, f) = sticky_delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&7), "not installed");
+        (h, f)
+    }
+
+    fn granted_any(out: &[Action]) -> bool {
+        lock_replies(out)
+            .iter()
+            .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. }))
+    }
+
+    /// A non-stealable stream is honoured from its install, but the root's
+    /// lock grants in its subtree come with the first granting answer to a
+    /// renewal (the handoff): until then it grants no lock there, or it
+    /// grants over a holder it does not know of (sim
+    /// `locks-root-own-unlinked-partition-nocrash` seed 177: a handover made
+    /// a new sticky stream, whose holder granted itself an inode the root's
+    /// own client held). Fails on fab9c072: granted at once.
+    #[test]
+    fn a_new_sticky_stream_grants_no_lock_before_the_roots_handoff() {
+        let (mut h, f) = sticky_delegate();
+        let out = request(&mut h, 4, 1, f, X, true);
+        assert!(
+            !granted_any(&out),
+            "a lock was granted before the root's handoff arrived: {out:?}"
+        );
+        // The root's granting answer to a renewal sent after the install.
+        let sent = h.honour().plus(1);
+        h.advance(2);
+        let mut out = Vec::new();
+        let now = h.clk();
+        h.core.deleg_unpark_grown(now, 7, sent, &mut out);
+        let out = request(&mut h, 4, 2, f, X, true);
+        assert!(granted_any(&out), "not served after the handoff: {out:?}");
+    }
+
+    /// The same for a subtree a live sticky stream grew by: honoured for ops
+    /// at the commit (a non-stealable stream needs no renewal), but no lock
+    /// in it before the granting answer that carries the root's handoff
+    /// (sim `locks-root-own-unlinked-partition-nocrash` seed 260: a handover
+    /// of the root's own sticky `d1` grew node 2's sticky stream, and node 2
+    /// granted itself an inode node 3 held). Fails on fab9c072: granted.
+    #[test]
+    fn a_subtree_a_sticky_stream_grew_by_grants_no_lock_before_the_roots_handoff() {
+        use constellation_meta::SubtreeKind;
+        let (mut h, f) = sticky_delegate();
+        let sent = h.honour().plus(1);
+        h.advance(2);
+        let mut out = Vec::new();
+        let now = h.clk();
+        h.core.deleg_unpark_grown(now, 7, sent, &mut out);
+        let out = request(&mut h, 4, 1, f, X, true);
+        assert!(granted_any(&out), "the honoured subtree is served: {out:?}");
+        // The root grew the stream by `/e`, committed.
+        let e = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let g = h.meta.allocate_ino(e).unwrap();
+        let grow = vec![
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "e".into(),
+                ino: e,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            },
+            LogRecord::Create {
+                parent: e,
+                name: "g".into(),
+                ino: g,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 4,
+            },
+            LogRecord::delegate_one(3, 7, e, SubtreeKind::Sticky),
+        ];
+        crate::replica::Replica::install_streamed(&h.meta, 1, 1, 10, 12, &grow, true, (0, 0))
+            .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].dirs.contains(&e), "not honoured for ops");
+        let out = request(&mut h, 4, 2, g, X, true);
+        assert!(
+            !granted_any(&out),
+            "a lock was granted in the grown subtree before the root's handoff: {out:?}"
+        );
+        // The honoured subtree is still served.
+        let out = request(&mut h, 5, 3, f, LockMode::Shared, true);
+        assert!(
+            lock_replies(&out)
+                .iter()
+                .all(|(_, _, o)| !matches!(o, LockOutcome::NotOwner { .. })),
+            "{out:?}"
+        );
+        // The granting answer to a renewal sent after the growth lets it in.
+        let sent = h.honour().plus(1);
+        h.advance(2);
+        let mut out = Vec::new();
+        let now = h.clk();
+        h.core.deleg_unpark_grown(now, 7, sent, &mut out);
+        let out = request(&mut h, 4, 4, g, X, true);
+        assert!(granted_any(&out), "not served after the handoff: {out:?}");
+    }
+
+    /// A non-stealable stream whose renewal a root that cannot grant now
+    /// refused (`ends` false) goes on, and renews again later: silent, it
+    /// never renewed again, and a root that took the lease over granted no
+    /// lock at all, its tenure floor waiting for this stream's renewal (sim
+    /// `locks-root-own-unlinked-partition` seed 1404). Fails on fab9c072:
+    /// no renewal timer.
+    #[test]
+    fn a_refused_sticky_stream_renews_again() {
+        let (mut h, _) = sticky_delegate();
+        let mut out = Vec::new();
+        if let Some(t) = h.core.dl.mine.get_mut(&7).unwrap().renew_timer.take() {
+            h.core.cancel_timer(t, &mut out);
+        }
+        let now = h.clk();
+        h.core
+            .deleg_renewal_refused(now, 7, false, &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(!d.stopped, "a sticky stream stopped on a refusal");
+        assert!(d.renew_timer.is_some(), "the stream never renews again");
+    }
+
     /// Executes two rows of generation 7 as node 3, the delegate.
     fn two_delegate_rows(h: &Harness, dir: Ino) {
         for n in 1..=2 {
@@ -82579,9 +82752,20 @@ mod root_own_sticky {
             again.iter().any(|(ino, _)| *ino == f),
             "the barrier was dropped: {again:?}"
         );
-        // A new request on f takes the root's cut as of the barrier (the
-        // barrier settles into f's floor and the grant carries it); with
-        // no barrier left it would be granted without one.
+        // A new request on f is granted only on a root's cut as of the
+        // barrier or later (the cut settles the barrier into f's floor);
+        // with no barrier left it would be granted on no cut at all. The
+        // cut the grant takes is this instant's.
+        let barrier_at = again
+            .iter()
+            .find(|(ino, _)| *ino == f)
+            .map(|(_, at)| *at)
+            .expect("listed above");
+        let (cut_at, _) = h.core.lock_cut_here(h.clk(), &h.meta);
+        assert!(
+            cut_at >= barrier_at,
+            "the root's cut ({cut_at}) is older than the barrier ({barrier_at})"
+        );
         let out = h.step(Event::Peer {
             from: 3,
             msg: PeerMsg::LockRequest {
@@ -82613,6 +82797,65 @@ mod root_own_sticky {
         assert!(
             settled.iter().all(|(ino, _)| *ino != f),
             "the grant did not settle the barrier: {settled:?}"
+        );
+    }
+
+    /// The root releases its own stream (a handover, or its share fell): the
+    /// grants of the generation are handed back with the release, and they
+    /// are the root's from that step on. The table is the root's too: taken
+    /// out, they were in no table until the root applied its own release
+    /// batch, and a waiter served in between was granted beside them (sim
+    /// `locks-root-own-unlinked-partition-nocrash` seed 15). Fails on
+    /// fab9c072: the record is gone after the hand-back.
+    #[test]
+    fn a_grant_of_the_roots_own_released_stream_stays_in_its_table() {
+        use constellation_meta::locks::LockMode;
+        let (mut h, d, _) = root_with_stream_and_file();
+        let op = create_in(&h, d.dir, "lk");
+        let MutateOp::Create { ino: f, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let until = WaitMs(h.now.0 + 5_000);
+        let g = x_grant(2, 4250, f, until, d.gen);
+        h.meta.locks().install(g);
+        h.core.lk.mirror_dirty = false;
+        let now = h.clk();
+        let back = h.core.lock_hand_back(now, d.gen, &[d.dir], true, &h.meta);
+        assert!(
+            back.grants.iter().any(|w| w.id == g.id),
+            "the release does not carry the grant"
+        );
+        let kept = h
+            .meta
+            .locks()
+            .get(g.id)
+            .expect("the grant left the root's table with its own release");
+        assert_eq!(kept.gen, 0, "not the root's");
+        assert!(kept.until >= until, "the record was shortened");
+        assert!(h.core.lk.mirror_dirty, "backups still see the old tag");
+        // Another node asking for the inode meets the grant.
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockRequest {
+                req: OpId(78),
+                ino: f,
+                mode: LockMode::Exclusive,
+                blocking: false,
+                sent: h.honour(),
+                incarnation: 1,
+                waited_ms: 0,
+            },
+        });
+        assert!(
+            !sends(&out).into_iter().any(|(_, m)| matches!(
+                m,
+                PeerMsg::LockReply {
+                    outcome: LockOutcome::Granted { .. },
+                    ..
+                }
+            )),
+            "granted beside the released stream's grant: {out:?}"
         );
     }
 
@@ -83389,14 +83632,19 @@ mod root_own_sticky {
     /// lock grants the release took out of the table are back in it, the
     /// holder still holding them. Fails on the parent of the catch-up (the
     /// generation stays live), and on the catch-up without the grants'
-    /// install (node 2's grant was lost).
+    /// install (node 2's grant was lost). The release no longer takes the
+    /// grants out of the table it shares with the root (seed 15 of
+    /// `locks-root-own-unlinked-partition-nocrash`).
     #[test]
     fn the_roots_own_rows_shipped_before_its_batch_are_appended_with_their_lock_grants() {
         let (mut h, dirs, gen, id) = own_stream_refused();
         let row = release_own(&mut h, gen);
-        assert!(
-            h.meta.locks().get(id).is_none(),
-            "the release did not take the grant"
+        // The release hands the grant back to the root, whose table it is
+        // too: it stays there, the root's (`Core::lock_hand_back`).
+        assert_eq!(
+            h.meta.locks().get(id).map(|g| g.gen),
+            Some(0),
+            "the grant is in no table while the root refuses its own batch"
         );
         assert!(!h.core.dl.gens[&gen].ended, "appended while refused");
         assert!(h.core.dl.gens[&gen].cursor < row);

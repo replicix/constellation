@@ -18198,9 +18198,14 @@ fn locks_unlinked_partition_config() -> SimConfig {
 /// the root and the generation share one lock table and one barrier map);
 /// a locker is cut from the others long enough to be outwaited, and turns are
 /// written from the root's own stream. With `crash`, the root also crashes at
-/// 3 s (back at 11 s) and a backup takes the lease over. Pins
+/// 3 s (back at 11 s) and a backup takes the lease over. Exercises
 /// `Core::lock_install_leaving`'s re-tag and the barrier
-/// `Core::deleg_drop_left` leaves.
+/// `Core::deleg_drop_left` leaves (the core tests pin them), and the
+/// handovers of the root's own `d1` to the locker that dominates it.
+///
+/// No random fault (`locks-partition` has one): `far-root-writes` has none,
+/// and its strict I5 is judged against its scheduled crash alone. The default
+/// clock mix still adds clock steps, a suspend and a reboot to most seeds.
 fn locks_root_own_unlinked_partition_config(crash: bool) -> SimConfig {
     let c = locks_partition_config();
     let mut faults = c.faults;
@@ -18217,6 +18222,82 @@ fn locks_root_own_unlinked_partition_config(crash: bool) -> SimConfig {
         faults,
         ..with_lock_writes(far_root_writes_config(), "d1")
     }
+}
+
+/// `locks-root-own-unlinked-partition-nocrash` seed 260: the root handed
+/// its own sticky `d1` over to node 2, whose sticky stream on `d2` grew by
+/// it; the root moved node 3's exclusive grant on `lk0` to the stream's
+/// handoff, but a non-stealable stream honours a subtree at its commit, and
+/// node 2 granted itself `lk0` before the granting answer carried the
+/// handoff. Now its locks there wait for that answer
+/// (`DelegateState::lock_wait`).
+#[test]
+fn regression_locks_root_own_unlinked_partition_nocrash_seed_260() {
+    run_seed(260, locks_root_own_unlinked_partition_config(false)).unwrap_or_else(|e| {
+        panic!(
+            "locks-root-own-unlinked-partition-nocrash seed 260: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-root-own-unlinked-partition-nocrash"
+        )
+    });
+}
+
+/// `locks-root-own-unlinked-partition-nocrash` seed 177: as seed 260, with a
+/// new sticky stream for the handover (node 2 held none): the holder granted
+/// itself `lk1` beside the root's own client before its first granting
+/// answer.
+#[test]
+fn regression_locks_root_own_unlinked_partition_nocrash_seed_177() {
+    run_seed(177, locks_root_own_unlinked_partition_config(false)).unwrap_or_else(|e| {
+        panic!(
+            "locks-root-own-unlinked-partition-nocrash seed 177: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-root-own-unlinked-partition-nocrash"
+        )
+    });
+}
+
+/// `locks-root-own-unlinked-partition-nocrash` seed 15: the root released
+/// its own sticky `d1` (its share fell); the hand-back took the
+/// generation's grants out of the one table the root and the stream share,
+/// and the same step granted waiters beside them before the root applied
+/// its own release batch. Now the records stay, re-tagged as the root's
+/// (`Core::lock_hand_back`).
+#[test]
+fn regression_locks_root_own_unlinked_partition_nocrash_seed_15() {
+    run_seed(15, locks_root_own_unlinked_partition_config(false)).unwrap_or_else(|e| {
+        panic!(
+            "locks-root-own-unlinked-partition-nocrash seed 15: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-root-own-unlinked-partition-nocrash"
+        )
+    });
+}
+
+/// `locks-root-own-unlinked-partition` seed 513: after its restart node 1
+/// (no longer the root) released its sticky `d1` to node 2's sticky stream;
+/// node 2 granted itself `lk1` under node 1's exclusive section, before the
+/// new root's handoff (as seed 260, the releaser a delegate).
+#[test]
+fn regression_locks_root_own_unlinked_partition_seed_513() {
+    run_seed(513, locks_root_own_unlinked_partition_config(true)).unwrap_or_else(|e| {
+        panic!(
+            "locks-root-own-unlinked-partition seed 513: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-root-own-unlinked-partition"
+        )
+    });
+}
+
+/// `locks-root-own-unlinked-partition` seed 1404: node 2's sticky stream had
+/// a renewal refused by the root just thawed from a pause, and never renewed
+/// again; the restarted root's tenure floor waited for that renewal, and no
+/// lock was granted in the 60 s after the restart. Now a refused
+/// non-stealable stream asks again.
+#[test]
+fn regression_locks_root_own_unlinked_partition_seed_1404() {
+    run_seed(1_404, locks_root_own_unlinked_partition_config(true)).unwrap_or_else(|e| {
+        panic!(
+            "locks-root-own-unlinked-partition seed 1404: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-root-own-unlinked-partition"
+        )
+    });
 }
 
 /// `locks-unlinked-delegated-partition` without the unlinks: the lock

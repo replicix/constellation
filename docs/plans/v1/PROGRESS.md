@@ -70159,3 +70159,18 @@ ships its journal and answers a drain.
   `a_kept_tail_stays_contiguous_below_its_top_row` and `a_tail_of_holes_and_delegate_rows_keeps_no_copy` (authority),
   `a_filling_hole_never_replaces_a_row_with_records` and its retired-row control (`member_copy.rs`), and the pin
   `regression_a_successors_member_copy_keeps_the_tails_holes_seed_1238`.
+
+Sim labels `locks-root-own-unlinked-partition` (and `-nocrash`): the root's own sticky `d1` holds the lock files, they
+are unlinked under their locks, lockers are cut from the others, and the placement hands `d1` over to the locker that
+dominates it. Red at the fixes above (105 and 316 of 2000 seeds), three causes, all ADR-55 handovers or releases:
+(1) a non-stealable (sticky) stream honours a subtree from the commit, without a renewal, while the root's grants there
+come with the next granting answer (the handoff): its holder granted an inode another node held, for a subtree its
+stream grew by and for a new stream alike. Its locks there now wait for that answer (`DelegateState::lock_wait`, let in
+by `Core::deleg_unpark_grown`). (2) The root releasing its own stream took the generation's grants out of the one table
+both share, and served waiters before it applied its own release batch: `Core::lock_hand_back` keeps them, re-tagged as
+the root's. (3) Liveness: a sticky stream whose renewal a root that could not grant refused never renewed again, and a
+root that took the lease over waited for that renewal (its tenure floor) and granted no lock: the stream asks again
+after a request timeout. Tests in `locks` (`a_new_sticky_stream_grants_no_lock_before_the_roots_handoff`,
+`a_subtree_a_sticky_stream_grew_by_grants_no_lock_before_the_roots_handoff`, `a_refused_sticky_stream_renews_again`) and
+`root_own_sticky::a_grant_of_the_roots_own_released_stream_stays_in_its_table`, each failing on the parent; sim pins
+seeds 260, 177, 15 (`-nocrash`), 513 and 1404. Both labels: 0 of 2000 failing. Not yet on a must-pass list.

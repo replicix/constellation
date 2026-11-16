@@ -3511,7 +3511,13 @@ directory and no unlinks, so every lock's owner is a delegate and an
 outwaited locker's turn sits in its own delegated stream; its seeds and
 those of the `locks-unlinked-delegated` variants that read a stale turn
 after an outwait are pinned in `regression_stale_read_after_an_outwait`
-(stale-read-outwaited). `sweep_config` also prints the seeds in which a
+(stale-read-outwaited). `locks-root-own-unlinked-partition` and its
+`-nocrash` variant (sweep and replay) put the lock files in the root's own
+sticky `d1` (ADR-55), unlink them under their locks and cut lockers off;
+the placement hands `d1` over to a dominant locker. Green at 2000 seeds
+since the handoff wait of non-stealable streams, not yet must-pass; seeds
+260, 177, 15, 513 and 1404 are pinned
+(`regression_locks_root_own_unlinked_partition_*`). `sweep_config` also prints the seeds in which a
 recall answer came after its generation had ended at the root and its
 grants were dropped (`SWEEP-LATE-HANDBACK`); `locks-unlinked-delegated-partition`
 seed 7455 (two exclusive holders after such an answer revived a lapsed

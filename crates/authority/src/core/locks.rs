@@ -961,6 +961,12 @@ impl Core {
                     if self.deleg_parked_for(&keys, d.gen, replica) {
                         return Route::Unknown;
                     }
+                    // A subtree a non-stealable stream grew by: honoured for
+                    // ops, but the root's grants there come with the next
+                    // granting answer. Wait a tick likewise.
+                    if self.deleg_lock_waits(ino, d.gen, replica) {
+                        return Route::Unknown;
+                    }
                     return match self.deleg_mine_until(d.gen) {
                         Some(until) if now.honour < until => Route::Me {
                             cap_ms: until.since(now.honour) - self.lock_margin_ms(),
@@ -6572,6 +6578,9 @@ impl Core {
         }
         if retagged {
             // Backups hold the record tagged with the generation otherwise.
+            // In the final-mirror window the flag is cleared without a send
+            // (`locks_after_event`): only a re-sent final mirror carries the
+            // re-tag there.
             self.lk.mirror_dirty = true;
         }
         if n > 0 {
@@ -6868,6 +6877,23 @@ impl Core {
             }
             taken
         };
+        // A root that holds its own stream (ADR-55) shares this table with
+        // the generation: the records it hands back are the root's from this
+        // step on, so they stay, re-tagged as the root's. Taken out, they were
+        // in no table until the root applied its own release batch, and a
+        // waiter served in between was granted beside them (sim
+        // `locks-root-own-unlinked-partition-nocrash` seed 15: a sticky
+        // release took node 2's exclusive grant out, and the same step
+        // granted node 3 the inode). The note still carries them, for the
+        // backups and the log.
+        if !grants.is_empty() && self.holder_root() == Some(self.cfg.node_id) {
+            for g in &grants {
+                replica
+                    .locks()
+                    .install_keeping_later(Grant { gen: 0, ..*g });
+            }
+            self.lk.mirror_dirty = true;
+        }
         // What is left of each record is a duration on this node's wait
         // clock (plan 43 C7-H1): the wire carries no absolute.
         let carry: Vec<(GrantId, u64)> = grants

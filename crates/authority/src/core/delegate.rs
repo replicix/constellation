@@ -748,6 +748,16 @@ pub(crate) struct DelegateState {
     /// counts; it carries the lock handoff and has waited for the read
     /// delegations under the new subtree).
     pub grown: BTreeMap<Ino, Option<HonourMs>>,
+    /// Subtrees a non-stealable stream grew by that it honours for its ops
+    /// (at the commit, without a renewal) but grants no lock in yet: the
+    /// root moved its grants there to the stream's handoff, which comes with
+    /// a granting answer to a renewal sent after the time kept here
+    /// ([`Core::deleg_unpark_grown`]). Granting before it, the delegate did
+    /// not know the grants the root had made there (sim
+    /// `locks-root-own-unlinked-partition-nocrash` seed 260: a handover of the
+    /// root's own sticky `d1` grew node 2's sticky stream, and node 2 granted
+    /// itself an inode node 3 held).
+    pub lock_wait: BTreeMap<Ino, HonourMs>,
     /// Plan 46 M1.2 step 10: this node released subtrees on the root's
     /// request and the root has not acknowledged the release row yet.
     pub release: Option<PendingRelease>,
@@ -2823,6 +2833,7 @@ impl Core {
                 DelegateState {
                     dirs: d.dir_list().into_iter().collect(),
                     grown: BTreeMap::new(),
+                    lock_wait: BTreeMap::new(),
                     release: remnant.then(|| PendingRelease {
                         note: constellation_meta::locks::ReleaseNote {
                             leaving: self.dl.leave_self,
@@ -2913,7 +2924,15 @@ impl Core {
             if d.non_stealable() {
                 // Honoured whatever the root says or the clock does
                 // (DESIGN.md §5.2: the designee writes while isolated).
-                self.dl.mine.get_mut(&d.gen).expect("present").until = HonourMs(i64::MAX / 2);
+                // Its locks wait for the first granting answer, which carries
+                // the root's grants in the subtrees (`lock_wait`; sim
+                // `locks-root-own-unlinked-partition-nocrash` seed 177: a
+                // handover made a new sticky stream, and its holder granted
+                // itself an inode the root's own client held).
+                let m = self.dl.mine.get_mut(&d.gen).expect("present");
+                m.until = HonourMs(i64::MAX / 2);
+                let before = HonourMs(now.honour.0 - 1);
+                m.lock_wait = m.dirs.iter().map(|dir| (*dir, before)).collect();
             }
             self.deleg_renew_now(now, d.gen, out);
             self.arm_deleg_lapse(now, d.gen, out);
@@ -3352,6 +3371,7 @@ impl Core {
         let listed = |dir: &Ino| subtrees.iter().any(|(x, _)| x == dir);
         d.dirs.retain(|dir| listed(dir));
         d.grown.retain(|dir, _| listed(dir));
+        d.lock_wait.retain(|dir, _| listed(dir));
         let mut learned = 0u64;
         for (dir, _) in subtrees {
             if !d.dirs.contains(dir) && !d.grown.contains_key(dir) {
@@ -3416,14 +3436,21 @@ impl Core {
             }
             // A stream never mixes grant kinds: a designated stream grows
             // by designations only, honoured once committed.
+            // Its locks wait for the handoff all the same (`lock_wait`).
             if non_stealable_stream {
                 d.grown.remove(&dir);
                 d.dirs.insert(dir);
+                d.lock_wait.insert(dir, after);
                 promoted += 1;
             }
         }
         self.stats.deleg_grows_honoured += promoted;
-        if self.dl.mine.get(&gen).is_some_and(|d| !d.grown.is_empty()) {
+        if self
+            .dl
+            .mine
+            .get(&gen)
+            .is_some_and(|d| !d.grown.is_empty() || !d.lock_wait.is_empty())
+        {
             // The renewal that unlocks it: sent after this point.
             self.deleg_renew_now(now, gen, out);
         }
@@ -3435,7 +3462,10 @@ impl Core {
     /// grown subtree whose commit was learned before that send is honoured
     /// from now on (returned). One still waiting asks again at once. Only
     /// the core's answer counts: an answer without it carries no handoff,
-    /// grace or floor for the new subtree.
+    /// grace or floor for the new subtree. The subtrees a non-stealable
+    /// stream honours already and grants no lock in yet (`lock_wait`) are
+    /// let in for locks by the same answer (returned too: the grace binds
+    /// them).
     pub(crate) fn deleg_unpark_grown(
         &mut self,
         now: Now,
@@ -3446,10 +3476,10 @@ impl Core {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return Vec::new();
         };
-        if d.grown.is_empty() {
+        if d.grown.is_empty() && d.lock_wait.is_empty() {
             return Vec::new();
         }
-        let ready: Vec<Ino> = d
+        let mut ready: Vec<Ino> = d
             .grown
             .iter()
             .filter(|(_, v)| v.is_some_and(|t| t < sent))
@@ -3460,11 +3490,31 @@ impl Core {
             d.dirs.insert(*dir);
         }
         self.stats.deleg_grows_honoured += ready.len() as u64;
-        let waiting = d.grown.values().any(|v| v.is_some());
+        let locks_in: Vec<Ino> = d
+            .lock_wait
+            .iter()
+            .filter(|(_, t)| **t < sent)
+            .map(|(dir, _)| *dir)
+            .collect();
+        for dir in &locks_in {
+            d.lock_wait.remove(dir);
+        }
+        ready.extend(locks_in);
+        let waiting = d.grown.values().any(|v| v.is_some()) || !d.lock_wait.is_empty();
         if waiting {
             self.deleg_renew_now(now, gen, out);
         }
         ready
+    }
+
+    /// The inode is under a subtree of `gen` that a non-stealable stream
+    /// honours but grants no lock in yet ([`DelegateState::lock_wait`]).
+    pub(crate) fn deleg_lock_waits(&self, ino: Ino, gen: u64, replica: &dyn Replica) -> bool {
+        self.dl.mine.get(&gen).is_some_and(|d| {
+            d.lock_wait
+                .keys()
+                .any(|dir| ino == *dir || replica.is_under(ino, *dir))
+        })
     }
 
     pub(crate) fn drop_delegate_state(
@@ -8445,7 +8495,7 @@ impl Core {
     /// then. A root that reclaimed a grant this node's frozen process could
     /// not renew refuses the renewal it sends on thawing, before the lapse
     /// watch is handled: counted as a loss in a freeze too.
-    fn deleg_renewal_refused(
+    pub(crate) fn deleg_renewal_refused(
         &mut self,
         now: Now,
         gen: u64,
@@ -8466,7 +8516,23 @@ impl Core {
         // step 5). A usable root that says the generation is not served
         // (`ends`: an operator's abandon, a recall, the end of the stream)
         // stops it, as for any other.
+        //
+        // It asks again after a request timeout: the answer took its renewal
+        // timer, and nothing else re-arms it. Silent, the stream never renewed
+        // again, and a root that took over (or re-took) the lease granted no
+        // lock at all: its tenure floor waits for every live stream's renewal
+        // (`Core::lock_tenure_floor_ready`; sim `locks-root-own-unlinked-partition`
+        // seed 1404: a renewal answered by a root just thawed from a pause,
+        // no lock granted in the 60 s after its restart).
         if d.non_stealable && !ends {
+            if d.renew_timer.is_none() && !d.stopped {
+                let t = self.set_timer_honour(
+                    now.honour.plus(self.deleg_request_timeout_ms()),
+                    Timer::DelegRenew(gen),
+                    out,
+                );
+                self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
+            }
             return;
         }
         let ran_out = !d.lapsed && now.honour >= self.deleg_lapse_at(d);
