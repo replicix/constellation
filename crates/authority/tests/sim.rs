@@ -7065,6 +7065,38 @@ fn regression_a_self_sealed_copy_stays_contiguous_seed_218() {
     }
 }
 
+/// `metered-shared+links` seed 1238 with slow lease reads: node 2 took
+/// epoch 1 over (epoch 2) and kept the rows it re-shipped as a member copy
+/// of epoch 1, but not the tail's holes, so the copy had gaps (at 16..20,
+/// 23, 27..29, ...). Node 3, a racing claimant, fetched the epoch's tail
+/// from that copy (`seal_tail_hold` case 3); its contiguous hold stopped at
+/// 15 of 46, and a winning claimant's gate would have dropped the committed
+/// rows past it, answered ones included ((1,1,8), (1,1,17)). The copy now
+/// keeps the tail's holes below its top row. Fails before the fix on the
+/// tripwire at the fetch (`tail_answer_gaps`).
+#[test]
+fn regression_a_successors_member_copy_keeps_the_tails_holes_seed_1238() {
+    let seed = 1238;
+    let cfg = SimConfig {
+        lease_reads: SLOW_LEASE_READS,
+        ..config_variant(metered_shared_config(), "links")
+    };
+    let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+        panic!(
+            "metered-shared+links seed {seed}: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=metered-shared+links AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
+    assert!(
+        report.stats.values().any(|s| s.tail_fetches > 0),
+        "the seed no longer fetches a tail"
+    );
+    for (id, stats) in &report.stats {
+        assert_eq!(stats.tail_answer_gaps, 0, "node {id}");
+        assert_eq!(stats.tail_beyond_gap_dropped, 0, "node {id}");
+    }
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and

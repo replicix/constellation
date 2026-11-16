@@ -6900,16 +6900,35 @@ impl Meta {
             // so that a claimant of its lease that fetches the inherited
             // tail finds them here whatever happens to its journal, until
             // the log carries their identities.
-            if !moved.is_empty() {
-                crate::store::member::put_rows_tx(
-                    &mut tx,
-                    self,
-                    t.epoch,
-                    t.config_version,
-                    &moved,
-                )?;
+            //
+            // The copy stays contiguous below its top row: every transaction
+            // of the sealed prefix it does not keep with records (a hole, a
+            // delegate's row, one the log carries or a drop-held retired, a
+            // dedup) is kept as a hole, as the tail held it. A later
+            // claimant that fetches this copy (`seal_tail_hold` case 3)
+            // counts its contiguous hold (`backup_acked`) to the top, not to
+            // the first such transaction: otherwise its gate would drop the
+            // committed rows past it as never committed.
+            let moved_rows = moved.len();
+            if let Some(top) = moved.iter().map(|m| m.last).max() {
+                let kept: HashSet<u64> = moved.iter().map(|m| m.first).collect();
+                let mut rows = moved;
+                rows.extend(
+                    txs.iter()
+                        .filter(|bt| {
+                            bt.first < top && bt.last <= t.through && !kept.contains(&bt.first)
+                        })
+                        .map(|bt| crate::BackupTx {
+                            first: bt.first,
+                            last: bt.last,
+                            records: Vec::new(),
+                            origin: (0, 0),
+                        }),
+                );
+                rows.sort_unstable_by_key(|r| r.first);
+                crate::store::member::put_rows_tx(&mut tx, self, t.epoch, t.config_version, &rows)?;
             }
-            report.tail_moved += moved.len();
+            report.tail_moved += moved_rows;
         }
         if !tails.is_empty() {
             // The rows the tail carried are back in the namespace: the

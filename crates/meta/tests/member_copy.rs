@@ -2259,3 +2259,59 @@ fn drop_held_rec(idents: Vec<(u64, u64)>) -> LogRecord {
         queued: Vec::new(),
     }
 }
+
+/// A hole that fills the gap of a copy is kept; one for a row the copy holds
+/// with records never replaces it (a holder's re-put of the tail may carry
+/// the row as a hole). Fails on the parent: the record row was replaced.
+#[test]
+fn a_filling_hole_never_replaces_a_row_with_records() {
+    let meta = Meta::open_in_memory().unwrap();
+    put(
+        &meta,
+        &[
+            mtx(1, 1, RowCommit::ROOT_GROUP, vec![create("a", ino(1), 10)]),
+            mtx(3, 3, RowCommit::ROOT_GROUP, vec![create("c", ino(3), 12)]),
+        ],
+    );
+    // The gap at 2 is filled by a hole; row 3 stays as it is.
+    put(
+        &meta,
+        &[
+            mtx(2, 2, RowCommit::ROOT_GROUP, Vec::new()),
+            mtx(3, 3, RowCommit::ROOT_GROUP, Vec::new()),
+        ],
+    );
+    assert_eq!(shape(&meta, 1), [(1, 1, true), (2, 2, false), (3, 3, true)]);
+}
+
+/// The twin of the above, D2: a transaction the log retired (`DropHeld`)
+/// still replaces the row it lands on, with a hole.
+#[test]
+fn a_retired_rows_hole_still_replaces_a_row_with_records() {
+    let meta = Meta::open_in_memory().unwrap();
+    put(
+        &meta,
+        &[mtx(
+            3,
+            3,
+            RowCommit::ROOT_GROUP,
+            vec![create("c", ino(3), 12)],
+        )],
+    );
+    // Epoch 1's row 9 is retired; a row 3 that carries its identity is a
+    // retired row's copy and is kept as a hole over what is there.
+    apply_rows(&meta, 1, 2, 0, &[], &[drop_held_rec(vec![(1, 9)])]);
+    put(
+        &meta,
+        &[mtx(
+            3,
+            3,
+            RowCommit::ROOT_GROUP,
+            vec![
+                LogRecord::TailOf { epoch: 1, jseq: 9 },
+                create("d", ino(4), 13),
+            ],
+        )],
+    );
+    assert_eq!(shape(&meta, 1), [(3, 3, false)]);
+}

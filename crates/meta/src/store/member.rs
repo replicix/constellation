@@ -1676,6 +1676,9 @@ pub(crate) fn put_row_tx(
         // more than the snapshot did: the class says what its client was
         // told.)
         Some(old) if old.class.gated() && !row.class.gated() => old,
+        // (A hole that fills a copy's gap never replaces a row it holds
+        // with records; a retired row's hole does, D2.)
+        Some(old) if !retired && row.tx.records.is_empty() && !old.tx.records.is_empty() => old,
         _ => row.clone(),
     };
     tx.insert(&meta.backup_tail, key, postcard::to_allocvec(&row)?);

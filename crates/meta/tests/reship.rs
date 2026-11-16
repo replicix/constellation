@@ -1297,3 +1297,92 @@ fn a_narrower_hole_resent_over_a_wider_one_leaves_the_wider_and_no_late_copy() {
         .unwrap();
     assert_eq!(spans(&meta), vec![(77, 80, 0)], "no copy of a retired row");
 }
+
+/// The successor's member copy of the sealed tail it re-ships stays
+/// contiguous below its top row: a hole, a row whose rid is done here and a
+/// dedup of an identity the tail carried already are kept as holes, as the
+/// tail held them, and a hole above the top row is not kept. A claimant that
+/// fetches the copy counts its hold to the top, not to the first row the
+/// re-ship did not move. Fails on the parent: the copy held rows 1, 4 and 6
+/// only (gaps at 2-3 and 5).
+#[test]
+fn the_successors_copy_has_no_gap_below_its_top_row() {
+    let meta = Meta::open_in_memory().unwrap();
+    // Row 3's rid is done here already.
+    execute_mutate(
+        &meta,
+        &MutateOp::Create {
+            parent: ROOT_INO,
+            name: "y".into(),
+            ino: ino(8),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        Some(rid(2, 2)),
+    )
+    .unwrap();
+    let again = vec![
+        tail_of(1),
+        create(ROOT_INO, "x", ino(7)),
+        LogRecord::Completed { rid: rid(2, 1) },
+    ];
+    let report = reship(
+        &meta,
+        &[
+            tx(1, 1, row(7)),
+            tx(2, 2, Vec::new()),
+            tx(
+                3,
+                3,
+                vec![
+                    create(ROOT_INO, "y", ino(8)),
+                    LogRecord::Completed { rid: rid(2, 2) },
+                ],
+            ),
+            tx(
+                4,
+                4,
+                vec![
+                    create(ROOT_INO, "z", ino(9)),
+                    LogRecord::Completed { rid: rid(2, 3) },
+                ],
+            ),
+            tx(5, 5, again),
+            tx(
+                6,
+                6,
+                vec![
+                    create(ROOT_INO, "w", ino(10)),
+                    LogRecord::Completed { rid: rid(2, 4) },
+                ],
+            ),
+            tx(7, 7, Vec::new()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        (report.tail_applied, report.tail_done, report.tail_dedup),
+        (3, 1, 1),
+        "{report:?}"
+    );
+    let (_, rows) = meta.member_copy_rows(EPOCH_PREV).unwrap().unwrap();
+    for pair in rows.windows(2) {
+        assert_eq!(pair[1].tx.first, pair[0].tx.last + 1, "a gap in the copy");
+    }
+    let shape: Vec<(u64, bool)> = rows
+        .iter()
+        .map(|r| (r.tx.first, !r.tx.records.is_empty()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (1, true),
+            (2, false),
+            (3, false),
+            (4, true),
+            (5, false),
+            (6, true)
+        ]
+    );
+}

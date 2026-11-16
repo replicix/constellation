@@ -6866,12 +6866,32 @@ impl Core {
         let Some(tail) = replica.backup_tail(role.epoch) else {
             return false;
         };
-        let txs: Vec<BackupTx> = tail
+        // (Kept contiguous below its top row: a hole, or a delegate's row,
+        // stays as a hole, so that a claimant that fetches the copy counts
+        // its hold to the top.)
+        let mut txs: Vec<BackupTx> = tail
             .into_iter()
-            .filter(|t| {
-                t.last <= acked && t.last > shipped && !t.records.is_empty() && t.origin == (0, 0)
+            .filter(|t| t.last <= acked && t.last > shipped)
+            .map(|t| {
+                if t.records.is_empty() || t.origin != (0, 0) {
+                    BackupTx {
+                        first: t.first,
+                        last: t.last,
+                        records: Vec::new(),
+                        origin: (0, 0),
+                    }
+                } else {
+                    t
+                }
             })
             .collect();
+        let top = txs
+            .iter()
+            .filter(|t| !t.records.is_empty())
+            .map(|t| t.last)
+            .max()
+            .unwrap_or(0);
+        txs.retain(|t| t.last <= top);
         if txs.is_empty() {
             return true;
         }

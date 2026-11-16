@@ -70145,3 +70145,17 @@ ships its journal and answers a drain.
   Tests: three orders of the confirm (`a_confirm_between_self_seal_and_claim_keeps_the_rows_past_it` and two more), the
   hole/quiescence/hold tests in `member_copy.rs`, and the pin of seed 218. The tripwire `tail_answer_gaps` checks every
   tail answer where the gap forms (a self-claim's copy and a fetched tail).
+- Member-copy holes (gapfix, seed 1238): a successor's member copy of a sealed epoch's tail dropped the holes
+  (`reship_epochs_at_takeover` built it from the rows it moved with records) and `keep_tail_as_member_copy` filtered
+  holes and delegates' rows. `seal_tail_hold` case 3 answered that gapped copy, `backup_acked` stopped at the first
+  gap and became the gate's `tail_through`: a third claimant, if the successor died before its re-ship landed, would
+  have dropped acknowledged and answered rows past the gap (I1). The trace showed it as `tail_answer_gaps` in
+  `metered-shared+links` under `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` (all missing rows were holes; none was lost
+  here). Now the successor's copy gets a record-less row for every transaction of the sealed prefix below its top moved
+  row that it does not move with records, `keep_tail_as_member_copy` keeps holes and delegates' rows as holes in
+  `(shipped, acked]` (trimmed above the top row with records; no copy if none has records), and `put_row_tx` never lets a
+  filling hole replace a row with records (a retired row's hole still does). Holes are not re-shipped and carry no
+  identity. Tests: `the_successors_copy_has_no_gap_below_its_top_row` (meta `reship.rs`),
+  `a_kept_tail_stays_contiguous_below_its_top_row` and `a_tail_of_holes_and_delegate_rows_keeps_no_copy` (authority),
+  `a_filling_hole_never_replaces_a_row_with_records` and its retired-row control (`member_copy.rs`), and the pin
+  `regression_a_successors_member_copy_keeps_the_tails_holes_seed_1238`.

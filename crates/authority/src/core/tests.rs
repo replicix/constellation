@@ -56991,6 +56991,90 @@ mod c1_member_copy {
         }
     }
 
+    /// The member copy of epoch 1 as `(first, last, has records)`, after a
+    /// check that it is contiguous from its first row (what a claimant that
+    /// fetches it counts as the hold).
+    fn copy_shape(h: &Harness) -> Vec<(u64, u64, bool)> {
+        let Some((_, rows)) = h.meta.member_copy_rows(1).unwrap() else {
+            return Vec::new();
+        };
+        for pair in rows.windows(2) {
+            assert_eq!(pair[1].tx.first, pair[0].tx.last + 1, "a gap in the copy");
+        }
+        rows.iter()
+            .map(|r| (r.tx.first, r.tx.last, !r.tx.records.is_empty()))
+            .collect()
+    }
+
+    /// A backup of epoch 1 holding `rows` (`first`, whether it has records,
+    /// the row's origin): `keep_tail_as_member_copy`'s result, and its copy.
+    fn keep_tail_of(rows: &[(u64, bool, (u64, u64))]) -> (Harness, bool) {
+        let mut h = Harness::new(2);
+        let txs: Vec<constellation_meta::BackupTx> = rows
+            .iter()
+            .map(|&(first, records, origin)| constellation_meta::BackupTx {
+                first,
+                last: first,
+                records: if records {
+                    vec![LogRecord::Create {
+                        parent: ROOT_INO,
+                        name: format!("n{first}"),
+                        ino: (1 << 40) | first,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 10,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                origin,
+            })
+            .collect();
+        assert!(crate::Replica::backup_append(&h.meta, 1, &txs));
+        let role = constellation_meta::BackupRole {
+            holder: 1,
+            epoch: 1,
+            config_version: 2,
+        };
+        let kept = h.core.keep_tail_as_member_copy(role, &h.meta);
+        (h, kept)
+    }
+
+    /// The tail this node held as backup keeps its holes and a delegate's rows
+    /// as holes below its top row with records, and drops what lies above it.
+    /// Fails on the parent: the copy held rows 1 and 4 only (a gap), and the
+    /// hole above the top row was kept.
+    #[test]
+    fn a_kept_tail_stays_contiguous_below_its_top_row() {
+        let own = (0, 0);
+        let (h, kept) = keep_tail_of(&[
+            (1, true, own),
+            (2, false, own),
+            (3, true, (1, 5)),
+            (4, true, own),
+            (5, false, own),
+        ]);
+        assert!(kept);
+        assert_eq!(
+            copy_shape(&h),
+            [(1, 1, true), (2, 2, false), (3, 3, false), (4, 4, true)]
+        );
+        assert_eq!(h.core.stats.tails_kept_as_member_copy, 1);
+    }
+
+    /// A tail with no row with records (holes and a delegate's row) stores no
+    /// copy at all, and the caller may clear the tail.
+    #[test]
+    fn a_tail_of_holes_and_delegate_rows_keeps_no_copy() {
+        let own = (0, 0);
+        let (h, kept) = keep_tail_of(&[(1, false, own), (2, true, (1, 5)), (3, false, own)]);
+        assert!(kept);
+        assert!(copy_shape(&h).is_empty());
+        assert!(h.meta.member_copy(1).unwrap().is_none());
+        assert_eq!(h.core.stats.tails_kept_as_member_copy, 0);
+    }
+
     /// A tail a node re-ships: each transaction starts with the identity of
     /// the journal that first held it; a transaction past the sealed hold's
     /// contiguous prefix is not re-shipped (never acknowledged); the group's
