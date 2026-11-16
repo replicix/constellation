@@ -82464,7 +82464,10 @@ mod root_own_sticky {
                 }
             )
         });
-        assert!(granted, "not granted once the cut covers the barrier: {out:?}");
+        assert!(
+            granted,
+            "not granted once the cut covers the barrier: {out:?}"
+        );
         let settled = h
             .core
             .deleg_leaving_barriers(Now::same(now.0), d.gen, &[], &h.meta);
