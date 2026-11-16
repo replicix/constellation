@@ -171,13 +171,30 @@ pub(crate) fn orphan_xattrs(
     ino: Ino,
 ) -> Result<Vec<(String, Vec<u8>)>, MetaError> {
     let mut out = Vec::new();
-    for guard in r.prefix(orphans, ino.to_be_bytes()) {
+    for guard in r.range(orphans, orphan_xattr_span(ino)) {
         let (k, v) = guard.into_inner()?;
-        if k.len() > 8 {
+        if k.len() > 8 && k[..8] == ino.to_be_bytes() {
             out.push((String::from_utf8_lossy(&k[8..]).into_owned(), v.to_vec()));
         }
     }
     Ok(out)
+}
+
+/// The keys of `ino`'s orphan xattrs ([`orphan_xattr_key`]): from the first
+/// name after the record's own 8-byte key to the next inode's record. The
+/// record key is outside the span on purpose: a pending unlink that the
+/// segment apply rewinds and redoes (`spec::restore_key_tx`) rewrites it
+/// every time, and an LSM scan that starts at it walks every version the
+/// memtable keeps of it (a prefix scan grew with each rewind of the row).
+fn orphan_xattr_span(ino: Ino) -> (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>) {
+    use std::ops::Bound;
+    let mut from = ino.to_be_bytes().to_vec();
+    from.push(0);
+    let to = match ino.checked_add(1) {
+        Some(next) => Bound::Excluded(next.to_be_bytes().to_vec()),
+        None => Bound::Unbounded,
+    };
+    (Bound::Included(from), to)
 }
 
 /// Drop every orphan xattr of `ino` (its record is reaped, or it is
@@ -188,10 +205,13 @@ pub(crate) fn clear_orphan_xattrs(
     ino: Ino,
 ) -> Result<(), MetaError> {
     let keys: Vec<Vec<u8>> = tx
-        .prefix(orphans, ino.to_be_bytes())
+        .range(orphans, orphan_xattr_span(ino))
         .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
         .collect::<Result<_, _>>()?;
-    for key in keys.into_iter().filter(|k| k.len() > 8) {
+    for key in keys
+        .into_iter()
+        .filter(|k| k.len() > 8 && k[..8] == ino.to_be_bytes())
+    {
         tx.remove(orphans, key);
     }
     Ok(())
@@ -877,4 +897,47 @@ pub(crate) fn ns_remove(
     dirty.capture(tx, ks, &key)?;
     tx.remove(ks, key);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Bound;
+
+    /// Whether `key` lies in `ino`'s orphan xattr span.
+    fn in_span(ino: Ino, key: &[u8]) -> bool {
+        let (from, to) = orphan_xattr_span(ino);
+        let above = match &from {
+            Bound::Included(f) => key >= f.as_slice(),
+            _ => unreachable!("the span starts at an included key"),
+        };
+        let below = match &to {
+            Bound::Excluded(t) => key < t.as_slice(),
+            Bound::Unbounded => true,
+            Bound::Included(_) => unreachable!("the span's end is excluded or open"),
+        };
+        above && below
+    }
+
+    /// Every orphan xattr key of `ino` is in its span, and nothing else is:
+    /// not the record key (a pending unlink's rewind rewrites that key, and a
+    /// scan that starts on it walks all its versions), nor a neighbour's
+    /// record or xattrs.
+    #[test]
+    fn orphan_xattr_span_holds_the_xattr_keys_and_not_the_record_key() {
+        for ino in [1u64, 2, 255, 256, 1 << 40, (7 << 40) | 5, u64::MAX - 1] {
+            for name in [&b"user.a"[..], b"\0", b"\xff\xff", b"user.long.name.x"] {
+                assert!(in_span(ino, &orphan_xattr_key(ino, name)), "{ino} {name:?}");
+            }
+            assert!(!in_span(ino, &ino.to_be_bytes()), "record key of {ino}");
+            assert!(!in_span(ino, &(ino + 1).to_be_bytes()), "next record");
+            assert!(!in_span(ino, &orphan_xattr_key(ino + 1, b"user.a")));
+            assert!(!in_span(ino, &(ino - 1).to_be_bytes()), "previous record");
+            assert!(!in_span(ino, &orphan_xattr_key(ino - 1, b"\xff\xff")));
+        }
+        // The last inode has no next record: the span is open above.
+        assert!(in_span(u64::MAX, &orphan_xattr_key(u64::MAX, b"user.a")));
+        assert!(!in_span(u64::MAX, &u64::MAX.to_be_bytes()));
+        assert!(!in_span(u64::MAX, &orphan_xattr_key(u64::MAX - 1, b"\xff")));
+    }
 }

@@ -70096,3 +70096,16 @@ the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and
   fenced, not retired yet); the root that takes over retires it with the normal leave. The core and ADR-61 are unchanged.
   Tests `a_member_leaves_an_epoch_whose_frozen_carrier_it_fenced`, `fence_frozen_carrier_fences_without_retiring`, and the
   harness scenario.
+- orphanscan: topology 2's forward unlink was slower than before M1.2 (+23 % p50 on tmpfs, +3 % on ext4 in the B4
+  comparison). b runs its forwarded unlinks speculatively, so every applied log segment rewinds and redoes the unlinks the
+  log does not carry yet, and each rewind calls `ns::clear_orphan_xattrs`. That scan was a prefix scan of `orphans` that
+  starts on the orphan's own record key, which the rewind and the redo rewrite each time: it walked a growing pile of
+  versions of that key (57 % of b's core thread in the slow runs). `clear_orphan_xattrs` and `orphan_xattrs` now range
+  over `[ino||0x00, ino+1)`, which holds exactly the xattr keys (`ns::orphan_xattr_key`: `ino` plus a non-empty name)
+  and never the record key. Results are unchanged, so no test failed before: the tests pin the span
+  (`orphan_xattr_span_holds_the_xattr_keys_and_not_the_record_key`) and the set an orphan keeps through 30 rewinds, with
+  its neighbours untouched (`a_pending_unlink_keeps_exactly_its_orphan_xattrs_through_many_rewinds`). Measured on ext4,
+  xfs, btrfs and tmpfs, topology 2, 4 A/B/B/A rounds each: forward unlink p50 x0.77 (ext4, xfs, btrfs) and x0.92 (tmpfs),
+  p99 down to x0.29; no cell above x1.02 at p50 on any file system (`bench/commit-rule/RESULTS.md`). Not done: the
+  rewind itself still redoes the whole not-yet-carried window per segment; other prefix scans that start on a rewritten
+  key (`clear_spilled_xattrs` on `ns`) did not show in the profile.

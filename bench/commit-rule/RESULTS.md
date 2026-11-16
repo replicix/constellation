@@ -363,3 +363,48 @@ Harness caveat: topology 5 checks only at the start that `a` lists no backup. In
 partway through (`ack.policy` `backup`). The root's ops were then `RootGroup`, answered after `b`'s acknowledgement (one
 WAN round trip). That is the "about one RTT" sometimes seen with a longer sync interval: with a 400 ms interval, 2 of 4
 probe runs waited about 110 ms with `b` listed, and 2 waited 405 ms with no backup.
+
+## Orphan xattr span (orphanscan): topology 2 forward unlink
+
+`ns::clear_orphan_xattrs` and `orphan_xattrs` scanned `orphans` by the prefix `ino`, which starts on the orphan's own
+record key. b's speculative forwarded unlinks are rewound and redone for every applied log segment, and each time the
+record key gets a new version, so the scan walked a growing pile of versions (57 % of b's core thread in the slow runs).
+Both now range over `[ino||0x00, ino+1)`. The result set is the same; the ack path, commit rule and protocol are
+untouched.
+
+`harness run ack-latency`, `ACK_LATENCY_TOPOLOGIES=2`, 600 samples, release builds, TMPDIR on the measured file
+system, 4 rounds each in A/B/B/A order, base = origin/main before the change. Per-round ratios fix/base of the p50
+(rounds 1 to 4), and their median. The p50 rule: every cell's median at most 1.03.
+
+| fs | cell | base p50 (us) | fix p50 (us) | per-round fix/base | median |
+|---|---|---|---|---|---|
+| ext4 | forward unlink | 834 854 841 868 | 692 650 655 665 | 0.830 0.761 0.779 0.766 | 0.772 |
+| ext4 | forward create | 718 728 690 714 | 693 715 693 682 | 0.965 0.982 1.004 0.955 | 0.974 |
+| ext4 | holder unlink | 242 261 244 237 | 241 243 265 239 | 0.996 0.931 1.086 1.008 | 1.002 |
+| ext4 | holder chmod | 252 245 217 235 | 230 222 240 213 | 0.913 0.906 1.106 0.906 | 0.910 |
+| ext4 | holder rename | 260 274 278 293 | 278 261 282 255 | 1.069 0.953 1.014 0.870 | 0.983 |
+| xfs | forward unlink | 810 814 821 825 | 632 618 641 623 | 0.780 0.759 0.781 0.755 | 0.770 |
+| xfs | forward create | 676 664 666 661 | 664 647 633 645 | 0.982 0.974 0.950 0.976 | 0.975 |
+| xfs | holder unlink | 236 237 245 274 | 243 242 236 239 | 1.030 1.021 0.963 0.872 | 0.992 |
+| xfs | holder chmod | 229 230 215 233 | 234 228 228 227 | 1.022 0.991 1.060 0.974 | 1.007 |
+| xfs | holder rename | 258 264 250 265 | 254 252 255 249 | 0.984 0.955 1.020 0.940 | 0.970 |
+| btrfs | forward unlink | 889 858 831 879 | 683 665 638 636 | 0.768 0.775 0.768 0.724 | 0.768 |
+| btrfs | forward create | 669 678 681 652 | 650 645 656 647 | 0.972 0.951 0.963 0.992 | 0.967 |
+| btrfs | holder unlink | 243 282 271 241 | 240 225 239 238 | 0.988 0.798 0.882 0.988 | 0.935 |
+| btrfs | holder chmod | 228 252 227 224 | 225 244 226 226 | 0.987 0.968 0.996 1.009 | 0.991 |
+| btrfs | holder rename | 257 262 294 261 | 262 240 260 256 | 1.019 0.916 0.884 0.981 | 0.948 |
+| tmpfs | forward unlink | 622 632 660 830 | 624 612 581 615 | 1.003 0.968 0.880 0.741 | 0.924 |
+| tmpfs | forward create | 653 670 667 681 | 649 638 624 657 | 0.994 0.952 0.936 0.965 | 0.958 |
+| tmpfs | holder unlink | 233 236 260 228 | 235 237 229 269 | 1.009 1.004 0.881 1.180 | 1.006 |
+| tmpfs | holder chmod | 223 221 239 240 | 211 213 218 248 | 0.946 0.964 0.912 1.033 | 0.955 |
+| tmpfs | holder rename | 250 249 234 261 | 255 248 281 251 | 1.020 0.996 1.201 0.962 | 1.008 |
+
+The other forward cells (chmod, rename) have p50 medians of 0.83 to 1.02 (forward rename 0.83 to 0.88 on all four).
+Forward unlink p99: ext4 0.66, xfs 0.30, btrfs 0.29, tmpfs 0.50 of base (xfs 3.1-3.4 ms -> 0.95-0.96 ms). The base's
+tmpfs slow mode (round 4: p50 830 us) is gone. The holder cells at p90 and p99 are the harness's usual noise on a path
+the change does not reach (the holder never rewinds): the p99 medians are 0.97 to 1.14 and rest on one or two
+stalls of 3 to 5 ms per run in both builds; ext4 holder chmod p90 had two fix rounds with a single stall (1127 and
+651 us against 320 us).
+
+vfs-bench (`cargo bench -p constellation-engine --bench vfs_bench`) times `getattr`, `lookup` and `read` dispatch only.
+It runs no unlink and no xattr, so it never reaches the changed code and was not run.

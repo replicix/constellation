@@ -579,6 +579,97 @@ fn a_stranded_unlink_leaves_no_orphan_xattrs() {
     assert_eq!(meta.list_xattrs(ino(1)).unwrap(), ["user.a"]);
 }
 
+/// A pending unlink's orphan keeps exactly its xattrs through many
+/// rollbacks and redos. Every segment the replica applies while the
+/// shadow is outstanding rewinds the unlink (`clear_orphan_xattrs` on
+/// the restored inode) and redoes it (the orphan and its xattrs are
+/// written again), and the orphan xattr scan must neither miss a key nor
+/// reach into the neighbouring inodes' (`ino - 1`, `ino + 1`) records and
+/// xattrs. The scan's span stays off the record key itself (the unit
+/// test `orphan_xattr_span_*` in `store::ns`), so a rewind's cost does
+/// not grow with the number of versions the key has.
+#[test]
+fn a_pending_unlink_keeps_exactly_its_orphan_xattrs_through_many_rewinds() {
+    let meta = Meta::open_in_memory().unwrap();
+    let setx = |i: u64, name: &str, value: &[u8], t: i64| LogRecord::SetXattr {
+        ino: ino(i),
+        name: name.into(),
+        value: value.to_vec(),
+        time_ns: t,
+    };
+    // Inodes 1 (below), 2 (the pending unlink) and 3 (above) hold xattrs;
+    // 1 and 3 are unlinked for good, so they are orphans with xattrs.
+    apply(
+        &meta,
+        1,
+        1,
+        &[
+            create("lo", ino(1), 10),
+            create("f", ino(2), 10),
+            create("hi", ino(3), 10),
+            setx(1, "user.lo", b"l", 11),
+            setx(2, "user.a", b"1", 11),
+            setx(2, "user.b", b"22", 11),
+            setx(2, "user.c", b"333", 11),
+            setx(3, "user.hi", b"h", 11),
+            unlink("lo", 12),
+            unlink("hi", 12),
+        ],
+    );
+    let op = MutateOp::Unlink {
+        parent: ROOT_INO,
+        name: "f".into(),
+    };
+    meta.install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
+        .unwrap();
+    let sorted = |ino: u64| {
+        let mut names = meta.list_xattrs(ino).unwrap();
+        names.sort();
+        names
+    };
+    let values = |ino: u64, names: &[&str]| -> Vec<Option<Vec<u8>>> {
+        names
+            .iter()
+            .map(|n| meta.get_xattr(ino, n).unwrap())
+            .collect()
+    };
+    assert_eq!(sorted(ino(2)), ["user.a", "user.b", "user.c"]);
+    for round in 0..30u64 {
+        // A segment that does not carry the unlink: it rewinds and redoes it.
+        apply(
+            &meta,
+            2 + round,
+            1,
+            &[create(&format!("n{round}"), ino(100 + round), 30)],
+        );
+        assert!(meta.has_outstanding_speculation(), "round {round}");
+        assert_eq!(meta.orphans().unwrap(), vec![ino(1), ino(2), ino(3)]);
+        assert_eq!(sorted(ino(2)), ["user.a", "user.b", "user.c"], "{round}");
+        assert_eq!(
+            values(ino(2), &["user.a", "user.b", "user.c"]),
+            [
+                Some(b"1".to_vec()),
+                Some(b"22".to_vec()),
+                Some(b"333".to_vec())
+            ],
+            "{round}"
+        );
+        assert_eq!(sorted(ino(1)), ["user.lo"], "{round}");
+        assert_eq!(sorted(ino(3)), ["user.hi"], "{round}");
+    }
+    // The log carries the unlink at last: the same set, now the log's.
+    apply(&meta, 40, 1, &[unlink("f", 20), completed(rid(1))]);
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(sorted(ino(2)), ["user.a", "user.b", "user.c"]);
+    assert_eq!(sorted(ino(1)), ["user.lo"]);
+    assert_eq!(sorted(ino(3)), ["user.hi"]);
+    // Reaping it drops its xattrs and only its.
+    meta.reap_orphan(ino(2)).unwrap();
+    assert!(meta.list_xattrs(ino(2)).is_err());
+    assert_eq!(sorted(ino(1)), ["user.lo"]);
+    assert_eq!(sorted(ino(3)), ["user.hi"]);
+}
+
 // ------------------------------------------------------ property test
 
 /// SplitMix64: a dependency-free, seedable generator.
