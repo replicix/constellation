@@ -2338,6 +2338,11 @@ pub struct Stats {
     /// committed rows of a self-reclaimed tail (answered, and not
     /// re-shipped). Must stay 0; the sim fails a seed that has one.
     pub tail_own_gated_beyond_gap: u64,
+    /// Tripwire where a tail answer's gap forms: a self-sealed claim's
+    /// member copy, or a fetched tail, whose contiguous hold (`backup_acked`)
+    /// is below its tip. The gate would drop the rows past the gap as never
+    /// committed. Must stay 0; the sim fails a seed that has one.
+    pub tail_answer_gaps: u64,
     /// Plan 46 M1.2 step 5 (c3-spec D3): a sealed tail that did not apply
     /// (`MetaError::TailDiverged`), one per pass of the closed gate. Must
     /// stay 0; the sim fails a seed that has one.

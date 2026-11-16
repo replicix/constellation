@@ -7477,6 +7477,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.tail_own_gated_beyond_gap, report.stats
             ));
         }
+        // A tail answer (a self-sealed claim's member copy, a fetched tail)
+        // whose contiguous hold stops below its tip: the gate would drop the
+        // rows past the gap. Any fails the seed.
+        if stats.tail_answer_gaps > 0 {
+            return Err(format!(
+                "node {id}: {} tail answer(s) were not contiguous (tail_answer_gaps)\n  stats: {:#?}",
+                stats.tail_answer_gaps, report.stats
+            ));
+        }
         // A row of the tail whose rid the log had already carried is skipped,
         // not re-shipped (`tail_rid_done`, c3-spec §4.3): under strict
         // identity or verbatim the seed fails. It is a benign overlap, not a

@@ -987,7 +987,7 @@ impl Core {
     /// epoch either: the holder may still win its own re-adoption CAS at the
     /// same epoch, and a seal here would refuse its backup stream for that
     /// whole tenure (the role is still written: the marker names the epoch).
-    fn tail_fetch_complete(
+    pub(super) fn tail_fetch_complete(
         &mut self,
         now: Now,
         ch: Chosen,
@@ -1028,6 +1028,7 @@ impl Core {
         // (Unreadable: what it holds counts from 0, which only ever
         // acknowledges less; the holder sends again.)
         self.bk.acked = replica.backup_acked(ch.epoch).unwrap_or(0);
+        self.check_tail_answer_contiguous("fetched", ch.epoch, self.bk.acked, &ch.txs);
         self.bk.held.clear();
         // The members of the old group: who held the tail a later claimant
         // may ask; this node's copy outlives the fetch.
@@ -1332,6 +1333,7 @@ impl Core {
                     return false;
                 };
                 self.bk.acked = acked;
+                self.check_tail_answer_contiguous("member copy", prev.epoch, acked, &txs);
                 let mut members: Vec<NodeId> = prev.backups.clone();
                 members.push(me);
                 members.sort_unstable();
@@ -1364,6 +1366,41 @@ impl Core {
             self.stats.claim_seals += 1;
         }
         true
+    }
+
+    /// Tripwire where a gap in a tail answer forms: the copy a claim takes
+    /// as the tail (its own member copy, or the answer it fetched) must hold
+    /// contiguously up to its tip, or the gate's `through`
+    /// (`backup_acked`) stops below rows it carries and the gate drops
+    /// them as never committed, answered ones included. Every answer is
+    /// contiguous by construction (a journal's seq gaps are holes, a
+    /// backup's answer stops at what it holds, a member copy keeps a hole
+    /// for a covered row below a live one): a violation is a bug, counted
+    /// in `tail_answer_gaps` (the sim fails a seed that has one).
+    fn check_tail_answer_contiguous(
+        &mut self,
+        source: &'static str,
+        epoch: Epoch,
+        acked: u64,
+        txs: &[BackupTx],
+    ) {
+        let tip = txs.iter().map(|t| t.last).max().unwrap_or(0);
+        if acked >= tip {
+            return;
+        }
+        self.stats.tail_answer_gaps += 1;
+        tracing::error!(
+            node = self.cfg.node_id,
+            epoch,
+            source,
+            acked,
+            tip,
+            "a tail answer is not contiguous: the rows past its gap would be dropped as never committed"
+        );
+        debug_assert!(
+            false,
+            "a tail answer is not contiguous: the rows past its gap would be dropped"
+        );
     }
 
     /// The wait of a claim for `prev`'s group (`status.lease.waiting_for_group`)

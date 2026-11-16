@@ -85267,3 +85267,105 @@ mod step8_handover_root {
         );
     }
 }
+
+/// The tripwire where a tail answer's gap forms (`tail_answer_gaps`): a
+/// self-sealed claim's member copy, and a fetched tail, whose contiguous hold
+/// is below their tip. Release counts it; a debug build also asserts.
+mod tail_answer_gaps {
+    use super::seal_tail::{Chosen, TailFetch};
+    use super::*;
+    use constellation_meta::{BackupTx, MemberTx, RowCommit};
+    use std::collections::BTreeMap;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn row(h: &Harness, first: u64, last: u64) -> MemberTx {
+        MemberTx {
+            tx: BackupTx {
+                first,
+                last,
+                records: vec![LogRecord::Completed { rid: h.rid(first) }],
+                origin: (0, 0),
+            },
+            class: RowCommit::ROOT_GROUP,
+            rid: None,
+            op: None,
+            lock_tag: Default::default(),
+        }
+    }
+
+    /// A self-sealed holder of epoch 1 whose copy holds `spans`.
+    fn self_sealed(spans: &[(u64, u64)]) -> (Harness, Lease) {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let prev = h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap();
+        h.core.bk.sealed = 1;
+        let rows: Vec<MemberTx> = spans.iter().map(|&(f, l)| row(&h, f, l)).collect();
+        h.meta.member_copy_put_rows(1, 1, &rows).unwrap();
+        (h, prev)
+    }
+
+    /// A1: a copy with a gap in the middle (hand-made: rows 1 and 3) is
+    /// counted when the claim takes it as the tail.
+    #[test]
+    fn a_self_claim_over_a_copy_with_a_gap_is_counted() {
+        let (mut h, prev) = self_sealed(&[(1, 1), (3, 3)]);
+        let run = catch_unwind(AssertUnwindSafe(|| {
+            h.core.prepare_tail_for_claim(&prev, &h.meta)
+        }));
+        assert_eq!(h.core.stats.tail_answer_gaps, 1);
+        if cfg!(debug_assertions) {
+            assert!(run.is_err(), "a debug build asserts");
+        } else {
+            assert!(run.unwrap());
+        }
+    }
+
+    /// A1 negative control: a contiguous copy counts nothing, a hole
+    /// included.
+    #[test]
+    fn a_self_claim_over_a_contiguous_copy_counts_nothing() {
+        let (mut h, prev) = self_sealed(&[(1, 1), (2, 3), (4, 4)]);
+        assert!(h.core.prepare_tail_for_claim(&prev, &h.meta));
+        assert_eq!(h.core.stats.tail_answer_gaps, 0);
+    }
+
+    /// A2: a fetched tail (another member's answer) with a gap is counted
+    /// when the fetch completes; a contiguous one counts nothing.
+    #[test]
+    fn a_fetched_tail_with_a_gap_is_counted() {
+        for (spans, gaps) in [(vec![(1, 1), (3, 3)], 1), (vec![(1, 1), (2, 3)], 0)] {
+            let mut h = Harness::new(2);
+            h.hold(1, None);
+            let prev = h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap();
+            let txs: Vec<BackupTx> = spans.iter().map(|&(f, l)| row(&h, f, l).tx).collect();
+            h.core.bk.tf = Some(TailFetch {
+                prev: prev.clone(),
+                tag: tag(),
+                asked: BTreeMap::new(),
+                chosen: None,
+                timer: None,
+                unproven: false,
+            });
+            let ch = Chosen {
+                node: 3,
+                epoch: prev.epoch,
+                config_version: 1,
+                req: OpId(0),
+                through: txs.iter().map(|t| t.last).max().unwrap(),
+                txs,
+            };
+            let mut out = Vec::new();
+            let clk = h.clk();
+            let run = catch_unwind(AssertUnwindSafe(|| {
+                h.core
+                    .tail_fetch_complete(clk, ch, false, &h.meta, &mut out)
+            }));
+            assert_eq!(h.core.stats.tail_answer_gaps, gaps);
+            if gaps == 0 {
+                assert!(run.is_ok());
+            } else if cfg!(debug_assertions) {
+                assert!(run.is_err(), "a debug build asserts");
+            }
+        }
+    }
+}

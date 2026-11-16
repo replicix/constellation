@@ -7042,6 +7042,29 @@ fn a_holders_own_rows_shipped_ahead_stay_in_the_log_for_its_next_claim() {
     });
 }
 
+/// `metered-shared` seed 218: a row of the holder's own tail was shipped
+/// ahead of a deferred one and confirmed between the node's self-seal and its
+/// claim; the member copy lost it with no hole, so the copy's contiguous hold
+/// stopped at the gap and the gate dropped six own `Group { on: Root }` rows
+/// past it as never committed (none answered here, but one could have been).
+/// The copy now keeps a record-less hole for a covered row below a row with
+/// records. Fails before the fix on the tripwire at the source
+/// (`tail_answer_gaps`); the gate drops nothing as past a gap.
+#[test]
+fn regression_a_self_sealed_copy_stays_contiguous_seed_218() {
+    let seed = 218;
+    let report = run_seed(seed, metered_shared_config()).unwrap_or_else(|e| {
+        panic!(
+            "metered-shared seed {seed}: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=metered-shared"
+        )
+    });
+    for (id, stats) in &report.stats {
+        assert_eq!(stats.tail_answer_gaps, 0, "node {id}");
+        assert_eq!(stats.tail_beyond_gap_dropped, 0, "node {id}");
+    }
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and
@@ -9945,6 +9968,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "deleg_append_queued",
             "tail_beyond_gap_dropped",
             "tail_own_gated_beyond_gap",
+            "tail_answer_gaps",
             "inherited_tails_cleared",
             "ttl_claims_without_tail",
             "touched_unknown_submits",
