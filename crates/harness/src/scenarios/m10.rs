@@ -427,7 +427,7 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
     })?;
     // The operator fences A from B: A's leases are fenced and B leaves the
     // epoch, but A is not retired (ADR-61: only a root retires a node).
-    let fenced = b.leave(Some(a_id), true);
+    let fenced = b.leave(Some(a_id), false);
     let msg = format!(
         "{:#}",
         fenced
@@ -438,6 +438,14 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
     anyhow::ensure!(
         msg.contains("fenced") && msg.contains("not retired"),
         "{msg}"
+    );
+    // A is fenced, not tombstoned: it is still on the roster.
+    let roster = b.control_status()?["roster"].clone();
+    anyhow::ensure!(
+        roster["write_eligible"]
+            .as_array()
+            .is_some_and(|l| l.iter().any(|n| n.as_u64() == Some(a_id))),
+        "A left the roster after the fence alone: {roster}"
     );
     eventually("B abandons the epoch", Duration::from_secs(30), || {
         let e = epoch_of(&b)?;
@@ -514,7 +522,7 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
     let mut abandoned = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        match root_node.leave(Some(a_id), true) {
+        match root_node.leave(Some(a_id), false) {
             Ok(()) => break,
             Err(e) => {
                 let e = format!("{e:#}");

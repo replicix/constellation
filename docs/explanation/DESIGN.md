@@ -1500,7 +1500,8 @@ the write-eligible roster beyond `f` is an **operator action**
 node still counts until it is retired. An admin leave also fences the
 retired node's leases, and epoch members abandon an epoch that carried a
 retired or fenced node's lease (a member fences a dead carrier itself, and
-the root that then takes over retires it). A node that enrolls during an epoch is a known gap.
+the root that then takes over retires it). A node that enrolls during an
+epoch is a known gap.
 
 ### Availability matrix
 

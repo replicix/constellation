@@ -15090,7 +15090,9 @@ impl Core {
                     Err(format!(
                         "node {node} is the root as this node read the lease, and no node has taken \
                          over yet{}: run the leave on the root once one has (this node's table \
-                         cannot tell that node {node} holds no grant)",
+                         cannot tell that node {node} holds no grant); if node {node} carries \
+                         a frozen continuation epoch, run the leave on a member of that epoch \
+                         first, which fences it so a node can take over",
                         if released {
                             " (the lease is released: a write on any node takes it, and that node \
                              is the root)"

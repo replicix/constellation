@@ -63,6 +63,13 @@ pub enum LeaveError {
         node_id: u64,
         partitions: Vec<String>,
     },
+    /// The target's leases were fenced, but this node's epoch was no longer
+    /// frozen with the target as carrier when the fence landed, so it did
+    /// not leave the epoch. Run the leave again.
+    FencedEpochKept {
+        node_id: u64,
+        partitions: Vec<String>,
+    },
     Other(String),
 }
 
@@ -107,6 +114,14 @@ impl fmt::Display for LeaveError {
                 } else {
                     partitions.join(", ")
                 }
+            ),
+            Self::FencedEpochKept {
+                node_id,
+                partitions,
+            } => write!(
+                f,
+                "node {node_id}'s leases are fenced ({}), but this node's epoch is no longer frozen; it did not leave it; run the leave again",
+                partitions.join(", ")
             ),
             Self::Other(msg) => write!(f, "{msg}"),
         }
@@ -195,7 +210,12 @@ pub async fn fence_frozen_carrier(
     if !fenced.is_empty() {
         tracing::warn!(node = target, ?fenced, "fenced the epoch carrier's leases");
     }
-    epochs.abandon_for_fenced_carrier(target);
+    if !epochs.abandon_for_fenced_carrier(target) {
+        return Err(LeaveError::FencedEpochKept {
+            node_id: target,
+            partitions: fenced,
+        });
+    }
     Ok(fenced)
 }
 
@@ -450,10 +470,32 @@ mod tests {
             Err(LeaveError::LiveLease { .. })
         ));
         assert_eq!(ls.get().await.unwrap().unwrap().0.epoch, 3, "untouched");
+        // This node's epoch is not frozen with `b` as carrier (here: no
+        // epoch): the fence lands, but the node did not leave an epoch.
+        let kept = fence_frozen_carrier(store.clone(), &epochs, a, b, true).await;
+        match kept {
+            Err(LeaveError::FencedEpochKept {
+                node_id,
+                partitions,
+            }) => {
+                assert_eq!(node_id, b);
+                assert_eq!(partitions, ["p0"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let msg = LeaveError::FencedEpochKept {
+            node_id: b,
+            partitions: vec!["p0".into()],
+        }
+        .to_string();
+        assert!(msg.contains("did not leave"), "{msg}");
+        assert_eq!(ls.get().await.unwrap().unwrap().0.epoch, 4, "fenced");
+        // A second call finds the lease already fenced.
         let fenced = fence_frozen_carrier(store.clone(), &epochs, a, b, true)
             .await
-            .unwrap();
-        assert_eq!(fenced, ["p0"]);
+            .unwrap_err();
+        assert!(matches!(fenced, LeaveError::FencedEpochKept { .. }));
+        let fenced: Vec<String> = vec!["p0".into()];
         let (lease, _) = ls.get().await.unwrap().unwrap();
         assert_eq!(lease.epoch, 4);
         assert!(lease.is_expired(replicix_objcas::lease::now_unix_ms()));
@@ -483,6 +525,49 @@ mod tests {
             .unwrap();
         assert!(get_node(store, b).await.unwrap().unwrap().retired);
         assert_eq!(ls.get().await.unwrap().unwrap().0.epoch, 4);
+    }
+
+    /// On a member of a frozen epoch the target carries, the fence lands and
+    /// this node leaves the epoch: the error says "fenced, not retired".
+    #[tokio::test]
+    async fn fence_frozen_carrier_leaves_the_frozen_epoch() {
+        use constellation_authority::EpochClaimView;
+        use constellation_net::{EpochActivation, EpochCarrier};
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = claim_node_id(store.clone()).await.unwrap();
+        let b = claim_node_id(store.clone()).await.unwrap();
+        let ls = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
+        ls.try_create(&Lease::granted("p0", b, 3, 60_000))
+            .await
+            .unwrap();
+        let epochs = EpochManager::new(a, open_meta(), Peers::disabled());
+        epochs.set_roster(vec![a, b, 3]);
+        epochs.set_slack(1);
+        epochs.set_claim_view(EpochClaimView {
+            advertised_slack: Some(1),
+            known: 1,
+            ..Default::default()
+        });
+        epochs.handle_propose("e".into(), vec![a, b], vec![], b, 1);
+        epochs.handle_activate(EpochActivation {
+            epoch_id: "e".into(),
+            members: vec![a, b],
+            base: vec![],
+            carrier: Some(EpochCarrier {
+                node: b,
+                epoch: 3,
+                expires_unix_ms: 5,
+            }),
+            stale_below: 1,
+        });
+        epochs.check_liveness().await;
+        assert_eq!(epochs.frozen_carrier(), Some(b));
+        let fenced = fence_frozen_carrier(store.clone(), &epochs, a, b, true)
+            .await
+            .unwrap();
+        assert_eq!(fenced, ["p0"]);
+        assert!(!epochs.is_open(), "left the epoch");
+        assert!(!get_node(store, b).await.unwrap().unwrap().retired);
     }
 
     /// Plan 30 §M10: an admin leave fences the retired node's lease — the
