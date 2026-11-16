@@ -82369,6 +82369,150 @@ mod root_own_sticky {
         assert_eq!(h.meta.locks().get(id).map(|g| g.gen), Some(0));
     }
 
+    /// The root with its own stream on `/w1` installed, and an inode in no
+    /// subtree (the root's).
+    fn root_with_stream_and_file() -> (Harness, constellation_meta::delegation::Delegation, Ino) {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        let d = own_grant_of(&h, dirs[0]).expect("the root holds a sticky grant on /w1");
+        archive_and_step(&mut h);
+        assert!(h.core.dl.mine.contains_key(&d.gen), "not installed");
+        let f = h.meta.allocate_ino(ROOT_INO).unwrap();
+        assert!(matches!(
+            h.meta.resolve_ownership(&Core::read_keys(f, None)),
+            constellation_meta::delegation::Ownership::Root
+        ));
+        (h, d, f)
+    }
+
+    fn x_grant(
+        node: NodeId,
+        seq: u64,
+        ino: Ino,
+        until: WaitMs,
+        gen: u64,
+    ) -> constellation_meta::locks::Grant {
+        use constellation_meta::locks::{Grant, GrantId, LockMode};
+        Grant {
+            id: GrantId { node, seq },
+            node,
+            ino,
+            mode: LockMode::Exclusive,
+            until,
+            recalled: false,
+            gen,
+            confirmed: Grant::MINTED,
+            settled: true,
+        }
+    }
+
+    /// An outwaited exclusive lock leaves a barrier on a root-owned inode.
+    /// The root holds its own stream and shares `lk.barriers` with the
+    /// generation: the stream batch lists the barrier, and the
+    /// acknowledgement (`deleg_drop_left`) must leave it, or the next
+    /// request on the inode is granted without a cut as of the barrier
+    /// (sim `locks-unlinked-delegated-partition` seed 4067). Fail-before:
+    /// the barrier is gone and the request is granted.
+    #[test]
+    fn a_barrier_on_a_root_owned_inode_survives_the_roots_own_acknowledgement() {
+        use constellation_meta::locks::LockMode;
+        let (mut h, d, f) = root_with_stream_and_file();
+        // Node 2 holds f exclusively under the generation and is outwaited.
+        let until = WaitMs(h.now.0 + 1_000);
+        h.meta.locks().install(x_grant(2, 4242, f, until, d.gen));
+        h.advance(5_000);
+        let now = h.now;
+        let carried = h
+            .core
+            .deleg_leaving_barriers(Now::same(now.0), d.gen, &[], &h.meta);
+        assert!(
+            carried.iter().any(|(ino, _)| *ino == f),
+            "the batch lists the barrier: {carried:?}"
+        );
+        // The root acknowledged the batch: the stream drops what left.
+        h.core.dl.mine.get_mut(&d.gen).unwrap().leaving = Some((0, vec![f]));
+        h.core.deleg_drop_left(d.gen, &h.meta);
+        let again = h
+            .core
+            .deleg_leaving_barriers(Now::same(now.0), d.gen, &[], &h.meta);
+        assert!(
+            again.iter().any(|(ino, _)| *ino == f),
+            "the barrier was dropped: {again:?}"
+        );
+        // A new request on f is cut as of the barrier, not granted.
+        let waits = h.core.stats.lock_barrier_waits;
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockRequest {
+                req: OpId(77),
+                ino: f,
+                mode: LockMode::Exclusive,
+                blocking: false,
+                sent: h.honour(),
+                incarnation: 1,
+                waited_ms: 0,
+            },
+        });
+        let granted = sends(&out).into_iter().any(|(_, m)| {
+            matches!(
+                m,
+                PeerMsg::LockReply {
+                    outcome: LockOutcome::Granted { .. },
+                    ..
+                }
+            )
+        });
+        assert!(!granted, "granted without a cut as of the barrier: {out:?}");
+        assert!(
+            h.core.stats.lock_barrier_waits > waits,
+            "the barrier did not hold the request back"
+        );
+    }
+
+    /// In the final-mirror window `lock_install_leaving` adds no record, but
+    /// the record of the sending generation must still become the root's, or
+    /// the acknowledgement takes it. Fail-before: the record is gone.
+    #[test]
+    fn a_grant_of_the_stream_stays_in_the_roots_table_in_the_final_mirror_window() {
+        let (mut h, d, f) = root_with_stream_and_file();
+        let until = WaitMs(h.now.0 + 5_000);
+        let g = x_grant(1, 4244, f, until, d.gen);
+        h.meta.locks().install(g);
+        h.core.lk.final_for = h.core.lock_lease_key();
+        assert!(h.core.lock_final_blocks(), "not in the final window");
+        h.core.lk.mirror_dirty = false;
+        let wire = g.to_wire(h.clk());
+        let now = h.clk();
+        h.core.lock_install_leaving(now, d.gen, vec![wire], &h.meta);
+        assert!(h.core.lk.mirror_dirty, "backups still see the old tag");
+        h.core.dl.mine.get_mut(&d.gen).unwrap().leaving = Some((0, vec![f]));
+        h.core.deleg_drop_left(d.gen, &h.meta);
+        let kept = h
+            .meta
+            .locks()
+            .get(g.id)
+            .expect("the grant is in no table in the final window");
+        assert_eq!(kept.gen, 0);
+        assert_eq!(kept.until, until, "the end moved in the final window");
+    }
+
+    /// A record whose end is past the restamp is re-tagged, not shortened.
+    #[test]
+    fn a_grant_ending_past_the_restamp_is_retagged_and_keeps_its_end() {
+        let (mut h, d, f) = root_with_stream_and_file();
+        let until = WaitMs(h.now.0 + 1_000_000_000);
+        let g = x_grant(1, 4245, f, until, d.gen);
+        h.meta.locks().install(g);
+        h.core.lk.mirror_dirty = false;
+        let wire = g.to_wire(h.clk());
+        let now = h.clk();
+        h.core.lock_install_leaving(now, d.gen, vec![wire], &h.meta);
+        let kept = h.meta.locks().get(g.id).expect("the record stays");
+        assert_eq!(kept.gen, 0, "not re-tagged");
+        assert_eq!(kept.until, until, "the end was shortened");
+        assert!(h.core.lk.mirror_dirty, "the re-tag is not mirrored");
+    }
+
     /// Test 2: never `/`, whoever asks (R-I1); the knob's unit check.
     #[test]
     fn the_roots_own_grant_is_never_on_slash() {

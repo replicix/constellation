@@ -469,7 +469,7 @@ pub(crate) struct LockState {
     /// Old root, plan 43 C7-F F-c: the lease (`lock_lease_key`) whose
     /// final mirror this node sent: while it is the lease held, nothing is
     /// added to the table (`lock_final_blocks`).
-    final_for: Option<LeaseKey>,
+    pub(crate) final_for: Option<LeaseKey>,
     /// The timer that brings the final mirror about (the lease's usable
     /// end), or re-sends it, and when it fires (honour clock).
     pub(crate) final_timer: Option<(TimerId, HonourMs)>,
@@ -6481,8 +6481,15 @@ impl Core {
         let Some((_, inos)) = d.leaving.take_if(|(last, _)| *last <= through) else {
             return;
         };
-        for ino in &inos {
-            self.lk.barriers.remove(ino);
+        // A root that holds its own stream shares `lk.barriers` with the
+        // generation, as it shares the lock table: a barrier on a root-owned
+        // inode is the root's (the stream batch only carried it for the
+        // backups), and it outlives the acknowledgement. A far delegate
+        // drops them: the root has them.
+        if self.holder_root() != Some(self.cfg.node_id) {
+            for ino in &inos {
+                self.lk.barriers.remove(ino);
+            }
         }
         let gone = replica
             .locks()
@@ -6514,11 +6521,10 @@ impl Core {
         leaving: Vec<GrantWire>,
         replica: &dyn Replica,
     ) {
-        if self.lock_final_blocks() {
-            return;
-        }
         let until = self.restamp(now);
+        let final_blocks = self.lock_final_blocks();
         let mut n = 0;
+        let mut retagged = false;
         for g in leaving {
             let here = match replica.resolve_ownership(&Self::read_keys(g.ino, None)) {
                 constellation_meta::delegation::Ownership::Root => true,
@@ -6534,14 +6540,26 @@ impl Core {
                 // delegate's too. The record becomes the root's here, whatever
                 // its end, or the delegate's `deleg_drop_left` takes it with
                 // its own and the holder's grant is in no table.
-                if e.node == g.node && e.ino == g.ino && (e.until < until || e.gen == gen) {
+                // In the final-mirror window the lease's end is fixed: only
+                // the re-tag happens, at the record's own end.
+                let until = if final_blocks { e.until } else { until };
+                if e.node == g.node
+                    && e.ino == g.ino
+                    && (e.gen == gen || (!final_blocks && e.until < until))
+                {
                     // Never sooner than the record's end *now* (plan 41
                     // L1): `e` was read above, and the owner's own record
                     // of this node may have been extended since.
                     replica
                         .locks()
                         .install_keeping_later(Grant { until, gen: 0, ..e });
+                    retagged |= e.gen != 0;
                 }
+                continue;
+            }
+            if final_blocks {
+                // The final mirror adds no record; only the re-tag above
+                // (it adds none) must still happen.
                 continue;
             }
             let g = Grant {
@@ -6551,6 +6569,10 @@ impl Core {
             if replica.locks().install_if_consistent(g, now.wait) {
                 n += 1;
             }
+        }
+        if retagged {
+            // Backups hold the record tagged with the generation otherwise.
+            self.lk.mirror_dirty = true;
         }
         if n > 0 {
             self.stats.lock_moved += n;

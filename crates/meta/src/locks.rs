@@ -7771,6 +7771,24 @@ mod token_tests {
         assert!(admit(&t, id, 2, LockMode::Exclusive, 170).is_some());
     }
 
+    /// `take_where_of_gen` takes only the given generation's records on
+    /// the inodes asked for; the root's (gen 0), other generations' and
+    /// other inodes' stay.
+    #[test]
+    fn take_where_of_gen_takes_only_that_generations_records() {
+        let t = LockTables::default();
+        let ours = t.grant(1, 2, 7, LockMode::Shared, WaitMs(500), 5);
+        let roots = t.grant(1, 3, 7, LockMode::Shared, WaitMs(500), 0);
+        let other = t.grant(1, 4, 7, LockMode::Shared, WaitMs(500), 6);
+        let elsewhere = t.grant(1, 2, 8, LockMode::Shared, WaitMs(500), 5);
+        let taken = t.take_where_of_gen(5, |i| i == 7);
+        assert_eq!(taken.iter().map(|g| g.id).collect::<Vec<_>>(), vec![ours]);
+        assert!(t.get(ours).is_none());
+        assert!(t.get(roots).is_some(), "the root's record went");
+        assert!(t.get(other).is_some(), "another generation's record went");
+        assert!(t.get(elsewhere).is_some(), "another inode's record went");
+    }
+
     /// A late admission beside a live conflicting record is refused (a
     /// supersede path would be missing): never admitted next to it.
     #[test]

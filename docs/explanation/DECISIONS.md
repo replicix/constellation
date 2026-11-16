@@ -4467,9 +4467,13 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   (the file unlinked under its lock) becomes the root's by re-tagging that record to
   generation 0 in place, never shortening it (`Core::lock_install_leaving`);
   when the batch is acknowledged the stream drops only its generation's
-  records (`LockTables::take_where_of_gen`), never the root's. A delegate on
-  another node has only its own generation's records on those inodes, and
-  drops all of them as before.
+  records (`LockTables::take_where_of_gen`), never the root's, and it leaves
+  the outwait barriers on those inodes (`lk.barriers` is shared the same way:
+  the batch only carries them to the backups). A delegate on another node
+  drops all of its records and barriers on those inodes as before; the root
+  has them. A deposed root that lives on as the holder of its own stream is
+  such a delegate, and may still hold gen-0 records of its old tenure on
+  those inodes until they expire; the drop leaves them.
 - **One rule for the root's own stream across a deposition (M1, M1', M5, S1).**
   A far delegate executes on a state that reflects only the rows the log
   carries plus its own stream. The root as its own holder also sees its

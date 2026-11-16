@@ -70123,7 +70123,9 @@ delegate's record already there and kept it the generation's (or did nothing), a
 `Core::deleg_drop_left` took every record on the inode: the only copy. The holder's next renewal, routed to the root, was
 answered `Lost`, the holder was fenced and its writes failed. Fix: `deleg_drop_left` drops only the generation's records
 (`LockTables::take_where_of_gen`), and `lock_install_leaving` re-tags a record of the sending generation to generation 0
-in place, never shortening it. A delegate on another node is unchanged. Tests
+in place, never shortening it (also in the final-mirror window, and then marking the lock mirror dirty); `deleg_drop_left`
+also keeps the outwait barriers on root-owned inodes when the node is the root holding its own stream (review: the batch
+only carries them to the backups). A delegate on another node is unchanged. Tests
 `root_own_sticky::a_grant_that_left_the_roots_own_stream_stays_in_the_roots_table` (fails on the parent) and
 `a_delegates_drop_of_what_left_removes_its_generations_records`.
 
