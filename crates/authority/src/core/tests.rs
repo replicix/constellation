@@ -82413,7 +82413,7 @@ mod root_own_sticky {
     /// acknowledgement (`deleg_drop_left`) must leave it, or the next
     /// request on the inode is granted without a cut as of the barrier
     /// (sim `locks-unlinked-delegated-partition` seed 4067). Fail-before:
-    /// the barrier is gone and the request is granted.
+    /// the barrier is gone after the acknowledgement.
     #[test]
     fn a_barrier_on_a_root_owned_inode_survives_the_roots_own_acknowledgement() {
         use constellation_meta::locks::LockMode;
@@ -82440,8 +82440,9 @@ mod root_own_sticky {
             again.iter().any(|(ino, _)| *ino == f),
             "the barrier was dropped: {again:?}"
         );
-        // A new request on f is cut as of the barrier, not granted.
-        let waits = h.core.stats.lock_barrier_waits;
+        // A new request on f takes the root's cut as of the barrier (the
+        // barrier settles into f's floor and the grant carries it); with
+        // no barrier left it would be granted without one.
         let out = h.step(Event::Peer {
             from: 3,
             msg: PeerMsg::LockRequest {
@@ -82463,10 +82464,13 @@ mod root_own_sticky {
                 }
             )
         });
-        assert!(!granted, "granted without a cut as of the barrier: {out:?}");
+        assert!(granted, "not granted once the cut covers the barrier: {out:?}");
+        let settled = h
+            .core
+            .deleg_leaving_barriers(Now::same(now.0), d.gen, &[], &h.meta);
         assert!(
-            h.core.stats.lock_barrier_waits > waits,
-            "the barrier did not hold the request back"
+            settled.iter().all(|(ino, _)| *ino != f),
+            "the grant did not settle the barrier: {settled:?}"
         );
     }
 
