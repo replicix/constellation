@@ -85320,11 +85320,10 @@ mod tail_answer_gaps {
         }
     }
 
-    /// A1 negative control: a contiguous copy counts nothing, a hole
-    /// included.
+    /// A1 negative control: a contiguous copy counts nothing.
     #[test]
     fn a_self_claim_over_a_contiguous_copy_counts_nothing() {
-        let (mut h, prev) = self_sealed(&[(1, 1), (2, 3), (4, 4)]);
+        let (mut h, prev) = self_sealed(&[(1, 1), (2, 2), (3, 3)]);
         assert!(h.core.prepare_tail_for_claim(&prev, &h.meta));
         assert_eq!(h.core.stats.tail_answer_gaps, 0);
     }

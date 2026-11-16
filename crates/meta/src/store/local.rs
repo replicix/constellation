@@ -4912,15 +4912,13 @@ mod verbatim_append_tests {
     /// confirms b (between the seal and the claim); the claim appends the
     /// copy and takes `backup_acked` as `through`. Returns (tip, through,
     /// report, c carried by journal or member copy after the gate).
-    fn gap_run(
-        cover: impl FnOnce(&Meta, &[u64]),
-        deposed: u8,
-    ) -> (u64, u64, crate::ReshipReport, bool) {
+    fn gap_run(cover: impl FnOnce(&Meta, &[u64]), deposed: u8) -> GapRun {
         let meta = Meta::open_in_memory().unwrap();
         meta.set_holder_epoch(1);
         own_row(&meta, "a", 14, RowCommit::ROOT_GROUP);
         own_row(&meta, "b", 15, RowCommit::ROOT_GROUP);
         own_row(&meta, "c", 16, RowCommit::ROOT_GROUP);
+        let c_first = first_of(&meta, rid(16));
         let b_first = first_of(&meta, rid(15));
         let b_last = row_of(&meta, rid(15)).1.last;
         let b_seqs: Vec<u64> = (b_first..=b_last).collect();
@@ -4971,15 +4969,57 @@ mod verbatim_append_tests {
             .iter()
             .any(|(_, recs)| recs.contains(&LogRecord::Completed { rid: rid(16) }));
         let in_copy = meta.member_copy_carries(rid(16)).unwrap();
-        (tip, through, report, in_journal || in_copy)
+        // Exactly once: c once in the journal, with its identity; b's
+        // transactions (a hole, or the row itself) as many times as asked.
+        let txs = journal(&meta);
+        let carrying = |n: u64| {
+            txs.iter()
+                .filter(|(_, recs)| recs.contains(&LogRecord::Completed { rid: rid(n) }))
+                .collect::<Vec<_>>()
+        };
+        let c_rows = carrying(16);
+        let c_once = c_rows.len() == 1
+            && c_rows[0].1.contains(&LogRecord::TailOf {
+                epoch: 1,
+                jseq: c_first,
+            });
+        GapRun {
+            tip,
+            through,
+            report,
+            kept: in_journal || in_copy,
+            c_once,
+            b_journaled: carrying(15).len(),
+        }
+    }
+
+    /// What [`gap_run`] saw.
+    struct GapRun {
+        tip: u64,
+        through: u64,
+        report: crate::ReshipReport,
+        kept: bool,
+        /// c is in the journal once, under `TailOf { 1, c.first }`.
+        c_once: bool,
+        /// How many journal transactions carry b after the gate.
+        b_journaled: usize,
     }
 
     /// Every row past the confirmed one survives the gate: nothing is
     /// dropped as past a gap, the whole copy is applied (c and the rows
     /// before it), and the tripwire stays 0.
-    fn gap_assert(run: (u64, u64, crate::ReshipReport, bool), applied: usize) {
-        let (tip, through, report, kept) = run;
+    fn gap_assert(run: GapRun, applied: usize, b_journaled: usize) {
+        let GapRun {
+            tip,
+            through,
+            report,
+            kept,
+            c_once,
+            b_journaled: b_seen,
+        } = run;
         assert_eq!(through, tip, "the copy's hold reaches its tip");
+        assert!(c_once, "c is re-journaled once with its TailOf identity");
+        assert_eq!(b_seen, b_journaled, "b is not re-journaled when confirmed");
         assert_eq!(report.tail_beyond_gap, 0, "{report:?}");
         assert_eq!(report.tail_own_gated_beyond_gap, 0, "{report:?}");
         assert_eq!(report.tail_applied, applied, "{report:?}");
@@ -4995,6 +5035,7 @@ mod verbatim_append_tests {
         gap_assert(
             gap_run(|meta, seqs| meta.ack_journal_rows_at(seqs, 1).unwrap(), 0),
             2,
+            0,
         );
     }
 
@@ -5005,6 +5046,7 @@ mod verbatim_append_tests {
         gap_assert(
             gap_run(|meta, seqs| meta.ack_journal_rows_at(seqs, 1).unwrap(), 2),
             2,
+            0,
         );
     }
 
@@ -5023,13 +5065,14 @@ mod verbatim_append_tests {
                 1,
             ),
             2,
+            0,
         );
     }
 
     /// Negative control: no confirm between the seal and the claim.
     #[test]
     fn no_confirm_between_self_seal_and_claim_keeps_the_rows() {
-        gap_assert(gap_run(|_, _| {}, 0), 3);
+        gap_assert(gap_run(|_, _| {}, 0), 3, 1);
     }
 
     /// Test 14: a deposed root's own stream rows are holder rows: the

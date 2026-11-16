@@ -1722,8 +1722,8 @@ records stays above it is kept as a record-less hole, with its read hold
 released, until the last such row retires (the member-copy twin of a backup's
 hole, D6); removed outright it left a gap in the middle of a self-sealed copy,
 so the copy's contiguous hold stopped below it, a self-claim's `through` with
-it, and the gate dropped the answered rows past the gap (`metered-shared` seed
-218). A tail answer that is not contiguous is a bug, and the sim fails a seed
+it, and the gate dropped the rows past the gap, answered ones included
+(`metered-shared` seed 218, where none had been answered). A tail answer that is not contiguous is a bug, and the sim fails a seed
 that gives one (`tail_answer_gaps`).
 
 **C2c (plan 43)**: a delegate acknowledges once its group holds the row. The

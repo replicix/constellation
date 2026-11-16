@@ -473,7 +473,8 @@ pub(crate) fn drop_settled_rows_tx(
         for row in rows_in(&*tx, meta, e)? {
             if let Some(by_floor) = log_settled_why_tx(&*tx, meta, e, &row)? {
                 tx.remove(&meta.backup_tail, tail_key(member_epoch(e), row.tx.first));
-                if by_floor && row.class.gated() {
+                // (A record-less hole carries no row: nothing is lost.)
+                if by_floor && row.class.gated() && !row.tx.records.is_empty() {
                     warn_gated_row_lost(e, &row);
                     meta.release_abandoned_row_tx(tx, member_epoch(e), row.tx.first);
                 } else {
@@ -608,7 +609,7 @@ pub(crate) struct Facts<'a> {
 /// What [`member_rules_tx`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemberOutcome {
-    /// Rows retired by coverage.
+    /// Rows with records retired by coverage (a hole is not counted).
     pub retired: usize,
     /// Rows dropped as never committed (past a `TailFollowsThrough`'s
     /// `through`, or unacknowledged at a newer epoch's marker).
@@ -1774,8 +1775,8 @@ pub(crate) fn member_rules_tx(
                 // record-less span takes its place until nothing with
                 // records stays above it. Removed outright, the copy's
                 // contiguous hold (`backup_acked`, a self-claim's `through`)
-                // stopped below the gap and the gate dropped the answered
-                // rows past it.
+                // stopped below the gap and the gate dropped the rows past
+                // it, answered ones included.
                 // (A hole is not a row retired: one the copy kept from an
                 // earlier pass is not counted again.)
                 if !row.tx.records.is_empty() {
@@ -1785,7 +1786,7 @@ pub(crate) fn member_rules_tx(
                             first,
                             last,
                             records: Vec::new(),
-                            origin: (0, 0),
+                            origin: row.tx.origin,
                         },
                         class: row.class,
                         rid: None,
@@ -1915,6 +1916,9 @@ pub(crate) fn member_rules_tx(
             }
             tx.remove(&meta.backup_tail, key);
             meta.release_row_tx(tx, member_epoch(e), first);
+            // (A hole kept by coverage and retired here is counted as
+            // dropped, though the row it stands for was carried by the log:
+            // `dropped` counts the span leaving, not a lost row.)
             out.dropped += 1;
         }
         if left == 0 {
