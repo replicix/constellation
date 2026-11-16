@@ -6963,6 +6963,7 @@ impl Core {
         replica: &dyn Replica,
     ) {
         self.stats.tail_beyond_gap_dropped += report.tail_beyond_gap as u64;
+        self.stats.tail_own_gated_beyond_gap += report.tail_own_gated_beyond_gap as u64;
         self.stats.tail_done_skipped += report.tail_done as u64;
         self.stats.tail_dedup += report.tail_dedup as u64;
         self.stats.tail_retired += report.tail_retired as u64;

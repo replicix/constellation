@@ -1705,7 +1705,15 @@ shipped by its holder, and the successor already ships the row); dropping a
 copy at any marker without a tail announcement (the successor may itself be
 replaced before it ships, D2). The formats are append-only: `TailOf` and
 `TailFollowsThrough` are new `LogRecord` variants, `TailFollows` stays
-decodable.
+decodable. A node that sealed its own epoch for a claimant and then won the
+next one reads its own tail back (876/S1): the gate re-journals its committed
+own rows at the journal's end, and every own append of a delegate's row behind
+the first of them goes with them, at any position (past the sealed `through`
+included), so the tenure's order and each stream's `idx` order hold. A moved
+append keeps the class it was journaled under (`Singleton`), never the tail's
+`Group`: the root's group never committed it, and a `Group` row in a later
+member copy would be queued for replay by rid on an abandon, the root
+re-executing a delegate's row.
 
 **C2c (plan 43)**: a delegate acknowledges once its group holds the row. The
 generation's configuration is a log record, `DelegGroup { dir, gen, version,

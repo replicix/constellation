@@ -9936,6 +9936,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "replay_gated_enqueued",
             "deleg_append_queued",
             "tail_beyond_gap_dropped",
+            "tail_own_gated_beyond_gap",
             "inherited_tails_cleared",
             "ttl_claims_without_tail",
             "touched_unknown_submits",

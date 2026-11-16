@@ -7469,6 +7469,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.tail_diverged, report.stats
             ));
         }
+        // S1 tripwire: an own committed row of a self-reclaimed tail lay
+        // past the sealed hold and was not re-shipped. Any fails the seed.
+        if stats.tail_own_gated_beyond_gap > 0 {
+            return Err(format!(
+                "node {id}: {} own committed row(s) of a self-reclaimed tail lay past the sealed hold (tail_own_gated_beyond_gap)\n  stats: {:#?}",
+                stats.tail_own_gated_beyond_gap, report.stats
+            ));
+        }
         // A row of the tail whose rid the log had already carried is skipped,
         // not re-shipped (`tail_rid_done`, c3-spec §4.3): under strict
         // identity or verbatim the seed fails. It is a benign overlap, not a

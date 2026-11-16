@@ -70073,3 +70073,12 @@ the parent. The m03 ratchet now covers `delegated-long-delegation-prod` at 0 and
   (`Meta::appends_behind_own_committed_tx`); both are re-journaled in the tenure's order. A first attempt that left the
   committed rows in place never quiesced. Test `a_self_reclaimed_tail_keeps_the_tenures_order` and the pin
   `regression_a_self_reclaimed_tail_ships_in_the_tenures_order_seed_876`.
+- S1 (follow-up of seed 876): an own append past the sealed `through` that follows a re-journaled own committed row
+  stayed in place and shipped ahead of it; one stream with b1 at or below `through` and b2 past it shipped out of
+  `idx` order. `appends_behind_own_committed_tx` no longer skips rows past `through`: once one own append moves,
+  every later one does, and the gate re-journals each moved row (the 876 rows inside `through` too) under its
+  original `Singleton` class, not the tail's `Group` (a `Group` row would be replayed by rid on an abandon). No sweep
+  reaches the case; it is covered by unit tests (T1 `..._past_through`, T2 `..._across_through`, negative controls).
+  Tripwire `ReshipReport.tail_own_gated_beyond_gap` (error log, debug assert, behaviour unchanged) counts an own
+  committed row past `through`, which the gate cannot re-ship; the fix for that class belongs in where `through` comes
+  from and needs its own spec.

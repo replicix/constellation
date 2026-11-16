@@ -817,6 +817,11 @@ pub struct ReshipReport {
     pub tail_applied: usize,
     /// Transactions past the sealed hold's contiguous prefix, not re-shipped.
     pub tail_beyond_gap: usize,
+    /// Tripwire (S1 spec 4.3): of `tail_beyond_gap`, this node's own
+    /// committed rows (`gen == 0`, gated) of a self-reclaimed tail. They were
+    /// answered to their clients and are not re-shipped. Must be 0; behaviour
+    /// is unchanged.
+    pub tail_own_gated_beyond_gap: usize,
     /// Transactions whose rid already had an outcome here, skipped: the log
     /// carried the effect under another identity. Not a normal sight (the
     /// sim fails a seed for it under strict identity).
@@ -6493,20 +6498,26 @@ impl Meta {
 
     /// B5: this node's own appends of delegates' rows that `tails` name
     /// (record for record, at the same epoch and journal seq) above a
-    /// committed own row of the same epoch the tails name too: the takeover
-    /// strand takes that row out and the tail re-journals it, so these go
-    /// with it, to keep the epoch's order (see `reship_epochs_at_takeover`).
+    /// committed own row the tail re-journals (at or below `through`), at any
+    /// position, past `through` included: the takeover strand takes that row
+    /// out and the tail re-journals it, so these go with it, to keep the
+    /// epoch's order (see `reship_epochs_at_takeover`). Returns each such
+    /// row's identity with the class it was journaled under (S1: the
+    /// re-journaled row keeps it), and, second, the identities of this
+    /// node's own committed (`gen == 0`, gated) rows past `through`, which
+    /// the tail never re-ships (the tripwire of `reship_epochs_at_takeover`).
+    #[allow(clippy::type_complexity)]
     fn appends_behind_own_committed_tx(
         &self,
         tx: &impl Readable,
         tails: &[(TailArgs, Vec<crate::BackupTx>)],
-    ) -> Result<HashSet<(u64, u64)>, MetaError> {
-        let mut out = HashSet::new();
+    ) -> Result<(HashMap<(u64, u64), RowCommit>, HashSet<(u64, u64)>), MetaError> {
+        let mut out = HashMap::new();
+        let mut own_gated_past = HashSet::new();
         for (t, txs) in tails {
             let mut committed_from: Option<u64> = None;
             for bt in txs {
                 if bt.records.is_empty()
-                    || bt.last > t.through
                     || crate::store::member::tail_identity(&bt.records).is_some()
                 {
                     continue;
@@ -6525,13 +6536,21 @@ impl Meta {
                     continue;
                 }
                 if j.gen == 0 && j.class.gated() {
-                    committed_from.get_or_insert(bt.first);
+                    // A gated own row past `through` is never re-journaled,
+                    // so nothing behind it needs to move.
+                    if bt.last <= t.through {
+                        committed_from.get_or_insert(bt.first);
+                    } else {
+                        own_gated_past.insert((t.epoch, bt.first));
+                    }
                 } else if j.gen != 0 && j.appended && committed_from.is_some() {
-                    out.insert((t.epoch, bt.first));
+                    // Once one own append moves, every later one does too
+                    // (S1): none stays in place behind one that moves.
+                    out.insert((t.epoch, bt.first), j.class);
                 }
             }
         }
-        Ok(out)
+        Ok((out, own_gated_past))
     }
 
     /// Whether the log carried a re-ship of identity `ident` whose
@@ -6590,21 +6609,6 @@ impl Meta {
         let staged = UsageTracker::staging();
         let mut report = ReshipReport::default();
         let mut part = StrandPart::default();
-        // Only the transactions this takeover re-applies name a copy:
-        // a hole names nothing, and one past the sealed prefix
-        // (`bt.last > through`) is counted `tail_beyond_gap` and never
-        // re-applied.
-        let tail_idents: HashSet<(u64, u64)> = tail_txs
-            .iter()
-            .flat_map(|(t, v)| {
-                v.iter()
-                    .filter(|bt| !bt.records.is_empty() && bt.last <= t.through)
-                    .map(|bt| {
-                        crate::store::member::tail_identity(&bt.records)
-                            .unwrap_or((t.epoch, bt.first))
-                    })
-            })
-            .collect();
         // B5 (`long-delegated-late-answers` seed 876): a node that sealed its
         // own epoch for a claimant and then won the lease itself reads its own
         // tail back. The strand takes its committed own rows out and the loop
@@ -6613,8 +6617,31 @@ impl Meta {
         // committed row would ship ahead of it, and the log would break the
         // tenure's order (a node's returned op after one it invoked later). So
         // an own append the tail names above such a row is taken out too and
-        // re-journaled behind it, in the tail's order.
-        let follows = self.appends_behind_own_committed_tx(&tx, &tail_txs)?;
+        // re-journaled behind it, in the tail's order. An append past `through`
+        // that follows such a row goes too: left in place, it would ship ahead
+        // of the row the tail re-journals (S1), and ahead of an earlier append
+        // of its own stream that moves. Computed before `tail_idents`: the
+        // moved rows are re-applied by this gate, so they name a copy too.
+        let (follows, own_gated_past) = self.appends_behind_own_committed_tx(&tx, &tail_txs)?;
+        // Only the transactions this takeover re-applies name a copy:
+        // a hole names nothing, and one past the sealed prefix
+        // (`bt.last > through`) is counted `tail_beyond_gap` and never
+        // re-applied, unless it is an own append that follows a re-journaled
+        // row (`follows`).
+        let tail_idents: HashSet<(u64, u64)> = tail_txs
+            .iter()
+            .flat_map(|(t, v)| {
+                v.iter()
+                    .filter(|bt| {
+                        !bt.records.is_empty()
+                            && (bt.last <= t.through || follows.contains_key(&(t.epoch, bt.first)))
+                    })
+                    .map(|bt| {
+                        crate::store::member::tail_identity(&bt.records)
+                            .unwrap_or((t.epoch, bt.first))
+                    })
+            })
+            .collect();
         if let Some(args) = strand {
             part = self.strand_part_tx(&mut tx, &staged, args, &tail_idents, &follows)?;
             report.stranded = part.stranded;
@@ -6630,7 +6657,27 @@ impl Meta {
                     // before it streamed past them; nothing to re-apply.
                     continue;
                 }
-                if bt.last > t.through {
+                let follower = follows.get(&(t.epoch, bt.first));
+                if bt.last > t.through && follower.is_none() {
+                    if strand.is_some() && own_gated_past.contains(&(t.epoch, bt.first)) {
+                        // Not reached by any sweep (S1 spec 2): `through` is
+                        // the sealed copy's tip for a self-sealed claim. The
+                        // row was answered to its client and is lost here.
+                        // Behaviour is unchanged; the cause belongs where
+                        // `through` is computed.
+                        report.tail_own_gated_beyond_gap += 1;
+                        tracing::error!(
+                            epoch = t.epoch,
+                            first = bt.first,
+                            last = bt.last,
+                            through = t.through,
+                            "an own committed row of a self-reclaimed tail lies past the sealed hold: it would not be re-shipped"
+                        );
+                        debug_assert!(
+                            false,
+                            "an own committed row of a self-reclaimed tail lies past the sealed hold"
+                        );
+                    }
                     report.tail_beyond_gap += 1;
                     continue;
                 }
@@ -6798,6 +6845,12 @@ impl Meta {
                     } else {
                         std::borrow::Cow::Borrowed(&bt.records)
                     };
+                // S1: a moved own append keeps the class it was journaled
+                // under (`Singleton`, the generation's version), never the
+                // tail's `Group`: the root's group never committed it, and a
+                // `Group` row in a later member copy would be replayed by
+                // rid on an abandon (the root re-executing a delegate's row).
+                let _row_class = follower.map(|c| crate::store::journal::PendingClass::set(*c));
                 let one = self
                     .journal_tail_tx(&mut tx, &records, rid, bt.origin)
                     .map_err(|e| match e {
@@ -6955,7 +7008,7 @@ impl Meta {
         staged: &UsageTracker,
         args: StrandArgs<'_>,
         tail_idents: &HashSet<(u64, u64)>,
-        follows: &HashSet<(u64, u64)>,
+        follows: &HashMap<(u64, u64), RowCommit>,
     ) -> Result<StrandPart, MetaError> {
         let StrandArgs {
             epoch,
@@ -6998,7 +7051,9 @@ impl Meta {
                     || entry.superseded_by_takeover(epoch, carried, tail_idents)
                     || entry.uncarried_by_takeover(epoch, tail_idents)
                     || abandons(entry)
-                    || entry.local_ident().is_some_and(|i| follows.contains(&i))
+                    || entry
+                        .local_ident()
+                        .is_some_and(|i| follows.contains_key(&i))
             },
             true,
             false,
@@ -7008,7 +7063,9 @@ impl Meta {
             // the tail re-journals it with its origin.)
             |entry| {
                 (entry.superseded_by_takeover(epoch, carried, tail_idents)
-                    || entry.local_ident().is_some_and(|i| follows.contains(&i)))
+                    || entry
+                        .local_ident()
+                        .is_some_and(|i| follows.contains_key(&i)))
                     && !abandons(entry)
             },
         )?;

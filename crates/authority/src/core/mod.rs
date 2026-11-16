@@ -2334,6 +2334,10 @@ pub struct Stats {
     /// Plan 43 C1-4: tail transactions past a gap, not re-shipped (never
     /// acknowledged; their clients retry by rid).
     pub tail_beyond_gap_dropped: u64,
+    /// S1 tripwire: of the tail transactions past a gap, this node's own
+    /// committed rows of a self-reclaimed tail (answered, and not
+    /// re-shipped). Must stay 0; the sim fails a seed that has one.
+    pub tail_own_gated_beyond_gap: u64,
     /// Plan 46 M1.2 step 5 (c3-spec D3): a sealed tail that did not apply
     /// (`MetaError::TailDiverged`), one per pass of the closed gate. Must
     /// stay 0; the sim fails a seed that has one.

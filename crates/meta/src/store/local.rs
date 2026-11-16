@@ -4379,6 +4379,90 @@ mod verbatim_append_tests {
             .collect()
     }
 
+    /// The journal row (`JournalTx`) whose transaction holds `r`'s outcome.
+    fn row_of(meta: &Meta, r: Rid) -> (usize, JournalTx, Vec<LogRecord>) {
+        let found: Vec<_> = journal(meta)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, recs))| recs.contains(&LogRecord::Completed { rid: r }))
+            .collect();
+        assert_eq!(found.len(), 1, "{r:?} must occur exactly once: {found:?}");
+        let (at, (row, recs)) = found.into_iter().next().unwrap();
+        (at, row, recs)
+    }
+
+    /// The journal seq of the row whose transaction holds `r`'s outcome.
+    fn first_of(meta: &Meta, r: Rid) -> u64 {
+        let rd = meta.db.read_tx();
+        let rows: Vec<u64> = read_journal_txs(&rd, meta)
+            .unwrap()
+            .into_iter()
+            .filter(|(first, row)| {
+                journal_records(&rd, meta, *first, row.last)
+                    .unwrap()
+                    .iter()
+                    .any(|(_, rec)| *rec == LogRecord::Completed { rid: r })
+            })
+            .map(|(first, _)| first)
+            .collect();
+        assert_eq!(rows.len(), 1, "{r:?}: {rows:?}");
+        rows[0]
+    }
+
+    /// A committed own row of epoch 1: a create of `name` under
+    /// `ROOT_GROUP` (answered once the group held it) or, with `class`, any
+    /// other class.
+    fn own_row(meta: &Meta, name: &str, seq: u64, class: RowCommit) {
+        let _c = crate::store::journal::PendingClass::set(class);
+        crate::mutate::execute(
+            meta,
+            &crate::mutate::MutateOp::Create {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino: meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(rid(seq)),
+        )
+        .unwrap();
+    }
+
+    /// The self-seal of epoch 1 and the self-reclaim at epoch 2: the
+    /// journal becomes the member copy and the tail the claim carries, with
+    /// `through` as the sealed hold's contiguous prefix.
+    fn seal_and_reclaim(
+        meta: &Meta,
+        through: impl FnOnce(&[crate::BackupTx]) -> u64,
+    ) -> crate::ReshipReport {
+        let rows = meta.journal_member_rows_from(1).unwrap();
+        meta.member_copy_put_rows(1, 2, &rows).unwrap();
+        let txs: Vec<crate::BackupTx> = rows.into_iter().map(|m| m.tx).collect();
+        meta.backup_append(1, &txs).unwrap();
+        let through = through(&txs);
+        let carried = Default::default();
+        let proof = Default::default();
+        meta.set_holder_epoch(2);
+        meta.reship_at_takeover(
+            Some(crate::store::spec::StrandArgs {
+                epoch: 2,
+                own_gens: &[],
+                abandoned: None,
+                carried: &carried,
+                proof: &proof,
+                marker: &[],
+            }),
+            Some(crate::store::spec::TailArgs {
+                epoch: 1,
+                through,
+                config_version: 3,
+                class: None,
+            }),
+        )
+        .unwrap()
+    }
+
     /// `[Create, Atime, Completed]`, an atime-only transaction, a
     /// transaction whose `Refused` precedes its `Completed`, and one that
     /// ends in an `InboxAck`: the root's journal carries each as streamed.
@@ -4564,64 +4648,161 @@ mod verbatim_append_tests {
         let meta = Meta::open_in_memory().unwrap();
         let gen = 9;
         meta.set_holder_epoch(1);
-        {
-            let _c = crate::store::journal::PendingClass::set(RowCommit::ROOT_GROUP);
-            crate::mutate::execute(
-                &meta,
-                &crate::mutate::MutateOp::Create {
-                    parent: ROOT_INO,
-                    name: "a".into(),
-                    ino: meta.allocate_ino(ROOT_INO).unwrap(),
-                    mode: 0o644,
-                    uid: 0,
-                    gid: 0,
-                },
-                Some(rid(14)),
-            )
-            .unwrap();
-        }
+        own_row(&meta, "a", 14, RowCommit::ROOT_GROUP);
         let b = vec![create("b", 2), LogRecord::Completed { rid: rid(16) }];
         assert!(meta
             .apply_delegate_tx(&b, Some(rid(16)), gen, 1, Default::default())
             .unwrap());
-        // The self-seal: the journal becomes the member copy of epoch 1 and
-        // the tail the claim carries.
-        let rows = meta.journal_member_rows_from(1).unwrap();
-        meta.member_copy_put_rows(1, 2, &rows).unwrap();
-        let txs: Vec<crate::BackupTx> = rows.into_iter().map(|m| m.tx).collect();
-        meta.backup_append(1, &txs).unwrap();
-        let through = txs.iter().map(|t| t.last).max().unwrap();
-        let carried = Default::default();
-        let proof = Default::default();
-        meta.set_holder_epoch(2);
-        meta.reship_at_takeover(
-            Some(crate::store::spec::StrandArgs {
-                epoch: 2,
-                own_gens: &[],
-                abandoned: None,
-                carried: &carried,
-                proof: &proof,
-                marker: &[],
-            }),
-            Some(crate::store::spec::TailArgs {
-                epoch: 1,
-                through,
-                config_version: 3,
-                class: None,
-            }),
-        )
-        .unwrap();
-        let at = |r: Rid| {
-            journal(&meta)
-                .iter()
-                .position(|(_, recs)| recs.contains(&LogRecord::Completed { rid: r }))
-                .unwrap_or_else(|| panic!("{r:?} is not in the journal"))
-        };
+        let class_b = row_of(&meta, rid(16)).1.class;
         assert!(
-            at(rid(14)) < at(rid(16)),
+            matches!(class_b, RowCommit::Singleton { .. }),
+            "{class_b:?}"
+        );
+        let report = seal_and_reclaim(&meta, |txs| txs.iter().map(|t| t.last).max().unwrap());
+        // A moved row keeps the class it was appended with (never the
+        // tail's `Group`: the root's group did not commit it).
+        let (_, row_b, _) = row_of(&meta, rid(16));
+        assert_eq!(row_b.class, class_b);
+        assert_eq!((row_b.gen, row_b.idx), (gen, 1));
+        let (at_a, ..) = row_of(&meta, rid(14));
+        let (at_b, ..) = row_of(&meta, rid(16));
+        assert!(
+            at_a < at_b,
             "the tenure's committed row ships behind its later row: {:?}",
             journal(&meta)
         );
+        assert_eq!(report.tail_own_gated_beyond_gap, 0);
+    }
+
+    /// S1: as above with `through` at the committed row `a` alone, so the
+    /// append `b` lies past it. Fail-before: `b` stayed in place and shipped
+    /// ahead of `a`, which the gate re-journaled behind it with a `TailOf`.
+    #[test]
+    fn a_self_reclaimed_tail_keeps_the_tenures_order_past_through() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        own_row(&meta, "a", 14, RowCommit::ROOT_GROUP);
+        let b = vec![create("b", 2), LogRecord::Completed { rid: rid(16) }];
+        assert!(meta
+            .apply_delegate_tx(&b, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        let class_b = row_of(&meta, rid(16)).1.class;
+        assert!(
+            matches!(class_b, RowCommit::Singleton { .. }),
+            "{class_b:?}"
+        );
+        let report = seal_and_reclaim(&meta, |txs| txs.iter().map(|t| t.last).min().unwrap());
+        // A moved row keeps the class it was appended with (never the
+        // tail's `Group`: the root's group did not commit it).
+        let (_, row_b, _) = row_of(&meta, rid(16));
+        assert_eq!(row_b.class, class_b);
+        assert_eq!((row_b.gen, row_b.idx), (gen, 1));
+        let (at_a, ..) = row_of(&meta, rid(14));
+        let (at_b, ..) = row_of(&meta, rid(16));
+        assert!(
+            at_a < at_b,
+            "the tenure's committed row ships behind its later row: {:?}",
+            journal(&meta)
+        );
+        assert_eq!(report.tail_own_gated_beyond_gap, 0);
+        assert_eq!(report.tail_beyond_gap, 0);
+        assert_eq!(report.tail_applied, 2);
+        // Exactly once: the delegate's re-stream of b dedups against the
+        // re-journaled row.
+        assert!(!meta
+            .apply_delegate_tx(&b, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        row_of(&meta, rid(16));
+    }
+
+    /// S1 (same stream): b1 (`idx` 1, at or below `through`) and b2 (`idx` 2,
+    /// past it) follow a committed own row. Both move behind it, in order:
+    /// the log never carries a stream out of `idx` order.
+    #[test]
+    fn a_self_reclaimed_tail_keeps_a_streams_order_across_through() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        own_row(&meta, "a", 14, RowCommit::ROOT_GROUP);
+        let b1 = vec![create("b1", 2), LogRecord::Completed { rid: rid(16) }];
+        let b2 = vec![create("b2", 3), LogRecord::Completed { rid: rid(17) }];
+        assert!(meta
+            .apply_delegate_tx(&b1, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        assert!(meta
+            .apply_delegate_tx(&b2, Some(rid(17)), gen, 2, Default::default())
+            .unwrap());
+        let report = seal_and_reclaim(&meta, |txs| txs[1].last);
+        assert_eq!(report.tail_beyond_gap, 0);
+        assert_eq!(report.tail_applied, 3);
+        let (at_a, ..) = row_of(&meta, rid(14));
+        let (at_1, r1, _) = row_of(&meta, rid(16));
+        let (at_2, r2, _) = row_of(&meta, rid(17));
+        assert!(
+            at_a < at_1 && at_1 < at_2,
+            "a stream out of order: {:?}",
+            journal(&meta)
+        );
+        assert_eq!((r1.gen, r1.idx), (gen, 1));
+        assert_eq!((r2.gen, r2.idx), (gen, 2));
+        assert_eq!(meta.log_stream_idx(gen).unwrap(), 2);
+    }
+
+    /// Negative control: an own append past `through` with no committed own
+    /// row before it stays in place.
+    #[test]
+    fn a_past_through_append_with_no_committed_row_before_it_stays() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        let b = vec![create("b", 2), LogRecord::Completed { rid: rid(16) }];
+        assert!(meta
+            .apply_delegate_tx(&b, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        let first_before = first_of(&meta, rid(16));
+        let report = seal_and_reclaim(&meta, |_| 0);
+        assert_eq!(report.tail_beyond_gap, 1);
+        assert_eq!(report.tail_applied, 0);
+        let (_, _, recs) = row_of(&meta, rid(16));
+        assert_eq!(first_of(&meta, rid(16)), first_before);
+        assert!(!matches!(recs.first(), Some(LogRecord::TailOf { .. })));
+    }
+
+    /// Negative control: no committed row at or below `through`, an own row
+    /// c past it (`Singleton`, so no tripwire) and an own append d past it:
+    /// d stays in place.
+    #[test]
+    fn appends_behind_an_own_root_row_past_through_stay() {
+        let meta = Meta::open_in_memory().unwrap();
+        let gen = 9;
+        meta.set_holder_epoch(1);
+        own_row(&meta, "c", 14, RowCommit::LONE);
+        let d = vec![create("d", 2), LogRecord::Completed { rid: rid(16) }];
+        assert!(meta
+            .apply_delegate_tx(&d, Some(rid(16)), gen, 1, Default::default())
+            .unwrap());
+        let first_before = first_of(&meta, rid(16));
+        let report = seal_and_reclaim(&meta, |_| 0);
+        assert_eq!(report.tail_beyond_gap, 2);
+        assert_eq!(report.tail_applied, 0);
+        let (_, _, recs) = row_of(&meta, rid(16));
+        assert_eq!(first_of(&meta, rid(16)), first_before);
+        assert!(!matches!(recs.first(), Some(LogRecord::TailOf { .. })));
+    }
+
+    /// S1 tripwire: an own committed row past `through` is not re-shipped
+    /// (behaviour unchanged) and is counted. Release only: debug builds
+    /// assert.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn an_own_committed_row_past_through_is_reported() {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        own_row(&meta, "c", 14, RowCommit::ROOT_GROUP);
+        let report = seal_and_reclaim(&meta, |_| 0);
+        assert_eq!(report.tail_beyond_gap, 1);
+        assert_eq!(report.tail_own_gated_beyond_gap, 1);
     }
 
     /// Test 14: a deposed root's own stream rows are holder rows: the
