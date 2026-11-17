@@ -2945,9 +2945,16 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
   removes the primary and then the next name of one inode (a stranded replay's
   records) holds the third name too; the op is cross-subtree and the root recalls and re-delegates
   (`delegate_dir`'s read recalls then cover the file). It closes the same race
-  for a usable root. Cost: one `RDentry` range seek per unlink, rename or
-  exchange in `keys_of_op_in` and the FUSE fast paths, only while a delegation
-  exists; the ops it makes cross-subtree are those of an inode with several
+  for a usable root. Cost: only while a delegation exists, in `keys_of_op_in`
+  and the FUSE fast paths, the inode's names are read in key order only until
+  the outcome is decided: one live name when the name leaving is not the
+  primary one, two when it is (the first review's text claimed one `RDentry`
+  range seek, which did not hold: the check listed every name of the inode,
+  O(links) per op). The keys are unchanged (an implementation note, no
+  decision change: `from_op_in_names` asks `names(ino, limit)` for a prefix,
+  doubling it until some fetched name survives the op's moves, and the
+  simulation and the meta tests compare it with the full computation); the
+  ops it makes cross-subtree are those of an inode with several
   names whose primary name leaves while another name is in a delegated
   subtree. A delegate no longer executes the unlink of the primary name of a
   file whose next name is in another generation of its own (the state a

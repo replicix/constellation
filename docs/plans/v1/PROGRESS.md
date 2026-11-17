@@ -70233,6 +70233,24 @@ stream as its holder once it is a singleton again (`place_root_own_released_sing
 Status: `delegation.root_own.skipped_no_peer` and `released_singleton`. ADR-55 amended. Pins in the ADR-55 test module
 (`no_own_grant_for_a_root_whose_only_reason_to_doubt_it_is_alone_is_its_own_lapse` and three more).
 
+### ADR-42's ownership check reads only the names it needs (2026-11-17)
+
+`TouchSet::from_op_in_names` listed every name of an inode (`Meta::names_of_ino`, a `String` per name) at every call
+while any delegation existed: an unlink of one name of an 8,192-name file cost O(8,192) in `Meta::root_fast_path`, the
+delegate's `admit_for`, the core's `keys_of_op_in` and the sim's model, several times per op (about 1.6 ms per unlink on
+every file system in the bisect's profile). `names_of_ino(ino, limit)` now stops its range at `limit` names, and the
+hold is computed over a prefix (limit 1, doubled and replayed from a fresh read until some fetched name survives the
+op's moves): one live name when the name leaving is not the primary, two when it is. The key set is unchanged: the
+private reference (today's computation, `test-util`) is compared in every sim run (`TouchSet::set_names_cross_check`)
+and by a proptest. ADR-42's cost claim ("one range seek") is corrected. Measured on btrfs, ext4 and tmpfs (8,192
+names of one file, a lapse-forced own grant so that the names are read, two runs each): the unlink phase took 14.4 to
+16.1 s on main (per-500 block means 1.6 to 3.5 ms) and 0.71 to 0.90 s with this change (59 to 135 us). With
+stress-ng's name order (`sng-1-0-<n>`, unpadded, unlinked in numeric order) main took 15.9 to 18.3 s and this change
+2.9 to 3.6 s: the earlier unlinks leave tombstones below the primary name in the reverse index, which every primary
+lookup (this one and `Namespace::primary_parent`) steps over until a memtable flush (a perf profile of that run is
+the lsm-tree memtable range iteration and its merge). Without a grant the unlink phase is unchanged (no regression on
+btrfs, ext4, xfs or tmpfs).
+
 ## Inbox escalation: no P2P ask, and a withdrawn registration (leaseesc)
 
 `delegate-partition` failed 11 of 20 runs under host load with "the root lost its lease". The root had handed its lease

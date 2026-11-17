@@ -307,19 +307,87 @@ impl TouchSet {
     /// are, so the op is cross-subtree and the root recalls the
     /// delegation first.
     ///
-    /// `names(ino)` lists every name of `ino` in key order, or nothing
-    /// when there is no table to consult (`Meta::names_of_ino`). A name
-    /// the op adds to the inode needs no hold here: its dentry is held
-    /// already.
+    /// `names(ino, limit)` lists the first `limit` names of `ino` in key
+    /// order (fewer than `limit` means all of them), or nothing when there
+    /// is no table to consult (`Meta::names_of_ino`). A name the op adds to
+    /// the inode needs no hold here: its dentry is held already.
+    ///
+    /// Only a prefix of the names is read: one live name when the name
+    /// leaving is not the primary one, two when it is (an unlink of a
+    /// name of an inode with 8,192 names does not read 8,192). Per inode,
+    /// the moves are replayed against `limit` = 1 names, and again against
+    /// twice as many (from a fresh `names` call, so every attempt sees one
+    /// snapshot) until the outcome is decided.
+    ///
+    /// Why that is exact. The fetched names are a prefix of the snapshot's
+    /// names in key order, which is `(u64, String)`'s `Ord` (the `RDentry`
+    /// key is `ino | parent BE | name bytes`), so every unfetched name is
+    /// greater than every fetched one. When some fetched name `s` is not
+    /// removed by the moves so far, the true minimum of the inode's names
+    /// is at most `s`: a fetched survivor or a name the op added, both of
+    /// which are known. If the name that becomes primary is an original
+    /// name it is at most `s`, so it was fetched, and `binary_search` of
+    /// the fetched names equals "the inode had it before the op". With
+    /// every name fetched this is the full computation
+    /// (`from_op_in_names_reference`, which the simulation and the meta
+    /// tests compare against, `Self::set_names_cross_check`).
     pub fn from_op_in_names(
         op: &crate::mutate::MutateOp,
         lookup: &dyn Fn(u64, &str) -> Option<u64>,
-        names: &dyn Fn(u64) -> Vec<(u64, String)>,
+        names: &dyn Fn(u64, usize) -> Vec<(u64, String)>,
     ) -> Self {
+        let (mut set, moves) = Self::name_moves(op, lookup);
+        // The moves of one inode, in the op's order. The inodes are
+        // independent (the holds go into ordered sets), so the grouping
+        // does not change the result.
+        let mut by_ino: std::collections::BTreeMap<u64, Vec<NameMove>> =
+            std::collections::BTreeMap::new();
+        for (ino, gone, arrives) in moves {
+            by_ino.entry(ino).or_default().push((gone, arrives));
+        }
+        for (ino, moves) in by_ino {
+            let mut limit = 1usize;
+            let holds = loop {
+                match replay_name_moves(&moves, limit, names(ino, limit)) {
+                    Some(holds) => break holds,
+                    None => limit = limit.saturating_mul(2),
+                }
+            };
+            for next in holds {
+                set.shared.insert(next.0);
+                set.dentries.insert(next);
+            }
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        if NAMES_CROSS_CHECK.load(std::sync::atomic::Ordering::Relaxed) {
+            let reference = Self::from_op_in_names_reference(op, lookup, names);
+            assert_eq!(
+                set, reference,
+                "bounded name reads changed the keys of {op:?}: {set:?} vs {reference:?}"
+            );
+        }
+        set
+    }
+
+    /// Whether [`Self::from_op_in_names`] also computes the keys the
+    /// unbounded way and asserts that they are the same (the simulation and
+    /// the meta tests turn it on; off by default, and not built in release
+    /// builds, which do not have the `test-util` feature).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_names_cross_check(on: bool) {
+        NAMES_CROSS_CHECK.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// [`Self::from_op_in`] and the name moves of the op, in the order the
+    /// op applies them: for each, the inode, the name leaving it and the
+    /// name it takes instead. The lookups of a record see what the earlier
+    /// records moved, removed or replaced, not the state before the op.
+    fn name_moves(
+        op: &crate::mutate::MutateOp,
+        lookup: &dyn Fn(u64, &str) -> Option<u64>,
+    ) -> (Self, Vec<Move>) {
         use crate::mutate::MutateOp;
-        let mut set = Self::from_op_in(op, lookup);
-        // (the inode, the name leaving it, the name it takes instead)
-        type Move = (u64, (u64, String), Option<(u64, String)>);
+        let set = Self::from_op_in(op, lookup);
         // The names of the inodes as the records leave them: a record's
         // lookups see what the earlier ones moved, removed or replaced
         // (`overlay`: `None` is a name that is gone), not the state before
@@ -423,7 +491,19 @@ impl TouchSet {
             }
             _ => {}
         }
-        let moves = steps.moves;
+        (set, steps.moves)
+    }
+
+    /// What [`Self::from_op_in_names`] computed before it read a prefix of
+    /// the names: all of them, and the primary changes judged one move at a
+    /// time against a per-inode name list.
+    #[cfg(any(test, feature = "test-util"))]
+    fn from_op_in_names_reference(
+        op: &crate::mutate::MutateOp,
+        lookup: &dyn Fn(u64, &str) -> Option<u64>,
+        names: &dyn Fn(u64, usize) -> Vec<(u64, String)>,
+    ) -> Self {
+        let (mut set, moves) = Self::name_moves(op, lookup);
         // One after another, as the op applies them: a `Records` op that
         // removes the primary name and then the next one of an inode hands
         // it to the third name, so each primary change is judged against the
@@ -434,7 +514,7 @@ impl TouchSet {
             std::collections::HashMap::new();
         for (ino, gone, arrives) in moves {
             let (orig, now) = seen.entry(ino).or_insert_with(|| {
-                let before = names(ino);
+                let before = names(ino, usize::MAX);
                 (before.clone(), before)
             });
             let primary = now.first().cloned();
@@ -459,6 +539,68 @@ impl TouchSet {
         let touched = TouchSet::from_records(std::iter::once(rec));
         self.overlaps(&touched)
     }
+}
+
+/// The name an op takes from an inode and the name it takes instead
+/// (`TouchSet::from_op_in_names`).
+type NameMove = ((u64, String), Option<(u64, String)>);
+/// An inode, with one [`NameMove`].
+type Move = (u64, (u64, String), Option<(u64, String)>);
+
+#[cfg(any(test, feature = "test-util"))]
+static NAMES_CROSS_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The moves of one inode judged against the first `limit` of its names
+/// (`fetched`, in key order): the names that become primary and were the
+/// inode's before the op (to be held), or `None` when the prefix does not
+/// decide the outcome (the caller asks for more names).
+fn replay_name_moves(
+    moves: &[NameMove],
+    limit: usize,
+    fetched: Vec<(u64, String)>,
+) -> Option<Vec<(u64, String)>> {
+    debug_assert!(fetched.is_sorted(), "names come in key order");
+    let complete = fetched.len() < limit;
+    // A name the moves so far removed (`false`) or added (`true`).
+    let mut overlay: std::collections::BTreeMap<(u64, String), bool> =
+        std::collections::BTreeMap::new();
+    let survivor = |overlay: &std::collections::BTreeMap<(u64, String), bool>| {
+        fetched.iter().find(|n| overlay.get(*n) != Some(&false))
+    };
+    // Every name that sorts after the fetched ones is unfetched: the
+    // outcome is decided once a fetched name survives (the true minimum is
+    // then known) or every name is in hand.
+    let exact = |overlay: &std::collections::BTreeMap<(u64, String), bool>| {
+        complete || survivor(overlay).is_some()
+    };
+    let min_now = |overlay: &std::collections::BTreeMap<(u64, String), bool>| {
+        let added = overlay.iter().find(|(_, on)| **on).map(|(n, _)| n);
+        match (survivor(overlay), added) {
+            (Some(a), Some(b)) => Some(a.min(b).clone()),
+            (a, b) => a.or(b).cloned(),
+        }
+    };
+    let mut holds = Vec::new();
+    for (gone, arrives) in moves {
+        if !exact(&overlay) {
+            return None;
+        }
+        let primary = min_now(&overlay);
+        overlay.insert(gone.clone(), false);
+        if let Some(a) = arrives {
+            overlay.insert(a.clone(), true);
+        }
+        if !exact(&overlay) {
+            return None;
+        }
+        let next = min_now(&overlay);
+        if let (Some(primary), Some(next)) = (primary, next) {
+            if next != primary && fetched.binary_search(&next).is_ok() {
+                holds.push(next);
+            }
+        }
+    }
+    Some(holds)
 }
 
 pub(crate) enum Applied {
@@ -1955,7 +2097,7 @@ mod tests {
             (3, "t") => Some(12),
             _ => None,
         };
-        let names = |i: u64| match i {
+        let full = |i: u64| match i {
             10 => vec![
                 (2, "a".to_string()),
                 (5, "b".to_string()),
@@ -1965,6 +2107,7 @@ mod tests {
             12 => vec![(3, "t".to_string())],
             _ => Vec::new(),
         };
+        let names = |i: u64, limit: usize| full(i).into_iter().take(limit).collect::<Vec<_>>();
         let keys = |op: &MutateOp| TouchSet::from_op_in_names(op, &lookup, &names);
         let holds = |k: &TouchSet, p: u64, n: &str| {
             k.dentries.contains(&(p, n.to_string())) && k.shared.contains(&p)
@@ -2048,7 +2191,7 @@ mod tests {
             (2, "a") | (5, "b") | (9, "c") => Some(10),
             _ => None,
         };
-        let names = |i: u64| match i {
+        let full = |i: u64| match i {
             10 => vec![
                 (2, "a".to_string()),
                 (5, "b".to_string()),
@@ -2056,6 +2199,7 @@ mod tests {
             ],
             _ => Vec::new(),
         };
+        let names = |i: u64, limit: usize| full(i).into_iter().take(limit).collect::<Vec<_>>();
         let keys = |records: Vec<LogRecord>| {
             TouchSet::from_op_in_names(&MutateOp::Records { records }, &lookup, &names)
         };
@@ -2094,11 +2238,12 @@ mod tests {
             (4, "b") => Some(20),
             _ => None,
         };
-        let names = |i: u64| match i {
+        let full = |i: u64| match i {
             10 => vec![(2, "a".to_string()), (9, "c".to_string())],
             20 => vec![(4, "b".to_string())],
             _ => Vec::new(),
         };
+        let names = |i: u64, limit: usize| full(i).into_iter().take(limit).collect::<Vec<_>>();
         let holds = |k: &TouchSet, p: u64, n: &str| {
             k.dentries.contains(&(p, n.to_string())) && k.shared.contains(&p)
         };
@@ -2123,6 +2268,277 @@ mod tests {
             &names,
         );
         assert!(holds(&k, 9, "c"), "the third name becomes primary: {k:?}");
+    }
+
+    /// ADR-42's cost: the names of an inode are read in key order only
+    /// until the outcome is decided. An unlink of a name that is not the
+    /// primary one reads one name, of the primary one two, whatever the
+    /// inode's name count. (Fails before: the one-argument `names` listed
+    /// all 8,192 at every call.)
+    #[test]
+    fn an_unlink_of_a_name_that_is_not_the_primary_reads_one_name() {
+        use crate::mutate::MutateOp;
+        use crate::replay::TouchSet;
+        use std::cell::Cell;
+        // (The cross-check, when another test has it on, reads them all with
+        // `usize::MAX`: not counted.)
+        let all: Vec<(u64, String)> = (0..8_192).map(|i| (2, format!("n{i:05}"))).collect();
+        let lookup = |p: u64, n: &str| (p == 2 && n.starts_with('n')).then_some(10);
+        let read = Cell::new(0usize);
+        let names = |i: u64, limit: usize| {
+            assert_eq!(i, 10);
+            let got: Vec<_> = all.iter().take(limit).cloned().collect();
+            if limit != usize::MAX {
+                read.set(read.get() + got.len());
+            }
+            got
+        };
+        let unlink = |name: &str| MutateOp::Unlink {
+            parent: 2,
+            name: name.into(),
+        };
+        let k = TouchSet::from_op_in_names(&unlink("n04000"), &lookup, &names);
+        assert!(read.get() <= 1, "read {} names", read.get());
+        assert!(!k.dentries.contains(&(2, "n00001".to_string())), "{k:?}");
+        read.set(0);
+        let k = TouchSet::from_op_in_names(&unlink("n00000"), &lookup, &names);
+        assert!(read.get() <= 3, "read {} names", read.get());
+        assert!(k.dentries.contains(&(2, "n00001".to_string())), "{k:?}");
+        assert!(k.shared.contains(&2));
+    }
+
+    mod bounded_names {
+        use crate::mutate::MutateOp;
+        use crate::record::LogRecord;
+        use crate::replay::TouchSet;
+        use proptest::prelude::*;
+
+        const SLOTS: usize = 16;
+
+        /// The `(parent, name)` of slot `s`: four parents, four names, so
+        /// that the names of an inode collide and interleave across parents.
+        fn slot(s: usize) -> (u64, String) {
+            ((s / 4) as u64 + 1, ["a", "b", "c", "d"][s % 4].to_string())
+        }
+
+        #[derive(Debug, Clone)]
+        enum Rec {
+            Unlink(usize),
+            Rmdir(usize),
+            Rename(usize, usize),
+            Exchange(usize, usize),
+        }
+
+        #[derive(Debug, Clone)]
+        enum Spec {
+            Unlink(usize),
+            Rename(usize, usize),
+            Exchange(usize, usize),
+            Records(Vec<Rec>),
+        }
+
+        fn rec() -> impl Strategy<Value = Rec> {
+            let s = 0..SLOTS;
+            prop_oneof![
+                s.clone().prop_map(Rec::Unlink),
+                s.clone().prop_map(Rec::Rmdir),
+                (s.clone(), s.clone()).prop_map(|(a, b)| Rec::Rename(a, b)),
+                (s.clone(), s).prop_map(|(a, b)| Rec::Exchange(a, b)),
+            ]
+        }
+
+        fn spec() -> impl Strategy<Value = Spec> {
+            let s = 0..SLOTS;
+            prop_oneof![
+                s.clone().prop_map(Spec::Unlink),
+                (s.clone(), s.clone()).prop_map(|(a, b)| Spec::Rename(a, b)),
+                (s, 0..SLOTS).prop_map(|(a, b)| Spec::Exchange(a, b)),
+                prop::collection::vec(rec(), 1..=6).prop_map(Spec::Records),
+            ]
+        }
+
+        fn op_of(spec: &Spec) -> MutateOp {
+            let rename = |a: usize, b: usize| {
+                let ((parent, name), (new_parent, new_name)) = (slot(a), slot(b));
+                (parent, name, new_parent, new_name)
+            };
+            match spec {
+                Spec::Unlink(a) => {
+                    let (parent, name) = slot(*a);
+                    MutateOp::Unlink { parent, name }
+                }
+                Spec::Rename(a, b) => {
+                    let (parent, name, new_parent, new_name) = rename(*a, *b);
+                    MutateOp::Rename {
+                        parent,
+                        name,
+                        new_parent,
+                        new_name,
+                        noreplace: false,
+                    }
+                }
+                Spec::Exchange(a, b) => {
+                    let (parent, name, new_parent, new_name) = rename(*a, *b);
+                    MutateOp::Exchange {
+                        parent,
+                        name,
+                        new_parent,
+                        new_name,
+                    }
+                }
+                Spec::Records(recs) => MutateOp::Records {
+                    records: recs
+                        .iter()
+                        .map(|r| match r {
+                            Rec::Unlink(a) => {
+                                let (parent, name) = slot(*a);
+                                LogRecord::Unlink {
+                                    parent,
+                                    name,
+                                    time_ns: 1,
+                                }
+                            }
+                            Rec::Rmdir(a) => {
+                                let (parent, name) = slot(*a);
+                                LogRecord::Rmdir {
+                                    parent,
+                                    name,
+                                    time_ns: 1,
+                                }
+                            }
+                            Rec::Rename(a, b) => {
+                                let (parent, name, new_parent, new_name) = rename(*a, *b);
+                                LogRecord::Rename {
+                                    parent,
+                                    name,
+                                    new_parent,
+                                    new_name,
+                                    time_ns: 1,
+                                }
+                            }
+                            Rec::Exchange(a, b) => {
+                                let (parent, name, new_parent, new_name) = rename(*a, *b);
+                                LogRecord::Exchange {
+                                    parent,
+                                    name,
+                                    new_parent,
+                                    new_name,
+                                    time_ns: 1,
+                                    ino: 0,
+                                    new_ino: 0,
+                                }
+                            }
+                        })
+                        .collect(),
+                },
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4_000))]
+
+            /// Reading a prefix of the names gives the keys that reading
+            /// every name gives, for every op shape, whatever the names.
+            #[test]
+            fn bounded_name_reads_give_the_keys_of_reading_every_name(
+                table in prop::collection::vec(prop::option::weighted(0.7, 0u64..3), SLOTS),
+                spec in spec(),
+            ) {
+                let lookup = |p: u64, n: &str| {
+                    (0..SLOTS).find(|s| slot(*s) == (p, n.to_string())).and_then(|s| table[s]).map(|i| 10 + i)
+                };
+                let names = |i: u64, limit: usize| {
+                    let mut all: Vec<(u64, String)> = (0..SLOTS)
+                        .filter(|s| table[*s].map(|t| 10 + t) == Some(i))
+                        .map(slot)
+                        .collect();
+                    all.sort();
+                    all.truncate(limit);
+                    all
+                };
+                let op = op_of(&spec);
+                let bounded = TouchSet::from_op_in_names(&op, &lookup, &names);
+                let reference = TouchSet::from_op_in_names_reference(&op, &lookup, &names);
+                prop_assert_eq!(bounded, reference);
+            }
+        }
+    }
+
+    /// The store's `names_of_ino` stops at the `limit`th name, and the
+    /// root's fast path admits what it admitted when it read every name
+    /// (the cross-check compares the two in every call here).
+    #[test]
+    fn the_store_reads_a_prefix_of_the_names_and_the_fast_path_admits_as_before() {
+        use crate::mutate::MutateOp;
+        use crate::replay::TouchSet;
+        TouchSet::set_names_cross_check(true);
+        let meta = Meta::open_in_memory().unwrap();
+        let (p1, p2, p3) = (1u64 << 40 | 2, 1u64 << 40 | 3, 1u64 << 40 | 4);
+        let mkdir = |name: &str, ino: u64| LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: name.into(),
+            ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        };
+        meta.apply_records(&[mkdir("p1", p1), mkdir("p2", p2), mkdir("p3", p3)])
+            .unwrap();
+        // The file: primary name (p1, "a"), then (p2, "x"), then 1,998
+        // names in p3.
+        let f = 1u64 << 40 | 5;
+        let mut records = vec![LogRecord::Create {
+            parent: p1,
+            name: "a".into(),
+            ino: f,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }];
+        let link = |parent: u64, name: String| LogRecord::Link {
+            ino: f,
+            parent,
+            name,
+            time_ns: 1,
+        };
+        records.push(link(p2, "x".into()));
+        records.extend((0..1_998).map(|i| link(p3, format!("n{i:04}"))));
+        meta.apply_records(&records).unwrap();
+        // A delegation of p2 (any, for the names to be read at all).
+        meta.apply_segment(
+            1,
+            1,
+            &[LogRecord::delegate_one(
+                4,
+                (1 << 32) | 1,
+                p2,
+                crate::SubtreeKind::Placed,
+            )],
+            &TouchSet::default(),
+        )
+        .unwrap();
+        assert!(meta.delegations_any());
+        assert_eq!(
+            meta.names_of_ino(f, 1),
+            vec![(p1, "a".to_string())],
+            "the primary name alone"
+        );
+        assert_eq!(meta.names_of_ino(f, 3).len(), 3);
+        assert_eq!(meta.names_of_ino(f, 0).len(), 0);
+        assert_eq!(meta.names_of_ino(f, usize::MAX).len(), 2_000);
+        let unlink = |parent: u64, name: &str| MutateOp::Unlink {
+            parent,
+            name: name.into(),
+        };
+        // A middle name of p3 is the root's: admitted.
+        assert!(meta.root_fast_path(&unlink(p3, "n1000")).is_some());
+        // The primary name's next one, (p2, "x"), is the delegate's: the op
+        // is cross-subtree and not the root's to run.
+        assert!(meta.root_fast_path(&unlink(p1, "a")).is_none());
+        // A name that is not the primary, in the root's: admitted.
+        assert!(meta.root_fast_path(&unlink(p3, "n0000")).is_some());
     }
 
     #[test]

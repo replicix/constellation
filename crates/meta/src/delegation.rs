@@ -643,7 +643,7 @@ impl Meta {
                         .flatten()
                         .map(|a| a.ino)
                 },
-                &|i| self.names_of_ino(i),
+                &|i, limit| self.names_of_ino(i, limit),
             );
             if !matches!(self.resolve_ownership(&keys), Ownership::Root) {
                 return None;
@@ -823,13 +823,15 @@ impl std::fmt::Display for GenLabel {
 pub(crate) const KV_NEXT_DELEG_GEN: &str = "next_deleg_gen";
 
 impl Meta {
-    /// Every name of `ino` as `(parent, name)`, in key order (the first is
-    /// its primary one: [`Namespace::primary_parent`]) — or nothing while
-    /// no delegation exists, when every key is the root's and a name that
-    /// leaves cannot move an inode between owners
-    /// ([`TouchSet::from_op_in_names`]).
-    pub fn names_of_ino(&self, ino: Ino) -> Vec<(Ino, String)> {
-        if ino == ROOT_INO || !self.delegations_any() {
+    /// The first `limit` names of `ino` as `(parent, name)`, in key order
+    /// (the first is its primary one: [`Namespace::primary_parent`]); fewer
+    /// than `limit` means that is all of them. Nothing while no delegation
+    /// exists, when every key is the root's and a name that leaves cannot
+    /// move an inode between owners ([`TouchSet::from_op_in_names`], which
+    /// asks for as many names as its outcome needs). The scan stops at the
+    /// `limit`th name, and a `String` is made only for the names returned.
+    pub fn names_of_ino(&self, ino: Ino, limit: usize) -> Vec<(Ino, String)> {
+        if limit == 0 || ino == ROOT_INO || !self.delegations_any() {
             return Vec::new();
         }
         let r = self.db.read_tx();
@@ -844,6 +846,9 @@ impl Meta {
             }) = keys::Key::parse(&k)
             {
                 out.push((parent_ino, String::from_utf8_lossy(name).into_owned()));
+                if out.len() >= limit {
+                    break;
+                }
             }
         }
         out

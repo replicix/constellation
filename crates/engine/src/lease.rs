@@ -1088,7 +1088,7 @@ impl DelegateView {
         let keys = constellation_meta::TouchSet::from_op_in_names(
             op,
             &|p, n| meta.child_ino(p, n).ok().flatten(),
-            &|i| meta.names_of_ino(i),
+            &|i, limit| meta.names_of_ino(i, limit),
         );
         // One read of the table serves the owner and the honoured check.
         let table = meta.delegation_table();
