@@ -70224,8 +70224,12 @@ generation it started with; an answer that comes after a newer registration (a n
 and maybe ended while the read or swap was out) leaves that registration's state alone, and its own end withdraws it
 (`a_withdrawal_swap_answered_after_a_new_registration_keeps_the_new_one`,
 `a_withdrawal_read_that_a_whole_new_escalation_overtook_keeps_the_new_one`). An escalation claims a name it finds listed
-unless another acquisition disowned it, and the withdrawal reads once more, after a wait, when a registration swap timed
-out in doubt (`an_escalation_claims_a_name_it_finds_listed`,
+unless another acquisition disowned it, and the withdrawal reads again, after a wait, when a registration swap timed
+out in doubt, until a read shows a tag other than the swap's (at most eight reads; past that the hole is narrowed, not
+closed: one unwanted lease move after a grace, no integrity loss; `a_withdrawal_settles_when_the_lease_tag_moved_past_an_in_doubt_registration`,
+`the_wait_for_an_in_doubt_registration_is_bounded`; a withdrawal swap that lands after a busy acquisition took the name
+keeps its `disowned`: `a_landed_withdrawal_swap_keeps_the_name_a_busy_acquisition_registered`,
+`an_escalation_does_not_claim_a_name_a_busy_acquisition_disowned`) (`an_escalation_claims_a_name_it_finds_listed`,
 `a_withdrawal_reads_again_after_a_registration_that_timed_out_in_doubt`,
 `a_withdrawal_read_swaps_nothing_for_a_name_that_was_disowned_meanwhile`); lease state
 `a_lapsed_note_keeps_the_grace_start_while_the_body_lists_the_name`.

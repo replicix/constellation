@@ -2708,6 +2708,10 @@ fn a_withdrawal_reads_again_after_a_registration_that_timed_out_in_doubt() {
     });
     assert!(s3_ops(&out).is_empty(), "{out:?}");
     assert!(tick_ops(&mut h).is_empty(), "it waits");
+    assert!(
+        h.core.inbox.withdrawal_pending(),
+        "the name is not called gone while the swap may still land"
+    );
     // It lands; the one more read finds the name and withdraws it.
     h.advance(1_100);
     let get = lone_get(&tick_ops(&mut h));
@@ -2718,6 +2722,176 @@ fn a_withdrawal_reads_again_after_a_registration_that_timed_out_in_doubt() {
     assert!(
         matches!(s3_ops(&out)[..], [(_, S3Op::LeaseSwap { .. })]),
         "{out:?}"
+    );
+}
+
+/// An in-doubt registration swap is conditional on the tag it read, so a
+/// read that shows another tag proves it can no longer land: the withdrawal
+/// is over, with no further read.
+#[test]
+fn a_withdrawal_settles_when_the_lease_tag_moved_past_an_in_doubt_registration() {
+    use crate::event::CasFailure;
+    assert_ne!(tag(), tag2(), "two distinct tags");
+    let (mut h, live, register) = registered_escalation();
+    h.step(Event::S3 {
+        op: register,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timeout".into()))),
+    });
+    demand_falls(&mut h);
+    h.advance(300);
+    // The read shows the registration's own tag: it may still land.
+    let get = lone_get(&tick_ops(&mut h));
+    h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.clone(), tag())))),
+    });
+    assert!(h.core.inbox.withdrawal_pending());
+    // The next read shows another tag (a renewal won): it cannot land now.
+    h.advance(1_100);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live, tag2())))),
+    });
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    assert!(!h.core.inbox.withdrawal_pending(), "settled");
+    h.advance(10_000);
+    assert!(tick_ops(&mut h).is_empty(), "no further read");
+}
+
+/// The wait for an in-doubt registration is bounded: a lease whose tag
+/// never moves is read a fixed number of times, then the withdrawal decides.
+#[test]
+fn the_wait_for_an_in_doubt_registration_is_bounded() {
+    use crate::event::CasFailure;
+    let (mut h, live, register) = registered_escalation();
+    h.step(Event::S3 {
+        op: register,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timeout".into()))),
+    });
+    demand_falls(&mut h);
+    h.advance(300);
+    let mut reads = 0;
+    for _ in 0..40 {
+        let ops = tick_ops(&mut h);
+        if ops.is_empty() {
+            h.advance(1_100);
+            if !h.core.inbox.withdrawal_pending() {
+                break;
+            }
+            continue;
+        }
+        reads += 1;
+        h.step(Event::S3 {
+            op: lone_get(&ops),
+            result: S3Result::LeaseGet(Ok(Some((live.clone(), tag())))),
+        });
+        h.advance(1_100);
+    }
+    assert_eq!(reads, 9, "the first read and eight settle reads");
+    assert!(!h.core.inbox.withdrawal_pending());
+}
+
+/// A busy acquisition (`fuse-acquire`) starts: its lease read, unanswered.
+fn start_fuse_acquire(h: &mut Harness) -> OpId {
+    let mut out = Vec::new();
+    h.core.enqueue_job(
+        h.clk(),
+        super::jobs::JobReq::Acquire {
+            reason: "fuse-acquire",
+            ask_handoff: false,
+        },
+        &h.meta,
+        &mut out,
+    );
+    lone_get(
+        &s3_ops(&out)
+            .into_iter()
+            .map(|(op, req)| (op, req.clone()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// S1: a withdrawal swap that lands after a busy acquisition took the name
+/// over (it registered it while the swap was out) must not clear the
+/// takeover: a later escalation that finds the name listed does not claim
+/// it, and its end withdraws nothing.
+#[test]
+fn a_landed_withdrawal_swap_keeps_the_name_a_busy_acquisition_registered() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    let swap = match s3_ops(&out)[..] {
+        [(op, S3Op::LeaseSwap { .. })] => op,
+        ref other => panic!("{other:?}"),
+    };
+    // The swap landed. A busy acquisition reads the body without the name
+    // and registers it; the withdrawal's answer arrives after that.
+    let fuse = start_fuse_acquire(&mut h);
+    let body = live_now(&h);
+    let out = h.step(Event::S3 {
+        op: fuse,
+        result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+    });
+    assert!(
+        s3_ops(&out).iter().any(
+            |(_, op)| matches!(op, S3Op::LeaseSwap { lease, .. } if lease.wanted_by.contains(&2))
+        ),
+        "the busy acquisition registers: {out:?}"
+    );
+    h.step(Event::S3 {
+        op: swap,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    // A new escalation finds the name listed (the busy registration landed)
+    // and ends.
+    demand_returns(&mut h);
+    let get = lone_get(&tick_ops(&mut h));
+    let listed = live_now(&h).wanting(2);
+    h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((listed, tag())))),
+    });
+    demand_falls(&mut h);
+    h.advance(1_000);
+    let ops = tick_ops(&mut h);
+    assert!(
+        ops.is_empty(),
+        "the escalation withdrew a name a busy acquisition registered: {ops:?}"
+    );
+}
+
+/// S2: the sticky `disowned` gate on the claim. A busy acquisition found
+/// the name listed (and disowned it); a later escalation that finds it
+/// listed does not claim it, and its end reads and swaps nothing.
+#[test]
+fn an_escalation_does_not_claim_a_name_a_busy_acquisition_disowned() {
+    let mut h = escalated_without_the_holder();
+    let fuse = start_fuse_acquire(&mut h);
+    let listed = live_now(&h).wanting(2);
+    h.step(Event::S3 {
+        op: fuse,
+        result: S3Result::LeaseGet(Ok(Some((listed, tag())))),
+    });
+    // The escalation's acquisition finds the name listed too.
+    let get = lone_get(&tick_ops(&mut h));
+    let listed = live_now(&h).wanting(2);
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((listed, tag())))),
+    });
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    demand_falls(&mut h);
+    h.advance(1_000);
+    let ops = tick_ops(&mut h);
+    assert!(
+        ops.is_empty(),
+        "the escalation withdrew a name a busy acquisition owns: {ops:?}"
     );
 }
 

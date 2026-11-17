@@ -909,7 +909,14 @@ escalation had asked while the link was down. Three rules follow.
   An escalation that finds its name already listed (a registration whose
   answer timed out and landed late) claims it, unless another acquisition of
   the node owns it; after a registration that timed out in doubt the
-  withdrawal reads once more, after a wait, before it calls the name gone.
+  withdrawal reads again, after a wait, until a read shows a lease tag other
+  than the one the in-doubt swap was made against (the swap is conditional on
+  that tag and can no longer land), at most eight times, before it calls the
+  name gone. The hole is closed when the tag moves within that bound (a holder
+  renews within half a TTL). It is narrowed otherwise: a swap that lands after
+  the bound leaves the name until a later escalation claims it, and the effect
+  is one unwanted lease move after a wanted grace, with no integrity loss (no
+  holder, epoch or expiry field is written).
 
 Who holds the lease is still decided by CAS and TTL alone; none of this writes
 a holder field.

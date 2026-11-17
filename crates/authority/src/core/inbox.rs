@@ -40,6 +40,7 @@ use constellation_store_s3::inbox::{
     gc_keep_newest, InboxBatch, InboxKey, InboxOp, InboxRid, PollBackoff, MAX_OPS_PER_BATCH,
 };
 use constellation_types::Code;
+use replicix_objcas::LeaseTag;
 use std::collections::{BTreeMap, VecDeque};
 
 /// PUT attempts per batch before the waiters are told the inbox is
@@ -67,6 +68,13 @@ const WITHDRAW_BACKOFF_MS: u64 = 500;
 /// doubt, before it reads the lease once more (the swap may still land).
 /// The request timeout counts when it is longer.
 const WITHDRAW_SETTLE_MS: u64 = 1_000;
+/// How many times, at most, a withdrawal reads again while the lease still
+/// carries the tag an in-doubt registration swapped against. A swap is
+/// conditional on its tag, so once a read shows another tag it can no
+/// longer land; the holder's next renewal moves the tag (at the latest
+/// within half a TTL). Past the bound the withdrawal decides on what it
+/// read, and a swap that lands later is left to the next escalation's claim.
+const WITHDRAW_SETTLE_READS: u8 = 8;
 
 /// A batch this tenure executed, paired with the journal seq its last
 /// row landed at (deletable once that seq has shipped).
@@ -139,10 +147,15 @@ struct WantedReg {
     generation: u64,
     /// The generation the withdrawal in flight withdraws.
     withdrawing_gen: u64,
-    /// A registration swap timed out in doubt: it may still land after a
-    /// read that finds no name, so the withdrawal reads once more after a
-    /// wait.
-    in_doubt: bool,
+    /// A registration swap timed out in doubt, with the lease tag it swapped
+    /// against: it may still land after a read that finds no name, as long
+    /// as that tag is current. The withdrawal reads again, after a wait,
+    /// until a read shows another tag (bounded by `WITHDRAW_SETTLE_READS`).
+    in_doubt: Option<LeaseTag>,
+    /// The lease tag the latest registration swap was made against.
+    registering_tag: Option<LeaseTag>,
+    /// The reads this withdrawal has spent waiting out an in-doubt swap.
+    settle_reads: u8,
     /// The escalation's `RegisterWanted` swaps still in flight. A read of
     /// the lease answered before one lands would find no name, and the
     /// swap landing later would leave it for the holder's whole tenure.
@@ -250,9 +263,10 @@ impl InboxState {
     /// An escalation's acquisition issued a `RegisterWanted` swap (or,
     /// for another acquisition, registered the name: no longer the
     /// escalation's to withdraw).
-    pub(crate) fn note_registering(&mut self, escalation: bool) {
+    pub(crate) fn note_registering(&mut self, escalation: bool, tag: LeaseTag) {
         if escalation {
             let reg = &mut self.wanted_reg;
+            reg.registering_tag = Some(tag);
             reg.posted = true;
             reg.disowned = false;
             reg.generation += 1;
@@ -267,7 +281,10 @@ impl InboxState {
     pub(crate) fn wanted_registered(&mut self, in_doubt: bool) {
         let reg = &mut self.wanted_reg;
         reg.registering = reg.registering.saturating_sub(1);
-        reg.in_doubt |= in_doubt;
+        if in_doubt {
+            reg.in_doubt = reg.registering_tag.clone();
+            reg.settle_reads = 0;
+        }
     }
 
     /// An escalation's acquisition finds its name listed in the lease: the
@@ -287,6 +304,12 @@ impl InboxState {
     pub(crate) fn disown_wanted(&mut self) {
         self.wanted_reg.posted = false;
         self.wanted_reg.disowned = true;
+    }
+
+    /// Whether an escalation's registration still waits to be withdrawn.
+    #[cfg(test)]
+    pub(crate) fn withdrawal_pending(&self) -> bool {
+        self.wanted_reg.posted && !self.wanted_reg.gave_up
     }
 
     /// The number of takeover-drain batches still waiting to be re-read.
@@ -1302,7 +1325,8 @@ impl Core {
         reg.failures = 0;
         reg.retry_at = None;
         reg.gave_up = false;
-        reg.in_doubt = false;
+        reg.in_doubt = None;
+        reg.settle_reads = 0;
     }
 
     /// A registration of a newer generation was made or claimed since the
@@ -1361,11 +1385,18 @@ impl Core {
         }
         let me = self.cfg.node_id;
         if lease.holder == me || lease.released || !lease.wanted_by.contains(&me) {
-            // A registration swap that timed out in doubt may still land:
-            // read once more after a wait before calling it done.
-            if self.inbox.wanted_reg.in_doubt && lease.holder != me && !lease.released {
+            // A registration swap that timed out in doubt may still land,
+            // while the tag it swapped against is current: read again after
+            // a wait, until a read shows another tag (the swap can no longer
+            // land), within a bound.
+            let reg = &self.inbox.wanted_reg;
+            if reg.in_doubt.as_ref().is_some_and(|t| *t == tag)
+                && reg.settle_reads < WITHDRAW_SETTLE_READS
+                && lease.holder != me
+                && !lease.released
+            {
                 let reg = &mut self.inbox.wanted_reg;
-                reg.in_doubt = false;
+                reg.settle_reads += 1;
                 reg.withdrawing = false;
                 let settle = WITHDRAW_SETTLE_MS.max(self.cfg.s3_request_timeout_ms);
                 self.inbox.wanted_reg.retry_at = Some(now.wait.plus(settle));
@@ -1402,6 +1433,10 @@ impl Core {
             return;
         }
         match result {
+            // Landed. A busy acquisition may have taken the name over while
+            // the swap was out (`posted` false): its `disowned` stays, as on
+            // the read path.
+            S3Result::LeasePut(Ok(_)) if !self.inbox.wanted_reg.posted => self.withdraw_ended(),
             S3Result::LeasePut(Ok(_)) => self.withdraw_done(),
             S3Result::LeasePut(Err(CasFailure::Conflict)) if left > 0 => {
                 self.issue_s3(S3Op::LeaseGet, S3For::WithdrawWantedGet(left - 1), out);

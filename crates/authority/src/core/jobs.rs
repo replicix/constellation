@@ -3848,20 +3848,22 @@ impl Core {
                     self.issue_s3(
                         S3Op::LeaseSwap {
                             lease: prev.wanting(self.cfg.node_id),
-                            tag,
+                            tag: tag.clone(),
                         },
                         S3For::RegisterWanted {
                             escalation: escalating,
                         },
                         out,
                     );
-                    self.inbox.note_registering(escalating);
+                    self.inbox.note_registering(escalating, tag);
                 } else if escalating {
                     // The escalation finds its name listed (a registration
-                    // whose answer was lost, or which landed late, or
-                    // that an earlier withdrawal gave up on): it is the
-                    // escalation's to withdraw, unless another acquisition
-                    // of this node owns it.
+                    // whose answer was lost, or which landed late): it is
+                    // the escalation's to withdraw, unless another
+                    // acquisition of this node owns it. (A name that an
+                    // earlier withdrawal gave up on is still `posted`, so
+                    // there is nothing to claim; the next escalation's
+                    // start clears `gave_up`.)
                     if prev.wanted_by.contains(&self.cfg.node_id) {
                         self.inbox.claim_listed_wanted();
                     }
