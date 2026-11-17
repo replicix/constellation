@@ -532,6 +532,8 @@ impl EngineControl {
                         answers: stats.root_own_answers,
                         holds: stats.root_own_holds,
                         skipped: stats.place_skipped_root_own,
+                        skipped_no_peer: stats.place_skipped_root_own_no_peer,
+                        released_singleton: stats.place_root_own_released_singleton,
                         commit_waits: stats.root_own_commit_waits,
                         commit_wait_ms_max: stats.root_own_commit_wait_ms_max,
                         resumed_rows: stats.root_own_resumed,

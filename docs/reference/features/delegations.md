@@ -782,14 +782,16 @@ and node, and evaluates it every tenth of the window:
   `status.delegation.handovers` counts requests, grants, drops and the holder's
   side. A placed grant is not moved this way (it keeps the long-dwell recall).
 - **Grant the root itself a sticky subtree** ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)): while the
-  root's own ops commit by the archive (it has a write-eligible peer and no
+  root's own ops commit by the archive (it has an evident write-eligible peer,
+  listed, heard or linked, never only a lapse or an unread roster, and no
   backup), the same rule proposes the root for a subtree it dominates, never
   `/`. The root is then the holder of its own stream: its ops in the subtree
   are answered `Final` at local speed after one archive wait for the grant
   record (the first op parks for it; `status.ack.classes.final` counts the
   rest), and its messages to itself are delivered in the same step. Ops in `/`
   and in other nodes' subtrees still wait for the archive. The root releases
-  its own grant only as the holder: after the long dwell below the floor, at an
+  its own grant only as the holder: after the long dwell below the floor, as soon
+  as it is a singleton again, at an
   unmount or suspension, by `undelegate`, `repair abandon` or an op across its
   boundary (which releases it and runs on the root's keys instead of `EXDEV`).
   `CONSTELLATION_DELEGATION_ROOT_STICKY=off` keeps the archive wait. A root
@@ -1382,7 +1384,7 @@ dies: no acknowledged write is lost) and the causal-cut oracle.
 | `CONSTELLATION_DELEGATION_LEAVE` | `50` | percent below which a placed delegation is recalled |
 | `CONSTELLATION_DELEGATION_DWELL_MS` | `300000` | recall dwell |
 | `CONSTELLATION_DELEGATION_STICKY_PLACEMENT` | on | a dominant far writer is granted a sticky subtree |
-| `CONSTELLATION_DELEGATION_ROOT_STICKY` | on | the root itself is granted a sticky subtree it dominates while its own ops commit by the archive ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)); off: its own ops wait for the archive. Needs sticky placement |
+| `CONSTELLATION_DELEGATION_ROOT_STICKY` | on | the root itself is granted a sticky subtree it dominates while its own ops commit by the archive and a peer is evident, and releases it once it is a singleton again ([ADR-55](../../explanation/DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)); off: its own ops wait for the archive. Needs sticky placement |
 | `CONSTELLATION_STICKY_HANDOVER_TENURE_MS` | `30000` | a sticky grant is handed to a dominant writer only after it has been with its holder this long |
 | `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` | `5000` | a holder asked to hand a subtree over releases it at once when none of its own ops is in flight there, else once they have been idle this long (`0`: only when nothing is in flight) |
 | `CONSTELLATION_STICKY_IDLE_RELEASE_MS` | `60000` | a holder releases a sticky subtree its own ops have not touched for this long (`0`: never; the root's own streams too) |
@@ -1453,7 +1455,10 @@ boundary that released the grant, by the root's own client or another node),
 the archive),
 `commit_waits` and the longest in `commit_wait_ms_max`, `resumed_rows` streamed
 to a later root after a deposition, `self_sends` delivered inline, `skipped`
-candidates and `inbox_refusals`), and the
+candidates (of which `skipped_no_peer`: no peer was evident, only a lapse, an
+incomplete read or no read), `released_singleton` (streams the root released as
+their holder because it is a singleton again, also counted in
+`released_by_dwell`) and `inbox_refusals`), and the
 placement's `place_evaluations`, `place_delegated`, `place_recalled`,
 `place_skipped_cooldown`,
 `place_skipped_unreachable` and `place_skipped_designated` (a node that holds

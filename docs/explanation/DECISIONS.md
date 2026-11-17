@@ -4625,9 +4625,10 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   (stream, acknowledgement, renewal, release request, seal, recall, read-grant
   void); lock messages keep the driver's path.
 - **The root releases its own grant only as its holder** (R-I6): after the long
-  dwell without its share or rate (`place_root_own_released`), at an unmount or
-  suspension (step 7's release), by `undelegate`, `repair abandon`, the epoch's
-  recall or Leave. Never by the placement as root, never by a TTL.
+  dwell without its share or rate (`place_root_own_released`), once the root is
+  a singleton again (see the amendment below), at an unmount or suspension
+  (step 7's release), by `undelegate`, `repair abandon`, the epoch's recall or
+  Leave. Never by the placement as root, never by a TTL.
 - **Cross-subtree ops (Q3).** An op across the boundary of the root's own sticky
   subtree releases the grant, as the holder, and runs on the root's keys after
   the release row, instead of `EXDEV` (`root_own_released_for_cross_own` and
@@ -4687,6 +4688,28 @@ root's own grant is not a singleton answer (ADR-52): it depends on no lease.
 (rolled back at a deposition: it breaks I5); first-write grants (the placement's
 dominance rule decides); a root-side TTL on its own grant (the grant would be
 stealable).
+
+**Amendment (2026-11-17: the grant needs an evident peer, and ends when the
+root is a singleton again)**: the grant is made only while a peer is evident:
+the roster lists another write-eligible node, another node has messaged this
+one, a connected link is a peer's that the read lists or cannot speak for, a
+backup candidate is being brought up, or another node holds a live generation
+of this root (`Core::root_peer_evident`, `Roster::peer_evident`). It is never
+made for a lapse of this node's own, an incomplete registry read or no read
+alone, though those make the root "not a singleton" and so keep its own ops
+waiting for the archive (`root_commits_by_archive` is unchanged: the commit
+rule still treats an unknown peer set as possibly populated; only the grant is
+stricter). A root that is a singleton again releases its own stream as its
+holder, through the dwell release's path (`own_sticky_release`, counted in
+`place_root_own_released_singleton`), without waiting for the dwell: a
+singleton answers its own ops locally and gains nothing from the stream. The
+reason: a grant made for a lapse alone outlived the lapse's window, and while
+it lived every op's ownership check ([ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits))
+was on for a single node (15 to 24 s bogo-ops on btrfs). No integrity
+invariant moves: no grant leaves the root's own ops on the archive wait (the
+`ROOT_STICKY=off` path), and the release is the holder's existing one (I1
+allows the local answer exactly while `singleton_now()` holds, which is the
+condition of the release).
 
 **May revert**: yes, by `CONSTELLATION_DELEGATION_ROOT_STICKY=off`.
 

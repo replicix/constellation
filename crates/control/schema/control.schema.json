@@ -2157,9 +2157,11 @@
             "released_by_dwell": 0,
             "released_for_cross_forwarded": 0,
             "released_for_cross_own": 0,
+            "released_singleton": 0,
             "resumed_rows": 0,
             "self_sends": 0,
-            "skipped": 0
+            "skipped": 0,
+            "skipped_no_peer": 0
           },
           "description": "Plan 46 M1.3 step 9 (ADR-55): the root's own sticky grants. Streams\nthis node granted itself as the root (placement), the ops it answered\nin them (`final`, local speed), the ops its root path held instead of\nrefusing them, the releases an op across a boundary asked for, the\nlongest the first ops waited for the record's archive (ms), the rows\nit streamed to a later root after its deposition, and the messages to\nitself the core delivered inline. The streams themselves are the rows\nof `mine` and `gens` whose node is this one."
         },
@@ -7484,6 +7486,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "released_singleton": {
+          "description": "Own streams the root released as their holder because it is a\nsingleton again (they also count in `released_by_dwell`, which counts\nevery release the root decided itself).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "resumed_rows": {
           "format": "uint64",
           "minimum": 0,
@@ -7498,6 +7506,12 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "skipped_no_peer": {
+          "description": "Of `skipped`, candidates refused because no peer was evident (only a\nlapse, an incomplete registry read or no read said the root might not\nbe alone).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -7509,6 +7523,8 @@
         "answers",
         "holds",
         "skipped",
+        "skipped_no_peer",
+        "released_singleton",
         "commit_waits",
         "commit_wait_ms_max",
         "resumed_rows",

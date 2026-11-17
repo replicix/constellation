@@ -337,6 +337,14 @@ pub struct RootOwnStatus {
     pub answers: u64,
     pub holds: u64,
     pub skipped: u64,
+    /// Of `skipped`, candidates refused because no peer was evident (only a
+    /// lapse, an incomplete registry read or no read said the root might not
+    /// be alone).
+    pub skipped_no_peer: u64,
+    /// Own streams the root released as their holder because it is a
+    /// singleton again (they also count in `released_by_dwell`, which counts
+    /// every release the root decided itself).
+    pub released_singleton: u64,
     pub commit_waits: u64,
     pub commit_wait_ms_max: u64,
     pub resumed_rows: u64,

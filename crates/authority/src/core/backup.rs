@@ -1885,6 +1885,22 @@ impl Core {
                 .any(|g| g.node != self.cfg.node_id && !g.ended)
     }
 
+    /// ADR-55: this node knows of a peer: a backup candidate is being
+    /// brought up, another node holds a live generation of this root's, or
+    /// the roster has an evident peer ([`Roster::peer_evident`]: listed,
+    /// heard or linked). The three groups of reasons [`Self::singleton_now`]
+    /// uses, without the unknown ones (no read, an incomplete read, a lapse
+    /// newer than the read).
+    pub(crate) fn root_peer_evident(&self) -> bool {
+        self.ack.candidate.is_some()
+            || self
+                .dl
+                .gens
+                .values()
+                .any(|g| g.node != self.cfg.node_id && !g.ended)
+            || self.roster.peer_evident(self.cfg.node_id)
+    }
+
     /// Plan 46 M1.1 step 5 (C8 conditions 1 and 3), ADR-50: a message from
     /// `node` is a singleton-test event, whatever its kind: a node that
     /// writes to this one is a peer, linked, whatever the roster read in
@@ -2181,7 +2197,9 @@ impl Core {
 
     /// Plan 46 M1.3 step 9 (ADR-55, R-I2): this root's own ops commit by
     /// the archive: it holds the lease, is no singleton (a write-eligible
-    /// peer is listed), has no group (no backup in the lease or in doubt), no
+    /// peer is listed, or nothing says it is alone: `!singleton_now` also
+    /// holds with no read, an incomplete read or a lapse; the sticky grant
+    /// asks for more, [`Self::root_peer_evident`]), has no group (no backup in the lease or in doubt), no
     /// continuation epoch and no takeover gate, and is not under `ack=s3`
     /// (which asks the archive of every answer, a sticky grant's included).
     /// Exactly when its own ops would otherwise wait for the archive.

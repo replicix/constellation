@@ -84596,6 +84596,115 @@ mod root_own_sticky {
         assert!(own_grant_of(&h, dirs[0]).is_none());
     }
 
+    /// The root of [`root_with_peer`], made a singleton again by events: a
+    /// complete read that lists only node 1, issued now, and a directory
+    /// snapshot with no links.
+    fn make_alone(h: &mut Harness) {
+        h.advance(10);
+        h.step(roster_ev(vec![1], w(h.now)));
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: Vec::new(),
+            lapses: 0,
+        });
+        assert!(h.core.singleton_now(), "premise: alone");
+    }
+
+    /// ADR-55 (amended 2026-11-17): a grant made for a lapse of the root's
+    /// own alone outlived the lapse and turned every op's ownership check on
+    /// for a single node. The root is "not a singleton" in the lapse's
+    /// window, its own ops wait for the archive, but no peer is evident.
+    /// (Fails before: the grant was made.)
+    #[test]
+    fn no_own_grant_for_a_root_whose_only_reason_to_doubt_it_is_alone_is_its_own_lapse() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        make_alone(&mut h);
+        h.step(Event::OwnLag {
+            from: w(h.now).minus(1),
+            until: w(h.now),
+        });
+        assert!(!h.core.singleton_now(), "premise: the lapse is newer");
+        assert!(h.core.root_commits_by_archive(), "premise: archive waits");
+        assert!(!h.core.root_peer_evident());
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_none(), "a lapse-only grant");
+        assert!(h.core.stats.place_skipped_root_own_no_peer >= 1);
+    }
+
+    /// As above, the doubt coming from a newer registry read that could not
+    /// be completed and listed only this node. (Fails before.)
+    #[test]
+    fn no_own_grant_while_the_newest_registry_read_could_not_be_completed() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        make_alone(&mut h);
+        h.advance(10);
+        h.step(roster_ev_seq(next_roster_seq(), vec![1], false, w(h.now)));
+        assert!(!h.core.singleton_now(), "premise: a newer incomplete read");
+        assert!(h.core.root_commits_by_archive(), "premise: archive waits");
+        assert!(!h.core.root_peer_evident());
+        root_dominates(&mut h, dirs[0]);
+        assert!(
+            own_grant_of(&h, dirs[0]).is_none(),
+            "an unread-roster grant"
+        );
+        assert!(h.core.stats.place_skipped_root_own_no_peer >= 1);
+    }
+
+    /// Positive controls: a listed peer, a peer linked after the read that
+    /// does not list it, and a peer that messaged the root each make the
+    /// grant (they pass before and after the amendment).
+    #[test]
+    fn an_own_grant_still_follows_a_listed_peer_a_linked_peer_and_a_heard_peer() {
+        // (a) Listed.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        assert!(h.core.root_peer_evident());
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_some(), "listed");
+        // (b) Linked after a read that lists only this node.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        make_alone(&mut h);
+        h.advance(10);
+        link_to_2(&mut h, Some(500));
+        assert!(!h.core.singleton_now());
+        assert!(h.core.root_peer_evident());
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_some(), "linked");
+        // (c) Heard: a read listing only this node, no links, and a message
+        // from node 2.
+        let (mut h, dirs) = root_with_peer(Some(500));
+        make_alone(&mut h);
+        h.advance(10);
+        let clk = h.clk();
+        h.core.note_heard(clk, 2, &h.meta);
+        assert!(!h.core.singleton_now());
+        assert!(h.core.root_peer_evident());
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_some(), "heard");
+    }
+
+    /// ADR-55 (amended 2026-11-17): the root releases its own stream, as its
+    /// holder, once it is a singleton again, whatever its share in the
+    /// subtree. (Fails before: nothing is released.)
+    #[test]
+    fn the_roots_own_stream_is_released_as_its_holder_once_it_is_a_singleton_again() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        assert!(own_grant_of(&h, dirs[0]).is_some(), "granted");
+        archive_and_step(&mut h);
+        // The peer goes; the root keeps writing the subtree, so the dwell is
+        // not the reason.
+        make_alone(&mut h);
+        root_dominates(&mut h, dirs[0]);
+        archive_and_step(&mut h);
+        assert_eq!(h.core.stats.place_root_own_released_singleton, 1);
+        assert!(
+            h.meta.delegation_table().get(dirs[0]).is_none(),
+            "the subtree is still granted"
+        );
+        assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
+        assert_eq!(h.core.stats.place_recalled, 0);
+    }
+
     /// Test 4 (R-I3): the root executes under its own grant once the
     /// archive carries the record: the first own op parks, the next is
     /// answered at once.

@@ -1221,12 +1221,14 @@ a grant goes to a *node* and covers a set of subtrees under one stream:
   release or the operator
   ([ADR-54](DECISIONS.md#adr-54-placement-grants-a-far-dominant-writer-a-sticky-subtree-and-recalls-placed-grants-only-after-a-long-dwell),
   plan 46 §5.3). The root itself is a candidate by the same rule while its own
-  ops commit by the archive (a write-eligible peer, no group): it takes a
+  ops commit by the archive (a write-eligible peer evident: listed, heard or
+  linked, never only a lapse or an unread roster; no group): it takes a
   sticky grant on the topmost subtree it dominates, never `/`, becomes the
   holder of its own stream and answers its ops there `Final` at local speed,
   once the root rows its position names are in the log (a deposition rolls
   those back while the stream's rows stay);
-  a deposed root that is alive keeps the grant and streams it to the next root
+  a deposed root that is alive keeps the grant and streams it to the next root, and
+  one that is a singleton again releases its own stream as its holder
   ([ADR-55](DECISIONS.md#adr-55-a-root-with-peers-and-no-group-writes-the-subtrees-it-dominates-under-its-own-sticky-grant)).
   A sticky subtree follows its dominant writer by *handover*: when another node
   dominates it, and the grant has been with its holder for the minimum tenure

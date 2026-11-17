@@ -1716,6 +1716,13 @@ pub struct Stats {
     pub place_root_own_granted: u64,
     pub place_root_own_released: u64,
     pub place_skipped_root_own: u64,
+    /// ADR-55: of those, candidates refused because no peer was evident
+    /// (only a lapse, an incomplete read or no read said the root might not
+    /// be alone); and own streams the root released because it is a
+    /// singleton again (such a release also counts in
+    /// `place_root_own_released`, which counts every own release).
+    pub place_skipped_root_own_no_peer: u64,
+    pub place_root_own_released_singleton: u64,
     /// ADR-55: ops of the root's own stream its root path held (`Held`)
     /// instead of refusing or executing them.
     pub root_own_holds: u64,

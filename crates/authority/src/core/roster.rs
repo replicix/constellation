@@ -360,6 +360,25 @@ impl Roster {
             && !self.links.values().any(|l| self.link_is_peer(me, l))
     }
 
+    /// Whether `me` knows of another node that could write: the newest
+    /// read in hand (complete, or a newer incomplete one) lists another
+    /// write-eligible node, a node has messaged this one since the
+    /// directory last showed it, or a link is a peer's that the read lists
+    /// or cannot speak for ([`Self::link_is_peer`]).
+    ///
+    /// Not the negation of [`Self::singleton`]: "not a singleton" also holds
+    /// when nothing is known (no complete read, a newer incomplete read, a
+    /// lapse of this node's newer than the read). Unknown never means alone
+    /// and it never means a peer either; this is false for those reasons
+    /// alone.
+    ///
+    /// Read by the root's own sticky grant (`Core::root_peer_evident`).
+    pub(crate) fn peer_evident(&self, me: NodeId) -> bool {
+        self.write_peers(me).next().is_some()
+            || !self.heard.is_empty()
+            || self.links.values().any(|l| self.link_is_peer(me, l))
+    }
+
     // ------------------------------------------------------- test hooks
 
     #[cfg(test)]

@@ -489,8 +489,10 @@ impl Core {
     }
 
     /// Plan 46 M1.3 step 9 (ADR-55): the kind of grant the root itself gets
-    /// on `dir`: sticky, only while its own ops commit by the archive (a
-    /// write-eligible peer, no group), never on `/`, and never beside a
+    /// on `dir`: sticky, only while its own ops commit by the archive and a
+    /// peer is evident (listed, heard, linked, a backup candidate or another
+    /// node's live generation; never a lapse, an incomplete read or no read
+    /// alone; no group), never on `/`, and never beside a
     /// designation (a stream never mixes kinds) or inside the quarantine
     /// of a release it made itself (step 7 D-e).
     fn place_kind_for_root(
@@ -510,6 +512,13 @@ impl Core {
             || (dir == ROOT_INO && !self.cfg.root_sticky_on_slash)
             || self.dl.leave_self
         {
+            return skip(self);
+        }
+        // The grant needs a peer in evidence, not only a doubt that the root
+        // is alone (no read, an incomplete read, a lapse): a grant made for
+        // a lapse outlives it and turns the ownership check on for every op.
+        if !self.root_peer_evident() {
+            self.stats.place_skipped_root_own_no_peer += 1;
             return skip(self);
         }
         let ns = replica.namespace();
@@ -688,6 +697,20 @@ impl Core {
             .collect();
         for (gen, dirs) in own {
             let me = self.cfg.node_id;
+            // A root that is a singleton again gains nothing from the stream
+            // (its own ops answer locally), and the stream is what turns
+            // every op's ownership check on: the holder releases it now.
+            if self.singleton_now() {
+                self.stats.place_root_own_released_singleton += 1;
+                tracing::info!(
+                    node = me,
+                    dirs = ?dirs,
+                    gen = %constellation_meta::delegation::GenLabel::of(gen),
+                    "the root releases its own sticky subtrees (it is a singleton again)"
+                );
+                self.own_sticky_release(now, gen, dirs.into_iter().collect(), replica, out);
+                continue;
+            }
             let mut keep = false;
             for dir in &dirs {
                 if let Some(by_node) = subtree.get(dir) {

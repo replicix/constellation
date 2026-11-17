@@ -70221,6 +70221,18 @@ end-to-end answers that must not count (`answers_that_do_not_count_leave_a_grown
 `a_new_sticky_stream_is_served_by_the_root_that_follows_a_refusal`), and the partial release of the root's own
 stream (`a_partial_release_of_the_roots_own_stream_keeps_its_grants_once`).
 
+### The root's own sticky grant needs an evident peer (2026-11-17)
+
+A single node whose core step ran long (a btrfs store-lock stall) got an own lapse, which makes the roster "not a
+singleton" until the next read. The placement of that window granted the root a sticky subtree of the busy directory,
+and the grant outlived the window: `delegations_any()` stayed true, so every unlink ran ADR-42's names scan (15 to 24 s
+bogo-ops). `Core::place_kind_for_root` now needs `Core::root_peer_evident` (a listed, heard or linked peer, a backup
+candidate, or another node's live generation) and never grants for a lapse, an incomplete read or no read alone
+(`place_skipped_root_own_no_peer`); the commit rule (`root_commits_by_archive`) is unchanged. The root releases its own
+stream as its holder once it is a singleton again (`place_root_own_released_singleton`, through `own_sticky_release`).
+Status: `delegation.root_own.skipped_no_peer` and `released_singleton`. ADR-55 amended. Pins in the ADR-55 test module
+(`no_own_grant_for_a_root_whose_only_reason_to_doubt_it_is_alone_is_its_own_lapse` and three more).
+
 ## Inbox escalation: no P2P ask, and a withdrawn registration (leaseesc)
 
 `delegate-partition` failed 11 of 20 runs under host load with "the root lost its lease". The root had handed its lease
