@@ -119,6 +119,11 @@ pub struct LeaseState {
     pub held_since: Option<WaitMs>,
     pub wanted: Vec<NodeId>,
     pub wanted_since: Option<WaitMs>,
+    /// The wanters an inbox batch named (`note_wanted`), with when each
+    /// last did. Unlike a name in the lease body, which stays until its
+    /// owner withdraws it, a batch is a live signal: it ends when the
+    /// batches stop (`expire_noted`).
+    pub wanted_noted: Vec<(NodeId, WaitMs)>,
     /// Plan 46 M1.2 step 7 (c3-spec D6): the holder of the lease this node's
     /// last claim took over (`None`: a create, or a claim of its own lease).
     /// A generation this root inherits with no recorded backup seals it.
@@ -792,6 +797,10 @@ impl LeaseState {
         if node == 0 || self.held.is_none() {
             return;
         }
+        match self.wanted_noted.iter_mut().find(|(n, _)| *n == node) {
+            Some((_, at)) => *at = now.wait,
+            None => self.wanted_noted.push((node, now.wait)),
+        }
         if !self.wanted.contains(&node) {
             self.wanted.push(node);
             self.wanted.sort_unstable();
@@ -801,10 +810,47 @@ impl LeaseState {
         }
     }
 
+    /// Forget the batch-named wanters that have not named themselves for
+    /// `ttl_ms` (a requester whose demand ended sends no more batches),
+    /// and so the grace they started. A name the held lease body lists
+    /// stays: only its owner's withdrawal (`Core::withdraw_wanted`) removes
+    /// it.
+    pub fn expire_noted(&mut self, now: Now, ttl_ms: u64) {
+        let before = self.wanted_noted.len();
+        self.wanted_noted
+            .retain(|(_, at)| now.wait.since(*at) <= ttl_ms as i64);
+        if self.wanted_noted.len() != before {
+            self.rebuild_wanted(now);
+        }
+    }
+
+    /// `wanted` is what the held body lists plus the live batch-named
+    /// wanters; the grace restarts when it empties.
+    fn rebuild_wanted(&mut self, now: Now) {
+        let mut wanted: Vec<NodeId> = Vec::new();
+        if let Some((held, _)) = &self.held {
+            wanted.extend(held.wanted_by.iter().copied());
+        }
+        wanted.extend(self.noted_names());
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.wanted = wanted;
+        if self.wanted.is_empty() {
+            self.wanted_since = None;
+        } else if self.wanted_since.is_none() {
+            self.wanted_since = Some(now.wait);
+        }
+    }
+
+    fn noted_names(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.wanted_noted.iter().map(|(n, _)| *n)
+    }
+
     /// `LeaseKeeper::open_won`: take ownership of a won lease.
     pub fn adopt(&mut self, now: Now, lease: Lease, tag: LeaseTag, gate: Option<PendingGate>) {
         self.gate = gate;
         self.wanted.clear();
+        self.wanted_noted.clear();
         self.wanted_since = None;
         self.held_since = Some(now.wait);
         self.last_write = now.wait;
@@ -840,15 +886,14 @@ impl LeaseState {
     }
 
     fn renewed_unchecked(&mut self, now: Now, lease: Lease, tag: LeaseTag) {
-        // Union with what inbox batches already told us (M5): a renewal
-        // object that predates a batch's flag must not forget it.
+        // The body's names, with what inbox batches already told us (M5: a
+        // renewal object that predates a batch's flag must not forget it).
+        // A name the body no longer lists was withdrawn by its owner
+        // (`Core::withdraw_wanted`): it is not carried over.
         let mut wanted = lease.wanted_by.clone();
-        for w in &self.wanted {
-            if !wanted.contains(w) {
-                wanted.push(*w);
-            }
-        }
+        wanted.extend(self.noted_names());
         wanted.sort_unstable();
+        wanted.dedup();
         self.wanted = wanted;
         if self.wanted.is_empty() {
             self.wanted_since = None;
@@ -975,6 +1020,7 @@ impl LeaseState {
     /// `LeaseKeeper::release`'s success arm.
     pub fn released(&mut self) {
         self.wanted.clear();
+        self.wanted_noted.clear();
         self.wanted_since = None;
         self.held_since = None;
         self.held = None;
@@ -2019,5 +2065,63 @@ mod tests {
             !st.idle_release_due(t0.plus(2_700), &cfg, 0, 1),
             "M4 held records keep it"
         );
+    }
+
+    /// A requester that withdrew its registration (the body read at the
+    /// next renewal no longer lists it) is not carried over from the last
+    /// body: the holder keeps the lease past the grace.
+    #[test]
+    fn a_withdrawn_wanted_by_name_is_forgotten_at_the_next_read() {
+        let mut cfg = cfg();
+        cfg.dwell_ms = 1_000;
+        cfg.idle_release_ms = 600_000;
+        cfg.wanted_grace_ms = 2_000;
+        let t0 = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let lease = st.granted_lease(t0, &cfg, None, false, false);
+        st.adopt(t0, lease.clone(), tag(), None);
+        st.renewed(t0.plus(500), lease.wanting(9), tag());
+        assert_eq!(st.wanted, vec![9]);
+        // The owner took its name out; the renewal's re-read shows it.
+        st.renewed(t0.plus(1_000), lease.clone(), tag());
+        assert!(st.wanted.is_empty(), "{:?}", st.wanted);
+        assert!(st.wanted_since.is_none());
+        assert!(!st.wants_handoff(t0.plus(9_000), &cfg), "nobody waiting");
+    }
+
+    /// Batch-named wanters expire when their batches stop, and keep the
+    /// grace running while they continue.
+    #[test]
+    fn a_batch_named_wanter_lasts_only_while_its_batches_continue() {
+        let mut cfg = cfg();
+        cfg.dwell_ms = 1_000;
+        cfg.idle_release_ms = 600_000;
+        cfg.wanted_grace_ms = 2_000;
+        let ttl = 10_000;
+        let t0 = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let lease = st.granted_lease(t0, &cfg, None, false, false);
+        st.adopt(t0, lease.clone(), tag(), None);
+        // Sustained demand: a batch every second keeps it.
+        for k in 0..20u64 {
+            let at = t0.plus(1_000 * k);
+            st.note_wanted(at, 9);
+            st.expire_noted(at, ttl);
+            st.renewed(at, lease.clone(), tag());
+        }
+        assert_eq!(st.wanted, vec![9]);
+        assert!(st.wants_handoff(t0.plus(19_500), &cfg), "grace elapsed");
+        // The batches stop: the name goes with the ttl, and the grace with
+        // it.
+        let stop = t0.plus(19_000);
+        st.expire_noted(stop.plus(ttl), ttl);
+        assert_eq!(st.wanted, vec![9], "inside the ttl");
+        st.expire_noted(stop.plus(ttl + 1), ttl);
+        assert!(st.wanted.is_empty(), "{:?}", st.wanted);
+        assert!(!st.wants_handoff(stop.plus(ttl + 5_000), &cfg));
+        // A name the body lists is not a batch's to expire.
+        st.renewed(stop.plus(ttl + 6_000), lease.wanting(9), tag());
+        st.expire_noted(stop.plus(ttl + 7_000), ttl);
+        assert_eq!(st.wanted, vec![9]);
     }
 }

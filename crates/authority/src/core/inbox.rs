@@ -54,6 +54,9 @@ const DEESCALATE_FRACTION: f64 = 0.5;
 const ESCALATE_WAIT_MIN_OPS: u64 = 5;
 /// The escalator's tick while demand is sustained.
 const ESCALATE_TICK_MS: u64 = 250;
+/// How many times a withdrawal of `wanted_by` reads the lease again after a
+/// renewal won its swap.
+const WITHDRAW_RETRIES: u8 = 4;
 
 /// A batch this tenure executed, paired with the journal seq its last
 /// row landed at (deletable once that seq has shipped).
@@ -131,6 +134,9 @@ pub(crate) struct InboxState {
     escalated_since: Option<WaitMs>,
     escalate_attempts: u32,
     escalate_last_request: Option<WaitMs>,
+    /// An escalation's acquisition asked for the lease (so it may have
+    /// registered in `wanted_by`) and the registration is not withdrawn.
+    wanted_posted: bool,
     pub(crate) escalate_timer: Option<TimerId>,
     // ---- holder ----
     pub(crate) holder: Option<HolderPoll>,
@@ -1021,6 +1027,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if !self.escalated(now) {
+            self.withdraw_wanted(now, out);
             return;
         }
         // M12 round 2: the inbox was a detour — the holder was briefly
@@ -1040,6 +1047,7 @@ impl Core {
                 );
                 self.inbox.escalated_since = None;
                 self.inbox.window.clear();
+                self.withdraw_wanted(now, out);
                 return;
             }
         }
@@ -1054,6 +1062,7 @@ impl Core {
             if due {
                 self.inbox.escalate_last_request = Some(now.wait);
                 self.inbox.escalate_attempts = self.inbox.escalate_attempts.saturating_add(1);
+                self.inbox.wanted_posted = true;
                 self.stats.inbox_lease_requests += 1;
                 // S3 only (`wanted_by`, which the holder honours after the
                 // wanted grace), never a P2P `LeaseRequest`, which the
@@ -1082,6 +1091,74 @@ impl Core {
             }
         }
         self.arm_escalate_tick(now, out);
+    }
+
+    /// The escalation ended (the demand fell off, or the holder is
+    /// reachable over P2P again): take this node's name out of the lease's
+    /// `wanted_by`, which the holder would otherwise keep for the rest of its
+    /// tenure and hand the lease over for after the wanted grace, long
+    /// after the demand that asked for it (a detour that ended moved the
+    /// root's lease to the node that took it). Best effort: a read of the
+    /// lease, then a swap without the name, retried when a renewal wins
+    /// the swap. While an acquisition is in flight it waits (that
+    /// acquisition may be real demand's registration), and a holder that is
+    /// this node, or released, has nothing to withdraw.
+    fn withdraw_wanted(&mut self, now: Now, out: &mut Vec<Action>) {
+        if !self.inbox.wanted_posted {
+            return;
+        }
+        if self.acquiring() {
+            if self.inbox.escalate_timer.is_none() {
+                let id =
+                    self.set_timer_wait(now.wait.plus(ESCALATE_TICK_MS), Timer::EscalateTick, out);
+                self.inbox.escalate_timer = Some(id);
+            }
+            return;
+        }
+        self.inbox.wanted_posted = false;
+        self.issue_s3(
+            S3Op::LeaseGet,
+            S3For::WithdrawWantedGet(WITHDRAW_RETRIES),
+            out,
+        );
+    }
+
+    /// The read of [`Self::withdraw_wanted`].
+    pub(crate) fn on_withdraw_wanted_read(
+        &mut self,
+        left: u8,
+        result: S3Result,
+        out: &mut Vec<Action>,
+    ) {
+        let S3Result::LeaseGet(Ok(Some((lease, tag)))) = result else {
+            return;
+        };
+        let me = self.cfg.node_id;
+        if lease.holder == me || lease.released || !lease.wanted_by.contains(&me) {
+            return;
+        }
+        let mut without = lease;
+        without.wanted_by.retain(|n| *n != me);
+        self.issue_s3(
+            S3Op::LeaseSwap {
+                lease: without,
+                tag,
+            },
+            S3For::WithdrawWantedSwap(left),
+            out,
+        );
+    }
+
+    /// The swap of [`Self::withdraw_wanted`]: lost to a renewal, read again.
+    pub(crate) fn on_withdraw_wanted_swap(
+        &mut self,
+        left: u8,
+        result: S3Result,
+        out: &mut Vec<Action>,
+    ) {
+        if matches!(result, S3Result::LeasePut(Err(CasFailure::Conflict))) && left > 0 {
+            self.issue_s3(S3Op::LeaseGet, S3For::WithdrawWantedGet(left - 1), out);
+        }
     }
 
     /// Called after every event that could have started an escalation.

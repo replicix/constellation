@@ -2555,6 +2555,12 @@ pub(crate) enum S3For {
     RefreshHolder,
     /// A `Busy` acquisition registering `wanted_by` (result ignored).
     RegisterWanted,
+    /// An escalation that ended reading the lease to take its name out of
+    /// `wanted_by` (`Core::withdraw_wanted`); the count is the CAS retries
+    /// left.
+    WithdrawWantedGet(u8),
+    /// The swap that takes the name out.
+    WithdrawWantedSwap(u8),
     /// M13: the submitter's batch PUT.
     InboxPut,
     /// M13: the submitter resyncing its batch numbering.
@@ -4213,6 +4219,8 @@ impl Core {
                 }
             }
             S3For::RegisterWanted => {}
+            S3For::WithdrawWantedGet(left) => self.on_withdraw_wanted_read(left, result, out),
+            S3For::WithdrawWantedSwap(left) => self.on_withdraw_wanted_swap(left, result, out),
             S3For::InboxPut => self.on_inbox_put(now, result, replica, out),
             S3For::InboxLastN => self.on_inbox_last_n(now, result, replica, out),
             S3For::InboxPoll(node) => self.on_inbox_polled(now, node, op, result, replica, out),

@@ -752,8 +752,16 @@ the lease back or on. Why: Linux serializes creates in one directory
 each op is one sequential inbox round trip and batches cannot form —
 there the lease must move, as it does today. `status.inbox.escalated`,
 `escalations`, `lease_requests`, `inbox_ops` and `local_ops` show which
-regime a node is in. An escalation is dropped if the holder becomes
-reachable over P2P again. Before an op that went into the inbox is
+regime a node is in. An escalation asks through S3 only (`wanted_by`), never with a P2P
+lease request, which the holder serves at once. It is dropped if the holder
+becomes reachable over P2P again, and when it ends (that, or the demand
+falling off) the requester takes its name out of `wanted_by` (a read of the
+lease and a swap, retried when a renewal wins it), because the holder keeps
+a name for its whole tenure and would hand the lease over after the wanted
+grace for a demand that is gone. The holder in turn forgets a requester
+whose batches carry `wants_lease` no more once they have been absent for the
+longer of the escalation window and the wanted grace. Real sustained demand
+keeps both alive: its batches keep naming it and its registration stays. Before an op that went into the inbox is
 forwarded over a P2P path that came back (or held back because a
 dependency was lost), the requester withdraws its own batch, so the op
 is not executed through both paths out of order; the rid dedups either

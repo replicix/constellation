@@ -3028,6 +3028,10 @@ impl Core {
             self.release_after_atime(now, replica, out);
             return;
         }
+        // A wanter whose batches stopped no longer wants it (the window of
+        // `keeps_lease_for_p2p_side`).
+        let note_ttl = self.cfg.escalate_window_ms.max(self.cfg.wanted_grace_ms);
+        self.lease.expire_noted(now, note_ttl);
         if self.lease.held.is_none() || self.lease.lost || !self.lease.wants_handoff(now, &self.cfg)
         {
             self.finish_round(now, None, replica, out);

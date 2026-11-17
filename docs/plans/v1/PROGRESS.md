@@ -70186,3 +70186,27 @@ end-to-end answers that must not count (`answers_that_do_not_count_leave_a_grown
 `a_lost_granting_answer_is_followed_by_one_that_carries_the_handoff`,
 `a_new_sticky_stream_is_served_by_the_root_that_follows_a_refusal`), and the partial release of the root's own
 stream (`a_partial_release_of_the_roots_own_stream_keeps_its_grants_once`).
+
+## Inbox escalation: no P2P ask, and a withdrawn registration (leaseesc)
+
+`delegate-partition` failed 11 of 20 runs under host load with "the root lost its lease". The root had handed its lease
+to the cut delegate on a P2P `LeaseRequest` from the delegate's inbox escalation: after the heal, that ask was the first
+thing heard on the link, the holder served it at once (`can_serve`: the cut delegation was already reclaimed), and the
+M12 round 2 rule in `on_escalate_tick` ("an ended P2P detour must not move the root's lease") could never beat its own
+P2P ask. The escalation's acquisition now asks through S3 only (`ask_handoff: false`), which the holder honours after the
+wanted grace. Test: `an_inbox_escalation_never_asks_the_holder_over_p2p` (fails with the old `ask_handoff: p2p`).
+With it, `delegate-partition` passes 20 of 20 under `stress-ng --cpu 48`.
+
+Same rule, the other end. The S3 `wanted_by` registration an escalation leaves, and the names the holder noted from
+`wants_lease` batches, stayed on the holder's wanted list for the rest of its tenure (`renewed_unchecked` only added
+names), so a root could still hand its lease to the node about one wanted grace after a detour. Now (a) a requester whose
+escalation ended (demand fell off, or the holder reachable again) reads the lease and swaps it without its name
+(`Core::withdraw_wanted`: best effort, read again up to four times when a renewal wins the swap, not while an acquisition
+is in flight, nothing when the name is gone or the lease is its own); (b) the holder takes the body's `wanted_by` as it
+reads it (a name the body no longer lists is not carried over) and forgets a batch-named wanter once its batches have
+been absent for the longer of the escalation window and the wanted grace (`LeaseState::expire_noted`, run at the round's
+release check). Why both: the registration lives in the S3 lease body, which only its owner may edit, while the batch
+flag is a live signal with no S3 record, so a withdrawal write cannot reach it. A requester whose demand continues keeps
+both: its batches refresh the name and its registration is not withdrawn. Tests: `an_ended_escalation_takes_its_name_out_of_wanted_by`,
+`a_withdrawal_that_finds_no_name_swaps_nothing` (core), `a_withdrawn_wanted_by_name_is_forgotten_at_the_next_read`,
+`a_batch_named_wanter_lasts_only_while_its_batches_continue` (lease state).
