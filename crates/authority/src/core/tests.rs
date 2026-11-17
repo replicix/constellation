@@ -18293,6 +18293,45 @@ mod locks {
         assert_eq!(probe(&mut h, 2, g), (false, false), "granted beside it");
     }
 
+    /// Liveness: the lane sent a renewal after the one the growth sent
+    /// (still in flight), and registers it late, raising the bound above
+    /// the first. The first one's answer then lets nothing in but asks
+    /// again at once; the answer to that one, with the handoff, does.
+    #[test]
+    fn a_renewal_sent_before_a_late_lane_registration_asks_again() {
+        use constellation_meta::SubtreeKind;
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (_, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, first, round) = renewal_of_7(&out).expect("no renewal on install");
+        h.advance(2);
+        h.step(renewed_answer(1, first, round, 20_000, Vec::new()));
+        assert_eq!(probe(&mut h, 1, f), (false, true), "not served");
+        h.advance(10);
+        let (e, g, out) = grow_stream(&mut h, SubtreeKind::Placed);
+        let (_, s_grow, _) = renewal_of_7(&out).expect("no renewal sent for the growth");
+        // The lane sent after the growth's renewal; it registers late.
+        h.advance(5);
+        let lane_sent_at = h.honour();
+        h.advance(5);
+        h.step(lane_sent(&h, 1, lane_sent_at));
+        h.advance(5);
+        let out = h.step(renewed_answer(1, s_grow, round, 20_000, Vec::new()));
+        assert!(h.core.dl.mine[&7].grown.contains_key(&e), "unparked");
+        assert_eq!(probe(&mut h, 2, g), (true, false));
+        let (_, next, _) = renewal_of_7(&out).expect("no renewal asked for");
+        h.advance(5);
+        let wire = handoff_wire(&h, 5, 9, g);
+        h.step(renewed_answer(1, next, round, 20_000, vec![wire]));
+        assert!(!h.core.dl.mine[&7].grown.contains_key(&e), "still parked");
+        assert!(h.meta.locks().own_grant(g, 5, h.clk().wait).is_some());
+        assert_eq!(probe(&mut h, 3, g), (false, false), "granted beside it");
+    }
+
     /// S1: answers that do not count leave a grown subtree's locks waiting:
     /// one of another round, one of another root, a refusal (`ttl_ms` 0).
     /// The next granting answer to a renewal sent after the growth lets

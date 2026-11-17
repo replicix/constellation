@@ -8352,6 +8352,18 @@ impl Core {
             return;
         }
         d.last_renew_sent = d.last_renew_sent.max(sent);
+        // The core cannot order this send against the growth it learned in
+        // the step that just ended: a bound `deleg_sync_growth` took
+        // without this request must not be below its send, or its granting
+        // answer (computed before the root handed the subtree's grants
+        // over) would let the locks in early. Liveness only: the renewal
+        // sent after the growth does.
+        for t in d.grown.values_mut().flatten() {
+            *t = (*t).max(sent);
+        }
+        for t in d.lock_wait.values_mut() {
+            *t = (*t).max(sent);
+        }
         self.dl.late.insert(
             req,
             LateReq {
