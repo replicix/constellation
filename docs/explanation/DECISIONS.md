@@ -876,6 +876,37 @@ caller had been told `EEXIST`.
 [`crates/store-s3/src/inbox.rs`](../../crates/store-s3/src/inbox.rs);
 model `crates/model/tests/inbox.rs`.
 
+**Amendment (2026-11-17: an ended escalation does not move the lease)**:
+a link outage that has ended must not move the root's lease; real sustained
+demand still does, after the wanted grace. The harness (`delegate-partition`,
+under host load) showed the root handing its lease to a delegate whose inbox
+escalation had asked while the link was down. Three rules follow.
+- An escalation never asks over P2P. Its acquisition asks through S3 only
+  (`wanted_by`), which the holder honours after the wanted grace. A P2P
+  `LeaseRequest` is served at once, and the first thing heard on a healed
+  link was that ask, which the "holder reachable again" rule could not beat.
+- A `wanted_by` registration is withdrawn when the escalation ends (the demand
+  fell off, or the holder is reachable over P2P again), and only a name the
+  escalation itself registered. The withdrawal waits for its own registration
+  swap and for any acquisition in flight, skips when a new escalation began,
+  swaps on the tag it read (a renewal that wins makes it read again), and is
+  tried again with a backoff, a bounded number of times, when S3 fails. The
+  holder takes the body's `wanted_by` as it reads it and does not carry over a
+  name the body dropped.
+- A name an inbox batch gave (`wants_lease`, no S3 record) expires at half
+  the wanted grace (and no more than the escalation window) after the last
+  batch, with the grace it started. A single batch of a detour can then never
+  carry the grace to its end. The durable signal of sustained demand is the
+  body registration, which the escalation's acquisition renews at least every
+  `escalate_retry_ms`; a note that lapses between sparse batches cannot starve
+  a genuine wanter.
+
+Who holds the lease is still decided by CAS and TTL alone; none of this writes
+a holder field.
+See [DESIGN.md, leases are sticky](DESIGN.md#one-log-one-root-lease),
+[Forwarded mutations — the inbox](../reference/features/forwarded-mutations.md#the-inbox-forwarding-without-p2p),
+`crates/authority/src/core/inbox.rs` (`withdraw_wanted`, `noted_ttl`).
+
 ## ADR-25: Cluster locks are leased grants from the owning sequencer
 
 **Context**: `flock` and `fcntl` were node-local, so SQLite or any other

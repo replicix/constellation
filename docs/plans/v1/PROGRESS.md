@@ -70201,12 +70201,20 @@ Same rule, the other end. The S3 `wanted_by` registration an escalation leaves, 
 `wants_lease` batches, stayed on the holder's wanted list for the rest of its tenure (`renewed_unchecked` only added
 names), so a root could still hand its lease to the node about one wanted grace after a detour. Now (a) a requester whose
 escalation ended (demand fell off, or the holder reachable again) reads the lease and swaps it without its name
-(`Core::withdraw_wanted`: best effort, read again up to four times when a renewal wins the swap, not while an acquisition
-is in flight, nothing when the name is gone or the lease is its own); (b) the holder takes the body's `wanted_by` as it
-reads it (a name the body no longer lists is not carried over) and forgets a batch-named wanter once its batches have
-been absent for the longer of the escalation window and the wanted grace (`LeaseState::expire_noted`, run at the round's
-release check). Why both: the registration lives in the S3 lease body, which only its owner may edit, while the batch
-flag is a live signal with no S3 record, so a withdrawal write cannot reach it. A requester whose demand continues keeps
-both: its batches refresh the name and its registration is not withdrawn. Tests: `an_ended_escalation_takes_its_name_out_of_wanted_by`,
-`a_withdrawal_that_finds_no_name_swaps_nothing` (core), `a_withdrawn_wanted_by_name_is_forgotten_at_the_next_read`,
-`a_batch_named_wanter_lasts_only_while_its_batches_continue` (lease state).
+(`Core::withdraw_wanted`: only a name the escalation registered; it waits for its own registration swap and for any
+acquisition in flight; it reads again, up to four times, when a renewal wins the swap; it tries again after a backoff,
+four failures at most, when S3 fails, and warns when it gives up; it swaps nothing when a new escalation began, the name
+is gone, or the lease is its own); (b) the holder takes the body's `wanted_by` as it reads it (a name the body no longer
+lists is not carried over) and forgets a batch-named wanter half a wanted grace after its last batch (never more than the
+escalation window: `Core::noted_ttl`, `LeaseState::expire_noted`, run at the round's release check and before a new
+note), so one batch of a detour cannot carry the grace it started to its end (the first version kept a name for the
+longer of window and grace, which still moved the lease one grace after the first batch). Why both: the registration
+lives in the S3 lease body, which only its owner may edit, while the batch flag is a live signal with no S3 record, so a
+withdrawal write cannot reach it. A requester whose demand continues keeps the registration (the batches' names may lapse
+between sparse batches or polls; the registration is the durable signal, renewed by the acquisition at least every
+`escalate_retry_ms`). ADR-24's amendment records the rules. Tests: `an_ended_escalation_takes_its_name_out_of_wanted_by`,
+`a_withdrawal_that_finds_no_name_swaps_nothing`, `a_withdrawal_waits_for_the_registration_swap_in_flight`,
+`a_withdrawal_read_overtaken_by_a_new_escalation_swaps_nothing`, `a_withdrawal_that_failed_is_tried_again_and_gives_up`,
+`a_withdrawal_leaves_the_name_another_acquisition_wants`, `a_single_wants_lease_batch_does_not_move_the_lease_a_grace_later`
+(core), `a_withdrawn_wanted_by_name_is_forgotten_at_the_next_read`, `a_batch_named_wanter_lasts_only_while_its_batches_continue`,
+`one_batch_does_not_hand_the_lease_over_a_grace_later` (lease state).

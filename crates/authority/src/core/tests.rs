@@ -2309,13 +2309,9 @@ fn an_inbox_escalation_never_asks_the_holder_over_p2p() {
     );
 }
 
-/// The same rule, the other end: the escalation's registration in the
-/// lease's `wanted_by` stays on the holder's list for its whole tenure and
-/// hands the lease over after the wanted grace, long after the detour. A
-/// requester whose escalation ended (the demand fell off) reads the lease
-/// and swaps it without its name, and again when a renewal wins the swap.
-#[test]
-fn an_ended_escalation_takes_its_name_out_of_wanted_by() {
+/// The escalation ticks once, reads the live holder, and registers; the
+/// registration swap's op is returned unanswered.
+fn registered_escalation() -> (Harness, Lease, OpId) {
     let mut h = escalated_without_the_holder();
     let mut out = Vec::new();
     h.core.on_escalate_tick(h.clk(), &h.meta, &mut out);
@@ -2328,22 +2324,59 @@ fn an_ended_escalation_takes_its_name_out_of_wanted_by() {
         op: get,
         result: S3Result::LeaseGet(Ok(Some((live.clone(), tag())))),
     });
-    assert!(
-        s3_ops(&out).iter().any(|(_, op)| matches!(
-            op,
-            S3Op::LeaseSwap { lease, .. } if lease.wanted_by.contains(&2)
-        )),
-        "the escalation registers: {out:?}"
-    );
-    // The demand falls off (the window empties); the next tick withdraws.
+    let register = match s3_ops(&out)
+        .into_iter()
+        .find(|(_, op)| matches!(op, S3Op::LeaseSwap { lease, .. } if lease.wanted_by.contains(&2)))
+    {
+        Some((op, _)) => op,
+        None => panic!("the escalation registers: {out:?}"),
+    };
+    (h, live, register)
+}
+
+/// The registration swap landed.
+fn registration_lands(h: &mut Harness, register: OpId) {
+    h.step(Event::S3 {
+        op: register,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+}
+
+/// The demand falls off (the window empties).
+fn demand_falls(h: &mut Harness) {
     h.advance(h.core.cfg.escalate_window_ms + 1);
+}
+
+/// One escalate tick; its S3 operations.
+fn tick_ops(h: &mut Harness) -> Vec<(OpId, S3Op)> {
     let mut out = Vec::new();
     h.core.on_escalate_tick(h.clk(), &h.meta, &mut out);
+    s3_ops(&out)
+        .into_iter()
+        .map(|(op, req)| (op, req.clone()))
+        .collect()
+}
+
+fn lone_get(ops: &[(OpId, S3Op)]) -> OpId {
+    match ops {
+        [(op, S3Op::LeaseGet)] => *op,
+        other => panic!("expected the lease read: {other:?}"),
+    }
+}
+
+/// The same rule, the other end: the escalation's registration in the
+/// lease's `wanted_by` stays on the holder's list for its whole tenure and
+/// hands the lease over after the wanted grace, long after the detour. A
+/// requester whose escalation ended (the demand fell off) reads the lease
+/// and swaps it without its name, and again when a renewal wins the swap.
+#[test]
+fn an_ended_escalation_takes_its_name_out_of_wanted_by() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let ops = tick_ops(&mut h);
     assert!(!h.core.escalated(h.clk()), "the demand fell off");
-    let get = match s3_ops(&out)[..] {
-        [(op, S3Op::LeaseGet)] => op,
-        ref other => panic!("expected the withdrawing read: {other:?}"),
-    };
+    let get = lone_get(&ops);
     let registered = live.wanting(2);
     let out = h.step(Event::S3 {
         op: get,
@@ -2370,46 +2403,184 @@ fn an_ended_escalation_takes_its_name_out_of_wanted_by() {
         op: get,
         result: S3Result::LeaseGet(Ok(Some((registered, tag())))),
     });
-    assert!(
-        matches!(s3_ops(&out)[..], [(_, S3Op::LeaseSwap { .. })]),
-        "{out:?}"
-    );
+    let swap = match s3_ops(&out)[..] {
+        [(op, S3Op::LeaseSwap { .. })] => op,
+        ref other => panic!("{other:?}"),
+    };
+    h.step(Event::S3 {
+        op: swap,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
     // Only once: a later tick asks nothing.
-    let mut out = Vec::new();
     h.advance(1_000);
-    h.core.on_escalate_tick(h.clk(), &h.meta, &mut out);
-    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    assert!(tick_ops(&mut h).is_empty());
 }
 
 /// A node that never registered, or whose lease is its own, has nothing to
 /// withdraw: a read that finds its name absent swaps nothing.
 #[test]
 fn a_withdrawal_that_finds_no_name_swaps_nothing() {
-    let mut h = escalated_without_the_holder();
-    let mut out = Vec::new();
-    h.core.on_escalate_tick(h.clk(), &h.meta, &mut out);
-    let get = match s3_ops(&out)[..] {
-        [(op, S3Op::LeaseGet)] => op,
-        ref other => panic!("{other:?}"),
-    };
-    let live = lease_of(1, 1, h.now.plus(10_000).0);
-    h.step(Event::S3 {
-        op: get,
-        result: S3Result::LeaseGet(Ok(Some((live.clone(), tag())))),
-    });
-    h.advance(h.core.cfg.escalate_window_ms + 1);
-    let mut out = Vec::new();
-    h.core.on_escalate_tick(h.clk(), &h.meta, &mut out);
-    let get = match s3_ops(&out)[..] {
-        [(op, S3Op::LeaseGet)] => op,
-        ref other => panic!("{other:?}"),
-    };
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let get = lone_get(&tick_ops(&mut h));
     // Already gone (a renewal's body without it).
     let out = h.step(Event::S3 {
         op: get,
         result: S3Result::LeaseGet(Ok(Some((live, tag())))),
     });
     assert!(s3_ops(&out).is_empty(), "{out:?}");
+    h.advance(1_000);
+    assert!(tick_ops(&mut h).is_empty(), "and it is not tried again");
+}
+
+/// The registration swap is a fire-and-forget op that outlives the
+/// acquisition job. A withdrawal whose read is answered before the swap
+/// lands finds no name, and the swap landing later leaves the name for the
+/// holder's whole tenure: the withdrawal waits for its own registration.
+#[test]
+fn a_withdrawal_waits_for_the_registration_swap_in_flight() {
+    let (mut h, _live, register) = registered_escalation();
+    demand_falls(&mut h);
+    for _ in 0..4 {
+        assert!(tick_ops(&mut h).is_empty(), "the swap is still out");
+        h.advance(300);
+    }
+    registration_lands(&mut h, register);
+    h.advance(300);
+    lone_get(&tick_ops(&mut h));
+}
+
+/// A read of the withdrawal that is answered after a new escalation began
+/// (its registration may be the one the read shows, or not yet) swaps
+/// nothing: the new escalation's end withdraws.
+#[test]
+fn a_withdrawal_read_overtaken_by_a_new_escalation_swaps_nothing() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let get = lone_get(&tick_ops(&mut h));
+    // The demand returns while the read is out.
+    for _ in 0..h.core.cfg.escalate_ops {
+        h.advance(10);
+        h.core.note_inbox_op(h.clk(), 50);
+    }
+    assert!(h.core.escalated(h.clk()));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .all(|(_, op)| !matches!(op, S3Op::LeaseSwap { .. })),
+        "the live registration was withdrawn: {out:?}"
+    );
+    // That escalation ends too: the name is still the node's to withdraw.
+    demand_falls(&mut h);
+    h.advance(1_000);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    assert!(
+        matches!(s3_ops(&out)[..], [(_, S3Op::LeaseSwap { .. })]),
+        "{out:?}"
+    );
+}
+
+/// A read or a swap of the withdrawal that failed (an S3 error, a timeout
+/// that may or may not have landed) is tried again after a backoff, a
+/// bounded number of times.
+#[test]
+fn a_withdrawal_that_failed_is_tried_again_and_gives_up() {
+    use crate::event::{CasFailure, S3Failure};
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let registered = live.wanting(2);
+    // A read error.
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Err(S3Failure("timeout".into()))),
+    });
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    assert!(tick_ops(&mut h).is_empty(), "inside the backoff");
+    h.advance(600);
+    let get = lone_get(&tick_ops(&mut h));
+    // A swap in doubt (it may have landed): read again, after a backoff.
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((registered.clone(), tag())))),
+    });
+    let swap = match s3_ops(&out)[..] {
+        [(op, S3Op::LeaseSwap { .. })] => op,
+        ref other => panic!("{other:?}"),
+    };
+    h.step(Event::S3 {
+        op: swap,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timeout".into()))),
+    });
+    assert!(tick_ops(&mut h).is_empty(), "inside the backoff");
+    // It keeps failing until the budget is spent.
+    let mut tries = 0;
+    for _ in 0..20 {
+        h.advance(9_000);
+        let ops = tick_ops(&mut h);
+        if ops.is_empty() {
+            break;
+        }
+        tries += 1;
+        h.step(Event::S3 {
+            op: lone_get(&ops),
+            result: S3Result::LeaseGet(Err(S3Failure("down".into()))),
+        });
+    }
+    assert!((1..5).contains(&tries), "{tries} further tries");
+    h.advance(60_000);
+    assert!(tick_ops(&mut h).is_empty(), "it gave up");
+}
+
+/// An escalation's end withdraws only a registration the escalation made:
+/// another acquisition of the node that wants the lease too (an explicit
+/// one) keeps the name.
+#[test]
+fn a_withdrawal_leaves_the_name_another_acquisition_wants() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    // An acquisition of another reason reads the lease and finds the
+    // holder live, with this node's name already listed.
+    let mut out = Vec::new();
+    h.core.enqueue_job(
+        h.clk(),
+        super::jobs::JobReq::Acquire {
+            reason: "fuse-acquire",
+            ask_handoff: false,
+        },
+        &h.meta,
+        &mut out,
+    );
+    let get = lone_get(
+        &s3_ops(&out)
+            .into_iter()
+            .map(|(op, req)| (op, req.clone()))
+            .collect::<Vec<_>>(),
+    );
+    h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    demand_falls(&mut h);
+    for _ in 0..3 {
+        let ops = tick_ops(&mut h);
+        assert!(
+            ops.iter().all(|(_, op)| !matches!(op, S3Op::LeaseGet)),
+            "the escalation withdrew a name another acquisition wants: {ops:?}"
+        );
+        h.advance(300);
+    }
 }
 
 /// What [`drive_job`] saw.
@@ -37886,64 +38057,67 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
     );
     assert_eq!(h.core.stats.deleg_executed, 2);
 }
+/// Node 1's peers 2..=4, those in `connected` linked.
+fn links(h: &mut Harness, connected: &[NodeId]) {
+    h.step(Event::Peers {
+        registry_complete: true,
+        links: (2..=4)
+            .map(|node| crate::event::PeerLink {
+                node,
+                connected: connected.contains(&node),
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            })
+            .collect(),
+        lapses: 0,
+    });
+}
+
+/// Run one round from the poll timer; whether it released the lease.
+fn round_releases(h: &mut Harness) -> bool {
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let Some(poll) = timers(&out, TimerKind::Poll).first().copied() else {
+        return false;
+    };
+    let mut out = h.step(Event::Timer { id: poll });
+    for _ in 0..8 {
+        if let Some(op) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op,
+                result: UploadResult::Done { held: 0 },
+            });
+            continue;
+        }
+        let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
+            .into_iter()
+            .map(|(op, req)| (op, req.clone()))
+            .collect();
+        match ops.as_slice() {
+            [(_, S3Op::LeaseSwap { lease, .. })] if lease.released => return true,
+            // The round renews first.
+            [(op, S3Op::LeaseSwap { .. })] => {
+                out = h.step(Event::S3 {
+                    op: *op,
+                    result: S3Result::LeasePut(Ok(tag())),
+                });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// EC2 finding 2: a holder whose wanter is across a P2P partition from
 /// the nodes using the lease keeps it (the wanter is served through the
 /// inbox); with no P2P demand of its own side — an isolated holder, or
 /// M13's no-P2P shape — it hands over after the wanted grace as before.
 #[test]
 fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
-    fn links(h: &mut Harness, connected: &[NodeId]) {
-        h.step(Event::Peers {
-            registry_complete: true,
-            links: (2..=4)
-                .map(|node| crate::event::PeerLink {
-                    node,
-                    connected: connected.contains(&node),
-                    last_seen: None,
-                    rtt_ms: None,
-                    since: None,
-                })
-                .collect(),
-            lapses: 0,
-        });
-    }
-    /// Run one round from the poll timer; whether it released the lease.
-    fn round_releases(h: &mut Harness) -> bool {
-        let mut out = Vec::new();
-        h.core.start(h.clk(), &h.meta, &mut out);
-        let Some(poll) = timers(&out, TimerKind::Poll).first().copied() else {
-            return false;
-        };
-        let mut out = h.step(Event::Timer { id: poll });
-        for _ in 0..8 {
-            if let Some(op) = out.iter().find_map(|a| match a {
-                Action::UploadDirtyChunks { op, .. } => Some(*op),
-                _ => None,
-            }) {
-                out = h.step(Event::UploadsDone {
-                    op,
-                    result: UploadResult::Done { held: 0 },
-                });
-                continue;
-            }
-            let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
-                .into_iter()
-                .map(|(op, req)| (op, req.clone()))
-                .collect();
-            match ops.as_slice() {
-                [(_, S3Op::LeaseSwap { lease, .. })] if lease.released => return true,
-                // The round renews first.
-                [(op, S3Op::LeaseSwap { .. })] => {
-                    out = h.step(Event::S3 {
-                        op: *op,
-                        result: S3Result::LeasePut(Ok(tag())),
-                    });
-                }
-                _ => return false,
-            }
-        }
-        false
-    }
     for (case, connected, p2p_users, keep) in [
         // Node 4 is cut off; 2 and 3 forward to us over P2P: keep.
         ("majority holder", &[2, 3][..], &[2, 3][..], true),
@@ -37961,19 +38135,64 @@ fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
         // Past the dwell; the wanters asked (inbox batches with
         // `wants_lease`), and the near side forwarded, within the window.
         h.advance(6_000);
+        for u in p2p_users {
+            h.core.note_demand(h.clk(), *u, true);
+        }
+        // The wanters' batches keep coming for the whole grace (a batch
+        // lapses after half of it), as a sustained demand's do.
+        let ttl = h.core.noted_ttl();
+        let until = h.core.config().wanted_grace_ms + 100;
+        for _ in 0..until.div_ceil(ttl) {
+            for w in &wanters {
+                h.core.note_demand(h.clk(), *w, false);
+                h.core.lease.note_wanted(h.clk(), *w, ttl);
+            }
+            h.advance(ttl);
+        }
         for w in &wanters {
             h.core.note_demand(h.clk(), *w, false);
-            h.core.lease.note_wanted(h.clk(), *w);
+            h.core.lease.note_wanted(h.clk(), *w, ttl);
         }
         for u in p2p_users {
             h.core.note_demand(h.clk(), *u, true);
         }
-        h.advance(h.core.config().wanted_grace_ms + 100);
         let released = round_releases(&mut h);
         assert_eq!(!released, keep, "{case}: released {released}");
         if keep {
             assert!(h.core.stats.leases_kept_for_p2p_side > 0, "{case}");
         }
+    }
+}
+
+/// Harness `delegate-partition`: a detour put one batch with `wants_lease`
+/// in the root's inbox and ended. The root must not hand the lease to the
+/// node one wanted grace after that batch: a batch's name lapses at half the
+/// grace, with the grace it started. Sustained batches still hand over.
+#[test]
+fn a_single_wants_lease_batch_does_not_move_the_lease_a_grace_later() {
+    for (sustained, moves) in [(false, false), (true, true)] {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        links(&mut h, &[]);
+        // Past the dwell.
+        h.advance(6_000);
+        let ttl = h.core.noted_ttl();
+        let grace = h.core.config().wanted_grace_ms;
+        assert!(ttl < grace, "the ttl {ttl} is below the grace {grace}");
+        h.core.note_demand(h.clk(), 2, false);
+        h.core.lease.note_wanted(h.clk(), 2, ttl);
+        // A little past the first note plus the grace, in steps; sustained
+        // demand keeps sending batches.
+        let step = ttl / 2;
+        for _ in 0..(grace + 100).div_ceil(step) {
+            h.advance(step);
+            if sustained {
+                h.core.note_demand(h.clk(), 2, false);
+                h.core.lease.note_wanted(h.clk(), 2, ttl);
+            }
+        }
+        let released = round_releases(&mut h);
+        assert_eq!(released, moves, "sustained batches: {sustained}");
     }
 }
 

@@ -3028,9 +3028,8 @@ impl Core {
             self.release_after_atime(now, replica, out);
             return;
         }
-        // A wanter whose batches stopped no longer wants it (the window of
-        // `keeps_lease_for_p2p_side`).
-        let note_ttl = self.cfg.escalate_window_ms.max(self.cfg.wanted_grace_ms);
+        // A wanter whose batches stopped no longer wants it (`noted_ttl`).
+        let note_ttl = self.noted_ttl();
         self.lease.expire_noted(now, note_ttl);
         if self.lease.held.is_none() || self.lease.lost || !self.lease.wants_handoff(now, &self.cfg)
         {
@@ -3829,6 +3828,13 @@ impl Core {
                         ..
                     }
                 );
+                let escalating = matches!(
+                    &self.job.as_ref().expect("job").what,
+                    What::Acquire {
+                        reason: "inbox-escalation",
+                        ..
+                    }
+                );
                 // Plan 31 C8: a forward-only node never asks a live
                 // holder for the lease — a registration would make it
                 // hand over (`wants_handoff`).
@@ -3844,9 +3850,17 @@ impl Core {
                             lease: prev.wanting(self.cfg.node_id),
                             tag,
                         },
-                        S3For::RegisterWanted,
+                        S3For::RegisterWanted {
+                            escalation: escalating,
+                        },
                         out,
                     );
+                    self.inbox.note_registering(escalating);
+                } else if !escalating && !offered {
+                    // Another acquisition of this node wants the lease (or
+                    // found its name listed): the name is no longer only
+                    // an escalation's to withdraw.
+                    self.inbox.disown_wanted();
                 }
                 let (ask, attempts) = match &self.job.as_ref().expect("job").what {
                     What::Acquire {

@@ -493,9 +493,14 @@ stops two competing writers ping-ponging a partition).
 
 A requester registers itself by appending its node id to the `wanted_by`
 list on the lease object with a single `If-Match` swap, which the holder
-picks up at its next renewal (at most half a TTL away). This path needs
-conditional writes, so it applies to `s3://` backends only; over P2P, a
-direct `HandOff` request is the fast path and needs none of it.
+picks up at its next renewal (at most half a TTL away). The requester
+takes its name out again when the demand that registered it ends (an inbox
+escalation that fell off, or whose holder is reachable over P2P again), so a
+holder does not hand the lease over for a demand that is gone; a name an
+inbox batch gave expires at half the wanted grace after the last batch. This
+path needs conditional writes, so it applies to `s3://` backends only. An
+inbox escalation always uses it, never a P2P ask; other requests over P2P
+use a direct `HandOff` request as the fast path and need none of it.
 
 The worst case is unchanged by stickiness — a requester waits out the
 same idle window it used to, or the same TTL against a genuinely busy

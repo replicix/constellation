@@ -2553,8 +2553,12 @@ pub(crate) enum S3For {
     LearnHolder(Rid),
     /// A holder-side `NotHolder` answer refreshing the cached holder.
     RefreshHolder,
-    /// A `Busy` acquisition registering `wanted_by` (result ignored).
-    RegisterWanted,
+    /// A `Busy` acquisition registering `wanted_by` (result ignored, but
+    /// an escalation's registration is tracked until it lands: the
+    /// withdrawal waits for it).
+    RegisterWanted {
+        escalation: bool,
+    },
     /// An escalation that ended reading the lease to take its name out of
     /// `wanted_by` (`Core::withdraw_wanted`); the count is the CAS retries
     /// left.
@@ -4218,9 +4222,13 @@ impl Core {
                     self.lease.note_object(&lease);
                 }
             }
-            S3For::RegisterWanted => {}
-            S3For::WithdrawWantedGet(left) => self.on_withdraw_wanted_read(left, result, out),
-            S3For::WithdrawWantedSwap(left) => self.on_withdraw_wanted_swap(left, result, out),
+            S3For::RegisterWanted { escalation } => {
+                if escalation {
+                    self.inbox.wanted_registered();
+                }
+            }
+            S3For::WithdrawWantedGet(left) => self.on_withdraw_wanted_read(now, left, result, out),
+            S3For::WithdrawWantedSwap(left) => self.on_withdraw_wanted_swap(now, left, result, out),
             S3For::InboxPut => self.on_inbox_put(now, result, replica, out),
             S3For::InboxLastN => self.on_inbox_last_n(now, result, replica, out),
             S3For::InboxPoll(node) => self.on_inbox_polled(now, node, op, result, replica, out),

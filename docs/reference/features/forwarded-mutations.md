@@ -756,12 +756,14 @@ regime a node is in. An escalation asks through S3 only (`wanted_by`), never wit
 lease request, which the holder serves at once. It is dropped if the holder
 becomes reachable over P2P again, and when it ends (that, or the demand
 falling off) the requester takes its name out of `wanted_by` (a read of the
-lease and a swap, retried when a renewal wins it), because the holder keeps
-a name for its whole tenure and would hand the lease over after the wanted
-grace for a demand that is gone. The holder in turn forgets a requester
-whose batches carry `wants_lease` no more once they have been absent for the
-longer of the escalation window and the wanted grace. Real sustained demand
-keeps both alive: its batches keep naming it and its registration stays. Before an op that went into the inbox is
+lease and a swap, read again when a renewal wins it, tried again after a
+backoff when S3 fails), because the holder keeps a name for its whole tenure
+and would hand the lease over after the wanted grace for a demand that is
+gone. It withdraws only a name the escalation registered. The holder in turn
+forgets a requester whose batches carry `wants_lease` no more once they have
+been absent for half the wanted grace (never more than the escalation window).
+Real sustained demand still moves the lease after the grace: its registration
+stays in `wanted_by` until the escalation ends. Before an op that went into the inbox is
 forwarded over a P2P path that came back (or held back because a
 dependency was lost), the requester withdraws its own batch, so the op
 is not executed through both paths out of order; the rid dedups either

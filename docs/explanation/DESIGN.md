@@ -780,7 +780,11 @@ delegations over the one log instead, below.)
   write-rate-weighted medoid of the writers
   ([ADR-15](DECISIONS.md#adr-15-holder-driven-placement-no-election),
   [Lease placement](../reference/features/lease-placement.md)); since
-  plan 30, placing subtrees on their writers (below) matters more.
+  plan 30, placing subtrees on their writers (below) matters more. A name
+  in `wanted_by` is withdrawn by its owner when the escalation that
+  registered it ends, and a name an inbox batch gave expires at half the
+  wanted grace: a link outage that has ended does not move the lease
+  ([ADR-24's amendment](DECISIONS.md#adr-24-the-hybrid-s3-inbox-for-writes-without-a-p2p-path)).
 - **Acquire and takeover.** A node acquires the lease by CAS (create, or
   swap an expired or released object), tails the log to head, ships an
   epoch marker at the next slot (which fences the old epoch in the log),
@@ -1461,8 +1465,10 @@ with a stale table is redirected (`NotHolder`, at most two hops).
 If the owner does not answer, the requester retries the same rid (§4),
 then goes through the S3 inbox if it has no P2P path to the holder, or
 the lease path if it does. The lease path is the one mechanism that works
-with nothing but S3: the requester registers in `wanted_by`, and the
-holder releases (§4) or its lease expires and the requester takes it by
+with nothing but S3: the requester registers in `wanted_by` (never asking
+over P2P, and withdrawing the name when its escalation ends: [ADR-24's
+amendment](DECISIONS.md#adr-24-the-hybrid-s3-inbox-for-writes-without-a-p2p-path)),
+and the holder releases (§4) or its lease expires and the requester takes it by
 CAS. `CONSTELLATION_FORWARD=off` restores writer-follows-lease for every
 write.
 

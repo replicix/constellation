@@ -793,10 +793,15 @@ impl LeaseState {
     /// A requester's inbox batch said it wants the lease (M13, M5): the
     /// same as finding it in `wanted_by` at a renewal, learned at the
     /// next poll instead of the next half-TTL.
-    pub fn note_wanted(&mut self, now: Now, node: NodeId) {
+    ///
+    /// Names whose batches stopped `ttl_ms` ago are forgotten first
+    /// (`expire_noted`), so a note that comes after a gap starts a fresh
+    /// grace instead of inheriting the one the lapsed note started.
+    pub fn note_wanted(&mut self, now: Now, node: NodeId, ttl_ms: u64) {
         if node == 0 || self.held.is_none() {
             return;
         }
+        self.expire_noted(now, ttl_ms);
         match self.wanted_noted.iter_mut().find(|(n, _)| *n == node) {
             Some((_, at)) => *at = now.wait,
             None => self.wanted_noted.push((node, now.wait)),
@@ -812,13 +817,15 @@ impl LeaseState {
 
     /// Forget the batch-named wanters that have not named themselves for
     /// `ttl_ms` (a requester whose demand ended sends no more batches),
-    /// and so the grace they started. A name the held lease body lists
-    /// stays: only its owner's withdrawal (`Core::withdraw_wanted`) removes
-    /// it.
+    /// and so the grace they started (`rebuild_wanted` restarts it when
+    /// nobody is left; the grace is of the set, not of a name). A name the
+    /// held lease body lists stays: only its owner's withdrawal
+    /// (`Core::withdraw_wanted`) removes it.
     pub fn expire_noted(&mut self, now: Now, ttl_ms: u64) {
         let before = self.wanted_noted.len();
+        let ttl = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
         self.wanted_noted
-            .retain(|(_, at)| now.wait.since(*at) <= ttl_ms as i64);
+            .retain(|(_, at)| now.wait.since(*at) <= ttl);
         if self.wanted_noted.len() != before {
             self.rebuild_wanted(now);
         }
@@ -2096,16 +2103,17 @@ mod tests {
         let mut cfg = cfg();
         cfg.dwell_ms = 1_000;
         cfg.idle_release_ms = 600_000;
-        cfg.wanted_grace_ms = 2_000;
-        let ttl = 10_000;
+        cfg.wanted_grace_ms = 4_000;
+        let ttl = 2_000;
         let t0 = Now::same(1_000_000);
         let mut st = LeaseState::default();
         let lease = st.granted_lease(t0, &cfg, None, false, false);
         st.adopt(t0, lease.clone(), tag(), None);
-        // Sustained demand: a batch every second keeps it.
+        // Sustained demand: a batch every second keeps it, and the grace
+        // runs from the first.
         for k in 0..20u64 {
             let at = t0.plus(1_000 * k);
-            st.note_wanted(at, 9);
+            st.note_wanted(at, 9, ttl);
             st.expire_noted(at, ttl);
             st.renewed(at, lease.clone(), tag());
         }
@@ -2123,5 +2131,45 @@ mod tests {
         st.renewed(stop.plus(ttl + 6_000), lease.wanting(9), tag());
         st.expire_noted(stop.plus(ttl + 7_000), ttl);
         assert_eq!(st.wanted, vec![9]);
+    }
+
+    /// A detour that sent one batch (and withdrew its registration) must
+    /// not move the lease one grace after the batch: the name lapses at
+    /// half the grace (`Core::noted_ttl`), with the grace it started, and
+    /// a later note starts a fresh one.
+    #[test]
+    fn one_batch_does_not_hand_the_lease_over_a_grace_later() {
+        let mut cfg = cfg();
+        cfg.dwell_ms = 1_000;
+        cfg.idle_release_ms = 600_000;
+        cfg.wanted_grace_ms = 4_000;
+        let ttl = cfg.wanted_grace_ms / 2;
+        let t0 = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let lease = st.granted_lease(t0, &cfg, None, false, false);
+        st.adopt(t0, lease.clone(), tag(), None);
+        let first = t0.plus(1_500);
+        st.note_wanted(first, 9, ttl);
+        // The round's order: expire, then ask.
+        for after in [ttl + 1, cfg.wanted_grace_ms + 1, 60_000] {
+            let at = first.plus(after);
+            st.expire_noted(at, ttl);
+            assert!(!st.wants_handoff(at, &cfg), "{after} ms after the batch");
+        }
+        assert!(st.wanted.is_empty() && st.wanted_since.is_none());
+        // The name came back alone (a new detour) long after: the grace is
+        // its own, not the lapsed note's.
+        let again = first.plus(60_000);
+        st.note_wanted(again, 9, ttl);
+        st.expire_noted(again.plus(cfg.wanted_grace_ms - 1), ttl);
+        assert!(!st.wants_handoff(again.plus(cfg.wanted_grace_ms - 1), &cfg));
+        // A note that finds its predecessor lapsed without a round having
+        // expired it starts afresh too.
+        let mut st = LeaseState::default();
+        st.adopt(t0, lease, tag(), None);
+        st.note_wanted(first, 9, ttl);
+        let late = first.plus(ttl + 5);
+        st.note_wanted(late, 9, ttl);
+        assert_eq!(st.wanted_since, Some(late.wait));
     }
 }
