@@ -946,7 +946,7 @@ impl Core {
 
     // ----------------------------------------------------- escalation
 
-    fn note_inbox_op(&mut self, now: Now, round_trip_ms: u64) {
+    pub(crate) fn note_inbox_op(&mut self, now: Now, round_trip_ms: u64) {
         self.inbox.window.push_back((now.wait, round_trip_ms));
         self.evaluate_escalation(now);
     }
@@ -1013,6 +1013,7 @@ impl Core {
     /// ordinary acquisition (which registers `wanted_by`), backing off
     /// from 100 ms doubling to `escalate_retry_ms`; ops keep going
     /// through the inbox meanwhile, and the batches carry `wants_lease`.
+    /// The ask is never made over P2P: see the acquisition below.
     pub(crate) fn on_escalate_tick(
         &mut self,
         now: Now,
@@ -1054,11 +1055,26 @@ impl Core {
                 self.inbox.escalate_last_request = Some(now.wait);
                 self.inbox.escalate_attempts = self.inbox.escalate_attempts.saturating_add(1);
                 self.stats.inbox_lease_requests += 1;
+                // S3 only (`wanted_by`, which the holder honours after the
+                // wanted grace), never a P2P `LeaseRequest`, which the
+                // holder serves at once. With P2P on, this node took the
+                // inbox only because the holder was out of its reach over
+                // P2P (`reaches`, checked above); a P2P ask that is
+                // answered proves the outage over, the end of the demand
+                // by the rule above, so a handoff it won moved the lease
+                // for nothing. The check above cannot close that race: a
+                // healed link stays marked down until something is heard
+                // on it, and the ask itself was the first thing heard
+                // (harness `delegate-partition` at host load 55: the
+                // first ask after the heal took the pinned root's lease
+                // 0.5 s after the escalation, inside the 600 s wanted
+                // grace the scenario pins the root with). With P2P off
+                // there was no P2P ask to begin with.
                 self.enqueue_job(
                     now,
                     super::jobs::JobReq::Acquire {
                         reason: "inbox-escalation",
-                        ask_handoff: self.cfg.p2p,
+                        ask_handoff: false,
                     },
                     replica,
                     out,

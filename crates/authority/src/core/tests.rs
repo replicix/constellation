@@ -2228,6 +2228,75 @@ fn a_single_writer_holder_never_hands_the_lease_over() {
     }
 }
 
+/// Harness `delegate-partition` under host load (55): the delegate's
+/// writes went through the root's S3 inbox while its P2P link to the root
+/// was cut, and escalated. The escalator's acquisitions asked the root
+/// over P2P; the first one after the heal was answered before anything
+/// else had marked the link up (`reaches` still said "out of reach"), and
+/// the root, which serves a P2P handoff at once, handed its lease over
+/// inside the wanted grace that pins it. An inbox escalation asks through
+/// S3 only (`wanted_by`): it never sends a `LeaseRequest`.
+#[test]
+fn an_inbox_escalation_never_asks_the_holder_over_p2p() {
+    let mut h = Harness::new(2);
+    assert!(h.core.cfg.p2p, "the P2P case");
+    // The holder (node 1) is in the peer directory and out of reach: a
+    // transport failure longer than the grace ago, nothing heard since.
+    h.step(Event::Peers {
+        registry_complete: true,
+        links: [1, 3, 4]
+            .into_iter()
+            .map(|node| crate::event::PeerLink {
+                node,
+                connected: false,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            })
+            .collect(),
+        lapses: 0,
+    });
+    h.core.lease.cached_holder = Some(1);
+    h.core.note_p2p_result(h.clk(), 1, false);
+    h.advance(h.core.cfg.inbox_p2p_grace_ms + 1);
+    assert!(!h.core.reaches(h.clk(), 1), "the holder is out of reach");
+    // Sustained inbox demand.
+    for _ in 0..h.core.cfg.escalate_ops {
+        h.advance(10);
+        h.core.note_inbox_op(h.clk(), 50);
+    }
+    assert!(h.core.escalated(h.clk()), "the demand escalated");
+    // The tick asks: an acquisition, which reads the lease first.
+    let mut out = Vec::new();
+    h.core.on_escalate_tick(h.clk(), &h.meta, &mut out);
+    assert_eq!(h.core.stats.inbox_lease_requests, 1, "{out:?}");
+    let get = match s3_ops(&out)[..] {
+        [(op, S3Op::LeaseGet)] => op,
+        ref other => panic!("expected the lease read: {other:?}"),
+    };
+    assert!(sends(&out).is_empty(), "{out:?}");
+    // The read finds the holder live: the escalation registers in
+    // `wanted_by` and asks nothing over P2P.
+    let live = lease_of(1, 1, h.now.plus(10_000).0);
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live, tag())))),
+    });
+    assert!(
+        s3_ops(&out).iter().any(|(_, op)| matches!(
+            op,
+            S3Op::LeaseSwap { lease, .. } if lease.holder == 1 && lease.wanted_by.contains(&2)
+        )),
+        "the escalation registers in wanted_by: {out:?}"
+    );
+    assert!(
+        !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::LeaseRequest { .. })),
+        "an inbox escalation asked the holder over P2P: {out:?}"
+    );
+}
+
 /// What [`drive_job`] saw.
 #[derive(Default)]
 struct Driven {
