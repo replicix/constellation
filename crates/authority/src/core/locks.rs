@@ -7271,7 +7271,13 @@ impl Core {
                     }
                     continue;
                 }
-                g.settled &= first || self.deleg_parked_for(&keys, gen, replica);
+                // (A subtree a non-stealable stream waits the handoff for
+                // is honoured for ops, yet nothing here served the inode
+                // before: as settled as one a stealable stream has parked.
+                // This install runs before the answer lets the locks in.)
+                g.settled &= first
+                    || self.deleg_parked_for(&keys, gen, replica)
+                    || self.deleg_lock_waits(g.ino, gen, replica);
                 self.lk.moved_seen.entry(gen).or_default().insert(g.id);
                 if let Some(d) = self.lk.deferred.get_mut(&gen) {
                     d.remove(&g.id);
@@ -7356,6 +7362,7 @@ impl Core {
                 continue;
             }
             g.settled &= self.deleg_parked_for(&keys, gen, replica)
+                || self.deleg_lock_waits(g.ino, gen, replica)
                 || promoted.iter().any(|dir| replica.is_under(g.ino, *dir));
             if replica.locks().install_if_consistent(g, now.wait) {
                 self.stats.lock_moved += 1;

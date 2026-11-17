@@ -70174,3 +70174,15 @@ after a request timeout. Tests in `locks` (`a_new_sticky_stream_grants_no_lock_b
 `a_subtree_a_sticky_stream_grew_by_grants_no_lock_before_the_roots_handoff`, `a_refused_sticky_stream_renews_again`) and
 `root_own_sticky::a_grant_of_the_roots_own_released_stream_stays_in_its_table`, each failing on the parent; sim pins
 seeds 260, 177, 15 (`-nocrash`), 513 and 1404. Both labels: 0 of 2000 failing. Not yet on a must-pass list.
+
+Review of the above: the bound a `lock_wait` (and a stealable stream's `grown`) entry waits for was the newer of the
+last granted renewal and the one in flight, so a renewal that had timed out (kept in `late`, its answer still used) did
+not count: its granting answer, computed by the root before it handed the grown subtree's grants over, let the locks
+in (the same double grant as seed 260). The bound now includes the newest such renewal (`Core::deleg_sync_growth`).
+A handoff grant on a subtree a non-stealable stream waits the handoff for stays settled, as one on a parked subtree
+of a stealable stream does. Pins: `a_late_granting_answer_computed_before_the_grow_lets_no_lock_in` and the
+end-to-end answers that must not count (`answers_that_do_not_count_leave_a_grown_subtrees_locks_waiting`,
+`an_answer_to_a_renewal_in_flight_at_the_grow_lets_no_lock_in`,
+`a_lost_granting_answer_is_followed_by_one_that_carries_the_handoff`,
+`a_new_sticky_stream_is_served_by_the_root_that_follows_a_refusal`), and the partial release of the root's own
+stream (`a_partial_release_of_the_roots_own_stream_keeps_its_grants_once`).

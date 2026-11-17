@@ -748,11 +748,14 @@ pub(crate) struct DelegateState {
     /// counts; it carries the lock handoff and has waited for the read
     /// delegations under the new subtree).
     pub grown: BTreeMap<Ino, Option<HonourMs>>,
-    /// Subtrees a non-stealable stream grew by that it honours for its ops
-    /// (at the commit, without a renewal) but grants no lock in yet: the
-    /// root moved its grants there to the stream's handoff, which comes with
-    /// a granting answer to a renewal sent after the time kept here
-    /// ([`Core::deleg_unpark_grown`]). Granting before it, the delegate did
+    /// Subtrees a non-stealable stream honours for its ops but grants no
+    /// lock in yet: those it grew by (honoured at the commit, without a
+    /// renewal) and, from its install, every subtree of a new stream (the
+    /// time kept is just before the install). The root moved its grants
+    /// there to the stream's handoff, which comes with a granting answer to
+    /// a renewal sent after the time kept here
+    /// ([`Core::deleg_unpark_grown`]); a renewal that timed out and sits in
+    /// `late` counts as sent before it. Granting before it, the delegate did
     /// not know the grants the root had made there (sim
     /// `locks-root-own-unlinked-partition-nocrash` seed 260: a handover of the
     /// root's own sticky `d1` grew node 2's sticky stream, and node 2 granted
@@ -2020,10 +2023,12 @@ impl Core {
         // What the batch that carried the note does, in its order
         // (`on_delegate_stream`). First the lock grants the release took out
         // of the table (`lock_hand_back`): this root's table is the holder's,
-        // so they are nowhere else, and the generation is still inside its
-        // window. The refused batch never installed them, and no batch
+        // so they stayed in it, re-tagged as the root's (gen 0), and the
+        // generation is still inside its window. The install is for what
+        // the note adds to them: the carried end (never shortened) and the
+        // floor. The refused batch never installed them, and no batch
         // carries the note again (its rows left the journal): skipped, the
-        // grants were lost while their holders still held them.
+        // end and the carry would be lost.
         self.lock_install_returned(now, gen, note.locks.clone(), &note.dirs, replica);
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.cursor = replica.stream_fills_past(gen, row);
@@ -3426,9 +3431,21 @@ impl Core {
         let mut promoted = 0u64;
         // Only a renewal sent after this point counts: not one in flight,
         // nor one answered or sent by the lane already.
+        // A renewal that timed out waits in `late` for an answer that is
+        // still used: it was sent before this point too (it is the newest
+        // wait bound a late granting answer must exceed).
+        let late_sent = self
+            .dl
+            .late
+            .values()
+            .filter(|l| l.gen == gen && l.kind == ReqKind::Renew)
+            .map(|l| l.sent)
+            .max()
+            .unwrap_or(HonourMs(-1));
         let after = d
             .last_renew_sent
-            .max(d.renew.map_or(HonourMs(-1), |(_, sent)| sent));
+            .max(d.renew.map_or(HonourMs(-1), |(_, sent)| sent))
+            .max(late_sent);
         let dirs: Vec<Ino> = d.grown.keys().copied().collect();
         for dir in dirs {
             if d.grown.get(&dir) == Some(&None) {

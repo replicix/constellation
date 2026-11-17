@@ -17886,7 +17886,7 @@ mod locks {
     /// grants over a holder it does not know of (sim
     /// `locks-root-own-unlinked-partition-nocrash` seed 177: a handover made
     /// a new sticky stream, whose holder granted itself an inode the root's
-    /// own client held). Fails on fab9c072: granted at once.
+    /// own client held).
     #[test]
     fn a_new_sticky_stream_grants_no_lock_before_the_roots_handoff() {
         let (mut h, f) = sticky_delegate();
@@ -17910,7 +17910,7 @@ mod locks {
     /// in it before the granting answer that carries the root's handoff
     /// (sim `locks-root-own-unlinked-partition-nocrash` seed 260: a handover
     /// of the root's own sticky `d1` grew node 2's sticky stream, and node 2
-    /// granted itself an inode node 3 held). Fails on fab9c072: granted.
+    /// granted itself an inode node 3 held).
     #[test]
     fn a_subtree_a_sticky_stream_grew_by_grants_no_lock_before_the_roots_handoff() {
         use constellation_meta::SubtreeKind;
@@ -17974,25 +17974,367 @@ mod locks {
         assert!(granted_any(&out), "not served after the handoff: {out:?}");
     }
 
+    /// The renewal of generation 7 in `out`: `(root, req, round)`.
+    fn renewal_of_7(out: &[Action]) -> Option<(NodeId, OpId, u64)> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegRenew {
+                req, gen: 7, round, ..
+            } => Some((to, *req, *round)),
+            _ => None,
+        })
+    }
+
+    /// An answer of `from` to the renewal `req` of generation 7 in `round`
+    /// (`ttl_ms` 0: a refusal that does not end the stream).
+    fn renewed_answer(
+        from: NodeId,
+        req: OpId,
+        round: u64,
+        ttl_ms: u64,
+        locks: Vec<constellation_meta::locks::GrantWire>,
+    ) -> Event {
+        Event::Peer {
+            from,
+            msg: PeerMsg::DelegRenewed {
+                req,
+                gen: 7,
+                round,
+                ttl_ms,
+                locks,
+                lock_grace_ms: 0,
+                lock_floor: Default::default(),
+                lock_cut_at: 0,
+                lock_cut: Box::default(),
+                lock_barrier: 0,
+                lock_carry: Vec::new(),
+                sent_at: 0,
+                ends: false,
+            },
+        }
+    }
+
+    /// The root's grant `seq` of `holder` on `ino`, as a handoff carries it.
+    fn handoff_wire(
+        h: &Harness,
+        holder: NodeId,
+        seq: u64,
+        ino: Ino,
+    ) -> constellation_meta::locks::GrantWire {
+        constellation_meta::locks::GrantWire {
+            id: GrantId { node: 1, seq },
+            node: holder,
+            ino,
+            mode: X,
+            until_ms: h.now.0 + 20_000,
+            recalled: false,
+            gen: 0,
+            confirmed: constellation_meta::locks::Grant::MINTED,
+            settled: true,
+            lapsed: false,
+        }
+    }
+
+    /// [`sticky_delegate`], with its first renewal in flight: `(harness,
+    /// dir, file, req, round)`.
+    fn sticky_delegate_in_flight() -> (Harness, Ino, Ino, OpId, u64) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (dir, f) = sticky_delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (to, req, round) = renewal_of_7(&out).expect("no renewal on install");
+        assert_eq!(to, 1);
+        (h, dir, f, req, round)
+    }
+
+    /// [`sticky_delegate_in_flight`], its first renewal granted: the
+    /// original subtree is let in, the next renewal is on its timer.
+    /// `(harness, file, round)`.
+    fn sticky_delegate_answered() -> (Harness, Ino, u64) {
+        let (mut h, _, f, req, round) = sticky_delegate_in_flight();
+        h.advance(2);
+        h.step(renewed_answer(1, req, round, 20_000, Vec::new()));
+        assert!(!h.core.deleg_lock_waits(f, 7, &h.meta), "still waiting");
+        assert!(h.core.dl.mine[&7].renew.is_none());
+        assert!(h.core.dl.mine[&7].renew_timer.is_some());
+        (h, f, round)
+    }
+
+    /// The root grows sticky stream 7 by `/e`, committed: `(e, g, out)`, `g`
+    /// a file in `e`, `out` the step's actions.
+    fn grow_sticky(h: &mut Harness) -> (Ino, Ino, Vec<Action>) {
+        use constellation_meta::SubtreeKind;
+        let e = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let g = h.meta.allocate_ino(e).unwrap();
+        let grow = vec![
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "e".into(),
+                ino: e,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            },
+            LogRecord::Create {
+                parent: e,
+                name: "g".into(),
+                ino: g,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 4,
+            },
+            LogRecord::delegate_one(3, 7, e, SubtreeKind::Sticky),
+        ];
+        crate::replica::Replica::install_streamed(&h.meta, 1, 1, 10, 12, &grow, true, (0, 0))
+            .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].dirs.contains(&e), "not honoured for ops");
+        assert!(h.core.deleg_lock_waits(g, 7, &h.meta), "no lock wait");
+        (e, g, out)
+    }
+
+    /// Whether a lock request of node 4 on `ino` met a node that does not
+    /// serve it yet (`NotOwner`), and whether it was granted.
+    fn probe(h: &mut Harness, req: u64, ino: Ino) -> (bool, bool) {
+        let out = request(h, 4, req, ino, X, false);
+        let replies = lock_replies(&out);
+        let not_owner = replies
+            .iter()
+            .any(|(_, _, o)| matches!(o, LockOutcome::NotOwner { .. }));
+        (not_owner, granted_any(&out))
+    }
+
     /// A non-stealable stream whose renewal a root that cannot grant now
     /// refused (`ends` false) goes on, and renews again later: silent, it
     /// never renewed again, and a root that took the lease over granted no
     /// lock at all, its tenure floor waiting for this stream's renewal (sim
-    /// `locks-root-own-unlinked-partition` seed 1404). Fails on fab9c072:
-    /// no renewal timer.
+    /// `locks-root-own-unlinked-partition` seed 1404). The timer is due a
+    /// request timeout after the refusal, and firing it sends the renewal.
     #[test]
     fn a_refused_sticky_stream_renews_again() {
-        let (mut h, _) = sticky_delegate();
+        let (mut h, _, _, req, round) = sticky_delegate_in_flight();
+        h.advance(5);
+        h.step(renewed_answer(1, req, round, 0, Vec::new()));
+        let d = &h.core.dl.mine[&7];
+        assert!(!d.stopped, "a sticky stream stopped on a refusal");
+        assert!(d.renew.is_none());
+        let timer = d.renew_timer.expect("the stream never renews again");
+        let timeout = h.core.deleg_request_timeout_ms() as i64;
+        assert_eq!(h.core.timer_ms(timer), Some(Ms(h.now.0 + timeout)));
+        h.now = Ms(h.now.0 + timeout);
+        let out = h.step(Event::Timer { id: timer });
+        let (to, _, _) = renewal_of_7(&out).expect("the timer sent no renewal");
+        assert_eq!(to, 1);
+    }
+
+    /// A refusal that ends the stream (`ends`) stops it, and arms no timer.
+    #[test]
+    fn a_sticky_stream_the_root_ends_arms_no_renewal_timer() {
+        let (mut h, _, _, _, _) = sticky_delegate_in_flight();
         let mut out = Vec::new();
         if let Some(t) = h.core.dl.mine.get_mut(&7).unwrap().renew_timer.take() {
             h.core.cancel_timer(t, &mut out);
         }
         let now = h.clk();
         h.core
-            .deleg_renewal_refused(now, 7, false, &h.meta, &mut out);
+            .deleg_renewal_refused(now, 7, true, &h.meta, &mut out);
         let d = &h.core.dl.mine[&7];
-        assert!(!d.stopped, "a sticky stream stopped on a refusal");
-        assert!(d.renew_timer.is_some(), "the stream never renews again");
+        assert!(d.stopped, "the stream goes on after the root ended it");
+        assert!(d.renew_timer.is_none(), "a stopped stream renews");
+    }
+
+    /// M1: a renewal that timed out waits in `late`, and its granting answer
+    /// is still used. Computed before the root handed the grown subtree's
+    /// grants over, it must not let the locks in: only an answer to a renewal
+    /// sent after the commit was learned does (the one sent at the grow).
+    #[test]
+    fn a_late_granting_answer_computed_before_the_grow_lets_no_lock_in() {
+        let (mut h, f, round) = sticky_delegate_answered();
+        let _ = f;
+        h.advance(10);
+        // S1 is sent on the renewal timer, and its answer is slow.
+        let timer = h.core.dl.mine[&7].renew_timer.expect("no timer");
+        let out = h.step(Event::Timer { id: timer });
+        let (_, s1, _) = renewal_of_7(&out).expect("no renewal");
+        // It times out: late, and the next is sent at once; a root that
+        // cannot grant now refuses that one.
+        h.advance(h.core.deleg_request_timeout_ms() + 1);
+        let out = poke(&mut h);
+        assert!(h.core.deleg_late_reqs().contains(&s1), "S1 is not late");
+        let (_, s2, _) = renewal_of_7(&out).expect("no renewal after the timeout");
+        assert_ne!(s1, s2);
+        h.advance(5);
+        h.step(renewed_answer(1, s2, round, 0, Vec::new()));
+        assert!(h.core.dl.mine[&7].renew.is_none());
+        // The growth is learned only now; the renewal sent for it is S4.
+        h.advance(5);
+        let (_, g, out) = grow_sticky(&mut h);
+        let (_, s4, _) = renewal_of_7(&out).expect("no renewal sent for the growth");
+        // The late answer to S1 (computed before the root handed anything
+        // over) arrives.
+        h.advance(5);
+        h.step(renewed_answer(1, s1, round, 20_000, Vec::new()));
+        assert!(
+            h.core.deleg_lock_waits(g, 7, &h.meta),
+            "a late answer to a renewal sent before the growth let the locks in"
+        );
+        assert_eq!(probe(&mut h, 1, g), (true, false));
+        // The answer to S4 carries the handoff and lets them in, the
+        // holder's grant there.
+        h.advance(5);
+        let wire = handoff_wire(&h, 5, 9, g);
+        h.step(renewed_answer(1, s4, round, 20_000, vec![wire]));
+        assert!(!h.core.deleg_lock_waits(g, 7, &h.meta), "still waiting");
+        assert!(h.meta.locks().own_grant(g, 5, h.clk().wait).is_some());
+        assert_eq!(probe(&mut h, 2, g), (false, false), "granted beside it");
+    }
+
+    /// S1: answers that do not count leave a grown subtree's locks waiting:
+    /// one of another round, one of another root, a refusal (`ttl_ms` 0).
+    /// The next granting answer to a renewal sent after the growth lets
+    /// them in.
+    #[test]
+    fn answers_that_do_not_count_leave_a_grown_subtrees_locks_waiting() {
+        let (mut h, _, round) = sticky_delegate_answered();
+        h.advance(10);
+        let (_, g, out) = grow_sticky(&mut h);
+        let (_, req, _) = renewal_of_7(&out).expect("no renewal sent for the growth");
+        h.advance(5);
+        h.step(renewed_answer(1, req, round + 1, 20_000, Vec::new()));
+        assert!(h.core.deleg_lock_waits(g, 7, &h.meta), "another round");
+        h.step(renewed_answer(2, req, round, 20_000, Vec::new()));
+        assert!(h.core.deleg_lock_waits(g, 7, &h.meta), "another root");
+        h.step(renewed_answer(1, req, round, 0, Vec::new()));
+        assert!(h.core.deleg_lock_waits(g, 7, &h.meta), "a refusal");
+        assert_eq!(probe(&mut h, 1, g), (true, false));
+        // The refusal armed the timer: the renewal that follows is the one.
+        let timer = h.core.dl.mine[&7].renew_timer.expect("no timer");
+        h.advance(5);
+        let out = h.step(Event::Timer { id: timer });
+        let (_, req, _) = renewal_of_7(&out).expect("no renewal");
+        h.advance(5);
+        h.step(renewed_answer(1, req, round, 20_000, Vec::new()));
+        assert!(!h.core.deleg_lock_waits(g, 7, &h.meta), "not let in");
+        assert_eq!(probe(&mut h, 2, g), (false, true));
+    }
+
+    /// S1: a granting answer to a renewal that was in flight at the growth
+    /// (sent before it was learned) lets no lock in; the renewal that goes
+    /// out then does.
+    #[test]
+    fn an_answer_to_a_renewal_in_flight_at_the_grow_lets_no_lock_in() {
+        let (mut h, _, round) = sticky_delegate_answered();
+        h.advance(10);
+        let timer = h.core.dl.mine[&7].renew_timer.expect("no timer");
+        let out = h.step(Event::Timer { id: timer });
+        let (_, in_flight, _) = renewal_of_7(&out).expect("no renewal");
+        h.advance(2);
+        let (_, g, out) = grow_sticky(&mut h);
+        assert!(renewal_of_7(&out).is_none(), "one in flight is enough");
+        h.advance(5);
+        let out = h.step(renewed_answer(1, in_flight, round, 20_000, Vec::new()));
+        assert!(
+            h.core.deleg_lock_waits(g, 7, &h.meta),
+            "an answer to a renewal sent before the growth let the locks in"
+        );
+        assert_eq!(probe(&mut h, 1, g), (true, false));
+        // Still waiting: another renewal is asked for at once.
+        let (_, next, _) = renewal_of_7(&out).expect("no renewal asked for");
+        h.advance(5);
+        let wire = handoff_wire(&h, 5, 9, g);
+        h.step(renewed_answer(1, next, round, 20_000, vec![wire]));
+        assert!(!h.core.deleg_lock_waits(g, 7, &h.meta), "not let in");
+        assert!(h.meta.locks().own_grant(g, 5, h.clk().wait).is_some());
+    }
+
+    /// S1 (e): the granting answer that carried the handoff is lost; the
+    /// next carries it again (the root re-sends every live copy with every
+    /// granting renewal, `a_resent_handoff_carries_what_is_left_at_each_send`)
+    /// and lets the locks in, the holder's grant there.
+    #[test]
+    fn a_lost_granting_answer_is_followed_by_one_that_carries_the_handoff() {
+        let (mut h, _, f, first, _) = sticky_delegate_in_flight();
+        let _ = first;
+        // The answer to the first renewal never arrives.
+        h.advance(h.core.deleg_request_timeout_ms() + 1);
+        let out = poke(&mut h);
+        let (_, again, round) = renewal_of_7(&out).expect("no renewal after the timeout");
+        assert_eq!(
+            probe(&mut h, 1, f),
+            (true, false),
+            "served before the handoff"
+        );
+        h.advance(5);
+        let wire = handoff_wire(&h, 5, 9, f);
+        h.step(renewed_answer(1, again, round, 20_000, vec![wire]));
+        assert!(!h.core.deleg_lock_waits(f, 7, &h.meta), "not let in");
+        assert!(h.meta.locks().own_grant(f, 5, h.clk().wait).is_some());
+        assert_eq!(probe(&mut h, 2, f), (false, false), "granted beside it");
+    }
+
+    /// S2: a new non-stealable stream whose first answer is refused, and
+    /// whose root is gone before it hands anything over, is served once the
+    /// next root grants: the renewal goes to whichever root holds the lease
+    /// then, and its handoff lets the locks in.
+    #[test]
+    fn a_new_sticky_stream_is_served_by_the_root_that_follows_a_refusal() {
+        let (mut h, _, f, req, round) = sticky_delegate_in_flight();
+        h.advance(5);
+        h.step(renewed_answer(1, req, round, 0, Vec::new()));
+        assert_eq!(probe(&mut h, 1, f), (true, false));
+        // The root changes; the renewal timer finds the new one.
+        h.core.lease.cached_holder = Some(2);
+        let timer = h.core.dl.mine[&7].renew_timer.expect("no timer");
+        h.advance(h.core.deleg_request_timeout_ms());
+        let mut out = h.step(Event::Timer { id: timer });
+        out.extend(poke(&mut h));
+        let (to, req) = sends(&out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::DelegRenew { req, gen: 7, .. } => Some((to, *req)),
+                _ => None,
+            })
+            .next_back()
+            .expect("no renewal");
+        assert_eq!(to, 2, "the renewal went to the old root");
+        // (The stream's round may have changed with the root.)
+        let round = round_of(&h, 7);
+        h.advance(5);
+        let wire = handoff_wire(&h, 5, 9, f);
+        h.step(renewed_answer(2, req, round, 20_000, vec![wire]));
+        assert!(!h.core.deleg_lock_waits(f, 7, &h.meta), "not let in");
+        assert!(h.meta.locks().own_grant(f, 5, h.clk().wait).is_some());
+        assert_eq!(probe(&mut h, 2, f), (false, false), "granted beside it");
+    }
+
+    /// S3: a handoff grant on a subtree a non-stealable stream waits the
+    /// handoff for stays settled (nothing here served the inode before), as
+    /// one on a parked subtree of a stealable stream does; one on a subtree
+    /// already served is not.
+    #[test]
+    fn a_handoff_grant_on_a_lock_wait_subtree_stays_settled() {
+        let (mut h, f, _) = sticky_delegate_answered();
+        // The first move is over: later ones are re-sends.
+        let now = h.clk();
+        h.core
+            .lock_install_moved(now, 7, Vec::new(), &[], None, &h.meta);
+        h.advance(10);
+        let (_, g, _) = grow_sticky(&mut h);
+        let on_wait = handoff_wire(&h, 5, 9, g);
+        let on_served = handoff_wire(&h, 6, 10, f);
+        let now = h.clk();
+        h.core
+            .lock_install_moved(now, 7, vec![on_wait, on_served], &[], None, &h.meta);
+        let wait = h.clk().wait;
+        let a = h.meta.locks().own_grant(g, 5, wait).expect("not installed");
+        assert!(a.settled, "unsettled on a subtree nothing served");
+        let b = h.meta.locks().own_grant(f, 6, wait).expect("not installed");
+        assert!(!b.settled, "settled on a subtree this node served");
     }
 
     /// Executes two rows of generation 7 as node 3, the delegate.
@@ -82805,8 +83147,7 @@ mod root_own_sticky {
     /// are the root's from that step on. The table is the root's too: taken
     /// out, they were in no table until the root applied its own release
     /// batch, and a waiter served in between was granted beside them (sim
-    /// `locks-root-own-unlinked-partition-nocrash` seed 15). Fails on
-    /// fab9c072: the record is gone after the hand-back.
+    /// `locks-root-own-unlinked-partition-nocrash` seed 15).
     #[test]
     fn a_grant_of_the_roots_own_released_stream_stays_in_its_table() {
         use constellation_meta::locks::LockMode;
@@ -82856,6 +83197,74 @@ mod root_own_sticky {
                 }
             )),
             "granted beside the released stream's grant: {out:?}"
+        );
+    }
+
+    /// The same for a partial release (the stream lives on): the grants under
+    /// the released subtree stay in the root's table as its own, a repeated
+    /// hand-back (the note rides every batch until acknowledged) leaves the
+    /// table as it was, and the note applied afterwards adds no second
+    /// record, shortens none, and revives none released in between.
+    #[test]
+    fn a_partial_release_of_the_roots_own_stream_keeps_its_grants_once() {
+        use constellation_meta::locks::LockMode;
+        let (mut h, d, _) = root_with_stream_and_file();
+        let mut files = Vec::new();
+        for name in ["lk", "lk2"] {
+            let op = create_in(&h, d.dir, name);
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            files.push(ino);
+        }
+        let until = WaitMs(h.now.0 + 5_000);
+        let kept = x_grant(2, 4260, files[0], until, d.gen);
+        let released = x_grant(2, 4261, files[1], until, d.gen);
+        h.meta.locks().install(kept);
+        h.meta.locks().install(released);
+        let now = h.clk();
+        let back = h.core.lock_hand_back(now, d.gen, &[d.dir], false, &h.meta);
+        assert_eq!(back.grants.len(), 2, "the release carries both grants");
+        let in_table = |h: &Harness, g: &constellation_meta::locks::Grant| {
+            h.meta.locks().get(g.id).map(|k| (k.gen, k.until))
+        };
+        assert_eq!(in_table(&h, &kept), Some((0, until)));
+        assert_eq!(in_table(&h, &released), Some((0, until)));
+        // A repeated hand-back: the same table, the same ends.
+        let now = h.clk();
+        let again = h.core.lock_hand_back(now, d.gen, &[d.dir], false, &h.meta);
+        assert!(again.grants.len() <= 2);
+        assert_eq!(in_table(&h, &kept), Some((0, until)));
+        let wait = h.clk().wait;
+        assert_eq!(
+            h.meta
+                .locks()
+                .conflicting(files[0], 9, LockMode::Exclusive, wait)
+                .len(),
+            1,
+            "not one record"
+        );
+        // One of the two is released before the note is applied.
+        h.meta.locks().forget(released.id);
+        let now = h.clk();
+        h.core
+            .lock_install_returned(now, d.gen, back, &[d.dir], &h.meta);
+        let (gen, end) = in_table(&h, &kept).expect("the record is gone");
+        assert_eq!(gen, 0, "not the root's");
+        assert!(end >= until, "the record was shortened");
+        let wait = h.clk().wait;
+        assert_eq!(
+            h.meta
+                .locks()
+                .conflicting(files[0], 9, LockMode::Exclusive, wait)
+                .len(),
+            1,
+            "a second record"
+        );
+        assert!(
+            in_table(&h, &released).is_none(),
+            "a released grant came back with the note"
         );
     }
 
