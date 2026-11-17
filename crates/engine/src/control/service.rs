@@ -455,6 +455,7 @@ impl EngineControl {
                     backups_removed: stats.backups_removed,
                     reconfig_cas: stats.reconfig_cas,
                     singleton_bumps: stats.singleton_bumps,
+                    backup_roster_rereads: stats.backup_roster_rereads,
                     backup_appends: stats.backup_appends,
                     backup_acks: stats.backup_acks,
                     backup_ack_timeouts: stats.backup_ack_timeouts,

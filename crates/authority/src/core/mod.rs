@@ -2027,6 +2027,10 @@ pub struct Stats {
     pub cfg_spans_closed: u64,
     /// Singleton bumps issued (`reconfig_cas` counts them too).
     pub singleton_bumps: u64,
+    /// Backup selection asked for a roster re-read because a linked peer the
+    /// roster does not list yet could be a candidate
+    /// ([`Core::ask_roster_reread`]).
+    pub backup_roster_rereads: u64,
     /// Holder: appends sent, acks received, backups that timed out.
     pub backup_appends: u64,
     pub backup_acks: u64,

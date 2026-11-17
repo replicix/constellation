@@ -16657,6 +16657,108 @@ mod backup_crash {
         }
     }
 
+    /// How many registry re-reads `out` asks for.
+    fn refreshes(out: &[Action]) -> usize {
+        out.iter()
+            .filter(|a| matches!(a, Action::RefreshRoster))
+            .count()
+    }
+
+    /// A holder with a backup budget and a roster read in hand that lists
+    /// only itself, issued at the start of the test.
+    fn holder_with_a_roster_of_itself() -> Harness {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.core.cfg.placement = false;
+        h.hold(1, None);
+        // A lease that outlasts the test (no renewal in between).
+        h.set_lease_end(h.now.plus(3_600_000));
+        h.step(roster_ev(vec![1], w(h.now)));
+        h
+    }
+
+    /// A peer's configuration: no singleton bump stands in the way of
+    /// backup selection.
+    fn no_bump_in_the_way(h: &mut Harness) {
+        h.core.lease.held.as_mut().unwrap().0.singleton = false;
+        h.core.ack.reconfig = None;
+        h.core.ack.reconfig_wanted = None;
+        h.core.ack.cfg_seen = None;
+        h.core.sync_cfg_spans(&h.meta);
+    }
+
+    fn housekeeping_step(h: &mut Harness) -> Vec<Action> {
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        })
+    }
+
+    /// A peer linked after the registry read in hand is a peer for the
+    /// singleton test but no backup candidate until a read lists it, and
+    /// nothing asked for that read before the driver's 5 s poll (the
+    /// stability window of 2 s was long over: culprit 2 of the hard-link
+    /// bisect, "bringing up a backup" 5 s after the mount). Backup selection
+    /// asks, at most once a second; candidacy still waits for the listing.
+    /// (Fails before: no `RefreshRoster` from backup selection.)
+    #[test]
+    fn a_linked_peer_outside_the_roster_makes_backup_selection_reread_it() {
+        let mut h = holder_with_a_roster_of_itself();
+        h.advance(10);
+        link_2(&mut h, true, Some(1), 0);
+        no_bump_in_the_way(&mut h);
+        // Housekeeping runs: the ask goes out.
+        h.advance(100);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 1, "{out:?}");
+        assert_eq!(h.core.stats.backup_roster_rereads, 1);
+        assert!(h.core.ack.candidate.is_none(), "unlisted: no candidate");
+        // Within a second: no second ask.
+        h.advance(500);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 0, "{out:?}");
+        // A second later: asked again (the read has not come).
+        h.advance(600);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 1, "{out:?}");
+        assert_eq!(h.core.stats.backup_roster_rereads, 2);
+        // The read lists it: it is a candidate, once the link is stable.
+        h.step(roster_ev(vec![1, 2], w(h.now)));
+        h.advance(h.core.cfg.backup_stable_ms + 100);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 0, "{out:?}");
+        assert_eq!(h.core.ack.candidate, Some(2));
+    }
+
+    /// A read-only node linked after the read, or a link the read already
+    /// speaks for, is no reason to ask.
+    #[test]
+    fn a_read_only_node_linked_after_the_read_makes_no_backup_roster_reread() {
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.core.cfg.placement = false;
+        h.hold(1, None);
+        h.set_lease_end(h.now.plus(3_600_000));
+        h.step(roster_ro_ev(vec![1], vec![2], w(h.now)));
+        h.advance(10);
+        link_2(&mut h, true, Some(1), 0);
+        no_bump_in_the_way(&mut h);
+        h.advance(100);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 0, "{out:?}");
+        h.advance(2_000);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 0, "{out:?}");
+        assert_eq!(h.core.stats.backup_roster_rereads, 0);
+        // A link older than a read that does not list it: the node left.
+        let mut h = holder_with_a_roster_of_itself();
+        link_2(&mut h, true, Some(1), 10_000);
+        no_bump_in_the_way(&mut h);
+        h.advance(100);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 0, "{out:?}");
+    }
+
     /// i1-592 (`drop-held-chain-backed`, `backup`, `backup-crash`,
     /// `long-backup` under `+commit`: about half the seeds): the tenure's
     /// first assessment (`acquire_won`) found the peer's link younger than

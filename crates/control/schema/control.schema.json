@@ -152,6 +152,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "backup_roster_rereads": {
+          "description": "Roster re-reads backup selection asked for: a linked peer the roster\ndoes not list yet.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "backup_tail_applied": {
           "format": "uint64",
           "minimum": 0,
@@ -561,6 +567,7 @@
         "backups_removed",
         "reconfig_cas",
         "singleton_bumps",
+        "backup_roster_rereads",
         "backup_appends",
         "backup_acks",
         "backup_ack_timeouts",

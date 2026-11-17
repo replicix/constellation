@@ -357,6 +357,9 @@
 //! `backup_stable_ms`; the one connected the longest is preferred; at
 //! most `backups_max`. No candidate: `backups = []`, `Local`, today's
 //! behaviour — a WAN-only cluster never pays a synchronous round trip.
+//! A linked peer the roster does not list yet makes the holder re-read the
+//! roster, at most once a second, as the placement does (it is a peer for
+//! the singleton test but no candidate until a read lists it).
 //! One node: nothing here ever runs (no peers, no backups, no messages).
 
 use super::lease::LeaseState;
@@ -4277,7 +4280,30 @@ impl Core {
         })
     }
 
-    fn backup_select(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
+    /// A node that is linked, within the RTT budget and a peer by
+    /// [`Roster::link_is_peer`] (so no read-only node and none the read
+    /// already speaks for), that the roster in hand does not list as
+    /// write-eligible: it could be a candidate once a read lists it.
+    fn linked_peer_outside_roster(&self) -> Option<NodeId> {
+        let me = self.cfg.node_id;
+        if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
+            return None;
+        }
+        self.roster
+            .links()
+            .values()
+            .find(|l| {
+                l.connected
+                    && l.node != me
+                    && !self.roster.lists(l.node)
+                    && self.roster.link_is_peer(me, l)
+                    && l.rtt_ms
+                        .is_none_or(|rtt| rtt <= self.cfg.backup_rtt_budget_ms)
+            })
+            .map(|l| l.node)
+    }
+
+    fn backup_select(&mut self, now: Now, _replica: &dyn Replica, out: &mut Vec<Action>) {
         // EC2 follow-up (e): a node that sealed the epoch held can never
         // back it: not a candidate. (It still counts for whether a backup
         // could be had: the acknowledgements wait for the archive, not for
@@ -4293,6 +4319,23 @@ impl Core {
             || self.ack.reconfig.is_some()
             || self.lease.backups().len() >= self.cfg.backups_max
         {
+            return;
+        }
+        // Nobody to bring up: a peer linked since the roster read in hand
+        // is a peer for the singleton test but no candidate until a read
+        // lists it, and nothing else asks for that read before the driver's
+        // 5 s poll (the 2 s stability window is over long before). Ask.
+        if candidates.is_empty() {
+            if let Some(node) = self.linked_peer_outside_roster() {
+                if self.ask_roster_reread(
+                    now,
+                    "backup selection: a linked peer outside the roster",
+                    node,
+                    out,
+                ) {
+                    self.stats.backup_roster_rereads += 1;
+                }
+            }
             return;
         }
         // The rate limit is for churn (the same node in and out); a set

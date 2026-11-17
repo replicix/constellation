@@ -2579,6 +2579,9 @@ pub struct AckStatus {
     /// The part of `reconfig_cas` that only moved the singleton flag (the
     /// backup set unchanged; ADR-50).
     pub singleton_bumps: u64,
+    /// Roster re-reads backup selection asked for: a linked peer the roster
+    /// does not list yet.
+    pub backup_roster_rereads: u64,
     pub backup_appends: u64,
     pub backup_acks: u64,
     pub backup_ack_timeouts: u64,

@@ -70,7 +70,9 @@ pub(crate) struct PlacementState {
     /// The last evaluation's top subtrees, `(dir, node, node_ops,
     /// subtree_ops)`, for `status`.
     pub top: Vec<(Ino, NodeId, u64, u64)>,
-    /// When a candidate outside the roster last had it re-read.
+    /// When a candidate outside the roster last had it re-read (placement's
+    /// and backup selection's ask share this limit:
+    /// [`Core::ask_roster_reread`]).
     roster_refreshed: Option<WaitMs>,
     /// Plan 46 M1.3 step 7: the links whose every sample since `since` was
     /// at least the far round trip (see [`Core::note_rtt_samples`]).
@@ -293,6 +295,26 @@ impl Core {
         if self.roster.lists(node) {
             return true;
         }
+        self.ask_roster_reread(
+            now,
+            "placement: a connected writer outside the roster",
+            node,
+            out,
+        );
+        false
+    }
+
+    /// Ask the driver to re-read the registry, at most once a second
+    /// ([`ROSTER_REFRESH_MS`], one limit for every caller: placement and
+    /// backup selection), because `node` is linked and the roster in hand
+    /// does not list it. `why` says which. `true` if the ask went out.
+    pub(crate) fn ask_roster_reread(
+        &mut self,
+        now: Now,
+        why: &'static str,
+        node: NodeId,
+        out: &mut Vec<Action>,
+    ) -> bool {
         if self
             .pl
             .roster_refreshed
@@ -302,9 +324,11 @@ impl Core {
             tracing::debug!(
                 node = self.cfg.node_id,
                 candidate = node,
-                "placement: a connected writer outside the roster; re-reading it"
+                why,
+                "re-reading the roster"
             );
             out.push(Action::RefreshRoster);
+            return true;
         }
         false
     }

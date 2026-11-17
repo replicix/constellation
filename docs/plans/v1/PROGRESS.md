@@ -70252,6 +70252,18 @@ lookup (this one and `Namespace::primary_parent`) steps over until a memtable fl
 the lsm-tree memtable range iteration and its merge). Without a grant the unlink phase is unchanged (no regression on
 btrfs, ext4, xfs or tmpfs).
 
+### A linked peer the roster does not list yet makes backup selection ask for a roster read (2026-11-17)
+
+In the hard-link bisect's logs a root brought up its backup about 5 s after its mount, not 2 s (`backup_stable_ms`)
+after the peer linked. `Core::backup_peers_in_budget` needs the roster to list the peer, and a node linked after the
+read in hand is a peer for the singleton test (`Roster::link_is_peer`) but no candidate until a read lists it (it may be
+read-only or a retired process); nothing asked for that read before the driver's 5 s poll. The placement already asked
+in the same situation (`place_eligible`, the `auto-placement` failure). The ask is now `Core::ask_roster_reread`, one
+rate limit (`ROSTER_REFRESH_MS`, 1 s) for both callers, and `backup_select` uses it when it has no candidate and a
+linked, connected, in-budget peer is outside the roster (`status.ack.backup_roster_rereads`). Candidacy is unchanged: the
+read must still list the node, and the stability window and the RTT budget still apply. Pin:
+`a_linked_peer_outside_the_roster_makes_backup_selection_reread_it`.
+
 ## Inbox escalation: no P2P ask, and a withdrawn registration (leaseesc)
 
 `delegate-partition` failed 11 of 20 runs under host load with "the root lost its lease". The root had handed its lease
