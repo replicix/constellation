@@ -33,6 +33,9 @@
 //! - `fsck` of each node is clean (it checks the published tree's dentry
 //!   forms and every inode's link count against its names), and neither node
 //!   recorded a conflict;
+//! - the burst is timed once A lists B as its backup (steady state: one
+//!   backup round trip per link, ADR-50); before that its ops commit by the
+//!   archive, one S3 PUT each;
 //! - the cost of a `link` does not grow with the number of names: the last
 //!   1,024 links of the burst average at most `HARDLINK_BURST_RATIO` times
 //!   the first 1,024 (the quadratic code is 40 times and more).
@@ -358,6 +361,17 @@ pub fn burst(_seed: u64) -> Result<()> {
         let mut extras: Vec<String> = Vec::with_capacity(links);
         let mut took: Vec<Duration> = Vec::with_capacity(links);
         let mut flip = false;
+        // The burst is timed in steady state: once A lists B as its backup
+        // (ADR-50: one backup round trip per link). Before that its ops
+        // commit by the archive, an S3 PUT each.
+        let b_id = super::m9::node_id(b)?;
+        let t_wait = Instant::now();
+        let backups = super::m9::wait_for_backup(a, Duration::from_secs(60))?;
+        let waited = t_wait.elapsed();
+        ensure!(
+            backups == vec![b_id],
+            "A lists {backups:?} as its backups, expected B ({b_id})"
+        );
         let t_up = Instant::now();
         for i in 0..links {
             let t = Instant::now();
@@ -496,9 +510,10 @@ pub fn burst(_seed: u64) -> Result<()> {
         let mut sorted = took.clone();
         sorted.sort();
         eprintln!(
-            "    {NAME}: {links} links in {up:?} (first {window} avg {first:?}, last {window} avg \
-             {last:?}, p50 {:?}, p99 {:?}, max {:?}), {links} unlinks in {down:?}; B's ls/du loop \
-             ran {looped} times; meta.db top A {up_a} B {up_b}, bottom A {down_a} B {down_b} bytes; \
+            "    {NAME}: A listed backup {backups:?} after {waited:?}; {links} links in {up:?} \
+             (first {window} avg {first:?}, last {window} avg {last:?}, p50 {:?}, p99 {:?}, \
+             max {:?}), {links} unlinks in {down:?}; B's ls/du loop ran {looped} times; \
+             meta.db top A {up_a} B {up_b}, bottom A {down_a} B {down_b} bytes; \
              du apparent/disk top {du_top:?}, bottom {du_bottom:?}",
             percentile(&sorted, 0.5),
             percentile(&sorted, 0.99),
