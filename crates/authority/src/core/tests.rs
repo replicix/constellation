@@ -2726,8 +2726,10 @@ fn a_withdrawal_reads_again_after_a_registration_that_timed_out_in_doubt() {
 }
 
 /// An in-doubt registration swap is conditional on the tag it read, so a
-/// read that shows another tag proves it can no longer land: the withdrawal
-/// is over, with no further read.
+/// read that shows another tag usually means it can no longer land: the
+/// withdrawal is over, with no further read. (A tag can repeat on an
+/// S3-compatible store, where the ETag is a content hash; the wait may then
+/// end early, which the tests with a counter-based tag cannot show.)
 #[test]
 fn a_withdrawal_settles_when_the_lease_tag_moved_past_an_in_doubt_registration() {
     use crate::event::CasFailure;

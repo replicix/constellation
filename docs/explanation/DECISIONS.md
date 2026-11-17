@@ -911,12 +911,16 @@ escalation had asked while the link was down. Three rules follow.
   the node owns it; after a registration that timed out in doubt the
   withdrawal reads again, after a wait, until a read shows a lease tag other
   than the one the in-doubt swap was made against (the swap is conditional on
-  that tag and can no longer land), at most eight times, before it calls the
-  name gone. The hole is closed when the tag moves within that bound (a holder
-  renews within half a TTL). It is narrowed otherwise: a swap that lands after
-  the bound leaves the name until a later escalation claims it, and the effect
-  is one unwanted lease move after a wanted grace, with no integrity loss (no
-  holder, epoch or expiry field is written).
+  that tag, so it usually can no longer land), at most eight times, before it
+  calls the name gone. The hole is usually closed when the tag moves within
+  that bound (a holder renews within half a TTL). It is narrowed otherwise: a
+  swap that lands after the bound leaves the name until a later escalation
+  claims it. A tag can also repeat (an S3-compatible ETag is the MD5 of the
+  body, so a `wanted_by` add and its remove between two renewals restore it;
+  a renewal always changes the bytes), and the wait may then end early. In
+  both cases the effect is one unwanted lease move after a wanted grace, with
+  no integrity loss: the settle writes nothing, and an equal ETag means an
+  equal holder, epoch and expiry.
 
 Who holds the lease is still decided by CAS and TTL alone; none of this writes
 a holder field.

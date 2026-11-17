@@ -70,10 +70,14 @@ const WITHDRAW_BACKOFF_MS: u64 = 500;
 const WITHDRAW_SETTLE_MS: u64 = 1_000;
 /// How many times, at most, a withdrawal reads again while the lease still
 /// carries the tag an in-doubt registration swapped against. A swap is
-/// conditional on its tag, so once a read shows another tag it can no
-/// longer land; the holder's next renewal moves the tag (at the latest
-/// within half a TTL). Past the bound the withdrawal decides on what it
-/// read, and a swap that lands later is left to the next escalation's claim.
+/// conditional on its tag, so a read that shows another tag usually means it
+/// can no longer land; the holder's next renewal moves the tag (at the latest
+/// within half a TTL). A tag can repeat, though: on S3-compatible stores the
+/// ETag of a single-part PUT is the MD5 of the body, so a `wanted_by` add and
+/// its remove between two renewals restore the same tag, and the wait may then
+/// end early. Past the bound, or after such an early end, the withdrawal
+/// decides on what it read, and a swap that lands later is left to the next
+/// escalation's claim.
 const WITHDRAW_SETTLE_READS: u8 = 8;
 
 /// A batch this tenure executed, paired with the journal seq its last
@@ -150,11 +154,15 @@ struct WantedReg {
     /// A registration swap timed out in doubt, with the lease tag it swapped
     /// against: it may still land after a read that finds no name, as long
     /// as that tag is current. The withdrawal reads again, after a wait,
-    /// until a read shows another tag (bounded by `WITHDRAW_SETTLE_READS`).
+    /// until a read shows another tag (bounded by `WITHDRAW_SETTLE_READS`;
+    /// a tag that repeats can end the wait early, see that constant).
     in_doubt: Option<LeaseTag>,
     /// The lease tag the latest registration swap was made against.
     registering_tag: Option<LeaseTag>,
     /// The reads this withdrawal has spent waiting out an in-doubt swap.
+    /// Reset by a new in-doubt answer, `withdraw_done` and `withdraw_ended`, not
+    /// by `withdraw_superseded`: a superseding escalation's withdrawal shares
+    /// the remaining budget (the same in-doubt swap, so the bound holds).
     settle_reads: u8,
     /// The escalation's `RegisterWanted` swaps still in flight. A read of
     /// the lease answered before one lands would find no name, and the
@@ -1387,8 +1395,9 @@ impl Core {
         if lease.holder == me || lease.released || !lease.wanted_by.contains(&me) {
             // A registration swap that timed out in doubt may still land,
             // while the tag it swapped against is current: read again after
-            // a wait, until a read shows another tag (the swap can no longer
-            // land), within a bound.
+            // a wait, until a read shows another tag (the swap usually can no
+            // longer land; a repeated tag can end the wait early, which only
+            // risks the accepted unwanted lease move), within a bound.
             let reg = &self.inbox.wanted_reg;
             if reg.in_doubt.as_ref().is_some_and(|t| *t == tag)
                 && reg.settle_reads < WITHDRAW_SETTLE_READS
