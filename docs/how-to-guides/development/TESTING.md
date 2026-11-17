@@ -3518,10 +3518,11 @@ the placement hands `d1` over to a dominant locker. Green at 2000 seeds
 since the handoff wait of non-stealable streams, not yet must-pass; seeds
 260, 177, 15, 513 and 1404 are pinned
 (`regression_locks_root_own_unlinked_partition_*`). `sweep_config` also
-prints the seeds in which a recall answer came after its generation had ended at the root and its
-grants were dropped (`SWEEP-LATE-HANDBACK`); `locks-unlinked-delegated-partition`
-seed 7455 (two exclusive holders after such an answer revived a lapsed
-grant) and seeds that take that path are pinned in
+prints the seeds in which a recall answer came after its generation had
+ended at the root and its grants were dropped (`SWEEP-LATE-HANDBACK`);
+`locks-unlinked-delegated-partition` seed 7455 (two exclusive holders
+after such an answer revived a lapsed grant) and seeds that take that
+path are pinned in
 `regression_locks_unlinked_delegated_partition_late_recall_answer`
 (unlinked-exclusion-7455). `locks-unlinked-delegated-dcrash-pause` (sweep
 and replay) is `-dcrash` with the root holder paused at 0.559 s for 1.3 s,

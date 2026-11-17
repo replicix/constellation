@@ -18065,7 +18065,18 @@ mod locks {
     /// The root grows sticky stream 7 by `/e`, committed: `(e, g, out)`, `g`
     /// a file in `e`, `out` the step's actions.
     fn grow_sticky(h: &mut Harness) -> (Ino, Ino, Vec<Action>) {
-        use constellation_meta::SubtreeKind;
+        let (e, g, out) = grow_stream(h, constellation_meta::SubtreeKind::Sticky);
+        assert!(h.core.dl.mine[&7].dirs.contains(&e), "not honoured for ops");
+        assert!(h.core.deleg_lock_waits(g, 7, &h.meta), "no lock wait");
+        (e, g, out)
+    }
+
+    /// The root grows stream 7 by `/e` of kind `kind`, committed: `(e, g,
+    /// out)`, `g` a file in `e`, `out` the sync's actions.
+    fn grow_stream(
+        h: &mut Harness,
+        kind: constellation_meta::SubtreeKind,
+    ) -> (Ino, Ino, Vec<Action>) {
         let e = h.meta.allocate_ino(ROOT_INO).unwrap();
         let g = h.meta.allocate_ino(e).unwrap();
         let grow = vec![
@@ -18087,14 +18098,12 @@ mod locks {
                 gid: 0,
                 time_ns: 4,
             },
-            LogRecord::delegate_one(3, 7, e, SubtreeKind::Sticky),
+            LogRecord::delegate_one(3, 7, e, kind),
         ];
         crate::replica::Replica::install_streamed(&h.meta, 1, 1, 10, 12, &grow, true, (0, 0))
             .unwrap();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        assert!(h.core.dl.mine[&7].dirs.contains(&e), "not honoured for ops");
-        assert!(h.core.deleg_lock_waits(g, 7, &h.meta), "no lock wait");
         (e, g, out)
     }
 
@@ -18190,6 +18199,96 @@ mod locks {
         let wire = handoff_wire(&h, 5, 9, g);
         h.step(renewed_answer(1, s4, round, 20_000, vec![wire]));
         assert!(!h.core.deleg_lock_waits(g, 7, &h.meta), "still waiting");
+        assert!(h.meta.locks().own_grant(g, 5, h.clk().wait).is_some());
+        assert_eq!(probe(&mut h, 2, g), (false, false), "granted beside it");
+    }
+
+    /// A stealable stream (`grown`, not `lock_wait`): the off-core lane
+    /// sent a renewal while the core was stuck, and the core registers it
+    /// only after the step that learned the growth. The root answered it
+    /// granting before it handed the subtree's grants over (the answer has
+    /// no handoff). It was sent before the growth, so it must not let the
+    /// locks in: the delegate would grant beside the root's grant (seed
+    /// 260's double grant on the stealable path). The answer to the
+    /// renewal sent for the growth, which carries the handoff, does.
+    #[test]
+    fn a_lane_renewal_registered_after_the_grow_lets_no_lock_in() {
+        use constellation_meta::SubtreeKind;
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (_, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, first, round) = renewal_of_7(&out).expect("no renewal on install");
+        h.advance(2);
+        h.step(renewed_answer(1, first, round, 20_000, Vec::new()));
+        assert_eq!(probe(&mut h, 1, f), (false, true), "not served");
+        // The core is stuck; the lane sends L now and queues its
+        // registration.
+        h.advance(10);
+        let lane_sent_at = h.honour();
+        // The growth is learned (the stuck step ends); the renewal for it
+        // goes out. L is not registered yet, so it is not in the bound.
+        h.advance(5);
+        let (e, g, out) = grow_stream(&mut h, SubtreeKind::Placed);
+        assert!(h.core.dl.mine[&7].grown.contains_key(&e), "not parked");
+        let (_, s_grow, _) = renewal_of_7(&out).expect("no renewal sent for the growth");
+        // The registration of L reaches the core, then the root's answer
+        // to L: granting, computed before the handoff.
+        h.advance(5);
+        h.step(lane_sent(&h, 1, lane_sent_at));
+        h.advance(5);
+        h.step(lane_answer(&h, 1, 20_000));
+        assert!(
+            h.core.dl.mine[&7].grown.contains_key(&e),
+            "a lane renewal sent before the growth unparked it"
+        );
+        assert_eq!(
+            probe(&mut h, 2, g),
+            (true, false),
+            "a lock was granted beside the root's grant"
+        );
+        // The answer to the renewal sent for the growth carries the
+        // handoff and lets the locks in, the holder's grant there.
+        h.advance(5);
+        let wire = handoff_wire(&h, 5, 9, g);
+        h.step(renewed_answer(1, s_grow, round, 20_000, vec![wire]));
+        assert!(h.core.dl.mine[&7].grown.is_empty(), "still parked");
+        assert!(h.meta.locks().own_grant(g, 5, h.clk().wait).is_some());
+        assert_eq!(probe(&mut h, 3, g), (false, false), "granted beside it");
+    }
+
+    /// Liveness of the same: a renewal sent after the growth, answered
+    /// granting, lets the locks in even when a lane renewal was registered
+    /// late.
+    #[test]
+    fn a_renewal_sent_after_a_late_lane_registration_lets_the_locks_in() {
+        use constellation_meta::SubtreeKind;
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (_, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (_, first, round) = renewal_of_7(&out).expect("no renewal on install");
+        h.advance(2);
+        h.step(renewed_answer(1, first, round, 20_000, Vec::new()));
+        assert_eq!(probe(&mut h, 1, f), (false, true), "not served");
+        h.advance(10);
+        let lane_sent_at = h.honour();
+        h.advance(5);
+        let (e, g, out) = grow_stream(&mut h, SubtreeKind::Placed);
+        let (_, s_grow, _) = renewal_of_7(&out).expect("no renewal sent for the growth");
+        h.advance(5);
+        h.step(lane_sent(&h, 1, lane_sent_at));
+        // The renewal for the growth is answered first, with the handoff.
+        h.advance(5);
+        let wire = handoff_wire(&h, 5, 9, g);
+        h.step(renewed_answer(1, s_grow, round, 20_000, vec![wire]));
+        assert!(!h.core.dl.mine[&7].grown.contains_key(&e), "still parked");
         assert!(h.meta.locks().own_grant(g, 5, h.clk().wait).is_some());
         assert_eq!(probe(&mut h, 2, g), (false, false), "granted beside it");
     }
@@ -42991,6 +43090,38 @@ fn deleg_unregistered_answers_do_not_keep_the_grant() {
     h.step(Event::Timer { id: old_lapse });
     assert_eq!(h.core.stats.deleg_lapsed, 1);
     assert!(h.core.dl.mine[&7].lapsed);
+}
+
+/// The late path counts an answer only from the root the request went to
+/// (`late.to`): a lane request's full answer from another root, which
+/// holds the lease by then, extends nothing; the same answer from the
+/// root it was sent to does.
+#[test]
+fn a_late_answer_from_another_root_does_not_count() {
+    let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+    h.advance(3_000);
+    let until = h.core.deleg_mine_until(7);
+    let sent = hm(t0.plus(2_500));
+    h.step(lane_sent(&h, 1, sent));
+    assert_eq!(h.core.deleg_late_reqs().len(), 1);
+    // Node 2 holds the lease now and answers the request node 1 got.
+    h.core.lease.cached_holder = Some(2);
+    let mut answer = lane_answer(&h, 1, 20_000);
+    if let Event::Peer { from, .. } = &mut answer {
+        *from = 2;
+    }
+    h.step(answer);
+    assert_eq!(
+        h.core.deleg_mine_until(7),
+        until,
+        "another root's answer counted"
+    );
+    assert!(h.core.dl.mine[&7].core_answer_sent.is_none());
+    // The same request answered by the root it went to counts.
+    h.core.lease.cached_holder = Some(1);
+    h.step(lane_sent(&h, 2, sent));
+    h.step(lane_answer(&h, 2, 20_000));
+    assert_eq!(h.core.deleg_mine_until(7), Some(sent.plus(20_000 - 1_000)));
 }
 
 /// The registration is the only thing the lane does to the core: a
