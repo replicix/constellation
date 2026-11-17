@@ -895,11 +895,21 @@ escalation had asked while the link was down. Three rules follow.
   name the body dropped.
 - A name an inbox batch gave (`wants_lease`, no S3 record) expires at half
   the wanted grace (and no more than the escalation window) after the last
-  batch, with the grace it started. A single batch of a detour can then never
-  carry the grace to its end. The durable signal of sustained demand is the
-  body registration, which the escalation's acquisition renews at least every
-  `escalate_retry_ms`; a note that lapses between sparse batches cannot starve
-  a genuine wanter.
+  batch, with the grace it started. A single batch of a detour cannot then
+  carry the grace to its end by itself; the one window left is a holder round
+  that releases between the end of a long escalation and the landing of its
+  withdrawal (one S3 read and one swap). The durable signal of sustained demand
+  is the body registration: it stands until withdrawn, and the escalation's
+  acquisition adds it again within `escalate_retry_ms` when it is missing; a
+  note that lapses between sparse batches cannot starve a genuine wanter.
+- A registration is tracked by a generation. A withdrawal acts only on the
+  generation it started with: an answer that comes after a newer registration
+  (a new escalation that began, registered and maybe ended meanwhile) leaves
+  that registration's state alone, and its own escalation's end withdraws it.
+  An escalation that finds its name already listed (a registration whose
+  answer timed out and landed late) claims it, unless another acquisition of
+  the node owns it; after a registration that timed out in doubt the
+  withdrawal reads once more, after a wait, before it calls the name gone.
 
 Who holds the lease is still decided by CAS and TTL alone; none of this writes
 a holder field.

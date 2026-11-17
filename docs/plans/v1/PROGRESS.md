@@ -70211,10 +70211,21 @@ note), so one batch of a detour cannot carry the grace it started to its end (th
 longer of window and grace, which still moved the lease one grace after the first batch). Why both: the registration
 lives in the S3 lease body, which only its owner may edit, while the batch flag is a live signal with no S3 record, so a
 withdrawal write cannot reach it. A requester whose demand continues keeps the registration (the batches' names may lapse
-between sparse batches or polls; the registration is the durable signal, renewed by the acquisition at least every
+between sparse batches or polls; the registration is the durable signal, which stands until withdrawn and is added again by the acquisition within
 `escalate_retry_ms`). ADR-24's amendment records the rules. Tests: `an_ended_escalation_takes_its_name_out_of_wanted_by`,
 `a_withdrawal_that_finds_no_name_swaps_nothing`, `a_withdrawal_waits_for_the_registration_swap_in_flight`,
 `a_withdrawal_read_overtaken_by_a_new_escalation_swaps_nothing`, `a_withdrawal_that_failed_is_tried_again_and_gives_up`,
 `a_withdrawal_leaves_the_name_another_acquisition_wants`, `a_single_wants_lease_batch_does_not_move_the_lease_a_grace_later`
 (core), `a_withdrawn_wanted_by_name_is_forgotten_at_the_next_read`, `a_batch_named_wanter_lasts_only_while_its_batches_continue`,
 `one_batch_does_not_hand_the_lease_over_a_grace_later` (lease state).
+
+Follow-up (leaseesc round 3): a registration generation (`WantedReg::generation`). A withdrawal acts only on the
+generation it started with; an answer that comes after a newer registration (a new escalation that began, registered
+and maybe ended while the read or swap was out) leaves that registration's state alone, and its own end withdraws it
+(`a_withdrawal_swap_answered_after_a_new_registration_keeps_the_new_one`,
+`a_withdrawal_read_that_a_whole_new_escalation_overtook_keeps_the_new_one`). An escalation claims a name it finds listed
+unless another acquisition disowned it, and the withdrawal reads once more, after a wait, when a registration swap timed
+out in doubt (`an_escalation_claims_a_name_it_finds_listed`,
+`a_withdrawal_reads_again_after_a_registration_that_timed_out_in_doubt`,
+`a_withdrawal_read_swaps_nothing_for_a_name_that_was_disowned_meanwhile`); lease state
+`a_lapsed_note_keeps_the_grace_start_while_the_body_lists_the_name`.

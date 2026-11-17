@@ -3856,7 +3856,16 @@ impl Core {
                         out,
                     );
                     self.inbox.note_registering(escalating);
-                } else if !escalating && !offered {
+                } else if escalating {
+                    // The escalation finds its name listed (a registration
+                    // whose answer was lost, or which landed late, or
+                    // that an earlier withdrawal gave up on): it is the
+                    // escalation's to withdraw, unless another acquisition
+                    // of this node owns it.
+                    if prev.wanted_by.contains(&self.cfg.node_id) {
+                        self.inbox.claim_listed_wanted();
+                    }
+                } else if !offered {
                     // Another acquisition of this node wants the lease (or
                     // found its name listed): the name is no longer only
                     // an escalation's to withdraw.

@@ -4224,7 +4224,10 @@ impl Core {
             }
             S3For::RegisterWanted { escalation } => {
                 if escalation {
-                    self.inbox.wanted_registered();
+                    self.inbox.wanted_registered(matches!(
+                        result,
+                        S3Result::LeasePut(Err(CasFailure::Failed(_)))
+                    ));
                 }
             }
             S3For::WithdrawWantedGet(left) => self.on_withdraw_wanted_read(now, left, result, out),

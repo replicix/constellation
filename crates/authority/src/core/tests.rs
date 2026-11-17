@@ -2583,6 +2583,202 @@ fn a_withdrawal_leaves_the_name_another_acquisition_wants() {
     }
 }
 
+/// The demand returns: a new escalation begins (the window fills again).
+fn demand_returns(h: &mut Harness) {
+    for _ in 0..h.core.cfg.escalate_ops {
+        h.advance(10);
+        h.core.note_inbox_op(h.clk(), 50);
+    }
+    assert!(h.core.escalated(h.clk()), "the demand is back");
+}
+
+/// The holder's lease as a read now finds it: live, a fresh renewal.
+fn live_now(h: &Harness) -> Lease {
+    lease_of(1, 1, h.now.plus(10_000).0)
+}
+
+/// A new escalation's acquisition reads the live lease (answered at once)
+/// and, when the name is absent, registers: the registration swap,
+/// unanswered.
+fn new_escalation_registers(h: &mut Harness) -> OpId {
+    demand_returns(h);
+    let get = lone_get(&tick_ops(h));
+    let body = live_now(h);
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((body, tag())))),
+    });
+    match s3_ops(&out)
+        .into_iter()
+        .find(|(_, op)| matches!(op, S3Op::LeaseSwap { lease, .. } if lease.wanted_by.contains(&2)))
+    {
+        Some((op, _)) => op,
+        None => panic!("the new escalation registers: {out:?}"),
+    }
+}
+
+/// R1: the withdrawal's swap is answered after a new escalation registered
+/// its name. The answer says nothing of that registration: its escalation's
+/// end still withdraws it.
+#[test]
+fn a_withdrawal_swap_answered_after_a_new_registration_keeps_the_new_one() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    let swap = match s3_ops(&out)[..] {
+        [(op, S3Op::LeaseSwap { .. })] => op,
+        ref other => panic!("{other:?}"),
+    };
+    // The swap landed; the demand returns and registers again before its
+    // answer is processed.
+    let second = new_escalation_registers(&mut h);
+    h.step(Event::S3 {
+        op: swap,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    registration_lands(&mut h, second);
+    demand_falls(&mut h);
+    h.advance(1_000);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    assert!(
+        matches!(s3_ops(&out)[..], [(_, S3Op::LeaseSwap { .. })]),
+        "the new registration was left in the lease: {out:?}"
+    );
+}
+
+/// R1: a whole new escalation starts, registers and ends while the
+/// withdrawal's read is out; the read predates its registration.
+#[test]
+fn a_withdrawal_read_that_a_whole_new_escalation_overtook_keeps_the_new_one() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let old_get = lone_get(&tick_ops(&mut h));
+    let second = new_escalation_registers(&mut h);
+    registration_lands(&mut h, second);
+    demand_falls(&mut h);
+    assert!(
+        tick_ops(&mut h).is_empty(),
+        "the first withdrawal is still out"
+    );
+    // The old read answers: no name (it predates the registration).
+    let out = h.step(Event::S3 {
+        op: old_get,
+        result: S3Result::LeaseGet(Ok(Some((live.clone(), tag())))),
+    });
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    h.advance(1_000);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    assert!(
+        matches!(s3_ops(&out)[..], [(_, S3Op::LeaseSwap { .. })]),
+        "the new registration was left in the lease: {out:?}"
+    );
+}
+
+/// R2: a registration swap that timed out in doubt lands after the
+/// withdrawal's read. The withdrawal reads once more after a wait.
+#[test]
+fn a_withdrawal_reads_again_after_a_registration_that_timed_out_in_doubt() {
+    use crate::event::CasFailure;
+    let (mut h, live, register) = registered_escalation();
+    h.step(Event::S3 {
+        op: register,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timeout".into()))),
+    });
+    demand_falls(&mut h);
+    h.advance(300);
+    let get = lone_get(&tick_ops(&mut h));
+    // The swap has not landed yet.
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.clone(), tag())))),
+    });
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    assert!(tick_ops(&mut h).is_empty(), "it waits");
+    // It lands; the one more read finds the name and withdraws it.
+    h.advance(1_100);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    assert!(
+        matches!(s3_ops(&out)[..], [(_, S3Op::LeaseSwap { .. })]),
+        "{out:?}"
+    );
+}
+
+/// R2: a name the escalation finds listed in the lease and that no other
+/// acquisition owns is the escalation's to withdraw.
+#[test]
+fn an_escalation_claims_a_name_it_finds_listed() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    // The withdrawal's read found nothing (the registration was in doubt
+    // and landed late): it is over.
+    let get = lone_get(&tick_ops(&mut h));
+    h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.clone(), tag())))),
+    });
+    // The next escalation finds the name listed: it registers nothing.
+    demand_returns(&mut h);
+    let get = lone_get(&tick_ops(&mut h));
+    let listed = live_now(&h).wanting(2);
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((listed, tag())))),
+    });
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .all(|(_, op)| !matches!(op, S3Op::LeaseSwap { .. })),
+        "{out:?}"
+    );
+    // Its end withdraws the name.
+    demand_falls(&mut h);
+    h.advance(1_000);
+    let get = lone_get(&tick_ops(&mut h));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    assert!(
+        matches!(s3_ops(&out)[..], [(_, S3Op::LeaseSwap { .. })]),
+        "the listed name stayed: {out:?}"
+    );
+}
+
+/// The withdrawal's read that finds another acquisition took the name over
+/// (it ran and ended while the read was out) swaps nothing.
+#[test]
+fn a_withdrawal_read_swaps_nothing_for_a_name_that_was_disowned_meanwhile() {
+    let (mut h, live, register) = registered_escalation();
+    registration_lands(&mut h, register);
+    demand_falls(&mut h);
+    let get = lone_get(&tick_ops(&mut h));
+    h.core.inbox.disown_wanted();
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((live.wanting(2), tag())))),
+    });
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+}
+
 /// What [`drive_job`] saw.
 #[derive(Default)]
 struct Driven {

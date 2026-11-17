@@ -63,6 +63,10 @@ const WITHDRAW_RETRIES: u8 = 4;
 const WITHDRAW_MAX_FAILURES: u8 = 4;
 /// The first backoff after a failed attempt, doubling per failure.
 const WITHDRAW_BACKOFF_MS: u64 = 500;
+/// The least a withdrawal waits, after a registration swap that timed out in
+/// doubt, before it reads the lease once more (the swap may still land).
+/// The request timeout counts when it is longer.
+const WITHDRAW_SETTLE_MS: u64 = 1_000;
 
 /// A batch this tenure executed, paired with the journal seq its last
 /// row landed at (deletable once that seq has shipped).
@@ -123,6 +127,22 @@ struct WantedReg {
     /// node wants the lease too: the name is then not the escalation's
     /// alone to withdraw.
     posted: bool,
+    /// The name is another acquisition's (it registered it or found it
+    /// listed): an escalation that finds the name listed does not claim it.
+    /// Cleared when the escalation's own swap registers the name, and when
+    /// a withdrawal ends.
+    disowned: bool,
+    /// The registration generation: moves at every registration the
+    /// escalation makes or claims. A withdrawal acts on the generation it
+    /// recorded when it started (`withdrawing_gen`) and leaves the state of
+    /// a newer one to that registration's own escalation.
+    generation: u64,
+    /// The generation the withdrawal in flight withdraws.
+    withdrawing_gen: u64,
+    /// A registration swap timed out in doubt: it may still land after a
+    /// read that finds no name, so the withdrawal reads once more after a
+    /// wait.
+    in_doubt: bool,
     /// The escalation's `RegisterWanted` swaps still in flight. A read of
     /// the lease answered before one lands would find no name, and the
     /// swap landing later would leave it for the holder's whole tenure.
@@ -232,22 +252,41 @@ impl InboxState {
     /// escalation's to withdraw).
     pub(crate) fn note_registering(&mut self, escalation: bool) {
         if escalation {
-            self.wanted_reg.posted = true;
-            self.wanted_reg.registering += 1;
+            let reg = &mut self.wanted_reg;
+            reg.posted = true;
+            reg.disowned = false;
+            reg.generation += 1;
+            reg.registering += 1;
         } else {
             self.disown_wanted();
         }
     }
 
-    /// An escalation's `RegisterWanted` swap was answered.
-    pub(crate) fn wanted_registered(&mut self) {
-        self.wanted_reg.registering = self.wanted_reg.registering.saturating_sub(1);
+    /// An escalation's `RegisterWanted` swap was answered; `in_doubt` when
+    /// it timed out (it may or may not land).
+    pub(crate) fn wanted_registered(&mut self, in_doubt: bool) {
+        let reg = &mut self.wanted_reg;
+        reg.registering = reg.registering.saturating_sub(1);
+        reg.in_doubt |= in_doubt;
+    }
+
+    /// An escalation's acquisition finds its name listed in the lease: the
+    /// name is the escalation's to withdraw (a registration whose answer
+    /// was lost, or whose withdrawal gave up), unless another acquisition
+    /// of this node owns it.
+    pub(crate) fn claim_listed_wanted(&mut self) {
+        let reg = &mut self.wanted_reg;
+        if !reg.disowned && !reg.posted {
+            reg.posted = true;
+            reg.generation += 1;
+        }
     }
 
     /// Another acquisition of this node wants the lease: the name is not
     /// only the escalation's, and its end does not withdraw it.
     pub(crate) fn disown_wanted(&mut self) {
         self.wanted_reg.posted = false;
+        self.wanted_reg.disowned = true;
     }
 
     /// The number of takeover-drain batches still waiting to be re-read.
@@ -1147,12 +1186,12 @@ impl Core {
 
     /// How long a name an inbox batch gave stands without another batch:
     /// strictly below the wanted grace (half of it, and no more than the
-    /// escalation window), so that one batch of a detour that ended can
-    /// never carry the grace it started to its end. A name the lease body
+    /// escalation window), so that one batch of a detour that ended cannot
+    /// carry the grace it started to its end by itself. A name the lease body
     /// lists (an acquisition's registration, durable until its owner
     /// withdraws it) is the holder's durable signal of sustained demand:
-    /// the escalation's acquisition re-registers it at least every
-    /// `escalate_retry_ms` while the demand lasts, so a note that lapses
+    /// it stands while the demand lasts, and the escalation's acquisition
+    /// adds it again within `escalate_retry_ms` if it is missing, so a note that lapses
     /// between sparse batches or polls cannot starve a genuine wanter.
     pub(crate) fn noted_ttl(&self) -> u64 {
         self.cfg
@@ -1187,8 +1226,10 @@ impl Core {
             self.arm_withdraw_tick(now, out);
             return;
         }
-        self.inbox.wanted_reg.withdrawing = true;
-        self.inbox.wanted_reg.retry_at = None;
+        let reg = &mut self.inbox.wanted_reg;
+        reg.withdrawing = true;
+        reg.withdrawing_gen = reg.generation;
+        reg.retry_at = None;
         self.issue_s3(
             S3Op::LeaseGet,
             S3For::WithdrawWantedGet(WITHDRAW_RETRIES),
@@ -1243,9 +1284,39 @@ impl Core {
         self.arm_withdraw_tick(now, out);
     }
 
-    /// The withdrawal is over (done, or nothing to do).
+    /// The withdrawal is over (done, or nothing to do): nothing of this
+    /// node is registered, and nothing is left to withdraw. Only for an
+    /// answer of the generation the withdrawal started with.
     fn withdraw_done(&mut self) {
-        self.inbox.wanted_reg = WantedReg::default();
+        self.inbox.wanted_reg = WantedReg {
+            generation: self.inbox.wanted_reg.generation,
+            ..WantedReg::default()
+        };
+    }
+
+    /// The withdrawal ends without touching what is registered: the name is
+    /// not the escalation's (another acquisition disowned it).
+    fn withdraw_ended(&mut self) {
+        let reg = &mut self.inbox.wanted_reg;
+        reg.withdrawing = false;
+        reg.failures = 0;
+        reg.retry_at = None;
+        reg.gave_up = false;
+        reg.in_doubt = false;
+    }
+
+    /// A registration of a newer generation was made or claimed since the
+    /// withdrawal started (a new escalation, which may have begun and ended
+    /// while its read or swap was out): its answer says nothing about that
+    /// registration. Drop the withdrawal, keep the registration's state
+    /// (its own escalation's end withdraws it) and try again if no
+    /// escalation is on.
+    fn withdraw_superseded(&mut self, now: Now, out: &mut Vec<Action>) {
+        let reg = &mut self.inbox.wanted_reg;
+        reg.withdrawing = false;
+        reg.failures = 0;
+        reg.retry_at = None;
+        self.arm_withdraw_tick(now, out);
     }
 
     /// The read of [`Self::withdraw_wanted`].
@@ -1256,6 +1327,10 @@ impl Core {
         result: S3Result,
         out: &mut Vec<Action>,
     ) {
+        if self.inbox.wanted_reg.generation != self.inbox.wanted_reg.withdrawing_gen {
+            self.withdraw_superseded(now, out);
+            return;
+        }
         let (lease, tag) = match result {
             S3Result::LeaseGet(Ok(Some(found))) => found,
             S3Result::LeaseGet(Ok(None)) => {
@@ -1278,8 +1353,25 @@ impl Core {
             self.arm_withdraw_tick(now, out);
             return;
         }
+        // Another acquisition took the name over while the read was out
+        // (it ran and ended in that time): nothing to withdraw.
+        if !self.inbox.wanted_reg.posted {
+            self.withdraw_ended();
+            return;
+        }
         let me = self.cfg.node_id;
         if lease.holder == me || lease.released || !lease.wanted_by.contains(&me) {
+            // A registration swap that timed out in doubt may still land:
+            // read once more after a wait before calling it done.
+            if self.inbox.wanted_reg.in_doubt && lease.holder != me && !lease.released {
+                let reg = &mut self.inbox.wanted_reg;
+                reg.in_doubt = false;
+                reg.withdrawing = false;
+                let settle = WITHDRAW_SETTLE_MS.max(self.cfg.s3_request_timeout_ms);
+                self.inbox.wanted_reg.retry_at = Some(now.wait.plus(settle));
+                self.arm_withdraw_tick(now, out);
+                return;
+            }
             self.withdraw_done();
             return;
         }
@@ -1305,6 +1397,10 @@ impl Core {
         result: S3Result,
         out: &mut Vec<Action>,
     ) {
+        if self.inbox.wanted_reg.generation != self.inbox.wanted_reg.withdrawing_gen {
+            self.withdraw_superseded(now, out);
+            return;
+        }
         match result {
             S3Result::LeasePut(Ok(_)) => self.withdraw_done(),
             S3Result::LeasePut(Err(CasFailure::Conflict)) if left > 0 => {

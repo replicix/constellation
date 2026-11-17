@@ -2172,4 +2172,35 @@ mod tests {
         st.note_wanted(late, 9, ttl);
         assert_eq!(st.wanted_since, Some(late.wait));
     }
+
+    /// The body registration is the durable signal: a batch note that lapses
+    /// while the body lists the name leaves the grace running, and the
+    /// holder hands over once it elapsed; when the owner's withdrawal
+    /// removes the name from the body, nobody waits.
+    #[test]
+    fn a_lapsed_note_keeps_the_grace_start_while_the_body_lists_the_name() {
+        let mut cfg = cfg();
+        cfg.dwell_ms = 1_000;
+        cfg.idle_release_ms = 600_000;
+        cfg.wanted_grace_ms = 4_000;
+        let ttl = cfg.wanted_grace_ms / 2;
+        let t0 = Now::same(1_000_000);
+        let mut st = LeaseState::default();
+        let lease = st.granted_lease(t0, &cfg, None, false, false);
+        st.adopt(t0, lease.clone(), tag(), None);
+        st.renewed(t0.plus(500), lease.wanting(9), tag());
+        let since = st.wanted_since;
+        assert!(since.is_some(), "the body's name starts the grace");
+        st.note_wanted(t0.plus(600), 9, ttl);
+        // The note lapses; the body still lists the name.
+        let lapsed = t0.plus(600 + ttl + 1);
+        st.expire_noted(lapsed, ttl);
+        assert_eq!(st.wanted, vec![9]);
+        assert_eq!(st.wanted_since, since, "the grace start is kept");
+        assert!(st.wants_handoff(t0.plus(500 + cfg.wanted_grace_ms + 1), &cfg));
+        // The owner withdrew: the body without the name, nobody waits.
+        st.renewed(t0.plus(500 + cfg.wanted_grace_ms), lease, tag());
+        assert!(st.wanted.is_empty() && st.wanted_since.is_none());
+        assert!(!st.wants_handoff(t0.plus(60_000), &cfg));
+    }
 }
