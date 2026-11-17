@@ -746,7 +746,8 @@ pub(crate) struct DelegateState {
     /// for a growth) and then for a granting answer to a renewal sent after
     /// that (`Some(after)`: a granting answer to a renewal sent after `after`
     /// counts; it carries the lock handoff and has waited for the read
-    /// delegations under the new subtree).
+    /// delegations under the new subtree). A lane renewal's registration
+    /// ([`Core::on_deleg_renew_sent_off_core`]) can raise a `Some` bound.
     pub grown: BTreeMap<Ino, Option<HonourMs>>,
     /// Subtrees a non-stealable stream honours for its ops but grants no
     /// lock in yet: those it grew by (honoured at the commit, without a
@@ -755,7 +756,8 @@ pub(crate) struct DelegateState {
     /// there to the stream's handoff, which comes with a granting answer to
     /// a renewal sent after the time kept here
     /// ([`Core::deleg_unpark_grown`]); a renewal that timed out and sits in
-    /// `late` counts as sent before it. Granting before it, the delegate did
+    /// `late` counts as sent before it. A lane renewal's registration can
+    /// raise the time kept. Granting before it, the delegate did
     /// not know the grants the root had made there (sim
     /// `locks-root-own-unlinked-partition-nocrash` seed 260: a handover of the
     /// root's own sticky `d1` grew node 2's sticky stream, and node 2 granted
@@ -8292,7 +8294,10 @@ impl Core {
     /// The off-core lane sent renewal `req` of `gen` (stream round `round`)
     /// to `to` at `sent` (this node's clock, read before the request was
     /// handed to the transport): its answer counts as a late answer does
-    /// ([`LateReq`]), honoured from that send, and nothing else changes.
+    /// ([`LateReq`]), honoured from that send. The registration also raises
+    /// every `grown` `Some(t)` and `lock_wait` bound of `gen` to at least
+    /// `sent`, so that an answer to a lane renewal sent before the grow's
+    /// handoff can never let locks in; nothing else changes.
     ///
     /// The lane exists for a core stuck in a step (a priority metadata
     /// write waiting for the store's writer lock behind a slow journal
@@ -8352,8 +8357,8 @@ impl Core {
             return;
         }
         d.last_renew_sent = d.last_renew_sent.max(sent);
-        // The core cannot order this send against the growth it learned in
-        // the step that just ended: a bound `deleg_sync_growth` took
+        // The core cannot order this send against a growth it learned in
+        // an earlier step: a bound `deleg_sync_growth` took
         // without this request must not be below its send, or its granting
         // answer (computed before the root handed the subtree's grants
         // over) would let the locks in early. Liveness only: the renewal
