@@ -935,10 +935,17 @@ impl Meta {
         }
     }
 
-    /// The clock the hold's age is read on, ms: the node's wait clock (the
-    /// lock table's, the simulation's virtual one there), or a monotonic host
-    /// clock where none is set (unit tests).
+    /// The clock the hold's age is read on, ms: [`Self::wait_clock_ms`].
     pub fn held_copy_now_ms(&self) -> i64 {
+        self.wait_clock_ms()
+    }
+
+    /// The node's wait clock in ms: the lock table's (the daemon's monotonic
+    /// protocol clock, the simulation's virtual one there), or a monotonic
+    /// host clock where none is set (unit tests). Every duration a store
+    /// reports into the core's statistics reads this clock, never the host's
+    /// directly, so a simulated run's numbers do not depend on machine load.
+    pub fn wait_clock_ms(&self) -> i64 {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         match self.locks().clock_now() {
             Some(now) => now.wait.0,

@@ -770,6 +770,14 @@ thread_local! {
     static FAIL_RESHIP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_STRAND_APPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_RESHIP_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DELAY_RESHIP_BEFORE_COMMIT_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: the next re-ship's transaction on this thread sleeps this many
+/// real milliseconds just before it commits (a slow writer on a loaded host).
+#[cfg(any(test, feature = "test-util"))]
+pub fn delay_next_reship_before_commit_on_this_thread_for_tests(ms: u64) {
+    DELAY_RESHIP_BEFORE_COMMIT_MS.with(|c| c.set(ms));
 }
 
 /// Test hook: the next re-ship's transaction on this thread fails after the
@@ -6897,7 +6905,7 @@ impl Meta {
             }))
         .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
-        let held_since = std::time::Instant::now();
+        let held_since_ms = self.wait_clock_ms();
         let staged = UsageTracker::staging();
         let mut report = ReshipReport::default();
         let mut part = StrandPart::default();
@@ -7270,6 +7278,13 @@ impl Meta {
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         #[cfg(any(test, feature = "test-util"))]
+        {
+            let ms = DELAY_RESHIP_BEFORE_COMMIT_MS.with(|c| c.replace(0));
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+        #[cfg(any(test, feature = "test-util"))]
         if FAIL_RESHIP_BEFORE_COMMIT.with(|c| c.replace(false)) {
             return Err(MetaError::Io(std::io::Error::other(
                 "injected re-ship commit fault (testing only)",
@@ -7295,7 +7310,7 @@ impl Meta {
                 tracing::warn!(%error, "the member copy flag could not be refreshed after the gate's marker rules");
             }
         }
-        report.hold_ms = u64::try_from(held_since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        report.hold_ms = u64::try_from(self.wait_clock_ms() - held_since_ms).unwrap_or(0);
         for (gen, cut) in part.orphan_cuts {
             tracing::info!(
                 gen = %crate::delegation::GenLabel::of(gen),

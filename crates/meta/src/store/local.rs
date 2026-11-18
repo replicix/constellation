@@ -4611,6 +4611,42 @@ mod verbatim_append_tests {
         .unwrap();
     }
 
+    /// The re-ship's `hold_ms` (the core's `reship_duration_ms_max`) reads the
+    /// node's wait clock, not the host's: with the clock fixed, a writer that
+    /// takes 20 ms of real time still holds 0 ms (fail-before: the host
+    /// `Instant` reported >= 20, so a simulated run's fingerprint varied with
+    /// machine load).
+    #[test]
+    fn reship_hold_ms_reads_the_wait_clock() {
+        use crate::store::spec::TailArgs;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.locks().set_clock(std::sync::Arc::new(|| {
+            constellation_types::clock::Now::same(1_000)
+        }));
+        let tail = crate::BackupTx {
+            first: 1,
+            last: 1,
+            records: vec![create("t", 9), LogRecord::Completed { rid: rid(9) }],
+            origin: (0, 0),
+        };
+        meta.backup_append(1, std::slice::from_ref(&tail)).unwrap();
+        crate::store::spec::delay_next_reship_before_commit_on_this_thread_for_tests(20);
+        let start = std::time::Instant::now();
+        let report = meta
+            .reship_at_takeover(
+                None,
+                Some(TailArgs {
+                    epoch: 1,
+                    through: 1,
+                    config_version: 3,
+                    class: None,
+                }),
+            )
+            .unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(20));
+        assert_eq!(report.hold_ms, 0, "{report:?}");
+    }
+
     /// Review M1.2 S3 (plan 43 C3 item 3): the re-ship puts this node's own
     /// delegate rows back after the tail in its own transaction. A fault after
     /// the tail and the re-append, before the commit, leaves the journal, the
