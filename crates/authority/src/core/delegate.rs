@@ -2406,12 +2406,103 @@ impl Core {
     /// ([`Replica::reaches_streams`]): the root rows an op rests on are
     /// [`Self::own_honoured`]'s premise (R-H), the stream's own rows the
     /// replica's, and a premise lost with its generation is not reached.
+    #[cfg(test)]
     pub(crate) fn stream_deps_reached(
         &self,
         gen: u64,
         deps: &Position,
         replica: &dyn Replica,
     ) -> bool {
+        self.stream_deps_reached_for(gen, deps, replica, None)
+    }
+
+    /// [`Self::stream_deps_reached`] for the op `(wait-clock ms now, from,
+    /// rid)`, whose time under a binding cap is tallied ([`Stats::deps_cap_open`]
+    /// and the fields beside it).
+    pub(crate) fn stream_deps_reached_for(
+        &self,
+        gen: u64,
+        deps: &Position,
+        replica: &dyn Replica,
+        op: Option<(i64, NodeId, Rid)>,
+    ) -> bool {
+        self.last_cap_bound
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let reached = self.stream_deps_reached_inner(gen, deps, replica);
+        if let Some((at, from, rid)) = op {
+            let strands = self.stats.local_rolled_back + self.stats.rows_member_copied;
+            let capped = !reached
+                && self
+                    .last_cap_bound
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut ops) = self.deps_cap_ops.lock() {
+                if capped {
+                    ops.open.entry((from, rid)).or_insert((at, strands));
+                } else if reached {
+                    if let Some((first, then)) = ops.open.remove(&(from, rid)) {
+                        ops.done.push((
+                            at.saturating_sub(first).max(0) as u64,
+                            u8::from(strands == then),
+                        ));
+                    }
+                }
+            }
+        }
+        reached
+    }
+
+    /// Fold the ops the cap let go since the last call into [`Stats`], and
+    /// the ones it held that no longer wait in a parked list (`at`: the wait
+    /// clock now).
+    pub(crate) fn fold_deps_cap_ops(&mut self, at: i64) {
+        let Ok(mut ops) = self.deps_cap_ops.lock() else {
+            return;
+        };
+        if !ops.open.is_empty() {
+            let parked: std::collections::HashSet<(NodeId, Rid)> = self
+                .dl
+                .mine
+                .values()
+                .flat_map(|d| d.parked.iter().map(|p| (p.from, p.rid)))
+                .collect();
+            let left: Vec<(NodeId, Rid)> = ops
+                .open
+                .keys()
+                .filter(|k| !parked.contains(*k))
+                .copied()
+                .collect();
+            for key in left {
+                if let Some((first, _)) = ops.open.remove(&key) {
+                    ops.done.push((at.saturating_sub(first).max(0) as u64, 2));
+                }
+            }
+        }
+        for (ms, class) in ops.done.drain(..) {
+            let (n, total, max) = match class {
+                0 => (
+                    &mut self.stats.deps_cap_ops_stranded,
+                    &mut self.stats.deps_cap_ms_stranded,
+                    &mut self.stats.deps_cap_max_ms_stranded,
+                ),
+                1 => (
+                    &mut self.stats.deps_cap_ops_shipped,
+                    &mut self.stats.deps_cap_ms_shipped,
+                    &mut self.stats.deps_cap_max_ms_shipped,
+                ),
+                _ => (
+                    &mut self.stats.deps_cap_ops_left,
+                    &mut self.stats.deps_cap_ms_left,
+                    &mut self.stats.deps_cap_max_ms_left,
+                ),
+            };
+            *n += 1;
+            *total += ms;
+            *max = (*max).max(ms);
+        }
+        self.stats.deps_cap_open = ops.open.len() as u64;
+    }
+
+    fn stream_deps_reached_inner(&self, gen: u64, deps: &Position, replica: &dyn Replica) -> bool {
         if self.is_own_stream(gen) && self.root_tenure() {
             replica.reaches_streams(deps) && !replica.deps_lost(deps)
         } else {
@@ -2430,6 +2521,8 @@ impl Core {
             if !reached && replica.reaches(deps) {
                 self.deps_capped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.last_cap_bound
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             reached
         }
@@ -4309,7 +4402,7 @@ impl Core {
         // The model's rule 1: the delegate waits for `deps` too.
         let reaches = settle_like
             || self.cfg.skip_deleg_dep_wait
-            || self.stream_deps_reached(gen, &deps, replica);
+            || self.stream_deps_reached_for(gen, &deps, replica, Some((now.wait.0, from, rid)));
         // Phase 2b (M8): the read delegations this delegate granted on
         // what the op touches are recalled first.
         let recalling = !settle_like
@@ -6645,7 +6738,12 @@ impl Core {
                 .filter(|(_, p)| {
                     p.settle
                         || (!quarantined
-                            && self.stream_deps_reached(gen, &p.deps, replica)
+                            && self.stream_deps_reached_for(
+                                gen,
+                                &p.deps,
+                                replica,
+                                Some((now.wait.0, p.from, p.rid)),
+                            )
                             && !self.gated_by_queue(p.from, p.rid, &p.op, replica)
                             && !(p.held
                                 && self.sticky_holds(

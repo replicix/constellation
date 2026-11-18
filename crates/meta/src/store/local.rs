@@ -1743,9 +1743,14 @@ impl Meta {
 
     /// The tip, lowered to the unshipped journal's heads: after a strand took
     /// rows out, so a node whose appends are gone is on the one-load fast
-    /// path again. Called from the core's thread, the one that journals the
-    /// appends (a concurrent raise could be lost).
+    /// path again. Appends are journaled on the core's thread, which is also
+    /// the caller. The store is a `compare_exchange` against the value read
+    /// before the journal scan, so a raise from another thread in between
+    /// wins and leaves the tip high: a high tip only costs a scan, a lost
+    /// raise would hide an unshipped append from `unshipped_append_cap`.
     pub(crate) fn lower_holder_append_tip(&self) -> Result<(), MetaError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let old = self.holder_append_tip.load(SeqCst);
         let r = self.db.read_tx();
         let tip = read_journal_tx_heads(&r, self)?
             .into_iter()
@@ -1753,8 +1758,9 @@ impl Meta {
             .map(|(_, h)| h.last)
             .max()
             .unwrap_or(0);
-        self.holder_append_tip
-            .store(tip, std::sync::atomic::Ordering::SeqCst);
+        let _ = self
+            .holder_append_tip
+            .compare_exchange(old, tip, SeqCst, SeqCst);
         Ok(())
     }
 

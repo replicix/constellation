@@ -10135,6 +10135,16 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "member_copies_dropped",
             "member_copies_abandoned",
             "deps_capped",
+            "deps_cap_ops_stranded",
+            "deps_cap_ms_stranded",
+            "deps_cap_max_ms_stranded",
+            "deps_cap_ops_shipped",
+            "deps_cap_ms_shipped",
+            "deps_cap_max_ms_shipped",
+            "deps_cap_ops_left",
+            "deps_cap_ms_left",
+            "deps_cap_max_ms_left",
+            "deps_cap_open",
             "tails_kept_as_member_copy",
             "rows_member_copied",
             "archive_dropped",
@@ -10330,6 +10340,10 @@ struct OracleTotals {
     /// queued with a gated class (counted), own `Archive` rows of an older
     /// epoch the takeover gate dropped].
     c14: [u64; 14],
+    /// Fix 1810: [ops the cap held then a strand came between, their summed
+    /// held ms, max; the same with none (shipped); the same for ops that left
+    /// the parked list unreached; ops still held].
+    cap_ops: [u64; 10],
     /// ADR-57: [reads a read hold touched, of them answered without the
     /// held row (violations), delegate rows a recall dropped, of them
     /// acknowledged and lost (violations)].
@@ -10489,6 +10503,18 @@ impl OracleTotals {
         self.c14[11] += r.identity_foreign_gated as u64;
         self.c14[12] += r.archive_dropped();
         self.c14[13] += r.stats.values().map(|st| st.deps_capped).sum::<u64>();
+        for st in r.stats.values() {
+            self.cap_ops[0] += st.deps_cap_ops_stranded;
+            self.cap_ops[1] += st.deps_cap_ms_stranded;
+            self.cap_ops[2] = self.cap_ops[2].max(st.deps_cap_max_ms_stranded);
+            self.cap_ops[3] += st.deps_cap_ops_shipped;
+            self.cap_ops[4] += st.deps_cap_ms_shipped;
+            self.cap_ops[5] = self.cap_ops[5].max(st.deps_cap_max_ms_shipped);
+            self.cap_ops[6] += st.deps_cap_ops_left;
+            self.cap_ops[7] += st.deps_cap_ms_left;
+            self.cap_ops[8] = self.cap_ops[8].max(st.deps_cap_max_ms_left);
+            self.cap_ops[9] += st.deps_cap_open;
+        }
         self.holds[0] += r.sessions.held_reads as u64;
         self.holds[1] += r.sessions.held_served as u64;
         self.holds[2] += r.recall_dropped as u64;
@@ -11179,6 +11205,23 @@ impl OracleTotals {
             self.c14[11],
             self.c14[12],
             self.c14[13]
+        );
+        eprintln!(
+            "SWEEP-CAP-OPS {label} seeds {}/{seeds}: distinct ops the unshipped-append cap held; \
+             let go after a strand: {} ops, {} ms held in all, max {} ms; let go with none (rows \
+             shipped): {} ops, {} ms, max {} ms; left the parked list unreached: {} ops, {} ms, max {} ms; \
+             still held at the end {}",
+            self.seeds,
+            self.cap_ops[0],
+            self.cap_ops[1],
+            self.cap_ops[2],
+            self.cap_ops[3],
+            self.cap_ops[4],
+            self.cap_ops[5],
+            self.cap_ops[6],
+            self.cap_ops[7],
+            self.cap_ops[8],
+            self.cap_ops[9]
         );
         eprintln!(
             "SWEEP-LEASE-TOTALS {label} seeds {}/{seeds}: ttl claims {} (of a live holder {} in \

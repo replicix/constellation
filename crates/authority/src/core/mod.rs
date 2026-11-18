@@ -2335,6 +2335,24 @@ pub struct Stats {
     /// the session would have reached and this node's own unshipped appends
     /// of the generation (`Core::unshipped_append_cap`) did not: the cap bound.
     pub deps_capped: u64,
+    /// Fix 1810: distinct ops the cap held (a first binding check each), and
+    /// the ms from that check to the first check that reached, split by what
+    /// came between: a strand of this node's unshipped appends (`stranded`),
+    /// or none (the rows shipped). The max is of one op.
+    pub deps_cap_ops_stranded: u64,
+    pub deps_cap_ms_stranded: u64,
+    pub deps_cap_max_ms_stranded: u64,
+    pub deps_cap_ops_shipped: u64,
+    pub deps_cap_ms_shipped: u64,
+    pub deps_cap_max_ms_shipped: u64,
+    /// The same for ops the cap held that left the parked list without a
+    /// check that passed (answered or redirected elsewhere, the generation
+    /// ended), ms to the event that noticed.
+    pub deps_cap_ops_left: u64,
+    pub deps_cap_ms_left: u64,
+    pub deps_cap_max_ms_left: u64,
+    /// Ops the cap holds now (gauge, set at every event).
+    pub deps_cap_open: u64,
     /// Plan 43 C1-4: this node's committed unshipped transactions moved to
     /// a member copy (a deposition, a takeover's strand) instead of queued.
     pub rows_member_copied: u64,
@@ -2836,6 +2854,16 @@ impl Timer {
 /// keys of, for forward replies' `base` (`Core::shipped_touches`).
 pub const SHIPPED_TOUCH_WINDOW: usize = 64;
 
+/// Fix 1810's sim statistic: the ops a binding unshipped-append cap holds
+/// ([`Core::stream_deps_reached_for`]) and the ones it let go since the last
+/// fold into [`Stats`], as `(held ms, class)`: 0 a strand came between, 1 none (shipped), 2 left
+/// the parked list unreached.
+#[derive(Default)]
+struct DepsCapOps {
+    open: std::collections::HashMap<(NodeId, Rid), (i64, u64)>,
+    done: Vec<(u64, u8)>,
+}
+
 pub struct Core {
     cfg: Config,
     next_op: u64,
@@ -3045,6 +3073,12 @@ pub struct Core {
     /// [`Stats::deps_capped`]'s tally, counted by the read-only dependency
     /// check and folded into `stats` at the end of each event.
     deps_capped: std::sync::atomic::AtomicU64,
+    /// The ops the cap holds now, keyed by `(from, rid)`: the wait-clock ms
+    /// of the first binding check and the strand tally then. Resolved into
+    /// `stats` by the check that reaches, at the end of the event.
+    deps_cap_ops: std::sync::Mutex<DepsCapOps>,
+    /// Set by the last dependency check when the cap was what bound.
+    last_cap_bound: std::sync::atomic::AtomicBool,
     pub stats: Stats,
 }
 
@@ -3148,6 +3182,8 @@ impl Core {
             clock: None,
             stopped: false,
             deps_capped: std::sync::atomic::AtomicU64::new(0),
+            deps_cap_ops: std::sync::Mutex::new(DepsCapOps::default()),
+            last_cap_bound: std::sync::atomic::AtomicBool::new(false),
             stats: Stats::default(),
             cfg,
         }
@@ -3395,6 +3431,7 @@ impl Core {
         self.stats.deps_capped += self
             .deps_capped
             .swap(0, std::sync::atomic::Ordering::Relaxed);
+        self.fold_deps_cap_ops(now.wait.0);
         let missed = replica.class_from_session().saturating_sub(from_session);
         if missed > 0 {
             self.stats.journal_class_from_session += missed;
@@ -5053,6 +5090,7 @@ impl Core {
         if self.epoch.open {
             self.epoch_probes = self.epoch_probes.saturating_add(1);
         }
+        self.retry_owed_strand(self.ship.next_seq, self.ship.max_epoch, replica);
         if self.job.is_some() {
             self.nudged = true;
             return;

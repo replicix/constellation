@@ -6602,7 +6602,12 @@ impl Meta {
         staged.drain_into(self.usage_tracker());
         // The strand took rows out of the journal: an appends' tip left above
         // the shipped watermark costs every dependency check a range scan.
-        self.lower_holder_append_tip()?;
+        // Best effort: the strand has committed, and a failed lowering only
+        // leaves the tip high (a scan), so it must not turn into an error
+        // that skips the caller's bookkeeping of the stranded rows.
+        if let Err(error) = self.lower_holder_append_tip() {
+            tracing::warn!(%error, "lowering the holder append tip after a strand failed");
+        }
         Ok(stranded)
     }
 

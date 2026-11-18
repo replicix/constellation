@@ -774,6 +774,25 @@ impl Core {
         Ok(())
     }
 
+    /// Retry the strand owed to a newer tenure, if one is owed: at every
+    /// applied foreign segment and at every poll, so a store error on a quiet
+    /// log does not leave the rows in the journal until the next segment.
+    pub(crate) fn retry_owed_strand(&mut self, seq: Seq, epoch: Epoch, replica: &dyn Replica) {
+        if !self.ship.strand_owed {
+            return;
+        }
+        if let Err(error) = self.strand_unshipped_appends(replica.applied_epoch(), replica) {
+            tracing::error!(
+                node = self.cfg.node_id,
+                seq,
+                epoch,
+                %error,
+                "stranding the unshipped appends of an older tenure failed; retried at \
+                 the next applied segment or poll"
+            );
+        }
+    }
+
     /// `Shipper::apply_decoded_segment`: own-segment recovery, epoch
     /// fencing, or a foreign apply that strands what it supersedes.
     pub(crate) fn apply_incoming(
@@ -944,19 +963,7 @@ impl Core {
             if seg.epoch > self.ship.max_epoch {
                 self.ship.strand_owed = true;
             }
-            if self.ship.strand_owed {
-                if let Err(error) = self.strand_unshipped_appends(replica.applied_epoch(), replica)
-                {
-                    tracing::error!(
-                        node = self.cfg.node_id,
-                        seq,
-                        epoch = seg.epoch,
-                        %error,
-                        "stranding the unshipped appends of an older tenure failed; \
-                         retried at the next applied segment"
-                    );
-                }
-            }
+            self.retry_owed_strand(seq, seg.epoch, replica);
             if seg.node != 0 && seg.epoch >= self.ship.max_epoch {
                 self.lease.name_holder(seg.node);
             }
