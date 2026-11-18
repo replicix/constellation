@@ -10030,6 +10030,19 @@ impl Core {
         else {
             return;
         };
+        // A cut of every subtree left in the stream releases the stream
+        // (`StreamReleased` covers the subtrees of earlier cuts too): it goes
+        // after their release rows, whose reads may still be out. The cut
+        // stays due; each release that journals runs the next.
+        if c.whole
+            && self
+                .dl
+                .mine
+                .get(&gen)
+                .is_some_and(|d| d.cuts.iter().any(|x| x.cut_row != cut_row))
+        {
+            return;
+        }
         if replica.stream_drop_pending(gen) {
             // The cut stays due: retried at the next stream event.
             self.stats.deleg_release_drop_pending += 1;
@@ -14521,6 +14534,7 @@ impl Core {
         }
         if self.release_row_journaled(gen, replica) {
             self.stats.claim_release_already += 1;
+            self.claim_drops_cuts(gen);
             return;
         }
         // (Unlike `release_subtrees`, a stopped or rebooted stream is no
@@ -14546,6 +14560,7 @@ impl Core {
         match replica.delegate_release(&records, gen, Position::ZERO) {
             Ok(row) => {
                 self.stats.claim_released += 1;
+                self.claim_drops_cuts(gen);
                 if let Some(d) = self.dl.mine.get(&gen) {
                     Self::note_sticky_end(
                         &mut self.stats,
@@ -14604,6 +14619,17 @@ impl Core {
                     "could not journal a claim's release row"
                 );
             }
+        }
+    }
+
+    /// ADR-63: the claim released the whole stream by its own row (ADR-60):
+    /// the subtrees of the cuts this node journaled as its holder are inside
+    /// it, and their release rows are never journaled. (A park that waits for
+    /// their reads finds no cut when it ends.)
+    fn claim_drops_cuts(&mut self, gen: u64) {
+        if let Some(d) = self.dl.mine.get_mut(&gen) {
+            self.stats.deleg_cut_left_to_claim += d.cuts.len() as u64;
+            d.cuts.clear();
         }
     }
 
@@ -16145,7 +16171,7 @@ impl Core {
                 let Some(d) = self.dl.mine.get_mut(&gen) else {
                     continue;
                 };
-                if d.stopped || d.release.is_some() {
+                if d.stopped || d.release.is_some() || !d.cuts.is_empty() {
                     // (Being released already: looked at again when it is done.)
                     soonest(tick);
                     continue;

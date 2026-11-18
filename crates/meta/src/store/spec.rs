@@ -7634,16 +7634,12 @@ impl Meta {
                     }
                 }
             }
-            // A claim's release row (ADR-60) has no rid and no op: nothing
-            // replays it, and it goes back verbatim like the rows below it.
+            // A claim's release row (ADR-60) or a holder's cut row (ADR-63)
+            // has no rid and no op: nothing replays it, and it goes back
+            // verbatim like the rows below it.
             let release_only = outcome.is_none()
                 && !row.records.is_empty()
-                && row.records.iter().all(|r| {
-                    matches!(
-                        r,
-                        LogRecord::StreamReleased { .. } | LogRecord::SubtreeReleased { .. }
-                    )
-                });
+                && row.records.iter().all(LogRecord::is_release_class);
             if halted
                 || ended.contains(&gen)
                 || !listed.contains(&gen)

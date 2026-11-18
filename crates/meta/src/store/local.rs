@@ -5332,6 +5332,134 @@ mod verbatim_append_tests {
         assert!(meta.pending_replays().unwrap().is_empty());
     }
 
+    /// ADR-63: a holder's cut row that the log does not carry yet is an own
+    /// row of this node's stranding gate, like a claim's release row: it has
+    /// no rid and nothing replays it, so the strand puts it back verbatim
+    /// behind the rows below it. Fails when only the release rows are let
+    /// through: the re-append halts at the cut, marks the generation
+    /// replayed (a claim then releases it rowless), and leaves the cut to
+    /// the replay by rid, which has nothing to replay.
+    #[test]
+    fn a_cut_row_goes_back_verbatim_at_a_stranding_gate() {
+        use crate::store::spec::{StrandArgs, TailArgs};
+        const GEN: u64 = 7;
+        let meta = Meta::open_in_memory().unwrap();
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        meta.apply_segment(
+            1,
+            1,
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::delegate_one(3, GEN, dir, crate::SubtreeKind::Placed),
+            ],
+            &crate::replay::TouchSet::default(),
+        )
+        .unwrap();
+        for n in 1..=2 {
+            let op = crate::mutate::MutateOp::Create {
+                parent: dir,
+                name: format!("r{n}"),
+                ino: meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            meta.delegate_execute(
+                &op,
+                Some(rid(n)),
+                GEN,
+                Default::default(),
+                &Default::default(),
+                constellation_types::clock::Now::same(0),
+            )
+            .unwrap();
+        }
+        // The holder stops in `dir` after row 2: its cut is row 3, unshipped.
+        let cut = meta
+            .delegate_cut(3, GEN, &[dir], 2, Default::default())
+            .unwrap();
+        assert_eq!(cut, 3);
+        let tail = crate::BackupTx {
+            first: 1,
+            last: 2,
+            records: vec![
+                create("t", 9),
+                LogRecord::Completed {
+                    rid: Rid {
+                        node: 1,
+                        incarnation: 1,
+                        seq: 9,
+                    },
+                },
+            ],
+            origin: (0, 0),
+        };
+        meta.backup_append(1, std::slice::from_ref(&tail)).unwrap();
+        let own_before: Vec<crate::BackupTx> = meta
+            .journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.origin.0 == GEN)
+            .collect();
+        assert_eq!(own_before.len(), 3);
+        let (carried, proof) = (Default::default(), Default::default());
+        let report = meta
+            .reship_at_takeover(
+                Some(StrandArgs {
+                    epoch: 2,
+                    own_gens: &[GEN],
+                    abandoned: None,
+                    carried: &carried,
+                    proof: &proof,
+                    marker: &[],
+                    own_lost_from: &Default::default(),
+                    reappend_version: 1,
+                }),
+                Some(TailArgs {
+                    epoch: 1,
+                    through: 2,
+                    config_version: 3,
+                    class: None,
+                }),
+            )
+            .unwrap();
+        assert!(report.own_halted_gens.is_empty(), "{report:?}");
+        assert_eq!(report.own_reappended, 3, "{report:?}");
+        let own: Vec<crate::BackupTx> = meta
+            .journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.origin.0 == GEN)
+            .collect();
+        assert_eq!(
+            own.iter().map(|t| t.records.clone()).collect::<Vec<_>>(),
+            own_before
+                .iter()
+                .map(|t| t.records.clone())
+                .collect::<Vec<_>>(),
+            "verbatim"
+        );
+        assert!(matches!(
+            own.last().unwrap().records.as_slice(),
+            [LogRecord::ReleaseCut {
+                gen: GEN,
+                at: 2,
+                ..
+            }]
+        ));
+        assert!(meta.pending_replays().unwrap().is_empty());
+        assert_eq!(meta.log_stream_idx(GEN).unwrap(), 3);
+        assert_eq!(meta.delegate_idx(GEN).unwrap(), 3);
+    }
+
     /// The self-seal of epoch 1 and the self-reclaim at epoch 2: the
     /// journal becomes the member copy and the tail the claim carries, with
     /// `through` as the sealed hold's contiguous prefix.

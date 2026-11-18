@@ -76732,6 +76732,72 @@ mod step9_one_stream_per_node {
         let _ = (f1, f2, r2);
     }
 
+    /// ADR-63: a cut of every subtree left in the stream releases the whole
+    /// stream, subtrees of earlier cuts included, so its release row goes
+    /// after theirs: the root must not see `d1` free while the read
+    /// delegations under it are out.
+    #[test]
+    fn a_whole_cut_releases_after_the_earlier_cuts_release_rows() {
+        let (mut h, d1, d2, d3, _f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        h.meta.read_delegations().grant(2, d2, until);
+        let recall_of = |out: &[Action], ino| {
+            sends(out).into_iter().find_map(|(_, m)| match m {
+                PeerMsg::DelegationRecall { req, ino: i, .. } if *i == ino => Some(*req),
+                _ => None,
+            })
+        };
+        let recs = |h: &Harness| -> Vec<LogRecord> {
+            crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
+                .into_iter()
+                .flat_map(|t| t.records)
+                .collect()
+        };
+        let out = release_request(&mut h, 5, vec![d1]);
+        let r1 = recall_of(&out, d1).expect("recall of d1");
+        let out = release_request(&mut h, 6, vec![d2, d3]);
+        let r2 = recall_of(&out, d2).expect("recall of d2");
+        assert_eq!(h.core.dl.mine[&7].cuts.len(), 2);
+        assert!(h.core.dl.mine[&7].cuts[1].whole);
+        // The whole cut's reads clear first: its release row waits.
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: r2 },
+        });
+        assert!(
+            !recs(&h).iter().any(|r| matches!(
+                r,
+                LogRecord::StreamReleased { .. } | LogRecord::SubtreeReleased { .. }
+            )),
+            "{:?}",
+            recs(&h)
+        );
+        // d1's reads clear: its row, then the stream's.
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: r1 },
+        });
+        let rel: Vec<LogRecord> = recs(&h)
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    LogRecord::StreamReleased { .. } | LogRecord::SubtreeReleased { .. }
+                )
+            })
+            .collect();
+        assert!(
+            matches!(
+                rel.as_slice(),
+                [LogRecord::SubtreeReleased { dir, .. }, LogRecord::StreamReleased { .. }]
+                    if *dir == d1
+            ),
+            "{rel:?}"
+        );
+        assert!(h.core.dl.mine[&7].cuts.is_empty());
+    }
+
     /// ADR-63 (test 7): the lock grants a cut hands back ride the release
     /// row's batch only: the batches between the cut and the release carry
     /// no note and no `leaving` grant of the cut subtree, and the note's rows
@@ -80095,6 +80161,32 @@ mod step5_sticky_release {
         let out = drain_stream(&mut h, out);
         let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no note: {out:?}"));
         assert_eq!(note.dirs, vec![dirs[0]]);
+    }
+
+    /// ADR-63 (test 15): `constellation release --wait` waits for the
+    /// release row's acknowledgement, not the cut's.
+    #[test]
+    fn sticky_release_wait_waits_for_the_release_row_not_the_cut() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        let out = release(&mut h, 50, Vec::new(), true);
+        let recall = recall_of(&out, dirs[0]).expect("recall");
+        // The cut ships and is acknowledged: the command is not done.
+        let all = drain_stream(&mut h, out);
+        assert!(answer(&all, 50).is_none(), "done at the cut: {all:?}");
+        assert!(!has_release_row(&h));
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        let all = drain_stream(&mut h, out);
+        assert!(has_release_row(&h));
+        assert!(
+            answer(&all, 50).is_some_and(|r| r.is_ok()),
+            "not done at the release row's acknowledgement: {all:?}"
+        );
     }
 
     /// With `release_cut` off the release is the held one (the control).
@@ -90469,6 +90561,39 @@ mod root_own_sticky {
         assert_eq!(h.core.dl.last_sticky_end.as_ref().map(|e| e.1), Some(gen));
         assert_eq!(h.core.stats.claim_release_rowless, 0);
         assert!(release_row_idx(&h, gen, record).is_some());
+    }
+
+    /// ADR-63 (test 9): a claim while a cut waits for its reads releases the
+    /// whole stream by its own row (ADR-60): the pending cut is dropped and
+    /// counted, and exactly one release row is journaled. Fails on the
+    /// parent: the cut stays pending, and its release row would follow the
+    /// claim's.
+    #[test]
+    fn the_claim_releases_a_stream_with_a_pending_cut() {
+        let (mut h, dirs, gen, record) = restarted_root_with_own_stream();
+        let cut = crate::core::delegate::PendingCut {
+            dirs: dirs.iter().take(1).copied().collect(),
+            whole: true,
+            cut_row: 2,
+            note: Default::default(),
+            left_at: h.clk().wait,
+            to: 1,
+            due: false,
+        };
+        h.core.dl.mine.get_mut(&gen).unwrap().cuts.push(cut);
+        claim(&mut h);
+        assert_eq!(h.core.stats.claim_released, 1);
+        assert_eq!(h.core.stats.deleg_cut_left_to_claim, 1);
+        assert!(h.core.dl.mine.get(&gen).is_none_or(|d| d.cuts.is_empty()));
+        let releases = Replica::journal_txs_from(&h.meta, record + 1, usize::MAX)
+            .iter()
+            .filter(|t| {
+                t.records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::StreamReleased { gen: g, .. } if *g == gen))
+            })
+            .count();
+        assert_eq!(releases, 1, "the release row is not journaled once");
     }
 
     /// Review S7: a stream whose own rows the takeover gate replayed by rid
