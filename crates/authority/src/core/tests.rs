@@ -87283,6 +87283,35 @@ mod tail_answer_gaps {
         }
     }
 
+    /// S1 (M1.2 review): a store read error of the member copy is not "no
+    /// copy". The claim ends and names no tail; a read that succeeds finds
+    /// the copy, which becomes the tail. Fails when the error maps to
+    /// "none held" (the claim goes on with no tail of the epoch).
+    #[test]
+    fn a_self_claim_with_an_unreadable_member_copy_ends() {
+        let (mut h, prev) = self_sealed(&[(1, 1), (2, 2)]);
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 1);
+        let went_on = h.core.prepare_tail_for_claim(&prev, &h.meta);
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+        assert!(!went_on, "a read error is not an empty tail");
+        assert!(h.core.bk.fetched.is_empty());
+        // The retry reads the copy and takes it as the tail.
+        assert!(h.core.prepare_tail_for_claim(&prev, &h.meta));
+        assert_eq!(h.core.bk.fetched.len(), 1);
+        assert_eq!(h.core.bk.fetched[0].through, 2);
+    }
+
+    /// S1 negative control: no copy held, read fine: the claim goes on.
+    #[test]
+    fn a_self_claim_with_no_member_copy_goes_on() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let prev = h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap();
+        h.core.bk.sealed = 1;
+        assert!(h.core.prepare_tail_for_claim(&prev, &h.meta));
+        assert!(h.core.bk.fetched.is_empty());
+    }
+
     /// A1 negative control: a contiguous copy counts nothing.
     #[test]
     fn a_self_claim_over_a_contiguous_copy_counts_nothing() {

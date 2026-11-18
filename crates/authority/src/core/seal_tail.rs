@@ -1317,8 +1317,29 @@ impl Core {
             if self.bk.fetched.iter().any(|f| f.epoch == prev.epoch) {
                 return true;
             }
+            // (A store read error is not "no copy": a claim that took it for
+            // one would name no tail of the epoch, and the rows this node
+            // acknowledged in it would be dropped or left in copies no lease
+            // names. Only a read that says "none held" lets the claim go on.)
+            match replica.member_copy_held(prev.epoch) {
+                None => {
+                    tracing::error!(
+                        node = me,
+                        epoch = prev.epoch,
+                        "the member copy could not be read: the claim ends"
+                    );
+                    return false;
+                }
+                Some(false) => return true,
+                Some(true) => {}
+            }
             let Some((cv, txs)) = replica.member_copy(prev.epoch) else {
-                return true;
+                tracing::error!(
+                    node = me,
+                    epoch = prev.epoch,
+                    "a held member copy could not be read: the claim ends"
+                );
+                return false;
             };
             if !txs.is_empty() {
                 if !replica.backup_append(prev.epoch, &txs) {

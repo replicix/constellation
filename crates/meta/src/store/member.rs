@@ -723,6 +723,8 @@ impl Meta {
         &self,
         epoch: u64,
     ) -> Result<Option<(MemberCopyInfo, Vec<MemberTx>)>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        super::backup::injected_read_fault()?;
         let r = self.db.read_tx();
         let Some(info) = info_in(&r, self, epoch)? else {
             return Ok(None);

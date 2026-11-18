@@ -70371,3 +70371,9 @@ alternating (median [range]); heavy-run commits with `journal_lock` of 100 ms or
 Light load (`W=4 OPS=4`, 2 runs per side): wall s btrfs 4.27 -> 4.12, ext4 5.64 -> 4.61, xfs 4.21 -> 3.75, tmpfs 3.87 -> 3.85; no file system is slower.
 The one remaining >=187 ms step per heavy run on the disk file systems is the PublishDone to LeaseSwap `Meta::sync` (out of scope); the btrfs
 metadata-reservation stall (cause 2) is out of scope too.
+
+M1.2 review S1 (tail claim): `prepare_tail_for_claim`'s self-sealed branch no longer reads a member-copy store read error
+as "no copy" (it asks `member_copy_held` first: `None`, and a held copy that then cannot be read, end the claim through
+`finish_acquire(false)`, retried at the next attempt like a failed seal; only `Some(false)` goes on with no tail). Test hook:
+the member-copy read honours `fail_store_reads_after_on_this_thread_for_tests`. Tests:
+`a_self_claim_with_an_unreadable_member_copy_ends`, `a_self_claim_with_no_member_copy_goes_on`.
