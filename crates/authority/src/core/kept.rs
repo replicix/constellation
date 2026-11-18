@@ -1151,6 +1151,9 @@ impl Core {
                 Some(TailAppend::Held) => {}
                 Some(TailAppend::Gap { acked }) => {
                     self.stats.kept_install_gaps += 1;
+                    // The plain claim retries on every attempt and ends each
+                    // time here: the operator's lever is the forced abandon.
+                    self.bk.kept_force_wanted = Some(u.targets[0].tenure.1);
                     tracing::error!(
                         node = me,
                         epoch = e,
@@ -1264,7 +1267,13 @@ impl Core {
             }
         }
         self.stats.kept_fetches_completed += 1;
-        if u.partial || forced {
+        // A row given up under an operator override is an abandon, whether a
+        // source stayed silent (`partial`), a divergence was overridden
+        // (`forced`) or the union was cut at a seq nothing covers while every
+        // source answered (`--force` with `past_gap`): without the record the
+        // keepers read the copies past the cut as never committed and drop
+        // them, instead of queueing them to replay by rid.
+        if u.partial || forced || (u.force && past_gap > 0) {
             let e = u.targets[0].tenure.1;
             self.stats.kept_abandoned += 1;
             self.stats.groups_abandoned += 1;

@@ -4348,8 +4348,10 @@ lease again. Fault-injection tests: `a_kept_union_that_cannot_be_read_names_no_r
 `a_kept_union_over_a_seq_the_log_carries_is_held_to_its_tip`, `a_readopted_kept_claim_reships_the_rows_past_a_seq_the_log_carries`,
 `a_readopted_two_epoch_kept_union_reships_both_epochs`, `an_in_doubt_kept_claim_is_rebuilt_from_its_own_lease`,
 `a_readopted_union_over_a_second_generation_reships_every_epoch`. A seq no source covers and the log does not carry between two
-copies (an abandoned or forced claim) cuts the union there (`fill_log_carried`, counted in `kept_past_gap`); the plain claim ends once
-on the store's `Gap`. A two-epoch union's lower epoch may be written before the upper one ends the attempt: no role, no seal,
+copies (an abandoned or forced claim) cuts the union there (`fill_log_carried`, counted in `kept_past_gap`, and recorded: `GroupAbandoned { through_known }` in the marker and
+`kept_abandoned`, also when `--force` cut a union every source answered, so the keepers queue the copies past the cut to replay by rid
+instead of dropping them as never committed); the plain claim ends on the store's `Gap` at every attempt and retries (status:
+`kept_force_wanted`; the operator's lever is `repair abandon --epoch --force`). A two-epoch union's lower epoch may be written before the upper one ends the attempt: no role, no seal,
 idempotent on the retry, trimmed by the next higher-epoch segment. Residual, unchanged: `core/seal_tail.rs` answers a stored tail
 only for the epoch and the one role that match, and a two-epoch install's role is the upper epoch's, so this node's stored copy of
 the lower epoch is not answered to a later claimant of a union (member copies and the kept streams are); the role answers of a
