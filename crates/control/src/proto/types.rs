@@ -2502,6 +2502,11 @@ pub struct AckStatus {
     /// void cut: the log never granted it (plan 46 M0.4; must stay 0).
     #[serde(default)]
     pub unjustified_ships: u64,
+    /// Tail answers a claim found not contiguous (a gap below the tip): each
+    /// attempt that saw one ended and left the tail untouched. Must stay 0;
+    /// a rise stalls the claim until an operator abandons the group.
+    #[serde(default)]
+    pub tail_answer_gaps: u64,
     /// Reads held now: acknowledged rows this node rolled back while the log
     /// lacks them (ADR-57); a read of their keys waits for the re-ship.
     #[serde(default)]

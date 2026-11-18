@@ -427,6 +427,7 @@ impl EngineControl {
                     ungated_shadows_non_stealable: a.ungated_shadows_non_stealable,
                     ungated_unexpected: s.ungated_unexpected,
                     unjustified_ships: self.meta.unjustified_ships(),
+                    tail_answer_gaps: stats.tail_answer_gaps,
                     read_holds: holds.holds,
                     read_holds_oldest_ms: holds.oldest_ms,
                     read_holds_refused: holds.refused,

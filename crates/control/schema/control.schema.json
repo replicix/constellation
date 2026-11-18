@@ -504,6 +504,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "tail_answer_gaps": {
+          "default": 0,
+          "description": "Tail answers a claim found not contiguous (a gap below the tip): each\nattempt that saw one ended and left the tail untouched. Must stay 0;\na rise stalls the claim until an operator abandons the group.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "unacked_replays_refused": {
           "format": "uint64",
           "minimum": 0,
