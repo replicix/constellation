@@ -12689,16 +12689,22 @@ impl Core {
             }
         }
         // Plan 46 M1.3 step 17: the root's reason, for a stream of
-        // non-stealable grants that is not the root's own (a holder's own end
+        // non-stealable grants (for the root's own grant only an abandon or an
+        // epoch recall; its releases record at `own_sticky_release`; a holder's own end
         // of it is the holder's: recorded at its release; a `LeaveNote` end is
         // the holder's `Leave`). Recorded once the end is journaled.
-        let sticky_why = if g.non_stealable() && g.node != self.cfg.node_id {
+        let own = g.node == self.cfg.node_id;
+        let sticky_why = if g.non_stealable() {
             if abandoned.is_some() {
                 Some(StickyEnd::Abandon)
             } else if drained {
                 match g.recall_cause {
-                    Some(RecallCause::Undelegate) => Some(StickyEnd::Undelegate),
+                    // The root's own grant ended by its release records its
+                    // reason there (`own_sticky_release`); only an epoch
+                    // recall ends it here.
                     Some(RecallCause::Epoch) => Some(StickyEnd::Epoch),
+                    _ if own => None,
+                    Some(RecallCause::Undelegate) => Some(StickyEnd::Undelegate),
                     Some(RecallCause::Leave) => Some(StickyEnd::LeaveOperator),
                     Some(RecallCause::LeaveNote | RecallCause::Other) | None => None,
                 }
