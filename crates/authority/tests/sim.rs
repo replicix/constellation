@@ -15052,6 +15052,23 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             },
             ..cfg
         },
+        // The same, later and with one name per directory: the chunk is lost
+        // after the root's own sticky stream's write of it (WP3's `+exp`).
+        "lost-chunk-late" => SimConfig {
+            names: 1,
+            ops_per_client: 24,
+            chunk_writes: 0.6,
+            chunk_write_nodes: vec![1],
+            faults: {
+                let mut f = cfg.faults.clone();
+                f.push(ScheduledFault {
+                    at_ms: 1_500,
+                    kind: FaultKind::LoseDirtyChunks { node: 1 },
+                });
+                f
+            },
+            ..cfg
+        },
         // Plan 46 M1.4 step 0: the durability oracle strict (`+durability`).
         "durability" => SimConfig {
             strict_durability: true,
@@ -21962,6 +21979,23 @@ fn a_drop_fills_the_stream_indices_it_rolls_back() {
             run_seed(seed, config_variant(config(), "lost-chunk"))
                 .unwrap_or_else(|e| panic!("{label}+lost-chunk seed {seed}: {e}"));
         }
+    }
+}
+
+/// Drop-held apply names a re-appended seed (a stream row the root appended
+/// again after re-taking its own lease) by its own rid, not by the synthetic
+/// replay rid (`far-root-writes+lost-chunk-late` 226,
+/// `drop_acked_loss_unrecorded`). The seed still fails, on an independent
+/// finding: `sticky_ends_only_by_holder_or_operator` (a self re-claimed own
+/// stream ended with no release row). So this pins the drop oracle only; tighten
+/// it to `.unwrap()` when that finding closes.
+#[test]
+fn a_reappended_seed_is_dropped_under_its_own_rid() {
+    if let Err(e) = run_seed(
+        226,
+        config_variant(far_root_writes_config(), "lost-chunk-late"),
+    ) {
+        assert!(!e.contains("drop_acked_loss"), "{e}");
     }
 }
 

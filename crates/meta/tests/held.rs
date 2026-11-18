@@ -1999,6 +1999,92 @@ fn a_drop_leaves_a_queued_replay_of_a_delegates_shadow_alone() {
     assert_eq!(shadow.gen, gen);
 }
 
+/// Seed 226 of `far-root-writes+lost-chunk-late`: a seed that is the root's
+/// own re-append of a stream row of its generation (`gen != 0`, appended) is
+/// never queued by the strand, but it has a real rid, the one the `DropHeld`
+/// names. The apply listed it, journaled `Refused` for it and queued its
+/// conflict copy under the synthetic `replay_rid_for` rid instead. Fails on
+/// the parent: the synthetic rid is listed and refused, the real one is not.
+#[test]
+fn a_drop_names_a_reappended_seed_by_its_own_rid() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(1).unwrap();
+    meta.set_holder_epoch(1);
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let broken = meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
+    let rows = batch(&meta);
+    ship(&meta, &rows, 1);
+    let rid = rid_of(1, 23);
+    let gen = (1u64 << 32) | 3;
+    meta.apply_adopted_records_from(
+        &[
+            LogRecord::WriteManifest {
+                ino: broken,
+                base_manifest: None,
+                manifest: manifest_naming(lost, 19),
+                size: 19,
+                time_ns: 11,
+                mtime_ns: 11,
+            },
+            LogRecord::Completed { rid },
+        ],
+        Some(rid),
+        (gen, 9),
+    )
+    .unwrap();
+    meta.note_unrecoverable_chunks(&[(lost, broken)], true)
+        .unwrap();
+    let decided = meta
+        .drop_held_knowing(
+            broken,
+            1,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(decided.dropped, 1, "{decided:?}");
+    let rows = batch(&meta);
+    assert!(
+        rows.iter().any(|(_, r)| matches!(
+            r,
+            LogRecord::DropHeld { rolled_back, .. }
+                if rolled_back.iter().any(|(_, r)| *r == Some(rid))
+        )),
+        "the record names the seed's rid: {rows:?}"
+    );
+    ship(&meta, &rows, 2);
+    let done = meta
+        .drop_held_apply(
+            broken,
+            1,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
+        .unwrap();
+    let lost_rids: Vec<_> = done.acked_lost.iter().map(|(r, _)| *r).collect();
+    assert!(lost_rids.contains(&rid), "{done:?}");
+    assert!(done.rolled_back.contains(&rid), "{done:?}");
+    for r in lost_rids.iter().chain(&done.rolled_back) {
+        assert_ne!(
+            r.incarnation,
+            constellation_meta::LOCAL_REPLAY_INCARNATION,
+            "a synthetic rid named: {done:?}"
+        );
+    }
+    let journal = batch(&meta);
+    assert!(
+        journal
+            .iter()
+            .any(|(_, r)| matches!(r, LogRecord::Refused { rid: x, .. } if *x == rid)),
+        "no Refused for the seed's rid: {journal:?}"
+    );
+}
+
 /// Final review of ADR-59 part B, SHOULD 1 and 2: a queued replay the drop
 /// leaves alone (a delegate's shadow) is counted and warned of
 /// (`queued_kept`), and it keeps the chunk's pending row and poison mark, as
