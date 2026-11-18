@@ -4337,16 +4337,23 @@ impl Core {
         // ADR-51: the union a kept fetch brought, one tail per epoch with rows.
         // (An inherited tail of an older epoch the union does not cover rides
         // along, in epoch order.)
-        let kept_tails: Vec<(Epoch, u64)> =
-            if self.bk.fetched.iter().any(|f| f.kept_owner.is_some()) {
-                self.bk
-                    .fetched
-                    .iter()
-                    .map(|f| (f.epoch, f.through))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let kept_fetched = self.bk.fetched.iter().any(|f| f.kept_owner.is_some());
+        let kept_tails: Vec<(Epoch, u64)> = if kept_fetched {
+            self.bk
+                .fetched
+                .iter()
+                .map(|f| (f.epoch, f.through))
+                .collect()
+        } else {
+            // `bk.fetched` is gone (the claim's CAS applied though the
+            // acquisition ended, or a restart): the union this node's own
+            // lease names is read from the store, where it was installed
+            // contiguous to its tip.
+            self.kept_tails_readopted(prev.as_ref(), replica)
+        };
+        if !kept_fetched && !kept_tails.is_empty() {
+            self.bk.gate_tails_from = kept_tails[0].0;
+        }
         let backup_tail_epoch = kept_tails.first().map(|t| t.0).or(backup_tail_epoch);
         if takeover
             && backup_tail_epoch.is_none()

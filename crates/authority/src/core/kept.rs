@@ -772,6 +772,68 @@ impl Core {
             .is_some_and(|k| k.asked.remove(&req).is_some())
     }
 
+    /// A re-adoption of this node's own lease that names a kept union
+    /// (`inherited_tail.kept`, an epoch below the lease's) with `bk.fetched`
+    /// gone: the union's tails from the store, the epochs `t.epoch` and
+    /// `t.epoch + 1` that hold a record-bearing tail, each with its
+    /// contiguous hold (the install stores the union contiguous to its tip).
+    /// An unreadable store is not "no tail": the lease's own `through` stands
+    /// for `t.epoch` (an error is logged); the upper epoch, for which the
+    /// lease gives no hold, is then not re-shipped (logged too).
+    pub(super) fn kept_tails_readopted(
+        &self,
+        prev: Option<&Lease>,
+        replica: &dyn Replica,
+    ) -> Vec<(Epoch, u64)> {
+        let me = self.cfg.node_id;
+        let Some((p, t)) = prev.and_then(|p| Some((p, p.inherited_tail.as_deref()?))) else {
+            return Vec::new();
+        };
+        if p.holder != me || p.released || !t.kept || t.epoch >= p.epoch {
+            return Vec::new();
+        }
+        let mut tails = Vec::new();
+        for e in [t.epoch, t.epoch + 1] {
+            match replica.backup_tail(e) {
+                Some(tail) => {
+                    if !tail.iter().any(|x| !x.records.is_empty()) {
+                        continue;
+                    }
+                    match replica.backup_acked(e) {
+                        Some(hold) => tails.push((e, hold)),
+                        None if e == t.epoch => {
+                            tracing::error!(
+                                node = me,
+                                epoch = e,
+                                "the kept union's hold could not be read: the lease's own is used"
+                            );
+                            tails.push((e, t.through));
+                        }
+                        None => tracing::error!(
+                            node = me,
+                            epoch = e,
+                            "the kept union's hold could not be read: the epoch is not re-shipped"
+                        ),
+                    }
+                }
+                None if e == t.epoch => {
+                    tracing::error!(
+                        node = me,
+                        epoch = e,
+                        "the kept union's stored tail could not be read: the lease's own is used"
+                    );
+                    tails.push((e, t.through));
+                }
+                None => tracing::error!(
+                    node = me,
+                    epoch = e,
+                    "the kept union's stored tail could not be read: the epoch is not re-shipped"
+                ),
+            }
+        }
+        tails
+    }
+
     /// The claim read the log to head: merge the union per epoch, write it as
     /// a sealed backup tail of the tenure, and name it for the gate. `false`:
     /// the attempt ended (two sources kept different transactions at one seq;
@@ -1027,6 +1089,43 @@ impl Core {
             self.end_tail_fetch_attempt(now, replica, out);
             return false;
         }
+        // Decide before any durable write: the tail each epoch would store,
+        // with record-less fillers over the seqs the log carries between the
+        // copies (the merge skipped them), and the contiguous hold the store
+        // would count after the append. A hold below the union's tip ends
+        // the attempt, in every build.
+        let mut stored_by_epoch: BTreeMap<Epoch, Vec<BackupTx>> = BTreeMap::new();
+        for (e, merged) in merged_by_epoch.iter().filter(|(_, m)| !m.is_empty()) {
+            let Some(stored) = replica.backup_tail(*e) else {
+                self.stats.kept_install_gaps += 1;
+                tracing::error!(
+                    node = me,
+                    epoch = e,
+                    "the kept union's stored tail could not be read: the attempt ends"
+                );
+                self.end_tail_fetch_attempt(now, replica, out);
+                return false;
+            };
+            let filled = fill_log_carried(&stored, merged, |s| {
+                replica.row_in_log(*e, s) || s <= carried_through(*e)
+            });
+            let hold = hold_after_append(&stored, &filled);
+            let tip = merged.last().map_or(0, |t| t.last);
+            if hold < tip {
+                self.stats.kept_install_gaps += 1;
+                tracing::error!(
+                    node = me,
+                    epoch = e,
+                    hold,
+                    tip,
+                    "the kept union would be stored with a gap the log does not carry: the \
+                     attempt ends"
+                );
+                self.end_tail_fetch_attempt(now, replica, out);
+                return false;
+            }
+            stored_by_epoch.insert(*e, filled);
+        }
         self.bk.kept_floor = floor;
         self.bk.gate_tails_from = u.targets.iter().map(|t| t.tenure.1).min().unwrap_or(0);
         debug_assert!(
@@ -1048,7 +1147,8 @@ impl Core {
         merged_by_epoch.retain(|_, m| !m.is_empty());
         let mut fetched: Vec<FetchedTail> = Vec::new();
         for (e, merged) in &merged_by_epoch {
-            if !replica.backup_append(*e, merged) {
+            let to_store = stored_by_epoch.get(e).unwrap_or(merged);
+            if !replica.backup_append(*e, to_store) {
                 self.end_acquire_attempt(now, replica, out);
                 return false;
             }
@@ -1072,6 +1172,20 @@ impl Core {
             }
             self.bk.role = Some(role);
             self.bk.acked = replica.backup_acked(*e).unwrap_or(0);
+            // Tripwire: the check above simulated this hold; the store's own
+            // count agrees or the simulation is wrong (counted, fails the sim).
+            let tip = merged.last().map_or(0, |t| t.last);
+            if self.bk.acked < tip && replica.backup_acked(*e).is_some() {
+                self.stats.kept_install_gaps += 1;
+                tracing::error!(
+                    node = me,
+                    epoch = e,
+                    hold = self.bk.acked,
+                    tip,
+                    "the stored kept union is held below its tip after the append"
+                );
+                debug_assert!(false, "the stored kept union is held below its tip");
+            }
             // The union is held by every node that kept a row of it, and by
             // this one from here on; a later claimant asks them all.
             let mut members: Vec<NodeId> = keepers
@@ -1136,4 +1250,67 @@ impl Core {
         self.bk.kept_ready = Some(prev.renewal_key());
         true
     }
+}
+
+/// The record-less spans that make `merged` contiguous with itself and with
+/// the epoch's already stored tail `stored`, over the seqs `carried` says the
+/// log has (the merge skipped those copies). A run with a seq that is not
+/// carried is left as a gap, which [`hold_after_append`] then shows.
+fn fill_log_carried(
+    stored: &[BackupTx],
+    merged: &[BackupTx],
+    carried: impl Fn(u64) -> bool,
+) -> Vec<BackupTx> {
+    let mut out: Vec<BackupTx> = Vec::with_capacity(merged.len());
+    let mut out_last: Option<u64> = None;
+    for tx in merged {
+        // A copy a span written just before it covers (a hole the merge
+        // widened over the copies it spans) is a late copy of rows gone: the
+        // store does not keep it either.
+        if out_last.is_some_and(|l| tx.last <= l) {
+            continue;
+        }
+        // What already holds the seqs below this copy: the stored tail's
+        // highest span below it, or the copies written before it.
+        let below = stored
+            .iter()
+            .map(|t| t.last)
+            .filter(|l| *l < tx.first)
+            .chain(out_last)
+            .max();
+        if let Some(p) = below.filter(|p| tx.first > p + 1 && (p + 1..tx.first).all(&carried)) {
+            out.push(BackupTx {
+                first: p + 1,
+                last: tx.first - 1,
+                records: Vec::new(),
+                origin: (0, 0),
+            });
+        }
+        out.push(tx.clone());
+        out_last = Some(tx.last);
+    }
+    out
+}
+
+/// The contiguous hold the store counts for an epoch (`Meta::backup_acked`:
+/// from the oldest stored span) after `add` supersedes the spans it covers.
+fn hold_after_append(stored: &[BackupTx], add: &[BackupTx]) -> u64 {
+    let mut spans: BTreeMap<u64, u64> = stored.iter().map(|t| (t.first, t.last)).collect();
+    for t in add {
+        let inside: Vec<u64> = spans.range(t.first..=t.last).map(|(k, _)| *k).collect();
+        for k in inside {
+            spans.remove(&k);
+        }
+        spans.insert(t.first, t.last);
+    }
+    let mut acked = 0;
+    let mut prev: Option<u64> = None;
+    for (first, last) in spans {
+        if prev.is_some_and(|p| first != p + 1) {
+            break;
+        }
+        acked = last;
+        prev = Some(last);
+    }
+    acked
 }

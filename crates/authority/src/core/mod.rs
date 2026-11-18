@@ -2360,6 +2360,11 @@ pub struct Stats {
     /// is below its tip. The gate would drop the rows past the gap as never
     /// committed. Must stay 0; the sim fails a seed that has one.
     pub tail_answer_gaps: u64,
+    /// A kept union that would be stored with a contiguous hold below its tip
+    /// (a gap the log does not carry), or whose stored tail could not be read:
+    /// the attempt ends before any write. Must stay 0; the sim fails a seed
+    /// that has one.
+    pub kept_install_gaps: u64,
     /// Plan 46 M1.2 step 5 (c3-spec D3): a sealed tail that did not apply
     /// (`MetaError::TailDiverged`), one per pass of the closed gate. Must
     /// stay 0; the sim fails a seed that has one.

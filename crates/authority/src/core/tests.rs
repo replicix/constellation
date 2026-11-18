@@ -71012,6 +71012,147 @@ mod kept_fetch {
         // A rival further up, too.
         assert_eq!(overtaken(4), (0, 1, false));
     }
+
+    // ---- keptgap: the union is stored contiguous to its tip ----
+
+    /// `n` transactions of node 4's epoch 2 (a transferee's own stream: its
+    /// own inodes and rids, from journal seq 1 of its epoch).
+    fn rows_at_epoch_2(n: u64) -> Vec<BackupTx> {
+        let holder = Harness::new(4);
+        holder.meta.set_holder_epoch(2);
+        for i in 1..=n {
+            let create = holder.create(&format!("g{i}"));
+            let rid = Rid {
+                node: 4,
+                incarnation: 1,
+                seq: i,
+            };
+            constellation_meta::execute_mutate(&holder.meta, &create, Some(rid)).unwrap();
+        }
+        holder.meta.journal_txs_from(1, 1000).unwrap()
+    }
+
+    /// The claimant's log carries `tx` of `epoch` (a row the owner shipped
+    /// ahead of a held one).
+    fn log_carries(h: &Harness, epoch: Epoch, tx: &BackupTx) {
+        let rows: Vec<u64> = (tx.first..=tx.last).collect();
+        h.meta
+            .apply_segment_rows(
+                1,
+                epoch,
+                0,
+                &rows,
+                &vec![(0, 0); rows.len()],
+                &tx.records,
+                &Default::default(),
+            )
+            .unwrap();
+        // (Applied ahead of the position: the log's applied journal seq is
+        // below the carried rows, as when a held row precedes them.)
+        h.meta.session().advance_rows(
+            1,
+            Some(constellation_meta::JournalPos { epoch, jseq: 0 }),
+            &rows,
+        );
+        assert!(Replica::row_in_log(&h.meta, epoch, tx.first));
+        assert!(!Replica::row_in_log(&h.meta, epoch, tx.first - 1));
+    }
+
+    /// Answers every S3 request from the bucket holding `body` until the
+    /// claim's CAS is issued; that CAS is answered `Conflict` although it
+    /// applied (the sim's `Fault::AppliedThen`). The lease it wrote.
+    fn win_until_cas_conflicts(h: &mut Harness, mut out: Vec<Action>, body: &Lease) -> Lease {
+        let mut won = None;
+        for _ in 0..60 {
+            let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
+                .into_iter()
+                .map(|(o, r)| (o, r.clone()))
+                .collect();
+            assert!(!ops.is_empty(), "no CAS was issued");
+            out = Vec::new();
+            for (op, req) in ops {
+                if let S3Op::LeaseSwap { lease, .. } | S3Op::LeaseCreate { lease } = &req {
+                    let sent = lease.clone();
+                    h.step(Event::S3 {
+                        op,
+                        result: S3Result::LeasePut(Err(crate::event::CasFailure::Conflict)),
+                    });
+                    return sent;
+                }
+                let result = answer_from_bucket(&req, body, &mut won);
+                out.extend(h.step(Event::S3 { op, result }));
+            }
+        }
+        panic!("the claim did not reach its CAS");
+    }
+
+    /// Node 3's kept claim of `fenced()` over rows at epoch 1 (`txs`, the
+    /// middle one carried by its log) and, with `upper`, rows at epoch 2, run
+    /// to a CAS that applied but answered `Conflict`.
+    fn in_doubt_kept_claim(upper: Option<Vec<BackupTx>>) -> (Harness, Lease, Vec<BackupTx>) {
+        let (mut h, out) = start(3, &fenced(), &[1, 2, 3], 1, false);
+        let txs = rows(3);
+        log_carries(&h, 1, &txs[1]);
+        let a = asks(&out);
+        let out = win(&mut h, out, &fenced());
+        assert!(cas(&out).is_none());
+        let mut last = Vec::new();
+        for (n, req, e) in a.iter().filter(|x| x.0 == 2) {
+            let served = match (*e, &upper) {
+                (1, _) => txs.clone(),
+                (_, Some(u)) => u.clone(),
+                _ => Vec::new(),
+            };
+            last = h.step(answer_at(*n, *req, *e, served, vec![vec![1, 2]]));
+        }
+        let sent = win_until_cas_conflicts(&mut h, last, &fenced());
+        (h, sent, txs)
+    }
+
+    /// A kept union over a seq the log carries (the owner shipped it ahead of
+    /// a held one) is stored contiguous to its tip: the store's hold is what
+    /// the in-memory `bk.fetched` says. Fails before: the hold stopped at the
+    /// first row (the carried seq was a gap in the stored tail).
+    #[test]
+    fn a_kept_union_over_a_seq_the_log_carries_is_held_to_its_tip() {
+        let (h, _sent, txs) = in_doubt_kept_claim(None);
+        assert_eq!(h.meta.backup_acked(1).unwrap(), txs[2].last);
+        assert_eq!(h.core.stats.kept_install_gaps, 0);
+    }
+
+    /// The claim's CAS applied but answered `Conflict`: `bk.fetched` is gone
+    /// and the node re-adopts its own lease, which names the kept union. The
+    /// gate rebuilds the tails from the store and re-ships the rows past the
+    /// seq the log carries. Fails before: the last transaction counted as
+    /// beyond the gap and was never re-journaled.
+    #[test]
+    fn a_readopted_kept_claim_reships_the_rows_past_a_seq_the_log_carries() {
+        let (mut h, sent, txs) = in_doubt_kept_claim(None);
+        assert!(h.core.bk.fetched.is_empty(), "the failed claim dropped it");
+        let t = sent.inherited_tail.clone().expect("names the union");
+        assert!(t.kept);
+        let out = acquire(&mut h, &sent);
+        let _ = win(&mut h, out, &sent);
+        let got = reshipped(&h);
+        assert!(got.contains(&(1, txs[0].first)), "{got:?}");
+        assert!(got.contains(&(1, txs[2].first)), "{got:?}");
+        assert_eq!(h.core.stats.tail_beyond_gap_dropped, 0);
+    }
+
+    /// The same with a union of two epochs: both are re-shipped, not only the
+    /// role's (the upper). Fails before: the lower epoch was not re-shipped.
+    #[test]
+    fn a_readopted_two_epoch_kept_union_reships_both_epochs() {
+        let upper = rows_at_epoch_2(2);
+        let (mut h, sent, txs) = in_doubt_kept_claim(Some(upper.clone()));
+        let out = acquire(&mut h, &sent);
+        let _ = win(&mut h, out, &sent);
+        let got = reshipped(&h);
+        assert!(got.contains(&(1, txs[0].first)), "{got:?}");
+        assert!(got.contains(&(1, txs[2].first)), "{got:?}");
+        assert!(got.contains(&(2, upper[0].first)), "{got:?}");
+        assert_eq!(h.core.stats.tail_beyond_gap_dropped, 0);
+    }
 }
 
 /// ADR-51: the member side of a claimant's kept fetch: what an epoch

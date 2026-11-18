@@ -7555,6 +7555,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.tail_answer_gaps, report.stats
             ));
         }
+        if stats.kept_install_gaps > 0 {
+            return Err(format!(
+                "node {id}: {} kept union(s) would be stored below their tip (kept_install_gaps)\n  stats: {:#?}",
+                stats.kept_install_gaps, report.stats
+            ));
+        }
         // A row of the tail whose rid the log had already carried is skipped,
         // not re-shipped (`tail_rid_done`, c3-spec §4.3): under strict
         // identity or verbatim the seed fails. It is a benign overlap, not a

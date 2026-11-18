@@ -70668,3 +70668,12 @@ fmt, clippy `--workspace --all-targets -D warnings`, lib tests of authority, eng
 (571 passed, 0 failed). Sims (300 seeds, plain, against the parent built the same way): `sticky-idle-release`, `sticky-handover-ping-pong`,
 `sticky-leave`, `sticky-claim`, `far-root-writes`, `sticky-holder-dies`: no failing seed, every `SWEEP-*` line equal except noise the parent shows
 against itself (`SWEEP-SIG`/`SEGMENTS` stored bytes, `far-root-writes` seed 110 `skipped-far` 1 or 2 run to run). Harness smoke (release, seed 42, linux-fuse): `sticky-release-cmd`, `sticky-release-on-unmount`, `sticky-suspend-inhibitor`, `root-own-sticky`, `designation-as-delegation` (reads `kind`) and `sticky-handover-one-off` (under `net-wan`, which it requires) pass.
+
+### The kept union stored contiguous; the gate rebuilds it from the store (2026-11-18)
+
+A kept union over a seq the claimant's log carries was stored with a gap there, so the store's contiguous hold stopped below the union's
+tip and a gate that had lost `bk.fetched` (a claim CAS that applied but answered `Conflict`, a restart, an in-doubt CAS) cut at the gap
+and dropped committed rows as beyond it (`drop-held-chain-backed` seed 1822: an acknowledged write would have been lost). Fix (A):
+`kept_install` fills the log-carried seqs with record-less spans and checks every epoch's hold in memory before any write
+(`kept_install_gaps`, sim-failing). Fix (B): `acquire_won` rebuilds the kept tails of a re-adopted own lease from the store. Three
+fail-before tests in `mod kept_fetch`. See ADR-51's amendment.
