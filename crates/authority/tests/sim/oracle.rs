@@ -2124,6 +2124,42 @@ pub fn lone_answered(acks: &[AckEntry]) -> HashSet<Rid> {
         .collect()
 }
 
+/// ADR-55 R-H: the rids a root answered `Final` from a row of its *own*
+/// stream (the judged transaction's origin generation is one the answering
+/// node minted for itself as root, `Oracles::own_stream_rows`), by an answer
+/// whose kind the client heard (the filter of [`lone_answered`]). Such an
+/// answer rests on log rows plus the stream alone, so one that only a
+/// rolled-back effect explains is a violation, not the L2 window of a holder
+/// that had acknowledged a Local/Lone effect and then died.
+pub fn own_stream_answered(
+    acks: &[AckEntry],
+    own_stream_rows: &HashMap<(u64, u64), OwnStreamRow>,
+) -> HashSet<Rid> {
+    let mut heard: BTreeMap<Rid, Vec<OutcomeKind>> = BTreeMap::new();
+    for a in acks.iter().filter(|a| !a.reply) {
+        heard.entry(a.rid).or_default().push(a.kind);
+    }
+    acks.iter()
+        .filter(|a| !a.is_relay())
+        .filter(|a| heard.get(&a.rid).is_none_or(|k| k.contains(&a.kind)))
+        .filter(|a| {
+            let Some(j) = a.judged.as_ref() else {
+                return false;
+            };
+            let Some(tx) = j.tx.as_ref() else {
+                return false;
+            };
+            let gen = tx.origin.0;
+            j.class == Some(Judged::Final)
+                && gen != 0
+                && own_stream_rows
+                    .iter()
+                    .any(|((g, _), row)| *g == gen && row.1 == a.node)
+        })
+        .map(|a| a.rid)
+        .collect()
+}
+
 /// The transaction in `txs` carrying `rid`'s outcome as `want`.
 fn find_tx(txs: &[BackupTx], rid: Rid, want: Option<Code>) -> Option<&BackupTx> {
     txs.iter().find(|t| carries_as(&t.records, rid, want))

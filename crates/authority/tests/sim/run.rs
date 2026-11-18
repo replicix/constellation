@@ -1603,6 +1603,8 @@ pub struct Report {
     pub stateright_checked: bool,
     /// Refusals explained only by an acked-then-rolled-back effect (L2).
     pub observed_tentative: usize,
+    /// ADR-55 R-H: `Final` answers of the root's own stream that only a rolled-back effect explains (`own_stream_observed_rolled_back`).
+    pub own_stream_observed_rolled_back: usize,
     /// Plan 30 §M6: the per-node session checks.
     pub sessions: super::session::SessionReport,
     /// Plan 30 §M8: close-to-open (enforced under `strict`).
@@ -7740,6 +7742,68 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &resumed,
     ) {
         history_err.get_or_insert(lin_context(e));
+    }
+    // ADR-55 R-H (plan 46 M1.3 step 9): the root's own stream answers `Final`
+    // on log rows plus the stream, so a refusal (or success) of such an answer
+    // that only a rolled-back effect explains is not the L2 window (a holder
+    // that had acknowledged a Local/Lone effect, then died): it is counted
+    // always and fails the run under the gate I5 uses. It narrows the excuse
+    // above for these answers; `observed_tentative` and the
+    // `strict_durability` check below are as they were.
+    let own_answered = super::oracle::own_stream_answered(
+        &oracles.acks.lock().unwrap(),
+        &oracles.own_stream_rows.lock().unwrap(),
+    );
+    let mut observed_own: Vec<Rid> = witness
+        .observers
+        .intersection(&own_answered)
+        .copied()
+        .collect();
+    observed_own.sort();
+    report.own_stream_observed_rolled_back = observed_own.len();
+    if !observed_own.is_empty() && (cfg.strict_lone || cfg.strict_durability) {
+        let acks = oracles.acks.lock().unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        for rid in &observed_own {
+            let answers: Vec<String> = acks
+                .iter()
+                .filter(|a| a.rid == *rid)
+                .map(|a| {
+                    format!(
+                        "n{} {:?} class={:?} at {}ms tx.origin={:?}",
+                        a.node,
+                        a.kind,
+                        a.judged.as_ref().and_then(|j| j.class),
+                        a.at_ms,
+                        a.judged
+                            .as_ref()
+                            .and_then(|j| j.tx.as_ref())
+                            .map(|t| t.origin)
+                    )
+                })
+                .collect();
+            // The tentative ops invoked before this rid returned.
+            let mut invoked: Vec<String> = Vec::new();
+            for e in &events {
+                match e {
+                    super::history::HistEvt::Invoke { rid: r, op, .. } if tentative.contains(r) => {
+                        invoked.push(format!("rid({},{},{}) {op:?}", r.node, r.incarnation, r.seq));
+                    }
+                    super::history::HistEvt::Return { rid: r, .. } if r == rid => break,
+                    _ => {}
+                }
+            }
+            seen.push(format!(
+                "{rid:?}: answers={answers:?} tentative ops invoked before it returned={invoked:?}"
+            ));
+        }
+        return Err(lin_context(format!(
+            "own_stream_observed_rolled_back: {} Final answer(s) of the root's own stream \
+             observed an effect that was later rolled back (ADR-55 R-H: an own stream rests on \
+             log rows plus the stream alone): {}",
+            observed_own.len(),
+            seen.join("; ")
+        )));
     }
     let observed_by_protocol = witness.observed_tentative - witness.observed_dropped;
     if strict_durability && observed_by_protocol > 0 {

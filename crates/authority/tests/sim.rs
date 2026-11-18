@@ -1791,13 +1791,14 @@ fn long_random() {
         match run_seed(seed, cfg.clone()) {
             Ok(report) => eprintln!(
                 "seed {seed}: ok in {:.2}s ({} ms simulated, {} ops, {} segments, converged {}, \
-                 observed-tentative refusals {})",
+                 observed-tentative refusals {}, own-stream observed rolled back {})",
                 started.elapsed().as_secs_f64(),
                 report.simulated_ms,
                 report.ops_returned,
                 report.segments,
                 report.converged_checked,
-                report.observed_tentative
+                report.observed_tentative,
+                report.own_stream_observed_rolled_back
             ),
             Err(e) => {
                 eprintln!("seed {seed}: {e}");
@@ -10767,6 +10768,8 @@ struct OracleTotals {
     sticky_core: [u64; 16],
     claim_core: [u64; 4],
     root_own_core: [u64; 15],
+    /// `Report::observed_tentative` and `own_stream_observed_rolled_back`, summed over the seeds that passed.
+    observed_own: (usize, usize),
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
     unapplied_core: [u64; 3],
@@ -11244,6 +11247,8 @@ impl OracleTotals {
                 *c += n;
             }
         }
+        self.observed_own.0 += r.observed_tentative;
+        self.observed_own.1 += r.own_stream_observed_rolled_back;
         self.i2 += r.identity_copies;
         self.i2c += r.non_verbatim;
         self.i2c_abandon_rerun.0 += r.i2c_abandon_rerun as u64;
@@ -11589,6 +11594,10 @@ impl OracleTotals {
             self.root_own_core[12],
             self.root_own_core[13],
             self.root_own_core[14]
+        );
+        eprintln!(
+            "OWN-OBSERVED-TOTALS {label} seeds {}/{seeds}: observed_tentative {}, own_stream_observed_rolled_back {}",
+            self.seeds, self.observed_own.0, self.observed_own.1
         );
         eprintln!(
             "HANDOVER-TOTALS {label} seeds {}/{seeds}: requested {} (`deleg_handovers_requested`), granted after the row {} (`place_handover_granted`), \
