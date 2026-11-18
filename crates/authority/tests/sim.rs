@@ -322,6 +322,7 @@ fn replay_seed() {
         Ok("far-root-writes-paused") => far_root_writes_paused_config(),
         Ok("far-root-writes-shared") => far_root_writes_shared_config(),
         Ok("far-root-writes-cross") => far_root_writes_cross_config(),
+        Ok("far-root-writes-held-own") => far_root_writes_held_own_config(),
         Ok("far-placement") => far_placement_config(),
         Ok("far-placement-release") => far_placement_release_config(),
         Ok("sticky-idle-release") => sticky_idle_release_config(),
@@ -2090,6 +2091,30 @@ fn far_root_writes_paused_config() -> SimConfig {
             },
         ],
         ..far_root_writes_config()
+    }
+}
+
+/// Plan 46 M1.3 step 9 (ADR-55 R-H (b)), the sim control's workload:
+/// `far-root-writes-paused` with one directory and two names, so that an
+/// answer of the root's own stream depends on a root row's *name*. Node 1's
+/// clients write chunks under `d1` (a metered upload hold of 12 s keeps one
+/// written before the grant, at about 1.6 s, unshipped past the pause at 3 s
+/// and the takeover at about 9 s), so the root's own clients' unlink, rename
+/// or link of such an inode is held by key and unacknowledged (the root
+/// commits by the archive), while the other root client's create, unlink or
+/// rename on the same two names is answered by the stream. Without the
+/// control `AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD=1` R-H (b) keeps that
+/// stream unhonoured until the row ships; with it, the deposition rolls the
+/// row back after the answer that saw it (`own_stream_observed_rolled_back`).
+fn far_root_writes_held_own_config() -> SimConfig {
+    SimConfig {
+        dirs: vec!["d1".into()],
+        sticky_delegations: Vec::new(),
+        names: 2,
+        chunk_writes: 0.6,
+        chunk_write_nodes: vec![1],
+        upload_hold_ms: 12_000,
+        ..far_root_writes_paused_config()
     }
 }
 
@@ -8197,6 +8222,7 @@ fn base_config(label: &str) -> SimConfig {
         "far-root-writes-paused" => far_root_writes_paused_config(),
         "far-root-writes-shared" => far_root_writes_shared_config(),
         "far-root-writes-cross" => far_root_writes_cross_config(),
+        "far-root-writes-held-own" => far_root_writes_held_own_config(),
         "far-placement" => far_placement_config(),
         "far-placement-release" => far_placement_release_config(),
         "sticky-idle-release" => sticky_idle_release_config(),
@@ -23572,6 +23598,7 @@ fn the_root_own_controls_fail_the_oracles() {
 fn far_root_writes_and_the_sticky_stubs_run_in_report_mode() {
     let cases = [
         ("far-root-writes", far_root_writes_config()),
+        ("far-root-writes-held-own", far_root_writes_held_own_config()),
         ("sticky-idle-release", sticky_idle_release_config()),
         (
             "sticky-handover-ping-pong",
