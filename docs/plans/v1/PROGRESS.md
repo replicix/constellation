@@ -69993,6 +69993,26 @@ the idle counter counts completed releases; the pin test, `sticky-claim` and the
 `sticky-holder-restarts-placed` 992 and 1637 fail on main and pass on the branch because the schedule changed (the idle
 release); they were not masked and are to be classified on main.
 
+Follow-up (2026-11-18, seed 226 of `far-root-writes+lost-chunk-late`): a claim through a stranding takeover gate (a
+self-sealed holder re-claiming its own lease) journaled no release row, and `sticky_ends_only_by_holder_or_operator`
+failed. Two guards stopped the row, neither exercised by step 12's tests (claims without a stranding gate): (1)
+`claim_releases` went rowless above `holder_append_cap`, copied from `release_subtrees`; the claim's end caps nothing and
+the ship plan keeps a stream's index order, so the guard is dropped (the lost-dependency guard stays); (2) the gate fence
+of `Meta::begin_local` (da4124cf) refused the write of an ended generation. `Meta::delegate_release` now journals through
+`PendingDelegate::set_release`, which only the fence skips, and refuses any record that is not `StreamReleased` /
+`SubtreeReleased`; ops and every other record stay fenced. ADR-60 carries the invariant argument. Fail-before (all fail on
+main, pass on the fix): `a_gate_ended_generation_takes_a_release_row_and_nothing_else` (meta; the same test is the safety
+side: ops and non-release records stay refused), `a_claim_through_a_stranding_gate_journals_the_release_row` and
+`a_claim_over_a_gate_ended_generation_journals_the_release_row` (core). Sweeps, release, x2,000 each, main plus the
+seed226 drop-held rid fix versus the fix (failing sets equal except seed 226, which now passes; claim totals
+journaled/rowless/waits/outrun equal except `far-root-writes+lost-chunk-late` 1594/0/10/3 -> 1595/0/11/4): the failing
+seeds of `far-root-writes+lost-chunk-late` go [226, 996, 1810] -> [996, 1810], `far-root-writes-paused+lost-chunk-late`
+[996] both; every other label clean on both sides (`far-root-writes{,-paused,-shared,-cross}+lost-chunk`,
+`far-placement+lost-chunk`, `sticky-claim`, `sticky-holder-restarts-placed`, `far-placement-release`, `far-root-writes`,
+`far-root-writes-paused`, `delegated-designated`, `drop-held-chain-backed`, `flex-crash+durability`). Seeds 996 and 1810
+are independent failures of the `+lost-chunk-late` variant, left. The variant and its seed 226 pin come with the
+drop-held fix.
+
 
 ### M1.3 step 14: Leave ends grants first (2026-11-14)
 
