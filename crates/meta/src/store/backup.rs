@@ -293,7 +293,7 @@ impl Meta {
         }
         #[cfg(any(test, feature = "test-util"))]
         if contiguous {
-            read_fault::check()?;
+            read_fault::check().inspect_err(|_| read_fault::note_append_hit())?;
         }
         // Every live key of the tail is at or above the floor (`backup_trim`
         // keeps it; a resend lowers it below, after the commit), so the
@@ -969,6 +969,15 @@ pub fn fail_deleg_backup_reads_on_this_thread_for_tests(n: u32) {
 pub fn fail_store_reads_after_on_this_thread_for_tests(skip: u32, n: u32) {
     read_fault::SKIP.with(|c| c.set(skip));
     read_fault::LEFT.with(|c| c.set(n));
+    read_fault::APPEND_HITS.with(|c| c.set(0));
+}
+
+/// How many injected read faults, since the last
+/// [`fail_store_reads_after_on_this_thread_for_tests`], hit
+/// [`Meta::backup_append_contiguous`]'s own read (and no other).
+#[cfg(any(test, feature = "test-util"))]
+pub fn append_contiguous_read_faults_on_this_thread_for_tests() -> u32 {
+    read_fault::APPEND_HITS.with(|c| c.get())
 }
 
 /// The test hook's check, for the store's other reads it covers.
@@ -984,6 +993,11 @@ mod read_fault {
     thread_local! {
         pub(super) static LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         pub(super) static SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        pub(super) static APPEND_HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn note_append_hit() {
+        APPEND_HITS.with(|c| c.set(c.get() + 1));
     }
 
     pub(super) fn check() -> Result<(), MetaError> {
@@ -1266,6 +1280,129 @@ mod tests {
             vec![real, hole(a, z + 2), next.clone()]
         );
         assert_eq!(backup.backup_acked(3).unwrap(), next.last);
+    }
+
+    /// The shapes `backup_append_contiguous` is tested on: a real
+    /// transaction over `first..=last`, and a hole over the same.
+    fn span_tx(real: &BackupTx, first: u64, last: u64) -> BackupTx {
+        BackupTx {
+            first,
+            last,
+            ..real.clone()
+        }
+    }
+
+    fn hole_tx(first: u64, last: u64) -> BackupTx {
+        BackupTx {
+            first,
+            last,
+            records: Vec::new(),
+            origin: (0, 0),
+        }
+    }
+
+    fn one_real_tx() -> BackupTx {
+        let holder = Meta::open_in_memory().unwrap();
+        holder.set_holder_epoch(3);
+        create(&holder, "a", 1);
+        holder.journal_txs_from(1, 1000).unwrap().remove(0)
+    }
+
+    /// After a gap nothing is written and the store's caches agree: the
+    /// tail is as it was, and a plain append of the missing rows lands and
+    /// leaves the hold contiguous through the tip.
+    fn assert_gap_leaves_nothing(meta: &Meta, before: &[BackupTx], missing: BackupTx, tip: u64) {
+        assert_eq!(meta.backup_tail(3).unwrap(), before);
+        meta.backup_append(3, &[missing]).unwrap();
+        assert_eq!(meta.backup_acked(3).unwrap(), tip);
+    }
+
+    /// Review 3 (S1): a batch that continues the hold is `Held` and is
+    /// written; one that leaves a gap before it is `Gap` with the hold the
+    /// merge would have left, and writes nothing.
+    #[test]
+    fn a_contiguous_append_is_held_and_one_past_a_gap_is_not() {
+        let real = one_real_tx();
+        let backup = Meta::open_in_memory().unwrap();
+        // An empty store: the batch is the whole hold.
+        assert_eq!(
+            backup
+                .backup_append_contiguous(3, &[span_tx(&real, 1, 1)])
+                .unwrap(),
+            TailAppend::Held
+        );
+        assert_eq!(
+            backup
+                .backup_append_contiguous(3, &[span_tx(&real, 2, 2)])
+                .unwrap(),
+            TailAppend::Held
+        );
+        assert_eq!(backup.backup_acked(3).unwrap(), 2);
+        // Past a gap (3..=4 missing).
+        let before = backup.backup_tail(3).unwrap();
+        assert_eq!(
+            backup
+                .backup_append_contiguous(3, &[span_tx(&real, 5, 5)])
+                .unwrap(),
+            TailAppend::Gap { acked: 2 }
+        );
+        assert_gap_leaves_nothing(&backup, &before, span_tx(&real, 3, 4), 4);
+        // The cache is coherent: the row once refused is now contiguous.
+        assert_eq!(
+            backup
+                .backup_append_contiguous(3, &[span_tx(&real, 5, 5)])
+                .unwrap(),
+            TailAppend::Held
+        );
+        assert_eq!(backup.backup_acked(3).unwrap(), 5);
+    }
+
+    /// Review 3 (S1, Fable's first case): a batch hole that begins inside a
+    /// stored hole merges with it, and the merged hole reaches the tip: no
+    /// gap. A walk over the stored rows before the merge (or in a fresh
+    /// read transaction) sees a hole 1..=10 and a row keyed at 5 and ends
+    /// the hold at 10.
+    #[test]
+    fn a_hole_merged_with_the_stored_hole_below_is_no_tail_gap() {
+        let backup = Meta::open_in_memory().unwrap();
+        backup.backup_append(3, &[hole_tx(1, 10)]).unwrap();
+        assert_eq!(
+            backup
+                .backup_append_contiguous(3, &[hole_tx(5, 15)])
+                .unwrap(),
+            TailAppend::Held
+        );
+        assert_eq!(backup.backup_tail(3).unwrap(), vec![hole_tx(1, 15)]);
+        assert_eq!(backup.backup_acked(3).unwrap(), 15);
+    }
+
+    /// Review 3 (S1, Fable's second case): a narrower batch hole inside a
+    /// wider stored one keyed at its first row keeps the wider hole, so the
+    /// hold reaches past the batch's tip; a real row past the wider hole's
+    /// end is still a gap, and the gap is the wider hole's end.
+    #[test]
+    fn a_wider_stored_hole_decides_the_tail_gap() {
+        let real = one_real_tx();
+        let backup = Meta::open_in_memory().unwrap();
+        backup
+            .backup_append(3, &[span_tx(&real, 1, 2), hole_tx(3, 12)])
+            .unwrap();
+        let before = backup.backup_tail(3).unwrap();
+        assert_eq!(
+            backup
+                .backup_append_contiguous(3, &[hole_tx(3, 8)])
+                .unwrap(),
+            TailAppend::Held
+        );
+        assert_eq!(backup.backup_tail(3).unwrap(), before);
+        // The same hole with a row past the wider one's end.
+        assert_eq!(
+            backup
+                .backup_append_contiguous(3, &[hole_tx(3, 8), span_tx(&real, 14, 14)])
+                .unwrap(),
+            TailAppend::Gap { acked: 12 }
+        );
+        assert_gap_leaves_nothing(&backup, &before, span_tx(&real, 13, 13), 13);
     }
 
     /// Round 2: rows the journal no longer has stream as holes, and a

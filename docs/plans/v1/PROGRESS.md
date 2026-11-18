@@ -70405,3 +70405,10 @@ with its own contiguous tail succeeds and the stall is real only where the gappe
 `an_abandon_after_a_fetched_gap_lets_the_next_attempt_claim`, `a_self_claim_whose_tail_cannot_be_written_ends`,
 `a_member_copy_read_error_answers_nothing_to_a_claimant`. Not done: the mutation fail-before of
 `a_self_claim_with_a_copy_that_fails_its_read_ends` (review S5), the kept-fetch adoption (S6, another agent), a scoped abandon.
+m12tail review 3 follow-up (S1, S2, nits): meta tests of `backup_append_contiguous` pin a contiguous and a gap pair (the
+tail unchanged after a Gap, a plain append still lands, the refused batch is Held once the gap is filled), a batch hole
+merged with the stored hole below (`{1..=10, 5..=15}` is Held), and a wider stored hole keyed at the batch's first row (the
+hold reaches its end; a row past it is `Gap { acked }`). `a_self_claim_whose_tail_cannot_be_written_ends` now asserts the
+injected read fault landed in the append itself (`append_contiguous_read_faults_on_this_thread_for_tests`), so a shifted
+read count cannot move the fault elsewhere unnoticed. `adopt_tail` is `#[must_use]`; a store error is logged once (the
+replica's warn carries the error).

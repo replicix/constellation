@@ -87559,8 +87559,11 @@ mod tail_answer_gaps {
         // The member copy is held and read; the append's read then fails.
         constellation_meta::fail_store_reads_after_on_this_thread_for_tests(2, 1);
         let went_on = h.core.prepare_tail_for_claim(&prev, &h.meta);
+        let hit_the_append =
+            constellation_meta::append_contiguous_read_faults_on_this_thread_for_tests();
         constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
         assert!(!went_on);
+        assert_eq!(hit_the_append, 1, "the injected fault landed in the append");
         assert_eq!(h.core.stats.tail_answer_gaps, 0, "a store error is no gap");
         assert!(h.core.bk.fetched.is_empty());
         assert!(h.core.bk.role.is_none());

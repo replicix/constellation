@@ -1431,6 +1431,7 @@ impl Core {
     /// commits only when the hold reaches the tip, so a gap leaves nothing
     /// behind. Returns whether the tail was written; the caller ends its
     /// claim on `false`, in every build.
+    #[must_use]
     fn adopt_tail(
         &mut self,
         source: &'static str,
@@ -1454,15 +1455,9 @@ impl Core {
                 );
                 false
             }
-            None => {
-                tracing::error!(
-                    node = self.cfg.node_id,
-                    epoch,
-                    source,
-                    "the claimed tail could not be written: the claim ends"
-                );
-                false
-            }
+            // A store error: logged once, with the error, where the replica
+            // sees it ("persisting an adopted tail failed; the claim ends").
+            None => false,
         }
     }
 
