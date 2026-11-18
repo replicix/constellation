@@ -70265,3 +70265,16 @@ nothing; the gate retries) instead of halting the row. `own_deleg_reappend_forge
 are gone. Tests: `a_crash_between_the_gate_strand_and_the_re_append_keeps_the_rows_identity` (fails on the parent),
 `reship_reappends_own_rows_in_its_own_transaction` (an injected fault before the commit leaves everything as before),
 `the_takeover_gate_re_appends_no_row_from_a_lost_dependency_on` (replaces the uncaptured-deps test: the deps are always read now).
+
+Review follow-up (same entry). The generations the re-ship left to the replay by rid are now marked in its transaction
+(`deleg_claim_replayed:{gen}`, `Meta::deleg_claim_replayed`, never cleared), so a claim after a crash right after the commit still
+journals no release row behind rows the replay journals by rid; the core's in-memory `claim_replayed` is gone. Tests:
+`a_claim_after_a_crash_still_journals_no_release_over_rows_the_gate_replayed` (fails without the mark),
+`a_dependency_past_an_orphan_cut_of_the_same_claim_halts_the_re_append` (pins the transaction's `orphan_lost` closure against
+`deps_lost`; fails with the closure removed). A failed re-append logs its generation and index; a re-ship that re-appended rows
+wakes readers waiting on keys of rows it took out of the queue. Gates (debug and release lib tests, fmt, clippy) and sweeps:
+fmt and clippy `-D warnings` clean; lib tests debug (meta 469, authority 1689) and release (468, 1689) pass, no FAILED. Sweeps,
+base `origin/main` against the fix, 2000 seeds each (nine labels: delegated-holder-cut, placement-hot, long-delegated-backup,
+long-delegated-late-answers (also with slow lease reads), delegated-two-dirs-one-backed, delegated-backup, delegated-epoch, tloss-two-node):
+zero `SWEEP-FAIL` seeds on both sides; the fix re-appended own rows in the labels that delegate (`SWEEP-REAPPENDED` totals 602, 22, 586,
+1084, 1372, 409, 285, 0, 10).
