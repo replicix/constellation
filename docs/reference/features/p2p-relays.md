@@ -68,8 +68,14 @@ URL in addition to any local IPs. Peers inject those records into iroh via
 
 - **Allowlist**: only registry-enrolled pubkeys are accepted on the direct
   ALPN. A relay cannot introduce an unenrolled peer.
-- **Signed messages**: gossip payloads are signed by the author key; a
-  relay cannot impersonate a node.
+- **Authenticated streams, signed gossip**: a direct stream is
+  authenticated and integrity-protected by the QUIC TLS 1.3 session, which
+  is bound to the enrolled key (the allowlist is re-checked on every
+  stream), and the node ids a request names are bound to that key; its
+  messages carry no per-message signature. Gossip payloads, which other
+  peers forward, are signed by the author key. Either way a relay cannot
+  impersonate a node. Direct-stream data is never sent as 0-RTT early data
+  ([ADR-63](../../explanation/DECISIONS.md#adr-63-direct-streams-carry-no-per-message-signature)).
 - **End-to-end crypto**: the relay forwards opaque QUIC; it cannot read
   or forge Constellation payloads.
 - **S3 remains truth**: leases, logs, and chunks commit on S3. Relays
@@ -88,7 +94,7 @@ relay is a shared blind forwarder; isolation between tenants is
 | Concern | Who enforces it |
 |---|---|
 | Join this filesystem / dial its ALPN | S3 node registry allowlist |
-| Impersonate a node / rewrite gossip | Endpoint keys + signed messages |
+| Impersonate a node / rewrite gossip | Endpoint keys (TLS session on streams) + signed gossip |
 | Read relayed bytes | End-to-end encryption (relay is blind) |
 | Enroll a rogue node id | Bucket write IAM |
 | Use the relay at all | Relay `access` (open, shared token(s), allowlist, …) |

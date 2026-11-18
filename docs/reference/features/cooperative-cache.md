@@ -148,7 +148,7 @@ first summary arrives.
 |---|---|
 | `CacheSummary` | ~150 bytes |
 | `CacheSetDelta` | ≤ 2048 keys, ≤ ~21 KiB (inside the 31 KiB gossip content limit) |
-| `ReplayRequest` | an incarnation and a `seq`, ~120 bytes signed |
+| `ReplayRequest` | an incarnation and a `seq`, ~30 bytes on a direct stream |
 | `ReplayReply` | ≤ 48 KiB of deltas plus the owner's summary (the first delta is always sent, so a page is never empty; under the 64 KiB frame) |
 | `ReconcileRequest` | ≤ 512 ranges, ~19 KiB |
 | `ReconcileReply` | ≤ 48 KiB of answers; the owner stops early and reports `processed`, and the rest is re-sent (always under the 64 KiB stream frame) |
@@ -247,8 +247,9 @@ status` expose the counters below. `/metrics` exports a subset:
 - `digest_mode`
 - `peer_false_positives`, `peer_stale_misses`, `peer_misses`
 - `digest_bytes_sent`, `digest_bytes_received`, `digest_messages`: all
-  digest-plane traffic in either mode, measured as the signed payload
-  size. Gossip fan-out is not included.
+  digest-plane traffic in either mode, measured as the payload size
+  plus its framing: the signed envelope for gossip, the 4-byte length for a
+  direct stream. Gossip fan-out is not included.
 - `digest_cpu_us`: time spent building, applying and answering digests
 - `reconcile_sessions`, `reconcile_rounds`, `reconcile_failures`,
   `reconcile_cpu_us`: the exact-mode sessions this node initiated. The

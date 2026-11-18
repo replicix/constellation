@@ -52,7 +52,9 @@ holder's S3 inbox instead.
 
 ## Wire messages
 
-Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
+Both messages are iroh payloads on a direct stream, authenticated by the
+connection (QUIC TLS bound to the enrolled key) rather than signed one by one.
+Mutation bodies use postcard encoding.
 
 `MutateRequest` contains:
 

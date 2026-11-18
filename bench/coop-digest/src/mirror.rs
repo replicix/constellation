@@ -3,7 +3,7 @@
 //! owner-side `reconcile::respond`.
 
 use crate::acc::Acc;
-use constellation_net::message::{wire_len, Payload};
+use constellation_net::message::{stream_wire_len as wire_len, Payload};
 use constellation_net::reconcile::{
     decode_keys, Answer, Delta, DeltaOutcome, Fingerprint, Key, KeySet, Query, Range, Reply,
     Summary, FANOUT_BITS, MAX_DELTA_KEYS, MAX_QUERIES_PER_REQUEST, MAX_ROUNDS, REPLY_BUDGET,

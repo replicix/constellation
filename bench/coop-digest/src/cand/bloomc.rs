@@ -6,7 +6,7 @@
 use crate::mirror::{LocationMirror, SeqState};
 use crate::util::mix64;
 use constellation_net::bloom::{bucket_count_for, bucket_index, Bloom, Hash};
-use constellation_net::message::{wire_len, Payload};
+use constellation_net::message::{gossip_wire_len as wire_len, Payload};
 use constellation_net::reconcile::{
     decode_keys, Delta, DeltaOutcome, Fingerprint, Key, KeySet, Range, Summary,
 };

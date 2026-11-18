@@ -6025,3 +6025,56 @@ namespace's).
 See: `crates/authority/tests/sim/history.rs` (`NsSpec::is_valid_step`),
 `crates/authority/tests/sim/run.rs` (the client's `EROFS` branch),
 [TESTING](../how-to-guides/development/TESTING.md), "The checker design".
+
+## ADR-63: Direct streams carry no per-message signature
+
+**Status**: decided by the maintainer on 2026-11-18, after a security review.
+
+**Context**: every direct P2P request and reply was a `Signed` envelope: an
+Ed25519 signature on each message, verified by the peer (about 100 us of a
+~275 us backup round trip and ~30% of the daemons' worker CPU). On a direct
+stream the signature proved nothing the connection did not: QUIC with TLS 1.3
+raw public keys gives `conn.remote_id()`, the peer's Ed25519 key proved in the
+handshake, and the code already required the signer to equal it. Nothing
+consumed a stream signature but the direct peer (a forwarded message is
+re-signed by its forwarder, nothing persists the envelope, no payload carries
+a proof), and the envelope had no nonce or channel binding, so replay never
+depended on it.
+
+**Decision**: on the direct ALPN, a frame is a 4-byte length and the postcard
+`Payload`, with no author and no signature (`write_payload` / `read_payload`):
+`request`, `request_liveness`, the pool's ping probe, the log stream
+(`LogSubscribe`, `LogFrame`, `LogEnd`), `ChunkRequest` / `ChunkResponse`, and
+every reply `handle_stream` writes. Gossip keeps `Signed`: other peers forward
+it, so the transport peer is not its author.
+- **Identity.** The connection's key is the author of its frames. The server
+  keeps `claimed_node_id` against the node enrolled under that key, so a peer
+  still cannot act for another node. The client asserts
+  `conn.remote_id() == expect` where it used to check the reply's author; the
+  dialed id is pinned by the handshake, so a dial whose id does not match its
+  address fails.
+- **Revocation.** `handle_conn` re-checks the allowlist on every stream and
+  closes a connection whose key left it (one set lookup). Before, a removed key
+  kept its open connections served for anything that named no node (`Ping`,
+  `ChunkRequest`, `SegmentPublished`). Re-checking beat closing tracked
+  connections in `set_allowed`: not every connection is tracked (the liveness
+  lane's are not) and a check at use has no window.
+- **Never 0-RTT.** 0-RTT early data is replayable, and an unsigned frame would
+  be replayable bare. Direct-stream frames must never be sent or read as 0-RTT;
+  none is today (no `into_0rtt`), and the comment at `P2p::request` says so.
+- **Two decoders.** The stream and gossip decoders stay distinct: gossip
+  refuses a bare `Payload`, with no "try one, fall back to the other".
+- **ALPN** `constellation/4`; `/3` joins `OLDER_ALPNS` and is refused by name.
+  Mixed-version clusters are not supported (no compatibility shim).
+- **Known and out of scope.** `EpochActivate` is not bound to its proposer,
+  on gossip or on a stream; recorded as an open item in PROGRESS.
+
+**Rejected**: a faster signature backend (about 25-45 us, keeps the cost);
+a per-connection MAC (about 95 us saved, proves nothing the QUIC AEAD does
+not); verifying only what is later relayed or stored (nothing on a stream is,
+so it reduces to this decision).
+
+See: `crates/net/src/message.rs` (`write_payload`, `read_payload`),
+`crates/net/src/peers.rs` (`handle_conn`, `handle_stream`),
+[p2p-relays](../reference/features/p2p-relays.md), "Trust model", and
+[security-audit-2026-09](../security-audit-2026-09.md).

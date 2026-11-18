@@ -8,7 +8,7 @@
 //!   sim          staleness under loss and reordering, many peers
 //!   cuckoo-load  filter insert failures and rebuilds at 50-95% load
 
-use constellation_net::message::wire_len;
+use constellation_net::message::stream_wire_len as wire_len;
 use constellation_net::reconcile::{
     respond_replay, DeltaLog as ProductLog, DeltaOutcome, KeySet, Mirror, Range, Summary,
     MAX_REPLAY_PAGES, REPLAY_PAGE_BUDGET,

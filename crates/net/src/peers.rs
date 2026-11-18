@@ -12,7 +12,7 @@
 
 use crate::allowlist::Decision;
 use crate::endpoint::{P2p, PathKind, PeerService};
-use crate::message::{read_frame, write_frame, Payload, Signed, ALPN};
+use crate::message::{read_payload, write_payload, Payload, Signed, ALPN};
 use anyhow::Result;
 use iroh::EndpointAddr;
 use std::collections::HashMap;
@@ -1311,6 +1311,15 @@ impl<S: PeerService> iroh::protocol::ProtocolHandler for DirectHandler<S> {
     }
 }
 
+/// Open one gossip message: the bare signed envelope, decoded and verified.
+/// Gossip has no unsigned form and no fallback to the stream framing: a
+/// bare `Payload`, a stream frame and a tampered envelope are all refused.
+/// Gossip carries whole messages, so the length prefix used for stream
+/// framing is not present here.
+fn open_gossip(content: &[u8]) -> Result<(iroh::PublicKey, Payload)> {
+    Signed::decode(content)?.verify()
+}
+
 /// Consume gossip events, dispatching verified `SegmentPublished` hints
 /// to the service. Returns when the topic ends.
 ///
@@ -1357,15 +1366,11 @@ pub async fn run_gossip<S: PeerService>(
             }
             iroh_gossip::api::Event::Received(msg) => msg,
         };
-        // Gossip carries whole messages, so the length prefix used for
-        // stream framing is not present here — decode the payload
-        // directly.
-        let Ok(signed) = Signed::decode(&msg.content) else {
-            tracing::debug!(bytes = msg.content.len(), "undecodable gossip message");
-            continue;
-        };
-        let Ok((author, payload)) = signed.verify() else {
-            tracing::debug!("dropping gossip message with a bad signature");
+        let Ok((author, payload)) = open_gossip(&msg.content) else {
+            tracing::debug!(
+                bytes = msg.content.len(),
+                "dropping an undecodable or badly signed gossip message"
+            );
             continue;
         };
         let hex = crate::identity::hex32(author.as_bytes());
@@ -1570,7 +1575,6 @@ async fn handle_conn<S: PeerService>(
     conn: iroh::endpoint::Connection,
 ) -> Result<()> {
     let remote = conn.remote_id();
-    let remote_key = *remote.as_bytes();
     let hex = crate::identity::hex32(remote.as_bytes());
     // Accept-time authorization: the key must be enrolled in the
     // registry, which requires bucket write. A miss re-reads the registry
@@ -1605,6 +1609,18 @@ async fn handle_conn<S: PeerService>(
             // Normal close.
             Err(_) => return Ok(()),
         };
+        // The allowlist is re-checked on every stream, not only at accept:
+        // the registry is the trust root and `set_allowed` replaces the
+        // list, but an open connection outlives its key's removal. With no
+        // signature on a frame, "enrolled" is what the connection's key
+        // proves, so a revoked key must stop being served at its next
+        // stream, whatever connection it arrives on (inbound or pooled,
+        // tracked or not). One hash lookup; a miss closes the connection.
+        if !inner.p2p.is_allowed(&hex) {
+            tracing::warn!(peer = %hex, "closing a connection whose key left the registry allowlist");
+            conn.close(1u32.into(), b"not allowed");
+            return Ok(());
+        }
         let waiting = std::time::Instant::now();
         let Ok(permit) = slots.clone().acquire_owned().await else {
             return Ok(());
@@ -1636,7 +1652,7 @@ async fn handle_conn<S: PeerService>(
                 spawn_us = accepted.elapsed().as_micros() as u64,
                 "stream accepted"
             );
-            let r = handle_stream(&inner, service.as_ref(), &remote_key, &hex, send, recv).await;
+            let r = handle_stream(&inner, service.as_ref(), &hex, send, recv).await;
             if let Err(e) = r {
                 tracing::debug!(peer = %hex, error = %e, "peer stream ended with an error");
             }
@@ -1644,8 +1660,9 @@ async fn handle_conn<S: PeerService>(
     }
 }
 
-/// Registry node id enrolled under the pubkey the stream is signed by,
-/// if any. A frame's signer is already pinned to the connection's peer
+/// Registry node id enrolled under the pubkey of the connection a stream
+/// arrived on, if any. A direct-stream frame carries no signature: its
+/// author is the connection's peer, whose key the TLS handshake proved
 /// (see `handle_stream`), so this is that peer's node id: arms whose
 /// payload names a node on whose behalf it claims to act compare against
 /// it, so an enrolled peer cannot speak for another node.
@@ -1720,7 +1737,6 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
 async fn handle_stream<S: PeerService>(
     inner: &Arc<Inner>,
     service: &S,
-    remote_key: &[u8; 32],
     hex: &str,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
@@ -1729,19 +1745,16 @@ async fn handle_stream<S: PeerService>(
     // Bound the wait for the request frame so a peer that opens a stream
     // and then sends nothing cannot pin one of this connection's stream
     // permits (see [`INBOUND_READ_TIMEOUT`]).
-    let req = tokio::time::timeout(INBOUND_READ_TIMEOUT, read_frame(&mut recv))
+    let payload = tokio::time::timeout(INBOUND_READ_TIMEOUT, read_payload(&mut recv))
         .await
         .map_err(|_| anyhow::anyhow!("inbound stream idle past the read deadline"))??;
     let read_us = t0.elapsed().as_micros() as u64;
-    let (author, payload) = req.verify()?;
-    // The signer must be the peer we authorized, so an allowed peer
-    // cannot relay a third party's request through its connection.
-    if author.as_bytes() != remote_key {
-        tracing::warn!(peer = %hex, "dropping frame signed by a different key");
-        return Ok(());
-    }
-    // And the node it claims to be must be the node enrolled under that
-    // key: an enrolled peer cannot act on another node's behalf.
+    // The frame is unsigned: its origin is the connection's key (`hex`),
+    // proved by the TLS 1.3 raw-public-key handshake, which also protects
+    // the stream's integrity, and `handle_conn` re-checked it against the
+    // allowlist for this stream. Frames are never read as 0-RTT early data.
+    // The node the payload claims to be must be the node enrolled under
+    // that key: an enrolled peer cannot act on another node's behalf.
     if let Some(claimed) = claimed_node_id(&payload) {
         let sender = sender_node_id(inner, hex);
         if sender != Some(claimed) {
@@ -1783,7 +1796,7 @@ async fn handle_stream<S: PeerService>(
                 from,
                 ..
             } => {
-                serve_log_stream(inner, service, hex, requester, req_id, from, &mut send).await?;
+                serve_log_stream(service, hex, requester, req_id, from, &mut send).await?;
                 let _ = send.finish();
                 return Ok(None);
             }
@@ -2329,8 +2342,7 @@ async fn handle_stream<S: PeerService>(
                     Err(why) => crate::message::ChunkStatus::Declined(*why),
                 };
                 let reply = Payload::ChunkResponse { hash, status };
-                let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
-                write_frame(&mut send, &signed).await?;
+                write_payload(&mut send, &reply).await?;
                 if let Ok(bytes) = served {
                     use tokio::io::AsyncWriteExt;
                     send.write_u64(bytes.len() as u64).await?;
@@ -2383,8 +2395,7 @@ async fn handle_stream<S: PeerService>(
     };
     let served_us = t0.elapsed().as_micros() as u64;
     if let Some(reply) = reply {
-        let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
-        write_frame(&mut send, &signed).await?;
+        write_payload(&mut send, &reply).await?;
     }
     let _ = send.finish();
     tracing::trace!(
@@ -2400,12 +2411,10 @@ async fn handle_stream<S: PeerService>(
 
 /// Plan 30 §M7: write `requester`'s log stream until the service closes
 /// it, the subscriber goes away, or a frame is not taken within
-/// [`crate::endpoint::LOG_FRAME_WRITE_TIMEOUT`]. Every frame is a signed
-/// [`Payload::LogFrame`] followed by the raw segment bytes, like a chunk
-/// body; the subscriber checks the bytes against the signed hash.
-#[allow(clippy::too_many_arguments)]
+/// [`crate::endpoint::LOG_FRAME_WRITE_TIMEOUT`]. Every frame is an
+/// (unsigned) [`Payload::LogFrame`] followed by the raw segment bytes, like a chunk
+/// body; the subscriber checks the bytes against the hash in the frame.
 async fn serve_log_stream<S: PeerService>(
-    inner: &Arc<Inner>,
     service: &S,
     hex: &str,
     requester: u64,
@@ -2416,14 +2425,14 @@ async fn serve_log_stream<S: PeerService>(
     use crate::endpoint::{LogEvent, LOG_FRAME_WRITE_TIMEOUT};
     use tokio::io::AsyncWriteExt;
     let Some(mut rx) = service.log_subscribe(requester, req_id, from) else {
-        let end = Signed::new(
-            inner.p2p.secret_key(),
+        write_payload(
+            send,
             &Payload::LogEnd {
                 req_id,
                 refused: true,
             },
-        )?;
-        write_frame(send, &end).await?;
+        )
+        .await?;
         return Ok(());
     };
     while let Some(event) = rx.recv().await {
@@ -2455,9 +2464,8 @@ async fn serve_log_stream<S: PeerService>(
             LogEvent::End { refused } => (Payload::LogEnd { req_id, refused }, None),
         };
         let end = matches!(payload, Payload::LogEnd { .. });
-        let signed = Signed::new(inner.p2p.secret_key(), &payload)?;
         let write = async {
-            write_frame(send, &signed).await?;
+            write_payload(send, &payload).await?;
             if let Some(body) = &body {
                 send.write_all(body).await?;
                 send.flush().await?;
@@ -3008,6 +3016,102 @@ mod tests {
         );
     }
 
+    /// Gossip stays signed and has no unsigned fallback: a bare `Payload`,
+    /// a direct-stream frame and a tampered envelope are all dropped by the
+    /// receive path, and the signed message after them is delivered.
+    #[test]
+    fn gossip_opens_only_a_valid_signed_envelope() {
+        let key = iroh::SecretKey::generate();
+        let other = iroh::SecretKey::generate();
+        let payload = Payload::SegmentPublished {
+            part: "p0".into(),
+            seq: 1,
+            epoch: 1,
+        };
+        let bare = postcard::to_allocvec(&payload).unwrap();
+        assert!(open_gossip(&bare).is_err(), "a bare payload");
+        let frame = crate::message::encode_payload(&payload).unwrap();
+        assert!(open_gossip(&frame).is_err(), "a stream frame");
+        let wire = Signed::new(&key, &payload).unwrap().encode_bare().unwrap();
+        let (author, got) = open_gossip(&wire).unwrap();
+        assert_eq!((author, got), (key.public(), payload.clone()));
+        let mut tampered = wire.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(open_gossip(&tampered).is_err(), "a tampered envelope");
+        // A signature made under another key does not pass for this author.
+        let mut forged = Signed::new(&other, &payload)
+            .unwrap()
+            .encode_bare()
+            .unwrap();
+        forged[..32].copy_from_slice(key.public().as_bytes());
+        assert!(
+            open_gossip(&forged).is_err(),
+            "a signature from another key"
+        );
+    }
+
+    /// The same over a real gossip topic: bytes that are not a signed
+    /// envelope reach the receive loop and never the service.
+    #[tokio::test]
+    async fn the_gossip_receive_loop_drops_unsigned_and_tampered_content() {
+        let (holder, asker, service) = pair(false).await;
+        let holder_id = holder.node_addr().unwrap().id;
+        let asker_id = asker.node_addr().unwrap().id;
+        let mut holder_rx = holder.join_topic(vec![asker_id]).await.unwrap();
+        let mut asker_rx = asker.join_topic(vec![holder_id]).await.unwrap();
+        let asker_service = Arc::new(Recorder::default());
+        let serving = asker.clone();
+        let svc = asker_service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+        let (holder_joined, asker_joined) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(holder_rx.joined(), asker_rx.joined())
+        })
+        .await
+        .expect("gossip peers did not join");
+        holder_joined.unwrap();
+        asker_joined.unwrap();
+        tokio::spawn(run_gossip(holder.clone(), holder_rx, service.clone()));
+        tokio::spawn(run_gossip(asker.clone(), asker_rx, asker_service));
+
+        let msg = |part: &str| Payload::SegmentPublished {
+            part: part.into(),
+            seq: 1,
+            epoch: 1,
+        };
+        let sender = &asker.inner.as_ref().unwrap().p2p;
+        let bare = postcard::to_allocvec(&msg("bare")).unwrap();
+        let frame = crate::message::encode_payload(&msg("frame")).unwrap();
+        let mut tampered = Signed::new(sender.secret_key(), &msg("tampered"))
+            .unwrap()
+            .encode_bare()
+            .unwrap();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        for raw in [bare, frame, tampered] {
+            sender.broadcast_raw(raw).await.unwrap();
+        }
+        asker.gossip(msg("signed")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !service.segments.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the signed message never crossed gossip");
+        let parts: Vec<String> = service
+            .segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _, _)| p.clone())
+            .collect();
+        assert_eq!(parts, vec!["signed".to_string()]);
+    }
+
     /// A peer that is not enrolled in the registry must be refused even
     /// though it can reach us: enrolment requires bucket write, so IAM
     /// stays the trust root.
@@ -3215,6 +3319,99 @@ mod tests {
             *service.lease_asks.lock().unwrap(),
             vec![("p0".to_string(), 2)],
             "only the request naming its real sender reaches the service"
+        );
+    }
+
+    /// The same binding for the other claim fields (`from`, `holder`,
+    /// `owner`): with no signature on a stream frame, the connection's key
+    /// is the only identity, and a payload naming another node is dropped
+    /// before any handler or the service sees it. The same peer naming
+    /// itself gets through.
+    #[tokio::test]
+    async fn a_from_or_holder_naming_another_node_is_dropped() {
+        let (holder, asker, service) = pair(true).await;
+        let to = holder.node_addr().unwrap();
+        let cancel = |from| Payload::LockCancel {
+            from,
+            ino: 7,
+            exclusive: false,
+            shared: false,
+            upto: 0,
+        };
+        let hold = |holder| Payload::BackupHold {
+            holder,
+            epoch: 3,
+            for_ms: 15_000,
+        };
+        let recall = |owner| Payload::LockRecall {
+            owner,
+            req_id: 1,
+            ino: 7,
+            grant: (1, 1),
+        };
+        // The asker is node 2: 3 is another node's id.
+        for forged in [cancel(3), hold(3), recall(3)] {
+            assert!(
+                asker.request_raw(to.clone(), &forged).await.is_err(),
+                "a forged {forged:?} must not be answered"
+            );
+        }
+        assert!(
+            service.holds.lock().unwrap().is_empty(),
+            "the forged hold must never reach the service"
+        );
+        for own in [cancel(2), hold(2)] {
+            assert!(matches!(
+                asker.request_raw(to.clone(), &own).await.unwrap(),
+                Payload::Ok { .. }
+            ));
+        }
+        assert_eq!(service.holds.lock().unwrap().len(), 1);
+    }
+
+    /// A key removed from the registry allowlist stops being served on its
+    /// open connection: the next stream is refused (the connection is
+    /// closed), where before only a claim-bearing payload was dropped and
+    /// `Ping`, `ChunkRequest` and the like were still answered.
+    #[tokio::test]
+    async fn a_revoked_keys_next_stream_is_refused() {
+        let (holder, asker, service) = pair(true).await;
+        let to = holder.node_addr().unwrap();
+        let ping = Payload::Ping { node_id: 2 };
+        let lease = Payload::LeaseRequest {
+            part: "p0".into(),
+            requester: 2,
+            epoch_applied: None,
+        };
+        // Served while enrolled, on a connection that then stays open.
+        assert!(matches!(
+            asker.request_raw(to.clone(), &ping).await.unwrap(),
+            Payload::Pong { .. }
+        ));
+        assert!(asker.request_raw(to.clone(), &lease).await.is_ok());
+        assert_eq!(service.lease_asks.lock().unwrap().len(), 1);
+        // The registry no longer lists the asker.
+        let inner = holder.inner.as_ref().unwrap();
+        let holder_key = inner.p2p.pubkey_hex();
+        let holder_addr = inner.p2p.addr();
+        holder.refresh_registry(vec![(
+            1,
+            holder_key,
+            serde_json::to_value(&holder_addr).unwrap(),
+        )]);
+        assert!(!inner
+            .p2p
+            .is_allowed(&asker.inner.as_ref().unwrap().p2p.pubkey_hex()));
+        for payload in [&ping, &lease] {
+            assert!(
+                asker.request_raw(to.clone(), payload).await.is_err(),
+                "a revoked key's stream must be refused: {payload:?}"
+            );
+        }
+        assert_eq!(
+            service.lease_asks.lock().unwrap().len(),
+            1,
+            "the revoked key's request must never reach the service"
         );
     }
 
@@ -3961,20 +4158,16 @@ mod tests {
             .connect(holder_addr, ALPN)
             .await
             .unwrap();
-        let msg = Signed::new(
-            client_p2p.secret_key(),
-            &Payload::ChunkRequest { hash: a_hash() },
-        )
-        .unwrap();
+        let msg = Payload::ChunkRequest { hash: a_hash() };
         let mut pending = Vec::new();
         for _ in 0..2 {
             let (mut send, recv) = conn.open_bi().await.unwrap();
-            write_frame(&mut send, &msg).await.unwrap();
+            write_payload(&mut send, &msg).await.unwrap();
             send.finish().ok();
             pending.push(recv);
         }
         for mut recv in pending {
-            let (_, body) = read_frame(&mut recv).await.unwrap().verify().unwrap();
+            let body = read_payload(&mut recv).await.unwrap();
             assert!(
                 matches!(
                     body,
@@ -4032,28 +4225,24 @@ mod tests {
             .connect(holder_addr, ALPN)
             .await
             .unwrap();
-        let chunk = Signed::new(
-            client_p2p.secret_key(),
-            &Payload::ChunkRequest { hash: a_hash() },
-        )
-        .unwrap();
+        let chunk = Payload::ChunkRequest { hash: a_hash() };
         for _ in 0..MAX_CONCURRENT_STREAMS + 4 {
             let (mut send, recv) = conn.open_bi().await.unwrap();
-            write_frame(&mut send, &chunk).await.unwrap();
+            write_payload(&mut send, &chunk).await.unwrap();
             send.finish().ok();
             // The requester times out: it drops its side.
             drop(recv);
         }
-        let ping = Signed::new(client_p2p.secret_key(), &Payload::Ping { node_id: 2 }).unwrap();
+        let ping = Payload::Ping { node_id: 2 };
         let answered = tokio::time::timeout(Duration::from_secs(10), async {
             let (mut send, mut recv) = conn.open_bi().await?;
-            write_frame(&mut send, &ping).await?;
+            write_payload(&mut send, &ping).await?;
             send.finish().ok();
-            read_frame(&mut recv).await?.verify()
+            read_payload(&mut recv).await
         })
         .await;
         assert!(
-            matches!(answered, Ok(Ok((_, Payload::Pong { .. })))),
+            matches!(answered, Ok(Ok(Payload::Pong { .. }))),
             "a request after abandoned ones was not served: {answered:?}"
         );
     }

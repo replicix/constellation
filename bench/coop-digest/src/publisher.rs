@@ -6,7 +6,7 @@
 //! bookkeeping (which no candidate touches) is omitted.
 
 use crate::util::Rng;
-use constellation_net::message::{wire_len, Payload};
+use constellation_net::message::{gossip_wire_len as wire_len, Payload};
 use constellation_net::reconcile::{encode_keys, Delta, Key, KeySet, Summary, MAX_DELTA_KEYS};
 use std::collections::{HashMap, HashSet};
 

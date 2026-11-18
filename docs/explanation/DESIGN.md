@@ -1929,10 +1929,17 @@ invariant 2 forces its op after the delete regardless of what it had seen.
   (NodeId = pubkey). Relays forward ciphertext only.
 - **Authorization**: accept-time allowlist against `nodes/` (self-
   enrollment requires bucket write, so IAM decides); read-only members are
-  countersigned by a writer node. Unknown NodeIds are dropped post-handshake.
+  marked `ro` in their registry record, which only a bucket writer can create
+  (there is no countersignature). Unknown NodeIds are dropped post-handshake,
+  and the allowlist is re-checked on every stream, so a key removed from the
+  registry stops being served on its open connections.
   Gossip topic ID derives from a secret in `meta.json` (bucket-readers only).
-  Control messages (lease handoff, delegation grant/ack, epoch promises) are
-  signed by node keys.
+  Control messages (lease handoff, delegation grant/ack, epoch promises) on
+  direct streams are authenticated by the TLS 1.3 raw-public-key session,
+  which is bound to the enrolled key, and the node ids they claim are bound to
+  that key; they carry no per-message signature. Gossip payloads, which other
+  peers forward, are signed by node keys
+  ([ADR-63](DECISIONS.md#adr-63-direct-streams-carry-no-per-message-signature)).
 - **Join / leave**: first mount CAS-creates `nodes/<id>.json`. Permanent
   leave **tombstones** the record (`retired: true`, `retired_unix`) rather
   than DELETE, so numeric ids (log-segment origin, ino prefixes) are never

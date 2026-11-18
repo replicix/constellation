@@ -1,14 +1,24 @@
 //! Wire messages for the P2P fast path (DESIGN.md §4, §12).
 //!
-//! Encoding is postcard. Gossip carries the bare signed envelope while
-//! direct streams add a four-byte length prefix. Cache digests make JSON
-//! materially expensive (base64 bloom bits and hex hashes), so every P2P
-//! message uses one compact format rather than maintaining two codecs.
+//! Encoding is postcard. Gossip carries the bare signed envelope
+//! ([`Signed`]); direct streams carry the bare [`Payload`] behind a
+//! four-byte length prefix ([`write_payload`], [`read_payload`]). Cache
+//! digests make JSON materially expensive (base64 bloom bits and hex
+//! hashes), so every P2P message uses one compact format rather than
+//! maintaining two codecs.
 //!
-//! Every message is **signed by the sender's node key and verified
-//! before it is acted on**. Signing matters even though QUIC already
-//! authenticates the peer: gossip messages are forwarded by third
-//! parties, so the transport peer is not necessarily the author.
+//! **Gossip messages are signed by the sender's node key and verified
+//! before they are acted on**: they are forwarded by third parties, so the
+//! transport peer is not necessarily the author. **Direct-stream messages
+//! carry no signature.** A direct connection is QUIC (TLS 1.3, raw public
+//! key) whose `remote_id()` is the peer's Ed25519 key proved in the
+//! handshake, so the connection's identity is the author of every frame
+//! on it, and the TLS session gives integrity. A frame is never signed,
+//! never relayed and never stored (docs/DECISIONS.md, the ADR on unsigned
+//! direct streams). The two decoders are distinct on purpose: gossip
+//! refuses a bare `Payload`, and there is no "try one, fall back to the
+//! other". Direct-stream frames must never be sent as 0-RTT early data
+//! (replayable); constellation never uses 0-RTT.
 //!
 //! Nothing here is load-bearing for correctness. Every message is an
 //! accelerator for something the S3 path already does on a timer, so a
@@ -21,12 +31,13 @@ use serde::{Deserialize, Serialize};
 /// ALPN for direct (non-gossip) requests. Versioned so a future
 /// message-set change can be negotiated rather than mis-parsed.
 ///
-/// `3`: `Payload::MutateRequest` carries `applied` (chunk
+/// `4`: direct streams carry the bare `Payload` with no signature
+/// ([`write_payload`]); gossip stays signed. `3`: `Payload::MutateRequest` carries `applied` (chunk
 /// close-stall-followup). `2`: `Payload::MutateReply` carries
 /// `own_chunks` (chunk close-stall-metered). Nodes of different versions
 /// do not talk P2P (no compatibility shim): a cluster upgrades all its
 /// nodes together.
-pub const ALPN: &[u8] = b"constellation/3";
+pub const ALPN: &[u8] = b"constellation/4";
 
 /// Earlier versions of [`ALPN`]. An endpoint accepts their handshakes only
 /// to refuse the connection by name (closing it with a reason naming both
@@ -34,7 +45,7 @@ pub const ALPN: &[u8] = b"constellation/3";
 /// learn its version: either way both sides log the mismatch explicitly
 /// (`endpoint::log_version_mismatch`), where they used to log only
 /// rustls' "peer doesn't support any known protocol" every few seconds.
-pub const OLDER_ALPNS: &[&[u8]] = &[b"constellation/2", b"constellation/1"];
+pub const OLDER_ALPNS: &[&[u8]] = &[b"constellation/3", b"constellation/2", b"constellation/1"];
 
 /// Largest accepted frame. Messages are small; the cap just stops a
 /// malicious peer from making us allocate.
@@ -1092,14 +1103,21 @@ pub enum ChunkStatus {
 }
 
 /// Bytes a [`Signed`] envelope adds around a payload's postcard body:
-/// author key, 64-byte signature and their length prefixes.
+/// author key, 64-byte signature and their length prefixes. Gossip only:
+/// direct streams are unsigned (see [`stream_wire_len`]).
 pub const SIGNED_ENVELOPE: usize = 32 + 1 + 64 + 3;
 
-/// Approximate on-the-wire size of `payload` once signed, for the
-/// digest-plane byte counters. Exact postcard body plus the fixed
+/// Approximate on-the-wire size of `payload` once signed for gossip, for
+/// the digest-plane byte counters. Exact postcard body plus the fixed
 /// envelope; gossip fan-out and QUIC framing are not included.
-pub fn wire_len(payload: &Payload) -> usize {
+pub fn gossip_wire_len(payload: &Payload) -> usize {
     postcard::to_allocvec(payload).map(|v| v.len()).unwrap_or(0) + SIGNED_ENVELOPE
+}
+
+/// Size of `payload` as one direct-stream frame: postcard body plus the
+/// four-byte length prefix ([`write_payload`]).
+pub fn stream_wire_len(payload: &Payload) -> usize {
+    postcard::to_allocvec(payload).map(|v| v.len()).unwrap_or(0) + 4
 }
 
 /// A payload plus its author and signature.
@@ -1139,19 +1157,9 @@ impl Signed {
         Ok((key, postcard::from_bytes(&self.body)?))
     }
 
-    /// Bare postcard envelope used by gossip and inside stream framing.
+    /// Bare postcard envelope, the gossip content.
     pub fn encode_bare(&self) -> Result<Vec<u8>> {
         Ok(postcard::to_allocvec(self)?)
-    }
-
-    /// Length-prefixed frame: 4-byte big-endian length, then postcard.
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let bare = self.encode_bare()?;
-        anyhow::ensure!(bare.len() <= MAX_FRAME, "message too large: {}", bare.len());
-        let mut out = Vec::with_capacity(4 + bare.len());
-        out.extend_from_slice(&(bare.len() as u32).to_be_bytes());
-        out.extend_from_slice(&bare);
-        Ok(out)
     }
 
     /// Decode exactly one bare message. Trailing bytes and a signature
@@ -1172,8 +1180,47 @@ impl Signed {
     }
 }
 
-/// Read one length-prefixed frame.
-pub async fn read_frame<R>(r: &mut R) -> Result<Signed>
+/// Encode `payload` as one direct-stream frame: 4-byte big-endian length,
+/// then the postcard body. No signature: the connection's identity is the
+/// author (module docs).
+pub fn encode_payload(payload: &Payload) -> Result<Vec<u8>> {
+    let body = postcard::to_allocvec(payload)?;
+    anyhow::ensure!(body.len() <= MAX_FRAME, "message too large: {}", body.len());
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Write one unsigned length-prefixed frame in a single `write_all`, then
+/// flush.
+pub async fn write_payload<W>(w: &mut W, payload: &Payload) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    w.write_all(&encode_payload(payload)?).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Decode exactly one [`Payload`]. Trailing bytes are refused:
+/// `postcard::from_bytes` ignores trailing input, which would let a frame
+/// with a different framing decode as a payload whenever its prefix
+/// happened to parse (see `Signed::decode`).
+pub fn decode_payload(body: &[u8]) -> Result<Payload> {
+    let (payload, rest): (Payload, _) = postcard::take_from_bytes(body)?;
+    anyhow::ensure!(
+        rest.is_empty(),
+        "{} trailing bytes after a message",
+        rest.len()
+    );
+    Ok(payload)
+}
+
+/// Read one unsigned length-prefixed frame. The length is checked against
+/// [`MAX_FRAME`] before anything is allocated.
+pub async fn read_payload<R>(r: &mut R) -> Result<Payload>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1184,18 +1231,7 @@ where
     anyhow::ensure!(len <= MAX_FRAME, "peer announced a {len}-byte frame");
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
-    Signed::decode(&buf)
-}
-
-/// Write one length-prefixed frame.
-pub async fn write_frame<W>(w: &mut W, msg: &Signed) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-    w.write_all(&msg.encode()?).await?;
-    w.flush().await?;
-    Ok(())
+    decode_payload(&buf)
 }
 
 #[cfg(test)]
@@ -1254,61 +1290,101 @@ mod tests {
 
     #[test]
     fn frame_roundtrip_over_a_duplex() {
-        let k = key();
-        let msg = Signed::new(
-            &k,
-            &Payload::Pong {
-                node_id: 42,
-                s3_ok: true,
-            },
-        )
-        .unwrap();
+        let msg = Payload::Pong {
+            node_id: 42,
+            s3_ok: true,
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
             let (mut a, mut b) = tokio::io::duplex(4096);
-            write_frame(&mut a, &msg).await.unwrap();
-            let got = read_frame(&mut b).await.unwrap();
-            assert_eq!(
-                got.verify().unwrap().1,
-                Payload::Pong {
-                    node_id: 42,
-                    s3_ok: true,
-                }
-            );
+            write_payload(&mut a, &msg).await.unwrap();
+            assert_eq!(read_payload(&mut b).await.unwrap(), msg);
         });
     }
 
-    /// Gossip carries whole datagrams while streams need framing, so the
-    /// two encodings differ. A prefixed frame must NOT decode as a bare
-    /// gossip payload — the mismatch was silent and disabled push
-    /// invalidation entirely (every peer fell back to polling).
+    /// A stream frame is the length prefix plus the bare postcard payload
+    /// and nothing else: no author, no signature.
     #[test]
-    fn stream_framing_and_bare_encoding_are_distinct() {
+    fn a_stream_frame_is_the_prefix_and_the_bare_payload() {
+        let payload = Payload::SegmentPublished {
+            part: "p0".into(),
+            seq: 3,
+            epoch: 1,
+        };
+        let frame = encode_payload(&payload).unwrap();
+        let body = postcard::to_allocvec(&payload).unwrap();
+        assert_eq!(frame.len(), stream_wire_len(&payload));
+        assert_eq!(frame.len(), body.len() + 4);
+        assert_eq!(&frame[..4], &(body.len() as u32).to_be_bytes());
+        assert_eq!(&frame[4..], &body[..]);
+    }
+
+    /// Trailing bytes after a payload are refused, as `Signed::decode`
+    /// refuses them.
+    #[test]
+    fn a_payload_with_trailing_bytes_is_refused() {
+        let payload = Payload::Ping { node_id: 1 };
+        let mut body = postcard::to_allocvec(&payload).unwrap();
+        assert_eq!(decode_payload(&body).unwrap(), payload);
+        body.push(0);
+        assert!(decode_payload(&body).is_err());
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(read_payload(&mut &frame[..]).await.is_err());
+        });
+    }
+
+    /// The announced length is checked against `MAX_FRAME` before the
+    /// buffer is allocated: the reader refuses without the body existing.
+    #[test]
+    fn an_oversized_announced_length_is_refused_before_allocating() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Only the 4-byte prefix is present: an attempt to read the
+            // body would fail with EOF, not with the length error.
+            for len in [(MAX_FRAME + 1) as u32, u32::MAX] {
+                let frame = len.to_be_bytes();
+                let err = read_payload(&mut &frame[..]).await.unwrap_err();
+                assert!(err.to_string().contains("-byte frame"), "{err}");
+            }
+        });
+    }
+
+    /// Gossip has no unsigned fallback: a bare `Payload`, and a stream
+    /// frame's bytes, are not accepted as gossip content, and a tampered
+    /// `Signed` fails verification. The two decoders stay distinct.
+    #[test]
+    fn gossip_refuses_a_bare_payload_a_stream_frame_and_a_tampered_envelope() {
         let k = key();
         let payload = Payload::SegmentPublished {
             part: "p0".into(),
             seq: 3,
             epoch: 1,
         };
+        let accept = |bytes: &[u8]| Signed::decode(bytes).and_then(|s| s.verify());
+        let bare = postcard::to_allocvec(&payload).unwrap();
+        assert!(accept(&bare).is_err(), "a bare payload is not gossip");
+        let frame = encode_payload(&payload).unwrap();
+        assert!(accept(&frame).is_err(), "a stream frame is not gossip");
+        // The signed envelope is not a stream frame either.
         let signed = Signed::new(&k, &payload).unwrap();
-        let bare = signed.encode_bare().unwrap();
-        let framed = signed.encode().unwrap();
-        assert_eq!(framed.len(), bare.len() + 4, "frame adds a length prefix");
-        // The bare form is what gossip receivers decode.
-        assert_eq!(Signed::decode(&bare).unwrap().verify().unwrap().1, payload);
-        // The framed form must not be mistaken for it. What a receiver
-        // does is decode *then verify*; decode alone refuses almost every
-        // frame structurally, and the signature check closes the rest
-        // (a shifted `from`/`sig` pair cannot verify).
-        assert!(
-            Signed::decode(&framed)
-                .and_then(|signed| signed.verify())
-                .is_err(),
-            "a length-prefixed frame must not be accepted as a bare payload"
-        );
+        let wire = signed.encode_bare().unwrap();
+        assert_eq!(accept(&wire).unwrap().1, payload);
+        assert!(decode_payload(&wire).is_err());
+        // A tampered envelope decodes but does not verify.
+        let mut tampered = signed.clone();
+        tampered.body[0] ^= 1;
+        let wire = tampered.encode_bare().unwrap();
+        assert!(accept(&wire).is_err(), "a tampered envelope");
     }
 
     /// The off-core delegation renewal message is the last variant of
@@ -1463,11 +1539,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let n = Signed::new(&key(), &request)
-            .unwrap()
-            .encode()
-            .unwrap()
-            .len();
+        let n = encode_payload(&request).unwrap().len();
         assert!(n <= MAX_FRAME, "{n}");
 
         let mut outcome = SnapshotBatchOutcome::Done(
@@ -1503,7 +1575,7 @@ mod tests {
             req_id: u64::MAX,
             outcome,
         };
-        let n = Signed::new(&key(), &reply).unwrap().encode().unwrap().len();
+        let n = encode_payload(&reply).unwrap().len();
         assert!(n <= MAX_FRAME, "{n}");
 
         // A short reason is left alone.
@@ -1514,17 +1586,15 @@ mod tests {
 
     #[test]
     fn oversized_frame_is_refused() {
-        let k = key();
-        let msg = Signed::new(
-            &k,
-            &Payload::SegmentPublished {
-                part: "p".repeat(MAX_FRAME),
-                seq: 1,
-                epoch: 1,
-            },
-        )
-        .unwrap();
-        assert!(msg.encode().is_err(), "must refuse to send a huge frame");
+        let msg = Payload::SegmentPublished {
+            part: "p".repeat(MAX_FRAME),
+            seq: 1,
+            epoch: 1,
+        };
+        assert!(
+            encode_payload(&msg).is_err(),
+            "must refuse to send a huge frame"
+        );
     }
 
     #[test]
@@ -1617,19 +1687,14 @@ mod tests {
                 late: true,
             })
             .collect();
-        let req = Signed::new(
-            &key(),
-            &Payload::LockRenew {
-                from: u64::MAX,
-                req_id: u64::MAX,
-                entries,
-                sent_ms: i64::MIN,
-                clock: u64::MAX,
-            },
-        )
-        .unwrap();
-        let n = req
-            .encode()
+        let req = Payload::LockRenew {
+            from: u64::MAX,
+            req_id: u64::MAX,
+            entries,
+            sent_ms: i64::MIN,
+            clock: u64::MAX,
+        };
+        let n = encode_payload(&req)
             .expect("maximum renewal exceeds MAX_FRAME")
             .len();
         assert!(n <= MAX_FRAME, "{n}");
@@ -1647,16 +1712,11 @@ mod tests {
                 )
             })
             .collect();
-        let reply = Signed::new(
-            &key(),
-            &Payload::LockRenewed {
-                req_id: u64::MAX,
-                results,
-            },
-        )
-        .unwrap();
-        let n = reply
-            .encode()
+        let reply = Payload::LockRenewed {
+            req_id: u64::MAX,
+            results,
+        };
+        let n = encode_payload(&reply)
             .expect("maximum answer exceeds MAX_FRAME")
             .len();
         assert!(n <= MAX_FRAME, "{n}");
@@ -1669,18 +1729,17 @@ mod tests {
                 late: true,
             })
             .collect();
-        let big = Signed::new(
-            &key(),
-            &Payload::LockRenew {
-                from: 1,
-                req_id: 1,
-                entries,
-                sent_ms: 0,
-                clock: 1,
-            },
-        )
-        .unwrap();
-        assert!(big.encode().is_err(), "a round of 2,048 fit a frame");
+        let big = Payload::LockRenew {
+            from: 1,
+            req_id: 1,
+            entries,
+            sent_ms: 0,
+            clock: 1,
+        };
+        assert!(
+            encode_payload(&big).is_err(),
+            "a round of 2,048 fit a frame"
+        );
     }
 
     /// The largest request and reply a session can produce must fit a
@@ -1700,8 +1759,11 @@ mod tests {
                 count: u64::MAX,
             })
             .collect();
-        let req = Signed::new(&key(), &Payload::ReconcileRequest { queries }).unwrap();
-        assert!(req.encode().is_ok(), "maximum request exceeds MAX_FRAME");
+        let req = Payload::ReconcileRequest { queries };
+        assert!(
+            encode_payload(&req).is_ok(),
+            "maximum request exceeds MAX_FRAME"
+        );
 
         // A dense owner answering "send everything" pages at the budget.
         let owner =
@@ -1725,8 +1787,10 @@ mod tests {
             count: owner.len() as u64,
         };
         let reply = respond(&owner, summary, &queries, REPLY_BUDGET);
-        let msg = Signed::new(&key(), &Payload::ReconcileReply { reply }).unwrap();
-        let n = msg.encode().expect("maximum reply exceeds MAX_FRAME").len();
+        let msg = Payload::ReconcileReply { reply };
+        let n = encode_payload(&msg)
+            .expect("maximum reply exceeds MAX_FRAME")
+            .len();
         assert!(n <= MAX_FRAME, "{n}");
 
         // And a reply made only of child splits.
@@ -1743,9 +1807,9 @@ mod tests {
             })
             .collect();
         let reply = respond(&owner, summary, &queries, REPLY_BUDGET);
-        let msg = Signed::new(&key(), &Payload::ReconcileReply { reply }).unwrap();
+        let msg = Payload::ReconcileReply { reply };
         assert!(
-            msg.encode().is_ok(),
+            encode_payload(&msg).is_ok(),
             "children-only reply exceeds MAX_FRAME"
         );
     }
@@ -1790,15 +1854,17 @@ mod tests {
         for budget in [REPLAY_PAGE_BUDGET, 1] {
             let reply = respond_replay(&log, summary, u64::MAX, 0, budget);
             assert!(reply.available && !reply.deltas.is_empty());
-            let msg = Signed::new(&key(), &Payload::ReplayReply { reply }).unwrap();
-            let n = msg.encode().expect("replay page exceeds MAX_FRAME").len();
+            let msg = Payload::ReplayReply { reply };
+            let n = encode_payload(&msg)
+                .expect("replay page exceeds MAX_FRAME")
+                .len();
             assert!(n <= MAX_FRAME, "{n}");
         }
         let req = Payload::ReplayRequest {
             incarnation: u64::MAX,
             after_seq: u64::MAX,
         };
-        assert!(Signed::new(&key(), &req).unwrap().encode().is_ok());
+        assert!(encode_payload(&req).is_ok());
     }
 
     /// Plan 43 C7-F F-a / C7-H1: the beat's guard rides after the three
@@ -1808,7 +1874,6 @@ mod tests {
     /// included.
     #[test]
     fn a_beat_carries_its_guard_and_clock_at_the_end() {
-        let k = key();
         for guard_ms in [0, 123_456_789, i64::MAX] {
             let beat = Beat {
                 seq: 7,
@@ -1824,10 +1889,8 @@ mod tests {
                 listed: true,
                 beat,
             };
-            let signed = Signed::new(&k, &payload).unwrap();
-            let frame = signed.encode().unwrap();
-            let back = Signed::decode(&frame[4..]).unwrap();
-            assert_eq!(back.verify().unwrap().1, payload);
+            let frame = encode_payload(&payload).unwrap();
+            assert_eq!(decode_payload(&frame[4..]).unwrap(), payload);
         }
         // The guard rides after the send reading, the wait-clock end and
         // the clock id follow.
@@ -1850,7 +1913,6 @@ mod tests {
     /// Plan 43 C2: a forward's `settle` flag crosses the wire.
     #[test]
     fn a_settle_request_round_trips() {
-        let k = key();
         for settle in [false, true] {
             let payload = Payload::MutateRequest {
                 part: "p".into(),
@@ -1869,10 +1931,8 @@ mod tests {
                 touched_gen: u64::MAX,
                 inbox_ever: true,
             };
-            let signed = Signed::new(&k, &payload).unwrap();
-            let frame = signed.encode().unwrap();
-            let back = Signed::decode(&frame[4..]).unwrap();
-            let (_, got) = back.verify().unwrap();
+            let frame = encode_payload(&payload).unwrap();
+            let got = decode_payload(&frame[4..]).unwrap();
             assert!(matches!(
                 got,
                 Payload::MutateRequest { settle: s, routed_gen: 7, touched_gen: u64::MAX, inbox_ever: true, .. }
@@ -1883,7 +1943,6 @@ mod tests {
 
     #[test]
     fn lock_payloads_round_trip() {
-        let k = key();
         for payload in [
             Payload::LockRequest {
                 requester: 1,
@@ -1957,10 +2016,8 @@ mod tests {
                 why: 1,
             },
         ] {
-            let signed = Signed::new(&k, &payload).unwrap();
-            let frame = signed.encode().unwrap();
-            let back = Signed::decode(&frame[4..]).unwrap();
-            assert_eq!(back.verify().unwrap().1, payload);
+            let frame = encode_payload(&payload).unwrap();
+            assert_eq!(decode_payload(&frame[4..]).unwrap(), payload);
         }
     }
 
@@ -1969,7 +2026,6 @@ mod tests {
     /// tenure has committed (`committed`) apart.
     #[test]
     fn a_delegate_stream_ack_round_trips_its_committed_prefix() {
-        let k = key();
         let payload = Payload::DelegateStreamAck {
             from: 6,
             req_id: 1,
@@ -1980,20 +2036,19 @@ mod tests {
             refused: false,
             archive_bound: true,
         };
-        let frame = Signed::new(&k, &payload).unwrap().encode().unwrap();
-        let back = Signed::decode(&frame[4..]).unwrap();
-        assert_eq!(back.verify().unwrap().1, payload);
+        let frame = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(&frame[4..]).unwrap(), payload);
     }
 
     #[test]
-    fn wire_len_tracks_the_signed_encoding() {
+    fn gossip_wire_len_tracks_the_signed_encoding() {
         let payload = Payload::Ping { node_id: 7 };
         let real = Signed::new(&key(), &payload)
             .unwrap()
             .encode_bare()
             .unwrap()
             .len();
-        let est = wire_len(&payload);
+        let est = gossip_wire_len(&payload);
         assert!(est.abs_diff(real) <= 8, "estimate {est} vs real {real}");
     }
 }

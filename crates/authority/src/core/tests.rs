@@ -41123,13 +41123,14 @@ fn a_lock_request_to_a_restarted_root_readopts_its_own_lease() {
 mod portable_codes {
     use super::*;
     use constellation_meta::{JournalPos, Position};
-    use constellation_net::{Payload, Signed};
+    use constellation_net::message::{decode_payload, encode_payload};
+    use constellation_net::Payload;
     use constellation_types::Code;
 
     /// One hop of the P2P transport for the holder's reply: packed the way
     /// the daemon packs it (`main.rs`'s `mutate_requested`: the outcome as
-    /// postcard inside `Payload::MutateReply`), signed and framed as the
-    /// endpoint sends it, then verified and unpacked the way the
+    /// postcard inside `Payload::MutateReply`), framed as the endpoint
+    /// sends it on a direct stream (unsigned), then decoded and unpacked the way the
     /// requester's forward task does (`authority_driver.rs`). Returns the
     /// decoded message and the outcome's wire bytes.
     fn over_the_wire(msg: &PeerMsg) -> (PeerMsg, Vec<u8>) {
@@ -41161,9 +41162,8 @@ mod portable_codes {
             committed: *committed,
             non_stealable: *non_stealable,
         };
-        let key = iroh::SecretKey::from_bytes(&[7; 32]);
-        let frame = Signed::new(&key, &payload).unwrap().encode().unwrap();
-        let (_, received) = Signed::decode(&frame[4..]).unwrap().verify().unwrap();
+        let frame = encode_payload(&payload).unwrap();
+        let received = decode_payload(&frame[4..]).unwrap();
         let Payload::MutateReply {
             req_id,
             outcome,

@@ -30,7 +30,7 @@
 
 use super::Coop;
 use constellation_fs_core::cache::{DigestBatch, DigestChange};
-use constellation_net::message::wire_len;
+use constellation_net::message::{gossip_wire_len, stream_wire_len};
 use constellation_net::reconcile::{
     encode_keys, key_of, respond, respond_replay, start_bits_for, Delta, DeltaLog, DeltaOutcome,
     Key, KeySet, Mirror, Query, ReplayReply, Session, Summary, MAX_DELTA_KEYS, MAX_REPLAY_PAGES,
@@ -340,19 +340,32 @@ impl Coop {
         self.config.enabled && self.config.mode == super::DigestMode::Exact
     }
 
-    fn note_rx(&self, payload: &Payload) {
+    /// A message received over gossip (signed).
+    fn note_gossip_rx(&self, payload: &Payload) {
         self.counters
             .digest_bytes_received
-            .fetch_add(wire_len(payload) as u64, Ordering::Relaxed);
+            .fetch_add(gossip_wire_len(payload) as u64, Ordering::Relaxed);
         self.counters
             .digest_messages
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A message received on a direct stream (unsigned).
+    fn note_rx(&self, payload: &Payload) {
+        self.counters
+            .digest_bytes_received
+            .fetch_add(stream_wire_len(payload) as u64, Ordering::Relaxed);
+        self.counters
+            .digest_messages
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A message sent on a direct stream (unsigned). Gossip sends are
+    /// counted where they are made (`Coop::gossip_digest`).
     fn note_tx(&self, payload: &Payload) {
         self.counters
             .digest_bytes_sent
-            .fetch_add(wire_len(payload) as u64, Ordering::Relaxed);
+            .fetch_add(stream_wire_len(payload) as u64, Ordering::Relaxed);
         self.counters
             .digest_messages
             .fetch_add(1, Ordering::Relaxed);
@@ -377,7 +390,7 @@ impl Coop {
         if !self.exact_active() || node_id == self.node_id {
             return;
         }
-        self.note_rx(&Payload::CacheSummary { node_id, summary });
+        self.note_gossip_rx(&Payload::CacheSummary { node_id, summary });
         let started = Instant::now();
         let need_sync = {
             let mut map = self.mirrors.lock().unwrap();
@@ -407,7 +420,7 @@ impl Coop {
             return;
         }
         let payload = Payload::CacheSetDelta { node_id, delta };
-        self.note_rx(&payload);
+        self.note_gossip_rx(&payload);
         let Payload::CacheSetDelta { delta, .. } = payload else {
             unreachable!()
         };
@@ -783,7 +796,7 @@ impl Coop {
                 after_seq: after,
             };
             self.note_tx(&request);
-            let sent = wire_len(&request) as u64;
+            let sent = stream_wire_len(&request) as u64;
             let reply = match self
                 .peers
                 .request_to_node_timeout(node_id, &request, RECONCILE_TIMEOUT)
@@ -793,7 +806,7 @@ impl Coop {
                     self.note_rx(&payload);
                     self.counters
                         .replay_bytes
-                        .fetch_add(sent + wire_len(&payload) as u64, Ordering::Relaxed);
+                        .fetch_add(sent + stream_wire_len(&payload) as u64, Ordering::Relaxed);
                     match payload {
                         Payload::ReplayReply { reply } => reply,
                         _ => unreachable!(),

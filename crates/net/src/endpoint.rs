@@ -13,7 +13,9 @@
 
 use crate::addrs::{AddrPolicy, PreferredPaths};
 use crate::allowlist::{Allowlist, Decision};
-use crate::message::{ChunkDecline, ChunkStatus, Payload, Signed, ALPN, OLDER_ALPNS};
+use crate::message::{
+    read_payload, write_payload, ChunkDecline, ChunkStatus, Payload, Signed, ALPN, OLDER_ALPNS,
+};
 use crate::relay::RelayPolicy;
 use anyhow::{Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
@@ -404,7 +406,6 @@ struct Pool {
     /// Set when the node says goodbye to a successor
     /// ([`P2p::close_for_successor`]): no dial starts or installs after.
     closed: std::sync::atomic::AtomicBool,
-    key: SecretKey,
     on_evict: Mutex<Option<EvictHook>>,
 }
 
@@ -415,7 +416,7 @@ impl std::fmt::Debug for Pool {
 }
 
 impl Pool {
-    fn new(key: SecretKey) -> Self {
+    fn new() -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
             tracked: Mutex::new(HashMap::new()),
@@ -426,7 +427,6 @@ impl Pool {
             epoch: std::sync::atomic::AtomicU64::new(0),
             peer_epochs: Mutex::new(HashMap::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
-            key,
             on_evict: Mutex::new(None),
         }
     }
@@ -561,15 +561,10 @@ impl Pool {
         let deadline = tokio::time::Instant::now() + window;
         let ping = async {
             let (mut send, mut recv) = conn.open_bi().await?;
-            let msg = Signed::new(&self.key, &Payload::Ping { node_id: 0 })?;
-            crate::message::write_frame(&mut send, &msg).await?;
+            ensure_remote(conn, expect)?;
+            write_payload(&mut send, &Payload::Ping { node_id: 0 }).await?;
             send.finish().ok();
-            let reply = crate::message::read_frame(&mut recv).await?;
-            let (author, body) = reply.verify()?;
-            anyhow::ensure!(
-                author.as_bytes() == expect.as_bytes(),
-                "pong from another key"
-            );
+            let body = read_payload(&mut recv).await?;
             anyhow::ensure!(matches!(body, Payload::Pong { .. }), "not a pong");
             anyhow::Ok(())
         };
@@ -1942,7 +1937,7 @@ impl P2p {
 
     pub async fn spawn_with(key: SecretKey, topic: TopicId, relay: RelayPolicy) -> Result<Self> {
         let lookup = MemoryLookup::new();
-        let pool = Arc::new(Pool::new(key.clone()));
+        let pool = Arc::new(Pool::new());
         let allow = Arc::new(Mutex::new(Allowlist::new()));
         let relay_mode = relay.to_iroh()?;
         let relay_label = relay.label();
@@ -2177,13 +2172,15 @@ impl P2p {
         Ok(rx)
     }
 
-    /// Broadcast a signed payload to the topic. Best effort: a failure
+    /// Broadcast a signed payload to the topic. Gossip stays signed: it is
+    /// forwarded by other peers, so the transport peer is not the author. Best effort: a failure
     /// only means peers learn from their next poll instead.
     ///
     /// Gossip delivers whole datagrams, so this sends bare postcard —
-    /// the 4-byte length prefix from [`Signed::encode`] exists only to
-    /// frame messages on a byte stream, and including it here would make
-    /// every receiver's decode fail silently.
+    /// the 4-byte length prefix of a direct-stream frame
+    /// ([`crate::message::write_payload`]) exists only to frame messages on
+    /// a byte stream, and including it here would make every receiver's
+    /// decode fail silently.
     pub async fn broadcast(&self, payload: &Payload) -> Result<()> {
         let msg = Signed::new(&self.key, payload)?;
         let body = msg.encode_bare()?;
@@ -2198,6 +2195,17 @@ impl P2p {
             anyhow::bail!("gossip topic not joined yet");
         };
         tx.broadcast(body.into()).await?;
+        Ok(())
+    }
+
+    /// Broadcast `bytes` as they are, for tests of the receive path.
+    #[cfg(test)]
+    pub(crate) async fn broadcast_raw(&self, bytes: Vec<u8>) -> Result<()> {
+        let guard = self.sender.lock().await;
+        let Some(tx) = guard.as_ref() else {
+            anyhow::bail!("gossip topic not joined yet");
+        };
+        tx.broadcast(bytes.into()).await?;
         Ok(())
     }
 
@@ -2246,16 +2254,15 @@ impl P2p {
                     "opening a stream to the peer waited (its stream limit)"
                 );
             }
-            let msg = Signed::new(&self.key, payload)?;
-            crate::message::write_frame(&mut send, &msg).await?;
+            // No signature on a direct stream: the connection is TLS 1.3
+            // with raw public keys, so `remote_id()` is the key the peer
+            // proved in the handshake, and that is the author of the reply.
+            // Frames are never sent as 0-RTT early data (replayable), and
+            // nothing here may start to.
+            ensure_remote(&conn, expect)?;
+            write_payload(&mut send, payload).await?;
             send.finish().ok();
-            let reply = crate::message::read_frame(&mut recv).await?;
-            let (author, body) = reply.verify()?;
-            anyhow::ensure!(
-                author.as_bytes() == expect.as_bytes(),
-                "reply signed by an unexpected key"
-            );
-            Ok(body)
+            read_payload(&mut recv).await
         }
         .await;
         in_flight.done = true;
@@ -2307,16 +2314,11 @@ impl P2p {
         };
         let result = async {
             let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-            let msg = Signed::new(&self.key, payload)?;
-            crate::message::write_frame(&mut send, &msg).await?;
+            // Unsigned, as in `request`: the connection's key is the author.
+            ensure_remote(&conn, expect)?;
+            write_payload(&mut send, payload).await?;
             send.finish().ok();
-            let reply = crate::message::read_frame(&mut recv).await?;
-            let (author, body) = reply.verify()?;
-            anyhow::ensure!(
-                author.as_bytes() == expect.as_bytes(),
-                "reply signed by an unexpected key"
-            );
-            Ok(body)
+            read_payload(&mut recv).await
         }
         .await;
         if result.is_err() {
@@ -2332,7 +2334,7 @@ impl P2p {
     }
 
     /// Fetch one chunk from `peer`. The control frames use the same
-    /// signed postcard as everything else; the payload (up to the FS chunk
+    /// unsigned postcard framing as every direct stream; the payload (up to the FS chunk
     /// size) follows as `u64be length + bytes` so we never shove 4 MiB
     /// through [`crate::message::MAX_FRAME`]. `Ok(Err(reason))` is a
     /// clean decline, distinct from a transport failure.
@@ -2392,7 +2394,7 @@ impl P2p {
     /// Plan 30 §M7: open a log stream to `peer` (the holder) and return
     /// the events read from it. The subscription frame goes out on a new
     /// bidirectional stream of the pooled connection; a reader task then
-    /// verifies each frame's author, reads the segment bytes that follow
+    /// reads each frame, reads the segment bytes that follow
     /// it and checks their hash, and forwards them in order. The channel
     /// closes when the stream ends or breaks — the caller's cue to fall
     /// back to S3 — and dropping the receiver ends the stream from this
@@ -2406,8 +2408,8 @@ impl P2p {
         let conn = self.connection(&peer).await?;
         let opened = async {
             let (mut send, recv) = conn.open_bi().await.context("opening a log stream")?;
-            let msg = Signed::new(&self.key, payload)?;
-            crate::message::write_frame(&mut send, &msg).await?;
+            ensure_remote(&conn, expect)?;
+            write_payload(&mut send, payload).await?;
             send.finish().ok();
             anyhow::Ok(recv)
         }
@@ -2422,17 +2424,12 @@ impl P2p {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         tokio::spawn(async move {
             loop {
-                let frame = match crate::message::read_frame(&mut recv).await {
-                    Ok(frame) => frame,
+                // Every frame is the connection's peer's (checked against
+                // the dialed id before the subscription went out).
+                let body = match read_payload(&mut recv).await {
+                    Ok(body) => body,
                     Err(_) => return,
                 };
-                let Ok((author, body)) = frame.verify() else {
-                    return;
-                };
-                if author.as_bytes() != expect.as_bytes() {
-                    tracing::warn!("log stream frame signed by an unexpected key; closing");
-                    return;
-                }
                 let event = match body {
                     Payload::LogFrame {
                         n,
@@ -2533,18 +2530,13 @@ impl P2p {
         use tokio::io::AsyncReadExt;
         let started = std::time::Instant::now();
         let (mut send, mut recv) = conn.open_bi().await.context("opening a chunk stream")?;
-        let msg = Signed::new(&self.key, &Payload::ChunkRequest { hash: *hash })?;
-        crate::message::write_frame(&mut send, &msg).await?;
+        ensure_remote(conn, expect)?;
+        write_payload(&mut send, &Payload::ChunkRequest { hash: *hash }).await?;
         send.finish().ok();
-        let reply = crate::message::read_frame(&mut recv).await?;
+        let body = read_payload(&mut recv).await?;
         // The control reply precedes the body, so this is a true
         // first-byte mark: everything after it is transfer time.
         let ttfb = started.elapsed();
-        let (author, body) = reply.verify()?;
-        anyhow::ensure!(
-            author.as_bytes() == expect.as_bytes(),
-            "chunk reply signed by an unexpected key"
-        );
         match body {
             Payload::ChunkResponse {
                 status: ChunkStatus::Declined(why),
@@ -3020,6 +3012,18 @@ fn transport_observation(
     }
 }
 
+/// The connection's key, proved by the TLS handshake, is the id that was
+/// dialed. Direct-stream frames carry no signature, so this is what binds a
+/// reply to the peer it was asked of; it costs nothing and keeps the
+/// binding explicit should the pool ever stop keying by `remote_id`.
+fn ensure_remote(conn: &iroh::endpoint::Connection, expect: iroh::EndpointId) -> Result<()> {
+    anyhow::ensure!(
+        conn.remote_id() == expect,
+        "connection is to an unexpected key"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3110,11 +3114,14 @@ mod tests {
         while old.addr().addrs.is_empty() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // This build is /4; /3 is the previous version, refused by name.
+        assert_eq!(ALPN, b"constellation/4");
+        assert_eq!(OLDER_ALPNS[0], b"constellation/3");
         let limit = Duration::from_secs(10);
         let err = tokio::time::timeout(limit, new.endpoint().connect(old.addr(), ALPN))
             .await
             .expect("the dial completes")
-            .expect_err("the old node refuses constellation/3");
+            .expect_err("the old node refuses constellation/4");
         assert!(refused_alpn(&err), "{err:#} / {err:?}");
         assert_eq!(
             peer_version(new.endpoint(), &old.addr(), limit).await,
@@ -3141,8 +3148,8 @@ mod tests {
     }
 
     /// End-to-end over real QUIC on loopback: a direct request reaches the
-    /// peer, the peer's handler runs, and the signed reply verifies as
-    /// coming from that peer. This is the piece the unit tests for
+    /// peer, the peer's handler runs, and the unsigned reply is accepted as
+    /// coming from the connection's peer. This is the piece the unit tests for
     /// `message`/`handoff` deliberately stub out.
     #[tokio::test]
     async fn direct_request_round_trip_over_quic() {
@@ -3153,14 +3160,12 @@ mod tests {
         server.set_allowed([client.pubkey_hex()]);
         client.set_allowed([server.pubkey_hex()]);
 
-        let server_key = server.secret_key().clone();
         let ep = server.endpoint().clone();
         let accept = tokio::spawn(async move {
             let incoming = ep.accept().await.expect("no inbound connection");
             let conn = incoming.await.unwrap();
             let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-            let req = crate::message::read_frame(&mut recv).await.unwrap();
-            let (_, payload) = req.verify().unwrap();
+            let payload = read_payload(&mut recv).await.unwrap();
             let reply = match payload {
                 Payload::LeaseRequest { part, .. } => Payload::LeaseHandoff {
                     part,
@@ -3171,10 +3176,7 @@ mod tests {
                 },
                 other => panic!("unexpected {other:?}"),
             };
-            let signed = Signed::new(&server_key, &reply).unwrap();
-            crate::message::write_frame(&mut send, &signed)
-                .await
-                .unwrap();
+            write_payload(&mut send, &reply).await.unwrap();
             send.finish().ok();
             // Keep the connection alive until the client has read.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -3199,6 +3201,93 @@ mod tests {
             crate::interpret_reply("p0", &reply),
             crate::RequestOutcome::ClaimNow
         );
+        accept.abort();
+    }
+
+    /// Spec A fail-before: one direct `request` is exactly one unsigned
+    /// frame on the wire, the 4-byte length plus the postcard payload. On
+    /// the signed framing the frame was larger by the envelope (author
+    /// key, signature, body prefix). The server reads the raw stream.
+    #[tokio::test]
+    async fn a_direct_request_is_one_unsigned_frame_of_the_stream_wire_len() {
+        let topic = topic_for(Some(&[3u8; 32]), "fs");
+        let server = P2p::spawn(SecretKey::generate(), topic).await.unwrap();
+        let client = P2p::spawn(SecretKey::generate(), topic).await.unwrap();
+        server.set_allowed([client.pubkey_hex()]);
+        client.set_allowed([server.pubkey_hex()]);
+
+        let ep = server.endpoint().clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let accept = tokio::spawn(async move {
+            let incoming = ep.accept().await.expect("no inbound connection");
+            let conn = incoming.await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let raw = recv.read_to_end(1 << 20).await.unwrap();
+            tx.send(raw).ok();
+            // Answer with a hand-built frame so the check on the request
+            // does not depend on the reply framing under test.
+            let body = postcard::to_allocvec(&Payload::Pong {
+                node_id: 9,
+                s3_ok: true,
+            })
+            .unwrap();
+            let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&body);
+            send.write_all(&frame).await.unwrap();
+            send.finish().ok();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let payload = Payload::Ping { node_id: 5 };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.request(server.addr(), &payload),
+        )
+        .await
+        .expect("request timed out");
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the server read nothing")
+            .unwrap();
+        assert_eq!(
+            raw.len(),
+            crate::message::stream_wire_len(&payload),
+            "the frame on the wire is the unsigned payload"
+        );
+        assert_eq!(&raw[4..], &postcard::to_allocvec(&payload).unwrap()[..]);
+        assert!(
+            matches!(result.unwrap(), Payload::Pong { node_id: 9, .. }),
+            "the unsigned reply is accepted"
+        );
+        accept.abort();
+    }
+
+    /// An address that carries B's sockets but C's id does not reach B:
+    /// the handshake proves the key, so the dial fails and nothing is
+    /// returned. This is what makes `conn.remote_id() == expect` hold.
+    #[tokio::test]
+    async fn a_dial_whose_id_does_not_match_its_address_fails() {
+        let topic = topic_for(Some(&[4u8; 32]), "fs");
+        let server = P2p::spawn(SecretKey::generate(), topic).await.unwrap();
+        let client = P2p::spawn(SecretKey::generate(), topic).await.unwrap();
+        server.set_allowed([client.pubkey_hex()]);
+        client.set_allowed([server.pubkey_hex()]);
+        let ep = server.endpoint().clone();
+        let accept = tokio::spawn(async move {
+            // The server answers any handshake it gets; none completes.
+            while let Some(incoming) = ep.accept().await {
+                let _ = incoming.await;
+            }
+        });
+        let mut addr = server.addr();
+        addr.id = SecretKey::generate().public();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.request(addr, &Payload::Ping { node_id: 1 }),
+        )
+        .await
+        .expect("the dial neither failed nor timed out");
+        assert!(res.is_err(), "a dial to the wrong key must fail: {res:?}");
         accept.abort();
     }
 }

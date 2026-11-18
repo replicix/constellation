@@ -40,7 +40,7 @@ use constellation_fs_core::cache::{ChunkState, DigestBatch, DigestChange, DiskCa
 use constellation_net::bloom::{
     bucket_count_for, bucket_index, ENTRIES_PER_BUCKET, MAX_BITS_BYTES, MAX_BUCKETS,
 };
-use constellation_net::message::{wire_len, SIGNED_ENVELOPE};
+use constellation_net::message::{gossip_wire_len, SIGNED_ENVELOPE};
 use constellation_net::reconcile::key_of;
 use constellation_net::{Bloom, ChunkDecline, PathKind, Payload, Peers};
 use constellation_store_s3::{ChunkStore, DecodePriority};
@@ -1333,7 +1333,7 @@ impl Coop {
     }
 
     async fn gossip_digest(&self, payload: Payload) -> bool {
-        let bytes = wire_len(&payload) as u64;
+        let bytes = gossip_wire_len(&payload) as u64;
         let ok = self.peers.gossip(payload).await.is_ok();
         if ok {
             self.counters

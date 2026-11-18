@@ -310,7 +310,9 @@ The codebase is unusually disciplined on the peer-input path; the audit
 confirmed, among others: the 4-byte P2P frame cap checked before allocation and
 `Signed::decode` refusing trailing bytes / non-64-byte signatures; signature
 verified before dispatch and the author bound to the transport key on direct
-streams; log-segment and chunk bodies length-capped before allocation and
+streams (update 2026-11: direct streams no longer carry a signature, because the
+connection's TLS key is the author and the allowlist is re-checked per stream, see
+ADR-63; gossip keeps the signature check); log-segment and chunk bodies length-capped before allocation and
 blake3-verified; `bloom::from_wire_bytes` validating `k`/`nbits`/length; the
 allowlist gating gossip and connections with rate-limited miss-refresh; the axum
 2 MiB default body limit; `meta::resolve_path` treating `..` as a literal dentry
