@@ -70730,9 +70730,15 @@ read_live, one `shadow_row_for`); `install_streamed_decodes_the_outstanding_entr
 one 4 x; the bound is n + 8, so one extra scan (2 x) fails too. `install_streamed_scans_do_not_grow_with_outstanding` (#400 within #10 + 8) is `#[ignore]`d ("Step 2"): it still fails,
 as the spec says it must (10 vs 400).
 
-**Gates.** fmt; clippy `--workspace --all-targets -D warnings`; lib tests of meta, authority and engine in debug (1,702 / 991 / 478 passed) and release
-(1,702 / 991 / 477); `cargo test -p constellation-authority --release` including the sim suite (575 passed, 0 failed, 16 ignored). The debug runs
-exercise the cross-check on every install.
+**Gates** (round 2, tree 0b950f4f on origin/main ec0b9712, every run after the last code edit; the only later change is this entry): fmt; clippy `--workspace --all-targets -D warnings`;
+lib tests of meta, authority and engine in debug (1,723 / 994 / 483 passed, 0 failed) and release (1,723 / 994 / 484); `cargo test -p constellation-meta --features test-util --tests`
+in debug (all integration binaries ok, including `held`); `cargo test --release -p constellation-authority` including the sim suite (576 passed, 0 failed, 16 ignored).
+
+**Re-read branches (cross-check live, debug, throwaway eprintln counters on a scratch copy, not committed).** Meta integration tests with `test-util`: the retract re-read
+ran once (`member_copy`), the strand re-read never (`former_delegate`, `reship`, `speculation`, `holder_capture`, `held`, meta lib: 0 and 0). Debug sweeps of 300 seeds each
+of `delegated-holder-cut`, `backup-crash`, the 16 `fast-takeover*` labels, `delegated-root-crash`, `tloss-two-node` and `long-delegated-late-answers`: 0 failures and 0
+cross-check messages, and neither re-read branch ran in any of them. So the strand re-read is not reached by any test or sweep run here; it is covered by the review of the
+code only. The cross-check never fired anywhere.
 
 **Sims, base (origin/main) vs fix, 2,000 seeds, release.** 40 of the 115 labels the spec pattern (`*links*`, `flex*`, `delegated*`, `backup-crash*`, `*ahead*`) matches; the `links`, `flex`, `backup-crash`, `ahead` and `delegated*` labels of the
 hlfix2 C1/C2 lists that stream and speculate (the full 242-label union was about 11 h on this loaded box and was not run). Same failing seeds on both
