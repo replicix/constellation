@@ -8375,6 +8375,35 @@ fn base_config(label: &str) -> SimConfig {
     }
 }
 
+/// A sweep label's configuration: a base name plus `+variant`s (see
+/// [`config_variant`]).
+fn label_config(label: &str) -> SimConfig {
+    let (base, variants) = label.split_once('+').unwrap_or((label, ""));
+    variants
+        .split('+')
+        .filter(|v| !v.is_empty())
+        .fold(base_config(base), config_variant)
+}
+
+/// T1/T2: a run is a pure function of its seed. Each run builds fresh maps
+/// (fresh `RandomState` keys), so a hash-ordered wakeup shows as a differing
+/// fingerprint among runs on the calling thread.
+fn assert_runs_repeat(label: &str, seed: u64, runs: usize) {
+    let fps: Vec<String> = (0..runs)
+        .map(|_| fingerprint(&run_seed(seed, label_config(label))))
+        .collect();
+    assert!(
+        fps.iter().all(|f| f == &fps[0]),
+        "{label} seed {seed}: {runs} runs gave different fingerprints: {fps:?}"
+    );
+}
+
+/// T1: a crash wakes its waiters in key order, not hash order.
+#[test]
+fn seed_runs_are_repeatable() {
+    assert_runs_repeat("flex+links", 955, 8);
+}
+
 /// Many seeds of a named configuration, run in parallel
 /// (`AUTHORITY_SIM_CONFIG`, default `delegated-holder-cut`;
 /// `AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`).
@@ -8393,13 +8422,7 @@ fn sweep_config() {
     let threads = env("AUTHORITY_SIM_THREADS", 8);
     let label = std::env::var("AUTHORITY_SIM_CONFIG").unwrap_or("delegated-holder-cut".into());
     // `<config>+nomove+solo`: see `config_variant`.
-    let config = move |label: &str| {
-        let (base, variants) = label.split_once('+').unwrap_or((label, ""));
-        variants
-            .split('+')
-            .filter(|v| !v.is_empty())
-            .fold(base_config(base), config_variant)
-    };
+    let config = label_config;
     // Plan 43 C7-F F-a: `AUTHORITY_SIM_BEATS=thread` runs any configuration
     // with the holder's off-core heartbeat on a thread of its own, as the
     // daemon has it: the floors of its fast takeovers are then capped by

@@ -155,8 +155,8 @@ impl SimEpoch {
 type CutOnAnswer = (NodeId, u64, HashSet<Rid>, bool);
 
 pub struct Shared {
-    replies: Mutex<HashMap<Rid, oneshot::Sender<ClientReply>>>,
-    controls: Mutex<HashMap<OpId, oneshot::Sender<Result<ControlOk, String>>>>,
+    replies: Mutex<BTreeMap<Rid, oneshot::Sender<ClientReply>>>,
+    controls: Mutex<BTreeMap<OpId, oneshot::Sender<Result<ControlOk, String>>>>,
     next_control: AtomicU64,
     view: Mutex<CoreView>,
     pub incarnation: AtomicU32,
@@ -722,8 +722,8 @@ impl NodeHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let (urgent_tx, urgent_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
-            replies: Mutex::new(HashMap::new()),
-            controls: Mutex::new(HashMap::new()),
+            replies: Mutex::new(BTreeMap::new()),
+            controls: Mutex::new(BTreeMap::new()),
             next_control: AtomicU64::new(1 << 48),
             view: Mutex::new(CoreView::default()),
             incarnation: AtomicU32::new(incarnation),
@@ -1158,8 +1158,14 @@ impl NodeHandle {
         self.shared.lane_wake.notify_one();
         bus.detach(self.id);
         self.task.abort();
-        self.shared.replies.lock().unwrap().clear();
-        self.shared.controls.lock().unwrap().clear();
+        // Dropping a sender wakes the waiting task, and the wake order is the
+        // order the tasks then run in (and draw from the shared bus RNG). The
+        // maps are BTreeMaps, so `take` + drop releases them in key order, not
+        // in a per-process random hash order.
+        let replies = std::mem::take(&mut *self.shared.replies.lock().unwrap());
+        drop(replies);
+        let controls = std::mem::take(&mut *self.shared.controls.lock().unwrap());
+        drop(controls);
     }
 
     /// A stopped process whose timers keep running: events queue up and
