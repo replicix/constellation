@@ -70308,3 +70308,32 @@ dependent with a real rid is neither listed nor rolled back; a failed `forget_re
 drop would refuse and list it twice (dedup by rid). Sweeps, release, 2,000 seeds, base (origin/main plus the test-only commit, which carries the
 `lost-chunk-late` variant) / fix, ten labels: failing sets equal (`lost-chunk-late` [226, 996, 1810] on both, none elsewhere); `acked_lost` totals 80, 50, 48,
 1445, 41, 265, 1000, 0 equal, backed chain 4817/4814 and backed+commit 4817/4816 (simdet nondeterminism, as in round 1).
+
+### btrstall: the core's step stays clear of the journal-lock stall (2026-11-18)
+
+Two small changes, no integrity change (diagnosis: the stall report of 2026-11-18, causes 1 and 3a).
+
+- **Vendored fjall change 12** (`vendor/fjall/CONSTELLATION-PATCH.md`): a memtable rotation's version GC only collects the stale versions under
+  `keyspaces.read()` and frees them (whole sealed memtables, file unlinks) after the guard is released. Before, a journal rotation waiting for
+  `keyspaces.write()` held the journal writer behind that read guard for 0.4-0.9 s, so every commit waited in `journal_lock` and the core's step
+  lapsed. `rotate` keeps its write lock. Fail-before: `keyspace::stale_gc_test::a_slow_version_gc_does_not_stall_commits_behind_a_journal_rotation`
+  (a commit waited 249 ms before, under 100 ms after).
+- **`Meta::clear_dirty_upto`** clears in chunks of `CLEAR_DIRTY_CHUNK` = 1,024 keys, one write transaction each, instead of one for 25k-52k keys
+  (the writer lock was held 13-226 ms). Nothing assumes the clear is atomic: both publish call sites run it after the commit and `remember()`, a
+  partial clear leaves a superset of the dirty set, and the next publish republishes it (an unchanged root takes the "nothing to commit, still
+  clears" path). Fail-before: `store::clear_dirty_tests::{the_clear_takes_the_writer_lock_for_a_bounded_chunk_at_a_time,
+  a_key_re_dirtied_between_chunks_survives_the_clear}` (1 write transaction for 5,000 keys before, at least 5 now).
+
+Measured on the quiet timing box, `stress-ng --link 8 --link-ops 16`, state on the named file system, `file://` backend on tmpfs, 3 runs per side,
+alternating (median [range]); heavy-run commits with `journal_lock` of 100 ms or more: before 3/3 runs on every file system (431-649 ms), after 0/3.
+
+| fs | wall s before | wall s after | stress-ng bogo-ops/s before | after | steps >=187 ms per run before | after | core waits behind the clear >=100 ms (runs) before | after |
+|---|---|---|---|---|---|---|---|---|
+| btrfs | 45.1 [44.2-45.7] | 19.8 [19.4-19.8] | 0.37 [0.37-0.37] | 0.81 [0.81-0.83] | 1,1,1 | 1,1,1 | 3 (max 181 ms) | 0 |
+| ext4 | 28.9 [28.7-56.6] | 23.2 [22.1-24.4] | 0.55 [0.28-0.56] | 0.69 [0.66-0.73] | 2,2,3 | 1,1,1 | 0 (max 83 ms) | 0 |
+| xfs | 43.5 [43.3-45.8] | 19.2 [18.9-19.2] | 0.37 [0.36-0.38] | 0.84 [0.84-0.85] | 1,1,1 | 1,0,0 | 0 (max 99 ms) | 0 |
+| tmpfs | 27.2 [20.7-27.9] | 17.5 [16.7-18.0] | 0.60 [0.58-0.77] | 0.92 [0.90-0.97] | 1,1,0 | 0,0,0 | 0 (max 36 ms) | 0 |
+
+Light load (`W=4 OPS=4`, 2 runs per side): wall s btrfs 4.27 -> 4.12, ext4 5.64 -> 4.61, xfs 4.21 -> 3.75, tmpfs 3.87 -> 3.85; no file system is slower.
+The one remaining >=187 ms step per heavy run on the disk file systems is the PublishDone to LeaseSwap `Meta::sync` (out of scope); the btrfs
+metadata-reservation stall (cause 2) is out of scope too.

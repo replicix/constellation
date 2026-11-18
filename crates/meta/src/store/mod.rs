@@ -106,6 +106,8 @@ pub use gate::{
     fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,
 };
 #[cfg(test)]
+mod clear_dirty_tests;
+#[cfg(test)]
 mod close_tests;
 pub mod held;
 pub mod inbox;
@@ -143,6 +145,9 @@ use fjall::{
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Keys one write transaction of [`Meta::clear_dirty_upto`] clears.
+pub(crate) const CLEAR_DIRTY_CHUNK: usize = 1024;
 
 /// Inos are `node_prefix << 40 | counter`: 24 bits of node id, 40 bits
 /// (~1.1e12) of per-node allocations. Prefix 0 belongs to `fs create`
@@ -2255,25 +2260,41 @@ impl Meta {
     /// counter has since moved on was re-dirtied after the snapshot this
     /// publish read, by a write this publish never saw, and must stay
     /// dirty for the next one.
+    ///
+    /// The keys go in chunks of [`CLEAR_DIRTY_CHUNK`], one write
+    /// transaction and one commit each, so the writer lock is held for a
+    /// bounded time (one transaction of 25k-52k keys held it 13-226 ms, and
+    /// the core's priority write waited that long behind it). Splitting is
+    /// safe:
+    ///
+    /// - each key's clear is an independent conditional delete: the chunks
+    ///   do not depend on one another;
+    /// - an error or a crash between chunks leaves a superset of the true
+    ///   dirty set, which the next publish republishes (the same as when the
+    ///   publish's `remember()` and this clear are already two
+    ///   transactions, `mtree_publish.rs`);
+    /// - a key re-dirtied between two chunks holds a higher counter when its
+    ///   chunk runs and survives.
+    ///
+    /// Stops at the first chunk that fails.
     pub fn clear_dirty_upto(&self, keys: &[(Vec<u8>, u64)]) -> Result<(), MetaError> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let mut tx = self.db.write_tx();
-        for (key, counter) in keys {
-            if let Some(current) = tx.get(&self.dirty, key.clone())? {
-                let current = u64::from_be_bytes(
-                    current
-                        .as_ref()
-                        .try_into()
-                        .map_err(|_| MetaError::Invalid("dirty counter".into()))?,
-                );
-                if current <= *counter {
-                    tx.remove(&self.dirty, key.clone());
+        for chunk in keys.chunks(CLEAR_DIRTY_CHUNK) {
+            let mut tx = self.db.write_tx();
+            for (key, counter) in chunk {
+                if let Some(current) = tx.get(&self.dirty, key.clone())? {
+                    let current = u64::from_be_bytes(
+                        current
+                            .as_ref()
+                            .try_into()
+                            .map_err(|_| MetaError::Invalid("dirty counter".into()))?,
+                    );
+                    if current <= *counter {
+                        tx.remove(&self.dirty, key.clone());
+                    }
                 }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(())
     }
 
