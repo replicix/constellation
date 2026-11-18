@@ -1683,6 +1683,19 @@ const INSTALL_WAIT_WARN_EVERY_MS: i64 = 60_000;
 
 /// The keys `op` touches, as ownership is resolved over them.
 impl Core {
+    /// Plan 46 M1.3 step 15a: the generations this node holds whose release
+    /// waits on read-delegation recalls (`StickyRelease`/recall release with
+    /// `held`), for the simulation's S4 measurement. Read-only; ascending.
+    #[must_use]
+    pub fn deleg_releases_held(&self) -> Vec<u64> {
+        self.dl
+            .mine
+            .iter()
+            .filter(|(_, d)| d.release.as_ref().is_some_and(|r| r.held))
+            .map(|(gen, _)| *gen)
+            .collect()
+    }
+
     pub fn deleg_view(&self) -> DelegView {
         let mut view = DelegView {
             gens: self
