@@ -8385,6 +8385,80 @@ fn label_config(label: &str) -> SimConfig {
         .fold(base_config(base), config_variant)
 }
 
+/// `AUTHORITY_SIM_FP_FILE=<path>`: the file the sweeps append their
+/// fingerprint lines to, one `<label> <seed> <fingerprint>\n` per run, each
+/// written whole under one lock. The `SWEEP-FP` line on stderr can be lost
+/// or spliced with another thread's tracing line; this file cannot, so a
+/// determinism gate compares it (sorted).
+fn write_fp_line(label: &str, seed: u64, fp: &str) {
+    static SINK: FpSink = FpSink::new();
+    if let Ok(path) = std::env::var("AUTHORITY_SIM_FP_FILE") {
+        SINK.append(&path, label, seed, fp);
+    }
+}
+
+/// The append-only fingerprint file behind [`write_fp_line`].
+struct FpSink(std::sync::Mutex<Option<std::fs::File>>);
+
+impl FpSink {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// One `write_all` of the whole line while holding the lock.
+    fn append(&self, path: &str, label: &str, seed: u64, fp: &str) {
+        use std::io::Write;
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let file = guard.get_or_insert_with(|| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap_or_else(|e| panic!("AUTHORITY_SIM_FP_FILE {path}: {e}"))
+        });
+        let line = format!("{label} {seed} {fp}\n");
+        file.write_all(line.as_bytes())
+            .unwrap_or_else(|e| panic!("AUTHORITY_SIM_FP_FILE {path}: {e}"));
+    }
+}
+
+/// T4: 200 fingerprint lines from 8 threads land whole in the file.
+#[test]
+fn fp_file_lines_are_written_whole() {
+    let dir = std::env::temp_dir().join(format!("fp-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fp.txt");
+    let path_str = path.to_str().unwrap().to_string();
+    let sink = std::sync::Arc::new(FpSink::new());
+    let fp = "0123456789abcdef";
+    let handles: Vec<_> = (0..8u64)
+        .map(|t| {
+            let (sink, path_str) = (sink.clone(), path_str.clone());
+            std::thread::spawn(move || {
+                for i in 0..25u64 {
+                    sink.append(&path_str, "flex", t * 25 + i, fp);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut seeds: Vec<u64> = text
+        .lines()
+        .map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            assert_eq!(f.len(), 3, "malformed line {l:?}");
+            assert_eq!((f[0], f[2]), ("flex", fp), "malformed line {l:?}");
+            f[1].parse().unwrap()
+        })
+        .collect();
+    seeds.sort_unstable();
+    assert_eq!(seeds, (0..200).collect::<Vec<u64>>());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// T1/T2: a run is a pure function of its seed. Each run builds fresh maps
 /// (fresh `RandomState` keys), so a hash-ordered wakeup shows as a differing
 /// fingerprint among runs on the calling thread.
@@ -8821,7 +8895,9 @@ fn sweep_config() {
             }
             let result = run_seed(seed, config(&label));
             if fingerprint_on {
-                eprintln!("SWEEP-FP {label} seed {seed}: {}", fingerprint(&result));
+                let fp = fingerprint(&result);
+                eprintln!("SWEEP-FP {label} seed {seed}: {fp}");
+                write_fp_line(&label, seed, &fp);
                 // The runs whose strict durability the failure budget
                 // waived (`Cluster::note_takedown`).
                 if let Ok(r) = &result {
