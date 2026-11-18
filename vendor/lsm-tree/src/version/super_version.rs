@@ -294,6 +294,12 @@ impl SuperVersions {
 pub struct StaleVersions(Vec<(PathBuf, SuperVersion)>);
 
 impl StaleVersions {
+    /// Whether there is nothing to drop or remove.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Drops the versions, then removes their files. A failure does not
     /// stop the loop: every file is tried, the first error is returned.
     pub fn remove(self) -> crate::Result<()> {

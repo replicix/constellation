@@ -10,6 +10,49 @@ mod write_delay;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod stale_gc_test;
+
+/// Test-only: sleeps while a memtable rotation handles a keyspace's stale
+/// versions, for the keyspaces of one database folder.
+#[cfg(test)]
+pub(crate) mod stale_gc_hook {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex, PoisonError,
+        },
+        time::Duration,
+    };
+
+    static DELAY: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
+    static FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) fn set(folder: &Path, delay: Duration) {
+        *DELAY.lock().unwrap_or_else(PoisonError::into_inner) = Some((folder.to_path_buf(), delay));
+        FIRED.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn clear() {
+        *DELAY.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn fired() -> usize {
+        FIRED.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn at(keyspace_path: &Path) {
+        let delay = DELAY.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some((folder, delay)) = delay {
+            if keyspace_path.starts_with(folder) {
+                FIRED.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(delay);
+            }
+        }
+    }
+}
+
 use crate::{
     file::{KEYSPACES_FOLDER, LSM_CURRENT_VERSION_MARKER},
     flush::Task as FlushTask,
@@ -764,27 +807,32 @@ impl Keyspace {
             self.supervisor.snapshot_tracker.pullup();
             self.supervisor.snapshot_tracker.gc();
 
-            for keyspace in self
-                .supervisor
-                .keyspaces
-                .read()
-                .expect("lock is poisoned")
-                .values()
+            // CONSTELLATION PATCH (change 12): under `keyspaces.read()` only
+            // the bookkeeping, under each tree's version lock. Freeing the
+            // stale versions (whole sealed memtables, a large skiplist free)
+            // and unlinking their files happen after the read guard is
+            // released: a journal rotation holds the journal writer, which
+            // every commit takes, while it waits for `keyspaces.write()`,
+            // so a long reader held every commit.
+            let mut stale_versions = Vec::new();
             {
-                // CONSTELLATION PATCH: only the bookkeeping under the
-                // version lock; dropping the stale versions (the last one
-                // holding a compaction's inputs deletes their files) and
-                // removing their files happen after it is released, since
-                // every insert into the tree waits for that lock.
-                let stale = keyspace.tree.get_version_history_lock().take_garbage(
-                    keyspace.path(),
-                    self.supervisor.snapshot_tracker.get_seqno_safe_to_gc(),
-                );
-                if let Err(e) = stale.remove() {
-                    log::warn!(
-                        "Version history GC failed for keyspace {:?}: {e:?}",
-                        keyspace.name,
+                #[expect(clippy::expect_used)]
+                let keyspaces = self.supervisor.keyspaces.read().expect("lock is poisoned");
+                for keyspace in keyspaces.values() {
+                    let stale = keyspace.tree.get_version_history_lock().take_garbage(
+                        keyspace.path(),
+                        self.supervisor.snapshot_tracker.get_seqno_safe_to_gc(),
                     );
+                    if !stale.is_empty() {
+                        stale_versions.push((stale, keyspace.name.clone()));
+                    }
+                }
+            }
+            for (stale, name) in stale_versions {
+                #[cfg(test)]
+                stale_gc_hook::at(self.path());
+                if let Err(e) = stale.remove() {
+                    log::warn!("Version history GC failed for keyspace {name:?}: {e:?}");
                 }
             }
         }

@@ -1,4 +1,4 @@
-# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock, a persist that says when it flushes, a write halt that holds back only its own writer, a journal rotation and eviction on demand
+# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock, a persist that says when it flushes, a write halt that holds back only its own writer, a journal rotation and eviction on demand, a version GC that frees outside the keyspaces lock
 
 This directory is fjall **3.1.10** exactly as published on crates.io
 (checksum `cd201c93…c33f`, upstream commit
@@ -10,7 +10,7 @@ and both texts stay here unchanged.
 
 ## What is changed
 
-There are ten changes, numbered 1-9 and 11 (10 was plan 41's journal write outside the writer lock, dropped: plan 41 §4 D8), each marked `CONSTELLATION PATCH`:
+There are eleven changes, numbered 1-9, 11 and 12 (10 was plan 41's journal write outside the writer lock, dropped: plan 41 §4 D8), each marked `CONSTELLATION PATCH`:
 
 1. **`src/db.rs`, `impl Drop for DatabaseInner`**: this is the fix. The
    worker shutdown loop never blocks now.
@@ -54,6 +54,11 @@ There are ten changes, numbered 1-9 and 11 (10 was plan 41's journal write outsi
     `rotate_journal_and_evict()`, which seals the active journal whatever its
     size and runs one journal maintenance pass, and `is_poisoned()`. See
     [Change 11](#change-11-a-journal-rotation-and-eviction-on-demand).
+12. **`src/keyspace/mod.rs`, `src/keyspace/stale_gc_test.rs` (new),
+    `../lsm-tree/src/version/super_version.rs`**: a memtable rotation's
+    version GC frees the stale versions after it released
+    `keyspaces.read()`. See
+    [Change 12](#change-12-version-gc-frees-outside-the-keyspaces-lock).
 
 The directory is also listed in the workspace `exclude` list. That way it is
 built as a plain dependency, and `cargo clippy --workspace`, `cargo fmt --all`
@@ -401,7 +406,54 @@ unsynced journal tail; that is upstream's behaviour, with or without this
 change. Upstream's own one-call rotation (`Writer::rotate`, used by its
 journal unit tests, and compiled only for tests) runs the same steps.
 
-### Tests
+### Change 12: version GC frees outside the keyspaces lock
+
+Change 6 moved the freeing of stale versions out of each tree's version
+lock, but the GC loop in `Keyspace::inner_rotate_memtable` still ran, for
+every keyspace, inside the guard of `supervisor.keyspaces.read()`.
+`StaleVersions::remove` drops the old versions, including whole sealed
+memtables (a large skiplist free), and unlinks their files: 0.56-0.86 s in
+that guard under load. A journal rotation (`journal/rotation.rs::rotate`,
+step 2) holds the journal writer and the journal manager while it waits for
+`keyspaces.write()`, and every commit takes the journal writer. So each
+commit waited as long as the free, in its `journal_lock` phase (380-645 ms
+seen in every heavy run on tmpfs, ext4, xfs and btrfs), and a core step
+lapsed.
+
+Now the guard only collects: it calls `take_garbage` for each keyspace
+(under that tree's version lock, with the watermark read where it was) and
+keeps each non-empty `StaleVersions` with the keyspace name in a local
+`Vec`. After the guard is dropped, each one is `remove()`d, with the same
+`log::warn!` on error. The journal manager's `maintenance()` still follows
+the loop. `StaleVersions::is_empty` (vendored lsm-tree) is new.
+
+No integrity change: `take_garbage` decides what is stale, under the version
+lock, as before. Removal already ran outside the version lock (change 6),
+and only the outer read guard is released earlier. A keyspace deleted between
+the guard and `remove` is harmless: `remove` treats a missing file as done
+(`try_exists`) and the `StaleVersions` own their `Arc`s. No journal file,
+rotation marker or seqno map is touched.
+
+The other `StaleVersions::remove` sites do not hold a `keyspaces` guard:
+`lsm-tree/src/tree/mod.rs` (~506) and `compaction/worker.rs` (~255, ~615,
+~684) are in lsm-tree, which has no notion of fjall's keyspace map, and
+fjall's worker pool, flush and compaction code never takes
+`supervisor.keyspaces`. The only other holders are `Database::keyspace`
+(write, creation), recovery and the post-recovery check (read), and
+`rotation::rotate`.
+
+Considered, not done: `rotate`'s `keyspaces.write()` could be a `read()`
+(commits hold the journal writer through the memtable insert, so building the
+seqno map under a read guard would be sound). It is not needed once the long
+reader is gone, and it is a lock-semantics change.
+
+The test is `keyspace::stale_gc_test::a_slow_version_gc_does_not_stall_commits_behind_a_journal_rotation`:
+a test-only hook (`stale_gc_hook`) sleeps 300 ms while a rotation handles a
+keyspace's stale versions; a forced journal rotation
+(`rotate_journal_and_evict`) waits for `keyspaces.write()` meanwhile, and a
+commit into another keyspace must take under 100 ms (before: 249 ms).
+
+## Tests
 
 `src/journal/rotation_test.rs` (in `cargo test --manifest-path
 vendor/fjall/Cargo.toml --lib`), with test-only hooks keyed by database
@@ -583,7 +635,7 @@ If the fix is still needed when moving to a newer fjall before upstream has
 it, vendor that version instead and re-apply the `db.rs` hunk. The hunk is
 self-contained and only touches `impl Drop for DatabaseInner`.
 
-Changes 3, 4, 5, 7, 8 and 9 have no upstream counterpart (7 and 9 are filed
+Changes 3, 4, 5, 7, 8, 9 and 12 have no upstream counterpart (7 and 9 are filed
 in `../ISSUE-fjall.md`): dropping the vendored copy
 means re-applying them to the new version (or giving up the writer
 priority and the unlocked sync, which brings back the stalls described
