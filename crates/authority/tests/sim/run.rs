@@ -5645,8 +5645,8 @@ pub fn last_run_sim_ms() -> u64 {
 /// clock (durations come from the node's wait clock, the paused virtual one
 /// here), iterates no `HashMap`/`HashSet` where the order wakes a task,
 /// sends a message or draws from a shared RNG (sort, or use a `BTreeMap`: a
-/// crash drops its waiters' senders in key order, placement breaks ties by
-/// inode), and has no unbiased `select!` (tokio's own RNG is randomly
+/// crash drops its waiters' senders in a seed-shuffled order, placement
+/// breaks ties by inode), and has no unbiased `select!` (tokio's own RNG is randomly
 /// seeded). Held-write OS threads run in lock-step rendezvous only: every
 /// `go`/`committed`/`phase` hand-off blocks the driver thread, so the paused
 /// clock cannot auto-advance while they run. The determinism gate

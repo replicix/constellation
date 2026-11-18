@@ -24,6 +24,9 @@ use constellation_store_s3::commits::{CommitChain, CommitPayload};
 use constellation_store_s3::heartbeat::HeartbeatStore;
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::{LogStore, StoreError};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use replicix_objcas::{LeaseMode, LeaseStore};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -155,6 +158,8 @@ impl SimEpoch {
 type CutOnAnswer = (NodeId, u64, HashSet<Rid>, bool);
 
 pub struct Shared {
+    /// The run's seed: a crash derives its own wake-order RNG from it.
+    seed: u64,
     replies: Mutex<BTreeMap<Rid, oneshot::Sender<ClientReply>>>,
     controls: Mutex<BTreeMap<OpId, oneshot::Sender<Result<ControlOk, String>>>>,
     next_control: AtomicU64,
@@ -722,6 +727,7 @@ impl NodeHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let (urgent_tx, urgent_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
+            seed: env.seed,
             replies: Mutex::new(BTreeMap::new()),
             controls: Mutex::new(BTreeMap::new()),
             next_control: AtomicU64::new(1 << 48),
@@ -1160,11 +1166,27 @@ impl NodeHandle {
         self.task.abort();
         // Dropping a sender wakes the waiting task, and the wake order is the
         // order the tasks then run in (and draw from the shared bus RNG). The
-        // maps are BTreeMaps, so `take` + drop releases them in key order, not
-        // in a per-process random hash order.
-        let replies = std::mem::take(&mut *self.shared.replies.lock().unwrap());
+        // maps are BTreeMaps, so the drained senders start in key order;
+        // they are then shuffled by an RNG of their own, derived from the run
+        // seed, the node and its incarnation. The order is the same on every
+        // run of a seed (not a per-process random hash order) and differs
+        // across seeds, so a sweep covers both "older call resubmits first"
+        // and "newer call resubmits first". Not the bus RNG: its draw stream
+        // stays as it was.
+        let incarnation = u64::from(self.shared.incarnation.load(Ordering::SeqCst));
+        let mut rng = StdRng::seed_from_u64(
+            self.shared.seed ^ (self.id << 40) ^ (incarnation << 8) ^ 0x0c4a_54ed,
+        );
+        let mut replies: Vec<_> = std::mem::take(&mut *self.shared.replies.lock().unwrap())
+            .into_values()
+            .collect();
+        replies.shuffle(&mut rng);
+        // A `Vec` drops its elements front to back: the shuffled order.
         drop(replies);
-        let controls = std::mem::take(&mut *self.shared.controls.lock().unwrap());
+        let mut controls: Vec<_> = std::mem::take(&mut *self.shared.controls.lock().unwrap())
+            .into_values()
+            .collect();
+        controls.shuffle(&mut rng);
         drop(controls);
     }
 

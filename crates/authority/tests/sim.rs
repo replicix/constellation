@@ -8472,7 +8472,7 @@ fn assert_runs_repeat(label: &str, seed: u64, runs: usize) {
     );
 }
 
-/// T1: a crash wakes its waiters in key order, not hash order.
+/// T1: a crash wakes its waiters in a seed-derived order, not a hash order.
 #[test]
 fn seed_runs_are_repeatable() {
     assert_runs_repeat("flex+links", 955, 8);

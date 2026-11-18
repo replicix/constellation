@@ -71223,11 +71223,12 @@ PUT can land after the read and release the lease under a node that went on as h
 ### Sim determinism: `seed -> fingerprint` is a pure function (2026-11-18)
 
 Five sources made two runs of one seed differ (diagnosis: simdet; 432 differing seeds of 12,000 between 2 and 8 sweep threads on main). Fixed, one commit each: the sim's crash drops
-its waiters' reply/control senders in key order (`Shared::replies`/`controls` are `BTreeMap`s; the drop order was a random hash order that reordered the woken
-clients' submits and the bus RNG draws); `Stats::reship_duration_ms_max` reads the node's wait clock (`Meta::wait_clock_ms`, as `held_copy_now_ms`), not
+its waiters' reply/control senders in a seed-shuffled order (`Shared::replies`/`controls` are `BTreeMap`s, drained and shuffled by an RNG of their own seeded from the run seed, node and incarnation; the drop order was a random hash order that reordered the woken
+clients' submits and the bus RNG draws; the shuffle keeps both resubmit orders in a sweep, which plain key order would have made one-sided); `Stats::reship_duration_ms_max` reads the node's wait clock (`Meta::wait_clock_ms`, as `held_copy_now_ms`), not
 the host `Instant` (load-dependent 0..4 ms in the fingerprint); the placement walks directories in `Ino` order, so an exact tie takes the lowest inode (product
 change: placement was hash-ordered on ties, and the status list is tie-broken too); `AUTHORITY_SIM_FP_FILE` writes fingerprint lines whole; `run_seed`'s
 `select!` is biased and the checkers' failure text no longer depends on map order. Pinned by `seed_runs_are_repeatable` (flex+links 955),
 `seed_runs_are_repeatable_across_a_placement_tie` (placement-hot+links 235), core `a_placement_tie_takes_the_lowest_directory`, meta
 `reship_hold_ms_reads_the_wait_clock`, `fp_file_lines_are_written_whole`; gated by `tools/sim-determinism-gate.sh` (TESTING.md, "The determinism gate").
 Not in scope: HLC stamps from the host clock in record payloads, and the 10 s / 300 s host-clock thresholds (session watermark TTL, `atime_stale`).
+Open item (placement): a node's covered top subtree masks its other dominated subtrees. While an exact tie between two subtrees of one node lasts, the lowest-`Ino` sibling wins every round: its total stays equal and the node's stream already covers it, so `table.covering` (`placement.rs`, the `chosen` walk) skips it and the higher-`Ino` sibling is never placed or grown. On main the hash order let a later round pick the other sibling ("grew a delegation's stream by a subtree", placement-hot seed 235); that outcome is now 0% per round, and the sim's placement-hot coverage of the grow-by-second-subtree path drops with it. Same masking every strictly smaller dominated subtree of a node already had; no safety effect, the hot directory still wins. Candidate fix: skip candidates the node's own stream already covers when filling `chosen`.
