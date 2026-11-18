@@ -1856,6 +1856,21 @@ impl Core {
             .collect()
     }
 
+    /// Plan 46 M1.3 step 15b (ADR-63): the generations this node holds that
+    /// journaled a `ReleaseCut` whose release row waits for the read
+    /// delegations under its subtrees. For the simulation's measurement of
+    /// the cut spans (the counterpart of [`Self::deleg_releases_held`]).
+    /// Read-only; ascending.
+    #[must_use]
+    pub fn deleg_releases_cut(&self) -> Vec<u64> {
+        self.dl
+            .mine
+            .iter()
+            .filter(|(_, d)| !d.cuts.is_empty())
+            .map(|(gen, _)| *gen)
+            .collect()
+    }
+
     pub fn deleg_view(&self) -> DelegView {
         let mut view = DelegView {
             gens: self

@@ -230,6 +230,9 @@ pub struct Shared {
     pub queued_seen: Mutex<BTreeSet<(Rid, u64)>>,
     /// `Stats::ungated_shadows` of this node's earlier incarnations.
     pub ungated_shadows_before: AtomicU64,
+    /// A release of this node is held on read recalls, or cut and waiting
+    /// for them (`FaultKind::SuspendWhenReleaseHeld` watches it).
+    pub release_open: AtomicBool,
     /// `Stats::settle_frozen_asks` of this node's earlier incarnations.
     pub settle_asks_before: AtomicU64,
     /// `Meta::unjustified_ships` of this node's earlier incarnations (a meta
@@ -755,6 +758,7 @@ impl NodeHandle {
             rolled_back_at: Mutex::new(BTreeMap::new()),
             queued_seen: Mutex::new(BTreeSet::new()),
             ungated_shadows_before: AtomicU64::new(0),
+            release_open: AtomicBool::new(false),
             settle_asks_before: AtomicU64::new(0),
             unjustified_ships_before: AtomicU64::new(0),
             journaled_refusals: Mutex::new(BTreeSet::new()),
@@ -1023,6 +1027,7 @@ impl NodeHandle {
             unsettled_seen: 0,
             settles_seen: 0,
             releases_seen: 0,
+            cut_counters_seen: [0; 3],
             deps_refused_seen: 0,
             deleg_rows_from: 0,
             deleg_sig: Mutex::new(Vec::new()),
@@ -1379,6 +1384,10 @@ struct Driver {
     settles_seen: u64,
     /// `Stats::deleg_sticky_releases` as last seen.
     releases_seen: u64,
+    /// `Stats::{settles_answered_at_cut, deleg_release_rowless_held,
+    /// deleg_exec_in_cut}` as last seen (ADR-63's counters, summed over the
+    /// run's incarnations in `Oracles`).
+    cut_counters_seen: [u64; 3],
     /// `Stats::deleg_deps_refused` already judged (the causal-cut oracle).
     deps_refused_seen: u64,
     /// The next journal seq to scan for a delegate's rows the root appended
@@ -2649,9 +2658,47 @@ impl Driver {
                     &held,
                     self.oracles.reach.now_ms(),
                 );
+                // ADR-63: the cut spans and the counters.
+                let cut = self.core.deleg_releases_cut();
+                self.oracles.cut_releases.lock().unwrap().note(
+                    self.id,
+                    &cut,
+                    self.oracles.reach.now_ms(),
+                );
+                // What fires a `SuspendWhenReleaseHeld`: a release of this node
+                // is held or cut.
+                self.shared
+                    .release_open
+                    .store(!held.is_empty() || !cut.is_empty(), Ordering::Relaxed);
+                let now_counters = [
+                    self.core.stats.settles_answered_at_cut,
+                    self.core.stats.deleg_release_rowless_held,
+                    self.core.stats.deleg_exec_in_cut,
+                ];
+                let ord = Ordering::Relaxed;
+                for (i, (now_n, seen)) in now_counters
+                    .iter()
+                    .zip(self.cut_counters_seen.iter_mut())
+                    .enumerate()
+                {
+                    if *now_n > *seen {
+                        let counter = match i {
+                            0 => &self.oracles.answered_at_cut,
+                            1 => &self.oracles.rowless_held,
+                            _ => &self.oracles.exec_in_cut,
+                        };
+                        counter.fetch_add(*now_n - *seen, ord);
+                    }
+                    *seen = *now_n;
+                }
                 let sent = self.core.stats.settles_sent;
                 if sent > self.settles_seen {
                     self.oracles.held_releases.lock().unwrap().note_settles(
+                        sent - self.settles_seen,
+                        self.oracles.reach.now_ms(),
+                        self.core.dl_t().settle_window,
+                    );
+                    self.oracles.cut_releases.lock().unwrap().note_settles(
                         sent - self.settles_seen,
                         self.oracles.reach.now_ms(),
                         self.core.dl_t().settle_window,

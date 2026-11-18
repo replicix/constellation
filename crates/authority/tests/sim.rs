@@ -338,6 +338,8 @@ fn replay_seed() {
         Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
         Ok("sticky-s4-idle") => sticky_s4_idle_config(),
         Ok("sticky-s4-leave") => sticky_s4_leave_config(),
+        Ok("sticky-s4-suspend") => sticky_s4_suspend_config(),
+        Ok("sticky-s4-merge") => sticky_s4_merge_config(),
         Ok("sticky-holder-restarts-placed") => sticky_holder_restarts_placed_config(),
         Ok("sticky-holder-fresh") => sticky_holder_fresh_config(),
         Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
@@ -2602,6 +2604,72 @@ fn sticky_s4_leave_config() -> SimConfig {
             });
             faults
         },
+        ..sticky_holder_restarts_config()
+    }
+}
+
+/// Plan 46 M1.3 step 15b (ADR-63): `sticky-s4-idle` plus a forced suspend of
+/// the holder after its release has cut (or, with the control
+/// `AUTHORITY_SIM_NO_RELEASE_CUT=1`, after the release was held on read
+/// recalls): the suspend outlasts the sim's settle cap (14.9 s). The held
+/// release cannot end while the holder is suspended and the settles on `d2`
+/// through the root park or bounce past their cap: the S4 tag fires. With the
+/// cut, the root answers them at the cut row.
+fn sticky_s4_suspend_config() -> SimConfig {
+    let mut config = sticky_s4_idle_config();
+    config.faults.push(ScheduledFault {
+        at_ms: 0,
+        kind: FaultKind::SuspendWhenReleaseHeld {
+            node: 2,
+            // (More than twice the peers' round trip: the cut row has left.)
+            after_ms: 400,
+            ms: 15_000,
+        },
+    });
+    config
+}
+
+/// Plan 46 M1.3 step 15b (ADR-63): node 2 holds sticky `d2` to `d5` (one
+/// stream), node 3 reads all four, and the 2-3 partition runs for 25 s from
+/// 2 s. The operator releases `d2` at 2.3 s, `d3` at 6.3 s, `d4` at 10.3 s and
+/// `d5` at 14.3 s; each waits for node 3's grants and merges into the held
+/// note. Nodes 1 and 3 write in `d2` throughout. Today the release row of
+/// `d2` and every later row of the stream stay held until the last release
+/// clears; with the cut, `d2`'s cut row is appended at 2.3 s and its settles
+/// are answered.
+fn sticky_s4_merge_config() -> SimConfig {
+    let mut faults: Vec<ScheduledFault> = vec![ScheduledFault {
+        at_ms: 2_000,
+        kind: FaultKind::Partition {
+            a: 2,
+            b: 3,
+            for_ms: 25_000,
+        },
+    }];
+    for (at_ms, dir) in [(2_300, "d2"), (7_300, "d3"), (12_300, "d4"), (17_300, "d5")] {
+        faults.push(ScheduledFault {
+            at_ms,
+            kind: FaultKind::StickyRelease {
+                node: 2,
+                dirs: vec![dir.to_string()],
+                wait: false,
+            },
+        });
+    }
+    SimConfig {
+        dirs: ["d1", "d2", "d3", "d4", "d5"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        sticky_delegations: ["d2", "d3", "d4", "d5"]
+            .into_iter()
+            .map(|d| (d.to_string(), 2))
+            .collect(),
+        reader_nodes: Vec::new(),
+        client_plan: Vec::new(),
+        clients_per_node: 6,
+        ops_per_client: 120,
+        faults,
         ..sticky_holder_restarts_config()
     }
 }
@@ -8087,6 +8155,8 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-holder-restarts" => sticky_holder_restarts_config(),
         "sticky-s4-idle" => sticky_s4_idle_config(),
         "sticky-s4-leave" => sticky_s4_leave_config(),
+        "sticky-s4-suspend" => sticky_s4_suspend_config(),
+        "sticky-s4-merge" => sticky_s4_merge_config(),
         "sticky-holder-restarts-placed" => sticky_holder_restarts_placed_config(),
         "sticky-holder-fresh" => sticky_holder_fresh_config(),
         "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
@@ -10714,6 +10784,14 @@ struct OracleTotals {
     s4_excused: (u64, u64),
     s4_spans: (u64, u64),
     s4_settles: (u64, u64),
+    /// ADR-63: the cut spans seen (and the seeds with one), the settles sent
+    /// while a cut waited, the settles the roots answered at a cut, the
+    /// rowless held releases (RC-1) and the executions refused under a cut.
+    s4_cut_spans: (u64, u64),
+    s4_cut_settles: u64,
+    s4_answered_at_cut: u64,
+    s4_rowless_held: u64,
+    s4_exec_in_cut: u64,
     s4_span_max_ms: u64,
     violation_causes: std::collections::BTreeMap<String, u64>,
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
@@ -10966,6 +11044,12 @@ impl OracleTotals {
         self.s4_settles.1 += r.settles_sent_in_hold;
         self.s4_spans.0 += r.held_release_spans as u64;
         self.s4_spans.1 += u64::from(r.held_release_spans > 0);
+        self.s4_cut_spans.0 += r.cut_release_spans as u64;
+        self.s4_cut_spans.1 += u64::from(r.cut_release_spans > 0);
+        self.s4_cut_settles += r.settles_sent_in_cut;
+        self.s4_answered_at_cut += r.settles_answered_at_cut;
+        self.s4_rowless_held += r.rowless_held_releases;
+        self.s4_exec_in_cut += r.exec_in_cut;
         for (k, n) in &r.unsettled_violation_causes {
             *self.violation_causes.entry(k.clone()).or_default() += *n as u64;
         }
@@ -11172,7 +11256,7 @@ impl OracleTotals {
     /// apart, over the excused ones (a sticky stream's are `designation_held`).
     fn s4_line(&self, label: &str, seeds: u64) -> String {
         format!(
-            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms",
+            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms; cut spans {} in {} seeds; settles sent while a cut waited {}; settles answered at a cut {}; rowless held releases {}; executions refused under a cut {}",
             self.seeds,
             self.s4.0,
             self.s4.1,
@@ -11184,7 +11268,13 @@ impl OracleTotals {
             self.s4_spans.1,
             self.s4_settles.0,
             self.s4_settles.1,
-            self.s4_span_max_ms
+            self.s4_span_max_ms,
+            self.s4_cut_spans.0,
+            self.s4_cut_spans.1,
+            self.s4_cut_settles,
+            self.s4_answered_at_cut,
+            self.s4_rowless_held,
+            self.s4_exec_in_cut
         )
     }
 
@@ -23710,21 +23800,126 @@ fn a_restarted_sticky_holder_serves_no_stale_read() {
     assert!(quarantined > 0, "no restarted holder was quarantined");
 }
 
-/// Plan 46 M1.3 step 15a, S4 (review MUST-2): the hazard configurations
-/// reach the window, so a zero in `SWEEP-S4` is a measurement and not an
-/// absence. Core -> Report -> `OracleTotals` -> the sweep line, end to end:
-/// held-release spans exist, and settles are sent whose window overlaps one.
+/// Plan 46 M1.3 step 15b (ADR-63): the S4 hazard configurations reach the
+/// cut, so a zero in `SWEEP-S4` is a measurement and not an absence. Core ->
+/// Report -> `OracleTotals` -> the sweep line, end to end: cut spans exist
+/// (the holder's cut waited for read recalls), settles are sent while one
+/// waits, and the root answers settles at a cut (`settles_answered_at_cut`).
+/// The cut replaces the held release the first instrument measured; the
+/// control arm below keeps that one.
 #[test]
-fn the_s4_hazard_configurations_reach_a_held_release_and_the_sweep_line_says_so() {
+fn the_s4_hazard_configurations_reach_a_cut_and_the_sweep_line_says_so() {
+    for (label, config) in [
+        ("sticky-s4-idle", sticky_s4_idle_config as fn() -> SimConfig),
+        ("sticky-s4-leave", sticky_s4_leave_config),
+        ("sticky-s4-suspend", sticky_s4_suspend_config),
+        ("sticky-s4-merge", sticky_s4_merge_config),
+    ] {
+        let mut totals = OracleTotals::default();
+        // A seed that fails some other check says nothing about the window
+        // and is skipped, not a panic.
+        for seed in 0..400u64 {
+            let Ok(r) = run_seed(seed, config()) else {
+                continue;
+            };
+            totals.add(label, seed, &r);
+            if totals.s4_cut_spans.0 > 0
+                && totals.s4_cut_settles > 0
+                && totals.s4_answered_at_cut > 0
+            {
+                break;
+            }
+        }
+        assert!(
+            totals.s4_cut_spans.0 > 0,
+            "{label}: no cut waited on read recalls"
+        );
+        assert!(
+            totals.s4_cut_settles > 0,
+            "{label}: no settle was sent while a cut waited"
+        );
+        assert!(
+            totals.s4_answered_at_cut > 0,
+            "{label}: no settle was answered at a cut"
+        );
+        assert_eq!(totals.s4.0, 0, "{label}: a tagged unsettled EIO passed");
+        assert_eq!(totals.s4_exec_in_cut, 0, "{label}: an execution in a cut");
+        let line = totals.s4_line(label, 400);
+        assert!(
+            line.contains(&format!("cut spans {} in", totals.s4_cut_spans.0))
+                && line.contains(&format!(
+                    "settles answered at a cut {}",
+                    totals.s4_answered_at_cut
+                )),
+            "{line}"
+        );
+    }
+}
+
+/// ADR-63 pin: `seed` of `config` fails with the strict S4 tag with the
+/// control (`no_release_cut`: the held release), and passes on the fix with
+/// settles answered at a cut and nothing tagged.
+fn s4_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
+    let control = run_seed(
+        seed,
+        SimConfig {
+            no_release_cut: true,
+            ..config()
+        },
+    );
+    let e = control.expect_err(&format!(
+        "{label} seed {seed}: the control arm did not fail: the S4 control is vacuous"
+    ));
+    assert!(
+        e.contains("s4_release_read_recall") && e.contains(sim::oracle::S4_MARK),
+        "{label} seed {seed}: the control arm failed, but not on the S4 tag: {e}"
+    );
+    let fix = run_seed(
+        seed,
+        SimConfig {
+            no_release_cut: false,
+            ..config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{label} seed {seed}: the fix arm failed: {e}"));
+    assert!(
+        fix.settles_answered_at_cut > 0,
+        "{label} seed {seed}: no settle was answered at a cut"
+    );
+    assert_eq!((fix.unsettled_s4, fix.s4_strict.len()), (0, 0));
+    assert_eq!(fix.exec_in_cut, 0);
+}
+
+/// ADR-63: a holder suspended after its release cut leaves the settles on its
+/// subtree to the root, which answers them at the cut row. Fails with the
+/// control (the held release outlasts the settle cap, tagged EIO).
+#[test]
+fn s4_suspend_settle_answered_at_the_cut() {
+    s4_pin("sticky-s4-suspend", sticky_s4_suspend_config, 3);
+}
+
+/// ADR-63: the first release of a merged series (`d2`) is answered at its own
+/// cut row, not when the last release (`d5`) clears the held note. Fails with
+/// the control (a `d2` settle outlives its cap).
+#[test]
+fn s4_merge_first_release_settle_answered_at_the_cut() {
+    s4_pin("sticky-s4-merge", sticky_s4_merge_config, 8);
+}
+
+/// Plan 46 M1.3 step 15a, S4 (review MUST-2), now the control arm
+/// (`AUTHORITY_SIM_NO_RELEASE_CUT=1`): the hazard configurations reach the
+/// held release, so the instrument that measures it is not vacuous. Core ->
+/// Report -> `OracleTotals` -> the sweep line, end to end: held-release spans
+/// exist, and settles are sent whose window overlaps one.
+#[test]
+fn the_s4_control_arm_reaches_a_held_release_and_the_sweep_line_says_so() {
     for (label, config) in [
         ("sticky-s4-idle", sticky_s4_idle_config as fn() -> SimConfig),
         ("sticky-s4-leave", sticky_s4_leave_config),
     ] {
         let config = move || SimConfig {
-            // The instrument measures the held release; with the cut (ADR-63,
-            // the default) a row release holds nothing back. The control arm
-            // is what it measures until the strict tag and the cut spans
-            // replace it.
+            // The instrument measures the held release; with the cut (the
+            // default) a row release holds nothing back.
             no_release_cut: true,
             ..config()
         };

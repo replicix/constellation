@@ -226,6 +226,27 @@ pub enum FaultKind {
         within_ms: u64,
         restart_ms: Option<u64>,
     },
+    /// Plan 46 M1.3 step 15b (ADR-63, S4): once a release of `node` is held
+    /// on read recalls or cut and waiting for them (`NodeShared::release_open`),
+    /// `after_ms` later (the cut row has left: at least twice the peers'
+    /// round trip), suspend the node for `ms` (above the sim's settle cap).
+    /// Today the held release cannot end while the holder is suspended, and the
+    /// settles on its subtrees outlast their cap; with the cut the root
+    /// answers them at the cut row.
+    SuspendWhenReleaseHeld {
+        node: NodeId,
+        after_ms: u64,
+        ms: u64,
+    },
+    /// Plan 46 M1.3 step 15b: the operator's `sticky.release` of `dirs`
+    /// (names under the root; empty: all) on `node` at the fault's time:
+    /// `Control::StickyRelease`. With `wait` it is answered once the release
+    /// row is journaled.
+    StickyRelease {
+        node: NodeId,
+        dirs: Vec<String>,
+        wait: bool,
+    },
     /// Plan 30 §M10: an S3 outage for the current holder and `members −
     /// 1` other nodes (the lowest ids), which are also cut from every
     /// other node over P2P; the others keep S3. The sim's epoch
@@ -1864,6 +1885,21 @@ pub struct Report {
     pub settles_sent_in_hold: u64,
     /// The longest closed held-release span (ms).
     pub held_span_max_ms: u64,
+    /// Plan 46 M1.3 step 15b (ADR-63): the unsettled `EIO`s, excused ones
+    /// included, whose owning stream's release waited on read recalls during
+    /// their window: the strict class `s4_release_read_recall` (a violation
+    /// in every configuration), described.
+    pub s4_strict: Vec<String>,
+    /// The cut spans the run saw (`Oracles::cut_releases`), the settles the
+    /// roots answered at a cut, the releases that held their note without a
+    /// row (RC-1) and the executions a store fence refused under a cut
+    /// (must be 0).
+    pub cut_release_spans: usize,
+    /// The settles sent while a cut waited for its read recalls.
+    pub settles_sent_in_cut: u64,
+    pub settles_answered_at_cut: u64,
+    pub rowless_held_releases: u64,
+    pub exec_in_cut: u64,
     /// The I4 violations by `Unsettled::cause`.
     pub unsettled_violation_causes: BTreeMap<String, usize>,
     pub unsettled_examples: Vec<String>,
@@ -3864,6 +3900,7 @@ fn injects_clock_faults(cfg: &SimConfig) -> bool {
                 FaultKind::ClockStep { .. }
                     | FaultKind::RateSkew { .. }
                     | FaultKind::Suspend { .. }
+                    | FaultKind::SuspendWhenReleaseHeld { .. }
                     | FaultKind::RebootNode { .. }
                     | FaultKind::CrashHolderStepped { .. }
                     | FaultKind::CrashHolderWhileLockedStepped { .. }
@@ -5064,6 +5101,78 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             .await;
             let _ = stepper.await;
         }
+        FaultKind::SuspendWhenReleaseHeld { node, after_ms, ms } => {
+            // (Up to 20 s of the run's clock for a release to wait.)
+            let mut waited = 0u64;
+            let found = loop {
+                let n = cluster.get(node);
+                if n.alive()
+                    && n.shared
+                        .release_open
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break true;
+                }
+                if waited >= 20_000 {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                waited += 5;
+            };
+            if !found {
+                note(format!(
+                    "t={} suspend-when-release-held: no release of node {node} waited",
+                    fault.at_ms
+                ));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(after_ms)).await;
+            note(format!(
+                "t={} a release of node {node} waits for read recalls: suspend it",
+                cluster.env.clock.elapsed_ms()
+            ));
+            Box::pin(run_fault(
+                cluster,
+                ScheduledFault {
+                    at_ms: 0,
+                    kind: FaultKind::Suspend {
+                        who: StepOf::Node(node),
+                        ms,
+                    },
+                },
+                log.clone(),
+            ))
+            .await;
+        }
+        FaultKind::StickyRelease { node, dirs, wait } => {
+            let n = cluster.get(node);
+            if !n.alive() {
+                note(format!(
+                    "t={} sticky release: node {node} is down",
+                    fault.at_ms
+                ));
+                return;
+            }
+            let mut inos = Vec::new();
+            for d in &dirs {
+                if let Some(ino) = n.meta.child_ino(ROOT_INO, d).ok().flatten() {
+                    inos.push(ino);
+                }
+            }
+            let r = tokio::time::timeout(
+                Duration::from_secs(30),
+                n.control(constellation_authority::Control::StickyRelease {
+                    dirs: inos,
+                    wait,
+                    why: constellation_authority::StickyReleaseWhy::Command,
+                }),
+            )
+            .await;
+            note(format!(
+                "t={} node {node} sticky release {dirs:?}: {r:?}",
+                cluster.env.clock.elapsed_ms()
+            ));
+        }
         FaultKind::CrashWhenTailUnshipped {
             node,
             within_ms,
@@ -5611,6 +5720,22 @@ fn count_unsettled(
         (report.settles_sent_all, report.settles_sent_in_hold) = held.settle_counts();
     }
     report.unsettled_s4 = all.iter().filter(|u| u.release_read_recall).count();
+    {
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        report.s4_strict = everything
+            .iter()
+            .filter(|u| u.release_read_recall)
+            .map(|u| u.describe())
+            .collect();
+        {
+            let cut = oracles.cut_releases.lock().unwrap();
+            report.cut_release_spans = cut.spans();
+            report.settles_sent_in_cut = cut.settle_counts().1;
+        }
+        report.settles_answered_at_cut = oracles.answered_at_cut.load(ord);
+        report.rowless_held_releases = oracles.rowless_held.load(ord);
+        report.exec_in_cut = oracles.exec_in_cut.load(ord);
+    }
     // MUST-1: the tag over the excused ones too (non-stealable holder,
     // isolated from S3, held behind a lost chunk): a sticky stream's
     // release is the case S4 is about, and its EIOs are `designation_held`.
@@ -7204,6 +7329,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         // judged under `strict_unsettled`) like any other run's.
         let unsettled_violations =
             count_unsettled(&oracles, &mut report, &cluster.env.world, &bucket.archive);
+        if let Some(first) = report.s4_strict.first() {
+            return Err(format!(
+                "{first}\n  ({} s4_release_read_recall violation(s); the run ended with a claim \
+                 waiting for a group's tail)\n  faults: {:?}",
+                report.s4_strict.len(),
+                report.faults
+            ));
+        }
         if cfg.strict_unsettled {
             if let Some(first) = unsettled_violations.first() {
                 return Err(format!(
@@ -8455,6 +8588,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         (true, "nonholder_refused_a_designee_ran", &found.fence),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
+        // ADR-63 (RC-3): an unsettled EIO that rests on a stream whose release
+        // waited on read recalls is a violation in every configuration: row
+        // releases hold nothing back with the cut, and the rowless ones
+        // (RC-1) are what the tripwire is for.
+        (
+            true,
+            "s4_release_read_recall (an unsettled EIO while the owning stream's release waited on read recalls)",
+            &report.s4_strict,
+        ),
         (
             cfg.strict_unsettled,
             "I4 (unsettled EIO of a requester that was not isolated)",
@@ -8529,6 +8671,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 + h.meta.unjustified_ships()
         })
         .sum();
+    // ADR-63: the store fence refused no execution under a cut subtree.
+    if report.exec_in_cut > 0 {
+        return Err(format!(
+            "I2 deleg_exec_in_cut: {} execution(s) under subtrees a holder's cut stopped reached \
+             the store fence (a path that resolves ownership read the raw table)\n  {counters}\n  \
+             faults: {:?}",
+            report.exec_in_cut, report.faults
+        ));
+    }
     if report.unjustified_ships > 0 {
         return Err(format!(
             "I2c unjustified_ships: {} journal row(s) of a generation the log never granted              reached the shipper\n  {counters}\n  faults: {:?}",

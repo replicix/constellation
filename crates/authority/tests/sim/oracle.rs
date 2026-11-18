@@ -268,6 +268,17 @@ pub struct Oracles {
     /// waited on read-delegation recalls, per `(node, gen)`. Diagnostic only
     /// (`Unsettled::release_read_recall`).
     pub held_releases: Mutex<HeldReleases>,
+    /// Plan 46 M1.3 step 15b (ADR-63): the spans in which a holder's cut
+    /// waited for the read delegations under its subtrees
+    /// (`Core::deleg_releases_cut`), the settles the roots answered at a cut
+    /// (`Stats::settles_answered_at_cut`), the releases that held their note
+    /// without a row (RC-1, `deleg_release_rowless_held`) and the executions
+    /// a store fence refused under a cut (`deleg_exec_in_cut`, must be 0),
+    /// over every incarnation.
+    pub cut_releases: Mutex<HeldReleases>,
+    pub answered_at_cut: std::sync::atomic::AtomicU64,
+    pub rowless_held: std::sync::atomic::AtomicU64,
+    pub exec_in_cut: std::sync::atomic::AtomicU64,
     /// ADR-56: the root's handover requests and grants, stamped with the
     /// run's clock (`Core::take_hand_events`): `handover_tenure` and
     /// `one_off_no_handover` judge them.
@@ -673,6 +684,10 @@ impl Oracles {
             causal_cut: Mutex::new(Vec::new()),
             sticky_released: Mutex::new(BTreeMap::new()),
             held_releases: Mutex::new(HeldReleases::default()),
+            cut_releases: Mutex::new(HeldReleases::default()),
+            answered_at_cut: Default::default(),
+            rowless_held: Default::default(),
+            exec_in_cut: Default::default(),
             hand_events: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
             rolled_back_nodes: Mutex::new(BTreeMap::new()),
