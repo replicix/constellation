@@ -504,7 +504,23 @@ impl Core {
             if self.cfg.delegation && self.deleg_known() {
                 let keys = keys_of_op_in(&op, replica);
                 let mut answered_from_outcome = false;
-                if let Ownership::Delegated(d) = replica.resolve_ownership(&keys) {
+                // ADR-63 (R1): a settle whose keys lie under subtrees a
+                // delegate's cut row stopped (and the root's own) is
+                // answered from what this node holds, at once: the delegate
+                // appends nothing more there, so the dedup or the refusal is
+                // final whatever the read recalls that hold its release row
+                // back. No redirect (the stopped holder sends it back), no
+                // recall, no wait on the generation.
+                let cut_settle = settle && replica.settle_at_cut(&keys);
+                if cut_settle {
+                    self.stats.settles_answered_at_cut += 1;
+                }
+                let ownership = if cut_settle {
+                    Ownership::Root
+                } else {
+                    replica.resolve_ownership(&keys)
+                };
+                if let Ownership::Delegated(d) = ownership {
                     // Plan 46 M0.3 (S3): not a generation this root is
                     // recalling (its delegate is stopped and would send the
                     // op straight back: the recall is what ends it, and the
@@ -651,9 +667,9 @@ impl Core {
                 // answered `EXDEV` at once while the drain's journaled copy of
                 // the same refusal was unshipped).
                 let has_outcome = self.rid_has_outcome(rid, replica);
-                let plan = if answered_from_outcome {
+                let plan = if answered_from_outcome || cut_settle {
                     // (Nothing runs: no recall for the delegation the
-                    // requester's table lacked.)
+                    // requester's table lacked, nor for a settle at a cut.)
                     super::delegate::RecallPlan::None
                 } else {
                     self.deleg_recall_plan(now, false, &keys, replica, out)
@@ -1813,7 +1829,19 @@ impl Core {
             return None;
         }
         let me = self.cfg.node_id;
-        let ours = match replica.resolve_ownership(&keys_of_op_in(op, replica)) {
+        let keys = keys_of_op_in(op, replica);
+        // ADR-63 (R3, amends ADR-42/44): a settle on keys a delegate's cut
+        // row stopped (the predecessor's tail, applied, carries the row) is
+        // answered here like a root key's, not redirected to the stopped
+        // holder: under `g.epoch` once the gate's journal work is done.
+        if replica.settle_at_cut(&keys) {
+            return Some(if g.shippable {
+                GateSettle::Answer(g.epoch)
+            } else {
+                GateSettle::Held
+            });
+        }
+        let ours = match replica.resolve_ownership(&keys) {
             Ownership::Root => true,
             Ownership::Delegated(d) => {
                 if d.node != me {

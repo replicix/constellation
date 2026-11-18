@@ -23,6 +23,7 @@ use crate::segment;
 use constellation_fs_core::Ino;
 use constellation_meta::{JournalPos, LogRecord};
 use replicix_objcas::{AckPolicy, Lease, LeaseTag};
+use std::collections::BTreeSet;
 
 /// EC2 campaign 8 A-1: the reason of an acquisition started because a
 /// peer forwarded an op while the lease still names this node (see
@@ -1029,6 +1030,19 @@ impl Core {
             // and the table may have changed.
             if !self.dl.mine.is_empty() {
                 self.note_shipped_touches(seq, payload);
+            }
+            // ADR-63 (R4): a successor root learns a delegate's cut from the
+            // log; the settles it parked on that generation are answered.
+            let cut_gens: BTreeSet<u64> = seg
+                .records
+                .iter()
+                .filter_map(|r| match r {
+                    LogRecord::ReleaseCut { gen, .. } => Some(*gen),
+                    _ => None,
+                })
+                .collect();
+            if !cut_gens.is_empty() {
+                self.root_cut_seen(now, &cut_gens, replica, out);
             }
             if seg.records.iter().any(|r| {
                 matches!(

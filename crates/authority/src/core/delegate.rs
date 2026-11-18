@@ -13917,6 +13917,7 @@ impl Core {
         // them (each grant once, whichever batch brought it).
         let mut released_rows: Vec<Ino> = Vec::new();
         let mut released_all = false;
+        let mut cut_seen = false;
         if let Some(note) = &released {
             let dirs: Vec<Ino> = note.dirs.clone();
             self.lock_install_returned(now, gen, note.locks.clone(), &dirs, replica);
@@ -13996,6 +13997,7 @@ impl Core {
                         match r {
                             LogRecord::SubtreeReleased { dir, .. } => released_rows.push(*dir),
                             LogRecord::StreamReleased { .. } => released_all = true,
+                            LogRecord::ReleaseCut { .. } => cut_seen = true,
                             _ => {}
                         }
                     }
@@ -14027,6 +14029,11 @@ impl Core {
         let cut = released.as_ref().and_then(|n| n.end_at);
         let seal = released.as_ref().is_some_and(|n| n.seal);
         let no_stream = released.as_ref().is_some_and(|n| n.seal && n.no_stream);
+        if cut_seen {
+            // (Before the release rows: a batch that carries both has its
+            // parks answered by the release row's wake as before.)
+            self.root_cut_seen(now, &BTreeSet::from([gen]), replica, out);
+        }
         if !released_rows.is_empty() || released_all || cut.is_some() {
             self.root_release_appended(
                 now,

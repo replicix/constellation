@@ -2190,6 +2190,14 @@ pub struct Stats {
     /// has not heard its delegate on (`on_forward`): they park behind the
     /// recall.
     pub settles_not_redirected_unheard: u64,
+    /// ADR-63: settles the root answered from what it holds (the dedup, else
+    /// a refusal) because their keys lie under subtrees a delegate's
+    /// `ReleaseCut` row stopped: no redirect, no recall, no wait for the
+    /// release row.
+    pub settles_answered_at_cut: u64,
+    /// ADR-63 (R5): this node's own settles whose keys were at a cut, which
+    /// it did not send to the stopped holder.
+    pub settles_routed_around_cut: u64,
     /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it
     /// owns (a refusal journaled, or a dedup'd outcome), settles it left
     /// `Held` because its journal work was not done yet, and settles of a

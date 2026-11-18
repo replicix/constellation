@@ -40163,6 +40163,189 @@ mod s3_no_loops {
         assert!(!h.core.has_exec_parks(), "parked");
     }
 
+    /// The row of delegate 3's stream `gen` that cuts `dir` after row `at`.
+    fn cut_row(
+        gen: u64,
+        dir: constellation_fs_core::Ino,
+        at: u64,
+    ) -> constellation_meta::DelegateTx {
+        constellation_meta::DelegateTx {
+            idx: at + 1,
+            rid: None,
+            records: vec![LogRecord::ReleaseCut {
+                node: 3,
+                gen,
+                dirs: vec![dir],
+                at,
+            }],
+            deps: constellation_meta::Position::ZERO,
+        }
+    }
+
+    /// Node 2's settle `req` of its rid `seq`'s `op`.
+    fn settle_of(req: u64, seq: u64, op: MutateOp) -> Event {
+        Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq,
+                },
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: true,
+                routed_gen: 7,
+                touched_gen: 0,
+                inbox_ever: false,
+            },
+        }
+    }
+
+    /// The definitive answer to node 2's request `req` in `out`.
+    fn settled_to_2(out: &[Action], req: u64) -> Option<MutateOutcome> {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::MutateReply {
+                req: r, outcome, ..
+            } if to == 2 && *r == OpId(req) && crate::core::backup::is_answer(outcome) => {
+                Some(outcome.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// ADR-63 (R4), spec test 2: a settle the root parked for the recall of
+    /// a generation is answered when the generation's cut row is appended,
+    /// whatever the read recalls that hold its release row back: the
+    /// refusal is journaled and answered once it commits, the stream does
+    /// not end, the subtree stays delegated and an execution in it stays
+    /// out. Fails on the parent: the settle stays parked.
+    #[test]
+    fn a_root_answers_a_parked_settle_at_the_cut() {
+        let (mut h, dir, gen) = delegated_root();
+        h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+        h.core.start_recall(h.clk(), gen, &mut Vec::new());
+        let out = forward(&mut h, 2, 7, dir, true);
+        assert_eq!(reply_to(&out, 2, 7), None, "answered: {out:?}");
+        assert!(h.core.has_exec_parks(), "not parked");
+        let mut out = deliver_stream(&mut h, 3, gen, vec![cut_row(gen, dir, 0)], None);
+        out.extend(h.archive_lands());
+        assert_eq!(
+            settled_to_2(&out, 7),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 7,
+        };
+        assert!(
+            matches!(
+                h.meta.completed_outcome(rid),
+                Ok(Some(constellation_meta::CompletedOutcome::Refused { code }))
+                    if code == crate::ABANDONED_CODE
+            ),
+            "no refusal journaled"
+        );
+        assert!(!h.core.has_exec_parks(), "still parked");
+        assert!(!h.core.dl.gens[&gen].ended, "the stream ended");
+        assert_eq!(h.meta.delegation_table().get(dir).map(|d| d.gen), Some(gen));
+        assert_eq!(h.core.stats.settles_answered_at_cut, 1);
+        // An execution in the subtree still waits for the release row.
+        let out = forward(&mut h, 2, 8, dir, false);
+        assert!(
+            settled_to_2(&out, 8).is_none(),
+            "an execution was answered at the cut: {out:?}"
+        );
+        assert!(h.meta.lookup(dir, "n8").unwrap().is_none(), "it ran");
+    }
+
+    /// ADR-63 (R1), spec test 3: the delegate executed X in `D` (its row is
+    /// appended at the root, unshipped to the log), then cut. A settle of X
+    /// is answered from the outcome, never refused; a settle of a rid the
+    /// delegate never ran is refused. Fails on the parent: the settle is
+    /// redirected to the stopped holder (`NotHolder { 3 }`).
+    #[test]
+    fn a_settle_at_the_cut_answers_from_an_appended_row() {
+        let (mut h, dir, gen) = delegated_root();
+        h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 7,
+        };
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "x".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let executed = constellation_meta::DelegateTx {
+            idx: 1,
+            rid: Some(rid),
+            records: vec![
+                LogRecord::Create {
+                    parent: dir,
+                    name: "x".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Completed { rid },
+            ],
+            deps: constellation_meta::Position::ZERO,
+        };
+        deliver_stream(&mut h, 3, gen, vec![executed, cut_row(gen, dir, 1)], None);
+        assert!(
+            h.meta.lookup(dir, "x").unwrap().is_some(),
+            "row not appended"
+        );
+        let mut out = h.step(settle_of(7, 7, op));
+        out.extend(h.archive_lands());
+        assert!(
+            matches!(settled_to_2(&out, 7), Some(MutateOutcome::Accepted { .. })),
+            "{out:?}"
+        );
+        assert!(
+            matches!(
+                h.meta.completed_outcome(rid),
+                Ok(Some(constellation_meta::CompletedOutcome::Executed { .. }))
+            ),
+            "the outcome was replaced"
+        );
+        assert_eq!(h.core.stats.settles_answered_at_cut, 1);
+        assert_eq!(h.core.stats.settles_refused, 0);
+        // A rid the delegate never ran: refused for good.
+        let ino2 = h.meta.allocate_ino(dir).unwrap();
+        let other = MutateOp::Create {
+            parent: dir,
+            name: "y".into(),
+            ino: ino2,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let mut out = h.step(settle_of(8, 8, other));
+        out.extend(h.archive_lands());
+        assert_eq!(
+            settled_to_2(&out, 8),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(dir, "y").unwrap().is_none());
+        assert_eq!(h.core.stats.settles_refused, 1);
+    }
+
     /// A designation under recall (`online` released it) is never skipped:
     /// `deleg_recall_plan` would refuse every op on it (`EROFS`), the
     /// designee's own included. The designee's op is held, a third node's op
@@ -65202,6 +65385,66 @@ mod c2g_settle {
         );
         assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
         assert!(h.core.lease.gate.is_some(), "the gate is still pending");
+    }
+
+    /// ADR-63 (R3, amends ADR-42/44), spec test 12: a settle on keys a
+    /// delegate's cut row stopped is answered by the shippable gate that
+    /// inherited the row, `Refused { ABANDONED }` under the gate's epoch,
+    /// not redirected to the stopped holder; a gate whose journal work is not
+    /// done holds it. Fails on the parent: `NotHolder { 4 }` (shippable),
+    /// `Busy` (not).
+    #[test]
+    fn a_gate_answers_a_settle_at_a_cut_it_inherited() {
+        let cut = |h: &Harness, dir| {
+            Replica::apply_delegate_tx(
+                &h.meta,
+                &[LogRecord::ReleaseCut {
+                    node: 4,
+                    gen: 7,
+                    dirs: vec![dir],
+                    at: 0,
+                }],
+                None,
+                7,
+                1,
+                Default::default(),
+            )
+            .unwrap();
+        };
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        cut(&h, dir);
+        let op = create_in(&h, dir, "o");
+        let out = h.step_archived(request(7, 1, op, true));
+        assert_eq!(
+            answer(&out, 7).map(|a| a.0),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(abandoned_row(&h, rid3(1)), "no refusal journaled");
+        assert!(h.meta.lookup(dir, "o").unwrap().is_none());
+        assert_eq!(h.core.stats.gate_settles_answered, 1);
+        assert_eq!(h.core.stats.gate_settles_redirected, 0);
+        // Not shippable: held, nothing journaled.
+        let (mut h, dir) = gated_root_with_gen_at_4(false);
+        cut(&h, dir);
+        let out = h.step_archived(request(7, 1, create_in(&h, dir, "o"), true));
+        assert!(
+            matches!(reply_to_3(&out, 7), Some(MutateOutcome::Held { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.meta.completed_outcome(rid3(1)).unwrap(), None);
+        assert_eq!(h.core.stats.gate_settles_held, 1);
+        // A live delegation with no cut is redirected as before
+        // (`s5_a_shippable_gate_serves_another_nodes_generation`).
+        let (mut h, dir) = gated_root_with_gen_at_4(true);
+        h.step(batch_from_4(&h, dir, 10, 1));
+        h.step(renew_4(11, false));
+        let out = h.step_archived(request(12, 1, create_in(&h, dir, "o"), true));
+        assert_eq!(
+            reply_to_3(&out, 12),
+            Some(MutateOutcome::NotHolder { holder: 4 }),
+            "{out:?}"
+        );
     }
 
     /// S5: what the gate counts of what it takes on.

@@ -1777,6 +1777,43 @@ impl Core {
         }
     }
 
+    /// ADR-63 (R4): the delegate's `ReleaseCut` row of `gen` is in this
+    /// node's log. A settle parked on the generation's recall
+    /// (`ExecuteReply { settle: true }`, `ExecuteLocal` of an own settle)
+    /// whose keys are now at the cut no longer waits for it: it is woken and
+    /// answered from what this node holds (dedup, else `ABANDONED`).
+    pub(crate) fn root_cut_seen(
+        &mut self,
+        now: Now,
+        gens: &BTreeSet<u64>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let ids: BTreeSet<u64> = gens.iter().map(|g| super::delegate::wait_id(*g)).collect();
+        let mut woken = 0u64;
+        for p in self.rd.parked.values_mut() {
+            if !p.waiting.iter().any(|w| ids.contains(w)) {
+                continue;
+            }
+            let at_cut = match &p.what {
+                ParkedWhat::ExecuteReply {
+                    settle: true, op, ..
+                } => replica.settle_at_cut(&super::holder::keys_of_op_in(op, replica)),
+                ParkedWhat::ExecuteLocal { rid } => self.clients.get(rid).is_some_and(|c| {
+                    c.settle && replica.settle_at_cut(&super::holder::keys_of_op_in(&c.op, replica))
+                }),
+                _ => false,
+            };
+            if at_cut {
+                p.waiting.retain(|w| !ids.contains(w));
+                woken += 1;
+            }
+        }
+        if woken > 0 {
+            self.complete_ready(now, replica, out);
+        }
+    }
+
     /// Phase 2b: whether any parked continuation still waits on the
     /// recall of generation `gen`.
     pub(crate) fn rd_has_recall_wait(&self, gen: u64) -> bool {
