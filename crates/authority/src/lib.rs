@@ -50,8 +50,8 @@ pub use core::{
 };
 pub use event::{
     AbandonTarget, AheadGrants, Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome,
-    LockRenewEntry, LockRenewResult, LockTestOutcome, PeerLink, PeerMsg, Policy, ReadAhead,
-    ReadGrantMsg, ReadIndexOutcome, ReleaseWhy, S3Failure, S3Result, StickyReleaseWhy,
+    LockRenewEntry, LockRenewResult, LockTestOutcome, PeerLink, PeerMsg, Policy, ProbedLease,
+    ReadAhead, ReadGrantMsg, ReadIndexOutcome, ReleaseWhy, S3Failure, S3Result, StickyReleaseWhy,
     UploadResult, VoidScope,
 };
 pub use ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};

@@ -336,6 +336,23 @@ pub fn lane_tick_ms(forward_timeout_ms: u64) -> u64 {
     (forward_timeout_ms / 4).clamp(50, 250)
 }
 
+/// The wait before the next look of a release in doubt whose lease re-read
+/// failed too (`Core::release_unresolved`): `tries` looks have been made.
+/// It starts at the hold a `Held` answer asks of a requester
+/// (`recall_hold_ms`, at least 50 ms), doubles with each look and is capped
+/// at the forward timeout, which is also how long a lease probe may go
+/// unanswered before it is asked again. Not a safety bound: the bound of
+/// the whole wait is the held lease's honour end (the old give-up runs
+/// there), so the wait never outlasts one lease TTL. With the sim's
+/// defaults (forward timeout 400 ms, hold 200 ms) the looks are 200, 400,
+/// 400 ... ms apart; with the daemon's 500 ms forward timeout (hold 250 ms),
+/// 250, 500, 500 ... ms.
+pub fn release_reread_retry_ms(cfg: &Config, tries: u32) -> u64 {
+    let first = cfg.recall_hold_ms.max(50);
+    let cap = cfg.forward_timeout_ms.max(first);
+    first.saturating_mul(1u64 << tries.min(20)).min(cap)
+}
+
 /// The derivations every host of the core applies to a configuration once
 /// its knobs are set (the daemon's `load_config`, the simulation's driver at
 /// spawn), so both run the same derived configuration:

@@ -1726,6 +1726,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | MutateRequest { requester, .. }
         | ReadIndex { requester, .. }
         | PromiseRequest { requester, .. }
+        | LeaseProbe { requester, .. }
         | LockRequest { requester, .. }
         | LockTest { requester, .. }
         | ChunkHandoff { requester, .. }
@@ -2338,6 +2339,9 @@ async fn handle_stream<S: PeerService>(
                 req_id,
                 key,
             } => Some(service.promise_requested(requester, req_id, key).await),
+            Payload::LeaseProbe { requester, req_id } => {
+                Some(service.lease_probed(requester, req_id).await)
+            }
             Payload::ReconcileRequest { queries } => {
                 Some(service.reconcile_requested(queries).await)
             }
@@ -2402,6 +2406,7 @@ async fn handle_stream<S: PeerService>(
             | Payload::SealedTail { .. }
             | Payload::BackupAck { .. }
             | Payload::PromiseReply { .. }
+            | Payload::LeaseProbeReply { .. }
             | Payload::LockReply { .. }
             | Payload::LockRecalled { .. }
             | Payload::LockRenewed { .. }
@@ -3530,6 +3535,35 @@ mod tests {
         holder.refresh_registry_scan(own, true);
         assert!(!inner.p2p.is_allowed(&asker_key));
         assert!(asker.request_raw(to, &lease).await.is_err());
+    }
+
+    /// A lease probe names the requester it claims to be: one that names
+    /// another node than the connection's is dropped before the service
+    /// sees it, and the same peer naming itself is answered (the default
+    /// service says its read failed).
+    #[tokio::test]
+    async fn a_lease_probe_naming_another_node_is_dropped() {
+        let (holder, asker, _service) = pair(true).await;
+        let to = holder.node_addr().unwrap();
+        let forged = Payload::LeaseProbe {
+            requester: 3,
+            req_id: 9,
+        };
+        assert!(
+            asker.request_raw(to.clone(), &forged).await.is_err(),
+            "a forged probe must not be answered"
+        );
+        let own = Payload::LeaseProbe {
+            requester: 2,
+            req_id: 10,
+        };
+        assert!(matches!(
+            asker.request_raw(to, &own).await.unwrap(),
+            Payload::LeaseProbeReply {
+                req_id: 10,
+                read: crate::LeaseReadWire::Failed
+            }
+        ));
     }
 
     /// A registry record whose address does not parse still enrolls the

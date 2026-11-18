@@ -945,6 +945,31 @@ pub enum Payload {
         epoch: u64,
         sealed: bool,
     },
+    /// A node whose lease release is in doubt asks the peer to read the
+    /// lease object for it. The peer issues a fresh read after this request
+    /// arrives and answers [`Payload::LeaseProbeReply`].
+    LeaseProbe {
+        requester: u64,
+        req_id: u64,
+    },
+    /// What the peer's fresh read of the lease object returned.
+    LeaseProbeReply {
+        req_id: u64,
+        read: LeaseReadWire,
+    },
+}
+
+/// A peer's read of the lease object on the wire
+/// ([`Payload::LeaseProbeReply`]): the object as its serde JSON bytes (the
+/// net crate does not know the lease type).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaseReadWire {
+    /// The read failed.
+    Failed,
+    /// No lease object.
+    Absent,
+    /// The lease body, JSON.
+    Object(Vec<u8>),
 }
 
 /// A lease's renewal key on the wire (`replicix_objcas::RenewalKey`):

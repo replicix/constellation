@@ -1134,6 +1134,8 @@ pub struct Driver {
     seal_tail_replies: HashMap<(NodeId, OpId), oneshot::Sender<crate::sync::SealTailAnswer>>,
     /// Plan 30 §M10: peers' promise requests this node is answering.
     promise_replies: HashMap<OpId, oneshot::Sender<(bool, u32)>>,
+    /// Peers' lease probes waiting for the core's fresh read.
+    lease_probe_replies: HashMap<OpId, oneshot::Sender<constellation_authority::ProbedLease>>,
     /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
     /// answering, by the core's op id.
     backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool, bool)>>,
@@ -2910,6 +2912,7 @@ impl Driver {
             deleg_seal_replies: HashMap::new(),
             seal_tail_replies: HashMap::new(),
             promise_replies: HashMap::new(),
+            lease_probe_replies: HashMap::new(),
             backup_replies: HashMap::new(),
             controls: HashMap::new(),
             next_control: 1 << 48,
@@ -4401,6 +4404,14 @@ impl Driver {
                 Some(Internal::Event(Event::Peer {
                     from: requester,
                     msg: PeerMsg::PromiseRequest { req, key },
+                }))
+            }
+            SyncRequest::PeerLeaseProbe { requester, reply } => {
+                let req = self.control_id();
+                self.lease_probe_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: requester,
+                    msg: PeerMsg::LeaseProbe { req },
                 }))
             }
             SyncRequest::Slack(epoch_slack) => {
@@ -6370,6 +6381,68 @@ impl Driver {
                 if let Some(tx) = self.promise_replies.remove(&req) {
                     let _ = tx.send((granted, epoch_slack));
                 }
+            }
+            PeerMsg::LeaseProbeReply { req, read } => {
+                if let Some(tx) = self.lease_probe_replies.remove(&req) {
+                    let _ = tx.send(read);
+                }
+            }
+            PeerMsg::LeaseProbe { req } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let requester = self.node_id;
+                // The probed node's own read is bounded by the S3 client's
+                // timeout; the requester stops waiting at the forward timeout
+                // and asks again.
+                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
+                if crate::fault::p2p_denied(to) {
+                    let _ = tx.send(Internal::Event(Event::PeerFailed {
+                        req,
+                        to,
+                        outage: true,
+                    }));
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::LeaseProbe {
+                        requester,
+                        req_id: req.0,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::LeaseProbeReply { req_id, read })) if req_id == req.0 => {
+                            let read = match read {
+                                constellation_net::LeaseReadWire::Failed => {
+                                    constellation_authority::ProbedLease::Failed
+                                }
+                                constellation_net::LeaseReadWire::Absent => {
+                                    constellation_authority::ProbedLease::Absent
+                                }
+                                constellation_net::LeaseReadWire::Object(bytes) => {
+                                    match serde_json::from_slice(&bytes) {
+                                        Ok(lease) => {
+                                            constellation_authority::ProbedLease::Object(lease)
+                                        }
+                                        Err(_) => constellation_authority::ProbedLease::Failed,
+                                    }
+                                }
+                            };
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::LeaseProbeReply { req, read },
+                            }));
+                        }
+                        _ => {
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
             }
             PeerMsg::PromiseRequest { req, key } => {
                 let tx = self.int_tx.clone();

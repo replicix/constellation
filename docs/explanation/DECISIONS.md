@@ -718,6 +718,61 @@ record. The sync's duration is not exempted from the step lapse (the
 core is as blind during it as during any stall), it is moved out of the
 step.
 
+**Amendment (2026-11-18: a release in doubt whose re-read fails stays fenced until a read resolves it)**:
+56085d00 made a release CAS that failed without an answer re-read the
+lease: landed completes the release, ours keeps the lease, another's
+deposes, and, as a matter of liveness only, a re-read that failed too gave
+the lease up at once. That left the object naming a node that held
+nothing, and a continuation epoch that formed in the same cut carried a
+lease no node claimed: it refused writes, and the peers' settles found no
+sequencer (the I4 count of `locks-unlinked-delegated-blips+unsettled`,
+seeds 64, 391, 1477). The give-up was never an integrity rule; the
+integrity rules are the three the release keeps (fenced until the lease's
+state is known, no hold on a lease that may be released, the record before
+the CAS), and this amendment keeps all of them.
+
+The rule: a re-read that fails too does not give the lease up. The node
+stays the named holder, `releasing` (every fence of a release in flight
+holds unchanged: nothing new is admitted, no grant or delegation is
+renewed, no epoch hold is adopted, an activation carrying the lease owes
+the move), and looks for the lease's state until a read resolves it. It
+re-reads its own on a backoff and asks every reachable peer to read the
+lease (`LeaseProbe`/`LeaseProbeReply`), and answers the forwards it is
+asked `Held`, never `Busy` or `NotHolder`, executing nothing. The first
+conclusive read decides, by the re-read's own table: the release landed
+(complete it), the lease stands with the expiry fields the release
+replaced (the release did not happen: `releasing` drops, the held lease
+and tag stay, and a lease an epoch carried is held through
+`epoch_hold_after_kept_release`), another holder, a later epoch or no
+object (deposed). Anything else (an older epoch, other expiry fields, a
+failed read) decides nothing.
+
+The peer's standing: the probed peer issues a *new* lease read after the
+probe arrived, never answers from a body it has or a read in flight. That
+read is causally after the failed CAS, exactly as the node's own re-read
+is, so it resolves the doubt under the assumption 56085d00 already rests
+on (a CAS that failed without an answer does not land after a read that
+saw it had not): no new assumption. A peer cannot send a `LeaseTag`
+(objcas's field is private and the core is shared), so a kept lease keeps
+the tag the node holds; a stale tag only makes the next CAS conflict and
+re-read. The S3 liveness a peer's read proves is dated at the probe's
+send, never at the reply's arrival.
+
+The bound: the wait ends at the first conclusive read, or when the held
+lease's honour runs out (`honour_left <= expiry_margin`), where the old
+give-up runs unchanged (the `given_up` mark, the owed move, `EROFS` if the
+epoch now refuses writes). A shutdown flush gives up at once, as does a
+release that runs under an epoch hold. The record is durable before the
+CAS and nothing is written during the wait, so a crash restarts on the
+conservative side. The retry interval is `deadlines::release_reread_retry_ms`.
+
+The cost: at most one lease TTL more latency (the node's slot, its
+handoff's answer and the `Held` answers last to the honour end instead of
+one failed read) in a whole-bucket outage that begins during a release.
+The seeds: 64, 391 and 1477 of `locks-unlinked-delegated-blips+unsettled`
+(`regression_a_release_in_doubt_is_resolved_by_a_peer_read`); seed 1045 is
+not on this path (its re-read succeeded and found the release landed).
+
 **See**: plan 30 §M10;
 [Durability and failover — flexible continuation epochs](../reference/features/durability-and-failover.md#flexible-continuation-epochs);
 [`crates/authority/src/core/promise.rs`](../../crates/authority/src/core/promise.rs),

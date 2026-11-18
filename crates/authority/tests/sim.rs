@@ -7234,6 +7234,65 @@ fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
     }
 }
 
+/// `locks-unlinked-delegated-blips+unsettled` seeds 64, 391 and 1477: a
+/// release CAS went in doubt, its re-read failed in the same cut, and the node
+/// gave the lease up while the lease object still named it. The continuation
+/// epoch that formed in the cut carried a lease no node claimed, so it refused
+/// writes, and the peers' settles found no sequencer: 2, 1 and 1 unsettled
+/// `EIO` (the I4 count's isolated and no-sequencer classes). The node now stays
+/// the named holder, fenced, and a peer's fresh read of the lease resolves the
+/// doubt (`release_doubt.rs`); no `EIO` is left. Fails on the tree without it
+/// on the `EIO` count of each seed. (Seed 1045 is not on this path: its re-read
+/// succeeded and found the release landed.)
+#[test]
+fn regression_a_release_in_doubt_is_resolved_by_a_peer_read() {
+    let mut reached = 0;
+    let mut kept_by_peer = 0;
+    for seed in [64, 391, 1477] {
+        let cfg = SimConfig {
+            strict_unsettled: true,
+            ..locks_unlinked_blips_config()
+        };
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-blips+unsettled \
+                 AUTHORITY_SIM_SEED={seed}"
+            )
+        });
+        assert_eq!(
+            r.unsettled_isolated
+                + r.unsettled_no_sequencer_in_time
+                + r.unsettled_generation_tail_unreachable
+                + r.unsettled_violations,
+            0,
+            "seed {seed}: an unsettled EIO is left ({:?})",
+            r.unsettled_causes
+        );
+        let sum =
+            |f: fn(&constellation_authority::Stats) -> u64| r.stats.values().map(f).sum::<u64>();
+        eprintln!(
+            "seed {seed}: unresolved {}, kept by peer {}, gave up {}, inconclusive {}, held answers {}, probes answered {}",
+            sum(|s| s.release_unresolved),
+            sum(|s| s.release_unresolved_kept_by_peer),
+            sum(|s| s.release_unresolved_gave_up),
+            sum(|s| s.release_unresolved_inconclusive),
+            sum(|s| s.release_unresolved_held),
+            sum(|s| s.lease_probes_answered),
+        );
+        reached += sum(|s| s.release_unresolved);
+        kept_by_peer += sum(|s| s.release_unresolved_kept_by_peer);
+    }
+    assert!(
+        reached >= 3,
+        "the seeds no longer reach an unresolved release: the pin would pass vacuously"
+    );
+    assert!(
+        kept_by_peer >= 1,
+        "no peer read kept a lease: the path of the fix is not exercised"
+    );
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and

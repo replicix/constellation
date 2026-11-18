@@ -1951,6 +1951,21 @@ sleeps before the sync to widen the gap between the decision to release and
 the CAS. Unset, it is one cached lookup. The core's crash-point test is
 `release_record_crash_at_every_point`.
 
+A release in doubt whose own re-read fails too stays fenced until a read
+resolves it (ADR-22, `core/release_doubt.rs`). Its counters, per node in
+`Stats`: `release_unresolved` (entered), `release_unresolved_kept_by_peer`
+(a probed peer's fresh read showed the lease standing),
+`release_unresolved_gave_up` (the honour end, or a shutdown, ended the wait),
+`release_unresolved_inconclusive` (a peer read that decided nothing),
+`release_unresolved_held` (forwards answered `Held` meanwhile) and, on the
+probed side, `lease_probes_answered`. The sim pin is
+`regression_a_release_in_doubt_is_resolved_by_a_peer_read`
+(`locks-unlinked-delegated-blips+unsettled` seeds 64, 391, 1477: no
+unsettled `EIO`, the path reached, a peer read kept a lease). The core tests
+are in `core/tests.rs` (`a_release_in_doubt_whose_reread_fails_stays_named_and_fenced`
+and its neighbours, and the lock lane's
+`no_lock_grant_is_made_while_an_unresolved_release_waits_for_a_read`).
+
 Bug B scenarios (plan 30 M3a and M3b regression tests, in `SCENARIOS`;
 **rewritten for plan 43 C2f in plan 46 M0.3**: "the state cannot arise").
 Their rig (`phantom_setup`, shared with the M6 scenario) runs every node

@@ -22,7 +22,6 @@ use crate::replica::Replica;
 use crate::segment;
 use constellation_fs_core::Ino;
 use constellation_meta::{JournalPos, LogRecord};
-use constellation_types::Code;
 use replicix_objcas::{AckPolicy, Lease, LeaseTag};
 
 /// EC2 campaign 8 A-1: the reason of an acquisition started because a
@@ -390,6 +389,12 @@ impl Core {
                 }
             }
         }
+        // A shutdown does not wait for a release in doubt to be resolved:
+        // the process ends, and the record on disk keeps a restart
+        // conservative.
+        if matches!(req, JobReq::Flush { stop: true, .. }) && self.release_unresolved.is_some() {
+            self.give_up_unresolved_release(now, replica, out);
+        }
         let dup = self.queued_jobs.iter().any(|q| {
             matches!(
                 (q, &req),
@@ -505,6 +510,26 @@ impl Core {
             job.phase = phase;
             job.op = op;
         }
+    }
+
+    /// The release re-read's phase for a release in doubt, with `op` the
+    /// node's own outstanding re-read (`None`: waiting on the timer and the
+    /// peers, `release_doubt.rs`).
+    pub(super) fn set_release_reread_phase(&mut self, op: Option<OpId>) {
+        self.set_phase(Phase::ReleaseReread { in_doubt: true }, op);
+    }
+
+    /// The job in the slot is a shutdown flush (`Control::Shutdown`).
+    pub(super) fn job_is_stop_flush(&self) -> bool {
+        matches!(
+            self.job.as_ref().map(|j| &j.what),
+            Some(What::Flush { stop: true, .. })
+        )
+    }
+
+    /// The job in the slot waits for no S3 request of its own.
+    pub(super) fn job_has_no_op(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| j.op.is_none())
     }
 
     pub(crate) fn start_round(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -3414,7 +3439,7 @@ impl Core {
         }
     }
 
-    fn finish_round(
+    pub(super) fn finish_round(
         &mut self,
         now: Now,
         failed: Option<String>,
@@ -5210,7 +5235,7 @@ impl Core {
         self.flush_continue(now, 0, replica, out);
     }
 
-    fn finish_flush_job(
+    pub(super) fn finish_flush_job(
         &mut self,
         now: Now,
         released: bool,
@@ -5635,66 +5660,7 @@ impl Core {
                 self.set_phase(Phase::ReleaseReread { in_doubt: true }, Some(op));
             }
             (Phase::ReleaseReread { in_doubt }, S3Result::LeaseGet(result)) => {
-                let Some((mine, _)) = self.lease.held.clone() else {
-                    self.lease.releasing = false;
-                    self.lease_gone_mid_job(now, kind, replica, out);
-                    return;
-                };
-                match result {
-                    // Our own release, landed.
-                    Ok(Some((cur, _)))
-                        if cur.holder == self.cfg.node_id
-                            && cur.epoch == mine.epoch
-                            && cur.released =>
-                    {
-                        self.release_landed(now, kind, replica, out);
-                        return;
-                    }
-                    Ok(Some((cur, tag)))
-                        if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
-                    {
-                        self.lease.renewed(now, cur, tag);
-                    }
-                    Ok(Some((cur, _))) => {
-                        self.deposed(now, cur.holder, cur.epoch, mine.epoch, replica, out)
-                    }
-                    Ok(None) => self.deposed(now, 0, 0, mine.epoch, replica, out),
-                    Err(e) if in_doubt => {
-                        // Still unknown: the lease is given up here. Had
-                        // the release not landed, the object names this
-                        // node, unreleased, until it expires; the next
-                        // acquisition re-adopts it through the gate.
-                        tracing::warn!(
-                            node = self.cfg.node_id,
-                            error = %e.0,
-                            "lease re-read failed after a release in doubt; giving the lease up"
-                        );
-                        let carried_mine = self.epoch_carries(&mine);
-                        self.pr.released = Some((mine.epoch, mine.expires_unix_ms));
-                        self.pr.given_up = self.pr.released;
-                        self.lease.released();
-                        self.owe_given_up_move(carried_mine, replica);
-                        self.drop_unexecuted_parks(now, replica, out);
-                        self.deleg_on_lease_gone(now, replica, out);
-                        self.clear_holder_epoch(replica);
-                        self.inbox.holder = None;
-                        if self.epoch_refuses_writes() {
-                            // Nobody holds the epoch now: what waits for
-                            // the lease hears `EROFS` at once, not at its
-                            // deadline.
-                            self.refuse_waiting_for_lease(now, Code::ReadOnly, replica, out);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed")
-                    }
-                }
-                self.lease.releasing = false;
-                self.epoch_hold_after_kept_release(now, replica, out);
-                match kind {
-                    JobKind::Round => self.finish_round(now, None, replica, out),
-                    _ => self.finish_flush_job(now, false, replica, out),
-                }
+                self.on_release_reread(now, kind, in_doubt, result, replica, out)
             }
             // ---- acquire ----
             (Phase::Get, S3Result::LeaseGet(Ok(object))) => {
@@ -5982,7 +5948,7 @@ impl Core {
     }
 
     /// The release CAS landed (its answer, or a re-read after none).
-    fn release_landed(
+    pub(super) fn release_landed(
         &mut self,
         now: Now,
         kind: JobKind,
@@ -6025,7 +5991,7 @@ impl Core {
     /// before M9 only the CAS path itself could do. A deposed node runs
     /// the recovery from here (the round's `Recover` tail, as the CAS
     /// path would); otherwise the job just ends.
-    fn lease_gone_mid_job(
+    pub(super) fn lease_gone_mid_job(
         &mut self,
         now: Now,
         kind: JobKind,

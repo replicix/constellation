@@ -60,6 +60,7 @@ mod mode;
 mod placement;
 mod promise;
 mod readindex;
+mod release_doubt;
 mod replay;
 mod roster;
 mod seal_tail;
@@ -1935,6 +1936,17 @@ pub struct Stats {
     pub release_record_waits: u64,
     pub release_record_wait_ms_total: u64,
     pub release_record_wait_ms_max: u64,
+    /// A release in doubt whose re-read failed too and stayed fenced
+    /// (`release_doubt.rs`), how each ended: kept by a peer's read, given
+    /// up at the lease's honour end, inconclusive peer reads, and the
+    /// forwards answered `Held` meanwhile.
+    pub release_unresolved: u64,
+    pub release_unresolved_kept_by_peer: u64,
+    pub release_unresolved_gave_up: u64,
+    pub release_unresolved_inconclusive: u64,
+    pub release_unresolved_held: u64,
+    /// Peer side: lease probes answered with a fresh read.
+    pub lease_probes_answered: u64,
     pub lock_horizon_failed: u64,
     /// The read-grant horizons' write-ahead lane (`Action::PersistGrantHorizon`):
     /// the writes issued, the ones that failed, and the reads answered
@@ -2691,6 +2703,12 @@ pub(crate) enum S3For {
     /// Plan 41 L0: a fast tenure's lease read that renewal answers held
     /// for stale liveness wait for (`Core::renew_kick`).
     RenewProbe,
+    /// The fresh read `from`'s `LeaseProbe` `req` asked for
+    /// (`Core::on_lease_probe`); answered to `from`, no other effect.
+    LeaseProbe {
+        from: NodeId,
+        req: OpId,
+    },
 }
 
 /// A pending timer's deadline, on the clock it was set against (plan 43
@@ -2798,6 +2816,9 @@ enum Timer {
     /// The lease renewal falls due while a job waits for the takeover
     /// gate's inbox drain (`Core::on_gate_drain_renew`).
     GateDrainRenew,
+    /// A release in doubt whose re-read failed looks again
+    /// (`Core::on_release_reread_timer`).
+    ReleaseReread,
 }
 
 impl Timer {
@@ -2859,6 +2880,7 @@ impl Timer {
             | Timer::StickyRelease
             | Timer::AbandonWait => TimerKind::DelegExpiry,
             Timer::GateDrainRenew => TimerKind::Poll,
+            Timer::ReleaseReread => TimerKind::ReleaseReread,
         }
     }
 }
@@ -2892,6 +2914,10 @@ pub struct Core {
     /// gate completes in rounds).
     pending_flushes: Vec<jobs::PendingFlush>,
     flush_floor_timer: Option<TimerId>,
+    /// A release in doubt whose re-read failed too: it stays fenced and
+    /// looks for the lease's state until a read resolves it
+    /// (`release_doubt.rs`).
+    release_unresolved: Option<release_doubt::ReleaseUnresolved>,
     clients: BTreeMap<Rid, client::ClientOp>,
     /// Rids answered `InDoubt` and not yet resubmitted.
     in_doubt_rids: std::collections::BTreeSet<Rid>,
@@ -3117,6 +3143,7 @@ impl Core {
             queued_jobs: VecDeque::new(),
             pending_flushes: Vec::new(),
             flush_floor_timer: None,
+            release_unresolved: None,
             clients: BTreeMap::new(),
             in_doubt_rids: std::collections::BTreeSet::new(),
             unsettled_designation_rids: std::collections::BTreeSet::new(),
@@ -3960,6 +3987,10 @@ impl Core {
             PeerMsg::PromiseRequest { req, key } => {
                 self.on_promise_request(now, from, req, key, replica, out)
             }
+            PeerMsg::LeaseProbe { req } => self.on_lease_probe(from, req, out),
+            PeerMsg::LeaseProbeReply { req, read } => {
+                self.on_lease_probe_reply(now, from, req, read, replica, out)
+            }
             PeerMsg::PromiseReply {
                 req,
                 granted,
@@ -4281,6 +4312,9 @@ impl Core {
         if self.on_promise_request_failed(now, req, replica, out) {
             return;
         }
+        if self.on_release_probe_failed(req) {
+            return;
+        }
         if self.on_deleg_request_failed(now, req, out) {
             return;
         }
@@ -4378,6 +4412,7 @@ impl Core {
             }
             S3For::DeadRoot => self.on_dead_root_get(now, result, replica, out),
             S3For::RenewProbe => self.on_renew_probe(now, result, replica, out),
+            S3For::LeaseProbe { from, req } => self.on_lease_probe_read(from, req, result, out),
         }
     }
 
@@ -4409,6 +4444,7 @@ impl Core {
                     self.on_job_peer_failed(now, req, 0, replica, out);
                 }
             }
+            Timer::ReleaseReread => self.on_release_reread_timer(now, replica, out),
             Timer::FlushFloor => {
                 self.flush_floor_timer = None;
                 self.service_pending_flushes(now, replica, out);

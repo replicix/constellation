@@ -379,6 +379,10 @@ pub enum TimerKind {
     /// M11: a delegate's stream tick (a batch to send, a lost ack).
     DelegStream,
     Placement,
+    /// A release in doubt whose lease re-read failed too: look again, and
+    /// ask the peers to read, until a read resolves it or the lease's
+    /// honour ends (`Core::release_unresolved`).
+    ReleaseReread,
 }
 
 /// Successful control-plane results.

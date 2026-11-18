@@ -1623,9 +1623,10 @@ fn a_holders_handoff_queues_behind_the_round_then_flushes_and_releases() {
 /// may have landed, and a released lease is anyone's at once. The holder
 /// used to keep it and go on executing its own writes as the holder (two
 /// holders); it now admits nothing until a re-read says which. Landed:
-/// released (the handoff is served). The re-read failing too: the lease
-/// is given up all the same (the handoff is declined; the requester
-/// reads the object itself).
+/// released (the handoff is served). The re-read failing too: the node
+/// stays fenced and looks on (`release_doubt.rs`); with nothing to
+/// resolve it, the lease is given up at its honour end (the handoff is
+/// declined; the requester reads the object itself).
 #[test]
 fn a_release_in_doubt_is_reread_before_anything_is_admitted() {
     for reread_fails in [false, true] {
@@ -1681,7 +1682,22 @@ fn a_release_in_doubt_is_reread_before_anything_is_admitted() {
         } else {
             S3Result::LeaseGet(Ok(Some((released.clone(), tag()))))
         };
-        let out = h.step(Event::S3 { op: reread, result });
+        let mut out = h.step(Event::S3 { op: reread, result });
+        if reread_fails {
+            // (A re-read that fails too keeps the node fenced and looking:
+            // `release_doubt.rs`. Nothing resolves it here, so the lease is
+            // given up at its honour end.)
+            assert!(
+                !sends(&out)
+                    .iter()
+                    .any(|(_, m)| matches!(m, PeerMsg::LeaseHandoff { .. })),
+                "answered while unresolved: {out:?}"
+            );
+            assert!(h.core.lease().held.is_some());
+            let timer = timers(&out, TimerKind::ReleaseReread)[0];
+            h.advance(10_000);
+            out = h.step(Event::Timer { id: timer });
+        }
         assert!(
             matches!(
                 sends(&out)[0].1,
@@ -1698,6 +1714,563 @@ fn a_release_in_doubt_is_reread_before_anything_is_admitted() {
             .is_none());
         assert!(h.core.job().is_none());
     }
+}
+
+/// A handoff's release CAS in doubt whose re-read failed too: the lease
+/// the release replaced, and the actions of the failed re-read (the probes,
+/// the retry timer).
+fn unresolved_release(h: &mut Harness) -> (Lease, Vec<Action>) {
+    let mine = h.core.lease.held.as_ref().unwrap().0.clone();
+    let release = handoff_release_in_flight(h);
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into()))),
+    });
+    (mine, out)
+}
+
+/// The probe `to` was sent in `out`.
+fn probe_to(out: &[Action], to: NodeId) -> OpId {
+    sends(out)
+        .into_iter()
+        .find_map(|(n, m)| match m {
+            PeerMsg::LeaseProbe { req } if n == to => Some(*req),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no lease probe to node {to}: {out:?}"))
+}
+
+fn probe_reply(from: NodeId, req: OpId, read: crate::event::ProbedLease) -> Event {
+    Event::Peer {
+        from,
+        msg: PeerMsg::LeaseProbeReply { req, read },
+    }
+}
+
+/// A forward from node 2 (a create of `name`), request id `req`.
+fn forward_from_2(h: &mut Harness, req: u64, name: &str) -> Vec<Action> {
+    let event = forward_event(h, req, name);
+    h.step(event)
+}
+
+fn forward_outcome(out: &[Action], req: u64) -> Option<MutateOutcome> {
+    sends(out).into_iter().find_map(|(_, m)| match m {
+        PeerMsg::MutateReply {
+            req: r, outcome, ..
+        } if *r == OpId(req) => Some(outcome.clone()),
+        _ => None,
+    })
+}
+
+/// A release in doubt whose re-read fails too neither gives the lease up nor
+/// lets go of the fence: the node stays the named holder, `releasing`, answers
+/// forwards `Held` (executing nothing), and asks every reachable peer to read
+/// the lease (`release_doubt.rs`). It used to give the lease up at once, which
+/// left the object naming a node that held nothing (`locks-unlinked-delegated-blips`
+/// seeds 64, 391, 1477: an epoch that formed in the cut carried a lease no
+/// node claimed).
+#[test]
+fn a_release_in_doubt_whose_reread_fails_stays_named_and_fenced() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let (_, out) = unresolved_release(&mut h);
+    assert!(h.core.lease().held.is_some(), "the lease was given up");
+    assert!(h.core.lease().releasing, "the fence was lifted");
+    assert!(h.core.pr.given_up.is_none());
+    assert_eq!(h.core.stats.release_unresolved, 1);
+    // Nothing was answered: the handoff waits with the job.
+    assert!(
+        !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::LeaseHandoff { .. })),
+        "{out:?}"
+    );
+    assert_eq!(h.core.job(), Some(JobKind::Handoff));
+    // A probe to each reachable peer, and the retry timer.
+    for peer in [2, 3, 4] {
+        probe_to(&out, peer);
+    }
+    assert_eq!(timers(&out, TimerKind::ReleaseReread).len(), 1);
+    // A forward is answered `Held`, nothing executes.
+    let out = forward_from_2(&mut h, 40, "a");
+    assert!(
+        matches!(forward_outcome(&out, 40), Some(MutateOutcome::Held { .. })),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.release_unresolved_held, 1);
+    assert!(
+        !out.iter().any(|a| matches!(
+            a,
+            Action::Send {
+                msg: PeerMsg::MutateReply {
+                    outcome: MutateOutcome::Accepted { .. } | MutateOutcome::Busy,
+                    ..
+                },
+                ..
+            }
+        )),
+        "{out:?}"
+    );
+    assert!(h
+        .core
+        .lease
+        .new_mutation_epoch(h.clk(), h.core.config())
+        .is_none());
+}
+
+/// A peer's fresh read that shows the lease still ours, unreleased, with the
+/// expiry fields the release replaced: the release did not happen. The node
+/// goes on as the holder with the (lease, tag) it holds, the release record
+/// is cleared, and the next forward executes.
+#[test]
+fn a_peer_read_showing_the_lease_standing_keeps_it() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let before = format!("{:?}", h.core.lease.held.as_ref().unwrap().1);
+    let (mine, out) = unresolved_release(&mut h);
+    let req = probe_to(&out, 2);
+    let out = h.step(probe_reply(
+        2,
+        req,
+        crate::event::ProbedLease::Object(mine.clone()),
+    ));
+    assert!(!h.core.lease().releasing);
+    assert_eq!(
+        format!("{:?}", h.core.lease.held.as_ref().unwrap().1),
+        before,
+        "the held tag changed"
+    );
+    assert_eq!(h.core.lease.held.as_ref().unwrap().0, mine);
+    assert!(
+        release_record_writes(&out).contains(&None),
+        "the record was not cleared: {out:?}"
+    );
+    assert_eq!(h.core.stats.release_unresolved_kept_by_peer, 1);
+    assert_eq!(h.core.job(), None);
+    assert!(
+        sends(&out).iter().any(|(to, m)| *to == 3
+            && matches!(
+                m,
+                PeerMsg::LeaseHandoff {
+                    released: false,
+                    ..
+                }
+            )),
+        "the handoff is declined: {out:?}"
+    );
+    let event = forward_event(&mut h, 41, "b");
+    let out = h.step_archived(event);
+    assert!(
+        matches!(
+            forward_outcome(&out, 41),
+            Some(MutateOutcome::Accepted { .. })
+        ),
+        "{out:?}"
+    );
+}
+
+fn forward_event(h: &mut Harness, req: u64, name: &str) -> Event {
+    let rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: req,
+    };
+    let op = h.create(name);
+    Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateRequest {
+            req: OpId(req),
+            rid,
+            op,
+            acked_through: 0,
+            deps: constellation_meta::Position::ZERO,
+            applied: 0,
+            tag: Default::default(),
+            settle: false,
+            routed_gen: 0,
+            touched_gen: 0,
+            inbox_ever: false,
+        },
+    }
+}
+
+/// A peer's read that shows our own release landed completes it; one that
+/// shows another holder (or a later epoch, or no object) deposes the node.
+#[test]
+fn a_peer_read_showing_the_release_landed_completes_it() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let (mine, out) = unresolved_release(&mut h);
+    let req = probe_to(&out, 4);
+    let mut landed = mine.clone();
+    landed.released = true;
+    let out = h.step(probe_reply(
+        4,
+        req,
+        crate::event::ProbedLease::Object(landed),
+    ));
+    assert!(h.core.lease().held.is_none());
+    assert_eq!(h.core.stats.releases, 1);
+    assert!(
+        sends(&out)
+            .iter()
+            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::LeaseHandoff { released: true, .. })),
+        "{out:?}"
+    );
+    assert_eq!(h.core.job(), None);
+    assert!(!h.core.lease().lost);
+}
+
+#[test]
+fn a_peer_read_showing_another_holder_deposes() {
+    for (holder, epoch, absent) in [(3, 2, false), (1, 2, false), (0, 0, true)] {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let (mine, out) = unresolved_release(&mut h);
+        let req = probe_to(&out, 2);
+        let mut taken = mine.clone();
+        taken.holder = holder;
+        taken.epoch = epoch;
+        let read = if absent {
+            crate::event::ProbedLease::Absent
+        } else {
+            crate::event::ProbedLease::Object(taken)
+        };
+        h.step(probe_reply(2, req, read));
+        assert!(h.core.lease().held.is_none(), "{holder} {epoch} {absent}");
+        assert!(h.core.lease().lost, "{holder} {epoch} {absent}");
+        assert_eq!(h.core.job(), None);
+        assert_eq!(h.core.stats.release_unresolved_kept_by_peer, 0);
+    }
+}
+
+/// A peer's read with other expiry fields than the lease the release
+/// replaced, an older epoch, or a failed read, decides nothing: the node
+/// keeps waiting, fenced.
+#[test]
+fn a_peer_read_with_another_expiry_decides_nothing() {
+    let mut h = Harness::new(1);
+    h.hold(2, None);
+    let (mine, out) = unresolved_release(&mut h);
+    let mut later = mine.clone();
+    later.expires_unix_ms += 1;
+    let mut older = mine.clone();
+    older.epoch = 1;
+    let mut inconclusive = 0;
+    for (peer, read) in [
+        (2, crate::event::ProbedLease::Object(later)),
+        (3, crate::event::ProbedLease::Object(older)),
+        (4, crate::event::ProbedLease::Failed),
+    ] {
+        let req = probe_to(&out, peer);
+        h.step(probe_reply(peer, req, read));
+        if peer != 4 {
+            inconclusive += 1;
+        }
+        assert!(h.core.lease().held.is_some());
+        assert!(h.core.lease().releasing);
+        assert_eq!(h.core.job(), Some(JobKind::Handoff));
+        assert_eq!(h.core.stats.release_unresolved_inconclusive, inconclusive);
+    }
+    assert_eq!(h.core.stats.release_unresolved_kept_by_peer, 0);
+    assert!(h.core.release_unresolved.is_some());
+}
+
+/// Nothing resolves it: at the lease's honour end the old give-up runs. The
+/// epoch that formed meanwhile carried the lease, so the move is owed, and
+/// the write that waited for the lease is refused (`EROFS`) at once.
+#[test]
+fn the_unresolved_release_gives_up_at_the_lease_honour_end() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    let release = handoff_release_in_flight(&mut h);
+    // An outage begins during the release: the epoch carries the lease.
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(!h.core.lease.epoch_held());
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    let waiting = h.rid(1);
+    let op = h.create("a");
+    h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: waiting,
+        op,
+        tag: Default::default(),
+    });
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into()))),
+    });
+    assert!(h.core.lease.held.is_some(), "given up at once");
+    assert_eq!(
+        h.core.pr.owes_move, id,
+        "owed while it waits (the activation's)"
+    );
+    let mut timer = timers(&out, TimerKind::ReleaseReread)[0];
+    // Looks before the end: the own re-read goes out again, the probes too.
+    h.advance(600);
+    let out = h.step(Event::Timer { id: timer });
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseGet)),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.release_unresolved_gave_up, 0);
+    probe_to(&out, 2);
+    timer = timers(&out, TimerKind::ReleaseReread)[0];
+    h.advance(10_000);
+    let out = h.step(Event::Timer { id: timer });
+    assert_eq!(h.core.stats.release_unresolved_gave_up, 1);
+    assert!(h.core.lease.held.is_none(), "not given up");
+    assert_eq!(h.core.pr.given_up, id);
+    assert_eq!(h.core.pr.owes_move, id);
+    assert_eq!(h.meta.epoch_owes_move(), id);
+    assert!(
+        replies(&out).iter().any(|(r, reply)| *r == waiting
+            && matches!(
+                reply,
+                ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))
+            )),
+        "{out:?}"
+    );
+    assert!(
+        sends(&out).iter().any(|(to, m)| *to == 3
+            && matches!(
+                m,
+                PeerMsg::LeaseHandoff {
+                    released: false,
+                    ..
+                }
+            )),
+        "{out:?}"
+    );
+    assert_eq!(h.core.job(), None);
+}
+
+/// An activation that carries the lease while the release waits owes the move
+/// and adopts no hold (`epoch_carries_let_go`); the peer's read that shows the
+/// lease standing then hands the hold over through
+/// `epoch_hold_after_kept_release`.
+#[test]
+fn an_epoch_activated_while_unresolved_is_held_once_a_peer_keeps_the_lease() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    let (_, out) = unresolved_release(&mut h);
+    let req = probe_to(&out, 2);
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(h.core.epoch_carries_let_go());
+    assert!(!h.core.lease.epoch_held(), "a hold on a lease in doubt");
+    assert_eq!(h.core.pr.owes_move, id);
+    h.step(probe_reply(
+        2,
+        req,
+        crate::event::ProbedLease::Object(carried.clone()),
+    ));
+    assert!(
+        h.core.lease.epoch_held(),
+        "the kept lease's epoch has no holder"
+    );
+    assert_eq!(h.core.stats.release_unresolved_kept_by_peer, 1);
+    assert!(!h.core.epoch_refuses_writes());
+}
+
+/// A reply after the state ended (or from a peer not asked, or for a request
+/// never sent) is ignored.
+#[test]
+fn a_late_probe_reply_after_resolution_is_ignored() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let (mine, out) = unresolved_release(&mut h);
+    let (r2, r3) = (probe_to(&out, 2), probe_to(&out, 3));
+    // From a node that was not asked, and for another request id.
+    let mut landed = mine.clone();
+    landed.released = true;
+    h.step(probe_reply(
+        4,
+        r2,
+        crate::event::ProbedLease::Object(landed.clone()),
+    ));
+    h.step(probe_reply(
+        2,
+        OpId(9_999),
+        crate::event::ProbedLease::Absent,
+    ));
+    assert!(h.core.lease().held.is_some());
+    assert!(h.core.release_unresolved.is_some());
+    // Resolved by node 2; node 3's answer comes late.
+    h.step(probe_reply(
+        2,
+        r2,
+        crate::event::ProbedLease::Object(mine.clone()),
+    ));
+    assert_eq!(h.core.stats.release_unresolved_kept_by_peer, 1);
+    assert!(h.core.release_unresolved.is_none());
+    let out = h.step(probe_reply(3, r3, crate::event::ProbedLease::Absent));
+    assert!(out.is_empty(), "{out:?}");
+    assert!(h.core.lease().held.is_some());
+    assert!(!h.core.lease().lost);
+    assert_eq!(h.core.stats.release_unresolved_kept_by_peer, 1);
+}
+
+/// Peer side: a probe is answered from a read issued after it arrived, never
+/// from one already in flight or a cached body.
+#[test]
+fn a_probe_answer_comes_from_a_fresh_read() {
+    let mut h = Harness::new(2);
+    let lease = Lease::granted("p0", 1, 1, 1_000_000 + 10_000);
+    // A read of the node's own is in flight, and the last seen body is cached.
+    let mut out = Vec::new();
+    let inflight = h
+        .core
+        .issue_s3(S3Op::LeaseGet, S3For::PromiseWatch, &mut out);
+    h.core.lease.note_object(&lease);
+    let out = h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::LeaseProbe { req: OpId(61) },
+    });
+    assert!(sends(&out).is_empty(), "answered before a read: {out:?}");
+    let reads = s3_ops(&out);
+    let [(fresh, S3Op::LeaseGet)] = reads.as_slice() else {
+        panic!("no second read: {out:?}")
+    };
+    assert_ne!(*fresh, inflight);
+    // The read in flight is not the answer.
+    let out = h.step(Event::S3 {
+        op: inflight,
+        result: S3Result::LeaseGet(Ok(None)),
+    });
+    assert!(sends(&out).is_empty(), "{out:?}");
+    // The fresh read's result is, whatever it says.
+    let fresh = *fresh;
+    let out = h.step(Event::S3 {
+        op: fresh,
+        result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+    });
+    assert!(
+        matches!(
+            sends(&out).as_slice(),
+            [(1, PeerMsg::LeaseProbeReply { req: OpId(61), read: crate::event::ProbedLease::Object(l) })] if *l == lease
+        ),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.lease_probes_answered, 1);
+    for (result, want) in [
+        (
+            S3Result::LeaseGet(Ok(None)),
+            crate::event::ProbedLease::Absent,
+        ),
+        (
+            S3Result::LeaseGet(Err(crate::event::S3Failure("x".into()))),
+            crate::event::ProbedLease::Failed,
+        ),
+    ] {
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LeaseProbe { req: OpId(62) },
+        });
+        let (op, _) = s3_ops(&out)[0];
+        let out = h.step(Event::S3 { op, result });
+        assert!(
+            matches!(
+                sends(&out).as_slice(),
+                [(1, PeerMsg::LeaseProbeReply { req: OpId(62), read })] if *read == want
+            ),
+            "{out:?}"
+        );
+    }
+}
+
+/// A shutdown's release in doubt whose re-read fails gives the lease up at
+/// once, as ever: the process ends, and the record keeps a restart
+/// conservative.
+#[test]
+fn a_shutdown_release_in_doubt_still_gives_up_at_once() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let out = h.step(Event::Control {
+        op: OpId(901),
+        req: Control::Shutdown,
+    });
+    let mut out = out;
+    let release = 'driven: {
+        for _ in 0..16 {
+            if let Some(op) = out.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                out = h.step(Event::UploadsDone {
+                    op,
+                    result: UploadResult::Done { held: 0 },
+                });
+                continue;
+            }
+            if let Some(op) = out.iter().find_map(|a| match a {
+                Action::Publish { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                out = h.step(Event::PublishDone { op, ok: true });
+                continue;
+            }
+            let Some((op, req)) = s3_ops(&out).first().map(|(o, r)| (*o, (*r).clone())) else {
+                break;
+            };
+            let result = match req {
+                S3Op::LeaseSwap { lease, .. } if lease.released => break 'driven op,
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected {other:?}: {out:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        panic!("the release CAS never went out: {out:?}")
+    };
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into()))),
+    });
+    assert!(h.core.lease.held.is_none(), "a shutdown waited");
+    assert!(h.core.pr.given_up.is_some());
+    assert_eq!(h.core.stats.release_unresolved, 0);
+    assert!(h.core.release_unresolved.is_none());
+    assert!(h.core.stopped());
+}
+
+/// A shutdown that arrives while a release is unresolved does not wait for
+/// it: the lease is given up and the flush goes on.
+#[test]
+fn a_shutdown_during_an_unresolved_release_gives_up_at_once() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let (_, _) = unresolved_release(&mut h);
+    assert!(h.core.release_unresolved.is_some());
+    h.step(Event::Control {
+        op: OpId(902),
+        req: Control::Shutdown,
+    });
+    assert!(h.core.release_unresolved.is_none());
+    assert!(h.core.pr.given_up.is_some());
+    assert_eq!(h.core.stats.release_unresolved_gave_up, 1);
 }
 
 /// Slow S3 (slow-s3-no-seal): a round ships until the journal is empty,
@@ -22110,6 +22683,118 @@ mod locks {
             "the duty was taken from before the gap"
         );
         assert!(h.core.lk.release_unmarked);
+    }
+
+    /// A release in doubt whose re-read failed too waits fenced, and the
+    /// fence of a release in flight holds for all of that time: no lock
+    /// grant is made, the lock lane's certificate stays down (it extends no
+    /// own grant and answers no renewal off the core), and the node's own
+    /// delegation certificate is withdrawn. A peer's read that shows the
+    /// lease standing lifts it: the lane may certify again and a request is
+    /// granted.
+    #[test]
+    fn no_lock_grant_is_made_while_an_unresolved_release_waits_for_a_read() {
+        let (mut h, ino) = holder_with_file();
+        assert!(h.core.lock_lane_view(h.clk(), &h.meta).root_ok);
+        let mine = h.core.lease.held.as_ref().unwrap().0.clone();
+        let mut out = h.step(Event::Control {
+            op: OpId(9),
+            req: Control::Flush,
+        });
+        let release = 'driven: {
+            for _ in 0..16 {
+                if let Some(op) = out.iter().find_map(|a| match a {
+                    Action::UploadDirtyChunks { op, .. } => Some(*op),
+                    _ => None,
+                }) {
+                    out = h.step(Event::UploadsDone {
+                        op,
+                        result: UploadResult::Done { held: 0 },
+                    });
+                    continue;
+                }
+                if let Some(op) = out.iter().find_map(|a| match a {
+                    Action::Publish { op, .. } => Some(*op),
+                    _ => None,
+                }) {
+                    out = h.step(Event::PublishDone { op, ok: true });
+                    continue;
+                }
+                let Some((op, req)) = s3_ops(&out).first().map(|(o, r)| (*o, (*r).clone())) else {
+                    break;
+                };
+                let result = match req {
+                    S3Op::LeaseSwap { lease, .. } if lease.released => break 'driven op,
+                    S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                    S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                    S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                    other => panic!("unexpected {other:?}: {out:?}"),
+                };
+                out = h.step(Event::S3 { op, result });
+            }
+            panic!("the release CAS never went out: {out:?}")
+        };
+        let out = h.step(Event::S3 {
+            op: release,
+            result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+        });
+        let (reread, _) = s3_ops(&out)[0];
+        let probes = h.step(Event::S3 {
+            op: reread,
+            result: S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into()))),
+        });
+        assert!(
+            h.core.release_unresolved.is_some(),
+            "not waiting: {probes:?}"
+        );
+        assert!(h.core.lease.held.is_some() && h.core.lease.releasing);
+        assert!(h.core.release_unmarked_in_flight());
+        assert!(!h.core.lock_lane_view(h.clk(), &h.meta).root_ok);
+        assert!(h.core.deleg_root_lease().is_none());
+        let granted = |out: &[Action]| {
+            lock_replies(out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. }))
+        };
+        h.advance(100);
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert!(!granted(&out), "a grant was made while unresolved: {out:?}");
+        let out = h.step(Event::Control {
+            op: OpId(10),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: false,
+                waited_ms: 0,
+            },
+        });
+        assert!(
+            !out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    result: Ok(ControlOk::Lock(LockAnswer::Granted { .. })),
+                    ..
+                }
+            )),
+            "the holder granted itself: {out:?}"
+        );
+        assert_eq!(h.meta.locks().grants_len(), 0);
+        // A peer's read shows the lease standing: the release did not happen.
+        let req = probe_to(&probes, 2);
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LeaseProbeReply {
+                req,
+                read: crate::event::ProbedLease::Object(mine),
+            },
+        });
+        assert!(h.core.release_unresolved.is_none());
+        assert!(h.core.lock_lane_view(h.clk(), &h.meta).root_ok);
+        let out = request(&mut h, 4, 9, ino, X, false);
+        assert!(
+            granted(&out),
+            "not granted after the lease was kept: {out:?}"
+        );
     }
 
     fn request(

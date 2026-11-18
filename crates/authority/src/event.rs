@@ -897,6 +897,19 @@ pub enum PeerMsg {
         granted: bool,
         epoch_slack: u32,
     },
+    /// A node whose lease release is in doubt (the release CAS and the
+    /// re-read after it both failed) asks a peer to read the lease object
+    /// for it (`Core::release_unresolved`). The peer issues a fresh read
+    /// after the request arrives, never one in flight or a cached body, and
+    /// answers [`PeerMsg::LeaseProbeReply`].
+    LeaseProbe {
+        req: OpId,
+    },
+    /// What the probed peer's fresh lease read returned.
+    LeaseProbeReply {
+        req: OpId,
+        read: ProbedLease,
+    },
     /// Plan 30 §M11: a delegate streams its executed transactions of
     /// generation `gen` to the root, in stream order from index
     /// `from_idx` (`txs[0].idx`), one batch in flight per generation.
@@ -1287,6 +1300,20 @@ pub enum PeerMsg {
     },
 }
 
+/// What a peer's fresh read of the lease object returned
+/// ([`PeerMsg::LeaseProbeReply`]). The lease body only: the read's
+/// `LeaseTag` cannot be built outside the object store, so a requester
+/// that adopts the answer keeps the tag it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbedLease {
+    /// The read failed: it says nothing.
+    Failed,
+    /// No lease object.
+    Absent,
+    /// The object read.
+    Object(Lease),
+}
+
 /// ADR-51: why a member refused a kept `SealTail`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealRefusal {
@@ -1321,6 +1348,8 @@ impl PeerMsg {
             PeerMsg::BackupHold { .. } => "BackupHold",
             PeerMsg::PromiseRequest { .. } => "PromiseRequest",
             PeerMsg::PromiseReply { .. } => "PromiseReply",
+            PeerMsg::LeaseProbe { .. } => "LeaseProbe",
+            PeerMsg::LeaseProbeReply { .. } => "LeaseProbeReply",
             PeerMsg::DelegateStream { .. } => "DelegateStream",
             PeerMsg::DelegateStreamAck { .. } => "DelegateStreamAck",
             PeerMsg::DelegRenew { .. } => "DelegRenew",
@@ -1360,6 +1389,7 @@ impl PeerMsg {
             | PeerMsg::DelegationRecalled { req }
             | PeerMsg::BackupAck { req, .. }
             | PeerMsg::PromiseReply { req, .. }
+            | PeerMsg::LeaseProbeReply { req, .. }
             | PeerMsg::DelegateStreamAck { req, .. }
             | PeerMsg::DelegRenewed { req, .. }
             | PeerMsg::DelegRenewedOffCore { req, .. }
@@ -1408,6 +1438,7 @@ impl PeerMsg {
             | PeerMsg::DelegReadVoid { req, .. }
             | PeerMsg::BackupAppend { req, .. }
             | PeerMsg::PromiseRequest { req, .. }
+            | PeerMsg::LeaseProbe { req }
             | PeerMsg::DelegateStream { req, .. }
             | PeerMsg::DelegRenew { req, .. }
             | PeerMsg::DelegRenewOffCore { req, .. }

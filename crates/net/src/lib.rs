@@ -57,10 +57,10 @@ pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
 /// The gossip topic type ([`topic_for`]).
 pub use iroh_gossip::proto::TopicId;
 pub use message::{
-    Beat, ChunkDecline, ChunkStatus, EpochCarrier, EpochClaim, LeaseKeyWire, LockOutcomeWire,
-    LockRenewResultWire, LockRenewWire, LockTestOutcomeWire, Payload, Signed, SnapshotBatchOutcome,
-    SnapshotItem, SnapshotItemResult, SnapshotRowWire, ALPN, MAX_SNAPSHOT_DELETES_PER_BATCH,
-    MAX_SNAPSHOT_REASON_BYTES,
+    Beat, ChunkDecline, ChunkStatus, EpochCarrier, EpochClaim, LeaseKeyWire, LeaseReadWire,
+    LockOutcomeWire, LockRenewResultWire, LockRenewWire, LockTestOutcomeWire, Payload, Signed,
+    SnapshotBatchOutcome, SnapshotItem, SnapshotItemResult, SnapshotRowWire, ALPN,
+    MAX_SNAPSHOT_DELETES_PER_BATCH, MAX_SNAPSHOT_REASON_BYTES,
 };
 pub use paths::PathSummary;
 pub use peers::{run_gossip, Peer, PeerEnrollment, Peers, Refresher};

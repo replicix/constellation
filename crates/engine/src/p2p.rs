@@ -447,6 +447,44 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    fn lease_probed(
+        &self,
+        requester: u64,
+        req_id: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        use constellation_authority::ProbedLease;
+        use constellation_net::{LeaseReadWire, Payload};
+        Box::pin(async move {
+            let failed = Payload::LeaseProbeReply {
+                req_id,
+                read: LeaseReadWire::Failed,
+            };
+            if crate::fault::p2p_denied(requester) {
+                // Fault injection: the link is cut; no answer.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return failed;
+            }
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(sync::SyncRequest::PeerLeaseProbe { requester, reply })
+                .is_err()
+            {
+                return failed;
+            }
+            let read = match receive.await {
+                Ok(ProbedLease::Absent) => LeaseReadWire::Absent,
+                Ok(ProbedLease::Object(lease)) => match serde_json::to_vec(&lease) {
+                    Ok(bytes) => LeaseReadWire::Object(bytes),
+                    Err(_) => LeaseReadWire::Failed,
+                },
+                Ok(ProbedLease::Failed) | Err(_) => LeaseReadWire::Failed,
+            };
+            Payload::LeaseProbeReply { req_id, read }
+        })
+    }
+
     fn cache_digest(&self, digest: constellation_net::DigestSnapshot) {
         self.coop.apply_digest(digest);
     }

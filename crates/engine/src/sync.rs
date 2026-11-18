@@ -699,6 +699,13 @@ pub enum SyncRequest {
         key: replicix_objcas::RenewalKey,
         reply: tokio::sync::oneshot::Sender<(bool, u32)>,
     },
+    /// A peer whose lease release is in doubt asks this node for a fresh
+    /// read of the lease object (`PeerMsg::LeaseProbe`); answered with what
+    /// the read returned.
+    PeerLeaseProbe {
+        requester: u64,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::ProbedLease>,
+    },
     /// Plan 30 §M10: `meta.json`'s `epoch_slack` as last read.
     Slack(u32),
     /// Plan 30 §M10: this node's registry record is retired.

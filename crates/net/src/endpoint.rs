@@ -1354,6 +1354,21 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
+    /// A peer whose lease release is in doubt asks for a fresh read of the
+    /// lease object. Default answers that the read failed (P2P-disabled /
+    /// tests).
+    fn lease_probed(
+        &self,
+        _requester: u64,
+        req_id: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::LeaseProbeReply {
+                req_id,
+                read: crate::LeaseReadWire::Failed,
+            }
+        })
+    }
     /// Cooperative-cache digest snapshot from a peer.
     fn cache_digest(&self, _digest: DigestSnapshot) {}
     fn cache_digest_delta(&self, _delta: DigestDelta) {}

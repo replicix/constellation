@@ -481,6 +481,14 @@ impl Core {
                 // retries and send it to a lease path it may not have).
                 self.stats.readopt_for_forward += 1;
                 MutateOutcome::held(self.cfg.recall_hold_ms.max(50))
+            } else if req != OpId(0) && self.release_unresolved.is_some() {
+                // A release in doubt waits for a read of the lease
+                // (`release_doubt.rs`): this node is still the named
+                // holder, fenced, and executes nothing. `Held` keeps the
+                // requester asking here (a `Busy` sent it to the lease
+                // path, and its settle found no sequencer).
+                self.stats.release_unresolved_held += 1;
+                MutateOutcome::held(self.cfg.recall_hold_ms.max(50))
             } else {
                 MutateOutcome::Busy
             }
