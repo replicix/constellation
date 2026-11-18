@@ -7437,6 +7437,31 @@ fn flex_without_the_promise_check_is_found() {
     assert!(sampled > 0, "the sampler never saw the split brain");
 }
 
+/// The oracle counts a usable S3 lease as an authority unless the node's
+/// release CAS is out and the node is fenced (`epochs::s3_authority`).
+/// flex-tight seed 366: node 3's release CAS landed, then a pause held the
+/// process while a peer claimed and formed an epoch; the node's published
+/// view still showed its lease. Without the exclusion the sampler called
+/// that two authorities, though the node could acknowledge nothing.
+/// The fence is judged, not assumed: the node planted to admit new
+/// mutations with its release CAS out is a split brain on its own.
+#[test]
+fn flex_a_fenced_release_is_not_an_authority_but_an_open_one_is() {
+    let report = run_seed(366, flex_tight_config()).expect("seed 366 passes");
+    assert!(
+        report.fenced_release_samples > 0,
+        "seed 366 excluded no fenced release sample: {}",
+        report.fenced_release_samples
+    );
+    let planted = SimConfig {
+        plant_release_admits: true,
+        ..flex_tight_config()
+    };
+    let e = run_seed(366, planted).expect_err("the planted admission must be found");
+    assert!(e.contains("two authorities at once"), "{e}");
+    assert!(e.contains("release CAS out yet open"), "{e}");
+}
+
 /// Plan 30 §M10 with crashes, reads and the random CI faults.
 #[test]
 fn flex_epochs_survive_crashes_and_faults() {

@@ -773,6 +773,30 @@ The seeds: 64, 391 and 1477 of `locks-unlinked-delegated-blips+unsettled`
 (`regression_a_release_in_doubt_is_resolved_by_a_peer_read`); seed 1045 is
 not on this path (its re-read succeeded and found the release landed).
 
+The probe's framing: `LeaseProbe` carries a bare payload on an
+unsigned stream, and its `requester` is bound to the connection's
+enrolled key like every claim field (`claimed_node_id`): a probe naming
+another node than its sender is dropped before the service sees it.
+
+**Amendment (2026-11-19: the single-authority oracle's definition)**:
+the sampler's `single_authority` means that at most one live node *could
+acknowledge a write now*, the definition of the model
+(`crates/model/src/flex.rs`). An epoch hold always could; an S3 holder
+could while its lease is usable on its own clock. The model has no
+release. One state is outside the definition: the release CAS is out
+(`Core::release_cas_out`: `releasing`, job in `Release` or
+`ReleaseReread`). From the send on S3 may already have let go, so a peer
+may claim at once (this ADR, 670e57d3), and the releaser is fenced
+(`open_for_new_mutation` is false, the fast path refuses, forwards get
+`Busy`/`Held`, no delegation is renewed). Such a node is not counted
+(`Report::fenced_release_samples` counts the samples left out), and the
+exclusion rests on the fence being checked on every sample: a node with
+its CAS out whose view still admits new mutations is a split brain on its
+own. Paused nodes are not excluded. Flush and `PersistRelease`, before
+the CAS, still count. The false positive it removes: flex-tight seed 366,
+a paused releaser whose CAS had landed while a peer claimed and formed an
+epoch. No protocol rule changes. Testing: `docs/how-to-guides/development/TESTING.md`.
+
 **See**: plan 30 §M10;
 [Durability and failover — flexible continuation epochs](../reference/features/durability-and-failover.md#flexible-continuation-epochs);
 [`crates/authority/src/core/promise.rs`](../../crates/authority/src/core/promise.rs),

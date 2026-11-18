@@ -4973,6 +4973,25 @@ forwards are answered from it). `RUST_LOG=constellation_authority=debug`
 narrates a replay with each line stamped `t=<simulated ms>`, the fault
 log's clock.
 
+The single-authority sampler (`sample_authority`, `tests/sim/epochs.rs`,
+every 25 ms of simulated time) counts a node as an authority when it
+**could acknowledge a write now**, the model's `single_authority`: an epoch
+hold always, an S3 lease while it is usable on the node's own honour clock.
+Paused nodes count like any other (a paused holder with a usable lease is the
+GC-pause case). One state is left out: the release CAS is out
+(`Core::release_cas_out`: `releasing`, job in `Release` or `ReleaseReread`).
+From the send on S3 may already have let go, a peer may claim without a TTL
+wait (ADR-22), and the releaser is fenced. The exclusion rests on the fence
+being checked on every sample: a node with `release_cas_out` and a view that
+still admits new mutations (`open_for_new_mutation`) is a "two authorities at
+once" on its own. `Report::fenced_release_samples` counts the node-samples
+left out, so a sweep shows the exclusion at work. The classifier is
+`epochs::s3_authority` (unit test `s3_authority_classifies_the_release_states`);
+non-vacuity is `flex_a_fenced_release_is_not_an_authority_but_an_open_one_is`
+(flex-tight seed 366 passes with `fenced_release_samples > 0`, and fails with
+`SimConfig::plant_release_admits`, which publishes `admits` without the
+release fence).
+
 The checker design, settled in phase 2: the exact log-witnessed
 linearizability check runs on every seed; Stateright's
 `LinearizabilityTester` additionally checks the bounded histories (≤ 80

@@ -1024,6 +1024,9 @@ pub struct SimConfig {
     /// fast path ignores `Core::ack_gated`, so a holder answers its own op
     /// from its local disk while a backup is committed.
     pub plant_ungated_fast_path: bool,
+    /// Test-only: nodes publish `admits` without the release fence
+    /// (`NodeEnv::plant_release_admits`).
+    pub plant_release_admits: bool,
     /// Negative control for the causal-cut oracle: delegates do not wait for
     /// an op's deps (`Config::skip_deleg_dep_wait`), so one executes ahead
     /// of its cause and the root that is current refuses its batch.
@@ -1468,6 +1471,7 @@ impl Default for SimConfig {
             strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
+            plant_release_admits: false,
             skip_deleg_dep_wait: false,
             plant_claim_root_group_on_lone: false,
             abandon_after_ms: None,
@@ -1618,6 +1622,10 @@ pub struct Report {
     /// epoch (`epochs::try_form`, chunk epoch-liveness-gap).
     pub epochs_superseded: usize,
     pub authority_samples: u64,
+    /// Samples in which a node's usable S3 lease was left out of the
+    /// authority count because its release CAS was out and it was fenced
+    /// (`epochs::s3_authority`).
+    pub fenced_release_samples: u64,
     /// Plan 30 §M11: marker pairs checked and violations seen.
     pub marker_checks: u64,
     pub marker_violations: u64,
@@ -5878,6 +5886,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         oracles: oracles.clone(),
         rebuild_stub: cfg.rebuild_stub,
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
+        plant_release_admits: cfg.plant_release_admits,
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         placement_recalls_sticky: cfg.placement_recalls_sticky,
@@ -6717,6 +6726,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.epochs_continued = *cluster.epochs_continued.lock().unwrap();
     report.epochs_superseded = *cluster.epochs_superseded.lock().unwrap();
     report.authority_samples = super::epochs::SAMPLES.with(|s| s.get());
+    report.fenced_release_samples = super::epochs::FENCED_RELEASE.with(|s| s.get());
     {
         let (checks, violations) = *marker_stats.lock().unwrap();
         report.marker_checks = checks;

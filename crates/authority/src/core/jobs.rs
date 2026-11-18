@@ -2110,6 +2110,20 @@ impl Core {
             })
     }
 
+    /// Whether the lease's release CAS is out, or its outcome is still
+    /// being read back (`Phase::Release` / `Phase::ReleaseReread`) while
+    /// `releasing` holds. From the send on, S3 may have let go already, so a
+    /// peer may claim without a TTL wait (ADR-22); the node is fenced and
+    /// can acknowledge no new write. The single-authority sampler does not
+    /// count such a node's S3 lease as an authority, provided the node
+    /// reports itself closed to new mutations.
+    pub fn release_cas_out(&self) -> bool {
+        self.lease.releasing
+            && self.job.as_ref().is_some_and(|job| {
+                matches!(job.phase, Phase::Release | Phase::ReleaseReread { .. })
+            })
+    }
+
     pub(crate) fn lease_cas_in_flight(&self) -> bool {
         match &self.job {
             None => false,

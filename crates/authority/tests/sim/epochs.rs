@@ -33,6 +33,9 @@ use std::time::Duration;
 thread_local! {
     /// Authority samples taken by this thread's run.
     pub static SAMPLES: Cell<u64> = const { Cell::new(0) };
+    /// Node-samples whose usable S3 lease was not counted as an authority
+    /// because the node's release CAS was out and it was fenced.
+    pub static FENCED_RELEASE: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The fault: see `FaultKind::EpochOutage`.
@@ -482,12 +485,52 @@ fn s3_lease_usable(clock: &super::clock::Clock, honour_end: i64, margin: i64) ->
     honour_end != 0 && clock.peek_honour().0 < honour_end - margin
 }
 
+/// How the sampler counts one node's usable-or-not S3 lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3Auth {
+    /// The node could acknowledge a write now.
+    Counted,
+    /// The lease is not usable on the node's own clock.
+    NotAuthority,
+    /// The release CAS is out and the node reports itself closed to new
+    /// mutations: S3 may already have let go, and the node acknowledges
+    /// nothing. Left out of the count, and counted in
+    /// `Report::fenced_release_samples`.
+    FencedRelease,
+    /// The release CAS is out yet the node still admits new mutations: the
+    /// fence the exclusion rests on is broken. A split brain on its own.
+    Breach,
+}
+
+/// The sampler's verdict on one node holding an S3 lease. `usable` is the
+/// lease on the node's honour clock, `release_cas_out` is
+/// `Core::release_cas_out`, `admits` is `LeaseView::open_for_new_mutation`.
+///
+/// The oracle's definition of an authority is "could acknowledge a write
+/// now" (the model's `single_authority`, `crates/model/src/flex.rs`). An S3
+/// holder could while its lease is usable, except from the moment its
+/// release CAS is out: only then can S3 let go without a TTL wait, so a
+/// successor may claim at once (ADR-22) and the releaser, fenced, can ack
+/// nothing. A flush or `PersistRelease` (CAS not yet sent) still counts.
+/// Paused nodes count like any other: a paused holder with a usable lease is
+/// the classic GC-pause authority.
+pub fn s3_authority(usable: bool, release_cas_out: bool, admits: bool) -> S3Auth {
+    match (usable, release_cas_out, admits) {
+        (false, _, _) => S3Auth::NotAuthority,
+        (true, false, _) => S3Auth::Counted,
+        (true, true, false) => S3Auth::FencedRelease,
+        (true, true, true) => S3Auth::Breach,
+    }
+}
+
 /// Every 25 ms: no continuation-epoch hold alongside another node's
 /// usable S3 lease or another hold (plan 30 §M10's `single_authority`).
 /// A node's S3 lease is usable while its own clock reads before
-/// `expires − margin` (`LeaseView::usable`).
+/// `expires - margin` (`LeaseView::usable`). See [`s3_authority`] for what
+/// counts as an authority.
 pub async fn sample_authority(cluster: Arc<Cluster>) {
     SAMPLES.with(|s| s.set(0));
+    FENCED_RELEASE.with(|s| s.set(0));
     loop {
         tokio::time::sleep(Duration::from_millis(25)).await;
         SAMPLES.with(|s| s.set(s.get() + 1));
@@ -504,8 +547,20 @@ pub async fn sample_authority(cluster: Arc<Cluster>) {
             }
             if let Some((epoch, honour_end, _)) = v.s3_held {
                 let margin = (cluster.env.config)(id, 1).expiry_margin_ms as i64;
-                if s3_lease_usable(&node.clock, honour_end, margin) {
-                    leases.push((id, epoch));
+                let usable = s3_lease_usable(&node.clock, honour_end, margin);
+                match s3_authority(usable, v.release_cas_out, v.admits) {
+                    S3Auth::Counted => leases.push((id, epoch)),
+                    S3Auth::NotAuthority => {}
+                    S3Auth::FencedRelease => FENCED_RELEASE.with(|s| s.set(s.get() + 1)),
+                    S3Auth::Breach => {
+                        let what = format!(
+                            "t={} node {id} S3 lease epoch {epoch}: release CAS out yet open \
+                             for new mutation",
+                            cluster.env.clock.elapsed_ms()
+                        );
+                        tracing::error!("{what}");
+                        cluster.split_brains.lock().unwrap().push(what);
+                    }
                 }
             }
         }
@@ -548,5 +603,22 @@ mod tests {
             ahead <= constellation_types::clock::SUSPEND_PAD_MS + 5,
             "honour {ahead} ms ahead of wall after one suspend"
         );
+    }
+
+    /// The classifier's four cases (and the unusable lease).
+    #[test]
+    fn s3_authority_classifies_the_release_states() {
+        // Not releasing: an authority, whatever `admits` says.
+        assert_eq!(s3_authority(true, false, true), S3Auth::Counted);
+        assert_eq!(s3_authority(true, false, false), S3Auth::Counted);
+        // Releasing with no CAS out yet (flush, `PersistRelease`): still
+        // counted, `release_cas_out` is false there.
+        assert_eq!(s3_authority(true, false, false), S3Auth::Counted);
+        // CAS out and fenced: left out.
+        assert_eq!(s3_authority(true, true, false), S3Auth::FencedRelease);
+        // CAS out yet admitting: a split brain on its own.
+        assert_eq!(s3_authority(true, true, true), S3Auth::Breach);
+        // An unusable lease is no authority in any state.
+        assert_eq!(s3_authority(false, true, true), S3Auth::NotAuthority);
     }
 }

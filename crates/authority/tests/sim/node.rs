@@ -105,6 +105,13 @@ pub struct CoreView {
     /// its wait clock)` of an S3 lease this node holds (the ends are 0 when
     /// its body is not this incarnation's: unusable).
     pub s3_held: Option<(u64, i64, i64)>,
+    /// `Core::release_cas_out`: the lease's release CAS is out (or its
+    /// outcome is being read back), so S3 may already have let go.
+    pub release_cas_out: bool,
+    /// `LeaseView::open_for_new_mutation` now: whether the node could take
+    /// a new local mutation (read without moving the node's clock). With
+    /// `plant_release_admits` the release fence is ignored.
+    pub admits: bool,
     /// Plan 30 §M11.
     pub delegation: constellation_authority::core::DelegView,
     /// Plan 30 §M14: lock requests in flight (node side), waiters parked
@@ -519,6 +526,10 @@ pub struct NodeEnv {
     pub rebuild_stub: bool,
     /// See `SimConfig::plant_ungated_fast_path`.
     pub plant_ungated_fast_path: bool,
+    /// Test-only (`release_fence_is_judged_not_assumed`): the node's
+    /// published `admits` ignores the release fence, as a node would that
+    /// kept taking mutations with its release CAS out.
+    pub plant_release_admits: bool,
     /// See `SimConfig::skip_deleg_dep_wait`.
     pub skip_deleg_dep_wait: bool,
     /// See `SimConfig::ttl_reclaims_sticky`.
@@ -1024,6 +1035,7 @@ impl NodeHandle {
             versions_seen_retags: 0,
             rebuild_stub: env.rebuild_stub,
             plant_ungated_fast_path: env.plant_ungated_fast_path,
+            plant_release_admits: env.plant_release_admits,
             plant_claim_root_group_on_lone: env.plant_claim_root_group_on_lone,
         };
         let task = tokio::spawn(driver.run());
@@ -1377,6 +1389,7 @@ struct Driver {
     versions_seen_retags: u64,
     rebuild_stub: bool,
     plant_ungated_fast_path: bool,
+    plant_release_admits: bool,
     plant_claim_root_group_on_lone: bool,
 }
 
@@ -3110,6 +3123,22 @@ impl Driver {
         }
         view.claim = self.core.epoch_claim_view(now);
         view.epoch_held = lease.epoch_held();
+        view.release_cas_out = self.core.release_cas_out();
+        view.admits = {
+            let now = constellation_authority::Now {
+                wall: self.clock.wall(),
+                honour: self.clock.peek_honour(),
+                wait: self.clock.wait(),
+                boot: self.step_now.boot,
+            };
+            if self.plant_release_admits {
+                // The fence (`fenced()`) forgotten: only usability and the
+                // handoff pause bound admission.
+                lease.usable(now, self.core.config())
+            } else {
+                lease.open_for_new_mutation(now, self.core.config())
+            }
+        };
         view.s3_held = match &lease.held {
             Some((l, _)) if !lease.lost && !lease.epoch_held() && l.holder == self.id => {
                 // The lease's end on this node's honour clock, 0 when the
