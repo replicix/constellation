@@ -473,6 +473,10 @@ pub(crate) struct PendingDelegate {
     /// ADR-59 part B (a stream holder's drop): `idx` is this node's own
     /// position for the row, not a root's append of another node's row.
     pub own: bool,
+    /// The row is a release record only (`Meta::delegate_release` checked
+    /// that every record is a `StreamReleased` / `SubtreeReleased`): it
+    /// executes no op, so the gate fence of `Meta::begin_local` lets it by.
+    pub release_only: bool,
 }
 
 impl PendingDelegate {
@@ -487,6 +491,23 @@ impl PendingDelegate {
                 idx,
                 deps,
                 own: false,
+                release_only: false,
+            }))
+        });
+        PendingDelegateGuard
+    }
+
+    /// Like [`Self::set`] for a row of release records only, the one write
+    /// the gate fence lets through on an ended generation. Only
+    /// `Meta::delegate_release` calls it, after checking the records.
+    pub(crate) fn set_release(gen: u64, deps: crate::session::Position) -> PendingDelegateGuard {
+        PENDING_DELEGATE.with(|c| {
+            c.set(Some(PendingDelegate {
+                gen,
+                idx: None,
+                deps,
+                own: false,
+                release_only: true,
             }))
         });
         PendingDelegateGuard
@@ -506,6 +527,7 @@ impl PendingDelegate {
                 idx: Some(idx),
                 deps,
                 own: true,
+                release_only: false,
             }))
         });
         PendingDelegateGuard

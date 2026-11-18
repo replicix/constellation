@@ -13464,8 +13464,17 @@ impl Core {
     /// sim fails it), when the stream is not installed here, when a release
     /// row is in the journal already (a root's own release the restart
     /// interrupted), or when the stream cannot release by a row (a lost
-    /// dependency, rows its tenure has not committed: the end cuts as
-    /// before, counted).
+    /// dependency: the end cuts as before, counted).
+    ///
+    /// Unlike `release_subtrees`, the claim journals the row above holder
+    /// appends the tenure has not committed (the re-appended own rows of a
+    /// stranding takeover gate): there the cap protects a capped cut and the
+    /// L2b seal, and the claim's end caps nothing (its cut is
+    /// `cursor.max(delegate_idx)`, the row itself). The claimant's journal is
+    /// the root's, and the ship plan orders a stream's rows by index as an
+    /// exclusive key, so the row ships only after every lower row of its
+    /// stream. A gate-ended generation lets the row through the store's
+    /// fence (`Meta::delegate_release`: release records only).
     pub(super) fn claim_releases(&mut self, gen: u64, non_stealable: bool, replica: &dyn Replica) {
         let me = self.me();
         // (Durable: the re-ship's transaction marks the generations whose
@@ -13495,9 +13504,7 @@ impl Core {
         // journal is the root's: its own rows are all here, the seal has
         // nothing to ask.)
         let idx = replica.delegate_idx(gen);
-        if idx > self.holder_append_cap(gen, replica)
-            || self.deleg_find_lost(gen, replica).is_some()
-        {
+        if self.deleg_find_lost(gen, replica).is_some() {
             self.stats.claim_release_rowless += 1;
             return;
         }

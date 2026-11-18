@@ -85752,6 +85752,67 @@ mod root_own_sticky {
         assert_eq!(releases(&after), 1, "the claim journaled a second release");
     }
 
+    /// Plan 46 M1.3 step 12, seed 226's second finding: the claim comes
+    /// through a takeover gate that ended the generation (the store's fence
+    /// refused a delegate's own write under it) and left the stream's rows
+    /// as unshipped holder appends of the new tenure (the cap was below
+    /// them). The release row is journaled all the same, above every earlier
+    /// row of the stream. Fails on the parent: `claim_release_rowless == 1`.
+    #[test]
+    fn a_claim_through_a_stranding_gate_journals_the_release_row() {
+        let (mut h, _dirs, gen, record) = restarted_root_with_own_stream();
+        // The gate's strand marks the generation ended, and re-appends the
+        // stream's rows as unshipped holder appends of the new tenure (above
+        // the cap).
+        h.meta.strand_for_takeover(2, &[gen], None).unwrap();
+        assert!(h.meta.deleg_ended_at_gate(gen).unwrap());
+        let mut idx = h.meta.delegate_idx(gen).unwrap();
+        for n in 0..2u64 {
+            idx += 1;
+            let rid = Rid {
+                node: 1,
+                incarnation: 1,
+                seq: 900 + n,
+            };
+            crate::replica::Replica::apply_backup_tx_journaled(
+                &h.meta,
+                &[LogRecord::Completed { rid }],
+                Some(rid),
+                (gen, idx),
+            )
+            .unwrap();
+        }
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.holder_append_cap(gen, &h.meta) < h.meta.delegate_idx(gen).unwrap(),
+            "the setup left the cap above the stream's rows: cap {} idx {} tip {} appends {:?}",
+            h.core.holder_append_cap(gen, &h.meta),
+            h.meta.delegate_idx(gen).unwrap(),
+            h.meta.holder_append_tip(),
+            h.meta.holder_appends(gen)
+        );
+        claim(&mut h);
+        assert_eq!(h.core.stats.claim_released, 1);
+        assert_eq!(h.core.stats.claim_release_rowless, 0);
+        let release = release_row_idx(&h, gen, record).expect("no release row");
+        assert!(release > idx, "release {release} not above the rows {idx}");
+    }
+
+    /// The fence alone (nothing above the cap): a gate-ended generation
+    /// takes the claim's release row. Fails on the parent: the store refuses
+    /// it `NotAdmitted` and the claim goes rowless.
+    #[test]
+    fn a_claim_over_a_gate_ended_generation_journals_the_release_row() {
+        let (mut h, _dirs, gen, record) = restarted_root_with_own_stream();
+        h.meta.strand_for_takeover(2, &[gen], None).unwrap();
+        assert!(h.meta.deleg_ended_at_gate(gen).unwrap());
+        claim(&mut h);
+        assert_eq!(h.core.stats.claim_released, 1);
+        assert_eq!(h.core.stats.claim_release_rowless, 0);
+        assert!(release_row_idx(&h, gen, record).is_some());
+    }
+
     /// Review S7: a stream whose own rows the takeover gate replayed by rid
     /// gets no release row, and the sim's counter sees it.
     #[test]

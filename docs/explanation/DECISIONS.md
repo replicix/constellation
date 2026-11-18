@@ -5599,7 +5599,31 @@ ahead of rows it covers.
   rid (the row would precede root rows the log lacks; counted in
   `claim_own_rows_halted_non_stealable`, which the sim fails), when the stream
   is not installed, when a release row is in the journal already, or when the
-  stream cannot release by a row (counted in `claim_release_rowless`).
+  stream cannot release by a row (a lost dependency; counted in
+  `claim_release_rowless`). Rows the tenure has not committed are no reason for
+  no row (`release_subtrees` goes rowless above its cap to protect a capped cut
+  and the L2b seal; the claim's end caps nothing, its cut is the release row).
+- **The gate-fence exemption.** A claim through a stranding takeover gate (a
+  self-sealed holder re-claiming its own lease, `reappend_own_delegate_rows`)
+  finds its generation marked ended at the gate and its rows re-appended as
+  unshipped holder appends. The fence of `Meta::begin_local` (da4124cf, "the
+  gate's ended generation executes nothing") refuses any delegate write of such
+  a generation; the release row alone passes it: `Meta::delegate_release`
+  journals through `PendingDelegate::set_release` and refuses every record that
+  is not `StreamReleased` / `SubtreeReleased` (`MetaError::Invalid`, nothing
+  written). `delegate_execute`, `delegate_refusal` and every other path stay
+  fenced. Why a release-only row past the fence cannot do harm: (1) it executes
+  no op, carries no rid and touches no namespace key, so nothing runs ahead of
+  the gate's replay by rid, which is unchanged (exactly-once); (2) it is the
+  stream's next row (`idx` assigned in `finish_local` as for any row) and the
+  ship plan orders a stream's rows by index as an exclusive key (`held.rs`
+  `Walk::step`), so it ships only after every lower row, held rows included,
+  and no later row of any stream is shipped ahead of a held one because of it;
+  (3) the end's cut is that row, which the log reaches when the held rows ship
+  or a `DropHeld` fills them (causal cut and acked-at-or-below-cut unchanged);
+  (4) it hands no lock or grant to a third node: the claimant is root and
+  holder, and the stream is `stopped` from the row on. Without it the claim's
+  end was rowless (seed 226 of `far-root-writes+lost-chunk-late`).
 - The end waits (`Core::claim_end`, re-checked on every event and on the
   holder's release timer) while the stream holds a pending drop or one of its
   rows is held back from shipping (`journal_held_back`), at most

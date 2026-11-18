@@ -701,9 +701,12 @@ impl Meta {
         // mirror of the delegation table lags the core by an event, so an
         // op admitted before the strand reaches this lock after it; the
         // store is the fence. The root's append of a delegate's row
-        // (`idx: Some`) is not an execution of this node's.
+        // (`idx: Some`) is not an execution of this node's, and neither is
+        // a release row (`release_only`: it executes no op and touches no
+        // namespace key, ADR-60).
         if let Some(d) = journal::PendingDelegate::peek() {
             if d.idx.is_none()
+                && !d.release_only
                 && kv_get_tx(tx, &self.local, &deleg_ended_at_gate_key(d.gen))?.is_some()
             {
                 return Err(MetaError::NotAdmitted);
@@ -1482,7 +1485,22 @@ impl Meta {
         gen: u64,
         deps: crate::session::Position,
     ) -> Result<u64, MetaError> {
-        let _d = journal::PendingDelegate::set(gen, None, deps);
+        // The one write the gate fence of `begin_local` lets through on a
+        // generation the takeover gate ended: only release records, which
+        // execute no op, so anything else is refused here, before a row.
+        if records.is_empty()
+            || !records.iter().all(|r| {
+                matches!(
+                    r,
+                    LogRecord::StreamReleased { .. } | LogRecord::SubtreeReleased { .. }
+                )
+            })
+        {
+            return Err(MetaError::Invalid(
+                "a delegate's release row carries release records only".into(),
+            ));
+        }
+        let _d = journal::PendingDelegate::set_release(gen, deps);
         self.apply_records_journaled_inner(records, None, Journaled::Plain)?;
         self.delegate_idx(gen)
     }
@@ -3375,6 +3393,85 @@ mod root_substitution_tests {
         assert_eq!(meta.deleg_group_at(5, before), Some(0));
         assert_eq!(meta.deleg_group_at(5, after), Some(1));
         assert_eq!(meta.deleg_group_at(6, after), None);
+    }
+
+    /// ADR-60: the gate fence lets one write through on a generation the
+    /// takeover gate ended, the release row of a claim, and nothing else: an
+    /// op (`delegate_execute`) is still refused `NotAdmitted`, and
+    /// `delegate_release` itself refuses any record that is not a release
+    /// (`Invalid`), an op's records alone, mixed with a release, or none,
+    /// with nothing written. On the parent the release row is refused too.
+    #[test]
+    fn a_gate_ended_generation_takes_a_release_row_and_nothing_else() {
+        let meta = Meta::open_in_memory().unwrap();
+        let tag = crate::locks::LockTag::NONE;
+        let create = |name: &str, n: u64| MutateOp::Create {
+            parent: ROOT_INO,
+            name: name.into(),
+            ino: (3 << 40) | n,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = |seq| Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        };
+        meta.strand_for_takeover(2, &[5], None).unwrap();
+        assert!(meta.deleg_ended_at_gate(5).unwrap());
+        // The release row is not an execution: a stream release journals as
+        // the stream's next row on the ended generation, but nothing else
+        // gets through the exemption.
+        let release = |gen| {
+            [LogRecord::StreamReleased {
+                node: 1,
+                gen,
+                through: 0,
+            }]
+        };
+        let journal = meta.journal_len().unwrap();
+        let idx = meta
+            .delegate_release(&release(5), 5, Default::default())
+            .unwrap_or_else(|e| panic!("the release row was refused: {e:?}"));
+        assert_eq!(idx, 1, "the stream's next row");
+        assert!(meta.journal_len().unwrap() > journal);
+        // Still fenced after it: an op under the ended generation, and any
+        // record that is not a release through `delegate_release`.
+        let journal = meta.journal_len().unwrap();
+        let refused = meta.delegate_execute(
+            &create("f4", 4),
+            Some(rid(4)),
+            5,
+            Default::default(),
+            &tag,
+            Now::same(0),
+        );
+        assert!(
+            matches!(refused, Err(MetaError::NotAdmitted)),
+            "{refused:?}"
+        );
+        let (op_records, _) = Meta::open_in_memory()
+            .unwrap()
+            .delegate_execute(
+                &create("f4", 4),
+                Some(rid(4)),
+                5,
+                Default::default(),
+                &tag,
+                Now::same(0),
+            )
+            .unwrap();
+        let mixed: Vec<LogRecord> = release(5).into_iter().chain(op_records.clone()).collect();
+        for records in [op_records, mixed, Vec::new()] {
+            let refused = meta.delegate_release(&records, 5, Default::default());
+            assert!(
+                matches!(refused, Err(MetaError::Invalid(_))),
+                "{records:?}: {refused:?}"
+            );
+        }
+        assert_eq!(meta.journal_len().unwrap(), journal, "nothing was written");
+        assert!(meta.lookup(ROOT_INO, "f4").unwrap().is_none());
     }
 
     /// A takeover's strand of this node's own delegate rows takes them out
