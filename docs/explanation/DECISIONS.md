@@ -5360,9 +5360,16 @@ is the consequence of that record being in the log.**
   reach the log by right journals the record: the lease holder for root rows;
   the holder of a delegation stream's grant for that stream's rows, a deposed
   root's own sticky stream included (`far-placement+lost-chunk` 326: the
-  deposed root kept its stream with the seed in it, and no node could decide), and a restarted
-  remnant that still holds its release row included (`far-root-writes+lost-chunk-late`
-  996: its stream is the only path the rows and the release reach the log).
+  deposed root kept its stream with the seed in it, and no node could decide),
+  and a restart's remnant whose release row is still to ship, `rebooted` or
+  not, and with no `lost_from` (`far-root-writes+lost-chunk-late` 996: its
+  stream is the only path the rows and the release reach the log). A remnant
+  marked `rebooted` may decide because the held row and every row after it
+  never left its journal (the stream ships in order and stops at the held
+  row, a remnant has no backup), so no copy at the record's index exists
+  elsewhere to be overwritten; that holds for rows behind a hold only.
+  Other stopped streams (a live holder's whole release, a lapsed or
+  backup-sealed one, a gate-ended one) do not qualify.
   A stream holder's record is the stream's own row at the seed's index (the
   lowest rolled-back one), with `fills` for the stream's other rolled-back
   positions, and its identities are the stream positions

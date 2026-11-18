@@ -780,12 +780,14 @@ impl Core {
             )
         } else {
             // A restart's remnant that still ships its release row holds the
-            // stream too (`ships_remnant_release`).
+            // stream too, `rebooted` or not (`remnant_decides_held_drop`:
+            // the held rows never left this journal, so no copy at the
+            // record's index can differ).
             let holds = |gen: u64| {
-                self.dl
-                    .mine
-                    .get(&gen)
-                    .is_some_and(|d| !d.stopped || d.ships_remnant_release())
+                self.dl.mine.get(&gen).is_some_and(|d| {
+                    !d.stopped
+                        || (d.remnant_decides_held_drop() && !replica.deleg_ended_at_gate(gen))
+                })
             };
             replica.drop_held_in_stream(
                 ino,

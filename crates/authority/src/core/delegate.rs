@@ -991,15 +991,29 @@ pub(crate) struct DelegateState {
 }
 
 impl DelegateState {
-    /// A restart's remnant (no subtree left, stopped) whose release row is
-    /// still to ship: the stream is the only path its rows, and so the
-    /// release, reach the log, so this node is the stream's decider for a
-    /// drop of its held rows (ADR-59 part B, D1). Without it the rows held
-    /// behind a lost chunk keep the release from the root and the sticky
-    /// stream never ends. No other stopped state qualifies: the rows of a
-    /// gate-ended stream are stranded, not shipped by the stream.
-    pub(crate) fn ships_remnant_release(&self) -> bool {
-        self.dirs.is_empty()
+    /// A restart's remnant (installed again after the restart for a release
+    /// row nobody acknowledged yet) whose release row is still to ship: the
+    /// stream is the only path its rows, and so the release, reach the log,
+    /// so this node is the stream's decider for a drop of its held rows
+    /// (ADR-59 part B, D1). Without it the rows held behind a lost chunk keep
+    /// the release from the root and the sticky stream never ends.
+    ///
+    /// Only a remnant qualifies, and never one with `lost_from` set: the
+    /// stream sends nothing at or after `lost_from`, so a record there would
+    /// never ship and the plan would wait for a log that cannot carry it. A
+    /// remnant marked `rebooted` may decide: it is installed on a boot after
+    /// the one that held the stream, and a rebooted stealable holder is
+    /// otherwise never taken up again. That is safe because the held row and
+    /// every row after it never left this journal (the stream ships in order
+    /// and stops at the held row, a remnant has no backup), so no copy of
+    /// the row at the record's index exists elsewhere to be overwritten. The
+    /// argument holds for rows behind a hold only. A live holder's whole
+    /// release, a lapsed or backup-sealed stream and a gate-ended one do not
+    /// qualify.
+    pub(crate) fn remnant_decides_held_drop(&self) -> bool {
+        self.remnant
+            && self.lost_from.is_none()
+            && self.dirs.is_empty()
             && !self.release_acked
             && self.release.as_ref().is_some_and(|r| r.row.is_some())
     }

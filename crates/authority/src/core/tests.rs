@@ -76118,7 +76118,7 @@ mod step4_sticky {
 mod step5_sticky_release {
     use super::*;
     use crate::core::delegate::RecallPhase;
-    use crate::core::tests::await_retry::{drain, drop_held_decide_via_core};
+    use crate::core::tests::await_retry::drop_held_decide_via_core;
     use crate::core::{DelegKind, Timer};
     use crate::replica::Replica;
     use constellation_fs_core::{ChunkInfo, Manifest};
@@ -76523,15 +76523,12 @@ mod step5_sticky_release {
         assert!(h.core.dl.mine[&7].release.is_none());
     }
 
-    /// `far-root-writes+lost-chunk-late` 996: a restart installs the stream
-    /// as a remnant (stopped, no subtree) whose release row sits behind a row
-    /// held on a lost chunk. The remnant's stream is the only path the rows
-    /// reach the log, so its node decides the in-stream drop of them
-    /// (ADR-59 part B, D1) although it is not the sequencer. Fails without
-    /// `DelegateState::ships_remnant_release`: the drop is refused ("not all
-    /// rows of a stream it holds") and the stream never ends.
-    #[test]
-    fn a_remnant_holding_its_release_row_decides_the_drop_of_its_held_rows() {
+    /// A restarted holder's remnant of sticky stream 7: its seed row (a
+    /// manifest naming a chunk that is lost) never shipped (held), its
+    /// release row is journaled behind it, and node 1 holds the lease (this
+    /// node is not the sequencer). Returns the harness, the seed's inode and
+    /// the seed's index in the stream.
+    fn remnant_behind_a_held_seed() -> (Harness, constellation_fs_core::Ino, u64) {
         let (mut h, _dirs) = sticky_holder(&["a"]);
         let broken = h.meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
         let seqs: Vec<u64> = MetaStore::take_journal(&h.meta, usize::MAX)
@@ -76564,21 +76561,26 @@ mod step5_sticky_release {
         h.meta
             .delegate_execute(&seed, Some(rid), 7, Default::default(), &tag, Now::same(0))
             .unwrap();
-        // The release waits for the rows before it to sync and stream, then
-        // journals; the chunk is lost after (the row stays unshipped to the
-        // log: a restart's remnant meets it held).
-        let out = release(&mut h, 50, Vec::new(), false);
-        let out = flush(&mut h, &out);
-        let (req, round, last) =
-            batch(&out).unwrap_or_else(|| panic!("the row was not sent: {out:?}"));
-        h.step(stream_ack(1, req, round, last));
-        h.advance(250);
-        drain(&mut h);
-        assert!(last_is_release(&h), "{:?}", rows(&h));
+        // The chunk is pending, then lost, before the stream sends the seed:
+        // it stays in the journal. The release row (as a claim journals it)
+        // lands behind it.
         h.meta.add_pending_upload(&lost, broken).unwrap();
         h.meta
             .note_unrecoverable_chunks(&[(lost, broken)], false)
             .unwrap();
+        let seed_idx = Replica::delegate_idx(&h.meta, 7);
+        let through = seed_idx;
+        Replica::delegate_release(
+            &h.meta,
+            &[LogRecord::StreamReleased {
+                node: 3,
+                gen: 7,
+                through,
+            }],
+            7,
+            Position::ZERO,
+        )
+        .unwrap();
         // The restart: the core's memory is gone, the journal stays.
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
@@ -76586,18 +76588,73 @@ mod step5_sticky_release {
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let d = &h.core.dl.mine[&7];
-        assert!(d.stopped && d.release.is_some() && d.dirs.is_empty());
+        assert!(d.stopped && d.remnant && d.dirs.is_empty());
+        assert!(d.release.as_ref().is_some_and(|r| r.row.is_some()));
+        assert!(d.lost_from.is_none() && !d.release_acked);
         // Not the sequencer: node 1 holds the lease.
         assert!(h.core.lease.held.is_none());
-        let out = drop_held_decide_via_core(&mut h, broken);
-        let done = out.iter().find_map(|a| match a {
-            Action::ControlDone { result, .. } => Some(result.clone()),
+        (h, broken, seed_idx)
+    }
+
+    /// The answer of `repair drop-held` in `out`: none while it waits for
+    /// the log to carry the record.
+    fn drop_answer(out: &[Action]) -> Option<Result<(), String>> {
+        out.iter().find_map(|a| match a {
+            Action::ControlDone { result, .. } => Some(result.clone().map(|_| ())),
             _ => None,
-        });
-        if let Some(Err(e)) = &done {
+        })
+    }
+
+    /// `far-root-writes+lost-chunk-late` 996: a restart installs the stream
+    /// as a remnant (stopped, no subtree) whose release row sits behind a row
+    /// held on a lost chunk (never shipped). The remnant's stream is the only
+    /// path the rows reach the log, so its node decides the in-stream drop of
+    /// them (ADR-59 part B, D1) although it is not the sequencer: the plan is
+    /// the stream's own row at the seed's index. Fails without
+    /// `DelegateState::remnant_decides_held_drop`: the drop is refused ("not
+    /// all rows of a stream it holds") and the stream never ends.
+    #[test]
+    fn a_remnant_holding_its_release_row_decides_the_drop_of_its_held_rows() {
+        let (mut h, broken, seed_idx) = remnant_behind_a_held_seed();
+        let out = drop_held_decide_via_core(&mut h, broken);
+        if let Some(Err(e)) = drop_answer(&out) {
             panic!("the remnant's drop was refused: {e}");
         }
         assert_eq!(h.core.stats.drops_decided, 1, "{out:?}");
+        assert_eq!(
+            Replica::drop_plan_of(&h.meta, broken),
+            Some(Some((7, seed_idx)))
+        );
+    }
+
+    /// The predicate's limits: each of these is refused, as before the fix.
+    #[test]
+    fn only_a_remnant_with_its_release_to_ship_decides_the_drop_of_held_rows() {
+        type Break = fn(&mut crate::core::delegate::DelegateState);
+        let cases: [(&str, Break); 4] = [
+            ("the release is acknowledged", |d| d.release_acked = true),
+            ("a subtree is left", |d| {
+                d.dirs.insert(ROOT_INO);
+            }),
+            ("a stopped stream that is not a remnant", |d| {
+                d.remnant = false
+            }),
+            ("lost_from is set", |d| d.lost_from = Some(1)),
+        ];
+        for (name, mutate) in cases {
+            let (mut h, broken, _) = remnant_behind_a_held_seed();
+            mutate(h.core.dl.mine.get_mut(&7).unwrap());
+            let out = drop_held_decide_via_core(&mut h, broken);
+            let err = drop_answer(&out)
+                .unwrap_or_else(|| panic!("{name}: not answered"))
+                .expect_err(name);
+            assert!(
+                err.contains("not all rows of a stream it holds"),
+                "{name}: {err}"
+            );
+            assert_eq!(h.core.stats.drops_decided, 0, "{name}");
+            assert_eq!(Replica::drop_plan_of(&h.meta, broken), None, "{name}");
+        }
     }
 
     /// The remnant is not limited to non-stealable streams (a stream that
