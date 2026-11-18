@@ -2713,6 +2713,17 @@ impl Meta {
             ),
             ts_unix: now_unix,
         };
+        // The rolled-back rows with no rid at all (a local manifest commit, a
+        // snapshot row) are queued under the synthetic one by the strand, and
+        // a seed is named by it here when nothing was queued.
+        let mut synthetic_seed_rids: Vec<crate::rid::Rid> = Vec::new();
+        for row in walked
+            .rows
+            .iter()
+            .filter(|row| row.in_s && row.rid.is_none())
+        {
+            synthetic_seed_rids.push(spec::replay_rid_for(&tx, self, row.first)?);
+        }
         // Each seed: its queued replay becomes a refused one carrying the
         // manifest with the lost chunks as holes, so the drain makes the
         // conflict copy and never re-executes the seed.
@@ -2729,12 +2740,27 @@ impl Meta {
                 continue;
             };
             let queued = spec::queued_class_at(&tx, self, *origin)?;
-            let rid = match queued {
-                Some((rid, _)) => rid,
-                None => spec::replay_rid_for(&tx, self, t.first)?,
+            // The seed's own rid and class, as the walk read them before the
+            // strand deleted its journal row: a stream row this node appended
+            // (a root's own, re-appended after it re-took its lease) is never
+            // queued, yet has a real rid, the one the record names.
+            let own = walked.rows.iter().find(|row| row.first == t.first);
+            let own_rid = own.and_then(|row| row.rid);
+            let own_class = own.and_then(|row| row.class);
+            let rid = match (queued, own_rid) {
+                (Some((rid, _)), _) => rid,
+                (None, Some(rid)) => rid,
+                (None, None) => spec::replay_rid_for(&tx, self, t.first)?,
             };
-            // (A seed with no queued replay cannot be told: listed.)
-            if queued.is_none_or(|(rid, class)| may_have_left(rid, class)) {
+            // (A seed with no queued replay is listed unless its own row's
+            // class says its answer certainly has not left; one with no rid
+            // or class cannot be told: listed.)
+            let may_leave = match (queued, own_rid, own_class) {
+                (Some((rid, class)), _, _) => may_have_left(rid, class),
+                (None, Some(rid), Some(class)) => may_have_left(rid, class),
+                _ => true,
+            };
+            if may_leave {
                 acked_lost.push((rid, format!("wrote chunk(s) of inode {ino} that are gone")));
             }
             let op = MutateOp::SetManifest {
@@ -2830,6 +2856,14 @@ impl Meta {
             rolled_back.push(queued.rid);
             queued_dropped += 1;
         }
+        // The node never reports a loss the record does not name.
+        debug_assert!(
+            acked_lost.iter().all(|(rid, _)| plan.rids.contains(rid)
+                || plan.queued.iter().any(|(_, q)| q == rid)
+                || synthetic_seed_rids.contains(rid)),
+            "the apply of the drop of inode {ino} lists a loss the DropHeld does not name: \
+             {acked_lost:?}"
+        );
         // A seed gone from the journal by now (a dropper restarted after its
         // record shipped, the successor's re-ship or a deposition took it)
         // is still lost to its writer: the decision's list stands.
@@ -3441,6 +3475,9 @@ struct WalkedRow {
     /// Rolled back (else redone in place).
     in_s: bool,
     rid: Option<crate::rid::Rid>,
+    /// The class the row was journaled under, from the `journal_tx` row
+    /// (`None` when the row was not there). Read before anything strands it.
+    class: Option<local::RowCommit>,
 }
 
 /// What [`walk_drop`] found.
@@ -3534,6 +3571,7 @@ fn walk_drop(
             appended: row.as_ref().is_some_and(|row| row.appended),
             in_s,
             rid,
+            class: row.as_ref().map(|row| row.class),
         });
         if !in_s {
             out.redone.push((spec_seq, rid));
