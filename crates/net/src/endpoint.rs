@@ -2132,6 +2132,12 @@ impl P2p {
         self.allow.lock().unwrap().replace(keys);
     }
 
+    /// Add keys to the allowlist without removing any (a registry scan
+    /// that did not read every record).
+    pub fn extend_allowed(&self, keys: impl IntoIterator<Item = String>) {
+        self.allow.lock().unwrap().extend(keys);
+    }
+
     pub fn allowed_len(&self) -> usize {
         self.allow.lock().unwrap().len()
     }
@@ -2257,8 +2263,9 @@ impl P2p {
             // No signature on a direct stream: the connection is TLS 1.3
             // with raw public keys, so `remote_id()` is the key the peer
             // proved in the handshake, and that is the author of the reply.
-            // Frames are never sent as 0-RTT early data (replayable), and
-            // nothing here may start to.
+            // Frames are never sent as 0-RTT early data (replayable): iroh
+            // enables it in the TLS config without a switch, so clippy's
+            // `disallowed-methods` forbids `into_0rtt`.
             ensure_remote(&conn, expect)?;
             write_payload(&mut send, payload).await?;
             send.finish().ok();

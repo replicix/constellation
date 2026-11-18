@@ -1,0 +1,9 @@
+# Direct-stream frames carry no signature, so none may go out as 0-RTT early
+# data (replayable). iroh's TLS config enables early data and exposes no
+# switch, so the only guard is that nothing calls these (docs/explanation/
+# DECISIONS.md, the ADR on unsigned direct streams). A crate with its own
+# clippy.toml repeats the entries (a nearer file replaces this one).
+disallowed-methods = [
+    { path = "iroh::endpoint::Connecting::into_0rtt", reason = "unsigned direct-stream frames must never be sent as replayable 0-RTT early data" },
+    { path = "iroh::endpoint::Accepting::into_0rtt", reason = "unsigned direct-stream frames must never be read as replayable 0-RTT early data" },
+]

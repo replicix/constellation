@@ -70911,6 +70911,18 @@ The maintainer approved it after a security review ("safe with changes"); the re
 - **Open item (not fixed here).** `Payload::EpochActivate` is not tied to its proposer: it carries no check that the sender is the epoch's
   proposer, on gossip or on a stream, so any enrolled node can send one naming another proposer. Found by the O2 security review; independent of
   O2 (the signature never bound it either). Needs its own change.
+- **Open items from the security review (not fixed here; none comes from O2, the old signature never bound them either).**
+  - `Payload::LeaseOffer { part, epoch }` names no offerer: any enrolled node can make a node act as if its holder offered the lease.
+  - `MutateRequest.rid.node` is not bound to `requester`: `authority/src/core/holder.rs` (`forget_acked_through(rid.node, rid.incarnation,
+    acked_through)`) runs on the requester's say-so, so an enrolled node can make the holder forget another node's exactly-once records and that
+    node's retry of an executed op could run twice. `SnapshotBatchRequest` checks `rid.0 == requester`, but `MutateRequest` cannot copy that
+    (replayed ops legitimately carry another node's rid); it needs its own design (only the rid's owner may advance `acked_through`, or skip the
+    check for replay origins).
+- **Review round 2.** A registry scan that did not read every record no longer removes keys (`Peers::refresh_registry_scan`): one throttled GET
+  would otherwise have closed an enrolled peer's live connections at their next stream. The allowlist is also checked after the stream permit and
+  before each log frame (a revoked subscriber's log stream is reset). Early data cannot be turned off in iroh's TLS config, so clippy's
+  `disallowed-methods` forbids `into_0rtt`. Tests: `an_incomplete_scan_never_revokes_a_peer`, and the revocation test now covers an open log
+  subscription.
 - **Authority sim.** It does not use the net framing: no behaviour change, no sweep. The authority lib tests ran (frame-size test included).
 - **Measured** (`hardlink-burst`, seed 42, linux-fuse, two nodes, release builds of the base and the change, 3 interleaved rounds per file system, on a
   box at load average 37-65 on 16 CPUs; medians, with the range in brackets): on tmpfs p50 605 us (532-643) to 406 us (360-415), total link time

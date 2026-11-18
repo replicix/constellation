@@ -394,6 +394,20 @@ impl Peers {
     /// Refresh the peer directory and the accept-time allowlist from the
     /// registry. Each record is a [`PeerEnrollment`].
     pub fn refresh_registry(&self, records: impl IntoIterator<Item = impl Into<PeerEnrollment>>) {
+        self.refresh_registry_scan(records, true);
+    }
+
+    /// [`Peers::refresh_registry`] for a scan that may not have read every
+    /// record. A scan that `complete`ly read the registry replaces the
+    /// allowlist and the key-to-node map. One that did not only adds or
+    /// updates keys: a record that failed to read (a throttled GET) is not
+    /// a revocation, and dropping its key would close the live connections
+    /// of an enrolled peer at their next stream.
+    pub fn refresh_registry_scan(
+        &self,
+        records: impl IntoIterator<Item = impl Into<PeerEnrollment>>,
+        complete: bool,
+    ) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
@@ -476,8 +490,13 @@ impl Peers {
                 );
             }
         }
-        inner.p2p.set_allowed(allowed);
-        *inner.ids.lock().unwrap() = ids;
+        if complete {
+            inner.p2p.set_allowed(allowed);
+            *inner.ids.lock().unwrap() = ids;
+        } else {
+            inner.p2p.extend_allowed(allowed);
+            inner.ids.lock().unwrap().extend(ids);
+        }
         let enrolled: Vec<u64> = {
             let mut map = inner.peers.lock().unwrap();
             let enrolled = peers
@@ -1616,6 +1635,9 @@ async fn handle_conn<S: PeerService>(
         // proves, so a revoked key must stop being served at its next
         // stream, whatever connection it arrives on (inbound or pooled,
         // tracked or not). One hash lookup; a miss closes the connection.
+        // It is checked again once a stream permit is held, and before
+        // every frame of a log subscription ([`serve_log_stream`]); a
+        // handler already running finishes.
         if !inner.p2p.is_allowed(&hex) {
             tracing::warn!(peer = %hex, "closing a connection whose key left the registry allowlist");
             conn.close(1u32.into(), b"not allowed");
@@ -1625,6 +1647,13 @@ async fn handle_conn<S: PeerService>(
         let Ok(permit) = slots.clone().acquire_owned().await else {
             return Ok(());
         };
+        // Again after the wait: the registry may have dropped the key
+        // while this stream queued for a permit.
+        if !inner.p2p.is_allowed(&hex) {
+            tracing::warn!(peer = %hex, "closing a connection whose key left the registry allowlist");
+            conn.close(1u32.into(), b"not allowed");
+            return Ok(());
+        }
         // Every permit held: nothing more from this peer is served until
         // one frees, its renewals and heartbeats included. Said once in a
         // while, not per stream.
@@ -1752,7 +1781,9 @@ async fn handle_stream<S: PeerService>(
     // The frame is unsigned: its origin is the connection's key (`hex`),
     // proved by the TLS 1.3 raw-public-key handshake, which also protects
     // the stream's integrity, and `handle_conn` re-checked it against the
-    // allowlist for this stream. Frames are never read as 0-RTT early data.
+    // allowlist for this stream. Early data is permitted by iroh's TLS
+    // config but never sent by us (clippy forbids `into_0rtt`), so a peer
+    // that sent it would only replay itself.
     // The node the payload claims to be must be the node enrolled under
     // that key: an enrolled peer cannot act on another node's behalf.
     if let Some(claimed) = claimed_node_id(&payload) {
@@ -1796,7 +1827,7 @@ async fn handle_stream<S: PeerService>(
                 from,
                 ..
             } => {
-                serve_log_stream(service, hex, requester, req_id, from, &mut send).await?;
+                serve_log_stream(inner, service, hex, requester, req_id, from, &mut send).await?;
                 let _ = send.finish();
                 return Ok(None);
             }
@@ -2415,6 +2446,7 @@ async fn handle_stream<S: PeerService>(
 /// (unsigned) [`Payload::LogFrame`] followed by the raw segment bytes, like a chunk
 /// body; the subscriber checks the bytes against the hash in the frame.
 async fn serve_log_stream<S: PeerService>(
+    inner: &Inner,
     service: &S,
     hex: &str,
     requester: u64,
@@ -2464,6 +2496,13 @@ async fn serve_log_stream<S: PeerService>(
             LogEvent::End { refused } => (Payload::LogEnd { req_id, refused }, None),
         };
         let end = matches!(payload, Payload::LogEnd { .. });
+        // The subscription outlives the key's enrolment unless each frame
+        // asks again: a revoked subscriber gets no more of the log.
+        if !inner.p2p.is_allowed(hex) {
+            tracing::warn!(peer = %hex, "ending a log stream whose key left the registry allowlist");
+            let _ = send.reset(1u32.into());
+            return Ok(());
+        }
         let write = async {
             write_payload(send, &payload).await?;
             if let Some(body) = &body {
@@ -2509,6 +2548,10 @@ mod tests {
         log_subs: Mutex<Vec<(u64, u64, u64)>>,
         /// Plan 37 §8: backup holds seen, as `(holder, epoch, for_ms)`.
         holds: Mutex<Vec<(u64, u64, u64)>>,
+        /// When set, `log_subscribe` serves a channel the test feeds
+        /// through this sender instead of the canned frames.
+        log_feed: Mutex<Option<tokio::sync::mpsc::Sender<crate::endpoint::LogEvent>>>,
+        live_log: std::sync::atomic::AtomicBool,
     }
 
     impl PeerService for Recorder {
@@ -2565,6 +2608,10 @@ mod tests {
                 return None;
             }
             let (tx, rx) = tokio::sync::mpsc::channel(8);
+            if self.live_log.load(AtomicOrder::SeqCst) {
+                *self.log_feed.lock().unwrap() = Some(tx);
+                return Some(rx);
+            }
             tokio::spawn(async move {
                 let big = vec![0x5a; 3 * crate::message::MAX_FRAME];
                 for event in [
@@ -3383,6 +3430,30 @@ mod tests {
             requester: 2,
             epoch_applied: None,
         };
+        // A log subscription opened while enrolled.
+        service
+            .live_log
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut log = asker.subscribe_log(1, 77, 0).await.unwrap();
+        let frame = |n| crate::endpoint::LogEvent::Frame {
+            n,
+            epoch: 4,
+            head: n,
+            segment: None,
+        };
+        let feed = loop {
+            if let Some(tx) = service.log_feed.lock().unwrap().clone() {
+                break tx;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        feed.send(frame(0)).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), log.recv())
+                .await
+                .expect("no frame while enrolled"),
+            Some(frame(0))
+        );
         // Served while enrolled, on a connection that then stays open.
         assert!(matches!(
             asker.request_raw(to.clone(), &ping).await.unwrap(),
@@ -3413,6 +3484,50 @@ mod tests {
             1,
             "the revoked key's request must never reach the service"
         );
+        // The subscription it opened earlier gets no further frame.
+        let _ = feed.send(frame(1)).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), log.recv())
+            .await
+            .expect("the revoked subscription was left open");
+        assert!(
+            !matches!(got, Some(crate::endpoint::LogEvent::Frame { .. })),
+            "a revoked node received a log frame: {got:?}"
+        );
+    }
+
+    /// A registry scan that did not read every record (one GET failed or
+    /// was throttled) is no revocation: it leaves an enrolled peer on the
+    /// allowlist and its open connection served. A complete scan without
+    /// the peer does remove it.
+    #[tokio::test]
+    async fn an_incomplete_scan_never_revokes_a_peer() {
+        let (holder, asker, service) = pair(true).await;
+        let to = holder.node_addr().unwrap();
+        let ping = Payload::Ping { node_id: 2 };
+        assert!(asker.request_raw(to.clone(), &ping).await.is_ok());
+        let inner = holder.inner.as_ref().unwrap();
+        let asker_key = asker.inner.as_ref().unwrap().p2p.pubkey_hex();
+        let own = vec![(
+            1,
+            inner.p2p.pubkey_hex(),
+            serde_json::to_value(inner.p2p.addr()).unwrap(),
+        )];
+        holder.refresh_registry_scan(own.clone(), false);
+        assert!(inner.p2p.is_allowed(&asker_key), "kept by a partial scan");
+        assert_eq!(holder.node_id_for_key(&asker_key), Some(2));
+        let lease = Payload::LeaseRequest {
+            part: "p0".into(),
+            requester: 2,
+            epoch_applied: None,
+        };
+        assert!(
+            asker.request_raw(to.clone(), &lease).await.is_ok(),
+            "the live connection must still be served"
+        );
+        assert_eq!(service.lease_asks.lock().unwrap().len(), 1);
+        holder.refresh_registry_scan(own, true);
+        assert!(!inner.p2p.is_allowed(&asker_key));
+        assert!(asker.request_raw(to, &lease).await.is_err());
     }
 
     /// A registry record whose address does not parse still enrolls the

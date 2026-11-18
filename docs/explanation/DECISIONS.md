@@ -6054,14 +6054,22 @@ it, so the transport peer is not its author.
   dialed id is pinned by the handshake, so a dial whose id does not match its
   address fails.
 - **Revocation.** `handle_conn` re-checks the allowlist on every stream and
-  closes a connection whose key left it (one set lookup). Before, a removed key
-  kept its open connections served for anything that named no node (`Ping`,
-  `ChunkRequest`, `SegmentPublished`). Re-checking beat closing tracked
-  connections in `set_allowed`: not every connection is tracked (the liveness
-  lane's are not) and a check at use has no window.
+  closes a connection whose key left it (one set lookup), again once the
+  stream holds a permit, and `serve_log_stream` checks before every log frame
+  and resets the stream on a miss. Before, a removed key kept its open
+  connections served for anything that named no node (`Ping`, `ChunkRequest`,
+  `SegmentPublished`). Re-checking beat closing tracked connections in
+  `set_allowed`: not every connection is tracked (the liveness lane's are not).
+  The guarantee is "re-checked on every stream and every log frame", not "no
+  window": a handler already running finishes. A registry scan that did not
+  read every record only adds keys (`refresh_registry_scan`); a failed GET is
+  not a revocation, and only a complete scan removes a key.
 - **Never 0-RTT.** 0-RTT early data is replayable, and an unsigned frame would
-  be replayable bare. Direct-stream frames must never be sent or read as 0-RTT;
-  none is today (no `into_0rtt`), and the comment at `P2p::request` says so.
+  be replayable bare. iroh's TLS config enables early data and has no switch to
+  turn it off, so this is enforced in constellation: nothing calls
+  `into_0rtt`, and a clippy `disallowed-methods` entry (`clippy.toml`) fails the
+  build if something does. A peer that sent early data anyway would only replay
+  itself, and session tickets are single-use.
 - **Two decoders.** The stream and gossip decoders stay distinct: gossip
   refuses a bare `Payload`, with no "try one, fall back to the other".
 - **ALPN** `constellation/4`; `/3` joins `OLDER_ALPNS` and is refused by name.

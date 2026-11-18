@@ -14,11 +14,14 @@
 //! key) whose `remote_id()` is the peer's Ed25519 key proved in the
 //! handshake, so the connection's identity is the author of every frame
 //! on it, and the TLS session gives integrity. A frame is never signed,
-//! never relayed and never stored (docs/DECISIONS.md, the ADR on unsigned
+//! never relayed and never stored (docs/explanation/DECISIONS.md, the ADR on unsigned
 //! direct streams). The two decoders are distinct on purpose: gossip
 //! refuses a bare `Payload`, and there is no "try one, fall back to the
 //! other". Direct-stream frames must never be sent as 0-RTT early data
-//! (replayable); constellation never uses 0-RTT.
+//! (replayable). iroh's TLS config permits early data and has no switch to
+//! turn it off, so constellation never calls `into_0rtt` (a clippy
+//! `disallowed-methods` entry enforces it); a peer that sent early data
+//! would only replay itself, and tickets are single-use.
 //!
 //! Nothing here is load-bearing for correctness. Every message is an
 //! accelerator for something the S3 path already does on a timer, so a

@@ -8,4 +8,6 @@
 disallowed-methods = [
     { path = "std::env::set_var", reason = "changes the environment under every thread of the process (see crates/cli/clippy.toml)" },
     { path = "std::env::remove_var", reason = "changes the environment under every thread of the process (see crates/cli/clippy.toml)" },
+    { path = "iroh::endpoint::Connecting::into_0rtt", reason = "unsigned direct-stream frames must never be sent as replayable 0-RTT early data (see the repo clippy.toml)" },
+    { path = "iroh::endpoint::Accepting::into_0rtt", reason = "unsigned direct-stream frames must never be read as replayable 0-RTT early data (see the repo clippy.toml)" },
 ]

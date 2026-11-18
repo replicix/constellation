@@ -74,7 +74,7 @@ URL in addition to any local IPs. Peers inject those records into iroh via
   stream), and the node ids a request names are bound to that key; its
   messages carry no per-message signature. Gossip payloads, which other
   peers forward, are signed by the author key. Either way a relay cannot
-  impersonate a node. Direct-stream data is never sent as 0-RTT early data
+  impersonate a node. Direct-stream data is never sent as 0-RTT early data (clippy forbids `into_0rtt`)
   ([ADR-63](../../explanation/DECISIONS.md#adr-63-direct-streams-carry-no-per-message-signature)).
 - **End-to-end crypto**: the relay forwards opaque QUIC; it cannot read
   or forge Constellation payloads.

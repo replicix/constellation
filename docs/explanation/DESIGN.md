@@ -1931,8 +1931,10 @@ invariant 2 forces its op after the delete regardless of what it had seen.
   enrollment requires bucket write, so IAM decides); read-only members are
   marked `ro` in their registry record, which only a bucket writer can create
   (there is no countersignature). Unknown NodeIds are dropped post-handshake,
-  and the allowlist is re-checked on every stream, so a key removed from the
-  registry stops being served on its open connections.
+  and the allowlist is re-checked on every stream and before every log frame,
+  so a key removed from the registry is no longer served on its open
+  connections (a handler already running finishes; a registry scan that did
+  not read every record never removes a key).
   Gossip topic ID derives from a secret in `meta.json` (bucket-readers only).
   Control messages (lease handoff, delegation grant/ack, epoch promises) on
   direct streams are authenticated by the TLS 1.3 raw-public-key session,

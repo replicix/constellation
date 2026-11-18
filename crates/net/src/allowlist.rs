@@ -91,6 +91,14 @@ impl Allowlist {
         }
     }
 
+    /// Like [`Allowlist::replace`] with the current keys plus `keys`:
+    /// nothing is removed.
+    pub fn extend(&mut self, keys: impl IntoIterator<Item = String>) {
+        let mut all = std::mem::take(&mut self.keys);
+        all.extend(keys);
+        self.replace(all);
+    }
+
     pub fn contains(&self, pubkey_hex: &str) -> bool {
         self.keys.contains(pubkey_hex)
     }

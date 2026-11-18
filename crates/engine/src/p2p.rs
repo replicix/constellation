@@ -1629,7 +1629,7 @@ pub async fn refresh_peers(
             if !complete {
                 peers.set_registry_complete(false);
             }
-            peers.refresh_registry(records);
+            peers.refresh_registry_scan(records, complete);
             if complete {
                 peers.set_registry_complete(true);
             }
