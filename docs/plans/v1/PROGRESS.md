@@ -70422,3 +70422,99 @@ drop-held` refused it (`holds = mine[gen] && !stopped`), so nothing ended the st
 counts as holding the stream in `on_control_drop_held`; no other stopped state does. A `rebooted` remnant may decide: the held rows never left its journal. ADR-59 part B D1 names it.
 Fail-before: core `a_remnant_holding_its_release_row_decides_the_drop_of_its_held_rows`; sim `a_remnant_holding_its_release_row_decides_the_drop_996`
 (pins the crash label only; the `-paused` label's 996 is a different cause, spec-996 part B).
+
+## Plan 46 M1.3 step 15a: S4 and the carried I4 ceilings (2026-11-18)
+
+Evidence only; no product behaviour changes. `Core::deleg_releases_held` (read-only) tells the simulation which generations a node holds whose
+release waits on read-delegation recalls (`PendingRelease::held`). The oracle keeps those spans per `(node, gen)` and tags every unsettled `EIO`
+`release_read_recall` when a span of a generation its question rests on (an owner, a blocked owner, an awaited tail) overlaps `[from, at]`.
+The tag is diagnostic: `Verdict`, `allowed` and `cause` are untouched. `SWEEP-S4` prints the tagged total, the violations and the allowed among
+them, the seeds, and (added so a zero can be told from a blind instrument) the held-release spans seen; `SWEEP-I4-CAUSES` prints the violations
+by cause; a failing seed's message carries the number of its violations that are tagged. Test:
+`an_unsettled_eio_is_tagged_while_its_streams_release_waits_on_recalls` (fails with the overlap check returning false).
+
+**S4 bucket: zero.** 46 labels (the three m03 lists and the `long-delegated*` / `sticky-*` labels) x 2 arms (no knob; `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
+x 2,000 seeds `+unsettled`: no unsettled `EIO`, violation or allowed, fell in a window that overlapped a held release of a generation it rested on.
+That zero is not blind: the instrument saw held releases in the labels that have read grants under a release. A 40-seed scan of every label found
+spans only in `delegated-strict`, `sticky-holder-restarts-placed` and `sticky-leave`; at 2,000 seeds `+unsettled` they saw 2,798 / 875 / 697 spans
+(no knob; 2,619 / 952 / 699 with it) in 1,469 / 786 / 697 seeds, with no tagged `EIO`. The 46 labels of the table ran on the build before the span
+counter (same tag); 4 of them (`locks-blips-tight-delegated`, `locks-unlinked-delegated-blips`, `delegated-long-delegation`, `placement-hot`) were re-run
+on the final build, both arms, with 0 spans: the other labels have no held release to wait on in these workloads. The sim has no config where a settle is parked behind a held
+release's recall and ends in doubt. Whether to close S4 without `ReleaseCut` is the maintainer's decision (plan D1); it is not taken here.
+
+**Sweeps** (seeds 0..1,999 `+unsettled`; failing seeds, of them I4 unsettled `EIO`s; passing seeds' allowed unsettled `EIO`s):
+
+| label | no knob: failing seeds (I4) / allowed | knob: failing seeds (I4) / allowed |
+|---|---|---|
+| `flex` | 3 (3) / 13 | 1 (1) / 0 |
+| `delegated-crash` | 0 (0) / 0 | 8 (8) / 1 |
+| `delegated-root-crash` | 0 (0) / 0 | 19 (19) / 0 |
+| `delegated-delegate-restart` | 0 (0) / 0 | 1 (1) / 1 |
+| `delegated-partition` | 0 (0) / 0 | 3 (3) / 1 |
+| `far` | 0 (0) / 0 | 16 (16) / 4 |
+| `backup` | 0 (0) / 0 | 2 (2) / 0 |
+| `backup-hot` | 0 (0) / 0 | 2 (2) / 0 |
+| `locks-delegated` | 0 (0) / 0 | 0 (0) / 0 |
+| `shared-dir` | 0 (0) / 0 | 1 (1) / 0 |
+| `long-sessions` | 0 (0) / 1 | 40 (40) / 14 |
+| `tloss-two-node` | 0 (0) / 0 | 0 (0) / 0 |
+| `backup-crash` | 0 (0) / 0 | 3 (3) / 0 |
+| `long-backup` | 0 (0) / 0 | 13 (13) / 5 |
+| `locks-blips-tight-delegated` | 4 (4) / 14 | 80 (78) / 992 |
+| `locks-unlinked-delegated-blips` | 6 (6) / 8 | 334 (187) / 902 |
+| `sticky-leave-root-self` | 1 (1) / 0 | 2 (2) / 0 |
+| `backup-strict` | 0 (0) / 0 | 18 (18) / 0 |
+| `backup-two` | 0 (0) / 0 | 1 (1) / 0 |
+| `delegated-backup-and-delegate-die` | 5 (5) / 4061 | 4 (4) / 4206 |
+| `delegated-backup-and-delegate-die-abandon` | 5 (5) / 7 | 4 (4) / 0 |
+| `delegated-backup` | 1 (1) / 0 | 8 (8) / 0 |
+| `delegated-backup-dies-then-delegate-reboots` | 0 (0) / 0 | 0 (0) / 0 |
+| `delegated-backup-dies-then-delegate-reboots-early` | 0 (0) / 22259 | 0 (0) / 24424 |
+| `delegated-backup-dies-then-delegate-reboots-mid` | 0 (0) / 28 | 0 (0) / 112 |
+| `delegated-group-switch` | 0 (0) / 0 | 4 (4) / 2 |
+| `delegated-holder-cut` | 1 (1) / 0 | 44 (44) / 7 |
+| `delegated-long-delegation` | 0 (0) / 0 | 0 (0) / 0 |
+| `delegated-no-backup-root-near` | 1 (1) / 0 | 6 (6) / 0 |
+| `flex-crash` | 27 (27) / 129 | 17 (17) / 2 |
+| `flex-backup` | 2 (2) / 17 | 0 (0) / 0 |
+| `flex-tight` | 62 (62) / 348 | 416 (389) / 1477 |
+| `long-delegated` | 1 (1) / 0 | 22 (22) / 7 |
+| `long-delegated-backup` | 5 (5) / 2 | 31 (31) / 12 |
+| `long-delegated-late-answers` | 6 (6) / 0 | 61 (61) / 27 |
+| `placement-hot` | 0 (0) / 0 | 1 (1) / 0 |
+| `locks-blips-tight-single` | 0 (0) / 0 | 0 (0) / 0 |
+| `delegated-long-delegation-prod` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-handover-ping-pong` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-handover-ping-pong-root-writes` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-handover-busy` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-handover-busy-patient` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-handover-crash` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-handover-root` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-idle-release` | 0 (0) / 0 | 0 (0) / 0 |
+| `sticky-leave` | 0 (0) / 0 | 7 (5) / 0 |
+
+Totals: no knob 130 failing seeds (all I4), knob 1,169 (991 I4; the others are lock-client and cluster-drain checks of the `locks-*` labels). The
+`+unsettled` runs abort a failing seed at its first violation, so the I4 figures are seeds, one verdict each. Comparison with the parent at the same
+seeds (`flex-tight`, `long-delegated-late-answers`, `locks-blips-tight-delegated`, no knob): identical failing-seed sets, and the same `SWEEP-*` lines
+apart from run-to-run noise of one to six in a counter of a hundred thousand (the parent differs from itself by the same on a second run:
+`archive_waits` 48,564 and 48,568).
+
+**Buckets (first violation of each failing seed, by the oracle's verdict).** No knob: A (`itself`) 20, C (`lease-path`) 46, O (`root`) 64, of which in
+the takeover gate (`takeover gate` busy) 10; knob: A 80, C 134, O 774 (in-gate 79), plus 3 `Delegate`. Step 3's table counted violations over its 15
+configurations (knob: C 44, A 53, O 248; no knob: C 1, A 29, O 35); the same 15 here count seeds: knob C 3, A 36, O 178; no knob C 0, A 18, O 7.
+Where they are: no knob, A is the double fault of `delegated-backup-and-delegate-die(-abandon)` (5 seeds each, the documented cost of M1.2 step 14), and
+`long-delegated*` and `delegated-backup`; C is `flex-crash` (21) and `flex-tight` (23); O is `flex-tight` (37) and `flex-crash` (6).
+The flex family is ADR-58's residual (a settle in a frozen epoch ends one window after the freeze); `flex-crash` and `flex-tight` are ratcheted at
+their ceilings below. The knob arm is not the ratchet's arm; its remaining O are the slow lease read of the claim path, mostly `flex-tight` (302),
+`locks-unlinked-delegated-blips` (155), `long-delegated-late-answers` (46). Not re-traced in this step: the in-gate class of `long-delegated-backup` /
+`-late-answers` (3 and 3 seeds, no knob), whose closing item is the step 15 trace, and the knob arm's classes beyond the ones named; neither is a
+regression (the failing sets match the parent's where compared).
+
+**Ceilings (`m03`, seeds 0..99 without the knob, measured on this build; ceilings only go down).** Lowered: `delegated-backup-and-delegate-die` allowed
+190 to 182; `delegated-long-delegation` 65 / 160 to 0 / 0 (0 of 2,000 seeds fail, either arm). Measured above their entries, inside the margin, not
+raised: `delegated-backup-dies-then-delegate-reboots-early` allowed 979 (entry 978), `flex-crash` allowed 3 (entry 2), `flex-tight` allowed 20 (entry
+18; the 20 is the old classes, 1 more is the lapsed column, its entry), `long-delegated-backup` allowed 1 (entry 0), `long-delegated-late-answers`
+violations 1 (entry 0); each would need the entry to rise by one or two to stay exact, and none is changed. All others equal their entries.
+
+**Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, authority lib 1,687 passed 0 failed (debug and release), release
+authority sim suite 570 passed, 0 failed, 16 ignored.

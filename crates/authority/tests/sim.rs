@@ -21038,7 +21038,8 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             "delegated-backup-and-delegate-die",
             delegated_backup_and_delegate_die_config,
             0,
-            190,
+            // (Plan 46 M1.3 step 15a, 2026-11-18: seeds 0..99 measure 182.)
+            182,
         ),
         (
             "delegated-backup-and-delegate-die-abandon",
@@ -21083,8 +21084,11 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         (
             "delegated-long-delegation",
             delegated_long_delegation_config,
-            65,
-            160,
+            // (Plan 46 M1.3 step 15a, 2026-11-18: seeds 0..99 measure 0 and
+            // 0, and 0 of 2,000 seeds `+unsettled` fail, with and without
+            // the lease-reads knob; it was 65 and 160.)
+            0,
+            0,
         ),
         (
             "delegated-no-backup-root-near",
