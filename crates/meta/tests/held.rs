@@ -2048,6 +2048,10 @@ fn a_reappended_seed_drop(parked: bool) {
         (gen, 9),
     )
     .unwrap();
+    // The stream's rows 10..18 sit above the seed, journaled: the log index
+    // of the generation is at the last of them.
+    meta.kv_set(&format!("deleg_log_idx:{gen}"), "18").unwrap();
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 18);
     meta.note_unrecoverable_chunks(&[(lost, broken)], true)
         .unwrap();
     let decided = meta
@@ -2082,6 +2086,9 @@ fn a_reappended_seed_drop(parked: bool) {
             true,
         )
         .unwrap();
+    // The record fills (gen, 9): the seed's strand leaves the log index where
+    // the rows above it put it (it was taken back to the fill, 9).
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 18, "{done:?}");
     let lost_rids: Vec<_> = done.acked_lost.iter().map(|(r, _)| *r).collect();
     assert!(lost_rids.contains(&rid), "{done:?}");
     assert!(done.rolled_back.contains(&rid), "{done:?}");

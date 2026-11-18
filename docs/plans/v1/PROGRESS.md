@@ -70554,3 +70554,21 @@ violations 1 (entry 0); each would need the entry to rise by one or two to stay 
 
 **Gates** (debug and release): fmt, clippy `--workspace --all-targets -D warnings`, authority lib 1,687 passed 0 failed (debug and release), release
 authority sim suite 570 passed, 0 failed, 16 ignored.
+
+### 226 (debug): a drop's strand keeps the stream's log index at a position its record fills (2026-11-18)
+
+`far-root-writes+lost-chunk-late` seed 226 tripped the drop apply's stream-index `debug_assert` ("took the log index of stream ... back
+from 18 to 9 below a fill the log carries") in debug builds. The seed is the root's own re-appended stream row (`appended`, index 9); the
+sequencer's drop fills (gen, 9) with its record, and `strand_local_tx` skipped the log-index retraction only for a non-`appended` row named
+by a stream holder's plan, so the strand took the index back to 9 while rows 10..18 stayed journaled and ship after the record. In release
+the understated index (`deleg_log_idx`, the cursor a successor inherits) was guarded by rid dedup only.
+
+The strand now also skips the retraction for a row whose `(gen, idx)` a waiting drop's record fills (`held::drop_fills_tx`, any plan,
+appended or not, whoever decided it); the stream-holder rule stays. No compatibility shim, no version bump.
+
+Tests: `a_drop_names_a_reappended_seed_by_its_own_rid` and `a_parked_reappended_seed_is_still_an_acknowledged_loss` (meta, `tests/held.rs`)
+now put the stream's index at 18 above the seed and assert it is 18 after the apply; both fail on the parent (the debug assert), pass now.
+The sim pin `a_reappended_seed_is_dropped_under_its_own_rid` was already tightened to `.unwrap()` with the claim-through-a-gate fix.
+Sweeps (2,000 seeds, release, base vs fix): `far-root-writes{,-paused}+lost-chunk-late` fail only 996/1810 and 996 on both sides;
+`far-root-writes+lost-chunk`, `far-placement+lost-chunk`, `drop-held-chain-backed` 0 on both. `far-root-writes+lost-chunk-late` 500 seeds in
+debug: base trips the assert on 226, fix 0 failures.

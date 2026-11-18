@@ -1886,6 +1886,13 @@ fn strand_local_tx(
         && super::held::stream_drops_tx(&*tx, meta)?
             .iter()
             .any(|(gen, _, named)| *gen == row.gen && named.contains(&first));
+    // Nor a row at a position a waiting drop's record fills, appended or
+    // not, whoever decided that drop: the log carries the record there, and
+    // the rows above it stay journaled and ship after it. Taking the index
+    // back to the fill would understate it (a successor inheriting from this
+    // replica, or a re-stream, would offer rows the log already carries).
+    let named_by_drop = named_by_drop
+        || (row.gen != 0 && super::held::drop_fills_tx(&*tx, meta)?.contains(&(row.gen, row.idx)));
     if !named_by_drop {
         if let Some(to) = local::retract_log_idx_tx(tx, meta, row.gen, row.idx)? {
             meta.session.retract_stream(row.gen, to);

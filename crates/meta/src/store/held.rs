@@ -3393,6 +3393,21 @@ pub(crate) fn stream_drops_tx(
     Ok(out)
 }
 
+/// The stream positions `(gen, log index)` the decided, not yet applied
+/// drops' records fill (`DropHeld::fills`), whoever decided them.
+pub(crate) fn drop_fills_tx(
+    r: &impl Readable,
+    meta: &Meta,
+) -> Result<HashSet<(u64, u64)>, MetaError> {
+    let mut out = HashSet::new();
+    for guard in r.prefix(&meta.local, DROP_PLAN_PREFIX) {
+        let (_, v) = guard.into_inner()?;
+        let plan: DropPlan = postcard::from_bytes(&v)?;
+        out.extend(plan.fills.iter().copied());
+    }
+    Ok(out)
+}
+
 /// ADR-59 part B: the decided drop of `ino` never happened (its record, a row
 /// of a stream, left the journal unshipped with the stream's end): the plan
 /// goes, in the caller's transaction. Whether there was one.
