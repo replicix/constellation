@@ -70433,14 +70433,34 @@ them, the seeds, and (added so a zero can be told from a blind instrument) the h
 by cause; a failing seed's message carries the number of its violations that are tagged. Test:
 `an_unsettled_eio_is_tagged_while_its_streams_release_waits_on_recalls` (fails with the overlap check returning false).
 
-**S4 bucket: zero.** 46 labels (the three m03 lists and the `long-delegated*` / `sticky-*` labels) x 2 arms (no knob; `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`)
-x 2,000 seeds `+unsettled`: no unsettled `EIO`, violation or allowed, fell in a window that overlapped a held release of a generation it rested on.
-That zero is not blind: the instrument saw held releases in the labels that have read grants under a release. A 40-seed scan of every label found
-spans only in `delegated-strict`, `sticky-holder-restarts-placed` and `sticky-leave`; at 2,000 seeds `+unsettled` they saw 2,798 / 875 / 697 spans
-(no knob; 2,619 / 952 / 699 with it) in 1,469 / 786 / 697 seeds, with no tagged `EIO`. The 46 labels of the table ran on the build before the span
-counter (same tag); 4 of them (`locks-blips-tight-delegated`, `locks-unlinked-delegated-blips`, `delegated-long-delegation`, `placement-hot`) were re-run
-on the final build, both arms, with 0 spans: the other labels have no held release to wait on in these workloads. The sim has no config where a settle is parked behind a held
-release's recall and ends in doubt. Whether to close S4 without `ReleaseCut` is the maintainer's decision (plan D1); it is not taken here.
+**S4 evidence, corrected after the review (2026-11-18, second round).** Not closed here; D1 stays the maintainer's.
+The first round counted the tag over the classified unsettled EIOs only; the ones excused as `designation_held` (non-stealable: what a sticky stream
+produces), `isolated_from_s3` or `held-behind-lost-chunk` were dropped before the count. `SWEEP-S4` now prints the tag over both: tagged among
+the classified, and tagged among the excused, apart. The strict-failure text no longer says "N of them release waited on read recalls" for every
+list: only the unsettled-I4 list carries it. Tests: `the_s4_tag_is_counted_over_the_excused_ones_apart`, `only_the_unsettled_list_carries_the_s4_count`.
+Re-run on the final build, `+unsettled`, 2,000 seeds, both arms (no knob / `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`):
+
+| label | tagged, classified | tagged, excused | excused EIOs (designation-held) | spans | settles sent / window overlapped a held release |
+|---|---|---|---|---|---|
+| `delegated-strict` | 0 / 0 | 0 / 0 | 0 / 0 | 2,798 / 2,619 | 86 / 3, 104 / 4 |
+| `sticky-holder-restarts-placed` | 0 / 0 | 0 / 0 | 12 / 13 | 868 / 961 | 586 / 96, 609 / 77 |
+| `sticky-leave` | 0 / 0 | 0 / 0 | 0 / 0 | 697 / 699 | 448 / 1, 340 / 0 |
+| `sticky-s4-idle` (new) | 0 / 0 | 0 / 0 | 0 / 1 | 2,714 / 3,216 | 649 / 13, 706 / 34 |
+| `sticky-s4-leave` (new) | 0 / 0 | 0 / 0 | 1 / 25 | 694 / 698 | 567 / 15, 497 / 2 |
+
+The 12 and 13 designation-held EIOs of `sticky-holder-restarts-placed` are untagged: none fell in a window that overlapped a held release of a
+generation it rested on. No seed in the ten runs carries a tag.
+
+**The hazard configurations** (`sticky-s4-idle`, `sticky-s4-leave`; review MUST-2). `sticky-holder-restarts` with no crash; node 2 holds a sticky `d2`;
+node 3 reads and writes it, so it holds read delegations from the holder; three of the holder's answers to node 3 are lost early (`CutOnAnswer`, the
+op ran, its requester settles through the root), then the pair is cut for 9 s, longer than `read_span`; the holder's release is the idle release
+(1.2 s idle, `idle_gaps`) or its own leave at 2.5 s. They reach the window: held releases in 1,449 / 694 seeds (no knob), the longest held for 6.6 s /
+10.0 s, and settles whose window overlapped a held release (13 / 15 over 2,000 seeds no knob, 34 / 2 with the knob; 96 / 77 in
+`sticky-holder-restarts-placed`). Every one of them ended settled: **no unsettled EIO fell inside a held release in any run**. So the sim reaches the hazard
+and does not produce S4 there; the number of settles that met a hold is small (tens per 2,000 seeds), and the lost-answer trigger is what produces them.
+The knob arm and the late seeds of the new labels fail I4 in the root-owned and `itself` classes (knob: 21 and 13 seeds; no knob: 3 in `sticky-s4-idle`),
+untagged: their windows end seconds to a minute after the last held release. Those are the carried O/A classes, not S4; `sticky-s4-*` are not in the
+ratchet. `SWEEP-S4` now also prints the settles sent and those whose window overlapped a held release, and the longest closed span.
 
 **Sweeps** (seeds 0..1,999 `+unsettled`; failing seeds, of them I4 unsettled `EIO`s; passing seeds' allowed unsettled `EIO`s):
 
