@@ -312,15 +312,20 @@ impl TouchSet {
     /// is no table to consult (`Meta::names_of_ino`). A name the op adds to
     /// the inode needs no hold here: its dentry is held already.
     ///
-    /// Only a prefix of the names is read: two names at most for the usual
-    /// op, and one for an inode that has only one (an unlink of a name of
-    /// an inode with 8,192 names does not read 8,192). Per inode, the moves
-    /// are replayed against `limit` = 2 names, and again against twice as
-    /// many (from a fresh `names` call, so every attempt sees one snapshot)
-    /// until the outcome is decided. Two, not one: with one name fetched
-    /// out of a single-name inode the prefix could not tell that it was
-    /// complete, and every unlink or rename of an ordinary file would read
-    /// twice.
+    /// Only a prefix of the names is read: one name when the name that
+    /// leaves is not the primary one, two reads when it is (an unlink of a
+    /// name of an inode with 8,192 names does not read 8,192). Per inode,
+    /// the moves are replayed against `limit` = 1 names, and again against
+    /// twice as many (from a fresh `names` call, so every attempt sees one
+    /// snapshot) until the outcome is decided. One, not two: a first limit
+    /// of two reads the second live name, and in a link order like the
+    /// stress tools' (the primary stays, the others go in key order) the
+    /// second live name is the one leaving, behind a tombstone for every
+    /// name unlinked before it, so every op steps over all of them and the
+    /// unlinks of n names cost O(n^2) (measured: 25 to 48 s against 0.7 to
+    /// 1.9 s for 8,192 names). The price of one: an inode with a single
+    /// name is not seen complete by its one name, so its unlink or rename
+    /// reads twice (one name, then two), both reads short.
     ///
     /// Why that is exact. The fetched names are a prefix of the snapshot's
     /// names in key order, which is `(u64, String)`'s `Ord` (the `RDentry`
@@ -557,9 +562,11 @@ type NameMove = ((u64, String), Option<(u64, String)>);
 /// An inode, with one [`NameMove`].
 type Move = (u64, (u64, String), Option<(u64, String)>);
 
-/// The first `limit` of the names asked for: two, so that an inode with a
-/// single name is seen complete at once (`TouchSet::from_op_in_names`).
-const FIRST_NAMES_LIMIT: usize = 2;
+/// The first `limit` of the names asked for: one, so that the scan ends at
+/// the primary name and never reaches the tombstones that unlinked names
+/// leave after it (`TouchSet::from_op_in_names`; the meta test
+/// `the_unlinks_of_a_link_order_do_not_scan_more_tombstones_each` pins it).
+const FIRST_NAMES_LIMIT: usize = 1;
 
 #[cfg(any(test, feature = "test-util"))]
 thread_local! {
@@ -2304,12 +2311,12 @@ mod tests {
     }
 
     /// ADR-42's cost: the names of an inode are read in key order only
-    /// until the outcome is decided: one read of at most two names, whatever
-    /// the inode's name count, whether the name that leaves is the primary
-    /// one or not. (Fails before: the one-argument `names` listed all 8,192
-    /// at every call.)
+    /// until the outcome is decided, whatever the inode's name count. A name
+    /// that is not the primary one leaves after one read of one name; the
+    /// primary one after two reads (one name, then two). (Fails before: the
+    /// one-argument `names` listed all 8,192 at every call.)
     #[test]
-    fn an_unlink_of_a_name_that_is_not_the_primary_reads_two_names() {
+    fn an_unlink_of_a_name_that_is_not_the_primary_reads_one_name() {
         use crate::mutate::MutateOp;
         use crate::replay::TouchSet;
         use std::cell::Cell;
@@ -2329,22 +2336,23 @@ mod tests {
             name: name.into(),
         };
         let k = TouchSet::from_op_in_names(&unlink("n04000"), &lookup, &names);
-        assert_eq!((reads.get(), read.get()), (1, 2), "one read of two names");
+        assert_eq!((reads.get(), read.get()), (1, 1), "one read of one name");
         assert!(!k.dentries.contains(&(2, "n00001".to_string())), "{k:?}");
         reads.set(0);
         read.set(0);
         let k = TouchSet::from_op_in_names(&unlink("n00000"), &lookup, &names);
-        assert_eq!((reads.get(), read.get()), (1, 2), "one read of two names");
+        assert_eq!((reads.get(), read.get()), (2, 3), "reads of one, then two");
         assert!(k.dentries.contains(&(2, "n00001".to_string())), "{k:?}");
         assert!(k.shared.contains(&2));
     }
 
-    /// An unlink or a rename of a file that has one name is as cheap as it
-    /// was before the names were bounded: one read of one name. (Fails
-    /// with a first limit of 1: the prefix could not tell that the one name
-    /// was all of them, and the op read twice.)
+    /// An unlink or a rename of a file that has one name reads twice, both
+    /// reads short: one name (which could be a prefix of more), then the
+    /// two asked for, of which one exists. The first limit is one and not
+    /// two for the sake of the tombstones, not of this case
+    /// (`the_unlinks_of_a_link_order_do_not_scan_more_tombstones_each`).
     #[test]
-    fn an_unlink_or_a_rename_of_a_single_name_file_reads_once() {
+    fn an_unlink_or_a_rename_of_a_single_name_file_reads_twice_both_short() {
         use crate::mutate::MutateOp;
         use crate::replay::TouchSet;
         use std::cell::Cell;
@@ -2352,6 +2360,7 @@ mod tests {
         let (reads, read) = (Cell::new(0usize), Cell::new(0usize));
         let names = |i: u64, limit: usize| {
             assert_eq!(i, 10);
+            assert!(limit <= 2, "a read of {limit} names");
             let got: Vec<_> = [(2u64, "f".to_string())].into_iter().take(limit).collect();
             reads.set(reads.get() + 1);
             read.set(read.get() + got.len());
@@ -2362,7 +2371,7 @@ mod tests {
             name: "f".into(),
         };
         let k = TouchSet::from_op_in_names(&unlink, &lookup, &names);
-        assert_eq!((reads.get(), read.get()), (1, 1), "unlink: {k:?}");
+        assert_eq!((reads.get(), read.get()), (2, 2), "unlink: {k:?}");
         reads.set(0);
         read.set(0);
         let rename = MutateOp::Rename {
@@ -2373,7 +2382,7 @@ mod tests {
             noreplace: false,
         };
         let k = TouchSet::from_op_in_names(&rename, &lookup, &names);
-        assert_eq!((reads.get(), read.get()), (1, 1), "rename: {k:?}");
+        assert_eq!((reads.get(), read.get()), (2, 2), "rename: {k:?}");
     }
 
     mod bounded_names {
@@ -2740,6 +2749,111 @@ mod tests {
         assert!(meta.root_fast_path(&unlink(p1, "a")).is_none());
         // A name that is not the primary, in the root's: admitted.
         assert!(meta.root_fast_path(&unlink(p3, "n0000")).is_some());
+    }
+
+    /// M1's link order (one file, a primary name that stays, 8,192 links
+    /// unlinked in key order) with a delegation present: the names an unlink
+    /// asks for must not lie behind a tombstone for every earlier unlink. A
+    /// delete leaves a tombstone at the name's key, a forward scan from the
+    /// start steps over every one before the first live key, so the cost of
+    /// a read is the number of dead names that sort before the last name it
+    /// fetched. With a first limit of two the second live name (the one
+    /// leaving) is fetched, behind all the k earlier ones, and the sum over
+    /// the unlinks is n(n-1)/2 (the quadratic unlink: 25 to 48 s for 8,192
+    /// links on ext4, against 0.7 to 1.9 s with one); with one the primary
+    /// is the last name fetched and the sum is 0. The bound allows a few
+    /// per op. (Fails with `FIRST_NAMES_LIMIT` = 2: the sum is 33,550,336.)
+    #[test]
+    fn the_unlinks_of_a_link_order_do_not_scan_more_tombstones_each() {
+        use crate::mutate::MutateOp;
+        use crate::replay::TouchSet;
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        const N: usize = 8_192;
+        let meta = Meta::open_in_memory().unwrap();
+        let dir = 1u64 << 40 | 2;
+        meta.apply_records(&[LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }])
+        .unwrap();
+        let f = 1u64 << 40 | 3;
+        let link_name = |i: usize| format!("l{i:06}");
+        let mut records = vec![LogRecord::Create {
+            parent: dir,
+            name: "base".into(),
+            ino: f,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }];
+        records.extend((0..N).map(|i| LogRecord::Link {
+            ino: f,
+            parent: dir,
+            name: link_name(i),
+            time_ns: 1,
+        }));
+        meta.apply_records(&records).unwrap();
+        // A delegation (of the directory, any would do), for the names to
+        // be read at all.
+        meta.apply_segment(
+            1,
+            1,
+            &[LogRecord::delegate_one(
+                4,
+                (1 << 32) | 1,
+                dir,
+                crate::SubtreeKind::Placed,
+            )],
+            &TouchSet::default(),
+        )
+        .unwrap();
+        assert!(meta.delegations_any());
+        // The position of a name in the original key order: "base" first.
+        let rank: HashMap<String, usize> = std::iter::once("base".to_string())
+            .chain((0..N).map(link_name))
+            .enumerate()
+            .map(|(i, n)| (n, i))
+            .collect();
+        let lookup = |p: u64, n: &str| MetaStore::lookup(&meta, p, n).ok().flatten().map(|a| a.ino);
+        // Dead names before the last name of each read, summed. (Names that
+        // were unlinked are all before every live one in this order, so a
+        // fetched name at original rank `r` with `j` live names before it
+        // has `r - j` dead ones before it.)
+        let crossed = Cell::new(0usize);
+        let names = |i: u64, limit: usize| {
+            let got = meta.names_of_ino(i, limit);
+            if let Some((_, last)) = got.last() {
+                crossed.set(crossed.get() + rank[last] - (got.len() - 1));
+            }
+            got
+        };
+        for i in 0..N {
+            let name = link_name(i);
+            let op = MutateOp::Unlink {
+                parent: dir,
+                name: name.clone(),
+            };
+            TouchSet::from_op_in_names(&op, &lookup, &names);
+            meta.apply_records(&[LogRecord::Unlink {
+                parent: dir,
+                name,
+                time_ns: 2,
+            }])
+            .unwrap();
+        }
+        let bound = 4 * N;
+        assert!(
+            crossed.get() <= bound,
+            "the unlinks of {N} links stepped over {} dead names (at most {bound} allowed): quadratic",
+            crossed.get()
+        );
     }
 
     #[test]

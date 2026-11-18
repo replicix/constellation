@@ -70239,9 +70239,10 @@ Status: `delegation.root_own.skipped_no_peer` and `released_singleton`. ADR-55 a
 while any delegation existed: an unlink of one name of an 8,192-name file cost O(8,192) in `Meta::root_fast_path`, the
 delegate's `admit_for`, the core's `keys_of_op_in` and the sim's model, several times per op (about 1.6 ms per unlink on
 every file system in the bisect's profile). `names_of_ino(ino, limit)` now stops its range at `limit` names, and the
-hold is computed over a prefix (limit 2, doubled and replayed from a fresh read until some fetched name survives the
-op's moves): one read of at most two live names, and of one for an inode with a single name, so the common unlink or
-rename of a single-name file reads once, as before. The key set is unchanged: the private reference (today's
+hold is computed over a prefix (limit 1, doubled and replayed from a fresh read until some fetched name survives the
+op's moves): one read of one name when the name leaving is not the primary, two short reads when it is, and two short
+reads for the unlink or rename of a single-name file (a limit of 2 would make that one read, but see the next
+paragraph). The key set is unchanged: the private reference (today's
 computation, `test-util`) is compared in every sim run (`TouchSet::names_cross_check`, scoped to the seed's thread)
 and by a proptest. ADR-42's cost claim ("one range seek") is corrected. Measured on btrfs, ext4 and tmpfs (8,192
 names of one file, a lapse-forced own grant so that the names are read, two runs each): the unlink phase took 14.4 to
@@ -70251,6 +70252,23 @@ stress-ng's name order (`sng-1-0-<n>`, unpadded, unlinked in numeric order) main
 lookup (this one and `Namespace::primary_parent`) steps over until a memtable flush (a perf profile of that run is
 the lsm-tree memtable range iteration and its merge). Without a grant the unlink phase is unchanged (no regression on
 btrfs, ext4, xfs or tmpfs).
+
+The first limit is one, not two. A limit of two (tried first, so that the unlink of a single-name file read once) reads
+the second live name, and in M1's link order (the primary stays, the links go in key order) that is the name leaving,
+behind a tombstone for every link unlinked before it: each read steps over all of them and the unlink phase is
+quadratic whenever a delegated grant exists. Measured with the names change alone on top of the earlier tree (no change
+that prevents the grant), 8,192 links, three runs each: limit 2 took 8 to 42 s on tmpfs and 25 to 48 s on ext4 (per-500
+block means climbing from 0.2 ms to 8 to 16 ms; 16,384 links 134 s and 84 s), limit 1 took 0.8 to 1.6 s on tmpfs and 0.75 to
+3.0 s on ext4 (blocks flat at 0.1 to 0.3 ms; 16,384 links 1.9 s and 2.1 s). The same order with the final head, where
+the root's evident-peer rule keeps the grant from forming in that repro, takes 0.4 to 0.5 s on tmpfs and 0.6 to 1.3 s on ext4
+(16,384 links 1.2 s and 1.6 s), so the head alone could not show the regression. M2 (stress-ng names) with a grant is
+unchanged by the limit: the tombstones below the primary name are the other front (3.7 to 5.2 s on tmpfs, 4.4 to 8.3 s on
+ext4 for 8,192 names, 19 to 20 s for 16,384, as with limit 1 earlier). Cost of one: an unlink or a rename of a
+single-name file reads twice (one name, then two), both short. Guard: the meta test
+`the_unlinks_of_a_link_order_do_not_scan_more_tombstones_each` unlinks M1's 8,192 links with a delegation present and
+sums, per read, the dead names before the last name it fetched: 33,550,336 with a first limit of 2 (fails; the test takes 66 s
+because the store really steps over them), 0 with 1 (passes; the bound is 4n = 32,768). The tests that said "a
+single-name unlink or rename reads once" now say reads twice, both short, with `==` on the counts.
 
 ### A linked peer the roster does not list yet makes backup selection ask for a roster read (2026-11-17)
 
