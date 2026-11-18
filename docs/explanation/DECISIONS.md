@@ -5360,7 +5360,9 @@ is the consequence of that record being in the log.**
   reach the log by right journals the record: the lease holder for root rows;
   the holder of a delegation stream's grant for that stream's rows, a deposed
   root's own sticky stream included (`far-placement+lost-chunk` 326: the
-  deposed root kept its stream with the seed in it, and no node could decide).
+  deposed root kept its stream with the seed in it, and no node could decide), and a restarted
+  remnant that still holds its release row included (`far-root-writes+lost-chunk-late`
+  996: its stream is the only path the rows and the release reach the log).
   A stream holder's record is the stream's own row at the seed's index (the
   lowest rolled-back one), with `fills` for the stream's other rolled-back
   positions, and its identities are the stream positions

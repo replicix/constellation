@@ -70412,3 +70412,13 @@ hold reaches its end; a row past it is `Gap { acked }`). `a_self_claim_whose_tai
 injected read fault landed in the append itself (`append_contiguous_read_faults_on_this_thread_for_tests`), so a shifted
 read count cannot move the fault elsewhere unnoticed. `adopt_tail` is `#[must_use]`; a store error is logged once (the
 replica's warn carries the error).
+
+### ADR-59 part B follow-up: a restart's remnant decides the drop of its stream's held rows (2026-11-18)
+
+`far-root-writes+lost-chunk-late` 996 (crash label): a restarted holder installs its own sticky stream as a remnant (stopped, no subtree) whose
+release row sits behind a row held on a lost chunk. The remnant's stream is the only path its rows and release reach the log, but `repair
+drop-held` refused it (`holds = mine[gen] && !stopped`), so nothing ended the stream and ops under it were never answered.
+`DelegateState::ships_remnant_release` (no subtree, release row journaled, not acknowledged) now also counts as holding the stream in
+`on_control_drop_held`; no other stopped state does (a gate-ended stream's rows are stranded, not shipped by it). ADR-59 part B D1 names it.
+Fail-before: core `a_remnant_holding_its_release_row_decides_the_drop_of_its_held_rows`; sim `a_remnant_holding_its_release_row_decides_the_drop_996`
+(pins the crash label only; the `-paused` label's 996 is a different cause, spec-996 part B).

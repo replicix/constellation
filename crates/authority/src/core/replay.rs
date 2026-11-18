@@ -779,7 +779,14 @@ impl Core {
                 sequencer,
             )
         } else {
-            let holds = |gen: u64| self.dl.mine.get(&gen).is_some_and(|d| !d.stopped);
+            // A restart's remnant that still ships its release row holds the
+            // stream too (`ships_remnant_release`).
+            let holds = |gen: u64| {
+                self.dl
+                    .mine
+                    .get(&gen)
+                    .is_some_and(|d| !d.stopped || d.ships_remnant_release())
+            };
             replica.drop_held_in_stream(
                 ino,
                 now.wall.0 / 1000,

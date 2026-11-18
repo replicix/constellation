@@ -22004,6 +22004,21 @@ fn a_reappended_seed_is_dropped_under_its_own_rid() {
     assert!(report.drop_counts.drops > 0, "no drop was applied");
 }
 
+/// `far-root-writes+lost-chunk-late` 996: a restarted holder's remnant own
+/// stream (stopped, no subtree, its release row behind a row held on a lost
+/// chunk) decides the in-stream drop, so the sticky stream ends (ADR-59 part
+/// B, D1). Before, `repair drop-held` refused it ("not all rows of a stream it
+/// holds") and an op under the stream was never answered (540 s). Only the
+/// crash label is pinned: the `-paused` label's 996 is a different cause.
+#[test]
+fn a_remnant_holding_its_release_row_decides_the_drop_996() {
+    run_seed(
+        996,
+        config_variant(far_root_writes_config(), "lost-chunk-late"),
+    )
+    .unwrap();
+}
+
 /// ADR-59 part B, D1 widened (`far-placement+lost-chunk` 326): node 1 lost a
 /// chunk of its own sticky stream's seed, was deposed (node 3 took over), and
 /// kept its stream as a holder (R-I5); `repair drop-held` there was refused

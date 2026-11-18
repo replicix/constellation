@@ -76118,9 +76118,12 @@ mod step4_sticky {
 mod step5_sticky_release {
     use super::*;
     use crate::core::delegate::RecallPhase;
+    use crate::core::tests::await_retry::{drain, drop_held_decide_via_core};
     use crate::core::{DelegKind, Timer};
     use crate::replica::Replica;
+    use constellation_fs_core::{ChunkInfo, Manifest};
     use constellation_meta::{Position, SubtreeKind, TouchSet};
+    use replicix_chunkfmt::{ChunkHash, ChunkLayout};
 
     fn mkdir(h: &Harness, name: &str) -> (constellation_fs_core::Ino, LogRecord) {
         let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
@@ -76518,6 +76521,83 @@ mod step5_sticky_release {
         assert_eq!(last, 1);
         h.step(stream_ack(1, req, round, last));
         assert!(h.core.dl.mine[&7].release.is_none());
+    }
+
+    /// `far-root-writes+lost-chunk-late` 996: a restart installs the stream
+    /// as a remnant (stopped, no subtree) whose release row sits behind a row
+    /// held on a lost chunk. The remnant's stream is the only path the rows
+    /// reach the log, so its node decides the in-stream drop of them
+    /// (ADR-59 part B, D1) although it is not the sequencer. Fails without
+    /// `DelegateState::ships_remnant_release`: the drop is refused ("not all
+    /// rows of a stream it holds") and the stream never ends.
+    #[test]
+    fn a_remnant_holding_its_release_row_decides_the_drop_of_its_held_rows() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let broken = h.meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
+        let seqs: Vec<u64> = MetaStore::take_journal(&h.meta, usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        let tag = constellation_meta::locks::LockTag::NONE;
+        let seed = MutateOp::SetManifest {
+            ino: broken,
+            base_manifest: None,
+            manifest,
+            size: 19,
+            mtime_ns: None,
+            ctime_ns: None,
+        };
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        h.meta
+            .delegate_execute(&seed, Some(rid), 7, Default::default(), &tag, Now::same(0))
+            .unwrap();
+        // The release waits for the rows before it to sync and stream, then
+        // journals; the chunk is lost after (the row stays unshipped to the
+        // log: a restart's remnant meets it held).
+        let out = release(&mut h, 50, Vec::new(), false);
+        let out = flush(&mut h, &out);
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("the row was not sent: {out:?}"));
+        h.step(stream_ack(1, req, round, last));
+        h.advance(250);
+        drain(&mut h);
+        assert!(last_is_release(&h), "{:?}", rows(&h));
+        h.meta.add_pending_upload(&lost, broken).unwrap();
+        h.meta
+            .note_unrecoverable_chunks(&[(lost, broken)], false)
+            .unwrap();
+        // The restart: the core's memory is gone, the journal stays.
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(d.stopped && d.release.is_some() && d.dirs.is_empty());
+        // Not the sequencer: node 1 holds the lease.
+        assert!(h.core.lease.held.is_none());
+        let out = drop_held_decide_via_core(&mut h, broken);
+        let done = out.iter().find_map(|a| match a {
+            Action::ControlDone { result, .. } => Some(result.clone()),
+            _ => None,
+        });
+        if let Some(Err(e)) = &done {
+            panic!("the remnant's drop was refused: {e}");
+        }
+        assert_eq!(h.core.stats.drops_decided, 1, "{out:?}");
     }
 
     /// The remnant is not limited to non-stealable streams (a stream that

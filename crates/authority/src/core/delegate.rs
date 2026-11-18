@@ -990,6 +990,21 @@ pub(crate) struct DelegateState {
     pub lost_from: Option<u64>,
 }
 
+impl DelegateState {
+    /// A restart's remnant (no subtree left, stopped) whose release row is
+    /// still to ship: the stream is the only path its rows, and so the
+    /// release, reach the log, so this node is the stream's decider for a
+    /// drop of its held rows (ADR-59 part B, D1). Without it the rows held
+    /// behind a lost chunk keep the release from the root and the sticky
+    /// stream never ends. No other stopped state qualifies: the rows of a
+    /// gate-ended stream are stranded, not shipped by the stream.
+    pub(crate) fn ships_remnant_release(&self) -> bool {
+        self.dirs.is_empty()
+            && !self.release_acked
+            && self.release.as_ref().is_some_and(|r| r.row.is_some())
+    }
+}
+
 /// Plan 46 M1.1 step 5: a closed group of a delegate generation
 /// ([`DelegateState::group_spans`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
