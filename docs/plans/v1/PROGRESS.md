@@ -70885,3 +70885,41 @@ held, the ms from the first binding check to the check that reached, split by wh
 Gates on the round-4 head: fmt, clippy `-D warnings`, lib tests debug and release (1,708 each), meta held tests with `test-util`, the release sim suite (576), the 1810 and 226 pins,
 all 0 failed. Sweeps, release, 2,000 seeds, origin/main / fix, 20 labels: failing seeds equal except 1810 gone (`far-root-writes+lost-chunk-late` [1810] / none;
 `far-root-writes-paused+lost-chunk-late` [996] / [996]); `far-root-writes+lost-chunk-late` in a debug build, 500 seeds: none (the fix226 assert does not return).
+
+## O2: direct-stream messages carry no per-message signature (2026-11-18)
+
+Spec A of the rtprof round (two signs and two verifies were about 100 us of a ~275 us backup round trip and ~30% of both daemons' worker CPU).
+The maintainer approved it after a security review ("safe with changes"); the review's changes are all made. See
+[ADR-63](../../explanation/DECISIONS.md#adr-63-direct-streams-carry-no-per-message-signature).
+
+- **Change.** On the direct ALPN a frame is a 4-byte length and the bare `Payload` (`message::write_payload` / `read_payload`; `Signed::encode`,
+  `read_frame` and `write_frame` are gone): `request`, `request_liveness`, the ping probe, the log stream, `ChunkRequest` / `ChunkResponse` and
+  every reply `handle_stream` writes. Gossip keeps `Signed` (`open_gossip`), and refuses a bare payload, a stream frame and a tampered envelope.
+  The ALPN is `constellation/4`, `/3` joins `OLDER_ALPNS`. The byte counters use `stream_wire_len` on streams and `gossip_wire_len` on gossip.
+- **Review changes.** Each dropped author check is `ensure!(conn.remote_id() == expect)`. `handle_conn` re-checks the allowlist on every stream and
+  closes a connection whose key left it (a pre-existing gap: a removed key's open connections stayed served for `Ping`, `ChunkRequest` and the
+  like). It beats closing tracked connections in `set_allowed`: not every connection is tracked (the liveness lane's are not) and a check at use has
+  no window. "Never 0-RTT" is in a comment at `P2p::request`, in `message.rs` and in the ADR. DESIGN.md section 8, p2p-relays, forwarded-mutations,
+  cooperative-cache and the security audit are corrected, and DESIGN's stale "countersigned" read-only sentence too.
+- **Tests.** A stream request naming another node is dropped (`requester`: `a_request_naming_another_node_is_dropped`; `from`, `holder` and `owner`:
+  `a_from_or_holder_naming_another_node_is_dropped`); `a_dial_whose_id_does_not_match_its_address_fails`; `unenrolled_peer_is_refused`;
+  `a_revoked_keys_next_stream_is_refused`; gossip drops a bare payload, a stream frame and a tampered envelope (`gossip_opens_only_a_valid_signed_envelope`,
+  and over a real topic `the_gossip_receive_loop_drops_unsigned_and_tampered_content`); `a_peer_of_another_version_is_named` for /4 against /3; the
+  framing tests ported to `read_payload` (trailing bytes, the cap before allocating, the frame is the prefix and the bare payload).
+  Fail-before: `a_direct_request_is_one_unsigned_frame_of_the_stream_wire_len` fails on the base (frame 104 bytes, 6 expected); the revocation
+  test fails without the per-stream check (a revoked key's `Ping` is answered).
+- **Open item (not fixed here).** `Payload::EpochActivate` is not tied to its proposer: it carries no check that the sender is the epoch's
+  proposer, on gossip or on a stream, so any enrolled node can send one naming another proposer. Found by the O2 security review; independent of
+  O2 (the signature never bound it either). Needs its own change.
+- **Authority sim.** It does not use the net framing: no behaviour change, no sweep. The authority lib tests ran (frame-size test included).
+- **Measured** (`hardlink-burst`, seed 42, linux-fuse, two nodes, release builds of the base and the change, 3 interleaved rounds per file system, on a
+  box at load average 37-65 on 16 CPUs; medians, with the range in brackets): on tmpfs p50 605 us (532-643) to 406 us (360-415), total link time
+  11.8 s (11.5-13.7) to 11.0 s (10.0-12.0), last-1,024 average 1.10 ms to 0.97 ms; on ext4 p50 556 us (501-568) to 393 us (377-441), total 9.5 s
+  (9.2-10.4) to 8.8 s (7.4-13.2; the 13.2 s round ran as the load went from 65 to 98). The first-1,024 average (3.8-4.2 ms on tmpfs, 1.5-1.8 ms on
+  ext4) and the p99 (7-10 ms) are dominated by the burst's start and by the box's load, and do not move. The p50 falls by 160-200 us, more than the
+  ~100 us of signing, because the loaded box also paid the signing's wait for a worker. In the paired rounds the change is lower in every p50.
+- **Gates.** fmt; clippy `--workspace --all-targets -D warnings`; lib tests in debug then release (net 164, engine 991, authority 1,702, meta 477,
+  harness 165), 0 failed in both; the standalone `bench/coop-digest` crate checks. Harness smoke, seed 42, linux-fuse: 150 scenarios (the hlfix2
+  smoke's list plus every forwarded-mutations, coop, log-sink, transport, p2p, backup, seal, failover and partition scenario): 147 passed, 1 skipped
+  (`passthrough-on-every-transport`, needs root), 2 failed for the known environment reasons (`lock-device-stall-lone-node`: no dm device;
+  `lock-xcheckfs-cell`: no xcheckfs script).
