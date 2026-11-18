@@ -2420,13 +2420,18 @@ impl Core {
             // appended rows raised its session, and the newer tenure's log
             // may never carry them (fix 1810). Its own streams and the ones
             // it holds are the replica's.
-            replica.reaches_capped(deps, &|g| {
+            let reached = replica.reaches_capped(deps, &|g| {
                 if self.dl.mine.contains_key(&g) || self.is_own_stream(g) {
                     u64::MAX
                 } else {
                     self.unshipped_append_cap(g, replica)
                 }
-            })
+            });
+            if !reached && replica.reaches(deps) {
+                self.deps_capped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            reached
         }
     }
 

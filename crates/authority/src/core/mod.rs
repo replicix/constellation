@@ -2331,6 +2331,10 @@ pub struct Stats {
     pub member_copies_dropped: u64,
     /// Plan 43 C1-4: member-copy rows an operator's abandon queued.
     pub member_copies_abandoned: u64,
+    /// Fix 1810: a dependency check of a stream this node does not hold that
+    /// the session would have reached and this node's own unshipped appends
+    /// of the generation (`Core::unshipped_append_cap`) did not: the cap bound.
+    pub deps_capped: u64,
     /// Plan 43 C1-4: this node's committed unshipped transactions moved to
     /// a member copy (a deposition, a takeover's strand) instead of queued.
     pub rows_member_copied: u64,
@@ -2498,6 +2502,10 @@ pub struct ShipState {
     pub next_seq: Seq,
     /// The highest epoch of any applied segment (fencing floor).
     pub max_epoch: Epoch,
+    /// A newer tenure began (or the start found one applied) and this node's
+    /// unshipped appends of an older tenure are not stranded yet: retried at
+    /// every applied foreign segment until it succeeds.
+    pub strand_owed: bool,
     /// The highest sequence applied or shipped.
     pub head_seq: Seq,
     pub shipped_since_publish: u64,
@@ -2531,6 +2539,7 @@ impl Default for ShipState {
             // The log starts at 1 (`Shipper::ensure_part`: `applied + 1`).
             next_seq: 1,
             max_epoch: 0,
+            strand_owed: false,
             head_seq: 0,
             shipped_since_publish: 0,
             last_publish: WaitMs(0),
@@ -3033,6 +3042,9 @@ pub struct Core {
     /// the step's `now`.
     clock: Option<WindowsClock>,
     stopped: bool,
+    /// [`Stats::deps_capped`]'s tally, counted by the read-only dependency
+    /// check and folded into `stats` at the end of each event.
+    deps_capped: std::sync::atomic::AtomicU64,
     pub stats: Stats,
 }
 
@@ -3135,6 +3147,7 @@ impl Core {
             clk: Now::same(0),
             clock: None,
             stopped: false,
+            deps_capped: std::sync::atomic::AtomicU64::new(0),
             stats: Stats::default(),
             cfg,
         }
@@ -3333,7 +3346,9 @@ impl Core {
         }
         // A crash between a newer tenure's segment apply and the strand of
         // this node's unshipped appends of an older tenure: repaired from
-        // the persisted applied epoch (idempotent).
+        // the persisted applied epoch (idempotent). Safe ahead of the restarts
+        // below: they read a journal and table this strand leaves consistent.
+        self.ship.strand_owed = true;
         if let Err(error) = self.strand_unshipped_appends(replica.applied_epoch(), replica) {
             tracing::error!(
                 node = self.cfg.node_id,
@@ -3377,6 +3392,9 @@ impl Core {
         // debug assertion for the tests and the simulation.
         let from_session = replica.class_from_session();
         let out = self.handle_event(now, event, replica);
+        self.stats.deps_capped += self
+            .deps_capped
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
         let missed = replica.class_from_session().saturating_sub(from_session);
         if missed > 0 {
             self.stats.journal_class_from_session += missed;

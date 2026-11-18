@@ -10134,6 +10134,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "member_copies_retired",
             "member_copies_dropped",
             "member_copies_abandoned",
+            "deps_capped",
             "tails_kept_as_member_copy",
             "rows_member_copied",
             "archive_dropped",
@@ -10328,7 +10329,7 @@ struct OracleTotals {
     /// with member rows at convergence (must be 0), L2: rids of another node
     /// queued with a gated class (counted), own `Archive` rows of an older
     /// epoch the takeover gate dropped].
-    c14: [u64; 13],
+    c14: [u64; 14],
     /// ADR-57: [reads a read hold touched, of them answered without the
     /// held row (violations), delegate rows a recall dropped, of them
     /// acknowledged and lost (violations)].
@@ -10487,6 +10488,7 @@ impl OracleTotals {
         self.c14[10] += r.member_copy_rows_left as u64;
         self.c14[11] += r.identity_foreign_gated as u64;
         self.c14[12] += r.archive_dropped();
+        self.c14[13] += r.stats.values().map(|st| st.deps_capped).sum::<u64>();
         self.holds[0] += r.sessions.held_reads as u64;
         self.holds[1] += r.sessions.held_served as u64;
         self.holds[2] += r.recall_dropped as u64;
@@ -11161,7 +11163,7 @@ impl OracleTotals {
              tail {}, rows to a member copy {}, member rows retired {} dropped {} abandoned {}, \
              tails kept by a backup {}, tail rows past a gap {}, gated rows queued {}, ungated \
              I2 pairs {}, nodes with member rows at convergence {}, foreign gated queued {}, \
-             archive rows dropped at a gate {}",
+             archive rows dropped at a gate {}, dependency checks the unshipped-append cap bound {}",
             self.seeds,
             self.c14[0],
             self.c14[1],
@@ -11175,7 +11177,8 @@ impl OracleTotals {
             self.c14[9],
             self.c14[10],
             self.c14[11],
-            self.c14[12]
+            self.c14[12],
+            self.c14[13]
         );
         eprintln!(
             "SWEEP-LEASE-TOTALS {label} seeds {}/{seeds}: ttl claims {} (of a live holder {} in \

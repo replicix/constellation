@@ -83,6 +83,7 @@ pub use store::spec::{
 pub use store::spec::{
     fail_next_reship_before_commit_on_this_thread_for_tests,
     fail_next_reship_sync_on_this_thread_for_tests,
+    fail_next_strand_appended_on_this_thread_for_tests,
 };
 pub use store::{
     fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,

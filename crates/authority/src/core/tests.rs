@@ -45458,6 +45458,63 @@ fn a_crash_between_the_segment_apply_and_the_strand_is_repaired_at_start() {
     assert_eq!(copy.iter().map(|t| t.idx).collect::<Vec<_>>(), vec![7]);
 }
 
+/// A failed strand does not hold the fencing floor down (round 2, M1): the
+/// epoch-3 tenure's marker applies and its strand fails; an epoch-2
+/// straggler, superseded by it, is fenced and does not name its writer the
+/// holder. The strand is owed and retried at the next applied segment.
+#[test]
+fn a_failed_strand_keeps_the_fence_and_is_retried_at_the_next_segment() {
+    let (mut h, _deps) = restarted_root_with_an_unshipped_append();
+    let marker_of = |node: u64, epoch: u64, name: &str| {
+        crate::segment::encode(
+            node,
+            epoch,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino: (node << 40) | epoch,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 9,
+            }],
+        )
+        .unwrap()
+    };
+    let mut out = Vec::new();
+    let clk = h.clk();
+    constellation_meta::fail_next_strand_appended_on_this_thread_for_tests();
+    // (Whether the failed strand is reported is not the point: the fence is.)
+    drop(
+        h.core
+            .apply_incoming(clk, 1, &marker_of(3, 3, "m3"), &h.meta, &mut out),
+    );
+    assert!(
+        crate::replica::Replica::journal_len(&h.meta).unwrap() > 0,
+        "the injected fault left the row in the journal"
+    );
+    assert!(h.core.ship.strand_owed);
+    assert_eq!(h.core.ship.max_epoch, 3, "the floor advanced anyway");
+    assert_eq!(h.core.ship.next_seq, 2);
+    // The straggler of the superseded epoch 2.
+    h.core
+        .apply_incoming(clk, 2, &marker_of(2, 2, "late"), &h.meta, &mut out)
+        .unwrap();
+    assert_eq!(h.core.stats.fenced, 1, "the straggler is fenced");
+    assert_eq!(h.core.root_node(), Some(3), "the deposed node is not named");
+    assert!(h.meta.child_ino(ROOT_INO, "late").unwrap().is_none());
+    // The next applied segment retries the strand.
+    h.core
+        .apply_incoming(clk, 3, &marker_of(3, 3, "m3b"), &h.meta, &mut out)
+        .unwrap();
+    assert_eq!(crate::replica::Replica::journal_len(&h.meta).unwrap(), 0);
+    assert!(!h.core.ship.strand_owed);
+    assert_eq!(h.core.stats.local_rolled_back, 1);
+}
+
 /// A segment of an epoch the node has seen strands nothing (the current
 /// tenure's rows are kept).
 #[test]
@@ -87703,6 +87760,9 @@ mod root_own_sticky {
         h.meta.strand_for_takeover(2, &[gen], None).unwrap();
         assert!(h.meta.deleg_ended_at_gate(gen).unwrap());
         let mut idx = h.meta.delegate_idx(gen).unwrap();
+        // (Journaled under the gate's tenure, epoch 2, as the gate does: a row
+        // of an older tenure than the applied epoch is stranded at the start.)
+        h.meta.set_holder_epoch(2);
         for n in 0..2u64 {
             idx += 1;
             let rid = Rid {
@@ -87718,6 +87778,8 @@ mod root_own_sticky {
             )
             .unwrap();
         }
+        // The restart: no tenure is held.
+        h.meta.set_holder_epoch(0);
         let mut out = Vec::new();
         h.core.start(h.clk(), &h.meta, &mut out);
         assert!(

@@ -1741,6 +1741,23 @@ impl Meta {
         Ok(out)
     }
 
+    /// The tip, lowered to the unshipped journal's heads: after a strand took
+    /// rows out, so a node whose appends are gone is on the one-load fast
+    /// path again. Called from the core's thread, the one that journals the
+    /// appends (a concurrent raise could be lost).
+    pub(crate) fn lower_holder_append_tip(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        let tip = read_journal_tx_heads(&r, self)?
+            .into_iter()
+            .filter(|(_, h)| h.gen != 0 && h.appended)
+            .map(|(_, h)| h.last)
+            .max()
+            .unwrap_or(0);
+        self.holder_append_tip
+            .store(tip, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     /// At open: the tip from the unshipped journal's heads.
     pub(crate) fn refresh_holder_append_tip(&self) -> Result<(), MetaError> {
         let r = self.db.read_tx();

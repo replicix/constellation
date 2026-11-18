@@ -768,6 +768,7 @@ fn reship_sync(meta: &Meta) -> Result<(), MetaError> {
 #[cfg(any(test, feature = "test-util"))]
 thread_local! {
     static FAIL_RESHIP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_STRAND_APPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_RESHIP_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -776,6 +777,13 @@ thread_local! {
 #[cfg(any(test, feature = "test-util"))]
 pub fn fail_next_reship_before_commit_on_this_thread_for_tests() {
     FAIL_RESHIP_BEFORE_COMMIT.with(|c| c.set(true));
+}
+
+/// Test hook: the next [`Meta::strand_appended_below`] on this thread fails
+/// before it touches the store.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_next_strand_appended_on_this_thread_for_tests() {
+    FAIL_STRAND_APPENDED.with(|c| c.set(true));
 }
 
 /// Test hook: the next sync after a re-ship's commit on this thread fails.
@@ -6592,6 +6600,9 @@ impl Meta {
         tx.commit()?;
         self.report_rolled_back();
         staged.drain_into(self.usage_tracker());
+        // The strand took rows out of the journal: an appends' tip left above
+        // the shipped watermark costs every dependency check a range scan.
+        self.lower_holder_append_tip()?;
         Ok(stranded)
     }
 
@@ -6608,11 +6619,13 @@ impl Meta {
     /// Every other entry is left to the segment's own apply
     /// ([`Self::apply_segment_rows`]).
     pub fn strand_appended_below(&self, floor: u64) -> Result<Stranded, MetaError> {
-        // (A row of epoch 0 carries no tenure: not known to be an older one's.)
-        self.strand_journal_with(|entry| {
-            Self::is_appended_below(entry, floor)
-                && !matches!(entry, LiveEntry::Local { epoch: 0, .. })
-        })
+        #[cfg(any(test, feature = "test-util"))]
+        if FAIL_STRAND_APPENDED.with(|c| c.replace(false)) {
+            return Err(MetaError::Io(std::io::Error::other(
+                "injected strand fault (testing only)",
+            )));
+        }
+        self.strand_journal_with(|entry| Self::is_appended_below(entry, floor))
     }
 
     /// The takeover gate's strand (plan 30 §M3a × §M9 × §M11): everything
