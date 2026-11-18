@@ -2513,6 +2513,20 @@ row as it reads it for a batch and forgets them once the log carries the
 row. The drain of a sealed tail still waits for a dependency that is only
 not here yet. `Lone` and non-stealable rows are unchanged.
 
+**Amended (2026-11-18, fix 1810)**: the dependency wait of a stream holder
+that holds no root tenure (`Core::stream_deps_reached`) counts a generation it
+does not hold (neither a grant of its own nor an own stream) only below this
+node's own unshipped appends of it (`Core::unshipped_append_cap`, the cap the
+root's commit rule uses), not as far as its session's index, which those
+appends raised: a restarted old root's appended rows may never reach the newer
+tenure's log. A dependency on such a row is not reached whether or not a
+segment of the newer tenure has been applied yet. The deposition's strand has a second trigger for the same reason
+(plan 46 M1.2 step 7, `Meta::strand_appended_below`): a node that holds no
+lease, hold or lost mark and has applied an epoch above its appended rows'
+strands them (member copies, index retracted), at `Core::start` from the
+persisted applied epoch and at each newer tenure's first segment, so a crash
+between the segment's apply and the strand is repaired.
+
 See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-its-generation);
 `crates/authority/src/core/delegate.rs` (`deleg_caps`, `deleg_note_xdeps`,
 `deleg_drain_tail`).

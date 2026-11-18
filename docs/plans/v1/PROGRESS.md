@@ -70844,15 +70844,20 @@ the row. Had 1:1 ended at 35, the answered op would have been replayed by rid af
 The deposition's strand (`recover_deposed`, `strand_deposed`) runs only for a node that held the lease when it learned of the newer tenure; a node
 that restarted without it never ran it, and `apply_segment`'s strand leaves a delegate's appended row (`Local`, `gen != 0`) alone by design.
 
-Now `Core::apply_incoming`, on a foreign segment of an epoch above the highest seen (the newer tenure's first segment) at a node that holds no
-lease, hold or lost mark, calls `Meta::strand_appended_below(epoch)` (the appended-row clause of `strand_deposed` alone): the delegates' rows this node
-appended under an older tenure and never shipped are rolled back from their before-images, kept as member copies of their generation, and the
-generation's log index and the session's stream index go back below them, in the same step as the segment, before any stream the node holds
-executes. The segment's own strand still handles every other entry. Tests: `a_restarted_root_strands_its_unshipped_appends_when_a_newer_tenure_begins`
+Now `Core::strand_unshipped_appends` (called by `Core::apply_incoming` on a foreign segment of an epoch above the highest seen, and by `Core::start`
+with the persisted applied epoch) at a node that holds no lease, hold or lost mark calls `Meta::strand_appended_below(epoch)` (the appended-row
+clause of `strand_deposed`, one shared `strand_journal_with`): the delegates' rows this node appended under an older tenure and never shipped are
+rolled back from their before-images, kept as member copies of their generation, and the generation's log index and the session's stream index go
+back below them. It is a transaction after the segment's own, not in it: its error propagates (`max_epoch` does not advance, the next segment
+tries again) and a crash between the two is repaired at the next start. The segment's own strand still handles every other entry. The window
+before any newer segment is closed by the dependency rule: `Core::stream_deps_reached` of a node without a root tenure counts a generation it does
+not hold only below its own unshipped appends of it (`Core::unshipped_append_cap`, `Replica::reaches_capped`; ADR-39 amended). Tests: `a_restarted_root_strands_its_unshipped_appends_when_a_newer_tenure_begins`
 (core; fails on the parent: after the marker `reaches((4,7))` still holds and the log index stays 7), its guard
 `a_segment_of_the_same_epoch_strands_no_unshipped_append`, and the sim pin `a_restarted_root_does_not_depend_on_its_own_unshipped_appends`
 (`far-root-writes+lost-chunk-late` seed 1810, fails on the parent with the causal cut). Not covered: an op the restarted holder executes before it has
-applied any segment of the newer tenure (the node does not yet know it is deposed).
+applied any segment of the newer tenure: closed by the log-only dependency rule, test
+`a_restarted_holder_does_not_count_its_own_unshipped_append_of_another_stream` (fails before it), and the crash between apply and strand by
+`a_crash_between_the_segment_apply_and_the_strand_is_repaired_at_start`.
 Sweeps, release, 2,000 seeds, parent / fix: failing seeds equal except 1810 gone: `far-root-writes+lost-chunk-late` [226, 996, 1810] / [226, 996],
 `far-root-writes-paused+lost-chunk-late` [996] / [996]; none on `far-root-writes{,-paused,-shared,-cross}+lost-chunk`,
 `sticky-holder-restarts{,-cut,-placed}`, `long-delegated-late-answers`, `backup-crash`. The oracle control
