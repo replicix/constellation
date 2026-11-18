@@ -70872,3 +70872,16 @@ part B); no I-class or lock failure on either side. `Stats::deps_capped` (depend
 `flex-crash`, `delegated-holder-cut`, `drop-held-chain-backed`, `placement-hot`. Fail-before (old behaviour stubbed, logs kept): the floor test fails with
 `max_epoch` 0 instead of 3; the crash repair with the start's strand removed (journal still holds 2 rows); the holder/lost guard with the guard
 removed. The oracle control `the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait` passes.
+Review round 4 (2026-11-18, on origin/main with fix226 and m13wp1): rebased; only PROGRESS conflicted (both sides appended entries, both kept). `strand_unshipped_appends`
+goes through `strand_tx` and so `strand_local_tx`, which carries fix226's shipped-drop fill skip; the strand honours it unchanged. Review 3's SHOULDs:
+`lower_holder_append_tip` after the strand's commit is best-effort (a failure is logged, the tip stays high, the core's bookkeeping of the stranded rows
+still runs); the tip's store is a `compare_exchange` against the value read before the journal scan, so a raise from another thread wins; an owed strand is
+also retried at every poll (`Core::retry_owed_strand`). New sim stat (`SWEEP-CAP-OPS`, `Stats::deps_cap_*`): distinct ops (by `(from, rid)`) the cap
+held, the ms from the first binding check to the check that reached, split by whether a strand of this node's rows came between (stranded) or not
+(shipped), plus the ops that left the parked list without a passing check (answered or redirected elsewhere). Release sweeps, 2,000 seeds: plain `far-root-writes`
+0 stranded, 0 shipped, 145 left (max 68 ms, under one RTT); `-cross` 157 left (max 68 ms); `+lost-chunk-late` 1 shipped (57 ms), 454 left (max 71 ms);
+`-paused` 1 shipped (28 ms), 166 left (max 75 ms); `-paused+lost-chunk` 167 left (max 7.3 s, a paused root); `-paused+lost-chunk-late` 2 stranded (max 4.3 s), 5 shipped
+(max 8.2 s), 495 left (max 5.1 s). The cap binds long only where the root is paused, as the same wait would without it (the log cannot carry the position).
+Gates on the round-4 head: fmt, clippy `-D warnings`, lib tests debug and release (1,708 each), meta held tests with `test-util`, the release sim suite (576), the 1810 and 226 pins,
+all 0 failed. Sweeps, release, 2,000 seeds, origin/main / fix, 20 labels: failing seeds equal except 1810 gone (`far-root-writes+lost-chunk-late` [1810] / none;
+`far-root-writes-paused+lost-chunk-late` [996] / [996]); `far-root-writes+lost-chunk-late` in a debug build, 500 seeds: none (the fix226 assert does not return).
