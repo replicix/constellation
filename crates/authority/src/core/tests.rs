@@ -73756,6 +73756,39 @@ mod step9_one_stream_per_node {
         assert!(answer.is_ok(), "{answer:?}");
     }
 
+    /// Plan 46 M1.3 step 17: `StickyEnd::ALL` lists every variant once, at
+    /// the place `index()` names. The `match` has no wildcard, so a new
+    /// variant fails the build here until it is placed.
+    #[test]
+    fn sticky_end_all_lists_every_variant_at_its_index() {
+        use crate::core::StickyEnd as E;
+        let place = |e: E| -> usize {
+            match e {
+                E::Idle => 0,
+                E::Unmount => 1,
+                E::Suspend => 2,
+                E::Command => 3,
+                E::Handover => 4,
+                E::Leave => 5,
+                E::Claim => 6,
+                E::CrossOwn => 7,
+                E::Dwell => 8,
+                E::Singleton => 9,
+                E::Unhonoured => 10,
+                E::Abandon => 11,
+                E::Undelegate => 12,
+                E::Epoch => 13,
+                E::LeaveOperator => 14,
+            }
+        };
+        assert_eq!(E::ALL.len(), E::COUNT);
+        assert_eq!(E::COUNT, place(E::LeaveOperator) + 1);
+        for (i, e) in E::ALL.iter().enumerate() {
+            assert_eq!(e.index(), i, "{e:?}");
+            assert_eq!(place(*e), i, "{e:?}");
+        }
+    }
+
     /// A leave note (`gen` 0 of a `DelegateStream`) in `out` to `to`: its
     /// request and whether it says leaving.
     fn leave_note_req(out: &[Action], to: NodeId) -> Option<(OpId, bool)> {
@@ -76337,6 +76370,54 @@ mod step5_sticky_release {
             kind != SubtreeKind::Placed
         );
         (h, dirs)
+    }
+
+    /// Plan 46 M1.3 step 17: a sticky holder's own leave records `Leave`
+    /// once its release row is journaled; `release_why` is cleared after,
+    /// so a later recall of the root does not count as a leave.
+    #[test]
+    fn a_leaving_sticky_holder_records_leave_once_and_the_reason_does_not_leak() {
+        use crate::core::StickyEnd as E;
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        assert_eq!(h.core.stats.sticky_ended.iter().sum::<u64>(), 0);
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        assert!(answer(&out, 77).is_none(), "{out:?}");
+        // The leave's wait asks the stream's release on its timer.
+        let mut outs = Vec::new();
+        for _ in 0..10 {
+            if h.core.stats.sticky_ended[E::Leave.index()] > 0 {
+                break;
+            }
+            if let Some(id) = h.core.dl.leave_timer {
+                h.advance(600);
+                outs.extend(h.step(Event::Timer { id }));
+            }
+        }
+        assert!(h.core.stats.sticky_ended[E::Leave.index()] > 0, "{outs:?}");
+        assert_eq!(h.core.stats.sticky_ended[E::Leave.index()], 1);
+        assert_eq!(h.core.stats.sticky_ended.iter().sum::<u64>(), 1);
+        assert_eq!(
+            h.core.dl.last_sticky_end.as_ref().map(|e| (e.0, e.1)),
+            Some((E::Leave, 7))
+        );
+        assert!(h.core.dl.release_why.is_none(), "the reason leaked");
+        // The root's own request for the same stream afterwards: nothing
+        // more is recorded, whatever the reason would have been.
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
+                req: OpId(9),
+                gen: 7,
+                dirs: Vec::new(),
+            },
+        });
+        assert!(h.core.dl.release_why.is_none());
+        assert_eq!(h.core.stats.sticky_ended[E::Leave.index()], 1);
+        assert_eq!(h.core.stats.sticky_ended.iter().sum::<u64>(), 1);
     }
 
     fn release(
