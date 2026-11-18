@@ -70433,7 +70433,7 @@ them, the seeds, and (added so a zero can be told from a blind instrument) the h
 by cause; a failing seed's message carries the number of its violations that are tagged. Test:
 `an_unsettled_eio_is_tagged_while_its_streams_release_waits_on_recalls` (fails with the overlap check returning false).
 
-**S4 evidence, corrected after the review (2026-11-18, second round).** Not closed here; D1 stays the maintainer's.
+**S4 evidence, corrected after the review (2026-11-18, second round).** S4 is not closed here; see below.
 The first round counted the tag over the classified unsettled EIOs only; the ones excused as `designation_held` (non-stealable: what a sticky stream
 produces), `isolated_from_s3` or `held-behind-lost-chunk` were dropped before the count. `SWEEP-S4` now prints the tag over both: tagged among
 the classified, and tagged among the excused, apart. The strict-failure text no longer says "N of them release waited on read recalls" for every
@@ -70456,11 +70456,27 @@ node 3 reads and writes it, so it holds read delegations from the holder; three 
 op ran, its requester settles through the root), then the pair is cut for 9 s, longer than `read_span`; the holder's release is the idle release
 (1.2 s idle, `idle_gaps`) or its own leave at 2.5 s. They reach the window: held releases in 1,449 / 694 seeds (no knob), the longest held for 6.6 s /
 10.0 s, and settles whose window overlapped a held release (13 / 15 over 2,000 seeds no knob, 34 / 2 with the knob; 96 / 77 in
-`sticky-holder-restarts-placed`). Every one of them ended settled: **no unsettled EIO fell inside a held release in any run**. So the sim reaches the hazard
-and does not produce S4 there; the number of settles that met a hold is small (tens per 2,000 seeds), and the lost-answer trigger is what produces them.
-The knob arm and the late seeds of the new labels fail I4 in the root-owned and `itself` classes (knob: 21 and 13 seeds; no knob: 3 in `sticky-s4-idle`),
-untagged: their windows end seconds to a minute after the last held release. Those are the carried O/A classes, not S4; `sticky-s4-*` are not in the
-ratchet. `SWEEP-S4` now also prints the settles sent and those whose window overlapped a held release, and the longest closed span.
+`sticky-holder-restarts-placed`). No unsettled EIO, classified or excused, had a window that overlapped a held span of a generation it rested on
+(0 tagged in all ten runs); the outcomes of the overlapping settles were not recorded one by one. This measures what the sim reaches, not a bound:
+tens of settles per 2,000 seeds met a hold, all behind a lost-answer trigger, and none produced a tagged EIO.
+The knob arm and the late seeds of the new labels fail I4 in the root-owned and `itself` classes, untagged: `sticky-s4-idle` knob 21 seeds, no knob 3;
+`sticky-s4-leave` knob 12 I4 seeds (plus operator_abandon seed 119), no knob 0. Their windows end seconds to a minute after the last held release.
+They are not traced (the O/A classes are carried, not shown); `sticky-s4-*` are not in the ratchet.
+
+**What the evidence does and does not show.**
+- A single held release is bounded by `read_span` in wait-clock time (grant expiry R + m, or the ADR-46 restart quarantine, at most boot + `read_span`).
+  D11 (`settle_cap_span >= read_span`) covers a settle that starts at or after the hold begins and is parked behind it.
+- A suspend stretches that in real time: seed 622 of `sticky-s4-leave` (both arms) shows one park plus a 2.6 s suspend, 10,032 ms for a hold whose
+  wait-clock bound is 7,500 ms. The earlier explanation (a kernel drain armed by the restarted holder's first foreign contact) is withdrawn: the sim
+  runs with `kernel_cache_ttl_ms = 0`, so no drain is armed there.
+- Merged releases are unbounded in n: a release merged into a held note adds its own wait, so n merged releases hold for at most
+  `read_span + (n-1)*max(R + m, K)`, and no configuration inequality bounds n (`s4bound/report.md`). Settles started before a hold, and settles
+  redirected instead of parked (they end `designation_held`, ADR-47), are not covered by D11 either.
+- **S4 stays OPEN.** It is to be fixed by ReleaseCut (D-3), specified separately. The tag stays as a tripwire: a tagged unsettled EIO in a sweep
+  is an S4 reproduction. D11 is a `Warn` invariant asserted only in the sim (`every_sim_configuration_passes_deadline_check`); the daemon does not run
+  `Deadlines::check` (separate job).
+
+`SWEEP-S4` now also prints the settles sent and those whose window overlapped a held release, and the longest closed span.
 
 **Sweeps** (seeds 0..1,999 `+unsettled`; failing seeds, of them I4 unsettled `EIO`s; passing seeds' allowed unsettled `EIO`s):
 
