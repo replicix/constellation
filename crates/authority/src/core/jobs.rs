@@ -1871,12 +1871,9 @@ impl Core {
     ///
     /// Rows left to the replay (ended by the tail, past a lost dependency,
     /// not the log's next index, ...) are queued by rid as the strand
-    /// queued them, and their generations are marked `claim_replayed`.
+    /// queued them, and their generations are marked in that transaction (`Meta::deleg_claim_replayed`).
     fn reappend_own_delegate_rows(&mut self, report: &constellation_meta::ReshipReport) {
         self.stats.own_deleg_rows_reappended += report.own_reappended;
-        self.dl
-            .claim_replayed
-            .extend(report.own_halted_gens.iter().copied());
         if report.own_reappended > 0 {
             tracing::info!(
                 node = self.cfg.node_id,

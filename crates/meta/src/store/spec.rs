@@ -840,7 +840,8 @@ pub struct ReshipReport {
     /// stranded them (`StrandArgs::own_gens`).
     pub own_reappended: u64,
     /// The own generations a row of which did not go back (it and the rows
-    /// after it are queued for replay by rid): the core's `claim_replayed`.
+    /// after it are queued for replay by rid): marked durably in the same
+    /// transaction (`Meta::deleg_claim_replayed`).
     pub own_halted_gens: BTreeSet<u64>,
     /// Tail transactions journaled.
     pub tail_applied: usize,
@@ -7049,6 +7050,9 @@ impl Meta {
         }
         if report.own_reappended > 0 {
             self.flush_held_releases();
+            // (Rows queued before the gate under a re-appended rid left the
+            // queue in the transaction: a read waiting on their keys may go.)
+            self.session.notify();
         }
         if member != Default::default() {
             if let Err(error) = self.refresh_member_copy_flag() {
@@ -7272,6 +7276,10 @@ impl Meta {
             {
                 halted = true;
                 report.own_halted_gens.insert(gen);
+                // (Durable with the rest: a crash right after the commit
+                // must not let a claim release the generation behind rows
+                // the replay journals by rid.)
+                local::mark_deleg_claim_replayed_tx(tx, &self.local, gen);
                 continue;
             }
             // (The rid the transaction completes, as the tail passes it; a
@@ -7280,7 +7288,16 @@ impl Meta {
                 LogRecord::Completed { rid } => Some(*rid),
                 _ => None,
             });
-            let one = self.journal_adopted_from_tx(tx, &row.records, completes, row.origin)?;
+            let one = self
+                .journal_adopted_from_tx(tx, &row.records, completes, row.origin)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        gen = %crate::delegation::GenLabel::of(gen),
+                        idx,
+                        %error,
+                        "re-appending this node's own delegate row failed; the re-ship fails and the gate retries"
+                    );
+                })?;
             journaled.push((row.origin, one));
             report.own_reappended += 1;
             appended.extend(outcome);

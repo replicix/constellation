@@ -1341,3 +1341,83 @@ fn a_claimant_without_a_tail_keeps_its_rows_of_a_generation_only_speculation_end
     assert_eq!(meta.void_cut(g).unwrap(), None);
     assert!(!meta.deleg_ended_at_gate(g).unwrap());
 }
+
+/// Review m12s3 S2: the claim's re-ship re-appends this node's own delegate
+/// rows inside its transaction, where the orphan cuts of the same claim are
+/// not yet in the session; the gate's own rule (`orphan_lost`) judges a
+/// dependency past such a cut as lost, as `deps_lost` would after the commit.
+/// Own row of `h` (stream index 1) depends on `g`'s index 1, a generation
+/// that only an uncommitted streamed grant of epoch 1 listed, which the claim's
+/// proof ends at the log's index of it, 0. The row is not re-appended (it
+/// would put a row in the log whose cause the log never carries, ADR-39), it is
+/// queued for replay by rid, and its generation is marked as replayed.
+/// The control row, with no such dependency, goes back.
+#[test]
+fn a_dependency_past_an_orphan_cut_of_the_same_claim_halts_the_re_append() {
+    use constellation_meta::{StrandArgs, TailArgs};
+    let (g, h) = (gen(1, 1), gen(1, 2));
+    let run = |deps: Position| {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.apply_segment(1, 1, &[delegate(h)], &TouchSet::default())
+            .unwrap();
+        meta.install_streamed_committed(1, 3, 1, 1, &[delegate(g)], false, (0, 0))
+            .unwrap();
+        assert!(meta.delegation_table().has_gen(g));
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino: (2u64 << 40) | 20,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        meta.delegate_execute(
+            &op,
+            Some(RID),
+            h,
+            deps,
+            &Default::default(),
+            constellation_types::clock::Now::same(0),
+        )
+        .unwrap();
+        let proof = constellation_meta::OrphanProof::of(&[no_tail(1, 0)]);
+        let report = meta
+            .reship_at_takeover(
+                Some(StrandArgs {
+                    epoch: 2,
+                    own_gens: &[h],
+                    abandoned: None,
+                    carried: &Default::default(),
+                    proof: &proof,
+                    marker: &[],
+                    own_lost_from: &Default::default(),
+                    reappend_version: 1,
+                }),
+                Some(TailArgs {
+                    epoch: 1,
+                    through: 0,
+                    config_version: 1,
+                    class: None,
+                }),
+            )
+            .unwrap();
+        (meta, report)
+    };
+    let (meta, report) = run(at(g, 1));
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0), "the claim ends g at 0");
+    assert_eq!(report.own_reappended, 0, "{report:?}");
+    assert_eq!(report.own_halted_gens, [h].into(), "{report:?}");
+    assert!(
+        meta.pending_replays()
+            .unwrap()
+            .iter()
+            .any(|op| op.rid == RID),
+        "queued for replay by rid"
+    );
+    assert!(meta.deleg_claim_replayed(h).unwrap(), "marked durably");
+    let (meta, report) = run(Position::default());
+    assert_eq!(report.own_reappended, 1, "{report:?}");
+    assert!(report.own_halted_gens.is_empty(), "{report:?}");
+    assert!(meta.pending_replays().unwrap().is_empty());
+    assert!(!meta.deleg_claim_replayed(h).unwrap());
+}

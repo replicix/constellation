@@ -498,6 +498,10 @@ pub trait Replica {
     /// (`Meta::deleg_ended_at_gate`): the generation is never executed in
     /// here again.
     fn deleg_ended_at_gate(&self, gen: u64) -> bool;
+    /// The takeover gate left own rows of `gen` to the replay by rid
+    /// (`Meta::deleg_claim_replayed`, durable): the claim journals no release
+    /// row for it.
+    fn deleg_claim_replayed(&self, gen: u64) -> bool;
     /// Plan 46 M1.2 step 8b: the generations whose `DelegateNode` record this
     /// replica holds only as a streamed entry the root's configuration did
     /// not commit (`Meta::uncommitted_streamed_grants`). Such a grant is
@@ -1738,6 +1742,16 @@ impl Replica for Meta {
         // ended early, not a stream that never drains.
         Meta::deleg_ended_at_gate(self, gen).unwrap_or_else(|e| {
             tracing::warn!(gen = %constellation_meta::delegation::GenLabel::of(gen), error = %e, "gate-ended mark unreadable; taking it as set");
+            true
+        })
+    }
+
+    fn deleg_claim_replayed(&self, gen: u64) -> bool {
+        // An unreadable mark is taken as set: the cost is a release row not
+        // journaled (counted, the end cuts as before), not one behind rows
+        // the log lacks.
+        Meta::deleg_claim_replayed(self, gen).unwrap_or_else(|e| {
+            tracing::warn!(gen = %constellation_meta::delegation::GenLabel::of(gen), error = %e, "claim-replayed mark unreadable; taking it as set");
             true
         })
     }

@@ -1439,12 +1439,6 @@ pub(crate) struct DelegationState {
     /// The streams this node granted itself while it was the root (a deposed
     /// root keeps streaming them: `Stats::root_own_resumed`).
     pub(crate) own_minted: BTreeSet<u64>,
-    /// Plan 46 M1.3 step 12: the generations whose own rows the takeover
-    /// gate replayed by rid instead of re-appending them (the re-append
-    /// halted, or the tail or the log ended them); read once by the claim's
-    /// sync, which cannot journal their release row behind rows the log
-    /// does not hold.
-    pub(crate) claim_replayed: BTreeSet<u64>,
     /// Plan 46 M1.3 step 12: the claimed own streams whose end waits for the
     /// stream's rows (the wall time the wait began).
     pub(crate) claim_waits: BTreeMap<u64, WaitMs>,
@@ -13474,7 +13468,9 @@ impl Core {
     /// before, counted).
     pub(super) fn claim_releases(&mut self, gen: u64, non_stealable: bool, replica: &dyn Replica) {
         let me = self.me();
-        let replayed = self.dl.claim_replayed.remove(&gen);
+        // (Durable: the re-ship's transaction marks the generations whose
+        // rows it left to the replay, `Meta::deleg_claim_replayed`.)
+        let replayed = replica.deleg_claim_replayed(gen);
         if !non_stealable {
             if replayed {
                 self.stats.claim_own_rows_halted_stealable += 1;

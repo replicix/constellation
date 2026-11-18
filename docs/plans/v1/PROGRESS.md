@@ -70254,7 +70254,7 @@ cannot reach the window (both happen in one core event).
 
 Fix (option A, c3-spec 5.1 as written). The re-append runs inside the re-ship's transaction: it reads the own rows (records,
 origin, deps) before the strand, applies the same skip and halt rules after the tail (carried by origin, in the log, ended by
-the tail, unlisted, not the next index, no outcome rid, lost or uncaptured deps, a dependency on an own generation's row not
+the tail, unlisted, not the next index, no outcome rid, lost deps, a dependency on an own generation's row not
 yet in the log), journals the rest with `journal_adopted_from_tx` (the transaction form of `apply_adopted_records_from`,
 `bump_log_idx_tx` included), takes the re-appended rids out of the replay queue the strand filled in the same transaction
 (`drop_queued_of_rids_tx`; the queue never holds them at a commit), and ends the own streams at the log

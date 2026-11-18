@@ -1241,6 +1241,22 @@ impl Meta {
         deleg_ended_at_gate_tx(&r, &self.local, gen)
     }
 
+    /// Whether this node's takeover gate left own rows of generation `gen` to
+    /// the replay by rid (`ReshipReport::own_halted_gens`, marked in the
+    /// re-ship's transaction): a claim journals no release row for it.
+    pub fn deleg_claim_replayed(&self, gen: u64) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_claim_replayed_key(gen))?.is_some())
+    }
+
+    /// Tests: mark `gen` as [`Self::deleg_claim_replayed`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn mark_claim_replayed_for_tests(&self, gen: u64) {
+        let mut tx = self.db.write_tx();
+        mark_deleg_claim_replayed_tx(&mut tx, &self.local, gen);
+        tx.commit().unwrap();
+    }
+
     /// Plan 43 C2e follow-up: this node, the delegate of `gen`, holds a grant
     /// of it on boot `boot`, synced before it executes under it. A process
     /// that restarts on the same boot finds its journal as the last one left
@@ -3640,6 +3656,23 @@ pub(crate) fn mark_deleg_ended_at_gate_tx(
     gen: u64,
 ) {
     kv_set_tx(tx, local, &deleg_ended_at_gate_key(gen), "1");
+}
+
+fn deleg_claim_replayed_key(gen: u64) -> String {
+    format!("deleg_claim_replayed:{gen}")
+}
+
+/// Mark generation `gen`: the takeover gate left some of this node's own rows
+/// of it to the replay by rid (they could not go back under their origin), in
+/// the transaction that did so. A claim cannot journal the generation's
+/// release row behind rows the log lacks, and the mark outlives a crash right
+/// after the commit. Never cleared (generations are not reused, ADR-43).
+pub(crate) fn mark_deleg_claim_replayed_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) {
+    kv_set_tx(tx, local, &deleg_claim_replayed_key(gen), "1");
 }
 
 /// Plan 46 M1.2 step 6: the stream counters of the generations this node's

@@ -19627,7 +19627,7 @@ mod locks {
         );
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert_eq!(h.core.stats.own_deleg_rows_reappended, 0);
-        assert!(h.core.dl.claim_replayed.contains(&7));
+        assert!(h.meta.deleg_claim_replayed(7).unwrap());
         assert!(h.meta.deleg_ended_at_gate(7).unwrap());
         assert_eq!(h.meta.log_stream_idx(7).unwrap(), 0);
         assert_eq!(
@@ -85637,7 +85637,7 @@ mod root_own_sticky {
     #[test]
     fn a_rowless_claim_stops_the_stream_while_its_end_waits() {
         let (mut h, dirs, gen, record) = restarted_root_with_own_stream();
-        h.core.dl.claim_replayed.insert(gen);
+        h.meta.mark_claim_replayed_for_tests(gen);
         h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
         let before = Replica::journal_txs_from(&h.meta, record + 1, usize::MAX)
             .iter()
@@ -85757,10 +85757,49 @@ mod root_own_sticky {
     #[test]
     fn a_claim_over_replayed_own_rows_journals_no_release_and_counts_it() {
         let (mut h, _dirs, gen, _record) = restarted_root_with_own_stream();
-        h.core.dl.claim_replayed.insert(gen);
+        h.meta.mark_claim_replayed_for_tests(gen);
         claim(&mut h);
         assert_eq!(h.core.stats.claim_own_rows_halted_non_stealable, 1);
         assert_eq!(h.core.stats.claim_released, 0);
+    }
+
+    /// Review m12s3 S1: what the takeover gate left to the replay by rid
+    /// survives a crash right after its re-ship commits. A batch had found a
+    /// lost dependency at the stream's first row, so the gate re-appends
+    /// nothing and queues the rows by rid; the process dies; the restarted
+    /// claim finds no tail and no gate report, yet journals no release row
+    /// for the stream (it would precede root rows the log lacks). Fails
+    /// without the durable mark (`Meta::deleg_claim_replayed`): the claim
+    /// then journals the release.
+    #[test]
+    fn a_claim_after_a_crash_still_journals_no_release_over_rows_the_gate_replayed() {
+        let (mut h, _dirs, gen, _record) = restarted_root_with_own_stream();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.dl.mine.get_mut(&gen).expect("re-adopted").lost_from = Some(1);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert!(h.meta.deleg_claim_replayed(gen).unwrap(), "no mark");
+        // The crash: the core's memory goes, the store stays.
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.start(h.clk(), &h.meta, &mut out);
+        claim(&mut h);
+        assert_eq!(h.core.stats.claim_own_rows_halted_non_stealable, 1);
+        assert_eq!(
+            h.core.stats.claim_released, 0,
+            "a release row was journaled"
+        );
     }
 
     /// Spec 12a pin (the read-recall half of claim = release is covered by
