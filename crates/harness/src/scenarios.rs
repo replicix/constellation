@@ -1233,6 +1233,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m9::singleton_peer_join_nobackup,
     },
     Scenario {
+        name: "singleton-peer-join-backup",
+        desc: "singleton-peer-join where A lists B as its backup before the kill (waited for): B takes the lease over by seal within 15 s of the kill with no client write (backup_takeovers and seals count it), then holds every file A acknowledged after its roster listed B",
+        requires: &[],
+        caps: &[],
+        run: m9::singleton_peer_join_backup,
+    },
+    Scenario {
         name: "registered-peer-down",
         desc: "ADR-50 (plan 46 M1.3 step 10): B mounts and is killed without leave: A's writes still succeed, counted archive_waits, and A is no singleton; after A retires B (leave --node-id) it answers alone again",
         requires: &[],

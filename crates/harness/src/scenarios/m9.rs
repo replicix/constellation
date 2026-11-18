@@ -1072,22 +1072,42 @@ pub fn backup_partition(_seed: u64) -> Result<()> {
 /// bound). So B's first write after the kill must succeed within twice the
 /// TTL plus 10 s, B then holds the lease above A's epoch, and every file A
 /// acknowledged after its roster listed B is on B. A's backups just before
-/// the kill are printed: which of the two paths ran.
+/// the kill are printed: which of the two paths ran. The `-nobackup` and
+/// `-backup` siblings pin one path each.
 pub fn singleton_peer_join(_seed: u64) -> Result<()> {
-    singleton_peer_join_in("singleton-peer-join", &[])
+    singleton_peer_join_in("singleton-peer-join", &[], BackupPath::Either)
 }
 
 /// [`singleton_peer_join`] with no backup possible (`BACKUP_RTT_BUDGET_MS=0`):
-/// B is never A's backup, so the death is always followed by the TTL claim
-/// on demand.
+/// B is never A's backup (asserted before the kill), so the death is always
+/// followed by the TTL claim on demand.
 pub fn singleton_peer_join_nobackup(_seed: u64) -> Result<()> {
     singleton_peer_join_in(
         "singleton-peer-join-nobackup",
         &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0")],
+        BackupPath::None,
     )
 }
 
-fn singleton_peer_join_in(name: &str, extra: &[(&str, &str)]) -> Result<()> {
+/// [`singleton_peer_join`] where A lists B as its backup before the kill
+/// (waited for): B takes over by seal within the seal bound with no client
+/// write, so this is the variant that exercises the seal path.
+pub fn singleton_peer_join_backup(_seed: u64) -> Result<()> {
+    singleton_peer_join_in("singleton-peer-join-backup", &[], BackupPath::Listed)
+}
+
+/// What [`singleton_peer_join_in`] requires of A's backups before the kill.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupPath {
+    /// Whatever A has; the path that ran is printed.
+    Either,
+    /// A has none: the TTL claim on demand.
+    None,
+    /// A lists B (waited for): the seal takeover, without a write.
+    Listed,
+}
+
+fn singleton_peer_join_in(name: &str, extra: &[(&str, &str)], path: BackupPath) -> Result<()> {
     let (_env, _root, mut clients, _) = cluster_mounted(name, &["a", "b"], extra, 0, 1)?;
     let result = (|| -> Result<()> {
         let (before, _) = write_files(&clients[0], "alone", 20)?;
@@ -1117,25 +1137,65 @@ fn singleton_peer_join_in(name: &str, extra: &[(&str, &str)]) -> Result<()> {
             "A answered ungated after its roster listed B: {}",
             ack_of(&clients[0])?
         );
+        if path == BackupPath::Listed {
+            let backups = wait_for_backup(&clients[0], Duration::from_secs(60))?;
+            anyhow::ensure!(
+                backups.contains(&b),
+                "A's backups {backups:?} do not list B ({b})"
+            );
+        }
         let a = ack_of(&clients[0])?;
         print_ack(name, "A", &a);
         eprintln!("    {name}: A's backups before the kill: {}", a["backups"]);
-        let epoch = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
+        if path == BackupPath::None {
+            anyhow::ensure!(
+                a["backups"].as_array().is_some_and(|l| l.is_empty()),
+                "A has backups with the budget at 0: {a}"
+            );
+        }
+        let epoch = lease_of(&clients[0])?["epoch"]
+            .as_u64()
+            .context("A's lease has no epoch")?;
         clients[0].kill9()?;
-        // B claims on demand: a write is what asks. It must succeed inside
-        // twice the TTL plus 10 s (the TTL claim, the P2P grace and slack).
-        let bound = Duration::from_millis(2 * TTL_MS) + Duration::from_secs(10);
-        let t = Instant::now();
-        std::fs::write(clients[1].mnt.join("after-kill"), b"after-kill")
-            .map_err(|e| anyhow::anyhow!("B's first write after A's death failed: {e}"))?;
-        let took = t.elapsed();
-        eprintln!("    {name}: B's first write after A's death returned after {took:?}");
-        anyhow::ensure!(
-            took <= bound,
-            "B's first write took {took:?}, more than {bound:?}"
-        );
-        let held = wait_holds(&clients[1], epoch, Duration::from_secs(10))?;
-        eprintln!("    {name}: B holds above epoch {epoch} {held:?} after its write");
+        if path == BackupPath::Listed {
+            // The backup seals: nothing asks, B holds above A's epoch well
+            // inside the TTL.
+            let took = wait_holds(&clients[1], epoch, Duration::from_secs(15))?;
+            eprintln!("    {name}: B holds above epoch {epoch} {took:?} after the kill, no write");
+            let a = {
+                let t = Instant::now();
+                loop {
+                    let a = ack_of(&clients[1])?;
+                    if (n(&a, "backup_takeovers") >= 1 && n(&a, "seals") >= 1)
+                        || t.elapsed() > Duration::from_secs(10)
+                    {
+                        break a;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            };
+            print_ack(name, "B", &a);
+            anyhow::ensure!(
+                n(&a, "backup_takeovers") >= 1 && n(&a, "seals") >= 1,
+                "B did not take over by seal: {a}"
+            );
+        } else {
+            // B claims on demand: a write is what asks. It must succeed
+            // inside twice the TTL plus 10 s (the TTL claim, the P2P grace
+            // and slack).
+            let bound = Duration::from_millis(2 * TTL_MS) + Duration::from_secs(10);
+            let t = Instant::now();
+            std::fs::write(clients[1].mnt.join("after-kill"), b"after-kill")
+                .map_err(|e| anyhow::anyhow!("B's first write after A's death failed: {e}"))?;
+            let took = t.elapsed();
+            eprintln!("    {name}: B's first write after A's death returned after {took:?}");
+            anyhow::ensure!(
+                took <= bound,
+                "B's first write took {took:?}, more than {bound:?}"
+            );
+            let held = wait_holds(&clients[1], epoch, Duration::from_secs(10))?;
+            eprintln!("    {name}: B holds above epoch {epoch} {held:?} after its write");
+        }
         all_visible(&clients[1], &after, Duration::from_secs(30))?;
         // (What A answered alone before its roster listed B is on B or comes
         // back as a conflict copy when A returns: the singleton's accepted

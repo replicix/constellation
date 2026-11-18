@@ -496,6 +496,7 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("single-node-unchanged", Skip::Local(&[COUNT])),
     ("singleton-peer-join", Skip::Local(&[KILL])),
     ("singleton-peer-join-nobackup", Skip::Local(&[KILL, "turns backups off (CONSTELLATION_BACKUP_RTT_BUDGET_MS=0)"])),
+    ("singleton-peer-join-backup", Skip::Local(&[KILL])),
     ("registered-peer-down", Skip::Local(&[KILL])),
     ("backup-failover-with-delegation", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
     ("upgrade-after-a-seal", Skip::Local(&[KILL, CTO_STRICT, UPGRADE, NODES3])),
