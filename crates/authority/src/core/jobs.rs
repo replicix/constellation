@@ -899,6 +899,32 @@ impl Core {
                     }
                 }
             }
+            // A node that holds no lease (a restarted old root) and meets a
+            // newer tenure's first segment: the delegates' rows it appended
+            // under its own older tenure and never shipped are not in that
+            // tenure's log. Strand them now, before a stream it holds
+            // executes: its dependency wait counted them as the log's.
+            if seg.epoch > self.ship.max_epoch
+                && self.lease.held.is_none()
+                && !self.lease.epoch_held()
+                && !self.lease.lost
+            {
+                if let Ok(stranded) = replica.strand_appended_below(seg.epoch) {
+                    if stranded.any() {
+                        self.stats.local_rolled_back +=
+                            (stranded.locals + stranded.deleg_member_copied) as u64;
+                        self.note_committed_stranded(&stranded);
+                        replica.clear_streamed();
+                        tracing::warn!(
+                            node = self.cfg.node_id,
+                            epoch = seg.epoch,
+                            rows = stranded.deleg_member_copied,
+                            "a newer tenure began: this node's unshipped appends of an older \
+                             tenure are kept as member copies"
+                        );
+                    }
+                }
+            }
             if seg.node != 0 && seg.epoch >= self.ship.max_epoch {
                 self.lease.name_holder(seg.node);
             }

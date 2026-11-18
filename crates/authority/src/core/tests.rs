@@ -45279,6 +45279,139 @@ fn deposed_root_with_a_marker_replay() -> (Harness, Rid, constellation_meta::Str
     (h, rid, queued[0].clone())
 }
 
+/// A restarted old root: its journal holds the row 7 of generation 4 (a
+/// delegate's, node 2's) that it appended as the root of epoch 1 and never
+/// shipped, and the log it tails carries the generation through row 6. It
+/// holds no lease. Returns the node and the position naming row 7.
+fn restarted_root_with_an_unshipped_append() -> (Harness, constellation_meta::Position) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.meta.set_holder_epoch(1);
+    // The log carries generation 4 through row 6.
+    crate::replica::Replica::note_stream(&h.meta, 4, 6);
+    let data_rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    let data = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "data".into(),
+        ino: (2 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    assert!(h
+        .meta
+        .apply_delegate_tx(
+            &[data, LogRecord::Completed { rid: data_rid }],
+            Some(data_rid),
+            4,
+            7,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    // (The append counted in the session, as the root's append does.)
+    crate::replica::Replica::note_stream(&h.meta, 4, 7);
+    // The crash: the restart reads the journal back, with no lease.
+    h.meta.set_holder_epoch(0);
+    assert!(
+        crate::replica::Replica::journal_len(&h.meta).unwrap() > 0,
+        "the append is unshipped"
+    );
+    let deps = constellation_meta::Position::ZERO.with_streams_wire(&[(4, 7)]);
+    (h, deps)
+}
+
+/// The newer tenure's first segment (a marker of node 3 at epoch 2), as
+/// the tail delivers it.
+fn newer_tenure_marker() -> Vec<u8> {
+    crate::segment::encode(
+        3,
+        2,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Create {
+            parent: ROOT_INO,
+            name: "marker".into(),
+            ino: (3 << 40) | 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 9,
+        }],
+    )
+    .unwrap()
+}
+
+/// 1810 (step 0): a restarted root without the lease, whose journal holds
+/// a delegate's row it appended under its older tenure and never shipped,
+/// applies the epoch-2 tenure's marker. The row is not in that log: it is
+/// kept as a member copy and the generation's index goes back below it, so
+/// a stream this node holds waits for the log to carry row 7 instead of
+/// counting its own append (the op it executed answered Ok on a dependency
+/// the log never carried). Fails on the parent: the index stays 7.
+#[test]
+fn a_restarted_root_strands_its_unshipped_appends_when_a_newer_tenure_begins() {
+    let (mut h, deps) = restarted_root_with_an_unshipped_append();
+    assert!(
+        crate::replica::Replica::reaches(&h.meta, &deps),
+        "the parent's behaviour: its own append counts as the log's"
+    );
+    let mut out = Vec::new();
+    let clk = h.clk();
+    h.core
+        .apply_incoming(clk, 1, &newer_tenure_marker(), &h.meta, &mut out)
+        .unwrap();
+    assert!(
+        !crate::replica::Replica::reaches(&h.meta, &deps),
+        "row 7 is not in the log: a dependency on it is not reached"
+    );
+    assert_eq!(crate::replica::Replica::log_stream_idx(&h.meta, 4), 6);
+    assert_eq!(
+        crate::replica::Replica::journal_len(&h.meta).unwrap(),
+        0,
+        "the row left the journal"
+    );
+    assert!(h.meta.child_ino(ROOT_INO, "data").unwrap().is_none());
+    assert_eq!(h.core.stats.local_rolled_back, 1);
+}
+
+/// The strand is for a node that holds no lease: a holder that meets a
+/// newer tenure's segment is deposed (`recover_deposed` strands for it),
+/// and a segment of its own epoch strands nothing.
+#[test]
+fn a_segment_of_the_same_epoch_strands_no_unshipped_append() {
+    let (mut h, deps) = restarted_root_with_an_unshipped_append();
+    let marker = crate::segment::encode(
+        3,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Create {
+            parent: ROOT_INO,
+            name: "marker".into(),
+            ino: (3 << 40) | 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 9,
+        }],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let clk = h.clk();
+    h.core
+        .apply_incoming(clk, 1, &marker, &h.meta, &mut out)
+        .unwrap();
+    assert!(crate::replica::Replica::reaches(&h.meta, &deps));
+    assert!(crate::replica::Replica::journal_len(&h.meta).unwrap() > 0);
+}
+
 /// The takeover gate does not execute a replay ahead of the delegate rows
 /// it was ordered after (long-delegated-late-answers seed 2945): it stays
 /// queued for the drain, whose submit makes the root wait for them.

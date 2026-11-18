@@ -204,6 +204,11 @@ pub trait Replica {
     /// appended as the root are kept as a member copy of their generation
     /// instead of being rebuilt and replayed.
     fn strand_deposed(&self, floor: Epoch, own_stream: bool) -> Result<Stranded, MetaError>;
+    /// A node without the lease that learns a newer tenure began
+    /// (`Meta::strand_appended_below`): the delegates' rows it appended as an
+    /// older tenure's root and never shipped are kept as member copies and
+    /// leave the log index.
+    fn strand_appended_below(&self, floor: Epoch) -> Result<Stranded, MetaError>;
     /// Unshipped journal rows without before-images (`Meta::uncaptured_tx_count`):
     /// the only rows a strand cannot roll back.
     fn uncaptured_tx_count(&self) -> Result<u64, MetaError>;
@@ -1206,6 +1211,10 @@ impl Replica for Meta {
 
     fn strand_deposed(&self, floor: Epoch, own_stream: bool) -> Result<Stranded, MetaError> {
         Meta::strand_deposed_with(self, floor, own_stream)
+    }
+
+    fn strand_appended_below(&self, floor: Epoch) -> Result<Stranded, MetaError> {
+        Meta::strand_appended_below(self, floor)
     }
 
     fn uncaptured_tx_count(&self) -> Result<u64, MetaError> {

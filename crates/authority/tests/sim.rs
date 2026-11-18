@@ -22219,6 +22219,23 @@ fn a_claimed_stream_whose_end_never_ships_still_ships_its_release_row_996() {
     .unwrap();
 }
 
+/// A restarted root without the lease strands the delegates' rows it
+/// appended under its older tenure and never shipped, when a newer tenure's
+/// segment reaches it (`far-root-writes+lost-chunk-late` 1810). Node 1, the
+/// root of epoch 1, appended a row of node 2's stream and crashed before
+/// shipping it; restarted under node 3's epoch 2 it executed an op of its own
+/// sticky stream on that row (its dependency wait counted the append as the
+/// log's) and answered Ok, and the current root refused the batch for lacking
+/// the row. Failed on the parent with the causal cut.
+#[test]
+fn a_restarted_root_does_not_depend_on_its_own_unshipped_appends() {
+    run_seed(
+        1810,
+        config_variant(far_root_writes_config(), "lost-chunk-late"),
+    )
+    .unwrap_or_else(|e| panic!("far-root-writes+lost-chunk-late seed 1810: {e}"));
+}
+
 /// ADR-59 part B, D1 widened (`far-placement+lost-chunk` 326): node 1 lost a
 /// chunk of its own sticky stream's seed, was deposed (node 3 took over), and
 /// kept its stream as a holder (R-I5); `repair drop-held` there was refused

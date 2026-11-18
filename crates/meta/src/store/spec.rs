@@ -6579,6 +6579,51 @@ impl Meta {
         Ok(stranded)
     }
 
+    /// The appended-row half of [`Self::strand_deposed`] alone, for a node
+    /// that holds no lease and learns that a newer tenure (a segment of epoch
+    /// `floor`) has begun: a restarted old root. A delegate's row this node
+    /// appended as the root (`Local`, `appended`, journaled under an epoch
+    /// below `floor`) and never shipped can no longer reach the log of that
+    /// tenure. It is rolled back from its before-images, kept as a member
+    /// copy of its generation, and the generation's log index retracts below
+    /// it, in one transaction. Left in the journal it counted as part of the
+    /// log in a dependency wait of this node's own stream (`reaches`), and an
+    /// op executed on it was answered on a row the log may never carry.
+    /// Every other entry is left to the segment's own apply
+    /// ([`Self::apply_segment_rows`]).
+    pub fn strand_appended_below(&self, floor: u64) -> Result<Stranded, MetaError> {
+        let mut tx = self.db.write_tx();
+        let staged = UsageTracker::staging();
+        let stranded = strand_tx(
+            &mut tx,
+            self,
+            &staged,
+            |entry| {
+                matches!(
+                    entry,
+                    LiveEntry::Local { epoch, gen, appended: true, .. }
+                        if *gen != 0 && *epoch < floor
+                )
+            },
+            true,
+            false,
+            true,
+            None,
+            |_| false,
+        )?;
+        if !stranded.any() {
+            return Ok(stranded);
+        }
+        let from = journal_from(&tx, self)?;
+        compact_tx(&mut tx, self, from)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        self.report_rolled_back();
+        staged.drain_into(self.usage_tracker());
+        Ok(stranded)
+    }
+
     /// The takeover gate's strand (plan 30 §M3a × §M9 × §M11): everything
     /// [`Self::strand_below_epoch`] strands, and this node's own
     /// transactions as the *delegate* of generations `own_gens` (a
