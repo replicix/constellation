@@ -92,6 +92,10 @@ struct Harness {
     /// `step` leaves `Action::PersistLockHorizon` to the test (a slow
     /// write); otherwise it completes it at once, as the driver would.
     manual_horizon: bool,
+    /// `step` leaves `Action::PersistReleaseRecord` to the test (a slow
+    /// off-core write: the release CAS waits for it); otherwise it
+    /// completes it at once, as the driver would.
+    manual_release_record: bool,
     /// The read-grant horizons are not written ahead before a read: the
     /// first grant finds nothing durable (`Core::grant_horizon_covers`).
     /// Otherwise a read finds the lane warm, as steady reading does.
@@ -164,6 +168,7 @@ impl Harness {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         }
     }
@@ -241,7 +246,7 @@ impl Harness {
             }
         }
         let mut out = self.core.handle(self.clk(), event, &self.meta);
-        if self.manual_horizon {
+        if self.manual_horizon && self.manual_release_record {
             return out;
         }
         // The lock-grant horizon write lands at once: its answers follow
@@ -249,6 +254,23 @@ impl Harness {
         let mut i = 0;
         let mut writes = 0;
         while i < out.len() {
+            if let Action::PersistReleaseRecord { record } = out[i] {
+                if !self.manual_release_record {
+                    writes += 1;
+                    assert!(writes <= 16, "the release record write never settles");
+                    let ok = self.meta.persist_lease_released(record).is_ok();
+                    let more = self.core.handle(
+                        self.clk(),
+                        Event::ReleaseRecordPersisted { record, ok },
+                        &self.meta,
+                    );
+                    out.extend(more);
+                }
+            }
+            if self.manual_horizon {
+                i += 1;
+                continue;
+            }
             if let Action::PersistGrantHorizon { kind, until } = out[i] {
                 writes += 1;
                 assert!(
@@ -313,6 +335,32 @@ impl Harness {
 
     fn advance(&mut self, ms: u64) {
         self.now = self.now.plus(ms);
+    }
+
+    /// What the driver does with the release-record writes in `out` (a
+    /// step of the core that the test called directly, not through
+    /// [`Self::step`]): each lands at once and its event follows, the
+    /// release CAS in it. `manual_release_record` leaves them.
+    fn settle(&mut self, out: &mut Vec<Action>) {
+        let mut i = 0;
+        while i < out.len() && !self.manual_release_record {
+            if let Action::PersistReleaseRecord { record } = out[i] {
+                let ok = self.meta.persist_lease_released(record).is_ok();
+                let mut more = self.core.handle(
+                    self.clk(),
+                    Event::ReleaseRecordPersisted { record, ok },
+                    &self.meta,
+                );
+                // A test that called `issue_release` or `round_release`
+                // with no job in the slot has none to resume: the release
+                // goes on from here, as the job's re-entry would.
+                if ok && self.core.job.is_none() && self.core.lease.releasing {
+                    self.core.issue_release(self.clk(), &self.meta, &mut more);
+                }
+                out.extend(more);
+            }
+            i += 1;
+        }
     }
 
     /// Plan 43 C7b: this node read `lease`, watched it run out (see
@@ -2142,6 +2190,7 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         idle(&mut h);
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert_eq!(
             h.core.lease.releasing, !pending,
             "idle release with the takeover gate pending: {pending}"
@@ -2203,6 +2252,7 @@ fn a_single_writer_holder_never_hands_the_lease_over() {
         );
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert_eq!(
             h.core.lease.releasing, !single_writer,
             "released for a wanter (single writer: {single_writer})"
@@ -2977,6 +3027,7 @@ struct Driven {
 /// Answers a job's uploads and S3 requests until it asks for nothing more.
 fn drive_job(h: &mut Harness, mut acts: Vec<Action>) -> Driven {
     let mut d = Driven::default();
+    h.settle(&mut acts);
     for _ in 0..40 {
         d.uploads += acts
             .iter()
@@ -3353,6 +3404,7 @@ fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
         });
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert_eq!(
             h.core.lease.releasing,
             !(fast || foreign || tail),
@@ -11124,6 +11176,7 @@ mod cto {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         h.hold(1, None);
@@ -18676,6 +18729,7 @@ mod backup_crash {
                 honour_off: 0,
                 wait_off: 0,
                 manual_horizon: false,
+                manual_release_record: false,
                 cold_horizon: false,
             };
             let mut out = Vec::new();
@@ -21962,6 +22016,102 @@ mod locks {
         (h, ino)
     }
 
+    /// While the release record is written (`Phase::PersistRelease`) the
+    /// lease is fenced as it is while the CAS is out: no lock grant, no
+    /// new mutation. The duty a release leaves behind (`lock_duty_standing`)
+    /// is counted at the step that sends the CAS: a grant ended in the gap
+    /// lets it go unmarked.
+    #[test]
+    fn no_lock_grant_or_mutation_is_admitted_while_the_record_is_written() {
+        let (mut h, ino) = holder_with_file();
+        h.manual_release_record = true;
+        let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+        let id = Some((carried.epoch, carried.expires_unix_ms));
+        let out = request(&mut h, 3, 7, ino, X, false);
+        let replies = lock_replies(&out);
+        let [(3, _, LockOutcome::Granted { id: g3, .. })] = replies.as_slice() else {
+            panic!("not granted: {out:?}")
+        };
+        let g3 = *g3;
+        // An operator's flush leaves the grant standing and releases.
+        let out = h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Flush,
+        });
+        let upload = out
+            .iter()
+            .find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            })
+            .expect("the flush uploads first");
+        let mut out = h.step(Event::UploadsDone {
+            op: upload,
+            result: UploadResult::Done { held: 0 },
+        });
+        for _ in 0..12 {
+            if !release_record_writes(&out).is_empty() {
+                break;
+            }
+            if let Some(op) = out.iter().find_map(|a| match a {
+                Action::Publish { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                out = h.step(Event::PublishDone { op, ok: true });
+                continue;
+            }
+            let Some((op, req)) = s3_ops(&out).first().map(|(o, r)| (*o, (*r).clone())) else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected {other:?} before the release record: {out:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        assert_eq!(release_record_writes(&out), vec![id], "{out:?}");
+        assert_eq!(release_swaps(&out), 0, "{out:?}");
+        // The gap: another node's lock request is not granted, and no new
+        // mutation is admitted.
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert!(
+            !lock_replies(&out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. })),
+            "a grant was made while the release record was written: {out:?}"
+        );
+        assert!(!h.core.lease.open_for_new_mutation(h.clk(), &h.core.cfg));
+        // The grant ends in the gap.
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g3,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        assert_eq!(h.meta.locks().grants_len(), 0);
+        // The CAS goes out at the event, its duty counted now: unmarked.
+        let out = land_release_record(&mut h, id);
+        let swaps: Vec<_> = s3_ops(&out)
+            .into_iter()
+            .filter_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } if lease.released => Some(lease.clone()),
+                _ => None,
+            })
+            .collect();
+        let [swap] = swaps.as_slice() else {
+            panic!("no release CAS at the event: {out:?}")
+        };
+        assert!(
+            !swap.granted_delegations,
+            "the duty was taken from before the gap"
+        );
+        assert!(h.core.lk.release_unmarked);
+    }
+
     fn request(
         h: &mut Harness,
         from: NodeId,
@@ -23693,6 +23843,7 @@ mod locks {
                 honour_off: 0,
                 wait_off: 0,
                 manual_horizon: false,
+                manual_release_record: false,
                 cold_horizon: false,
             };
             h.hold(2, None);
@@ -23790,6 +23941,7 @@ mod locks {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         h.hold(2, None);
@@ -23849,6 +24001,7 @@ mod locks {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         h.step_wall(3_600_000);
@@ -29325,6 +29478,7 @@ mod locks {
             );
             out.clear();
             h.core.issue_release(h.clk(), &h.meta, &mut out);
+            h.settle(&mut out);
             s3_ops(&out)
                 .into_iter()
                 .find_map(|(_, r)| match r {
@@ -29751,6 +29905,7 @@ mod locks {
         assert_eq!(h.meta.locks().grants_len(), 1, "the record was purged");
         let mut out = Vec::new();
         h.core.issue_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert!(h.core.lease.releasing);
         let released = s3_ops(&out)
             .into_iter()
@@ -29906,6 +30061,7 @@ mod locks {
         // While node 3 holds its grant the lease stays.
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert!(!h.core.lease.releasing, "released over a grant: {out:?}");
         // Node 3 unlocks; the next round idle-releases.
         h.advance(100);
@@ -29921,6 +30077,7 @@ mod locks {
         h.core.lease.last_write = long_ago;
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert!(h.core.lease.releasing, "no idle release: {out:?}");
         let released = s3_ops(&out)
             .into_iter()
@@ -29968,6 +30125,7 @@ mod locks {
         h.meta.locks().set_quarantine(quarantine);
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert!(
             !h.core.lease.releasing,
             "released inside the quarantine: {out:?}"
@@ -29976,6 +30134,7 @@ mod locks {
         h.core.lk.grace.push((ROOT_INO, WaitMs(h.now.0 + 2_000)));
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert!(
             !h.core.lease.releasing,
             "released inside a subtree grace: {out:?}"
@@ -29984,6 +30143,7 @@ mod locks {
         h.advance(2_001);
         let mut out = Vec::new();
         h.core.round_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         assert!(h.core.lease.releasing, "no idle release: {out:?}");
         let released = s3_ops(&out)
             .into_iter()
@@ -30272,6 +30432,7 @@ mod locks {
         }
         let mut out = Vec::new();
         h.core.issue_release(h.clk(), &h.meta, &mut out);
+        h.settle(&mut out);
         let released = lease_swaps(&out)
             .into_iter()
             .map(|(_, l)| l)
@@ -39674,6 +39835,16 @@ fn epoch_report(
 /// The holder serves an (epoch-less) handoff request from node 3: the
 /// release CAS is in flight, `releasing` up. Its op.
 fn handoff_release_in_flight(h: &mut Harness) -> OpId {
+    let out = handoff_flushed(h);
+    assert!(h.core.lease.releasing);
+    let (release, req) = s3_ops(&out)[0];
+    assert!(matches!(req, S3Op::LeaseSwap { lease, .. } if lease.released));
+    release
+}
+
+/// The holder serves an (epoch-less) handoff request from node 3 and its
+/// uploads are done: the step that decides the release. Its actions.
+fn handoff_flushed(h: &mut Harness) -> Vec<Action> {
     let out = h.step(Event::Peer {
         from: 3,
         msg: PeerMsg::LeaseRequest {
@@ -39688,14 +39859,35 @@ fn handoff_release_in_flight(h: &mut Harness) -> OpId {
             _ => None,
         })
         .expect("the handoff uploads first");
-    let out = h.step(Event::UploadsDone {
+    h.step(Event::UploadsDone {
         op: upload,
         result: UploadResult::Done { held: 0 },
-    });
-    assert!(h.core.lease.releasing);
-    let (release, req) = s3_ops(&out)[0];
-    assert!(matches!(req, S3Op::LeaseSwap { lease, .. } if lease.released));
-    release
+    })
+}
+
+/// The writes of the release record `out` asks for, in order.
+fn release_record_writes(out: &[Action]) -> Vec<Option<(Epoch, i64)>> {
+    out.iter()
+        .filter_map(|a| match a {
+            Action::PersistReleaseRecord { record } => Some(*record),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many release CASes `out` sends.
+fn release_swaps(out: &[Action]) -> usize {
+    s3_ops(out)
+        .iter()
+        .filter(|(_, r)| matches!(r, S3Op::LeaseSwap { lease, .. } if lease.released))
+        .count()
+}
+
+/// What the driver does with `Action::PersistReleaseRecord { record }`:
+/// the durable write, then its event (`ok`), handled by the core.
+fn land_release_record(h: &mut Harness, record: Option<(Epoch, i64)>) -> Vec<Action> {
+    let ok = h.meta.persist_lease_released(record).is_ok();
+    h.step(Event::ReleaseRecordPersisted { record, ok })
 }
 
 /// S3 back: run the polls until the epoch closes and the carried lease
@@ -42596,6 +42788,7 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
         honour_off: 0,
         wait_off: 0,
         manual_horizon: false,
+        manual_release_record: false,
         cold_horizon: false,
     };
     h.advance(2);
@@ -48299,6 +48492,7 @@ mod persisted_floor {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         let mut out = Vec::new();
@@ -50629,6 +50823,7 @@ mod deleg_group {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         r.core.lease.cached_holder = Some(1);
@@ -54552,6 +54747,7 @@ mod c1_counted {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         let mut out = Vec::new();
@@ -57220,6 +57416,7 @@ mod c1_tail_fetch {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
@@ -58260,6 +58457,7 @@ mod c1_tail_fetch {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         let mut out = Vec::new();
@@ -65890,6 +66088,7 @@ mod await_retry {
             honour_off: 0,
             wait_off: 0,
             manual_horizon: false,
+            manual_release_record: false,
             cold_horizon: false,
         };
         let mut out = Vec::new();
@@ -90255,4 +90454,317 @@ mod tail_answer_gaps {
         }
         assert!(unreadable_runs >= 1, "no read of the answer was faulted");
     }
+}
+
+// ---- the release record's durable write runs off the core step ----
+
+/// The lease-release record's sync (70-394 ms on a loaded disk) was inside
+/// the step that sent the release CAS. The core only asks for the write
+/// now (`Action::PersistReleaseRecord`) and sends the CAS at its event, so
+/// the record is still durable before the CAS goes out. Fails on the
+/// parent: the CAS is in the first step, and the core wrote the record.
+#[test]
+fn the_release_cas_waits_for_the_off_core_record() {
+    let mut h = Harness::new(1);
+    h.manual_release_record = true;
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    let out = handoff_flushed(&mut h);
+    assert_eq!(release_record_writes(&out), vec![id], "{out:?}");
+    assert_eq!(
+        release_swaps(&out),
+        0,
+        "the CAS went out before the record: {out:?}"
+    );
+    assert_eq!(
+        h.meta.lease_released(),
+        None,
+        "the core wrote the record itself"
+    );
+    assert!(h.core.lease.releasing);
+    // The write lands, and the CAS goes out in the event's step.
+    let out = land_release_record(&mut h, id);
+    assert_eq!(h.meta.lease_released(), id);
+    assert_eq!(release_swaps(&out), 1, "{out:?}");
+    assert_eq!(h.core.pr.release_record, id);
+    assert!(
+        release_record_writes(&out).is_empty(),
+        "written twice: {out:?}"
+    );
+}
+
+/// A record that did not reach the disk must not let the release go: the
+/// lease is kept, the handoff declined.
+#[test]
+fn a_failed_release_record_keeps_the_lease() {
+    let mut h = Harness::new(1);
+    h.manual_release_record = true;
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    let out = handoff_flushed(&mut h);
+    assert_eq!(release_record_writes(&out), vec![id], "{out:?}");
+    let out = h.step(Event::ReleaseRecordPersisted {
+        record: id,
+        ok: false,
+    });
+    assert_eq!(
+        release_swaps(&out),
+        0,
+        "a release went out unrecorded: {out:?}"
+    );
+    assert!(!h.core.lease.releasing);
+    assert!(h.core.lease.held.is_some(), "the lease was let go");
+    assert!(h.core.job.is_none(), "the handoff goes on");
+    assert_eq!(
+        h.core.pr.release_record, None,
+        "a failed write is not a record"
+    );
+}
+
+/// The lease is still unreleased in S3 but a restart finds a record that
+/// says it was let go, or the other way round: only a record that is
+/// durable before the CAS makes the restart safe. Crash points of the
+/// off-core write (C1..C4 of the design), each with what the disk holds
+/// and whether the CAS went out. At every point a CAS that went out has
+/// its record durable, and a restart adopts no hold on a lease whose
+/// release was issued.
+#[test]
+fn release_record_crash_at_every_point() {
+    #[derive(Clone, Copy, Debug)]
+    enum Point {
+        /// Crash after the step that decided the release, before the `kv_set`.
+        C1BeforeWrite,
+        /// The `kv_set` ran, the sync had not returned: the record did not survive.
+        C2WrittenNotDurable,
+        /// The `kv_set` ran, the sync had not returned: the record survived.
+        C2WrittenDurable,
+        /// The sync returned, the event was not handled yet.
+        C3SyncedBeforeEvent,
+        /// The event was handled: the CAS went out (and may have landed).
+        C4AfterEvent,
+    }
+    for point in [
+        Point::C1BeforeWrite,
+        Point::C2WrittenNotDurable,
+        Point::C2WrittenDurable,
+        Point::C3SyncedBeforeEvent,
+        Point::C4AfterEvent,
+    ] {
+        let mut h = Harness::new(1);
+        h.manual_release_record = true;
+        h.hold(1, None);
+        let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+        let carrier = carrier_of(&carried);
+        let id = Some((carried.epoch, carried.expires_unix_ms));
+        let s1 = handoff_flushed(&mut h);
+        assert_eq!(release_record_writes(&s1), vec![id], "{point:?}: {s1:?}");
+        let mut cas_issued = release_swaps(&s1) > 0;
+        // What the disk holds at the crash.
+        let durable = match point {
+            Point::C1BeforeWrite | Point::C2WrittenNotDurable => None,
+            Point::C2WrittenDurable | Point::C3SyncedBeforeEvent => {
+                h.meta.persist_lease_released(id).unwrap();
+                id
+            }
+            Point::C4AfterEvent => {
+                let out = land_release_record(&mut h, id);
+                cas_issued |= release_swaps(&out) > 0;
+                h.meta.lease_released()
+            }
+        };
+        assert_eq!(
+            matches!(point, Point::C4AfterEvent),
+            cas_issued,
+            "{point:?}: the CAS goes out exactly at the event"
+        );
+        assert!(
+            !cas_issued || durable == id,
+            "{point:?}: the CAS went out with no durable record"
+        );
+        // The restart: a new process, the disk as it stands.
+        // (The same disk: the record is what the crash left of it.)
+        let cfg = h.core.config().clone();
+        let mut r = h;
+        r.meta.persist_lease_released(durable).unwrap();
+        r.core = Core::new(cfg);
+        let mut out = Vec::new();
+        r.core.start(r.clk(), &r.meta, &mut out);
+        r.step(epoch_report(carrier, true, true, false, false));
+        if durable.is_some() {
+            assert!(
+                !r.core.lease.epoch_held(),
+                "{point:?}: a restart adopted the hold on a lease whose release was recorded"
+            );
+            assert_eq!(r.core.pr.owes_move, id, "{point:?}: the move is owed");
+            assert_eq!(r.core.pr.released, id, "{point:?}");
+        } else {
+            assert!(!cas_issued, "{point:?}");
+            assert_eq!(r.core.pr.owes_move, None, "{point:?}: nothing was released");
+            assert_eq!(r.core.pr.released, None, "{point:?}");
+        }
+        // The heal at C4: the object is the released lease; the epoch closes.
+        if cas_issued {
+            let (closed, reclaimed) = epoch_probe_until_close(&mut r, carrier, carried.released());
+            assert!(closed, "{point:?}: the epoch never closed");
+            assert!(
+                reclaimed.is_none(),
+                "{point:?}: a released lease re-claimed"
+            );
+        }
+        // A re-acquisition clears a record left standing (the whole
+        // acquisition is `the_release_record_is_cleared_by_a_kept_release_
+        // and_by_an_acquisition`).
+        if durable.is_some() && !cas_issued {
+            let mut out = Vec::new();
+            r.core.release_superseded(true, &mut out);
+            assert_eq!(
+                release_record_writes(&out),
+                vec![None],
+                "{point:?}: {out:?}"
+            );
+            land_release_record(&mut r, None);
+            assert_eq!(r.meta.lease_released(), None, "{point:?}");
+            assert_eq!(r.core.pr.release_record, None, "{point:?}");
+        }
+    }
+}
+
+/// The release is abandoned in the gap (the lease is lost, or the job
+/// ended): the late event only records what is on the disk, sends no CAS,
+/// and the stale record is cleared through the serializer.
+#[test]
+fn a_release_abandoned_in_the_gap_sends_no_cas() {
+    // The lease is lost in the gap.
+    let mut h = Harness::new(1);
+    h.manual_release_record = true;
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    handoff_flushed(&mut h);
+    h.core.lease.lost = true;
+    let out = land_release_record(&mut h, id);
+    assert_eq!(release_swaps(&out), 0, "a CAS for a lost lease: {out:?}");
+    assert_eq!(h.core.pr.release_record, id, "the record on disk is known");
+    assert!(h.core.job.is_none());
+    // The job's end clears the stale record through the serializer.
+    assert_eq!(release_record_writes(&out), vec![None], "{out:?}");
+    land_release_record(&mut h, None);
+    assert_eq!(h.core.pr.release_record, None);
+    assert_eq!(h.meta.lease_released(), None);
+
+    // The job ended in the gap (not releasing any more): the late event
+    // clears the stale record itself.
+    let mut h = Harness::new(1);
+    h.manual_release_record = true;
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    handoff_flushed(&mut h);
+    h.core.job = None;
+    h.core.lease.releasing = false;
+    let out = land_release_record(&mut h, id);
+    assert_eq!(
+        release_swaps(&out),
+        0,
+        "a CAS for an abandoned release: {out:?}"
+    );
+    assert_eq!(h.core.pr.release_record, id);
+    assert_eq!(release_record_writes(&out), vec![None], "{out:?}");
+    land_release_record(&mut h, None);
+    assert_eq!(h.meta.lease_released(), None);
+    assert_eq!(h.core.pr.release_record, None);
+}
+
+/// One write of `local["lease_released"]` at a time, the latest request
+/// wins, and the disk ends at the last request: a clear queued behind a
+/// set (an acquisition right after an abandoned release) lands after it.
+#[test]
+fn release_record_writes_are_serialized() {
+    let mut h = Harness::new(1);
+    h.manual_release_record = true;
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    let out = handoff_flushed(&mut h);
+    assert_eq!(release_record_writes(&out), vec![id]);
+    // The release is abandoned, and a lease is acquired: a clear is
+    // requested while the set is in flight. It waits.
+    h.core.job = None;
+    h.core.lease.releasing = false;
+    let mut out = Vec::new();
+    h.core.release_superseded(true, &mut out);
+    assert!(
+        release_record_writes(&out).is_empty(),
+        "two writes of the key in flight: {out:?}"
+    );
+    // The set lands: exactly one write follows, the clear.
+    let out = land_release_record(&mut h, id);
+    assert_eq!(release_record_writes(&out), vec![None], "{out:?}");
+    assert_eq!(release_swaps(&out), 0);
+    // Meanwhile the latest request wins: a set, then a clear, behind the
+    // clear in flight. Nothing follows it, and the disk ends cleared.
+    let mut out = Vec::new();
+    h.core.write_release_record(id, &mut out);
+    h.core.write_release_record(None, &mut out);
+    assert!(release_record_writes(&out).is_empty(), "{out:?}");
+    let out = land_release_record(&mut h, None);
+    assert!(release_record_writes(&out).is_empty(), "{out:?}");
+    assert_eq!(
+        h.meta.lease_released(),
+        None,
+        "the disk ends at the last request"
+    );
+    assert_eq!(h.core.pr.release_record, None);
+}
+
+/// A clear of the record that failed may have landed in the journal all the
+/// same: what is on disk is not known, so the next release writes its record
+/// again before its CAS goes out, rather than trust the old one.
+#[test]
+fn a_failed_clear_does_not_let_the_next_release_go_unrecorded() {
+    let mut h = Harness::new(1);
+    h.manual_release_record = true;
+    h.hold(1, None);
+    let lease = h.core.lease.held.as_ref().unwrap().0.clone();
+    let id = Some((lease.epoch, lease.expires_unix_ms));
+    // The record stands, and a release finds it durable.
+    h.core.pr.release_record = id;
+    let mut out = Vec::new();
+    assert!(matches!(
+        h.core.record_release(&lease, &mut out),
+        crate::core::promise::ReleaseRecord::Durable
+    ));
+    assert!(out.is_empty());
+    // A clear is requested and fails.
+    h.core.write_release_record(None, &mut out);
+    assert_eq!(release_record_writes(&out), vec![None]);
+    h.step(Event::ReleaseRecordPersisted {
+        record: None,
+        ok: false,
+    });
+    // The next release writes its record again.
+    let mut out = Vec::new();
+    assert!(matches!(
+        h.core.record_release(&lease, &mut out),
+        crate::core::promise::ReleaseRecord::Pending
+    ));
+    assert_eq!(release_record_writes(&out), vec![id], "{out:?}");
+}
+
+/// The release reconfiguration waits for the record's write as it waits
+/// for the CAS: a backup reconfiguration CAS must not race the release.
+#[test]
+fn a_reconfiguration_waits_for_the_release_record() {
+    let mut h = Harness::new(1);
+    h.manual_release_record = true;
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    assert!(!h.core.lease_cas_in_flight());
+    handoff_flushed(&mut h);
+    assert!(h.core.lease_cas_in_flight(), "waiting for the record");
+    land_release_record(&mut h, id);
+    assert!(h.core.lease_cas_in_flight(), "the CAS is out");
 }

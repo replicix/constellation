@@ -34,6 +34,15 @@ pub struct Applied {
     pub member: constellation_meta::MemberOutcome,
 }
 
+/// The value of `local["lease_released"]` for `released` (empty: cleared).
+/// The one format, for the replica's own write and the driver's off-core
+/// one (`Action::PersistReleaseRecord`).
+pub fn release_record_value(released: Option<(Epoch, i64)>) -> String {
+    released
+        .map(|(e, x)| format!("{e}:{x}"))
+        .unwrap_or_default()
+}
+
 pub trait Replica {
     // ---- executing ops (holder side, local fast path, lease path) ----
 
@@ -2423,10 +2432,7 @@ impl Replica for Meta {
     }
 
     fn persist_lease_released(&self, released: Option<(Epoch, i64)>) -> Result<(), MetaError> {
-        let v = released
-            .map(|(e, x)| format!("{e}:{x}"))
-            .unwrap_or_default();
-        Meta::kv_set_durable(self, "lease_released", &v)
+        Meta::kv_set_durable(self, "lease_released", &release_record_value(released))
     }
 
     fn gate_orphan_proof_persisted(&self) -> Option<(Epoch, constellation_meta::OrphanProof)> {

@@ -91,6 +91,12 @@ pub enum Event {
         until: WaitMs,
         durable: Option<WaitMs>,
     },
+    /// `Action::PersistReleaseRecord { record }` finished: `ok` the key
+    /// is durable (written and synced); `false` it may or may not be.
+    ReleaseRecordPersisted {
+        record: Option<(Epoch, i64)>,
+        ok: bool,
+    },
     /// `Action::PersistGrantHorizon { kind, until }` finished: `durable`
     /// is the horizon now on disk, `None` if the write failed.
     GrantHorizonPersisted {

@@ -4458,6 +4458,24 @@ impl Driver {
                         .ok();
                     let _ = self.tx.send(Event::LockHorizonPersisted { until, durable });
                 }
+                Action::PersistReleaseRecord { record } => {
+                    // The write lands here (a crash in the simulation keeps
+                    // the store, so the durable-state cases are the core
+                    // tests'); the event follows after a seeded delay, as
+                    // the blocking pool's sync takes, so the release's CAS
+                    // races the renewals, recalls, reconfigurations,
+                    // crashes and epoch activations that arrive meanwhile.
+                    let ok = Replica::persist_lease_released(&*self.meta, record).is_ok();
+                    let tx = self.tx.clone();
+                    let epoch = record.map_or(0, |(e, _)| e);
+                    let delay = epoch.wrapping_mul(11).wrapping_add(self.id) % 26;
+                    tokio::spawn(async move {
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                        let _ = tx.send(Event::ReleaseRecordPersisted { record, ok });
+                    });
+                }
                 Action::PersistGrantHorizon { kind, until } => {
                     // As the lock horizon's: written here, answered as an
                     // event, so the horizon covers grants one event later.

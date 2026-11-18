@@ -258,6 +258,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::RebuildDone { .. } => "RebuildDone",
         Event::LockFlushed { .. } => "LockFlushed",
         Event::LockHorizonPersisted { .. } => "LockHorizonPersisted",
+        Event::ReleaseRecordPersisted { .. } => "ReleaseRecordPersisted",
         Event::GrantHorizonPersisted { .. } => "GrantHorizonPersisted",
         Event::DelegStreamSynced { .. } => "DelegStreamSynced",
         Event::Roster { .. } => "Roster",
@@ -315,6 +316,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::RebuildReplica { .. } => "RebuildReplica",
         Action::LockFlush { .. } => "LockFlush",
         Action::PersistLockHorizon { .. } => "PersistLockHorizon",
+        Action::PersistReleaseRecord { .. } => "PersistReleaseRecord",
         Action::PersistGrantHorizon { .. } => "PersistGrantHorizon",
         Action::SyncDelegStream { .. } => "SyncDelegStream",
         Action::RoundDone { .. } => "RoundDone",
@@ -988,6 +990,45 @@ fn parse_ack_policy(raw: Option<&str>) -> anyhow::Result<Option<String>> {
 /// (`ack_policy = s3` in `meta.json`).
 pub fn ack_s3_of(fs_policy: Option<&str>) -> bool {
     fs_policy.is_some_and(|p| p.trim().eq_ignore_ascii_case("s3"))
+}
+
+/// The durable write of `local["lease_released"]` behind
+/// `Action::PersistReleaseRecord`: the key, then a sync of the whole
+/// journal, on the calling (blocking-pool) thread, ahead of the other
+/// writers (`priority_writes`) as the core's own step would have been.
+/// `true` once it is synced. The fault point
+/// `CONSTELLATION_FAULT_RELEASE_RECORD` strikes inside it.
+fn write_release_record(
+    meta: &Meta,
+    record: Option<(constellation_authority::Epoch, i64)>,
+) -> bool {
+    use crate::fault::ReleaseRecordFault as Fault;
+    let value = constellation_authority::replica::release_record_value(record);
+    let fault = crate::fault::release_record_fault();
+    let (result, _stats) = constellation_meta::priority_writes(|| {
+        if fault == Some(Fault::Before) {
+            std::process::abort();
+        }
+        meta.kv_set("lease_released", &value)?;
+        if fault == Some(Fault::Written) {
+            std::process::abort();
+        }
+        if let Some(Fault::Delay(d)) = fault {
+            std::thread::sleep(d);
+        }
+        meta.sync()?;
+        if fault == Some(Fault::Synced) {
+            std::process::abort();
+        }
+        Ok::<(), constellation_meta::MetaError>(())
+    });
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "persisting the released lease failed; the release does not go out");
+            false
+        }
+    }
 }
 
 fn now() -> Now {
@@ -4973,6 +5014,21 @@ impl Driver {
                         }));
                     });
                 }
+                Action::PersistReleaseRecord { record } => {
+                    // The lease-release record's durable write (the key,
+                    // then a sync of the whole journal: up to a second on
+                    // a loaded disk): on the blocking pool, never the
+                    // driver loop. The release CAS waits for the event.
+                    let tx = self.int_tx.clone();
+                    let meta = self.deps.meta.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let ok = write_release_record(&meta, record);
+                        let _ = tx.send(Internal::Event(Event::ReleaseRecordPersisted {
+                            record,
+                            ok,
+                        }));
+                    });
+                }
                 Action::PersistGrantHorizon { kind, until } => {
                     // A durable write (seconds on a loaded disk): on the
                     // blocking pool, never the driver loop. The core grants
@@ -8413,6 +8469,11 @@ impl Standalone {
                         durable: Some(until),
                     })
                 }
+                Action::PersistReleaseRecord { record } => {
+                    let ok = write_release_record(&self.meta, record);
+                    self.queue
+                        .push_back(Event::ReleaseRecordPersisted { record, ok })
+                }
                 Action::PersistGrantHorizon { kind, until } => {
                     let durable = self.meta.persist_grant_horizon(kind, until, now()).ok();
                     self.queue.push_back(Event::GrantHorizonPersisted {
@@ -9004,6 +9065,55 @@ mod tests {
             alive_tick(Some(&t), (30_000, HonourMs(30_000)), (29_000, 0, 0), 15_000),
             beats
         );
+    }
+
+    /// `Action::PersistReleaseRecord`: the record is written and synced
+    /// (one sync) on the thread that runs it, which is not the thread that
+    /// asked, and the value is the one `persist_lease_released` writes.
+    #[test]
+    fn the_release_record_write_syncs_on_the_blocking_pool() {
+        let meta = std::sync::Arc::new(super::Meta::open_in_memory().unwrap());
+        let record = Some((7, 123_456));
+        let syncs = meta.sync_count();
+        let asked_from = std::thread::current().id();
+        let m = meta.clone();
+        let ran_on = std::thread::spawn(move || {
+            assert!(super::write_release_record(&m, record));
+            std::thread::current().id()
+        })
+        .join()
+        .unwrap();
+        assert_ne!(ran_on, asked_from);
+        assert_eq!(meta.sync_count(), syncs + 1, "one sync per write");
+        assert_eq!(
+            constellation_authority::Replica::lease_released(&*meta),
+            record
+        );
+        assert!(super::write_release_record(&meta, None));
+        assert_eq!(
+            constellation_authority::Replica::lease_released(&*meta),
+            None
+        );
+    }
+
+    /// The tools' driver turns the action into one event, after the write.
+    #[test]
+    fn the_standalone_driver_answers_a_release_record_with_one_event() {
+        use constellation_authority::Replica;
+        use replicix_objcas::LeaseMode;
+        let meta = std::sync::Arc::new(super::Meta::open_in_memory().unwrap());
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let mut standalone = super::Standalone::new(meta.clone(), store, 1, LeaseMode::Cas);
+        standalone.queue.clear();
+        let record = Some((3, 99));
+        standalone.absorb(vec![
+            constellation_authority::Action::PersistReleaseRecord { record },
+        ]);
+        assert_eq!(meta.lease_released(), record);
+        assert!(matches!(
+            standalone.queue.make_contiguous(),
+            [constellation_authority::Event::ReleaseRecordPersisted { record: r, ok: true }] if *r == record
+        ));
     }
 
     /// ADR-52: both drivers' cores read a fresh clock where an answer

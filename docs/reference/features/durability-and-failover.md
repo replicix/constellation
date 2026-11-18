@@ -1391,7 +1391,8 @@ Operational rules:
   CAS goes out (`local["lease_released"]`), so a restart after the CAS
   landed owes the move too, rather than holding an epoch on a lease
   anyone may have claimed; the record is cleared when the release ends
-  with the lease kept or the node acquires a lease.
+  with the lease kept or the node acquires a lease. The write runs off
+  the core step; the release CAS goes out when it is durable.
 - The close keeps the lease's [cluster lock](cluster-locks.md#failover)
   grants. The re-claim's CAS replacing the lease the close let go (or
   the object a re-claim CAS in doubt may have written over it) proves

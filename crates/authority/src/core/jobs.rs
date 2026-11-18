@@ -13,6 +13,7 @@
 //! slot at all (see the module doc of `core`).
 
 use super::lease::{honour_end_of, wait_end_of, PendingGate, Plan};
+use super::promise::ReleaseRecord;
 use super::{Core, S3For};
 use crate::action::{Action, ControlOk, S3Op};
 use crate::event::{CasFailure, Control, PeerMsg, S3Failure, S3Result, UploadResult};
@@ -210,6 +211,11 @@ enum Phase {
     /// Plan 30 §M8: waiting for read delegations to be recalled before
     /// the release CAS.
     RecallBeforeRelease,
+    /// The release record's durable write outstanding
+    /// (`Action::PersistReleaseRecord`); the CAS goes out at its event
+    /// (`on_release_record_persisted`). It holds no op: a stray S3 result
+    /// is ignored.
+    PersistRelease { rec: (Epoch, i64) },
     /// `LeaseGet` after a release CAS conflict, or after a release CAS
     /// that failed without an answer (`in_doubt`: it may have landed).
     ReleaseReread { in_doubt: bool },
@@ -2086,6 +2092,7 @@ impl Core {
                 job.phase,
                 Phase::Renew { .. }
                     | Phase::RenewReread { .. }
+                    | Phase::PersistRelease { .. }
                     | Phase::Release
                     | Phase::ReleaseReread { .. }
                     | Phase::Cas { .. }
@@ -3139,21 +3146,39 @@ impl Core {
             self.set_phase(Phase::RecallBeforeRelease, None);
             return;
         }
-        // Waited for, or its bound passed: done with.
-        if let Some(w) = self.dl.release_wait.take() {
-            self.cancel_timer(w.timer, out);
-        }
         let Some((lease, tag)) = self.lease.held.clone() else {
             return;
         };
         // Durable before the CAS goes out: a restart after it landed must
         // know the lease was let go (`PromiseState::released`), or an
         // activation carrying it would hold an epoch on a lease anyone
-        // may claim without promises. Not persisted, it does not go out.
-        if !self.record_release(&lease, replica) {
-            self.lease.releasing = false;
-            self.job_failed(now, "persisting the released lease".into(), replica, out);
-            return;
+        // may claim without promises. The write runs off the core
+        // (`Action::PersistReleaseRecord`): the CAS goes out at its event,
+        // which comes back here (`on_release_record_persisted`).
+        match self.record_release(&lease, out) {
+            ReleaseRecord::Durable => {}
+            ReleaseRecord::Pending => {
+                self.pr.release_asked = Some(now.wait);
+                self.set_phase(
+                    Phase::PersistRelease {
+                        rec: (lease.epoch, lease.expires_unix_ms),
+                    },
+                    None,
+                );
+                return;
+            }
+            ReleaseRecord::Failed => {
+                self.release_wait_done(out);
+                self.lease.releasing = false;
+                self.job_failed(now, "persisting the released lease".into(), replica, out);
+                return;
+            }
+        }
+        // Waited for, or its bound passed: done with. (Kept until here, so
+        // that the re-entry after the record's write finds the wait as it
+        // was left, its bound passed, and does not park again.)
+        if let Some(w) = self.dl.release_wait.take() {
+            self.cancel_timer(w.timer, out);
         }
         // Plan 43 C7-F F-a0: a release that leaves lock grants (or a grace
         // for an earlier tenure's) behind says so, as a marked tenure's
@@ -3181,6 +3206,143 @@ impl Core {
             out,
         );
         self.set_phase(Phase::Release, Some(op));
+    }
+
+    /// The job in the slot waits for the release record's write
+    /// (`Phase::PersistRelease`).
+    pub(crate) fn release_record_pending(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|j| matches!(j.phase, Phase::PersistRelease { .. }))
+    }
+
+    /// The release's wait for recalls (kept across the record's write) is
+    /// over: the release does not go on.
+    fn release_wait_done(&mut self, out: &mut Vec<Action>) {
+        if let Some(w) = self.dl.release_wait.take() {
+            self.cancel_timer(w.timer, out);
+        }
+    }
+
+    /// `Action::PersistReleaseRecord` finished. The writes of the key are
+    /// serialised (`PromiseState::write_release_record`), so this is the
+    /// one in flight. The release CAS goes out here, in this step, when
+    /// the job still waits for exactly this record and `ok`.
+    pub(crate) fn on_release_record_persisted(
+        &mut self,
+        now: Now,
+        record: Option<(Epoch, i64)>,
+        ok: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.pr.release_inflight = None;
+        if ok {
+            self.pr.release_record = record;
+        } else {
+            // The key may or may not have landed (the write went to the
+            // journal, the sync failed): what is on disk is not known, so a
+            // release writes its record again rather than trust the old one
+            // (a clear that half landed must not let the CAS go out
+            // unrecorded). A stale record that stands is the conservative
+            // side.
+            self.pr.release_record = None;
+            tracing::warn!(
+                node = self.cfg.node_id,
+                ?record,
+                "persisting the released lease failed"
+            );
+        }
+        let waiting = match self.job.as_ref().map(|j| &j.phase) {
+            Some(Phase::PersistRelease { rec }) => Some(*rec),
+            _ => None,
+        };
+        match waiting {
+            Some(rec) if Some(rec) == record => {
+                let kind = self
+                    .job
+                    .as_ref()
+                    .map(|j| j.kind())
+                    .unwrap_or(JobKind::Round);
+                let same_lease = self
+                    .lease
+                    .held
+                    .as_ref()
+                    .is_some_and(|(l, _)| (l.epoch, l.expires_unix_ms) == rec)
+                    && !self.lease.lost;
+                if !same_lease {
+                    // Deposed or lost while the record was written: the
+                    // record stands (conservative), no CAS goes out.
+                    self.release_wait_done(out);
+                    self.lease.releasing = false;
+                    self.lease_gone_mid_job(now, kind, replica, out);
+                } else {
+                    let state = if ok {
+                        ReleaseRecord::Durable
+                    } else {
+                        ReleaseRecord::Failed
+                    };
+                    match state {
+                        ReleaseRecord::Durable => {
+                            if let Some(asked) = self.pr.release_asked.take() {
+                                let waited = now.wait.0.saturating_sub(asked.0).max(0) as u64;
+                                self.stats.release_record_waits += 1;
+                                self.stats.release_record_wait_ms_total += waited;
+                                self.stats.release_record_wait_ms_max =
+                                    self.stats.release_record_wait_ms_max.max(waited);
+                                tracing::info!(
+                                    node = self.cfg.node_id,
+                                    waited_ms = waited,
+                                    "release record durable; sending the release CAS"
+                                );
+                            }
+                            if matches!(kind, JobKind::Handoff | JobKind::Flush)
+                                && replica.journal_len().ok() != Some(0)
+                            {
+                                self.stats.release_rows_in_gap += 1;
+                                tracing::error!(
+                                    node = self.cfg.node_id,
+                                    "journal rows appeared while the release record was written"
+                                );
+                                debug_assert!(
+                                    false,
+                                    "the journal is not empty at the release CAS of a handoff or flush"
+                                );
+                            }
+                            self.issue_release(now, replica, out);
+                        }
+                        ReleaseRecord::Pending | ReleaseRecord::Failed => {
+                            self.release_wait_done(out);
+                            self.lease.releasing = false;
+                            self.job_failed(
+                                now,
+                                "persisting the released lease".into(),
+                                replica,
+                                out,
+                            );
+                        }
+                    }
+                }
+            }
+            // The job waits for a later write of the key (queued behind
+            // the one that just finished).
+            Some(_) => {}
+            // The release was abandoned in the gap (the lease lost, the
+            // job ended): no CAS goes out, and the record on disk is
+            // stale, which is the conservative side. Clear it unless a
+            // release is under way again.
+            None => {
+                if !self.lease.releasing {
+                    self.release_wait_done(out);
+                }
+                self.release_superseded(false, out)
+            }
+        }
+        if let Some(n) = self.pr.release_next.take() {
+            if !(ok && n == record) {
+                self.write_release_record(n, out);
+            }
+        }
     }
 
     /// Plan 30 §M8: the recalls a release waited for are done.
@@ -3259,7 +3421,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.epoch_hold_after_kept_release(now, replica);
+        self.epoch_hold_after_kept_release(now, replica, out);
         let Some(job) = self.job.take() else {
             return;
         };
@@ -4571,7 +4733,7 @@ impl Core {
             .as_ref()
             .map(|p| p.holder)
             .filter(|h| *h != self.cfg.node_id);
-        self.release_superseded(true, replica);
+        self.release_superseded(true, out);
         self.shipped_touches.clear();
         self.shipped_floor = self.ship.head_seq;
         self.ship.held_tail_at = Some(now.wait);
@@ -5056,7 +5218,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.lease.releasing = false;
-        self.epoch_hold_after_kept_release(now, replica);
+        self.epoch_hold_after_kept_release(now, replica, out);
         let Some(job) = self.job.take() else {
             return;
         };
@@ -5528,7 +5690,7 @@ impl Core {
                     }
                 }
                 self.lease.releasing = false;
-                self.epoch_hold_after_kept_release(now, replica);
+                self.epoch_hold_after_kept_release(now, replica, out);
                 match kind {
                     JobKind::Round => self.finish_round(now, None, replica, out),
                     _ => self.finish_flush_job(now, false, replica, out),

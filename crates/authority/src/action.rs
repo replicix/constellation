@@ -138,6 +138,16 @@ pub enum Action {
     /// action is internal, never serialised); the store stamps it with the
     /// boot.
     PersistLockHorizon { until: WaitMs },
+    /// A durable write of `local["lease_released"]`
+    /// (`Replica::persist_lease_released`: the key, then a sync of the
+    /// whole journal) off the core, then report
+    /// `Event::ReleaseRecordPersisted`. `record` is the lease (epoch,
+    /// expiry) whose release CAS is about to go out, or `None` for
+    /// clearing a stale record. The release CAS waits for the event (the
+    /// record is durable before the CAS goes out); at most one is in
+    /// flight, and the writes of the key are serialised
+    /// (`PromiseState::write_release_record`).
+    PersistReleaseRecord { record: Option<(Epoch, i64)> },
     /// Persist a read-grant horizon (`Meta::persist_grant_horizon`, a
     /// durable write) off the core up to `until`, then report
     /// `Event::GrantHorizonPersisted`. The core grants only up to the

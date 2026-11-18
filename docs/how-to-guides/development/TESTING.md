@@ -1942,6 +1942,15 @@ Reproducing these needed two things no scenario had before:
   instead of the shared `env.endpoint`, so that one node's S3 path can
   drop while its peers' stay up.
 
+`CONSTELLATION_FAULT_RELEASE_RECORD=<stage>[:<delay_ms>]` strikes in the
+off-core write of the lease-release record (`Action::PersistReleaseRecord`,
+whose event lets the release CAS go out): `before` aborts the process
+before the key is written, `written` after the write and before the sync,
+`synced` after the sync and before the event is sent, and `delay:<ms>`
+sleeps before the sync to widen the gap between the decision to release and
+the CAS. Unset, it is one cached lookup. The core's crash-point test is
+`release_record_crash_at_every_point`.
+
 Bug B scenarios (plan 30 M3a and M3b regression tests, in `SCENARIOS`;
 **rewritten for plan 43 C2f in plan 46 M0.3**: "the state cannot arise").
 Their rig (`phantom_setup`, shared with the M6 scenario) runs every node

@@ -2544,12 +2544,15 @@ impl Core {
         }
         self.complete_ready(now, replica, out);
         // No release waits any more (the lease went with no release
-        // parked, or the release went on): nothing for a later one.
+        // parked, or the release went on): nothing for a later one. Not
+        // while the release waits for its record's write: its re-entry
+        // (`on_release_record_persisted`) must find the bound passed.
         if !self
             .rd
             .parked
             .values()
             .any(|p| matches!(p.what, ParkedWhat::Release))
+            && !self.release_record_pending()
         {
             self.dl.release_wait = None;
         }

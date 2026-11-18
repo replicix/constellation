@@ -1926,6 +1926,15 @@ pub struct Stats {
     /// and the ones that failed (their answers refused).
     pub lock_horizon_held: u64,
     pub lock_horizon_writes: u64,
+    /// Journal rows found at a handoff's or flush's release CAS, after the
+    /// release record's write (`Phase::PersistRelease`): the fence should
+    /// have kept the journal empty.
+    pub release_rows_in_gap: u64,
+    /// Releases that waited for their record's off-core write, the time
+    /// they waited in total and the longest (ms, wait clock).
+    pub release_record_waits: u64,
+    pub release_record_wait_ms_total: u64,
+    pub release_record_wait_ms_max: u64,
     pub lock_horizon_failed: u64,
     /// The read-grant horizons' write-ahead lane (`Action::PersistGrantHorizon`):
     /// the writes issued, the ones that failed, and the reads answered
@@ -3516,6 +3525,9 @@ impl Core {
             } => self.on_grant_horizon_persisted(now, kind, until, durable, replica, &mut out),
             Event::LockHorizonPersisted { until, durable } => {
                 self.on_lock_horizon_persisted(now, until, durable, replica, &mut out)
+            }
+            Event::ReleaseRecordPersisted { record, ok } => {
+                self.on_release_record_persisted(now, record, ok, replica, &mut out)
             }
             Event::PublishDone { op, ok } => {
                 if self.publishing == Some(op) {

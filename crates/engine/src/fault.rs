@@ -29,6 +29,49 @@ pub fn lose_chunk(hash: &ChunkHash) -> bool {
     .contains(hash)
 }
 
+/// Where `CONSTELLATION_FAULT_RELEASE_RECORD=<stage>[:<delay_ms>]` strikes in
+/// the off-core write of the lease-release record
+/// (`Action::PersistReleaseRecord`): the release CAS waits for that write,
+/// so a crash at each point shows what a restart finds (plan "release
+/// record off the core", crash points C1..C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseRecordFault {
+    /// Abort the process before the `kv_set`.
+    Before,
+    /// Abort after the `kv_set`, before the sync.
+    Written,
+    /// Abort after the sync, before the event is sent.
+    Synced,
+    /// Sleep this long before the sync (widens the gap).
+    Delay(std::time::Duration),
+}
+
+/// The stage `CONSTELLATION_FAULT_RELEASE_RECORD` names (`before`,
+/// `written`, `synced`, `delay:<ms>`); `None` when unset or unparsable.
+pub fn release_record_fault() -> Option<ReleaseRecordFault> {
+    static FAULT: OnceLock<Option<ReleaseRecordFault>> = OnceLock::new();
+    *FAULT.get_or_init(|| {
+        parse_release_record_fault(&std::env::var("CONSTELLATION_FAULT_RELEASE_RECORD").ok()?)
+    })
+}
+
+fn parse_release_record_fault(v: &str) -> Option<ReleaseRecordFault> {
+    let (stage, arg) = match v.trim().split_once(':') {
+        Some((s, a)) => (s, Some(a)),
+        None => (v.trim(), None),
+    };
+    match (stage, arg) {
+        ("before", None) => Some(ReleaseRecordFault::Before),
+        ("written", None) => Some(ReleaseRecordFault::Written),
+        ("synced", None) => Some(ReleaseRecordFault::Synced),
+        ("delay", Some(ms)) => ms
+            .parse()
+            .ok()
+            .map(|ms| ReleaseRecordFault::Delay(std::time::Duration::from_millis(ms))),
+        _ => None,
+    }
+}
+
 /// `CONSTELLATION_FAULT_HOLD_SYNC_FILE=<path>`: while that file exists,
 /// every managed sync round returns at once — nothing is uploaded, shipped
 /// or published — and the round writes `<path>.held` to say a round has
@@ -526,6 +569,21 @@ mod tests {
         assert!(poll_clock_step(&file, &mut applied, |v| seen.push(v)));
         assert_eq!(seen, vec![3_000, -1_500, 0]);
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "0");
+    }
+
+    #[test]
+    fn release_record_fault_spec() {
+        use ReleaseRecordFault as F;
+        assert_eq!(parse_release_record_fault("before"), Some(F::Before));
+        assert_eq!(parse_release_record_fault("written"), Some(F::Written));
+        assert_eq!(parse_release_record_fault("synced"), Some(F::Synced));
+        assert_eq!(
+            parse_release_record_fault("delay:250"),
+            Some(F::Delay(Duration::from_millis(250)))
+        );
+        for bad in ["", "delay", "delay:x", "before:1", "later"] {
+            assert_eq!(parse_release_record_fault(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

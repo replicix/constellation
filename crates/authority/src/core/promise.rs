@@ -165,6 +165,20 @@ pub fn resolve_epoch_claims(acks: &[EpochAckClaim]) -> (Option<Carrier>, Epoch) 
     (carrier, stale_below)
 }
 
+/// Where the durable record of a release stands (`Core::record_release`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum ReleaseRecord {
+    /// On disk (as far as this process knows), and no later write of the
+    /// key is queued: the release CAS may go out.
+    Durable,
+    /// The write is requested or in flight: the CAS waits for its event.
+    Pending,
+    /// The write failed (reported by the event handler only): the release
+    /// must not go out.
+    Failed,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct PromiseState {
     /// Where the last promise issued (persisted) ends on this node's wait
@@ -229,7 +243,19 @@ pub(crate) struct PromiseState {
     /// CAS this node issued last (written before the CAS goes out,
     /// `issue_release`). Cleared when that release ends with the lease
     /// kept, or a lease is acquired.
+    ///
+    /// Set only when a write of it reported durable (`on_release_record_persisted`)
+    /// and at start-up: "what is on disk as far as this process knows".
     pub release_record: Option<(Epoch, i64)>,
+    /// The `local["lease_released"]` write in flight
+    /// (`Action::PersistReleaseRecord`), if any: the value it carries.
+    pub release_inflight: Option<Option<(Epoch, i64)>>,
+    /// The value to write once the one in flight is done (latest wins):
+    /// the writes of the key are serialised.
+    pub release_next: Option<Option<(Epoch, i64)>>,
+    /// When (wait clock) the job's release waited for its record: the
+    /// release latency the off-core write adds (`on_release_record_persisted`).
+    pub release_asked: Option<WaitMs>,
     /// The lease this process gave up with its release in doubt (the
     /// re-read failed too): while the open epoch carries it and nobody
     /// holds the epoch, writes are refused (`epoch_refuses_writes`).
@@ -1044,21 +1070,51 @@ impl Core {
         }
     }
 
-    /// Persist the lease whose release CAS is about to go out
-    /// (`PromiseState::release_record`): a restart after the CAS landed
-    /// must not adopt an epoch hold on it. `false` if it could not be
-    /// persisted (the release must not go out).
-    pub(crate) fn record_release(&mut self, lease: &Lease, replica: &dyn Replica) -> bool {
+    /// Ask for `rec` to be made the durable `local["lease_released"]`
+    /// (`Action::PersistReleaseRecord`). One write is in flight at a time;
+    /// a request made meanwhile waits in `release_next` (latest wins), so
+    /// a clear can never land before an earlier set or the reverse.
+    /// `release_record` is not touched here: it follows the events.
+    pub(crate) fn write_release_record(
+        &mut self,
+        rec: Option<(Epoch, i64)>,
+        out: &mut Vec<Action>,
+    ) {
+        match self.pr.release_inflight {
+            None => {
+                self.pr.release_inflight = Some(rec);
+                self.pr.release_next = None;
+                out.push(Action::PersistReleaseRecord { record: rec });
+            }
+            // What is in flight is the latest request after all.
+            Some(inflight) if inflight == rec => self.pr.release_next = None,
+            Some(_) => self.pr.release_next = Some(rec),
+        }
+    }
+
+    /// The value the record will have once every write requested so far
+    /// has landed.
+    fn release_record_requested(&self) -> Option<(Epoch, i64)> {
+        self.pr
+            .release_next
+            .or(self.pr.release_inflight)
+            .unwrap_or(self.pr.release_record)
+    }
+
+    /// The lease whose release CAS is about to go out must be durable in
+    /// `local["lease_released"]` first (`PromiseState::release_record`): a
+    /// restart after the CAS landed must not adopt an epoch hold on it.
+    /// `Pending`: the write is requested (or in flight), and the release
+    /// goes on at its event (`on_release_record_persisted`).
+    pub(crate) fn record_release(&mut self, lease: &Lease, out: &mut Vec<Action>) -> ReleaseRecord {
         let it = Some((lease.epoch, lease.expires_unix_ms));
-        if self.pr.release_record == it {
-            return true;
+        if self.pr.release_record == it && self.release_record_requested() == it {
+            return ReleaseRecord::Durable;
         }
-        if let Err(error) = replica.persist_lease_released(it) {
-            tracing::warn!(node = self.cfg.node_id, %error, "persisting the released lease failed");
-            return false;
-        }
-        self.pr.release_record = it;
-        true
+        // (A clear of the same value queued behind it, or in flight, makes
+        // the record on disk not stand: it is written again after.)
+        self.write_release_record(it, out);
+        ReleaseRecord::Pending
     }
 
     /// The persisted release record is moot: its release ended with the
@@ -1066,26 +1122,21 @@ impl Core {
     /// `acquired` a lease since (a new expiry: no activation carrying the
     /// released one matches it). An acquisition clears the in-memory
     /// `released` and `given_up` too.
-    pub(crate) fn release_superseded(&mut self, acquired: bool, replica: &dyn Replica) {
+    pub(crate) fn release_superseded(&mut self, acquired: bool, out: &mut Vec<Action>) {
         if acquired {
             self.pr.released = None;
             self.pr.given_up = None;
         } else if self.lease.releasing || self.pr.released == self.pr.release_record {
             return;
         }
-        if self.pr.release_record.is_none() {
+        // Nothing on disk, and no set on its way there.
+        if self.release_record_requested().is_none() {
             return;
         }
-        match replica.persist_lease_released(None) {
-            Ok(()) => self.pr.release_record = None,
-            // A stale record only makes a restart owe the move of an epoch
-            // carrying that lease rather than hold it.
-            Err(error) => tracing::warn!(
-                node = self.cfg.node_id,
-                %error,
-                "clearing the released lease failed"
-            ),
-        }
+        // A stale record only makes a restart owe the move of an epoch
+        // carrying that lease rather than hold it, so a clear that fails
+        // (`on_release_record_persisted`) is only warned about.
+        self.write_release_record(None, out);
     }
 
     /// Record that this node owes the carried lease's move
@@ -1140,9 +1191,14 @@ impl Core {
     /// is the epoch's holder after all and adopts the hold. Leaving the
     /// obligation, nobody held the epoch, and writes stopped at the
     /// lease's expiry until the heal.
-    pub(crate) fn epoch_hold_after_kept_release(&mut self, now: Now, replica: &dyn Replica) {
+    pub(crate) fn epoch_hold_after_kept_release(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         if !self.lease.releasing && self.lease.held.is_some() {
-            self.release_superseded(false, replica);
+            self.release_superseded(false, out);
         }
         if self.lease.releasing
             || self.lease.lost

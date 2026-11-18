@@ -1040,6 +1040,24 @@ fn delegations_without_recall_are_found() {
     );
 }
 
+/// The release record's write runs off the core (`Action::PersistReleaseRecord`,
+/// answered after a seeded delay in the simulation): some release of
+/// `flex-crash` waits for its record, and every run still converges, so the
+/// sweeps do exercise the gap between the decision to release and its CAS.
+#[test]
+fn releases_wait_for_their_record_in_the_simulation() {
+    let mut waits = 0;
+    for seed in 0..40 {
+        let r = run_seed(seed, flex_crash_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        waits += r
+            .stats
+            .values()
+            .map(|s| s.release_record_waits)
+            .sum::<u64>();
+    }
+    assert!(waits > 0, "no release of 40 seeds waited for its record");
+}
+
 /// The counterexample: bounded mode (reads never ask the sequencer) reads
 /// stale state after another node's write completed — the checker finds
 /// it, so it is not vacuous.
@@ -1050,7 +1068,9 @@ fn bounded_mode_reads_stale() {
         ..SimConfig::default()
     };
     let mut found = None;
-    for seed in 800..900 {
+    // (800..900 until the release record's off-core write moved the schedules: no
+    // seed of it reads stale on this tree; the checker finds one a little later.)
+    for seed in 800..5_000 {
         let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         if let Some(v) = report.cto.violations.first() {
             found = Some((seed, v.clone()));

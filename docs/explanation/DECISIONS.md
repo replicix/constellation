@@ -701,6 +701,23 @@ is not installed again; a handoff whose flush cannot drain the journal
 is declined (the deferred rows would bounce between epochs); a round
 that shipped nothing does not follow itself at once.
 
+**Amendment (2026-11-18: the release record is written off the core step)**:
+the rule of 670e57d3 stands: the lease a release CAS is about to replace
+is durable in `local["lease_released"]` before the CAS goes out. The
+write (the key, then a sync of the whole journal, 70-394 ms on a loaded
+disk) no longer runs inside the core's step, where it stalled the node's
+events and the lapse measure: the core sends `Action::PersistReleaseRecord`
+and parks the job (`Phase::PersistRelease`), the driver writes and syncs
+on the blocking pool, and the CAS goes out in the step of
+`Event::ReleaseRecordPersisted`, which re-enters the release. Writes of
+the key are serialised (one in flight, latest wins), and the waiting
+phase counts as a lease CAS in flight. A crash at any point leaves
+either no record and no CAS, or a record without a CAS (the conservative
+side: the node owes a move it did not need to); never a CAS without a
+record. The sync's duration is not exempted from the step lapse (the
+core is as blind during it as during any stall), it is moved out of the
+step.
+
 **See**: plan 30 §M10;
 [Durability and failover — flexible continuation epochs](../reference/features/durability-and-failover.md#flexible-continuation-epochs);
 [`crates/authority/src/core/promise.rs`](../../crates/authority/src/core/promise.rs),

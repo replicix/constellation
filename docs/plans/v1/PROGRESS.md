@@ -71027,3 +71027,42 @@ Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tes
 - **Gates:** fmt, clippy `-D warnings` (workspace, all targets), lib tests debug 4563 and release 4561 passed, the release sim suite
   (578 passed, 0 failed, `--test-threads=6`), harness smoke at seed 42 (backup-failover, backup-departs, deposed-reintegration-backup,
   ack-s3-failover, lease-handover, p2p-handover, snapshot-lifecycle, snapshot-busy-latency, snapshot-mount) all passed.
+
+
+### The lease-release record's sync leaves the core's step (2026-11-18)
+
+btrstall cause 3 (`PublishDone` -> `LeaseSwap`, `store_syncs=1`, 70-394 ms): `issue_release` wrote and synced
+`local["lease_released"]` inside the step that sent the release CAS. The rule of 670e57d3 stands (the record is durable before the
+CAS goes out); the write moves off the core, staged like `PersistLockHorizon`. The core sends `Action::PersistReleaseRecord` and parks the
+job in `Phase::PersistRelease` (a lease CAS in flight for the reconfiguration wait); the driver writes the key and syncs on the blocking pool
+(`priority_writes`); `Event::ReleaseRecordPersisted` re-enters `issue_release`, which then computes the lock duty (at the event's `now`) and sends
+the CAS. Writes of the key are serialised (`PromiseState::write_release_record`: one in flight, latest wins; `release_record` follows the events,
+a failed write forgets it so the next release rewrites). A release abandoned in the gap sends no CAS; its late event only records the disk and the
+stale record is cleared through the serializer. A release's wait for recalls is kept across the write, so the re-entry finds its bound passed.
+Crash points C1-C4 (design report section 3) leave no CAS without a durable record. Fault point `CONSTELLATION_FAULT_RELEASE_RECORD`
+(`before`, `written`, `synced`, `delay:<ms>`). ADR-22 amended. Stats: `release_record_waits`, `release_record_wait_ms_*`, `release_rows_in_gap`.
+Phase sites: `lease_cas_in_flight` takes the phase; `release_unmarked_in_flight` does not (the mark starts at the CAS); `release_after_recalls` and
+the `on_job_s3` Release arms are untouched (the phase holds no op; a stray S3 result is ignored).
+
+Fail-before (core, on origin/main plus the new variants only): `the_release_cas_waits_for_the_off_core_record`,
+`a_failed_release_record_keeps_the_lease`, `release_record_crash_at_every_point`,
+`no_lock_grant_or_mutation_is_admitted_while_the_record_is_written` fail; the CAS and the write are in the first step there. After:
+all pass, with `a_release_abandoned_in_the_gap_sends_no_cas`, `release_record_writes_are_serialized`,
+`a_failed_clear_does_not_let_the_next_release_go_unrecorded`, `a_reconfiguration_waits_for_the_release_record`, two engine tests and the sim's
+`releases_wait_for_their_record_in_the_simulation`. Gates: fmt, workspace clippy, lib tests debug and release (authority, meta, engine), release sim
+suite. Sweeps 0..2000 (`flex-crash`, `flex`, `long-backup`, `backup-crash`, `long-delegated`, `placement-hot`, `delegated-holder-cut`) and 0..1000
+(`locks`, `locks-blips-tight`, `locks-blips-tight-in-doubt`, `sticky-ttl`): 0 failing on both origin/main and the change (18,000 seeds each).
+`bounded_mode_reads_stale` pinned seeds 800..900; the schedule shift moved its first stale read, its scan is 800..5000 now. On origin/main the sim suite
+already fails `m03_a_reachable_sequencers_requester_is_not_isolated` (seed 2), `m03_the_configurations_at_zero_violations_stay_there`
+(`locks-unlinked-delegated-blips+unsettled` 3 allowed against the ceiling 2), `regression_a_readoption_landing_after_a_seal_is_not_served` (1115),
+`regression_every_inbox_batch_of_a_rid_is_withdrawn` (16329) and `regression_no_generation_number_is_minted_twice` (1659), with the same messages
+before and after: not touched here. Harness `chaos-ci --seed 42` passes.
+
+Step histogram (heavy 8x16 hardlink, backend on tmpfs, `SLOW_STEP_US` 50 ms, shared loaded box, so counts, not timing; 6 runs each, base then fix):
+steps of 187 ms and over per run, ext4 base [0,0,1,1,1,1], fix [0,0,0,1,0,1]; btrfs base [0,0,1,0,0,0], fix [0,0,1,0,0,0]. Every base step
+was `PublishDone`/`LeaseSwap` with `store_syncs=1` (sync 21, 78, 96, 78 ms on ext4; 281 ms on btrfs, of 210-501 ms handled). In the fix no
+`PublishDone`/`LeaseSwap` step has a sync, and no step has `store_syncs>0` at the record's event. The steps of 187 ms and over that remain
+(189, 190 ms ext4; 234 ms btrfs) are the same flush step, now emitting `PersistReleaseRecord`, with `store_syncs=0` and no lock wait: the time
+is `Replica::has_dirty()` in `flush_continue` (187-202 ms, measured with a temporary timer, not kept). Follow-up, not done here. Release
+latency S1 to the CAS (record wait): ext4 5-270 ms (median about 150), btrfs 79-538 ms (median about 270). Not done: the four-file-system quiet A/B
+(waits for a quiet box), the Timer -> mint-generation sync, the harness scenario `release-record-abort`.
