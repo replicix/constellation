@@ -3394,7 +3394,10 @@ pub(crate) fn stream_drops_tx(
 }
 
 /// The stream positions `(gen, log index)` the decided, not yet applied
-/// drops' records fill (`DropHeld::fills`), whoever decided them.
+/// drops' records fill (`DropHeld::fills`), whoever decided them, for the
+/// plans whose record the log carries (shipped): their fill markers were
+/// written in the same ack transaction. An unshipped plan can still be
+/// cancelled, which would leave its fill a hole.
 pub(crate) fn drop_fills_tx(
     r: &impl Readable,
     meta: &Meta,
@@ -3403,7 +3406,9 @@ pub(crate) fn drop_fills_tx(
     for guard in r.prefix(&meta.local, DROP_PLAN_PREFIX) {
         let (_, v) = guard.into_inner()?;
         let plan: DropPlan = postcard::from_bytes(&v)?;
-        out.extend(plan.fills.iter().copied());
+        if plan.shipped {
+            out.extend(plan.fills.iter().copied());
+        }
     }
     Ok(out)
 }

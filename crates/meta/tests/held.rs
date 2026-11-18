@@ -2108,6 +2108,102 @@ fn a_reappended_seed_drop(parked: bool) {
     );
 }
 
+/// A node-one root whose stream `gen` holds a re-appended seed of `broken`
+/// at index 9 and real journaled rows 10..18 above it (index 18), the drop of
+/// `broken` decided and its record not shipped.
+fn a_decided_drop_with_rows_above_its_seed() -> (Meta, Ino, u64) {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(1).unwrap();
+    meta.set_holder_epoch(1);
+    let lost = ChunkHash::of(b"bytes that are gone");
+    let broken = meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
+    let rows = batch(&meta);
+    ship(&meta, &rows, 1);
+    let rid = rid_of(1, 23);
+    let gen = (1u64 << 32) | 3;
+    meta.apply_adopted_records_from(
+        &[
+            LogRecord::WriteManifest {
+                ino: broken,
+                base_manifest: None,
+                manifest: manifest_naming(lost, 19),
+                size: 19,
+                time_ns: 11,
+                mtime_ns: 11,
+            },
+            LogRecord::Completed { rid },
+        ],
+        Some(rid),
+        (gen, 9),
+    )
+    .unwrap();
+    for idx in 10..=18u64 {
+        let r = rid_of(1, 100 + idx);
+        meta.apply_adopted_records_from(&[LogRecord::Completed { rid: r }], Some(r), (gen, idx))
+            .unwrap();
+    }
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 18);
+    meta.note_unrecoverable_chunks(&[(lost, broken)], true)
+        .unwrap();
+    let decided = meta
+        .drop_held_knowing(
+            broken,
+            1,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(decided.dropped, 1, "{decided:?}");
+    (meta, broken, gen)
+}
+
+/// Review of fix226, M1: a strand other than the drop's apply (a deposed
+/// root's) must not keep the index at a position a decided drop's record
+/// fills while that record has not shipped: the plan can still be cancelled
+/// and the log then never carries the position. Fails when `drop_fills_tx`
+/// counts unshipped plans: the index stays at 9 (a hole).
+#[test]
+fn a_strand_does_not_keep_a_position_an_unshipped_drop_may_never_fill() {
+    let (meta, broken, gen) = a_decided_drop_with_rows_above_its_seed();
+    let stranded = meta.strand_deposed(2).unwrap();
+    assert!(stranded.any());
+    meta.drop_held_cancel(broken).unwrap();
+    let idx = meta.log_stream_idx(gen).unwrap();
+    assert!(idx <= 8, "the index claims a position the log never carries: {idx}");
+}
+
+/// Review of fix226, S1: after the apply of a shipped drop (the index stays
+/// at 18, the record fills 9), a later strand of the real journaled rows
+/// above the seed (a deposed root's) takes the index back to the fill, 9
+/// (its marker), not below it.
+#[test]
+fn a_strand_of_the_rows_above_an_applied_seed_stops_at_its_fill() {
+    let (meta, broken, gen) = a_decided_drop_with_rows_above_its_seed();
+    // Only the drop's record ships: the rows above the seed stay journaled.
+    let rows: Vec<_> = batch(&meta)
+        .into_iter()
+        .filter(|(_, r)| matches!(r, LogRecord::DropHeld { .. }))
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    ship(&meta, &rows, 2);
+    meta.drop_held_apply(
+        broken,
+        1,
+        &|_| false,
+        &|_| Vec::new(),
+        &Default::default(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 18);
+    let stranded = meta.strand_deposed(2).unwrap();
+    assert!(stranded.any());
+    assert_eq!(meta.log_stream_idx(gen).unwrap(), 9);
+}
+
 /// Final review of ADR-59 part B, SHOULD 1 and 2: a queued replay the drop
 /// leaves alone (a delegate's shadow) is counted and warned of
 /// (`queued_kept`), and it keeps the chunk's pending row and poison mark, as
