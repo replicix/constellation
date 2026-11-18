@@ -2415,7 +2415,18 @@ impl Core {
         if self.is_own_stream(gen) && self.root_tenure() {
             replica.reaches_streams(deps) && !replica.deps_lost(deps)
         } else {
-            replica.reaches(deps)
+            // A stream this node does not hold counts only below this
+            // node's own unshipped appends of it: a restarted old root's
+            // appended rows raised its session, and the newer tenure's log
+            // may never carry them (fix 1810). Its own streams and the ones
+            // it holds are the replica's.
+            replica.reaches_capped(deps, &|g| {
+                if self.dl.mine.contains_key(&g) || self.is_own_stream(g) {
+                    u64::MAX
+                } else {
+                    self.unshipped_append_cap(g, replica)
+                }
+            })
         }
     }
 
@@ -5123,6 +5134,29 @@ impl Core {
                     || (durable != u64::MAX && last <= durable))
     }
 
+    /// [`Self::holder_append_cap`] without the cache: for a read-only caller
+    /// ([`Self::stream_deps_reached`]), which asks only for the generations a
+    /// dependency names. Cheap when this node has no unshipped append of any
+    /// generation (the usual holder): the appends' tip is at or below the
+    /// shipped watermark.
+    pub(crate) fn unshipped_append_cap(&self, gen: u64, replica: &dyn Replica) -> u64 {
+        let tip = replica.holder_append_tip();
+        if tip == 0 {
+            return u64::MAX;
+        }
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
+        if tip <= shipped {
+            return u64::MAX;
+        }
+        let Ok(appends) = replica.holder_appends(gen) else {
+            return 0;
+        };
+        appends
+            .iter()
+            .find(|(_, last)| !self.holder_append_committed(*last, shipped))
+            .map_or(u64::MAX, |(idx, _)| idx.saturating_sub(1))
+    }
+
     /// The highest index of generation `gen` below this node's first holder
     /// append of it, in index order, that its tenure has not committed
     /// (`u64::MAX`: none). Not a walk down from a prefix: rows ship out of
@@ -5158,13 +5192,7 @@ impl Core {
                 return *cap;
             }
         }
-        let Ok(appends) = replica.holder_appends(gen) else {
-            return 0;
-        };
-        let cap = appends
-            .iter()
-            .find(|(_, last)| !self.holder_append_committed(*last, shipped))
-            .map_or(u64::MAX, |(idx, _)| idx.saturating_sub(1));
+        let cap = self.unshipped_append_cap(gen, replica);
         self.dl.holder_caps.insert(gen, (stamp, cap));
         cap
     }

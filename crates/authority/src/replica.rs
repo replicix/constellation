@@ -470,6 +470,11 @@ pub trait Replica {
     fn reaches(&self, deps: &Position) -> bool;
     /// The streams part of [`Self::reaches`] (the root's check).
     fn reaches_streams(&self, deps: &Position) -> bool;
+    /// [`Self::reaches`], where a stream position above `cap(gen)` is not
+    /// reached: the index of `gen` below this node's own unshipped appends
+    /// of it (`u64::MAX`: none), which raised the session as if the log
+    /// carried them. A void generation is reached as ever.
+    fn reaches_capped(&self, deps: &Position, cap: &dyn Fn(u64) -> u64) -> bool;
     /// This replica holds stream `gen` through `idx` (executed here or
     /// appended here).
     fn note_stream(&self, gen: u64, idx: u64);
@@ -1626,6 +1631,15 @@ impl Replica for Meta {
 
     fn reaches_streams(&self, deps: &Position) -> bool {
         self.reaches_streams_deps(deps)
+    }
+
+    fn reaches_capped(&self, deps: &Position, cap: &dyn Fn(u64) -> u64) -> bool {
+        // (`reaches_deps` first: it voids the generations the table ended.)
+        self.reaches_deps(deps)
+            && deps
+                .streams
+                .iter()
+                .all(|(gen, idx)| idx == 0 || self.session().is_voided(gen) || idx <= cap(gen))
     }
 
     fn note_stream(&self, gen: u64, idx: u64) {

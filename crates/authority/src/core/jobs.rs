@@ -740,6 +740,39 @@ impl Core {
         Ok(n >= width && n > 0 && (last_new || !round))
     }
 
+    /// A node without a lease, hold or lost mark strands the delegates'
+    /// rows it appended as an older tenure's root and never shipped, once it
+    /// has applied the epoch `floor` of a newer tenure: that tenure's log can
+    /// not carry them, and a node that applied `floor` cannot ship an older
+    /// epoch's rows. They are rolled back, kept as member copies and leave
+    /// the stream index (`Replica::strand_appended_below`). Idempotent and
+    /// keyed on persisted state (the journal rows' epochs, the replica's
+    /// applied epoch), so a crash between the segment's apply and this
+    /// strand is repaired at the next start ([`Core::start`]) or segment.
+    pub(crate) fn strand_unshipped_appends(
+        &mut self,
+        floor: Epoch,
+        replica: &dyn Replica,
+    ) -> Result<(), constellation_meta::MetaError> {
+        if floor == 0 || self.lease.held.is_some() || self.lease.epoch_held() || self.lease.lost {
+            return Ok(());
+        }
+        let stranded = replica.strand_appended_below(floor)?;
+        if stranded.any() {
+            self.stats.local_rolled_back += (stranded.locals + stranded.deleg_member_copied) as u64;
+            self.note_committed_stranded(&stranded);
+            replica.clear_streamed();
+            tracing::warn!(
+                node = self.cfg.node_id,
+                epoch = floor,
+                rows = stranded.deleg_member_copied,
+                "a newer tenure began: this node's unshipped appends of an older \
+                 tenure are kept as member copies"
+            );
+        }
+        Ok(())
+    }
+
     /// `Shipper::apply_decoded_segment`: own-segment recovery, epoch
     /// fencing, or a foreign apply that strands what it supersedes.
     pub(crate) fn apply_incoming(
@@ -759,6 +792,7 @@ impl Core {
             self.ship.next_seq
         );
         let seg = segment::decode(payload)?;
+        let mut strand_error: Option<constellation_meta::MetaError> = None;
         if seg.node == self.cfg.node_id {
             // (A marker's `TailFollows` is no journal row; nor is its
             // `GroupAbandoned` of the root group, `gen` 0. A delegation's
@@ -902,27 +936,12 @@ impl Core {
             // A node that holds no lease (a restarted old root) and meets a
             // newer tenure's first segment: the delegates' rows it appended
             // under its own older tenure and never shipped are not in that
-            // tenure's log. Strand them now, before a stream it holds
-            // executes: its dependency wait counted them as the log's.
-            if seg.epoch > self.ship.max_epoch
-                && self.lease.held.is_none()
-                && !self.lease.epoch_held()
-                && !self.lease.lost
-            {
-                if let Ok(stranded) = replica.strand_appended_below(seg.epoch) {
-                    if stranded.any() {
-                        self.stats.local_rolled_back +=
-                            (stranded.locals + stranded.deleg_member_copied) as u64;
-                        self.note_committed_stranded(&stranded);
-                        replica.clear_streamed();
-                        tracing::warn!(
-                            node = self.cfg.node_id,
-                            epoch = seg.epoch,
-                            rows = stranded.deleg_member_copied,
-                            "a newer tenure began: this node's unshipped appends of an older \
-                             tenure are kept as member copies"
-                        );
-                    }
+            // tenure's log. Strand them now, for the reads that would see
+            // them. A failure is not swallowed: `max_epoch` stays below the
+            // segment's epoch, so the next segment tries again.
+            if seg.epoch > self.ship.max_epoch {
+                if let Err(error) = self.strand_unshipped_appends(seg.epoch, replica) {
+                    strand_error = Some(error);
                 }
             }
             if seg.node != 0 && seg.epoch >= self.ship.max_epoch {
@@ -949,6 +968,13 @@ impl Core {
             }) {
                 self.delegation_sync(now, replica, out);
             }
+        }
+        if let Some(error) = strand_error {
+            // The segment itself is applied (its transaction is committed):
+            // the cursor moves past it, the fencing floor does not.
+            self.ship.next_seq = seq + 1;
+            self.ship.head_seq = self.ship.head_seq.max(seq);
+            return Err(error.into());
         }
         self.ship.max_epoch = self.ship.max_epoch.max(seg.epoch);
         self.ship.next_seq = seq + 1;

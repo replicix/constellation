@@ -45378,14 +45378,93 @@ fn a_restarted_root_strands_its_unshipped_appends_when_a_newer_tenure_begins() {
     );
     assert!(h.meta.child_ino(ROOT_INO, "data").unwrap().is_none());
     assert_eq!(h.core.stats.local_rolled_back, 1);
+    // The row is kept as the member copy of its generation (the delegate
+    // holds it until the log carries it), never queued for replay.
+    let copy = h.meta.deleg_backup_tail(4).unwrap();
+    assert_eq!(copy.iter().map(|t| t.idx).collect::<Vec<_>>(), vec![7]);
+    assert!(h.meta.pending_replays().unwrap().is_empty());
 }
 
-/// The strand is for a node that holds no lease: a holder that meets a
-/// newer tenure's segment is deposed (`recover_deposed` strands for it),
-/// and a segment of its own epoch strands nothing.
+/// 1810 (the window before the first newer-tenure segment): the restarted
+/// holder has not applied any segment of the newer tenure yet, and the lease
+/// may not even have been read. A stream it holds that depends on a
+/// delegate's row it appended and never shipped must not count that append
+/// as reached: only what the log carries. Fails before the log-only rule:
+/// the session counted the append.
+#[test]
+fn a_restarted_holder_does_not_count_its_own_unshipped_append_of_another_stream() {
+    let (h, deps) = restarted_root_with_an_unshipped_append();
+    // (Stream 9: a stream this node holds; generation 4 is another's.)
+    assert!(
+        crate::replica::Replica::reaches(&h.meta, &deps),
+        "the session counts the append"
+    );
+    assert!(
+        !h.core.stream_deps_reached(9, &deps, &h.meta),
+        "a stream this node does not hold counts only below its own unshipped appends"
+    );
+    // What the log carries (through row 6) is reached.
+    let below = constellation_meta::Position::ZERO.with_streams_wire(&[(4, 6)]);
+    assert!(h.core.stream_deps_reached(9, &below, &h.meta));
+}
+
+/// The strand needs no lease, hold or lost mark: a held tenure or a lost
+/// mark leaves it to the deposition (`recover_deposed`).
+#[test]
+fn the_unshipped_append_strand_leaves_a_holder_and_a_lost_node_alone() {
+    let (mut h, _deps) = restarted_root_with_an_unshipped_append();
+    h.hold(1, None);
+    h.core.strand_unshipped_appends(2, &h.meta).unwrap();
+    assert!(crate::replica::Replica::journal_len(&h.meta).unwrap() > 0);
+    h.core.lease.force_lost();
+    h.core.strand_unshipped_appends(2, &h.meta).unwrap();
+    assert!(crate::replica::Replica::journal_len(&h.meta).unwrap() > 0);
+    assert_eq!(h.core.stats.local_rolled_back, 0);
+}
+
+/// A crash between the newer tenure's segment apply (its own transaction)
+/// and the strand: the next start strands from the persisted applied epoch.
+#[test]
+fn a_crash_between_the_segment_apply_and_the_strand_is_repaired_at_start() {
+    let (mut h, deps) = restarted_root_with_an_unshipped_append();
+    // The segment applied through the replica alone: the strand never ran.
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        1,
+        2,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Create {
+            parent: ROOT_INO,
+            name: "marker".into(),
+            ino: (3 << 40) | 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 9,
+        }],
+    )
+    .unwrap();
+    assert!(crate::replica::Replica::journal_len(&h.meta).unwrap() > 0);
+    assert_eq!(crate::replica::Replica::applied_epoch(&h.meta), 2);
+    let mut out = Vec::new();
+    let clk = h.clk();
+    h.core.start(clk, &h.meta, &mut out);
+    assert_eq!(crate::replica::Replica::journal_len(&h.meta).unwrap(), 0);
+    assert!(!crate::replica::Replica::reaches(&h.meta, &deps));
+    assert_eq!(crate::replica::Replica::log_stream_idx(&h.meta, 4), 6);
+    let copy = h.meta.deleg_backup_tail(4).unwrap();
+    assert_eq!(copy.iter().map(|t| t.idx).collect::<Vec<_>>(), vec![7]);
+}
+
+/// A segment of an epoch the node has seen strands nothing (the current
+/// tenure's rows are kept).
 #[test]
 fn a_segment_of_the_same_epoch_strands_no_unshipped_append() {
     let (mut h, deps) = restarted_root_with_an_unshipped_append();
+    // (The `>` gate is what is tested: the epoch 1 is already seen.)
+    h.core.ship.max_epoch = 1;
     let marker = crate::segment::encode(
         3,
         1,

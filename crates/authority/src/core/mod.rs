@@ -3331,6 +3331,17 @@ impl Core {
         if replica.lost_persisted() {
             self.lease.force_lost();
         }
+        // A crash between a newer tenure's segment apply and the strand of
+        // this node's unshipped appends of an older tenure: repaired from
+        // the persisted applied epoch (idempotent).
+        if let Err(error) = self.strand_unshipped_appends(replica.applied_epoch(), replica) {
+            tracing::error!(
+                node = self.cfg.node_id,
+                %error,
+                "stranding the unshipped appends of an older tenure failed at start; \
+                 retried at the next newer segment"
+            );
+        }
         self.arm_poll(now, 0, out);
         self.arm_drain(now, out);
         self.floor_start(now, replica);

@@ -6540,26 +6540,42 @@ impl Meta {
     /// answered) are rolled back with the root's rows. Never set by the
     /// daemon.
     pub fn strand_deposed_with(&self, floor: u64, own_stream: bool) -> Result<Stranded, MetaError> {
+        self.strand_journal_with(|entry| {
+            entry.stranded_by_takeover(floor)
+                || Self::is_appended_below(entry, floor)
+                || (own_stream
+                    && matches!(
+                        entry,
+                        LiveEntry::Local { epoch, gen, appended: false, .. }
+                            if *gen != 0 && *epoch != 0 && *epoch < floor
+                    ))
+        })
+    }
+
+    /// A delegate's row this node appended as the root, journaled under an
+    /// epoch below `floor` ([`Self::strand_deposed`]'s kept-as-copy clause).
+    fn is_appended_below(entry: &LiveEntry, floor: u64) -> bool {
+        matches!(
+            entry,
+            LiveEntry::Local { epoch, gen, appended: true, .. }
+                if *gen != 0 && *epoch < floor
+        )
+    }
+
+    /// The strand both deposition strands share: the entries `pred` names
+    /// are rolled back, delegates' appended rows kept as member copies, and
+    /// the journal compacted, in one transaction.
+    fn strand_journal_with(
+        &self,
+        pred: impl Fn(&LiveEntry) -> bool,
+    ) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         let stranded = strand_tx(
             &mut tx,
             self,
             &staged,
-            |entry| {
-                entry.stranded_by_takeover(floor)
-                    || matches!(
-                        entry,
-                        LiveEntry::Local { epoch, gen, appended: true, .. }
-                            if *gen != 0 && *epoch < floor
-                    )
-                    || (own_stream
-                        && matches!(
-                            entry,
-                            LiveEntry::Local { epoch, gen, appended: false, .. }
-                                if *gen != 0 && *epoch != 0 && *epoch < floor
-                        ))
-            },
+            pred,
             true,
             false,
             true,
@@ -6592,36 +6608,11 @@ impl Meta {
     /// Every other entry is left to the segment's own apply
     /// ([`Self::apply_segment_rows`]).
     pub fn strand_appended_below(&self, floor: u64) -> Result<Stranded, MetaError> {
-        let mut tx = self.db.write_tx();
-        let staged = UsageTracker::staging();
-        let stranded = strand_tx(
-            &mut tx,
-            self,
-            &staged,
-            |entry| {
-                matches!(
-                    entry,
-                    LiveEntry::Local { epoch, gen, appended: true, .. }
-                        if *gen != 0 && *epoch < floor
-                )
-            },
-            true,
-            false,
-            true,
-            None,
-            |_| false,
-        )?;
-        if !stranded.any() {
-            return Ok(stranded);
-        }
-        let from = journal_from(&tx, self)?;
-        compact_tx(&mut tx, self, from)?;
-        let (bytes, files) = staged.raw_delta();
-        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
-        tx.commit()?;
-        self.report_rolled_back();
-        staged.drain_into(self.usage_tracker());
-        Ok(stranded)
+        // (A row of epoch 0 carries no tenure: not known to be an older one's.)
+        self.strand_journal_with(|entry| {
+            Self::is_appended_below(entry, floor)
+                && !matches!(entry, LiveEntry::Local { epoch: 0, .. })
+        })
     }
 
     /// The takeover gate's strand (plan 30 §M3a × §M9 × §M11): everything
