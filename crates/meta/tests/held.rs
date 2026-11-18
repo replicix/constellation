@@ -2172,7 +2172,10 @@ fn a_strand_does_not_keep_a_position_an_unshipped_drop_may_never_fill() {
     assert!(stranded.any());
     meta.drop_held_cancel(broken).unwrap();
     let idx = meta.log_stream_idx(gen).unwrap();
-    assert!(idx <= 8, "the index claims a position the log never carries: {idx}");
+    assert!(
+        idx <= 8,
+        "the index claims a position the log never carries: {idx}"
+    );
 }
 
 /// Review of fix226, S1: after the apply of a shipped drop (the index stays
