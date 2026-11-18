@@ -1255,25 +1255,26 @@ fn a_claimant_without_a_tail_keeps_its_rows_of_a_listed_generation() {
     assert!(!meta.deleg_ended_at_gate(g).unwrap());
 }
 
-/// Plan 46 M0.4 review SHOULD-1 (pin, ignored: L2b, deferred to plan 46
-/// M1.2). ADR-43 says an orphan-ended generation's rows "roll back and replay
-/// by rid", but the orphan pass strands them as a recall does, and C2 §3.8
-/// drops a delegate's gated row there (`strand_local_tx`: `recall && gated &&
-/// gen != 0 && epoch == 0`), on the premise that a committed row is at or
-/// below the cut. At an orphan cut of 0 that premise fails: a `DelegateNodeGroup`
-/// row may be answered (ADR-41: a lone root's journal counts as the second
-/// copy), and the delegate keeps nothing of it. What rescues it today is the
-/// requester's persisted shadow and the deposed root's queued append, both
-/// replays by rid: the L2b pair. Queuing it here as well adds a third copy
-/// of the rid beside them, which is L2b's own question (the member copies of
-/// M1.2 remove both decision sites).
+/// Plan 46 M0.4 review SHOULD-1, closed at the M1.2 close (review M4). An
+/// orphan-ended generation's rows roll back; a delegate's gated row
+/// (`DelegGroup`) is dropped there, not queued (C2 section 3.8: a committed
+/// row is at or below the cut). At an orphan cut of 0 that would lose an
+/// answered row, but no such row exists: the delegate honours a grant only
+/// once the root's configuration committed its `DelegateNode` (step 8b), so a
+/// grant held only as an uncommitted streamed entry
+/// (`uncommitted_streamed_grants`) is never honoured and no row of it is ever
+/// answered. Dropping is then the whole story and a third rid copy beside the
+/// requester's shadow and the root's queued append is not wanted.
 #[test]
-#[ignore = "L2b: plan 46 M1.2 (review M0.4 SHOULD-1)"]
-fn an_orphan_end_queues_a_delegates_answered_gated_row() {
+fn an_orphan_end_drops_a_delegates_gated_row_of_a_grant_it_never_honoured() {
     let g = gen(1, 1);
     let meta = Meta::open_in_memory().unwrap();
     meta.install_streamed_committed(1, 1, 1, 1, &[delegate(g)], false, (0, 0))
         .unwrap();
+    assert!(
+        meta.uncommitted_streamed_grants().unwrap().contains(&g),
+        "the grant is held only as an uncommitted streamed entry"
+    );
     {
         let _class =
             constellation_meta::PendingClass::set(constellation_meta::RowCommit::DELEG_GROUP);
@@ -1284,11 +1285,12 @@ fn an_orphan_end_queues_a_delegates_answered_gated_row() {
     assert_eq!(meta.void_cut(g).unwrap(), Some(0), "ended at 0");
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_none());
     assert!(
-        meta.pending_replays()
+        !meta
+            .pending_replays()
             .unwrap()
             .iter()
             .any(|op| op.rid == RID),
-        "the answered row is queued for replay by rid, never dropped"
+        "the row is dropped, nothing is queued"
     );
 }
 

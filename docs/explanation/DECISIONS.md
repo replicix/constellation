@@ -3052,6 +3052,8 @@ follow-up). Amends the generation identity of
 [ADR-23](#adr-23-delegated-sub-sequencers-over-one-log); the rule of ADR-41
 and [ADR-42](#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)
 (a gate inherits other nodes' generations *by number*) is unchanged.
+Amended at plan 46 M1.2 close (2026-11-18): the orphan-rows paragraph states why a delegate's gated row never meets
+an orphan cut of 0 answered (review M4).
 
 **Context**: a root minted `max(its counter, table.max_gen() + 1)` from its own
 view of the log. Two roots of different epochs whose views agree on `max_gen`
@@ -3192,11 +3194,15 @@ block.
   re-adoption never gets one. A covered number that the table no
   longer lists, that this replica holds no trace of in the log (no cut key, no log index) and that no outstanding speculation
   ends is ended as the log's `Recall` would, at what the log holds of it (0), after the cut loop (a generation the segment
-  itself ends stays out by its cut key): its rows roll back and replay by rid (a delegate's gated row, `DelegGroup`, is
-  dropped there instead, C2 §3.8, on the premise that a committed row is at or below the cut, which a cut of 0 breaks: an
-  answered one is then rescued only by its other copies, the requester's persisted shadow and the deposed root's queued
-  append, both replays by rid; the L2b pair, deferred to plan 46 M1.2, review M0.4 SHOULD-1; pin
-  `an_orphan_end_queues_a_delegates_answered_gated_row`, ignored). Candidates are the table's list before the
+  itself ends stays out by its cut key): its rows roll back and replay by rid (a delegate's gated row is dropped there instead, C2 §3.8. Such a row is never answered: the delegate honours a
+  grant only once the root's configuration committed its `DelegateNode` (plan 46 M1.2 step 8b: a lone root streams
+  nothing ahead, a backed root streams only rows its group holds as committed, an uncommitted streamed grant waits
+  for the log), and a `DelegGroup` answer needs the root's committed prefix of its appends (ADR-41, amended) or the
+  delegate's own backup under a `DelegateNodeGroup` record the delegate applies from its table, which follows the
+  grant. Either way the grant is in the root's group or the archive, so the claim names a tail that carries it or the
+  log lists the generation, and no orphan end at a cut of 0 meets an answered row. Witnesses:
+  `acked_at_or_below_cut` strict in every configuration, the core test of step 8b, and
+  `an_orphan_end_drops_a_delegates_gated_row_of_a_grant_it_never_honoured`. The L2b pin retired at the M1.2 close.) Candidates are the table's list before the
   strand, the numbers a live entry's records grant (a streamed `Delegate` whose `RecallCut` streamed too), the generations
   this node holds delegate rows of (`deleg_gens_awaiting_end`) and those of its live shadows and hints. Old-mint numbers are
   left alone. The claimant never applies its own marker as a segment, so its takeover strand runs the same rule with its

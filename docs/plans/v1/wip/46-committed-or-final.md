@@ -833,7 +833,7 @@ from 281 / 676 (no knob / slow lease reads) to 6 / 149 in `long-delegated-late-a
 `delegated-backup`, `delegated-holder-cut`, `long-delegated-backup` and `long-delegated-late-answers`; none was raised (the allowed ceiling of
 `delegated-backup-and-delegate-die` moved from 0 to 26 when the waiting runs' `EIO`s began to be counted, a count the ceiling never saw). **Carried to
 stage 1:** SHOULD-1 (the §3.8 drop of an answered gated row at an orphan cut of 0, with ADR-41's second copy; pin
-`an_orphan_end_queues_a_delegates_answered_gated_row` ignored) to **M1.2** with L2b; the in-gate class's residual classes (a delegate restarted in the
+`an_orphan_end_queues_a_delegates_answered_gated_row` ignored; retired at the M1.2 close, ADR-43) to **M1.2** with L2b; the in-gate class's residual classes (a delegate restarted in the
 gate, a rid that took effect, an unreachable delegate, a refusal not shipped by the window's end) to **M1.3** with S4, where the on-demand recall becomes
 a request the holder answers with `SubtreeReleased`; ADR-41's lone-journal commit and ADR-43's no-tail proof against sticky grants to the **M1.0**
 model, before M1.3; two classifier gaps in the lease-path arm (the generation-tail condition the root arm applies; the requester counted as a member holding
@@ -902,6 +902,9 @@ delegate-turned-root re-appends in a lone tenure, ending unshipped below the nex
 by rid (I2 in `long-delegated-backup` 13016; I2c in 13907, 14284, 15005, 15996, all under slow lease reads). M1.2's member
 copy (C3 items 1–4) keeps the row's verbatim copy until the log carries it. The ignored sim test
 `l2b_findings_a_committed_delegate_row_lands_with_its_identity` is the pin: it passes, and loses its `#[ignore]`, in M1.2.
+*Closed at M1.2 (2026-11-18):* the sim pin passes without `#[ignore]` (step 7, a deposed root keeps its appended delegate rows as a member copy). The meta pin
+`an_orphan_end_queues_a_delegates_answered_gated_row` is retired by an unreachability argument in ADR-43's orphan-rows paragraph (no answered row meets an orphan
+cut of 0: a grant is honoured only once committed, step 8b) and replaced by `an_orphan_end_drops_a_delegates_gated_row_of_a_grant_it_never_honoured`.
 
 *L3 (landed 2026-11-04; PROGRESS, "L3"):* the root sends an unanswered `DelegRecall` again, with a back-off from a request's
 timeout to 2 s, and a delegate answers a repeated recall with the same lock hand-back. No design rule changes (ADR-41's

@@ -70234,3 +70234,11 @@ keeps its `disowned`: `a_landed_withdrawal_swap_keeps_the_name_a_busy_acquisitio
 `a_withdrawal_reads_again_after_a_registration_that_timed_out_in_doubt`,
 `a_withdrawal_read_swaps_nothing_for_a_name_that_was_disowned_meanwhile`); lease state
 `a_lapsed_note_keeps_the_grace_start_while_the_body_lists_the_name`.
+
+### M4: the L2b orphan-end pin retired with its argument (2026-11-18)
+
+The ignored meta pin `an_orphan_end_queues_a_delegates_answered_gated_row` is replaced by
+`an_orphan_end_drops_a_delegates_gated_row_of_a_grant_it_never_honoured` (`crates/meta/tests/generation_epochs.rs`): a grant held only as an
+uncommitted streamed entry is in `uncommitted_streamed_grants`, so the delegate never honoured it, and its gated row is dropped at the orphan cut of 0
+with nothing queued. ADR-43's orphan-rows paragraph now carries the unreachability argument (witnesses: `acked_at_or_below_cut` strict, the step 8b core
+test, the new test) and an "Amended at plan 46 M1.2 close" line; plan 46's L2b note says how M1.2 closed L2b. No product code changed.
