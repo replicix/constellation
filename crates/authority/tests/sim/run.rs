@@ -5579,11 +5579,8 @@ fn count_unsettled(
     // MUST-1: the tag over the excused ones too (non-stealable holder,
     // isolated from S3, held behind a lost chunk): a sticky stream's
     // release is the case S4 is about, and its EIOs are `designation_held`.
-    report.unsettled_s4_excused = everything
-        .iter()
-        .filter(|u| u.release_read_recall)
-        .count()
-        - report.unsettled_s4;
+    report.unsettled_s4_excused =
+        everything.iter().filter(|u| u.release_read_recall).count() - report.unsettled_s4;
     report.unsettled_s4_violations = all
         .iter()
         .filter(|u| u.release_read_recall && !u.verdict.allowed())
@@ -9204,8 +9201,8 @@ pub fn judge_handover(
 
 #[cfg(test)]
 mod s4_count_tests {
-    use super::*;
     use super::super::oracle::{ArchiveIndex, Oracles};
+    use super::*;
 
     fn rid(seq: u64) -> Rid {
         Rid {
@@ -9251,7 +9248,10 @@ mod s4_count_tests {
     fn only_the_unsettled_list_carries_the_s4_count() {
         let unsettled = vec![format!("a [{S4_MARK}]"), "b".to_string()];
         let other = vec!["x".to_string()];
-        assert_eq!(s4_note(&unsettled, &unsettled), format!(", 1 of them {S4_MARK}"));
+        assert_eq!(
+            s4_note(&unsettled, &unsettled),
+            format!(", 1 of them {S4_MARK}")
+        );
         assert_eq!(s4_note(&other, &unsettled), "");
     }
 }

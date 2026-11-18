@@ -2587,15 +2587,11 @@ impl Driver {
                 );
                 let sent = self.core.stats.settles_sent;
                 if sent > self.settles_seen {
-                    self.oracles
-                        .held_releases
-                        .lock()
-                        .unwrap()
-                        .note_settles(
-                            sent - self.settles_seen,
-                            self.oracles.reach.now_ms(),
-                            self.core.dl_t().settle_window,
-                        );
+                    self.oracles.held_releases.lock().unwrap().note_settles(
+                        sent - self.settles_seen,
+                        self.oracles.reach.now_ms(),
+                        self.core.dl_t().settle_window,
+                    );
                     self.settles_seen = sent;
                 }
             }

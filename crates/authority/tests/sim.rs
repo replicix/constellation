@@ -23054,7 +23054,10 @@ fn the_s4_hazard_configurations_reach_a_held_release_and_the_sweep_line_says_so(
                 break;
             }
         }
-        assert!(totals.s4_spans.0 > 0, "{label}: no release waited on read recalls");
+        assert!(
+            totals.s4_spans.0 > 0,
+            "{label}: no release waited on read recalls"
+        );
         assert!(
             totals.s4_settles.1 > 0,
             "{label}: no settle overlapped a held release"
