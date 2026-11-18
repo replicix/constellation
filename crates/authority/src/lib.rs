@@ -45,13 +45,14 @@ pub use action::{
 };
 pub use core::{
     beat_sent_ms, lease_may_carry, resolve_epoch_claims, Config, Core, DelegRenewCert,
-    EpochClaimView, EpochState, HandEvent, InboxView, LockView, ShipState, Stats, ABANDONED_CODE,
-    DELEG_READ_EPOCH_BASE,
+    EpochClaimView, EpochState, HandEvent, InboxView, LockView, ShipState, Stats, StickyEnd,
+    ABANDONED_CODE, DELEG_READ_EPOCH_BASE,
 };
 pub use event::{
     AbandonTarget, AheadGrants, Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome,
     LockRenewEntry, LockRenewResult, LockTestOutcome, PeerLink, PeerMsg, Policy, ReadAhead,
-    ReadGrantMsg, ReadIndexOutcome, ReleaseWhy, S3Failure, S3Result, UploadResult, VoidScope,
+    ReadGrantMsg, ReadIndexOutcome, ReleaseWhy, S3Failure, S3Result, StickyReleaseWhy,
+    UploadResult, VoidScope,
 };
 pub use ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 pub use replica::Replica;

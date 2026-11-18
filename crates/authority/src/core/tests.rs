@@ -75148,6 +75148,55 @@ mod step4_sticky {
         assert_eq!(counts(&h), (0, 0));
     }
 
+    /// Plan 46 M1.3 step 17: the root records why a sticky stream ended when
+    /// it ends it: the operator's `undelegate` and a continuation epoch's
+    /// `recall_all` (and not before the end).
+    #[test]
+    fn the_root_records_the_cause_of_a_recalled_sticky_streams_end() {
+        use crate::core::delegate::RecallCause;
+        for (cause, want) in [
+            (RecallCause::Undelegate, crate::core::StickyEnd::Undelegate),
+            (RecallCause::Epoch, crate::core::StickyEnd::Epoch),
+        ] {
+            let (mut h, d1, _d2) = root_with_two_dirs();
+            let (ok, _) = control_delegate(&mut h, 900, d1, 3, true);
+            assert!(ok);
+            let gen = sticky_gen_of(&h, d1);
+            match cause {
+                RecallCause::Undelegate => {
+                    h.step(Event::Control {
+                        op: OpId(901),
+                        req: Control::Undelegate { dir: d1 },
+                    });
+                }
+                _ => h.core.recall_all(h.clk(), &mut Vec::new()),
+            }
+            assert_eq!(h.core.dl.gens[&gen].recall_cause, Some(cause));
+            // Recalled, not ended: nothing is recorded yet.
+            assert!(!h.core.dl.gens[&gen].ended);
+            assert_eq!(h.core.stats.sticky_ended.iter().sum::<u64>(), 0);
+            assert!(h.core.dl.last_sticky_end.is_none());
+            // The delegate drained: the root ends the generation.
+            let cursor = h.core.dl.gens[&gen].cursor;
+            h.core.dl.gens.get_mut(&gen).unwrap().recall = RecallPhase::Drained(cursor);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            h.step(Event::Activity {
+                last_write: WaitMs(0),
+                acked_seqs: Vec::new(),
+            });
+            assert!(
+                h.core.dl.gens[&gen].ended,
+                "the drained recall did not end it"
+            );
+            assert_eq!(h.core.stats.sticky_ended[want.index()], 1);
+            assert_eq!(h.core.stats.sticky_ended.iter().sum::<u64>(), 1);
+            let end = h.core.dl.last_sticky_end.clone().expect("no last end");
+            assert_eq!((end.0, end.1), (want, gen));
+            assert_eq!(end.2, vec![d1]);
+        }
+    }
+
     fn holder_of(
         committed: bool,
         grants: &[(SubtreeKind, &str)],
@@ -75382,6 +75431,15 @@ mod step4_sticky {
         assert_eq!(h.core.stats.deleg_abandon_reads_recalled, 1);
         assert_eq!(h.core.stats.deleg_abandon_reads_expired, 0);
         assert_eq!(h.core.stats.deleg_sticky_ended_abandoned, 1);
+        // Plan 46 M1.3 step 17: the root's reason, recorded at the end.
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Abandon.index()],
+            1
+        );
+        assert_eq!(
+            h.core.dl.last_sticky_end.as_ref().map(|e| (e.0, e.1)),
+            Some((crate::core::StickyEnd::Abandon, gen))
+        );
         // The negative control: the code without the read recall.
         let (mut h, gen) = root_with_a_silent_sticky_holder();
         h.core.cfg.abandon_skips_read_recall = true;
@@ -76289,7 +76347,11 @@ mod step5_sticky_release {
     ) -> Vec<Action> {
         h.step(Event::Control {
             op: OpId(op),
-            req: Control::StickyRelease { dirs, wait },
+            req: Control::StickyRelease {
+                dirs,
+                wait,
+                why: crate::event::StickyReleaseWhy::Command,
+            },
         })
     }
 
@@ -76416,6 +76478,12 @@ mod step5_sticky_release {
             }
             assert!(!last_is_release(&h), "released before the drain");
             assert_eq!(h.core.stats.deleg_sticky_release_undrained, 0);
+            // Nothing is recorded before the release row is journaled.
+            assert_eq!(
+                h.core.stats.sticky_ended[crate::core::StickyEnd::Command.index()],
+                0
+            );
+            assert!(h.core.dl.last_sticky_end.is_none());
             // The root appends the row: the drain is over, the release goes.
             let ack = h.step(stream_ack(1, req, round, last));
             assert!(last_is_release(&h), "not released after the drain: {ack:?}");
@@ -76442,6 +76510,12 @@ mod step5_sticky_release {
             let a = answer(&out, 50).unwrap_or_else(|| panic!("not answered: {out:?}"));
             assert!(a.is_ok(), "{a:?}");
             assert_eq!(h.core.stats.deleg_sticky_releases, 1);
+            assert_eq!(
+                h.core.stats.sticky_ended[crate::core::StickyEnd::Command.index()],
+                1
+            );
+            let end = h.core.dl.last_sticky_end.clone().expect("no last end");
+            assert_eq!((end.0, end.1), (crate::core::StickyEnd::Command, 7));
         }
     }
 
@@ -77991,6 +78065,14 @@ mod step5_sticky_release {
         assert_eq!(h.core.stats.deleg_handover_released, 1);
         assert_eq!(h.core.stats.deleg_sticky_releases, 1);
         assert!(h.core.dl.handovers.is_empty());
+        // Plan 46 M1.3 step 17: recorded once the row is journaled.
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Handover.index()],
+            1
+        );
+        let (why, gen, end_dirs, _) = h.core.dl.last_sticky_end.clone().expect("no last end");
+        assert_eq!((why, gen), (crate::core::StickyEnd::Handover, 7));
+        assert_eq!(end_dirs, dirs);
     }
 
     /// ADR-59 part B × ADR-56: a drop decided by the holder of a stream that is
@@ -78011,12 +78093,22 @@ mod step5_sticky_release {
         assert!(!last_is_release(&h), "released with the drop pending");
         assert!(h.core.stats.deleg_release_drop_pending >= 1);
         assert_eq!(h.core.stats.deleg_handover_released, 1, "agreed, not made");
+        // A release that waits records nothing (step 17).
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Handover.index()],
+            0
+        );
+        assert!(h.core.dl.last_sticky_end.is_none());
         // The drop is applied: its plan goes, and the release is made.
         h.meta.drop_held_cancel(99).unwrap();
         sample(&mut h, &[], &[]);
         let out = release_tick(&mut h, 200);
         assert!(last_is_release(&h), "not released after the apply: {out:?}");
         assert_eq!(h.core.stats.deleg_sticky_releases, 1);
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Handover.index()],
+            1
+        );
     }
 
     /// Plan 46 M1.3 step 6: a sticky subtree the holder's own ops have not
@@ -78055,6 +78147,14 @@ mod step5_sticky_release {
             h.clk().wait
         );
         assert_eq!(h.core.stats.deleg_sticky_idle_requested, dirs.len() as u64);
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Idle.index()],
+            1
+        );
+        assert_eq!(
+            h.core.dl.last_sticky_end.as_ref().map(|e| (e.0, e.1)),
+            Some((crate::core::StickyEnd::Idle, 7))
+        );
     }
 
     /// Plan 46 M1.3 step 6: an op the fast path admitted (in flight), or one
@@ -78121,6 +78221,7 @@ mod step5_sticky_release {
             req: Control::StickyRelease {
                 dirs: Vec::new(),
                 wait: true,
+                why: crate::event::StickyReleaseWhy::Command,
             },
         });
         assert!(answer(&out, 5).is_none(), "answered at once: {out:?}");
@@ -78131,6 +78232,12 @@ mod step5_sticky_release {
         let error = answered.expect_err("released under a pending drop");
         assert!(error.contains("drop pending"), "{error}");
         assert!(!last_is_release(&h));
+        // A release that gave up records nothing (step 17).
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Command.index()],
+            0
+        );
+        assert!(h.core.dl.last_sticky_end.is_none());
     }
 
     /// ADR-56 review M1: the release waits for a sample taken after the
@@ -84799,6 +84906,14 @@ mod root_own_sticky {
         root_dominates(&mut h, dirs[0]);
         archive_and_step(&mut h);
         assert_eq!(h.core.stats.place_root_own_released_singleton, 1);
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Singleton.index()],
+            1
+        );
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Dwell.index()],
+            0
+        );
         assert!(
             h.meta.delegation_table().get(dirs[0]).is_none(),
             "the subtree is still granted"
@@ -84837,6 +84952,12 @@ mod root_own_sticky {
         assert_eq!(h.core.dl.sticky_cmds.len(), 1, "one release command");
         assert_eq!(h.core.stats.place_root_own_released, 1);
         assert_eq!(h.core.stats.place_root_own_released_singleton, 1);
+        // Still draining: nothing is recorded before the row (step 17).
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Singleton.index()],
+            0
+        );
+        assert!(h.core.dl.last_sticky_end.is_none());
         // The op drains; the release completes, and the count is still one.
         for _ in 0..3 {
             let now = h.now;
@@ -84849,6 +84970,10 @@ mod root_own_sticky {
             "released after the drain"
         );
         assert_eq!(h.core.stats.place_root_own_released_singleton, 1);
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Singleton.index()],
+            1
+        );
         assert!(
             h.core.stats.place_root_own_released_singleton <= h.core.stats.place_root_own_released
         );
@@ -85344,6 +85469,14 @@ mod root_own_sticky {
             archive_and_step(&mut h);
         }
         assert_eq!(h.core.stats.place_root_own_released, 1);
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Dwell.index()],
+            1
+        );
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Singleton.index()],
+            0
+        );
         assert_eq!(h.core.stats.deleg_sticky_recalled_other, 0);
         assert_eq!(h.core.stats.place_recalled, 0);
         assert!(
@@ -85383,6 +85516,7 @@ mod root_own_sticky {
             h.clk(),
             d.gen,
             [dirs[0]].into_iter().collect(),
+            crate::core::StickyEnd::Dwell,
             &h.meta,
             &mut out
         ));
@@ -86122,6 +86256,7 @@ mod root_own_sticky {
             h.clk(),
             d.gen,
             [dirs[0]].into_iter().collect(),
+            crate::core::StickyEnd::Dwell,
             &h.meta,
             &mut out
         ));
@@ -86189,6 +86324,10 @@ mod root_own_sticky {
         );
         claim(&mut h);
         assert_eq!(h.core.stats.claim_released, 1);
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Claim.index()],
+            1
+        );
         assert_eq!(h.core.stats.claim_release_rowless, 0);
         let release = release_row_idx(&h, gen, record).expect("no release row");
         assert!(release > idx, "release {release} not above the rows {idx}");
@@ -86204,6 +86343,11 @@ mod root_own_sticky {
         assert!(h.meta.deleg_ended_at_gate(gen).unwrap());
         claim(&mut h);
         assert_eq!(h.core.stats.claim_released, 1);
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Claim.index()],
+            1
+        );
+        assert_eq!(h.core.dl.last_sticky_end.as_ref().map(|e| e.1), Some(gen));
         assert_eq!(h.core.stats.claim_release_rowless, 0);
         assert!(release_row_idx(&h, gen, record).is_some());
     }
@@ -86338,6 +86482,7 @@ mod root_own_sticky {
             h.clk(),
             d.gen,
             [dirs[0]].into_iter().collect(),
+            crate::core::StickyEnd::Dwell,
             &h.meta,
             &mut out
         ));
@@ -86401,6 +86546,11 @@ mod root_own_sticky {
         );
         assert_eq!(h.core.stats.root_own_released_for_cross_own, 1);
         assert_eq!(h.core.stats.root_own_released_for_cross_forwarded, 0);
+        // The release row is appended inline (the reason is recorded then).
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::CrossOwn.index()],
+            1
+        );
         // The release row is appended inline; the op runs after it.
         let mut all = out;
         for _ in 0..6 {
@@ -86436,6 +86586,7 @@ mod root_own_sticky {
             req: Control::StickyRelease {
                 dirs: Vec::new(),
                 wait: true,
+                why: crate::event::StickyReleaseWhy::Unmount,
             },
         });
         let mut all = out;
@@ -86458,6 +86609,14 @@ mod root_own_sticky {
             "the release did not complete before its row shipped: {done:?}"
         );
         assert!(h.meta.delegation_table().get(dirs[0]).is_none());
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Unmount.index()],
+            1
+        );
+        assert_eq!(
+            h.core.stats.sticky_ended[crate::core::StickyEnd::Command.index()],
+            0
+        );
     }
 
     // ---- ADR-55 step 9, the own stream across a deposition (R-H, R-X, R-D, R-J) ----

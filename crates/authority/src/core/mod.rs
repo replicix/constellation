@@ -87,7 +87,9 @@ pub use deleg_windows::{
     decide, DelegWindows, Refusal, RootLease, Window, WindowStats, WindowsClock,
 };
 pub(crate) use delegate::STICKY_HOLD_MAX_MS;
-pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
+pub use delegate::{
+    DelegKind, DelegRenewCert, DelegView, RecallPhase, StickyEnd, StickyStreamView,
+};
 pub use roster::RosterView;
 pub use seal_tail::WaitingForGroup;
 
@@ -1509,6 +1511,11 @@ pub struct Stats {
     /// completed) because its own ops had been idle there for
     /// `sticky_idle_release_ms`,
     pub deleg_sticky_released_idle: u64,
+    /// Plan 46 M1.3 step 17: non-stealable subtrees that left their holder, by
+    /// reason (indexed by [`StickyEnd::index`]; one per stream part, counted
+    /// when the holder's release row is journaled, or by the root when it ends
+    /// the generation). Every other counter of the releases stays.
+    pub sticky_ended: [u64; StickyEnd::COUNT],
     /// ... requested (the command made) and given up (out of time: a drop the
     /// holder decided, or a drain that did not finish).
     pub deleg_sticky_idle_requested: u64,
@@ -4578,8 +4585,8 @@ impl Core {
             }
             Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
             Control::ReleaseGrants => self.on_control_release_grants(now, op, replica, out),
-            Control::StickyRelease { dirs, wait } => {
-                self.on_control_sticky_release(now, op, dirs, wait, replica, out)
+            Control::StickyRelease { dirs, wait, why } => {
+                self.on_control_sticky_release(now, op, dirs, wait, why, replica, out)
             }
             Control::LeaveFailed => {
                 if self.dl.leave_self {

@@ -592,6 +592,8 @@ pub enum SyncRequest {
     StickyRelease {
         dirs: Vec<Ino>,
         wait: bool,
+        /// Who asked (plan 46 M1.3 step 17: status shows the reason).
+        why: constellation_authority::StickyReleaseWhy,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Plan 46 M1.2 step 11 ("Leave ends grants first"): before the
@@ -1091,11 +1093,13 @@ mod roster_request_tests {
 pub(crate) async fn release_sticky(
     tx: &tokio::sync::mpsc::UnboundedSender<SyncRequest>,
     cap: std::time::Duration,
+    why: constellation_authority::StickyReleaseWhy,
 ) -> Result<String, String> {
     let (reply, receive) = tokio::sync::oneshot::channel();
     tx.send(SyncRequest::StickyRelease {
         dirs: Vec::new(),
         wait: true,
+        why,
         reply,
     })
     .map_err(|_| "the sync task is not running".to_string())?;
@@ -1109,6 +1113,7 @@ pub(crate) async fn release_sticky(
 #[cfg(test)]
 mod sticky_release_tests {
     use super::*;
+    use constellation_authority::StickyReleaseWhy;
     use std::time::Duration;
 
     /// An unmount's (and a suspension's) release asks for every sticky
@@ -1118,16 +1123,44 @@ mod sticky_release_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let asked = tokio::spawn(async move {
             match rx.recv().await {
-                Some(SyncRequest::StickyRelease { dirs, wait, reply }) => {
+                Some(SyncRequest::StickyRelease {
+                    dirs,
+                    wait,
+                    why,
+                    reply,
+                }) => {
                     let _ = reply.send(Ok("released".into()));
-                    Some((dirs, wait))
+                    Some((dirs, wait, why))
                 }
                 _ => None,
             }
         });
-        let done = release_sticky(&tx, Duration::from_secs(5)).await;
+        let done = release_sticky(&tx, Duration::from_secs(5), StickyReleaseWhy::Unmount).await;
         assert_eq!(done, Ok("released".to_string()));
-        assert_eq!(asked.await.unwrap(), Some((Vec::new(), true)));
+        assert_eq!(
+            asked.await.unwrap(),
+            Some((Vec::new(), true, StickyReleaseWhy::Unmount))
+        );
+    }
+
+    /// Plan 46 M1.3 step 17: the trigger reaches the core as asked (an
+    /// unmount's and a suspension's release are told apart in status).
+    #[tokio::test]
+    async fn the_release_carries_its_trigger() {
+        for why in [StickyReleaseWhy::Unmount, StickyReleaseWhy::Suspend] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let asked = tokio::spawn(async move {
+                match rx.recv().await {
+                    Some(SyncRequest::StickyRelease { why, reply, .. }) => {
+                        let _ = reply.send(Ok(String::new()));
+                        Some(why)
+                    }
+                    _ => None,
+                }
+            });
+            let _ = release_sticky(&tx, Duration::from_secs(5), why).await;
+            assert_eq!(asked.await.unwrap(), Some(why));
+        }
     }
 
     /// A root that does not answer never hangs the caller past its bound.
@@ -1140,7 +1173,7 @@ mod sticky_release_tests {
             drop(held);
         });
         let started = std::time::Instant::now();
-        let done = release_sticky(&tx, Duration::from_millis(100)).await;
+        let done = release_sticky(&tx, Duration::from_millis(100), StickyReleaseWhy::Unmount).await;
         assert!(done.is_err(), "{done:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
         keep.abort();
@@ -1151,6 +1184,10 @@ mod sticky_release_tests {
     async fn the_release_fails_at_once_without_a_sync_task() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
-        assert!(release_sticky(&tx, Duration::from_secs(5)).await.is_err());
+        assert!(
+            release_sticky(&tx, Duration::from_secs(5), StickyReleaseWhy::Unmount)
+                .await
+                .is_err()
+        );
     }
 }

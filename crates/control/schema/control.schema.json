@@ -2207,6 +2207,15 @@
           "minimum": 0,
           "type": "integer"
         },
+        "sticky": {
+          "$ref": "#/$defs/StickyStatus",
+          "default": {
+            "ended": [],
+            "last_end": null,
+            "streams": []
+          },
+          "description": "Plan 46 M1.3 step 17: the non-stealable streams this node knows of,\nand why subtrees of that kind have left their holders."
+        },
         "stranded": {
           "description": "Delegate rows stranded here by a recall (rolled back, replayed).",
           "format": "uint64",
@@ -2326,10 +2335,6 @@
     "DelegationStatus": {
       "description": "Plan 30 §M11: one live delegation: a subtree grant (the rows of one\nnode's stream share its `node` and `gen`; plan 46 M1.2 step 9: a node holds\none stream, [`DelegationStreamStatus`]).",
       "properties": {
-        "designated": {
-          "description": "Phase 2b: an offline designation (never recalled by TTL or\nplacement while every subtree of the stream is one).",
-          "type": "boolean"
-        },
         "dir": {
           "format": "uint64",
           "minimum": 0,
@@ -2339,6 +2344,10 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "kind": {
+          "description": "The grant's kind (plan 46 M1.3 step 17): `placed` (the placement's;\nthe root may take it back), `sticky` (the holder keeps it until it\nreleases or an operator ends it), or `designated` (an offline\ndesignation, never recalled by TTL or placement; only `online` moves\nit).",
+          "type": "string"
         },
         "node": {
           "format": "uint64",
@@ -2354,7 +2363,7 @@
         "path",
         "node",
         "gen",
-        "designated"
+        "kind"
       ],
       "type": "object"
     },
@@ -10371,6 +10380,41 @@
       ],
       "type": "object"
     },
+    "StickyEndStatus": {
+      "description": "Plan 46 M1.3 step 17: the last non-stealable subtrees to leave their\nholder.",
+      "properties": {
+        "ago_ms": {
+          "description": "How long ago, ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dirs": {
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "gen": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "description": "Why (`idle`, `unmount`, `suspend`, `command`, `handover`, `leave`,\n`claim`, `cross-own`, `dwell`, `singleton`, `unhonoured`, `abandon`,\n`undelegate`, `epoch`, `leave-operator`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "gen",
+        "dirs",
+        "ago_ms"
+      ],
+      "type": "object"
+    },
     "StickyHandoverStatus": {
       "description": "Plan 46 M1.3 step 8 (ADR-56): the handover of sticky grants\n(`DelegationReport::handovers`). The root's side: requests sent to a\nholder, grants made after its release row, requests it dropped\nunanswered, grants it dropped, and the candidates held back by the tenure\nor because the dominant node could not be given the subtree. The\nholder's side: requests it waited on, released, ignored (a designated\nsubtree), let expire, and releases that gave up.",
       "properties": {
@@ -10469,6 +10513,107 @@
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "StickyStatus": {
+      "description": "Plan 46 M1.3 step 17: `status.delegation.sticky`.",
+      "properties": {
+        "ended": {
+          "description": "How many times each reason ended a stream part here, every reason\nlisted (zeros included), in a fixed order.",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "last_end": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StickyEndStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last end, if any."
+        },
+        "streams": {
+          "description": "The non-stealable streams this node knows of: every live one it\ngranted (as the root) and the ones it holds.",
+          "items": {
+            "$ref": "#/$defs/StickyStreamStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "streams",
+        "ended"
+      ],
+      "type": "object"
+    },
+    "StickyStreamStatus": {
+      "description": "Plan 46 M1.3 step 17: one non-stealable (sticky or designated) stream.",
+      "properties": {
+        "age_ms": {
+          "description": "How long it has been granted (the root's view) or installed (the\nholder's), ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dirs": {
+          "description": "The subtrees the stream holds, by directory and path.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "gen": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "description": "`sticky` or `designated`.",
+          "type": "string"
+        },
+        "mine": {
+          "description": "This node holds it.",
+          "type": "boolean"
+        },
+        "node": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "node",
+        "gen",
+        "dirs",
+        "paths",
+        "kind",
+        "age_ms",
+        "mine"
+      ],
       "type": "object"
     },
     "StreamEnd": {

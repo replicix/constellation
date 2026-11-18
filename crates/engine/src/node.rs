@@ -2592,7 +2592,13 @@ impl Engine {
             // for a handover: its successor carries the grants on.
             if withdraw_holds {
                 let cap = Duration::from_millis(self.sticky_release_wait_ms);
-                match crate::sync::release_sticky(&self.sync_tx, cap).await {
+                match crate::sync::release_sticky(
+                    &self.sync_tx,
+                    cap,
+                    constellation_authority::StickyReleaseWhy::Unmount,
+                )
+                .await
+                {
                     Ok(done) => tracing::info!(%done, "unmount: sticky grants released"),
                     Err(error) => tracing::warn!(%error, "unmount: sticky grants not released"),
                 }

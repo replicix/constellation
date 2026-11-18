@@ -70641,3 +70641,30 @@ transaction, so the skip and `past_stream_fills` agree; an unshipped plan keeps 
 journaled rows 10..18 above the seed, no `kv_set`): `a_strand_does_not_keep_a_position_an_unshipped_drop_may_never_fill` (fails before: the
 index stays at 9 in release, a `hold_row_tx` debug assert in debug) and `a_strand_of_the_rows_above_an_applied_seed_stops_at_its_fill`
 (index 9 after the apply then a deposed strand of the rows above).
+
+### Plan 46 M1.3 step 17 (status): the grant kind and `status.delegation.sticky` (2026-11-18)
+
+`status.delegation.table[].designated` is now `kind` (`placed`, `sticky`, `designated`), and `status.delegation.sticky` shows the non-stealable
+streams (`streams`: node, gen, dirs, paths, kind, `age_ms` since the root granted it or the holder installed it, `mine`), `ended` (every
+reason, zeros included, in a fixed order) and `last_end` (reason, gen, dirs, `ago_ms`); `constellation status` prints one line per stream and the
+last end on stderr. Core: `StickyEnd` (`delegate.rs`), `Stats::sticky_ended` (an array, `Stats` is `Copy`) and `dl.last_sticky_end`; every existing counter
+stays. Recorded once per stream part, when the holder's release row is journaled (`sticky_part_progress`, beside `deleg_sticky_releases`; the
+command carries its reason in `StickyReleaseCmd::why`): `idle`, `unmount`, `suspend` and `command` (`Control::StickyRelease` carries
+`StickyReleaseWhy`, threaded through `SyncRequest` and `sync::release_sticky`), `handover`, `cross-own`, `dwell`, `singleton` (the argument
+`own_sticky_release` takes; `placement.rs` passes `Dwell` or `Singleton` at its two calls), `unhonoured` (the root's own grant never honoured:
+a reason the spec's list lacked, it had its own caller), `claim` (`claim_releases`, beside `claim_released`), `leave` (the holder's own leave
+release, journaled or ended at the cut); and by the root, once the end of the generation is journaled (`end_generation`): `abandon`,
+`undelegate`, `epoch`, `leave-operator` (a `LeaveNote` end is the holder's `leave`, not counted again). A release that waits or gives up records
+nothing. Nothing on the op path changes: the recording sites are release paths, so there is no perf gate.
+Tests: core, the holder's reasons in the existing release tests (`a_release_before_the_drain_is_refused` (command, and nothing before the row),
+`an_idle_sticky_subtree_is_released_after_the_setting`, the handover pair (nothing while a pending drop holds it), the claim pair, the singleton and
+dwell release tests, the cross-own test, the root's unmount release (`unmount`), `a_waited_release_under_a_pending_drop_fails_saying_so` (nothing)),
+`an_abandon_with_a_live_read_grant_waits` (abandon), `the_root_records_the_cause_of_a_recalled_sticky_streams_end` (undelegate, epoch); engine
+`the_release_carries_its_trigger` (unmount, suspend) and `sticky_status_tests` (kind names; a view with one sticky stream gives its row, every
+reason in order and the last end); cli `status_lines_name_the_sticky_streams_and_the_last_end`; harness `sticky-release-cmd` and
+`sticky-suspend-inhibitor` read `status.delegation.sticky.last_end.reason` (`command`, `suspend`; the unmount one exits, so it has no status to read).
+Fail-before: with the two recording lines of `note_sticky_end` removed, 13 core tests fail. Control schema re-blessed. Gates (debug, then release):
+fmt, clippy `--workspace --all-targets -D warnings`, lib tests of authority, engine, control, harness and the cli's tests, the release sim suite
+(571 passed, 0 failed). Sims (300 seeds, plain, against the parent built the same way): `sticky-idle-release`, `sticky-handover-ping-pong`,
+`sticky-leave`, `sticky-claim`, `far-root-writes`, `sticky-holder-dies`: no failing seed, every `SWEEP-*` line equal except noise the parent shows
+against itself (`SWEEP-SIG`/`SEGMENTS` stored bytes, `far-root-writes` seed 110 `skipped-far` 1 or 2 run to run). Harness smoke (release, seed 42, linux-fuse): `sticky-release-cmd`, `sticky-release-on-unmount`, `sticky-suspend-inhibitor`, `root-own-sticky`, `designation-as-delegation` (reads `kind`) and `sticky-handover-one-off` (under `net-wan`, which it requires) pass.

@@ -3990,8 +3990,13 @@ impl Driver {
             SyncRequest::Undelegate { dir, reply } => {
                 control(Control::Undelegate { dir }, ControlReply::Text(reply))
             }
-            SyncRequest::StickyRelease { dirs, wait, reply } => control(
-                Control::StickyRelease { dirs, wait },
+            SyncRequest::StickyRelease {
+                dirs,
+                wait,
+                why,
+                reply,
+            } => control(
+                Control::StickyRelease { dirs, wait, why },
                 ControlReply::Text(reply),
             ),
             SyncRequest::EndGrantsOf { node, reply } => {

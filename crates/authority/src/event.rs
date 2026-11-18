@@ -335,6 +335,18 @@ pub struct PeerLink {
     pub since: Option<WaitMs>,
 }
 
+/// Plan 46 M1.3 step 17: who asked for a `Control::StickyRelease` (the reason
+/// status shows when the release row is journaled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickyReleaseWhy {
+    /// The operator's `sticky.release` (and the network dispatcher's).
+    Command,
+    /// The node unmounts.
+    Unmount,
+    /// The node suspends.
+    Suspend,
+}
+
 /// Why the root asks a delegate to release subtrees (plan 46 M1.3 step 8,
 /// ADR-56).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,7 +538,12 @@ pub enum Control {
     /// answered (`Text`) once the root has appended the release row (and
     /// so ended the stream, or shrunk it), else at once. A named directory
     /// that is no sticky grant of this node is an error.
-    StickyRelease { dirs: Vec<Ino>, wait: bool },
+    StickyRelease {
+        dirs: Vec<Ino>,
+        wait: bool,
+        /// Plan 46 M1.3 step 17: who asked (status shows the reason).
+        why: StickyReleaseWhy,
+    },
     /// The engine's leave failed after `ReleaseGrants` was answered (the
     /// flush, or the registry's retirement): the node is not leaving any
     /// more, takes grants again, and tells its root so. Answered `Done`.

@@ -1511,6 +1511,11 @@ fn sticky_leaves(scenario: &str, how: Leave) -> Result<()> {
                         Ok(())
                     },
                 )?;
+                let end = deleg_of(&clients[1])?["sticky"]["last_end"].clone();
+                anyhow::ensure!(
+                    end["reason"] == "suspend",
+                    "b's status.delegation.sticky.last_end: {end}"
+                );
                 let s = clients[1].control_status()?["lifecycle"]["last_suspend"].clone();
                 anyhow::ensure!(
                     s["within_deadline"] == true && s["lease_released"] == true,
@@ -1953,6 +1958,12 @@ pub fn sticky_release_cmd(_seed: u64) -> Result<()> {
         // The root has the row when the command returns: no wait for a
         // time-out.
         anyhow::ensure!(!in_table(&clients[0], "/d1")?, "/d1 still in a's table");
+        // Plan 46 M1.3 step 17: the holder's status says why.
+        let end = deleg_of(&clients[1])?["sticky"]["last_end"].clone();
+        anyhow::ensure!(
+            end["reason"] == "command",
+            "b's status.delegation.sticky.last_end: {end}"
+        );
         let t = Instant::now();
         eventually("c writes d1/c-after", Duration::from_secs(10), || {
             std::fs::write(clients[2].mnt.join("d1/c-after"), b"c")?;
@@ -3144,7 +3155,7 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
                 anyhow::ensure!(
                     table.iter().any(|e| e["path"] == "/site"
                         && n(e, "node") == b_id
-                        && e["designated"] == true),
+                        && e["kind"] == "designated"),
                     "not yet: {d}"
                 );
                 Ok(())

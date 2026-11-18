@@ -479,11 +479,11 @@ impl Lifecycle {
         // that cannot reach the root only loses the wait (the rows stay
         // final and stream on its return).
         let cap = left().min(self.deps.sticky_release_wait);
-        match self
-            .deps
-            .rt
-            .block_on(crate::sync::release_sticky(&self.deps.sync_tx, cap))
-        {
+        match self.deps.rt.block_on(crate::sync::release_sticky(
+            &self.deps.sync_tx,
+            cap,
+            constellation_authority::StickyReleaseWhy::Suspend,
+        )) {
             Ok(done) => tracing::info!(%done, "suspending: sticky grants released"),
             Err(error) => tracing::warn!(%error, "suspending: sticky grants not released"),
         }

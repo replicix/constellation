@@ -102,9 +102,9 @@
 //! after the epoch closed.
 
 use super::backup::{FreshHold, FreshVerdict};
-use super::{Asker, CommitRule, Core, GroupOn, Timer};
+use super::{Asker, CommitRule, Core, GroupOn, Stats, Timer};
 use crate::action::{Action, AnswerSource, ControlOk};
-use crate::event::{PeerMsg, ReleaseWhy};
+use crate::event::{PeerMsg, ReleaseWhy, StickyReleaseWhy};
 use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::types::ROOT_INO;
@@ -151,6 +151,94 @@ pub enum RecallCause {
     /// Placement, a cross-subtree op, a designation, a stalled partial
     /// release: causes that never apply to a non-stealable grant.
     Other,
+}
+
+/// Plan 46 M1.3 step 17: why a non-stealable (sticky or designated) subtree
+/// left its holder. The holder's own reasons are recorded when its release
+/// row is journaled; the root's (`Abandon`, `Undelegate`, `Epoch`,
+/// `LeaveOperator`) when it ends the generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StickyEnd {
+    /// The holder's own ops left the subtree idle (`sticky_idle_release_ms`).
+    Idle,
+    /// The node unmounts (`Control::StickyRelease` from the unmount).
+    Unmount,
+    /// The node suspends (`Control::StickyRelease` from the suspend hook).
+    Suspend,
+    /// The operator's `sticky.release` (also the network dispatcher's).
+    Command,
+    /// The holder's handover to a node that dominates the subtree (ADR-56).
+    Handover,
+    /// The holder's own leave released its streams.
+    Leave,
+    /// ADR-60: the claimant released the stream it claimed.
+    Claim,
+    /// The root released its own grant for an op across its boundary.
+    CrossOwn,
+    /// The placement released the root's own grant (the long dwell).
+    Dwell,
+    /// The root became a singleton again and released its own grant.
+    Singleton,
+    /// The root's own grant was never honoured and was released.
+    Unhonoured,
+    /// The root ended the generation by the operator's `repair abandon`.
+    Abandon,
+    /// The root recalled the stream for the operator's `undelegate`.
+    Undelegate,
+    /// The root recalled the stream for a continuation epoch.
+    Epoch,
+    /// The root recalled the stream for an operator's leave of its holder.
+    LeaveOperator,
+}
+
+impl StickyEnd {
+    /// Every reason, in the order status lists them.
+    pub const ALL: [StickyEnd; 15] = [
+        StickyEnd::Idle,
+        StickyEnd::Unmount,
+        StickyEnd::Suspend,
+        StickyEnd::Command,
+        StickyEnd::Handover,
+        StickyEnd::Leave,
+        StickyEnd::Claim,
+        StickyEnd::CrossOwn,
+        StickyEnd::Dwell,
+        StickyEnd::Singleton,
+        StickyEnd::Unhonoured,
+        StickyEnd::Abandon,
+        StickyEnd::Undelegate,
+        StickyEnd::Epoch,
+        StickyEnd::LeaveOperator,
+    ];
+
+    /// The number of reasons ([`Stats::sticky_ended`]'s length).
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// The reason's place in [`Self::ALL`].
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The kebab-case name status shows.
+    pub const fn name(self) -> &'static str {
+        match self {
+            StickyEnd::Idle => "idle",
+            StickyEnd::Unmount => "unmount",
+            StickyEnd::Suspend => "suspend",
+            StickyEnd::Command => "command",
+            StickyEnd::Handover => "handover",
+            StickyEnd::Leave => "leave",
+            StickyEnd::Claim => "claim",
+            StickyEnd::CrossOwn => "cross-own",
+            StickyEnd::Dwell => "dwell",
+            StickyEnd::Singleton => "singleton",
+            StickyEnd::Unhonoured => "unhonoured",
+            StickyEnd::Abandon => "abandon",
+            StickyEnd::Undelegate => "undelegate",
+            StickyEnd::Epoch => "epoch",
+            StickyEnd::LeaveOperator => "leave-operator",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -899,6 +987,8 @@ pub(crate) struct DelegateState {
     /// Phase 2b: every grant is non-stealable (a designation or a sticky
     /// grant): honoured whatever the clock says.
     pub non_stealable: bool,
+    /// Every subtree of the stream is an offline designation (status).
+    pub designated: bool,
     /// Phase 2b: the root the stream last went to; a different one
     /// (a failover) gets every unretired transaction again.
     pub last_root: Option<NodeId>,
@@ -1186,6 +1276,9 @@ pub(crate) struct StickyReleaseCmd {
     /// the idle release (`0`: not an idle release); counted released when the
     /// command completes, given up when it runs out of time.
     pub idle: u64,
+    /// Plan 46 M1.3 step 17: why the holder releases (recorded per part when
+    /// its release row is journaled, [`Core::note_sticky_end`]).
+    pub why: StickyEnd,
 }
 
 /// ADR-56: the root asked this node, the holder of sticky subtrees of stream
@@ -1376,6 +1469,14 @@ pub(crate) struct OwnGrant {
 
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
+    /// Plan 46 M1.3 step 17: the last non-stealable subtrees to leave (the
+    /// reason, the generation, the subtrees, when, on the wait clock).
+    pub last_sticky_end: Option<(StickyEnd, u64, Vec<Ino>, WaitMs)>,
+    /// Plan 46 M1.3 step 17: the holder's own reason for the release
+    /// `release_subtrees` is journaling now (a self-leave's), `None` for a
+    /// root's recall (the root records its own reasons) or a command's
+    /// (recorded by [`Core::sticky_part_progress`]).
+    pub release_why: Option<StickyEnd>,
     /// The `(gen, idx)` rows `deleg_drain_tail` appended since the last
     /// [`Core::take_drained_rows`]: the simulation's oracle judges a row
     /// drained from a sealed tail by the tenure that drained it.
@@ -1662,6 +1763,28 @@ pub struct DelegView {
     pub backups: Vec<(u64, NodeId, u64)>,
     /// Phase 2b: per generation on the root, `(gen, kind, backup)`.
     pub kinds: Vec<(u64, String, NodeId)>,
+    /// Plan 46 M1.3 step 17: the non-stealable streams this node knows of
+    /// (as the root, every live one it granted; as a holder, the ones it
+    /// holds), for `status`.
+    pub sticky: Vec<StickyStreamView>,
+    /// Plan 46 M1.3 step 17: the last non-stealable subtrees to leave, `(reason
+    /// name, gen, subtrees, ms ago)`.
+    pub last_sticky_end: Option<(String, u64, Vec<Ino>, u64)>,
+}
+
+/// One non-stealable stream of [`DelegView::sticky`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StickyStreamView {
+    pub node: NodeId,
+    pub gen: u64,
+    pub dirs: Vec<Ino>,
+    /// `sticky` or `designated`.
+    pub kind: &'static str,
+    /// Since the root granted it (the wait clock), or since the holder
+    /// installed it (the honour clock), ms.
+    pub age_ms: u64,
+    /// This node holds it.
+    pub mine: bool,
 }
 
 /// Path B: an install of a generation that waits for an ended
@@ -1781,6 +1904,50 @@ impl Core {
             ..DelegView::default()
         };
         self.deleg_view_local(&mut view);
+        // Plan 46 M1.3 step 17.
+        let me = self.me();
+        for (gen, g) in &self.dl.gens {
+            if g.ended || !g.non_stealable() {
+                continue;
+            }
+            view.sticky.push(StickyStreamView {
+                node: g.node,
+                gen: *gen,
+                dirs: g.dir_list(),
+                kind: if g.designated() {
+                    "designated"
+                } else {
+                    "sticky"
+                },
+                age_ms: self.clk.wait.since(g.granted).max(0) as u64,
+                mine: g.node == me,
+            });
+        }
+        for (gen, d) in &self.dl.mine {
+            if !d.non_stealable || d.dirs.is_empty() || view.sticky.iter().any(|s| s.gen == *gen) {
+                continue;
+            }
+            view.sticky.push(StickyStreamView {
+                node: me,
+                gen: *gen,
+                dirs: d.dirs.iter().copied().collect(),
+                kind: if d.designated { "designated" } else { "sticky" },
+                age_ms: self.clk.honour.since(d.installed).max(0) as u64,
+                mine: true,
+            });
+        }
+        view.last_sticky_end = self
+            .dl
+            .last_sticky_end
+            .as_ref()
+            .map(|(why, gen, dirs, at)| {
+                (
+                    why.name().to_string(),
+                    *gen,
+                    dirs.clone(),
+                    self.clk.wait.since(*at).max(0) as u64,
+                )
+            });
         view
     }
 
@@ -2441,7 +2608,7 @@ impl Core {
         }
         for g in release {
             let dirs = self.sticky_held(g, replica);
-            if self.own_sticky_release(now, g, dirs, replica, out) {
+            if self.own_sticky_release(now, g, dirs, StickyEnd::Unhonoured, replica, out) {
                 self.stats.root_own_released_unhonoured += 1;
                 // (Counted once: the release is under way, the grant ends.)
                 if let Some(og) = self.dl.own_grants.get_mut(&g) {
@@ -2929,6 +3096,8 @@ impl Core {
                     executed: 0,
                     last_own_op: BTreeMap::new(),
                     non_stealable: d.non_stealable(),
+                    designated: !d.dirs.is_empty()
+                        && d.dirs.iter().all(|(_, k)| *k == SubtreeKind::Designated),
                     remnant,
                     last_root: self.holder_root(),
                     known_root: self.holder_root(),
@@ -3187,7 +3356,7 @@ impl Core {
                 if d.node == me {
                     // Plan 46 M1.3 step 12 (claim = release): a non-stealable
                     // holder's claim is its release, the stream's next row.
-                    self.claim_releases(d.gen, d.non_stealable(), replica);
+                    self.claim_releases(now, d.gen, d.non_stealable(), replica);
                     cursor = cursor.max(replica.delegate_idx(d.gen));
                 }
                 tracing::info!(
@@ -9182,6 +9351,21 @@ impl Core {
             }
         }
         self.stats.deleg_recalls_received += 1;
+        // Plan 46 M1.3 step 17: a release this node's own leave asked for
+        // (journaled as a row, or ended at the cut): the holder's reason.
+        if let (Some(why), Some(d)) = (self.dl.release_why, self.dl.mine.get(&gen)) {
+            if d.non_stealable {
+                let dirs = asked.iter().copied().collect();
+                Self::note_sticky_end(
+                    &mut self.stats,
+                    &mut self.dl.last_sticky_end,
+                    now,
+                    why,
+                    gen,
+                    dirs,
+                );
+            }
+        }
         // The subtrees' lock grants go back with the note; their waiters are
         // told to ask the root.
         let asked_list: Vec<Ino> = asked.iter().copied().collect();
@@ -9995,7 +10179,8 @@ impl Core {
             for (gen, dirs) in &involved {
                 if is_own(self, gen) {
                     let asked: BTreeSet<Ino> = dirs.keys().copied().collect();
-                    if !self.own_sticky_release(now, *gen, asked, replica, out) {
+                    if !self.own_sticky_release(now, *gen, asked, StickyEnd::CrossOwn, replica, out)
+                    {
                         // Nothing of the asked subtrees is held any more (the
                         // release took them already): no release to wait for;
                         // the stream's executor runs the op.
@@ -12503,6 +12688,26 @@ impl Core {
                 self.stats.deleg_sticky_ended_other += 1;
             }
         }
+        // Plan 46 M1.3 step 17: the root's reason, for a stream of
+        // non-stealable grants that is not the root's own (a holder's own end
+        // of it is the holder's: recorded at its release; a `LeaveNote` end is
+        // the holder's `Leave`). Recorded once the end is journaled.
+        let sticky_why = if g.non_stealable() && g.node != self.cfg.node_id {
+            if abandoned.is_some() {
+                Some(StickyEnd::Abandon)
+            } else if drained {
+                match g.recall_cause {
+                    Some(RecallCause::Undelegate) => Some(StickyEnd::Undelegate),
+                    Some(RecallCause::Epoch) => Some(StickyEnd::Epoch),
+                    Some(RecallCause::Leave) => Some(StickyEnd::LeaveOperator),
+                    Some(RecallCause::LeaveNote | RecallCause::Other) | None => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Plan 43 C2: the generation's end carries its cut: the rows this
         // root appended (`cursor`) — or, when this root was the
         // generation's delegate itself (inherited at a takeover), further:
@@ -12535,6 +12740,16 @@ impl Core {
             tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), %error, "could not journal the recall record");
             self.arm_gen_expiry(now.plus(500), gen, out);
             return;
+        }
+        if let Some(why) = sticky_why {
+            Self::note_sticky_end(
+                &mut self.stats,
+                &mut self.dl.last_sticky_end,
+                now,
+                why,
+                gen,
+                dirs.clone(),
+            );
         }
         replica.void_stream(gen, through);
         replica.note_void_cut(gen, through);
@@ -13517,7 +13732,13 @@ impl Core {
     /// exclusive key, so the row ships only after every lower row of its
     /// stream. A gate-ended generation lets the row through the store's
     /// fence (`Meta::delegate_release`: release records only).
-    pub(super) fn claim_releases(&mut self, gen: u64, non_stealable: bool, replica: &dyn Replica) {
+    pub(super) fn claim_releases(
+        &mut self,
+        now: Now,
+        gen: u64,
+        non_stealable: bool,
+        replica: &dyn Replica,
+    ) {
         let me = self.me();
         // (Durable: the re-ship's transaction marks the generations whose
         // rows it left to the replay, `Meta::deleg_claim_replayed`.)
@@ -13563,6 +13784,16 @@ impl Core {
         match replica.delegate_release(&records, gen, Position::ZERO) {
             Ok(_) => {
                 self.stats.claim_released += 1;
+                if let Some(d) = self.dl.mine.get(&gen) {
+                    Self::note_sticky_end(
+                        &mut self.stats,
+                        &mut self.dl.last_sticky_end,
+                        now,
+                        StickyEnd::Claim,
+                        gen,
+                        d.dirs.iter().copied().collect(),
+                    );
+                }
                 // The stream is released from this row on: the holder
                 // executes nothing in it (an op that landed after the row
                 // would be a row of the stream behind its release; the ops
@@ -14369,12 +14600,14 @@ impl Core {
     /// one of a recall's release: it appends the row, then ends the stream
     /// (`DelegateNodeEnded`) when nothing is left of it, or lets it live on
     /// without the released subtrees (the same generation).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_control_sticky_release(
         &mut self,
         now: Now,
         op: OpId,
         dirs: Vec<Ino>,
         wait: bool,
+        why: StickyReleaseWhy,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -14439,6 +14672,11 @@ impl Core {
             root: 0,
             made_at: self.dl.step,
             idle: 0,
+            why: match why {
+                StickyReleaseWhy::Command => StickyEnd::Command,
+                StickyReleaseWhy::Unmount => StickyEnd::Unmount,
+                StickyReleaseWhy::Suspend => StickyEnd::Suspend,
+            },
         });
         self.sticky_release_progress(now, replica, out);
     }
@@ -14452,6 +14690,7 @@ impl Core {
         now: Now,
         gen: u64,
         dirs: BTreeSet<Ino>,
+        why: StickyEnd,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -14484,6 +14723,7 @@ impl Core {
             root: 0,
             made_at: self.dl.step,
             idle: 0,
+            why,
         });
         self.sticky_release_progress(now, replica, out);
         true
@@ -14506,7 +14746,7 @@ impl Core {
             let gens: Vec<u64> = c.parts.keys().copied().collect();
             for gen in gens {
                 let mut dirs = c.parts.remove(&gen).expect("present");
-                if !self.sticky_part_progress(now, gen, c.made_at, &mut dirs, replica, out) {
+                if !self.sticky_part_progress(now, gen, c.made_at, c.why, &mut dirs, replica, out) {
                     c.parts.insert(gen, dirs);
                 }
             }
@@ -14564,12 +14804,30 @@ impl Core {
         self.sticky_release_arm(now, out);
     }
 
+    /// Plan 46 M1.3 step 17: records why non-stealable subtrees left (the
+    /// counter and the last one, shown by status). An associated function
+    /// over the two fields so a caller holding a borrow of another field of
+    /// the core can use it.
+    fn note_sticky_end(
+        stats: &mut Stats,
+        last: &mut Option<(StickyEnd, u64, Vec<Ino>, WaitMs)>,
+        now: Now,
+        why: StickyEnd,
+        gen: u64,
+        dirs: Vec<Ino>,
+    ) {
+        stats.sticky_ended[why.index()] += 1;
+        *last = Some((why, gen, dirs, now.wait));
+    }
+
     /// One part of a command: stream `gen`'s subtrees `dirs`. `true`: done.
+    #[allow(clippy::too_many_arguments)]
     fn sticky_part_progress(
         &mut self,
         now: Now,
         gen: u64,
         made_at: u64,
+        why: StickyEnd,
         dirs: &mut BTreeSet<Ino>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -14661,6 +14919,16 @@ impl Core {
                     // (The stream lives on: MUST-1.)
                     self.stats.deleg_sticky_releases_partial += 1;
                 }
+                // The row is journaled (or the stream ended by this release):
+                // the reason is recorded now, not before.
+                Self::note_sticky_end(
+                    &mut self.stats,
+                    &mut self.dl.last_sticky_end,
+                    now,
+                    why,
+                    gen,
+                    dirs.iter().copied().collect(),
+                );
             }
         }
         false
@@ -15016,6 +15284,7 @@ impl Core {
             root,
             made_at: self.dl.step,
             idle: 0,
+            why: StickyEnd::Handover,
         });
     }
 
@@ -15114,6 +15383,7 @@ impl Core {
                 root: 0,
                 made_at: self.dl.step,
                 idle: n,
+                why: StickyEnd::Idle,
             });
             self.sticky_release_progress(now, replica, out);
         }
@@ -15682,6 +15952,8 @@ impl Core {
                     };
                     w.asked.insert(gen, now.wait);
                     let req = self.op_id();
+                    // (This node's own release: its reason is the holder's.)
+                    self.dl.release_why = Some(StickyEnd::Leave);
                     self.on_release_request(
                         now,
                         root,
@@ -15692,6 +15964,7 @@ impl Core {
                         replica,
                         out,
                     );
+                    self.dl.release_why = None;
                 }
             } else {
                 let gens: Vec<u64> = self

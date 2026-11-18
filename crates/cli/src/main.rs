@@ -1846,6 +1846,9 @@ fn run() -> Result<()> {
             for line in render_waiting_generations(&s.delegation) {
                 eprintln!("{line}");
             }
+            for line in render_sticky(&s.delegation.sticky) {
+                eprintln!("{line}");
+            }
             eprint!(
                 "{}",
                 sched_cli::render_node_summary(&s.snapsched, &s.snapacct)
@@ -4210,6 +4213,34 @@ fn render_waiting_for_group(lease: &api::LeaseStatus) -> Option<String> {
     ))
 }
 
+/// The `status` lines for the non-stealable streams (plan 46 M1.3 step 17):
+/// one per stream, and the last end.
+fn render_sticky(sticky: &api::StickyStatus) -> Vec<String> {
+    let mut lines: Vec<String> = sticky
+        .streams
+        .iter()
+        .map(|s| {
+            format!(
+                "{} node {} gen {} age {}s: {}",
+                s.kind,
+                s.node,
+                gen_label(s.gen),
+                s.age_ms / 1000,
+                s.paths.join(", ")
+            )
+        })
+        .collect();
+    if let Some(e) = &sticky.last_end {
+        lines.push(format!(
+            "last sticky end: {} (gen {}, {} s ago)",
+            e.reason,
+            gen_label(e.gen),
+            e.ago_ms / 1000
+        ));
+    }
+    lines
+}
+
 /// The `status` lines for delegation generations that cannot end because no
 /// member of their group has handed over the tail (plan 43 C2e): the
 /// members and when each was last asked, lost, or heard from, and the
@@ -5042,6 +5073,32 @@ mod parse_byte_size_tests {
     fn a_generation_is_shown_as_its_epoch_and_counter() {
         assert_eq!(gen_label(10), "10");
         assert_eq!(gen_label((3 << 32) | 7), "3:7 (12884901895)");
+    }
+
+    #[test]
+    fn status_lines_name_the_sticky_streams_and_the_last_end() {
+        let mut st = api::StickyStatus::default();
+        assert!(render_sticky(&st).is_empty());
+        st.streams.push(api::StickyStreamStatus {
+            node: 2,
+            gen: 7,
+            dirs: vec![5, 6],
+            paths: vec!["/a".into(), "/b".into()],
+            kind: "sticky".into(),
+            age_ms: 12_500,
+            mine: false,
+        });
+        st.last_end = Some(api::StickyEndStatus {
+            reason: "command".into(),
+            gen: 6,
+            dirs: vec![4],
+            ago_ms: 3_000,
+        });
+        let lines = render_sticky(&st);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("node 2"), "{}", lines[0]);
+        assert!(lines[0].contains("age 12s: /a, /b"), "{}", lines[0]);
+        assert!(lines[1].contains("command"), "{}", lines[1]);
     }
 
     #[test]

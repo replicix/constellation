@@ -41,7 +41,7 @@
 //! of the window's distinct directories to the root (the directory
 //! depth each). Off (`placement: false`), nothing here runs.
 
-use super::delegate::DelegKind;
+use super::delegate::{DelegKind, StickyEnd};
 use super::{Core, Timer};
 use crate::action::Action;
 use crate::event::PeerLink;
@@ -728,7 +728,14 @@ impl Core {
             // call returns early while one is under way or not yet possible).
             if self.singleton_now() {
                 let before = self.stats.place_root_own_released;
-                self.own_sticky_release(now, gen, dirs.iter().copied().collect(), replica, out);
+                self.own_sticky_release(
+                    now,
+                    gen,
+                    dirs.iter().copied().collect(),
+                    StickyEnd::Singleton,
+                    replica,
+                    out,
+                );
                 if self.stats.place_root_own_released > before {
                     self.stats.place_root_own_released_singleton += 1;
                     tracing::info!(
@@ -768,7 +775,14 @@ impl Core {
                     gen = %constellation_meta::delegation::GenLabel::of(gen),
                     "the root releases its own sticky subtrees (its share or rate was below the floor for the dwell)"
                 );
-                self.own_sticky_release(now, gen, dirs.into_iter().collect(), replica, out);
+                self.own_sticky_release(
+                    now,
+                    gen,
+                    dirs.into_iter().collect(),
+                    StickyEnd::Dwell,
+                    replica,
+                    out,
+                );
             }
         }
         // 2. New placements: the topmost dominated directory per node.

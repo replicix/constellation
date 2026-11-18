@@ -242,9 +242,56 @@ pub struct DelegationStatus {
     pub path: String,
     pub node: u64,
     pub gen: u64,
-    /// Phase 2b: an offline designation (never recalled by TTL or
-    /// placement while every subtree of the stream is one).
-    pub designated: bool,
+    /// The grant's kind (plan 46 M1.3 step 17): `placed` (the placement's;
+    /// the root may take it back), `sticky` (the holder keeps it until it
+    /// releases or an operator ends it), or `designated` (an offline
+    /// designation, never recalled by TTL or placement; only `online` moves
+    /// it).
+    pub kind: String,
+}
+
+/// Plan 46 M1.3 step 17: one non-stealable (sticky or designated) stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct StickyStreamStatus {
+    pub node: u64,
+    pub gen: u64,
+    /// The subtrees the stream holds, by directory and path.
+    pub dirs: Vec<u64>,
+    pub paths: Vec<String>,
+    /// `sticky` or `designated`.
+    pub kind: String,
+    /// How long it has been granted (the root's view) or installed (the
+    /// holder's), ms.
+    pub age_ms: u64,
+    /// This node holds it.
+    pub mine: bool,
+}
+
+/// Plan 46 M1.3 step 17: the last non-stealable subtrees to leave their
+/// holder.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct StickyEndStatus {
+    /// Why (`idle`, `unmount`, `suspend`, `command`, `handover`, `leave`,
+    /// `claim`, `cross-own`, `dwell`, `singleton`, `unhonoured`, `abandon`,
+    /// `undelegate`, `epoch`, `leave-operator`).
+    pub reason: String,
+    pub gen: u64,
+    pub dirs: Vec<u64>,
+    /// How long ago, ms.
+    pub ago_ms: u64,
+}
+
+/// Plan 46 M1.3 step 17: `status.delegation.sticky`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct StickyStatus {
+    /// The non-stealable streams this node knows of: every live one it
+    /// granted (as the root) and the ones it holds.
+    pub streams: Vec<StickyStreamStatus>,
+    /// How many times each reason ended a stream part here, every reason
+    /// listed (zeros included), in a fixed order.
+    pub ended: Vec<(String, u64)>,
+    /// The last end, if any.
+    pub last_end: Option<StickyEndStatus>,
 }
 
 /// Plan 46 M1.2 step 9: one node's stream with the subtrees it holds (a node
@@ -427,6 +474,10 @@ pub struct DelegationReport {
     /// Plan 46 M1.3 step 8 (ADR-56): the handover of sticky grants.
     #[serde(default)]
     pub handovers: StickyHandoverStatus,
+    /// Plan 46 M1.3 step 17: the non-stealable streams this node knows of,
+    /// and why subtrees of that kind have left their holders.
+    #[serde(default)]
+    pub sticky: StickyStatus,
     pub executed: u64,
     /// Ops the FUSE fast path executed here as the delegate (not
     /// counted in `executed`, which is the core's).

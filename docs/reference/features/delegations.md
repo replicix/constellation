@@ -1464,6 +1464,23 @@ placement's `place_evaluations`, `place_delegated`, `place_recalled`,
 `place_skipped_unreachable` and `place_skipped_designated` (a node that holds
 designations only, or has one pending, takes no placed grant).
 
+Each `table` row says the grant's `kind`: `placed`, `sticky` or `designated`.
+`delegation.sticky` (plan 46 M1.3 step 17) shows the non-stealable streams:
+`streams` (the root lists every live one it granted, a holder the ones it
+holds: `node`, `gen`, `dirs`, `paths`, `kind`, `age_ms` since the grant or the
+install, and `mine`), `ended` (how many times each reason ended a stream part,
+every reason listed in a fixed order, zeros included) and `last_end` (`reason`,
+`gen`, `dirs`, `ago_ms`). The reasons, recorded by the holder when its release
+row is journaled: `idle` (the idle release), `unmount`, `suspend`, `command`
+(`sticky.release`, also the network dispatcher's), `handover` (ADR-56),
+`leave` (the holder's own leave), `claim` (ADR-60), `cross-own` (the root's own
+grant released for an op across its boundary), `dwell` (the placement's release
+of it), `singleton` (the root is a singleton again) and `unhonoured` (the
+root's own grant was never honoured); and by the root when it ends the
+generation: `abandon` (`repair abandon`), `undelegate`, `epoch` (a
+continuation epoch's recall) and `leave-operator` (an operator's leave of the
+holder). Nothing is recorded for a release that gave up or still waits.
+
 ## Compatibility
 
 A file system written before plan 46 M1.2 step 1 (the removal of hash-range

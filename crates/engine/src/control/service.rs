@@ -541,6 +541,9 @@ impl EngineControl {
                         self_sends: stats.self_sends,
                         inbox_refusals: stats.holder_inbox_refusals_own_root,
                     },
+                    sticky: sticky_status(v, &stats.sticky_ended, |dir| {
+                        self.meta.path_of(dir).unwrap_or_default()
+                    }),
                     handovers: api::StickyHandoverStatus {
                         requested: stats.deleg_handovers_requested,
                         granted: stats.place_handover_granted,
@@ -1195,7 +1198,12 @@ impl EngineControl {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
-            .send(sync::SyncRequest::StickyRelease { dirs, wait, reply })
+            .send(sync::SyncRequest::StickyRelease {
+                dirs,
+                wait,
+                why: constellation_authority::StickyReleaseWhy::Command,
+                reply,
+            })
             .map_err(|_| "sync task is not running".to_string())?;
         tokio::task::block_in_place(|| {
             self.rt
@@ -1208,7 +1216,7 @@ impl EngineControl {
         self.meta
             .delegation_table()
             .iter()
-            .map(|d| self.delegation_row(d.dir, d.node, d.gen, d.designated()))
+            .map(|d| self.delegation_row(d.dir, d.node, d.gen, d.kind))
             .collect()
     }
 
@@ -1217,14 +1225,14 @@ impl EngineControl {
         dir: u64,
         node: u64,
         gen: u64,
-        designated: bool,
+        kind: constellation_meta::SubtreeKind,
     ) -> api::DelegationStatus {
         api::DelegationStatus {
             dir,
             path: self.meta.path_of(dir).unwrap_or_default(),
             node,
             gen,
-            designated,
+            kind: kind_name(kind).to_string(),
         }
     }
 
@@ -1239,14 +1247,7 @@ impl EngineControl {
                 dirs: st
                     .subtrees
                     .iter()
-                    .map(|(dir, kind)| {
-                        self.delegation_row(
-                            *dir,
-                            st.node,
-                            st.gen,
-                            *kind == constellation_meta::SubtreeKind::Designated,
-                        )
-                    })
+                    .map(|(dir, kind)| self.delegation_row(*dir, st.node, st.gen, *kind))
                     .collect(),
             })
             .collect()
@@ -2305,5 +2306,112 @@ mod abandon_target_tests {
         assert!(abandon_target(&p(Some(7), Some(2), None, false)).is_err());
         assert!(abandon_target(&p(Some(7), None, Some(3), false)).is_err());
         assert!(abandon_target(&p(Some(7), None, None, true)).is_err());
+    }
+}
+
+/// The grant kind `status` shows (plan 46 M1.3 step 17).
+fn kind_name(kind: constellation_meta::SubtreeKind) -> &'static str {
+    match kind {
+        constellation_meta::SubtreeKind::Placed => "placed",
+        constellation_meta::SubtreeKind::Sticky => "sticky",
+        constellation_meta::SubtreeKind::Designated => "designated",
+    }
+}
+
+/// `status.delegation.sticky` (plan 46 M1.3 step 17): the core's view and
+/// counters as the control types, `path_of` naming each subtree.
+fn sticky_status(
+    v: &constellation_authority::core::DelegView,
+    ended: &[u64; constellation_authority::StickyEnd::COUNT],
+    path_of: impl Fn(u64) -> String,
+) -> api::StickyStatus {
+    api::StickyStatus {
+        streams: v
+            .sticky
+            .iter()
+            .map(|s| api::StickyStreamStatus {
+                node: s.node,
+                gen: s.gen,
+                dirs: s.dirs.clone(),
+                paths: s.dirs.iter().map(|d| path_of(*d)).collect(),
+                kind: s.kind.to_string(),
+                age_ms: s.age_ms,
+                mine: s.mine,
+            })
+            .collect(),
+        ended: constellation_authority::StickyEnd::ALL
+            .iter()
+            .map(|e| (e.name().to_string(), ended[e.index()]))
+            .collect(),
+        last_end: v
+            .last_sticky_end
+            .as_ref()
+            .map(|(reason, gen, dirs, ago_ms)| api::StickyEndStatus {
+                reason: reason.clone(),
+                gen: *gen,
+                dirs: dirs.clone(),
+                ago_ms: *ago_ms,
+            }),
+    }
+}
+
+#[cfg(test)]
+mod sticky_status_tests {
+    use super::*;
+    use constellation_authority::core::{DelegView, StickyStreamView};
+    use constellation_authority::StickyEnd;
+    use constellation_meta::SubtreeKind;
+
+    /// Plan 46 M1.3 step 17: the grant kinds `status` names.
+    #[test]
+    fn the_table_names_the_grant_kind() {
+        assert_eq!(kind_name(SubtreeKind::Placed), "placed");
+        assert_eq!(kind_name(SubtreeKind::Sticky), "sticky");
+        assert_eq!(kind_name(SubtreeKind::Designated), "designated");
+    }
+
+    /// A view with one sticky stream and a last end: the stream row with its
+    /// age and paths, every reason listed (zeros included, in enum order),
+    /// and the last end.
+    #[test]
+    fn the_sticky_status_lists_streams_every_reason_and_the_last_end() {
+        let v = DelegView {
+            sticky: vec![StickyStreamView {
+                node: 2,
+                gen: 7,
+                dirs: vec![5, 6],
+                kind: "sticky",
+                age_ms: 12_000,
+                mine: false,
+            }],
+            last_sticky_end: Some(("command".to_string(), 6, vec![4], 3_000)),
+            ..DelegView::default()
+        };
+        let mut ended = [0u64; StickyEnd::COUNT];
+        ended[StickyEnd::Command.index()] = 2;
+        let st = sticky_status(&v, &ended, |d| format!("/d{d}"));
+        assert_eq!(st.streams.len(), 1);
+        let s = &st.streams[0];
+        assert_eq!(
+            (s.node, s.gen, s.kind.as_str(), s.age_ms),
+            (2, 7, "sticky", 12_000)
+        );
+        assert_eq!(s.paths, ["/d5", "/d6"]);
+        assert!(!s.mine);
+        let names: Vec<&str> = st.ended.iter().map(|(n, _)| n.as_str()).collect();
+        let want: Vec<&str> = StickyEnd::ALL.iter().map(|e| e.name()).collect();
+        assert_eq!(names, want);
+        assert_eq!(st.ended.len(), StickyEnd::COUNT);
+        assert!(st.ended.iter().any(|(n, c)| n == "command" && *c == 2));
+        assert!(st
+            .ended
+            .iter()
+            .any(|(n, c)| n == "leave-operator" && *c == 0));
+        let end = st.last_end.expect("last end");
+        assert_eq!(
+            (end.reason.as_str(), end.gen, end.ago_ms),
+            ("command", 6, 3_000)
+        );
+        assert_eq!(end.dirs, [4]);
     }
 }
