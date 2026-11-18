@@ -288,7 +288,19 @@ impl Core {
         }
         // 3. A member copy of `epoch` (a sealed holder's, or one a later
         // claimant is told again): idempotent.
-        let (_, txs) = replica.member_copy(epoch)?;
+        // (A read error is no answer at all, not "nothing held".)
+        match replica.member_copy_held(epoch) {
+            None => {
+                self.bk.seal_unreadable = true;
+                return None;
+            }
+            Some(false) => return None,
+            Some(true) => {}
+        }
+        let Some((_, txs)) = replica.member_copy(epoch) else {
+            self.bk.seal_unreadable = true;
+            return None;
+        };
         let through = txs.iter().map(|t| t.last).max().unwrap_or(0);
         self.stats.seal_tail_member_copy += 1;
         // (A re-ask of the holder's own sealed epoch: this claimant's CAS
@@ -1004,6 +1016,22 @@ impl Core {
         }
         self.bk.tf_round = None;
         let prev = tf.prev;
+        // The gap is decided in memory, before any write: a role and a tail
+        // left behind would answer a later claimant truncated at the gap.
+        // The attempt ends in every build (integrity over availability);
+        // the holder's copy still has the rows.
+        let Some(held) = Self::acked_after_append(replica, ch.epoch, &ch.txs) else {
+            tracing::error!(
+                node = self.cfg.node_id,
+                "the held tail could not be read: the claim ends"
+            );
+            self.end_acquire_attempt(now, replica, out);
+            return;
+        };
+        if !self.check_tail_answer_contiguous("fetched", ch.epoch, held, &ch.txs) {
+            self.end_acquire_attempt(now, replica, out);
+            return;
+        }
         if !replica.backup_append(ch.epoch, &ch.txs) {
             self.end_acquire_attempt(now, replica, out);
             return;
@@ -1030,14 +1058,6 @@ impl Core {
         // acknowledges less; the holder sends again.)
         let acked = replica.backup_acked(ch.epoch);
         self.bk.acked = acked.unwrap_or(0);
-        // (A store read error is not a gap: only a hold that was read counts.)
-        if let Some(acked) = acked {
-            let contiguous = self.check_tail_answer_contiguous("fetched", ch.epoch, acked, &ch.txs);
-            debug_assert!(
-                contiguous,
-                "a tail answer is not contiguous: the rows past its gap would be dropped"
-            );
-        }
         self.bk.held.clear();
         // The members of the old group: who held the tail a later claimant
         // may ask; this node's copy outlives the fetch.
@@ -1346,6 +1366,25 @@ impl Core {
                 return false;
             };
             if !txs.is_empty() {
+                // A gap in the copy ends the claim (integrity over
+                // availability, as `reship_failed` and `TailDiverged` do):
+                // the marker's `through` would stop below the rows past the
+                // gap and drop them, answered ones included. Decided in
+                // memory, before any write: a role or tail left behind would
+                // answer a later claimant's `SealTail` truncated at the gap.
+                // The copy keeps the rows; a claimant is answered from it
+                // (the gap and the tip) and ends the same way.
+                let Some(held) = Self::acked_after_append(replica, prev.epoch, &txs) else {
+                    tracing::error!(
+                        node = me,
+                        epoch = prev.epoch,
+                        "the held tail could not be read: the claim ends"
+                    );
+                    return false;
+                };
+                if !self.check_tail_answer_contiguous("member copy", prev.epoch, held, &txs) {
+                    return false;
+                }
                 if !replica.backup_append(prev.epoch, &txs) {
                     return false;
                 }
@@ -1359,19 +1398,8 @@ impl Core {
                     return false;
                 }
                 self.bk.role = Some(role);
-                let Some(acked) = replica.backup_acked(prev.epoch) else {
-                    return false;
-                };
-                self.bk.acked = acked;
-                // A gap in the copy ends the claim (integrity over
-                // availability, as `reship_failed` and `TailDiverged` do):
-                // the marker's `through` would stop below the rows past the
-                // gap and drop them, answered ones included. The copy keeps
-                // them; the next attempt, or another member's fetch, sees
-                // them again.
-                if !self.check_tail_answer_contiguous("member copy", prev.epoch, acked, &txs) {
-                    return false;
-                }
+                // (Unreadable: counts from 0, which only acknowledges less.)
+                self.bk.acked = replica.backup_acked(prev.epoch).unwrap_or(0);
                 let mut members: Vec<NodeId> = prev.backups.clone();
                 members.push(me);
                 members.sort_unstable();
@@ -1406,6 +1434,36 @@ impl Core {
         true
     }
 
+    /// The contiguous hold `backup_append(epoch, txs)` would leave, computed
+    /// in memory from what the backup tail of `epoch` holds now and `txs`
+    /// (a span supersedes the entries it covers, as the append does), so a
+    /// gap is decided before anything is written. `None`: the tail could
+    /// not be read.
+    fn acked_after_append(replica: &dyn Replica, epoch: Epoch, txs: &[BackupTx]) -> Option<u64> {
+        let mut held: std::collections::BTreeMap<u64, u64> = replica
+            .backup_tail(epoch)?
+            .iter()
+            .map(|t| (t.first, t.last))
+            .collect();
+        for t in txs {
+            let covered: Vec<u64> = held.range(t.first..=t.last).map(|(&f, _)| f).collect();
+            for f in covered {
+                held.remove(&f);
+            }
+            held.insert(t.first, t.last);
+        }
+        let mut acked = 0;
+        let mut prev: Option<u64> = None;
+        for (&first, &last) in &held {
+            if prev.is_some_and(|p| first != p + 1) {
+                break;
+            }
+            acked = last;
+            prev = Some(last);
+        }
+        Some(acked)
+    }
+
     /// Tripwire where a gap in a tail answer forms: the copy a claim takes
     /// as the tail (its own member copy, or the answer it fetched) must hold
     /// contiguously up to its tip, or the gate's `through`
@@ -1437,7 +1495,8 @@ impl Core {
             source,
             acked,
             tip,
-            "a tail answer is not contiguous: the rows past its gap would be dropped as never committed"
+            "a tail answer is not contiguous: the claim ends, as the rows past its gap would be dropped as never committed \
+             (operator remedy: docs/reference/features/durability-and-failover.md, \"A tail answer is not contiguous\")"
         );
         false
     }

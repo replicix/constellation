@@ -1681,6 +1681,36 @@ member within the delegation's ttl, it is refused without `--force`: confirm
 from another node that they are down first. See
 [Delegations](delegations.md#failures).
 
+### A tail answer is not contiguous
+
+The error log says "a tail answer is not contiguous" and
+`status.ack.tail_answer_gaps` rises (it counts each attempt that saw the gap).
+The copy a claim would take as the tail of an epoch (its own member copy, or
+the answer it fetched) holds contiguously only up to a point below its tip. A
+marker built from it would drop the rows past the gap as never committed,
+answered ones included, so the claim ends before anything is written: no role
+and no tail are persisted, the copy keeps all the rows, and any later claimant
+is answered from the copy, gap and tip, and ends the same way. This is a bug
+to report (with the log and the status); integrity is chosen over
+availability, so while it lasts the volume can have no holder.
+
+What works:
+
+- A claim that fetched the gapped answer (the log line is on that node, and
+  `status.lease.waiting_for_group` names the epoch): `constellation repair
+  abandon myfs --epoch E` on that node lets its next attempt claim without the
+  tail. The rows of that epoch's group are then lost or replayed as for any
+  abandon (see above): rows only the gapped copy held are gone.
+- A self-sealed holder whose own member copy has the gap (the log line is on
+  the node that held the epoch): `repair abandon --epoch E` is refused
+  ("not waiting for epoch E's group"), because this claim path opens no
+  group wait, and there is no other command. Its claims fail at every
+  attempt. Another node can claim the lease once it expires (it fetches the
+  copy, ends the same way, and then the abandon above is accepted there).
+  Beyond that nothing is built: a scoped abandon of the gapped epoch
+  (take the contiguous prefix, drop the named rows, with an audit) does not
+  exist yet, and a lone node with this gap stays without a holder.
+
 ### Writes got slower after a second node joined
 
 A peer within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` became a backup:

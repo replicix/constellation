@@ -70384,7 +70384,13 @@ read error as "no copy" (it asks `member_copy_held` first: `None` and an unreada
 is contiguous) ends the claim in every build before its CAS instead of writing a marker whose `through` drops the rows
 past the gap. Both are the claim's ordinary refusal (`finish_acquire(false)`, as a failed seal or role write): the next
 acquisition attempt reads again; a gap stays counted (`tail_answer_gaps`) and logged at error level at every attempt, and
-the sim fails the seed. While it lasts the group has no holder from this node; another member's claim fetches the copy as
-the tail. The fetched answer's check keeps its debug assertion; `tail_own_gated_beyond_gap` (after the marker) is unchanged.
-Tests: `a_self_claim_with_an_unreadable_member_copy_ends`, `a_self_claim_with_no_member_copy_goes_on`,
-`a_self_claim_over_a_copy_with_a_gap_ends`.
+the sim fails the seed. While it lasts the group has no holder from this node.
+m12tail round 2 (review M1, M2, S1-S3): the gap is decided in memory (`acked_after_append`) before `backup_append`,
+`set_backup_role` and `bk.role`, so an ended claim leaves no role or tail and a later claimant's `SealTail` is answered
+from the member copy (gap and tip), not truncated below the gap. The fetched answer (`tail_fetch_complete`) ends the
+attempt the same way in every build (the debug assertion is gone). `seal_tail_hold` case 3 uses `member_copy_held` and
+sets `seal_unreadable` on a read error. A persistent gap can stall the volume; the remedy and its limits are in
+durability-and-failover.md ("A tail answer is not contiguous"). `tail_own_gated_beyond_gap` (after the marker) is unchanged.
+Tests: `a_self_claim_with_an_unreadable_member_copy_ends`, `a_self_claim_with_a_copy_that_fails_its_read_ends`,
+`a_self_claim_with_no_member_copy_goes_on`, `a_self_claim_over_a_copy_with_a_gap_ends`,
+`a_gap_ended_claim_leaves_no_role_to_answer_from`, `a_fetched_tail_with_a_gap_is_counted`.

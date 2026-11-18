@@ -87233,8 +87233,8 @@ mod step8_handover_root {
 
 /// The tripwire where a tail answer's gap forms (`tail_answer_gaps`): a
 /// self-sealed claim's member copy, and a fetched tail, whose contiguous hold
-/// is below their tip. Both count it; the claim over a member copy ends, and
-/// a debug build asserts at the fetch.
+/// is below their tip. Both count it and end the claim, before any write, in
+/// every build.
 mod tail_answer_gaps {
     use super::seal_tail::{Chosen, TailFetch};
     use super::*;
@@ -87279,12 +87279,72 @@ mod tail_answer_gaps {
         assert!(!h.core.prepare_tail_for_claim(&prev, &h.meta));
         assert_eq!(h.core.stats.tail_answer_gaps, 1);
         assert!(h.core.bk.fetched.is_empty());
+        // M1 (m12tail review): the ended claim left no role and no tail.
+        assert!(h.core.bk.role.is_none());
+        assert!(h.meta.backup_role().unwrap().is_none());
+        assert!(h.meta.backup_tail(1).unwrap().is_empty());
         let (_, kept) = h.meta.member_copy(1).unwrap().unwrap();
         assert_eq!(kept.len(), 2, "the row past the gap is kept");
         // Every attempt sees it again (counted again): it does not wedge
         // silently.
         assert!(!h.core.prepare_tail_for_claim(&prev, &h.meta));
         assert_eq!(h.core.stats.tail_answer_gaps, 2);
+    }
+
+    /// M1 (m12tail review): after a gap-ended claim a later claimant's
+    /// `SealTail` for that epoch is answered from the member copy (the gap
+    /// and the tip), not from a role the failed claim left: the claimant's
+    /// own check then fires. Fails when the claim persists its role before
+    /// the gap check (the answer stops at the contiguous prefix, `through`
+    /// 1, and the rows past the gap are lost silently).
+    #[test]
+    fn a_gap_ended_claim_leaves_no_role_to_answer_from() {
+        let (mut h, prev) = self_sealed(&[(1, 1), (3, 3)]);
+        assert!(!h.core.prepare_tail_for_claim(&prev, &h.meta));
+        // The realistic state: deposed, the lease lost, nothing held.
+        h.core.lease.held = None;
+        h.core.lease.lost = true;
+        let mut other = prev.clone();
+        other.holder = 3;
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::SealTail {
+                req: OpId(90),
+                epoch: 1,
+                config_version: 1,
+                from: 0,
+                key: other.renewal_key(),
+                kept: false,
+                tenure: (0, 0),
+                closed_hold: false,
+            },
+        });
+        let answers: Vec<(usize, u64)> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    msg: PeerMsg::SealedTail { txs, through, .. },
+                    ..
+                } => Some((txs.len(), *through)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, vec![(2, 3)], "answered from the copy, gap kept");
+        assert!(h.meta.backup_role().unwrap().is_none());
+    }
+
+    /// N1 (m12tail review): the copy reads as held, then cannot be read:
+    /// the claim ends, and the retry finds it.
+    #[test]
+    fn a_self_claim_with_a_copy_that_fails_its_read_ends() {
+        let (mut h, prev) = self_sealed(&[(1, 1), (2, 2)]);
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(1, 1);
+        let went_on = h.core.prepare_tail_for_claim(&prev, &h.meta);
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+        assert!(!went_on);
+        assert!(h.core.bk.fetched.is_empty());
+        assert!(h.core.bk.role.is_none());
+        assert!(h.core.prepare_tail_for_claim(&prev, &h.meta));
     }
 
     /// S1 (M1.2 review): a store read error of the member copy is not "no
@@ -87325,7 +87385,8 @@ mod tail_answer_gaps {
     }
 
     /// A2: a fetched tail (another member's answer) with a gap is counted
-    /// when the fetch completes; a contiguous one counts nothing.
+    /// when the fetch completes, and ends the attempt; a contiguous one counts
+    /// nothing.
     #[test]
     fn a_fetched_tail_with_a_gap_is_counted() {
         for (spans, gaps) in [(vec![(1, 1), (3, 3)], 1), (vec![(1, 1), (2, 3)], 0)] {
@@ -87356,11 +87417,13 @@ mod tail_answer_gaps {
                     .tail_fetch_complete(clk, ch, false, &h.meta, &mut out)
             }));
             assert_eq!(h.core.stats.tail_answer_gaps, gaps);
-            if gaps == 0 {
-                assert!(run.is_ok());
-            } else if cfg!(debug_assertions) {
-                assert!(run.is_err(), "a debug build asserts");
-            }
+            // M2 (m12tail review): a gapped answer ends the attempt in every
+            // build, before anything is written; a contiguous one is taken.
+            assert!(run.is_ok());
+            assert_eq!(h.core.bk.fetched.is_empty(), gaps == 1);
+            assert_eq!(h.core.bk.role.is_none(), gaps == 1);
+            assert_eq!(h.meta.backup_role().unwrap().is_none(), gaps == 1);
+            assert_eq!(h.meta.backup_tail(1).unwrap().is_empty(), gaps == 1);
         }
     }
 }
