@@ -429,6 +429,22 @@ pub enum LogRecord {
     /// acknowledged. Every replica reads the cut from the record. Touches
     /// no inode or dentry.
     DelegateNodeEnded { node: u64, gen: u64, through: u64 },
+    /// Plan 46 M1.3 step 15b (S4, ADR-63): a row of the delegate's own
+    /// stream. The holder of `(node, gen)` stopped executing under the
+    /// subtrees `dirs` after index `at` of its stream (this row is `at + 1`
+    /// or later): every row of the stream that touched `dirs` is at or below
+    /// `at`, and none follows. The release itself (`SubtreeReleased` /
+    /// `StreamReleased`) follows once the read delegations the holder
+    /// granted there are recalled or expired. Until then the subtrees stay
+    /// the stream's: nobody executes there. A sequencer that has this row in
+    /// order answers a settle whose keys lie under `dirs` from what it holds
+    /// (dedup, else `Refused { ABANDONED }`). Touches no inode or dentry.
+    ReleaseCut {
+        node: u64,
+        gen: u64,
+        dirs: Vec<u64>,
+        at: u64,
+    },
 }
 
 /// What a granted subtree is (§5.2): `Placed` is the placement policy's
@@ -493,9 +509,23 @@ impl LogRecord {
             | LogRecord::SubtreeReleased { node, gen, .. }
             | LogRecord::StreamReleased { node, gen, .. }
             | LogRecord::DelegateNodeGroup { node, gen, .. }
-            | LogRecord::DelegateNodeEnded { node, gen, .. } => Some((*node, *gen)),
+            | LogRecord::DelegateNodeEnded { node, gen, .. }
+            | LogRecord::ReleaseCut { node, gen, .. } => Some((*node, *gen)),
             _ => None,
         }
+    }
+
+    /// The records a delegate journals as a row of its own stream with no rid
+    /// and no op to replay, which a stranding gate puts back verbatim (ADR-60,
+    /// ADR-63): a release (`StreamReleased`, `SubtreeReleased`) or a cut
+    /// (`ReleaseCut`). A cut is not a release: it ends and releases nothing.
+    pub fn is_release_class(&self) -> bool {
+        matches!(
+            self,
+            LogRecord::StreamReleased { .. }
+                | LogRecord::SubtreeReleased { .. }
+                | LogRecord::ReleaseCut { .. }
+        )
     }
 }
 
@@ -644,6 +674,12 @@ mod tests {
                 node: 2,
                 gen: 5,
                 through: 12,
+            },
+            LogRecord::ReleaseCut {
+                node: 2,
+                gen: 5,
+                dirs: vec![7, 9],
+                at: 11,
             },
         ];
         for r in recs {

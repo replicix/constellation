@@ -2143,6 +2143,7 @@ impl Meta {
                     LogRecord::DelegateNode { .. }
                         | LogRecord::SubtreeReleased { .. }
                         | LogRecord::StreamReleased { .. }
+                        | LogRecord::ReleaseCut { .. }
                         | LogRecord::DelegateNodeEnded { .. }
                 )
             })

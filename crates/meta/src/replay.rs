@@ -121,6 +121,7 @@ impl TouchSet {
             | LogRecord::StreamReleased { .. }
             | LogRecord::DelegateNodeGroup { .. }
             | LogRecord::DelegateNodeEnded { .. }
+            | LogRecord::ReleaseCut { .. }
             | LogRecord::GroupAbandoned { .. }
             | LogRecord::TailOf { .. }
             | LogRecord::TailFollowsThrough { .. }
@@ -1247,6 +1248,20 @@ fn apply_one(
                 node: *node,
                 gen: *gen,
                 dir: *dir,
+            });
+            crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            Ok(Applied::Done)
+        }
+        // Step 15b (ADR-63): the holder's cut. The table marks the subtrees;
+        // nothing else changes until the release row.
+        LogRecord::ReleaseCut {
+            node, gen, dirs, ..
+        } => {
+            let mut table = crate::delegation::read_table_tx(tx, meta)?;
+            table.apply(crate::delegation::DelegationRecord::ReleaseCut {
+                node: *node,
+                gen: *gen,
+                dirs: dirs.clone(),
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             Ok(Applied::Done)

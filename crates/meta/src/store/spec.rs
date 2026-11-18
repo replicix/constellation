@@ -2019,6 +2019,7 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
                     | LogRecord::DelegateNode { .. }
                     | LogRecord::SubtreeReleased { .. }
                     | LogRecord::StreamReleased { .. }
+                    | LogRecord::ReleaseCut { .. }
                     | LogRecord::DelegateNodeEnded { .. }
                     | LogRecord::DelegateNodeGroup { .. }
                     // Plan 43 C1-4: bookkeeping of a re-shipped tail, no
@@ -7013,6 +7014,7 @@ impl Meta {
                     LogRecord::DelegateNode { .. }
                         | LogRecord::SubtreeReleased { .. }
                         | LogRecord::StreamReleased { .. }
+                        | LogRecord::ReleaseCut { .. }
                         | LogRecord::DelegateNodeEnded { .. }
                 )
             }))

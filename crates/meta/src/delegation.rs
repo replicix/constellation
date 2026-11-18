@@ -37,7 +37,7 @@ use constellation_fs_core::Ino;
 use constellation_mtree::keys;
 use fjall::{Readable, SingleWriterWriteTx};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type NodeId = u64;
 /// A delegation generation: minted by the root tenure that grants it, in its
@@ -68,6 +68,15 @@ pub enum DelegationRecord {
     /// Generation `gen` ended: every record of its stream that is not
     /// before this one in the log is void.
     DelegateNodeEnded { node: NodeId, gen: Gen },
+    /// Plan 46 M1.3 step 15b (ADR-63): the holder stopped executing in
+    /// `dirs` (the stream's `ReleaseCut` row). Marks them; changes nothing
+    /// else: a cut subtree is still the stream's in every view, until its
+    /// release row.
+    ReleaseCut {
+        node: NodeId,
+        gen: Gen,
+        dirs: Vec<Ino>,
+    },
 }
 
 /// One live subtree grant, as the walk finds it: the subtree `dir`, the
@@ -124,6 +133,12 @@ pub struct DelegationTable {
     /// anyway; it floors the next mint (`Meta::next_delegation_gen`) and
     /// seeds the restart's session (`SessionState::seed_generations`).
     max_gen: Gen,
+    /// Plan 46 M1.3 step 15b (ADR-63): the subtrees whose holder journaled a
+    /// `ReleaseCut` and has not released them yet, with the stream that cut
+    /// them. Only [`Self::settle_at_cut`] and its accessors read it: `by_dir`,
+    /// `streams`, `resolve` and `covering` still list a cut subtree as the
+    /// stream's.
+    cut: BTreeMap<Ino, (NodeId, Gen)>,
 }
 
 /// A live stream's subtrees (the persisted row of one stream).
@@ -150,6 +165,8 @@ impl DelegationTable {
                     // lacked, as before).
                     if let Some((n, gn, _)) = self.by_dir.insert(g.dir, (node, gen, g.kind)) {
                         if (n, gn) != (node, gen) {
+                            // The old holder's cut of it goes with its hold.
+                            self.cut.remove(&g.dir);
                             // The stream that lost its last subtree to the
                             // grant is gone, as the old fold dropped it (a
                             // stream that *released* its set stays until
@@ -178,11 +195,28 @@ impl DelegationTable {
                         set.remove(&dir);
                     }
                 }
+                if self.cut.get(&dir) == Some(&(node, gen)) {
+                    self.cut.remove(&dir);
+                }
             }
             DelegationRecord::StreamReleased { node, gen } => {
                 if let Some(set) = self.streams.get_mut(&(node, gen)) {
                     for dir in std::mem::take(set).into_keys() {
                         self.by_dir.remove(&dir);
+                    }
+                }
+                self.cut.retain(|_, held| *held != (node, gen));
+            }
+            DelegationRecord::ReleaseCut { node, gen, dirs } => {
+                for dir in dirs {
+                    // A directory the stream does not hold is ignored, as a
+                    // release of one is.
+                    if self
+                        .by_dir
+                        .get(&dir)
+                        .is_some_and(|e| (e.0, e.1) == (node, gen))
+                    {
+                        self.cut.insert(dir, (node, gen));
                     }
                 }
             }
@@ -198,6 +232,7 @@ impl DelegationTable {
                         self.by_dir.remove(&dir);
                     }
                 }
+                self.cut.retain(|_, held| held.1 != gen);
             }
         }
     }
@@ -221,12 +256,15 @@ impl DelegationTable {
             .iter()
             .map(|(&(n, g), set)| (n, g, set.iter().map(|(&d, &k)| (d, k)).collect()))
             .collect();
-        postcard::to_allocvec(&(rows, self.max_gen)).unwrap_or_default()
+        let cuts: Vec<(Ino, NodeId, Gen)> =
+            self.cut.iter().map(|(&d, &(n, g))| (d, n, g)).collect();
+        postcard::to_allocvec(&(rows, self.max_gen, cuts)).unwrap_or_default()
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, MetaError> {
-        let (rows, max_gen): (Vec<Row>, Gen) = crate::record::from_bytes_exact(bytes)
-            .map_err(|e| MetaError::Invalid(format!("delegation row: {e}")))?;
+        let (rows, max_gen, cuts): (Vec<Row>, Gen, Vec<(Ino, NodeId, Gen)>) =
+            crate::record::from_bytes_exact(bytes)
+                .map_err(|e| MetaError::Invalid(format!("delegation row: {e}")))?;
         let mut t = DelegationTable {
             max_gen,
             ..DelegationTable::default()
@@ -241,7 +279,55 @@ impl DelegationTable {
                     .collect(),
             });
         }
+        for (dir, node, gen) in cuts {
+            t.apply(DelegationRecord::ReleaseCut {
+                node,
+                gen,
+                dirs: vec![dir],
+            });
+        }
         Ok(t)
+    }
+
+    /// The stream `(node, gen)` that cut the subtree `dir` and has not
+    /// released it (`None`: not cut).
+    pub fn cut_of(&self, dir: Ino) -> Option<(NodeId, Gen)> {
+        self.cut.get(&dir).copied()
+    }
+
+    /// The subtrees stream `(node, gen)` cut and has not released.
+    pub fn cut_dirs(&self, node: NodeId, gen: Gen) -> BTreeSet<Ino> {
+        self.cut
+            .iter()
+            .filter(|(_, held)| **held == (node, gen))
+            .map(|(&d, _)| d)
+            .collect()
+    }
+
+    /// Whether a settle on `keys` is answered at a cut (ADR-63): at least one
+    /// key's covering delegation is a subtree its holder cut, and every key's
+    /// is either the root's (`None`) or such a cut one. A key under a live,
+    /// uncut delegation makes it false.
+    pub fn settle_at_cut(&self, ns: &dyn Namespace, keys: &TouchSet) -> bool {
+        if self.cut.is_empty() {
+            return false;
+        }
+        let mut cut = false;
+        let mut hit = |ino: Ino| match self.covering(ns, ino) {
+            None => true,
+            Some(d) if self.cut_of(d.dir) == Some(d.stream()) => {
+                cut = true;
+                true
+            }
+            Some(_) => false,
+        };
+        let all = keys.dentries.iter().all(|(parent, _)| hit(*parent))
+            && keys
+                .inos
+                .iter()
+                .chain(keys.shared.iter())
+                .all(|ino| hit(*ino));
+        all && cut
     }
 
     /// The subtree grant on `dir` itself, if any.
@@ -1185,5 +1271,137 @@ mod tests {
         assert!(!t.has_gen(6));
         assert!(t.stream(8, 6).is_none());
         assert_eq!(t.gens().collect::<Vec<_>>(), vec![7]);
+    }
+
+    fn cut(node: NodeId, gen: Gen, dirs: &[Ino]) -> DelegationRecord {
+        DelegationRecord::ReleaseCut {
+            node,
+            gen,
+            dirs: dirs.to_vec(),
+        }
+    }
+
+    /// ADR-63: a cut marks the subtrees the stream holds and changes no other
+    /// view; its release, the stream's whole release, the stream's end and a
+    /// re-grant to another stream each clear the mark; a directory the stream
+    /// does not hold is not marked.
+    #[test]
+    fn release_cut_marks_and_release_clears() {
+        use SubtreeKind::Placed;
+        let ns = Tree::new();
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed), (3, Placed)]));
+        let before = t.clone();
+        // Not held by this stream: ignored.
+        t.apply(cut(7, 5, &[9]));
+        t.apply(cut(8, 6, &[2]));
+        assert_eq!(t, before);
+        t.apply(cut(7, 5, &[2]));
+        assert_eq!(t.cut_of(2), Some((7, 5)));
+        assert_eq!(t.cut_of(3), None);
+        assert_eq!(t.cut_dirs(7, 5), BTreeSet::from([2]));
+        // Every other view is unchanged: the subtree is still the stream's.
+        assert_eq!(t.get(2), before.get(2));
+        assert_eq!(t.stream(7, 5), before.stream(7, 5));
+        assert_eq!(t.owner_of_dir(&ns, 4), Some((7, 5)));
+        assert!(matches!(
+            t.resolve(&ns, &dentry(4, "x")),
+            Ownership::Delegated(Delegation { gen: 5, .. })
+        ));
+        assert_eq!(t.gens().collect::<Vec<_>>(), vec![5]);
+        // A release of another subtree leaves the cut.
+        t.apply(DelegationRecord::SubtreeReleased {
+            node: 7,
+            gen: 5,
+            dir: 3,
+        });
+        assert_eq!(t.cut_of(2), Some((7, 5)));
+        // Its own release clears it.
+        t.apply(DelegationRecord::SubtreeReleased {
+            node: 7,
+            gen: 5,
+            dir: 2,
+        });
+        assert_eq!(t.cut_of(2), None);
+        // The whole release clears every cut of the stream, not another's.
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed), (3, Placed)]));
+        t.apply(grow(8, 6, &[(4, Placed)]));
+        t.apply(cut(7, 5, &[2, 3]));
+        t.apply(cut(8, 6, &[4]));
+        t.apply(DelegationRecord::StreamReleased { node: 7, gen: 5 });
+        assert!(t.cut_dirs(7, 5).is_empty());
+        assert_eq!(t.cut_of(4), Some((8, 6)));
+        // The end clears it.
+        t.apply(DelegationRecord::DelegateNodeEnded { node: 8, gen: 6 });
+        assert_eq!(t.cut_of(4), None);
+        // A regrant to another stream drops the old holder's cut.
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed)]));
+        t.apply(cut(7, 5, &[2]));
+        t.apply(grow(9, 7, &[(2, Placed)]));
+        assert_eq!(t.cut_of(2), None);
+        t.apply(DelegationRecord::DelegateNodeEnded { node: 9, gen: 7 });
+        assert!(t.cut_dirs(7, 5).is_empty());
+    }
+
+    #[test]
+    fn the_table_row_round_trips_its_cuts() {
+        use SubtreeKind::Placed;
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed), (3, Placed)]));
+        t.apply(grow(8, 6, &[(4, Placed)]));
+        t.apply(cut(7, 5, &[3, 2]));
+        t.apply(cut(8, 6, &[4]));
+        let back = DelegationTable::decode(&t.encode()).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.cut_of(2), Some((7, 5)));
+        assert_eq!(back.cut_dirs(7, 5), BTreeSet::from([2, 3]));
+        assert_eq!(back.cut_of(4), Some((8, 6)));
+        // The encoding is canonical: a decoded table encodes to the same row.
+        assert_eq!(back.encode(), t.encode());
+        // A table with no cut is unchanged by the field.
+        let plain = table();
+        assert_eq!(DelegationTable::decode(&plain.encode()).unwrap(), plain);
+    }
+
+    /// ADR-63: a settle is answered at the cut when at least one key is under
+    /// a cut subtree and every key is the root's or under a cut one.
+    #[test]
+    fn settle_at_cut_needs_every_key_cut_or_root() {
+        use SubtreeKind::Placed;
+        let ns = Tree::new();
+        let mut t = DelegationTable::default();
+        t.apply(grow(7, 5, &[(2, Placed)]));
+        t.apply(grow(8, 6, &[(3, Placed)]));
+        // No cut at all.
+        assert!(!t.settle_at_cut(&ns, &dentry(4, "x")));
+        t.apply(cut(7, 5, &[2]));
+        // Under the cut subtree (a nested dir and a file in it).
+        assert!(t.settle_at_cut(&ns, &dentry(4, "x")));
+        let mut file = TouchSet::default();
+        file.inos.insert(10);
+        assert!(t.settle_at_cut(&ns, &file));
+        // The root's keys alone are not a cut.
+        assert!(!t.settle_at_cut(&ns, &dentry(1, "x")));
+        // A cut key and a root key.
+        let mut mixed = dentry(4, "a");
+        mixed.dentries.insert((1, "b".into()));
+        assert!(t.settle_at_cut(&ns, &mixed));
+        // A key under a live, uncut delegation makes it false.
+        let mut live = dentry(4, "a");
+        live.dentries.insert((3, "b".into()));
+        assert!(!t.settle_at_cut(&ns, &live));
+        // Both cut: true.
+        t.apply(cut(8, 6, &[3]));
+        assert!(t.settle_at_cut(&ns, &live));
+        // After the release row the subtree is the root's: no cut left.
+        t.apply(DelegationRecord::SubtreeReleased {
+            node: 7,
+            gen: 5,
+            dir: 2,
+        });
+        assert!(!t.settle_at_cut(&ns, &dentry(4, "x")));
+        assert!(!t.settle_at_cut(&ns, &mixed));
     }
 }
