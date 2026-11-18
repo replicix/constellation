@@ -70833,3 +70833,27 @@ Finding 996 part B, round 3 (review S1, S2, S4, N1, N4):
 - S4: a renewal at the claimant root of a grant tagged with the kept stream's generation is answered, not `Lost` (`a_renewal_of_a_kept_streams_grant_at_the_root_is_not_lost`). No code change.
 - N1: `own_end_remnants` filters candidates by `delegate_idx > log_stream_idx` before it reads the journal. N4: the sweep numbers left the `release_row_unshipped` doc.
 - N2, N3, N5, N6: not done (N2/N3 change behaviour or need a decision; N5 and N6 are test and docs polish).
+
+### A restarted old root strands its unshipped appends when a newer tenure begins (2026-11-18)
+
+`far-root-writes+lost-chunk-late` seed 1810 failed the causal cut: node 1 (root of epoch 1) appended row 36 of node 2's stream 1:1, crashed
+before shipping it, and restarted under node 3's epoch 2 without the lease. As the holder of its own sticky stream it executed an op and answered Ok
+with dependencies naming (1:1, 36): its session's stream index for 1:1 was still 36 (the journal's own append), so the holder's dependency wait
+(`replica.reaches`) was satisfied by a row the log of the epoch-2 tenure never carried; the current root refused the batch until node 2 re-streamed
+the row. Had 1:1 ended at 35, the answered op would have been replayed by rid after its client was told Ok (I1), and node 1's reads had seen row 36 (I5).
+The deposition's strand (`recover_deposed`, `strand_deposed`) runs only for a node that held the lease when it learned of the newer tenure; a node
+that restarted without it never ran it, and `apply_segment`'s strand leaves a delegate's appended row (`Local`, `gen != 0`) alone by design.
+
+Now `Core::apply_incoming`, on a foreign segment of an epoch above the highest seen (the newer tenure's first segment) at a node that holds no
+lease, hold or lost mark, calls `Meta::strand_appended_below(epoch)` (the appended-row clause of `strand_deposed` alone): the delegates' rows this node
+appended under an older tenure and never shipped are rolled back from their before-images, kept as member copies of their generation, and the
+generation's log index and the session's stream index go back below them, in the same step as the segment, before any stream the node holds
+executes. The segment's own strand still handles every other entry. Tests: `a_restarted_root_strands_its_unshipped_appends_when_a_newer_tenure_begins`
+(core; fails on the parent: after the marker `reaches((4,7))` still holds and the log index stays 7), its guard
+`a_segment_of_the_same_epoch_strands_no_unshipped_append`, and the sim pin `a_restarted_root_does_not_depend_on_its_own_unshipped_appends`
+(`far-root-writes+lost-chunk-late` seed 1810, fails on the parent with the causal cut). Not covered: an op the restarted holder executes before it has
+applied any segment of the newer tenure (the node does not yet know it is deposed).
+Sweeps, release, 2,000 seeds, parent / fix: failing seeds equal except 1810 gone: `far-root-writes+lost-chunk-late` [226, 996, 1810] / [226, 996],
+`far-root-writes-paused+lost-chunk-late` [996] / [996]; none on `far-root-writes{,-paused,-shared,-cross}+lost-chunk`,
+`sticky-holder-restarts{,-cut,-placed}`, `long-delegated-late-answers`, `backup-crash`. The oracle control
+`the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait` passes.
