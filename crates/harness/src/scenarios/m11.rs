@@ -2059,9 +2059,11 @@ pub fn sticky_holder_restart(_seed: u64) -> Result<()> {
     for c in &clients {
         let log = c.log_text();
         anyhow::ensure!(
-            log.contains("protocol deadlines checked")
-                && log.contains(&format!("read_delegation_ttl_ms={READ_TTL_MS}"))
-                && !log.contains("cut to fit"),
+            // The log line carries the TTL as a coloured field, so match the
+            // value on the line that reports the check.
+            log.lines().any(|l| {
+                l.contains("protocol deadlines checked") && l.contains(&READ_TTL_MS.to_string())
+            }) && !log.contains("cut to fit"),
             "{}: the daemon did not run with a {READ_TTL_MS} ms read TTL:\n{}",
             c.name,
             c.tail_log_n(40)
