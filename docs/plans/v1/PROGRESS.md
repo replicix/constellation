@@ -70572,3 +70572,11 @@ The sim pin `a_reappended_seed_is_dropped_under_its_own_rid` was already tighten
 Sweeps (2,000 seeds, release, base vs fix): `far-root-writes{,-paused}+lost-chunk-late` fail only 996/1810 and 996 on both sides;
 `far-root-writes+lost-chunk`, `far-placement+lost-chunk`, `drop-held-chain-backed` 0 on both. `far-root-writes+lost-chunk-late` 500 seeds in
 debug: base trips the assert on 226, fix 0 failures.
+
+Round 2 (review M1): the skip counted fills of plans whose record the log does not carry yet, and such a plan can be cancelled after the
+strand (a restart's `strand_appended_below` before `drop_plans_start`, a deposed root's strand then `drop_held_cancel`), leaving the index at
+a position the log never carries (I5). `drop_fills_tx` now counts only shipped plans: their `deleg_fill:` markers are written in the same ack
+transaction, so the skip and `past_stream_fills` agree; an unshipped plan keeps the old, understated index. Tests (meta, `tests/held.rs`, real
+journaled rows 10..18 above the seed, no `kv_set`): `a_strand_does_not_keep_a_position_an_unshipped_drop_may_never_fill` (fails before: the
+index stays at 9 in release, a `hold_row_tx` debug assert in debug) and `a_strand_of_the_rows_above_an_applied_seed_stops_at_its_fill`
+(index 9 after the apply then a deposed strand of the rows above).
