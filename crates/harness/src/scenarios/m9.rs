@@ -1065,12 +1065,30 @@ pub fn backup_partition(_seed: u64) -> Result<()> {
 /// ADR-50 (plan 46 M1.3 step 10): A writes alone and its fast path is open
 /// (`singleton`); B mounts and does nothing. Within a registry poll A's
 /// `status.roster` lists B, A is no singleton, and its acknowledgements are
-/// gated (they wait for the archive). Then A is killed (`kill -9`) and B
-/// claims after the TTL: every file A acknowledged after its roster listed B
-/// is on B.
+/// gated (they wait for the archive). Then A is killed (`kill -9`). Leases
+/// are claimed on demand: if B is already A's backup it takes over by seal
+/// (about 1.5 s), otherwise nothing on an idle B asks for the lease and it
+/// is the lease TTL after a write on B that it is claimed (f3052f4a's
+/// bound). So B's first write after the kill must succeed within twice the
+/// TTL plus 10 s, B then holds the lease above A's epoch, and every file A
+/// acknowledged after its roster listed B is on B. A's backups just before
+/// the kill are printed: which of the two paths ran.
 pub fn singleton_peer_join(_seed: u64) -> Result<()> {
-    const NAME: &str = "singleton-peer-join";
-    let (_env, _root, mut clients, _) = cluster_mounted(NAME, &["a", "b"], &[], 0, 1)?;
+    singleton_peer_join_in("singleton-peer-join", &[])
+}
+
+/// [`singleton_peer_join`] with no backup possible (`BACKUP_RTT_BUDGET_MS=0`):
+/// B is never A's backup, so the death is always followed by the TTL claim
+/// on demand.
+pub fn singleton_peer_join_nobackup(_seed: u64) -> Result<()> {
+    singleton_peer_join_in(
+        "singleton-peer-join-nobackup",
+        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0")],
+    )
+}
+
+fn singleton_peer_join_in(name: &str, extra: &[(&str, &str)]) -> Result<()> {
+    let (_env, _root, mut clients, _) = cluster_mounted(name, &["a", "b"], extra, 0, 1)?;
     let result = (|| -> Result<()> {
         let (before, _) = write_files(&clients[0], "alone", 20)?;
         let r = roster_of(&clients[0])?;
@@ -1099,13 +1117,25 @@ pub fn singleton_peer_join(_seed: u64) -> Result<()> {
             "A answered ungated after its roster listed B: {}",
             ack_of(&clients[0])?
         );
-        print_ack(NAME, "A", &ack_of(&clients[0])?);
+        let a = ack_of(&clients[0])?;
+        print_ack(name, "A", &a);
+        eprintln!("    {name}: A's backups before the kill: {}", a["backups"]);
+        let epoch = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
         clients[0].kill9()?;
-        eventually("B holds the lease", Duration::from_secs(90), || {
-            let l = lease_of(&clients[1])?;
-            anyhow::ensure!(l["held"] == true, "B does not hold: {l}");
-            Ok(())
-        })?;
+        // B claims on demand: a write is what asks. It must succeed inside
+        // twice the TTL plus 10 s (the TTL claim, the P2P grace and slack).
+        let bound = Duration::from_millis(2 * TTL_MS) + Duration::from_secs(10);
+        let t = Instant::now();
+        std::fs::write(clients[1].mnt.join("after-kill"), b"after-kill")
+            .map_err(|e| anyhow::anyhow!("B's first write after A's death failed: {e}"))?;
+        let took = t.elapsed();
+        eprintln!("    {name}: B's first write after A's death returned after {took:?}");
+        anyhow::ensure!(
+            took <= bound,
+            "B's first write took {took:?}, more than {bound:?}"
+        );
+        let held = wait_holds(&clients[1], epoch, Duration::from_secs(10))?;
+        eprintln!("    {name}: B holds above epoch {epoch} {held:?} after its write");
         all_visible(&clients[1], &after, Duration::from_secs(30))?;
         // (What A answered alone before its roster listed B is on B or comes
         // back as a conflict copy when A returns: the singleton's accepted
@@ -1115,7 +1145,7 @@ pub fn singleton_peer_join(_seed: u64) -> Result<()> {
             .filter(|n| !clients[1].mnt.join(n).exists())
             .count();
         eprintln!(
-            "    {NAME}: {missing} of {} early files are not on B",
+            "    {name}: {missing} of {} early files are not on B",
             before.len()
         );
         Ok(())

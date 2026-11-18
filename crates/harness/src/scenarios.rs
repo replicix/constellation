@@ -1220,10 +1220,17 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "singleton-peer-join",
-        desc: "ADR-50 (plan 46 M1.3 step 10): A writes alone (singleton answers); B mounts and does nothing: within a registry poll A's status.roster lists B, A is no singleton and its singleton class stops growing; A is killed, B claims after the TTL and holds every file A acknowledged after its roster listed B",
+        desc: "ADR-50 (plan 46 M1.3 step 10): A writes alone (singleton answers); B mounts and does nothing: within a registry poll A's status.roster lists B, A is no singleton and its singleton class stops growing; A is killed (its backups are printed); leases are claimed on demand, so B's first write after the kill must succeed within 2 x TTL + 10 s, B then holds the lease above A's epoch within 10 s and holds every file A acknowledged after its roster listed B",
         requires: &[],
         caps: &[],
         run: m9::singleton_peer_join,
+    },
+    Scenario {
+        name: "singleton-peer-join-nobackup",
+        desc: "singleton-peer-join with CONSTELLATION_BACKUP_RTT_BUDGET_MS=0: B is never A's backup, so after A's death nothing on the idle B claims the lease until a write asks (the TTL bound of f3052f4a); that write must succeed within 2 x TTL + 10 s, B holds above A's epoch within 10 s and holds every file A acknowledged after its roster listed B",
+        requires: &[],
+        caps: &[],
+        run: m9::singleton_peer_join_nobackup,
     },
     Scenario {
         name: "registered-peer-down",
