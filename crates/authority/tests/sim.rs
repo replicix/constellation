@@ -8404,6 +8404,12 @@ fn seed_runs_are_repeatable() {
     assert_runs_repeat("flex+links", 955, 8);
 }
 
+/// T2: a placement tie takes the lowest directory, not the hash order's.
+#[test]
+fn seed_runs_are_repeatable_across_a_placement_tie() {
+    assert_runs_repeat("placement-hot+links", 235, 8);
+}
+
 /// Many seeds of a named configuration, run in parallel
 /// (`AUTHORITY_SIM_CONFIG`, default `delegated-holder-cut`;
 /// `AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`).

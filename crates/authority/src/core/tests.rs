@@ -74922,6 +74922,29 @@ mod step9_one_stream_per_node {
         assert_eq!(h.core.stats.place_delegated, 1);
     }
 
+    /// Two sibling directories one node dominates with equal totals tie for
+    /// the node's placement; the lowest directory (inode) wins every time,
+    /// not the one a per-core hash order happens to visit first (fail-before:
+    /// placement-hot+links seed 235 placed d2 or not by run). Each core
+    /// builds its maps with fresh hash keys, so 16 fresh cores see 16 orders.
+    #[test]
+    fn a_placement_tie_takes_the_lowest_directory() {
+        for round in 0..16 {
+            let (mut h, dirs) = root_with_peer(Some(2));
+            for d in &dirs {
+                for _ in 0..40 {
+                    h.core.place_note(2, [*d]);
+                }
+            }
+            place_tick(&mut h);
+            assert_eq!(h.core.stats.place_delegated, 1, "round {round}");
+            let lowest = *dirs.iter().min().unwrap();
+            let placed: Vec<Vec<constellation_fs_core::Ino>> =
+                h.core.dl.gens.values().map(|g| g.dir_list()).collect();
+            assert_eq!(placed, vec![vec![lowest]], "round {round}");
+        }
+    }
+
     /// Drive `n` samples of node 2's link at `rtt`, `step_ms` apart.
     fn samples(h: &mut Harness, rtt: Option<u64>, n: u32, step_ms: u64) {
         for _ in 0..n {

@@ -597,13 +597,15 @@ impl Core {
             .map(|(dir, by_node)| {
                 let (node, n) = by_node
                     .iter()
-                    .max_by_key(|(_, n)| **n)
+                    .max_by_key(|(node, n)| (**n, std::cmp::Reverse(**node)))
                     .map(|(node, n)| (*node, *n))
                     .unwrap_or((0, 0));
                 (*dir, node, n, by_node.values().sum())
             })
             .collect();
-        top.sort_by_key(|(_, _, _, total)| std::cmp::Reverse(*total));
+        // Equal totals in directory order: the map's hash order must not pick
+        // which subtrees the status keeps.
+        top.sort_by_key(|(dir, _, _, total)| (std::cmp::Reverse(*total), *dir));
         top.truncate(16);
         self.pl.top = top;
         // 1. Recalls of placed generations (hysteresis over the dwell).
@@ -790,7 +792,12 @@ impl Core {
         let ns = replica.namespace();
         let me = self.cfg.node_id;
         let mut chosen: BTreeMap<NodeId, (Ino, u64)> = BTreeMap::new();
-        for (dir, by_node) in &subtree {
+        // In directory order: two subtrees of one node with equal totals tie,
+        // and the lowest directory (inode) wins, whatever the map's hash
+        // order. The same seed must place the same subtree every run.
+        let mut dirs: Vec<(&Ino, &HashMap<NodeId, u64>)> = subtree.iter().collect();
+        dirs.sort_unstable_by_key(|(dir, _)| **dir);
+        for (dir, by_node) in dirs {
             // The root directory is the root sequencer's: never placed (the
             // fault `root_sticky_on_slash` lets the walk reach it).
             if *dir == ROOT_INO && !self.cfg.root_sticky_on_slash {
