@@ -1823,6 +1823,12 @@ pub struct Report {
     pub unsettled_s4_excused: usize,
     /// The held-release spans the run saw (`HeldReleases::spans`).
     pub held_release_spans: usize,
+    /// The settles sent, and those sent while a release waited on read
+    /// recalls (`HeldReleases::settle_counts`).
+    pub settles_sent_all: u64,
+    pub settles_sent_in_hold: u64,
+    /// The longest closed held-release span (ms).
+    pub held_span_max_ms: u64,
     /// The I4 violations by `Unsettled::cause`.
     pub unsettled_violation_causes: BTreeMap<String, usize>,
     pub unsettled_examples: Vec<String>,
@@ -5563,7 +5569,12 @@ fn count_unsettled(
         .map(|u| u.describe())
         .collect();
     report.unsettled_violations = bad.len();
-    report.held_release_spans = oracles.held_releases.lock().unwrap().spans();
+    {
+        let held = oracles.held_releases.lock().unwrap();
+        report.held_release_spans = held.spans();
+        report.held_span_max_ms = held.longest_span_ms();
+        (report.settles_sent_all, report.settles_sent_in_hold) = held.settle_counts();
+    }
     report.unsettled_s4 = all.iter().filter(|u| u.release_read_recall).count();
     // MUST-1: the tag over the excused ones too (non-stealable holder,
     // isolated from S3, held behind a lost chunk): a sticky stream's
@@ -9189,4 +9200,58 @@ pub fn judge_handover(
     }
     f.min_gap_ms = min_gap.unwrap_or(0);
     f
+}
+
+#[cfg(test)]
+mod s4_count_tests {
+    use super::*;
+    use super::super::oracle::{ArchiveIndex, Oracles};
+
+    fn rid(seq: u64) -> Rid {
+        Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// Review MUST-1: the S4 tag is counted over the excused unsettled EIOs
+    /// (`designation_held`, the sticky streams' own) apart from the
+    /// classified ones, and not in either when absent.
+    #[test]
+    fn the_s4_tag_is_counted_over_the_excused_ones_apart() {
+        let oracles = Oracles::new(Bucket::new(1, (0, 0)));
+        for seq in 1..=4 {
+            oracles.note_unsettled(3, rid(seq), 1_000, None, false, false, false, false, false);
+        }
+        {
+            let mut all = oracles.unsettled.lock().unwrap();
+            // 1: classified and tagged; 2: classified, untagged; 3: excused
+            // and tagged; 4: excused, untagged.
+            all[0].release_read_recall = true;
+            all[2].designation_held = true;
+            all[2].release_read_recall = true;
+            all[3].designation_held = true;
+        }
+        let mut report = Report::default();
+        count_unsettled(
+            &oracles,
+            &mut report,
+            &ChunkWorld::default(),
+            &ArchiveIndex::default(),
+        );
+        assert_eq!(report.unsettled_s4, 1);
+        assert_eq!(report.unsettled_s4_excused, 1);
+        assert_eq!(report.unsettled_nonstealable_holder, 2);
+    }
+
+    /// Review SHOULD-1: only the unsettled-I4 list says how many of its
+    /// entries were tagged; another list says nothing of S4.
+    #[test]
+    fn only_the_unsettled_list_carries_the_s4_count() {
+        let unsettled = vec![format!("a [{S4_MARK}]"), "b".to_string()];
+        let other = vec!["x".to_string()];
+        assert_eq!(s4_note(&unsettled, &unsettled), format!(", 1 of them {S4_MARK}"));
+        assert_eq!(s4_note(&other, &unsettled), "");
+    }
 }

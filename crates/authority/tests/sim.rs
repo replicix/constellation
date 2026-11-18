@@ -2482,6 +2482,35 @@ fn sticky_holder_restarts_config() -> SimConfig {
     }
 }
 
+/// The faults of the S4 hazard configurations: a few answers of the holder
+/// to node 3 are lost (each loss cuts the pair for 0.6 s: the op ran, its
+/// requester settles through the root), then the pair is cut for longer than
+/// `read_span` from `cut_at` ms.
+fn s4_lost_answers_then_cut(cut_at: u64) -> Vec<ScheduledFault> {
+    let mut faults: Vec<ScheduledFault> = [600, 1_300, 2_000]
+        .into_iter()
+        .filter(|&at| at < cut_at)
+        .map(|at_ms| ScheduledFault {
+            at_ms,
+            kind: FaultKind::CutOnAnswer {
+                node: 2,
+                peer: 3,
+                for_ms: 600,
+                inbox_ever_only: false,
+            },
+        })
+        .collect();
+    faults.push(ScheduledFault {
+        at_ms: cut_at,
+        kind: FaultKind::Partition {
+            a: 2,
+            b: 3,
+            for_ms: 9_000,
+        },
+    });
+    faults
+}
+
 /// Plan 46 M1.3 step 15a, S4 (review MUST-2): the hazard itself. Node 2
 /// holds a sticky `d2`, node 3 reads it under read delegations from the
 /// holder, and the holder is cut from the reader for longer than `read_span`
@@ -2492,14 +2521,11 @@ fn sticky_s4_idle_config() -> SimConfig {
     SimConfig {
         sticky_idle_ms: Some(1_200),
         idle_gaps: true,
-        faults: vec![ScheduledFault {
-            at_ms: 1_800,
-            kind: FaultKind::Partition {
-                a: 2,
-                b: 3,
-                for_ms: 9_000,
-            },
-        }],
+        // Node 3 writes too: its writes in `d2` go to the holder it cannot
+        // reach, so they settle through the root.
+        reader_nodes: Vec::new(),
+        client_plan: Vec::new(),
+        faults: s4_lost_answers_then_cut(3_200),
         ..sticky_holder_restarts_config()
     }
 }
@@ -2509,24 +2535,20 @@ fn sticky_s4_idle_config() -> SimConfig {
 /// cut off from it from 2 s.
 fn sticky_s4_leave_config() -> SimConfig {
     SimConfig {
-        faults: vec![
-            ScheduledFault {
-                at_ms: 2_000,
-                kind: FaultKind::Partition {
-                    a: 2,
-                    b: 3,
-                    for_ms: 9_000,
-                },
-            },
-            ScheduledFault {
+        reader_nodes: Vec::new(),
+        client_plan: Vec::new(),
+        faults: {
+            let mut faults = s4_lost_answers_then_cut(2_400);
+            faults.push(ScheduledFault {
                 at_ms: 2_500,
                 kind: FaultKind::LeaveNode {
                     node: 2,
                     admin: false,
                     within_ms: 30_000,
                 },
-            },
-        ],
+            });
+            faults
+        },
         ..sticky_holder_restarts_config()
     }
 }
@@ -10280,6 +10302,8 @@ struct OracleTotals {
     s4: (u64, u64, u64),
     s4_excused: (u64, u64),
     s4_spans: (u64, u64),
+    s4_settles: (u64, u64),
+    s4_span_max_ms: u64,
     violation_causes: std::collections::BTreeMap<String, u64>,
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
     /// takeover gate took on, renewals it granted, transactions it appended,
@@ -10513,6 +10537,9 @@ impl OracleTotals {
         self.s4.2 += u64::from(r.unsettled_s4 > 0);
         self.s4_excused.0 += r.unsettled_s4_excused as u64;
         self.s4_excused.1 += u64::from(r.unsettled_s4_excused > 0);
+        self.s4_span_max_ms = self.s4_span_max_ms.max(r.held_span_max_ms);
+        self.s4_settles.0 += r.settles_sent_all;
+        self.s4_settles.1 += r.settles_sent_in_hold;
         self.s4_spans.0 += r.held_release_spans as u64;
         self.s4_spans.1 += u64::from(r.held_release_spans > 0);
         for (k, n) in &r.unsettled_violation_causes {
@@ -10715,7 +10742,7 @@ impl OracleTotals {
     /// apart, over the excused ones (a sticky stream's are `designation_held`).
     fn s4_line(&self, label: &str, seeds: u64) -> String {
         format!(
-            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds",
+            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms",
             self.seeds,
             self.s4.0,
             self.s4.1,
@@ -10724,7 +10751,10 @@ impl OracleTotals {
             self.s4_excused.0,
             self.s4_excused.1,
             self.s4_spans.0,
-            self.s4_spans.1
+            self.s4_spans.1,
+            self.s4_settles.0,
+            self.s4_settles.1,
+            self.s4_span_max_ms
         )
     }
 
@@ -23002,6 +23032,40 @@ fn a_restarted_sticky_holder_serves_no_stale_read() {
         quarantined += r.quarantine_core[0];
     }
     assert!(quarantined > 0, "no restarted holder was quarantined");
+}
+
+/// Plan 46 M1.3 step 15a, S4 (review MUST-2): the hazard configurations
+/// reach the window, so a zero in `SWEEP-S4` is a measurement and not an
+/// absence. Core -> Report -> `OracleTotals` -> the sweep line, end to end:
+/// held-release spans exist, and settles are sent whose window overlaps one.
+#[test]
+fn the_s4_hazard_configurations_reach_a_held_release_and_the_sweep_line_says_so() {
+    for (label, config) in [
+        ("sticky-s4-idle", sticky_s4_idle_config as fn() -> SimConfig),
+        ("sticky-s4-leave", sticky_s4_leave_config),
+    ] {
+        let mut totals = OracleTotals::default();
+        for seed in 0..400u64 {
+            let r = run_seed(seed, config()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            totals.add(label, seed, &r);
+            if totals.s4_spans.0 > 0 && totals.s4_settles.1 > 0 {
+                break;
+            }
+        }
+        assert!(totals.s4_spans.0 > 0, "{label}: no release waited on read recalls");
+        assert!(
+            totals.s4_settles.1 > 0,
+            "{label}: no settle overlapped a held release"
+        );
+        let line = totals.s4_line(label, 400);
+        assert!(
+            line.contains(&format!("held-release spans seen {} in", totals.s4_spans.0))
+                && line.contains(&format!("held release {}", totals.s4_settles.1)),
+            "{line}"
+        );
+    }
 }
 
 /// ADR-46: a reader that cannot be reached by the void leaves the persisted

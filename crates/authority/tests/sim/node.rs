@@ -997,6 +997,7 @@ impl NodeHandle {
             freeze_handed: (0, 0),
             own_lapse: None,
             unsettled_seen: 0,
+            settles_seen: 0,
             releases_seen: 0,
             deps_refused_seen: 0,
             deleg_rows_from: 0,
@@ -1323,6 +1324,9 @@ struct Driver {
     /// Plan 46 M0.3: the unsettled `EIO`s of this incarnation's core
     /// (`Stats::client_unsettled_eio`) already classified.
     unsettled_seen: u64,
+    /// `Stats::settles_sent` as last seen (the S4 instrument's count of the
+    /// settles sent while a release waited on read recalls).
+    settles_seen: u64,
     /// `Stats::deleg_sticky_releases` as last seen.
     releases_seen: u64,
     /// `Stats::deleg_deps_refused` already judged (the causal-cut oracle).
@@ -2581,6 +2585,19 @@ impl Driver {
                     &held,
                     self.oracles.reach.now_ms(),
                 );
+                let sent = self.core.stats.settles_sent;
+                if sent > self.settles_seen {
+                    self.oracles
+                        .held_releases
+                        .lock()
+                        .unwrap()
+                        .note_settles(
+                            sent - self.settles_seen,
+                            self.oracles.reach.now_ms(),
+                            self.core.dl_t().settle_window,
+                        );
+                    self.settles_seen = sent;
+                }
             }
             {
                 let mut holds = self.oracles.epoch_holds.lock().unwrap();

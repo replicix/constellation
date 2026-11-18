@@ -300,6 +300,8 @@ type Span = (u64, Option<u64>);
 #[derive(Default, Debug)]
 pub struct HeldReleases {
     spans: BTreeMap<(NodeId, u64), Vec<Span>>,
+    /// The settles requesters sent: when, and how long they last at least.
+    settles: Vec<(u64, u64)>,
 }
 
 impl HeldReleases {
@@ -319,6 +321,39 @@ impl HeldReleases {
                 spans.push((now_ms, None));
             }
         }
+    }
+
+    /// `n` settles were sent just now, each lasting at least `window_ms`.
+    pub fn note_settles(&mut self, n: u64, now_ms: u64, window_ms: u64) {
+        for _ in 0..n {
+            self.settles.push((now_ms, window_ms));
+        }
+    }
+
+    /// `(sent, those whose window overlapped a held release of any node)`:
+    /// the sweep's check that the S4 window is reached at all.
+    pub fn settle_counts(&self) -> (u64, u64) {
+        let in_hold = self
+            .settles
+            .iter()
+            .filter(|&&(at, w)| {
+                self.spans
+                    .values()
+                    .flatten()
+                    .any(|&(s, e)| s <= at + w && e.is_none_or(|e| e > at))
+            })
+            .count();
+        (self.settles.len() as u64, in_hold as u64)
+    }
+
+    /// The longest closed span, in ms.
+    pub fn longest_span_ms(&self) -> u64 {
+        self.spans
+            .values()
+            .flatten()
+            .filter_map(|&(s, e)| e.map(|e| e - s))
+            .max()
+            .unwrap_or(0)
     }
 
     /// How many spans were seen (the instrument's own check: a sweep that
