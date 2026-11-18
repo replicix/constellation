@@ -440,6 +440,32 @@ pub trait Replica {
         gen: u64,
         deps: Position,
     ) -> Result<u64, MetaError>;
+    /// Plan 46 M1.3 step 15b (ADR-63): the delegate of `gen` journals its
+    /// `ReleaseCut` for `dirs` (after stream index `at`) as the next
+    /// transaction of its stream and, in the same transaction, drops them
+    /// from its own view of the table. `node` is the holder's id. Returns
+    /// the stream index. `NotAdmitted` on a generation the takeover gate
+    /// ended.
+    fn delegate_cut(
+        &self,
+        node: u64,
+        gen: u64,
+        dirs: &[Ino],
+        at: u64,
+        deps: Position,
+    ) -> Result<u64, MetaError>;
+    /// ADR-63: whether a settle on `keys` is answered at a cut, on this
+    /// replica's view of the table.
+    fn settle_at_cut(&self, keys: &TouchSet) -> bool;
+    /// ADR-63: the subtrees this node's own stream `gen` cut and has not
+    /// released (node-local; empty for none).
+    fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino>;
+    /// ADR-63: the raw fold of the table, this node's own cut subtrees
+    /// still listed as its stream's (the holder's re-drive reads it).
+    fn delegation_table_folded(&self) -> DelegationTable;
+    /// ADR-63's store fence: executions refused since the last call because
+    /// they touch a subtree this node's stream cut (must stay 0).
+    fn take_deleg_exec_in_cut(&self) -> u64;
     /// The root appends a delegate's transaction with its origin
     /// (`Ok(false)`: the rid was completed already).
     fn apply_delegate_tx(
@@ -1600,6 +1626,35 @@ impl Replica for Meta {
         let applied = Meta::apply_delegate_tx(self, records, rid, gen, idx, deps)?;
         self.session().note_stream(gen, idx);
         Ok(applied)
+    }
+
+    fn delegate_cut(
+        &self,
+        node: u64,
+        gen: u64,
+        dirs: &[Ino],
+        at: u64,
+        deps: Position,
+    ) -> Result<u64, MetaError> {
+        let idx = Meta::delegate_cut(self, node, gen, dirs, at, deps)?;
+        self.session().note_stream(gen, idx);
+        Ok(idx)
+    }
+
+    fn settle_at_cut(&self, keys: &TouchSet) -> bool {
+        Meta::settle_at_cut(self, keys)
+    }
+
+    fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino> {
+        Meta::own_cut_dirs(self, gen)
+    }
+
+    fn delegation_table_folded(&self) -> DelegationTable {
+        Meta::delegation_table_folded(self)
+    }
+
+    fn take_deleg_exec_in_cut(&self) -> u64 {
+        Meta::take_deleg_exec_in_cut(self)
     }
 
     fn take_deleg_append_skipped(&self) -> u64 {

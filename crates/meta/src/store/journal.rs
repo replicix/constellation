@@ -577,6 +577,38 @@ impl Drop for PendingDelegateGuard {
     }
 }
 
+thread_local! {
+    static PENDING_OWN_CUT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Plan 46 M1.3 step 15b (ADR-63): the generation whose `ReleaseCut` row the
+/// transaction being journaled is this node's own, as the stream's holder
+/// ([`crate::Meta::delegate_cut`]). The apply of the record then writes the
+/// node-local `deleg_own_cut` key in the same transaction. Set only there:
+/// every other apply of a `ReleaseCut` (the root's append, a replica's log
+/// apply) leaves the key alone. Same thread-local scoping as
+/// [`PendingDelegate`].
+pub(crate) struct PendingOwnCut;
+
+impl PendingOwnCut {
+    pub(crate) fn set(gen: u64) -> PendingOwnCutGuard {
+        PENDING_OWN_CUT.with(|c| c.set(Some(gen)));
+        PendingOwnCutGuard
+    }
+
+    pub(crate) fn peek() -> Option<u64> {
+        PENDING_OWN_CUT.with(|c| c.get())
+    }
+}
+
+pub(crate) struct PendingOwnCutGuard;
+
+impl Drop for PendingOwnCutGuard {
+    fn drop(&mut self) {
+        PENDING_OWN_CUT.with(|c| c.set(None));
+    }
+}
+
 /// The rid `mutate::execute` is completing, visible only to the thread
 /// running it.
 ///

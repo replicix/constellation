@@ -951,6 +951,7 @@ impl Meta {
         tag: &crate::locks::LockTag,
         now: constellation_types::clock::Now,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
+        self.refuse_in_cut(op, gen)?;
         let _d = journal::PendingDelegate::set(gen, None, deps);
         let records = crate::mutate::execute_tagged(self, op, rid, tag, now)?;
         let idx = self.delegate_idx(gen)?;
@@ -1330,6 +1331,83 @@ impl Meta {
         Ok(out)
     }
 
+    /// Plan 46 M1.3 step 15b (ADR-63): the subtrees this node's stream `gen`
+    /// cut and has not released (empty: none). Node-local; the holder's own
+    /// view of what it stopped executing in.
+    pub fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino> {
+        if !self.own_cut_any.load(Ordering::Acquire) {
+            return Default::default();
+        }
+        let r = self.db.read_tx();
+        own_cut_dirs_tx(&r, &self.local, gen).unwrap_or_default()
+    }
+
+    /// The generations this node holds an own-cut key for, with their
+    /// subtrees (the raw read behind [`Self::delegation_table`]'s view).
+    pub(crate) fn own_cuts_tx(
+        &self,
+        r: &impl Readable,
+    ) -> Result<Vec<(u64, std::collections::BTreeSet<Ino>)>, MetaError> {
+        let mut out = Vec::new();
+        for guard in r.prefix(&self.local, DELEG_OWN_CUT_PREFIX.as_bytes()) {
+            let (k, v) = guard.into_inner()?;
+            let Some(gen) = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|k| k.strip_prefix(DELEG_OWN_CUT_PREFIX))
+                .and_then(|g| g.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let dirs = parse_own_cut(&String::from_utf8_lossy(&v));
+            if !dirs.is_empty() {
+                out.push((gen, dirs));
+            }
+        }
+        Ok(out)
+    }
+
+    /// At open: raise [`Meta::own_cut_any`] when a `deleg_own_cut` key was
+    /// left by a previous process.
+    pub(crate) fn load_own_cut_flag(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        if r.prefix(&self.local, DELEG_OWN_CUT_PREFIX.as_bytes())
+            .next()
+            .is_some()
+        {
+            self.own_cut_any.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// ADR-63's store fence: an execution as the delegate of `gen` touching a
+    /// subtree this node's stream cut is refused (`NotAdmitted`, nothing
+    /// written) and counted ([`Self::take_deleg_exec_in_cut`]). The core
+    /// never admits one (its view forgets the subtree at the cut); this is
+    /// the belt. The keys are judged on the raw fold.
+    fn refuse_in_cut(&self, op: &MutateOp, gen: u64) -> Result<(), MetaError> {
+        if !self.own_cut_any.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.own_cut_dirs(gen).is_empty() {
+            return Ok(());
+        }
+        let keys = TouchSet::from_op_in_names(
+            op,
+            &|p, n| {
+                crate::MetaStore::lookup(self, p, n)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.ino)
+            },
+            &|i, limit| self.names_of_ino(i, limit),
+        );
+        if self.delegation_table_folded().touches_cut(self, &keys, gen) {
+            self.deleg_exec_in_cut.fetch_add(1, Ordering::Relaxed);
+            return Err(MetaError::NotAdmitted);
+        }
+        Ok(())
+    }
+
     /// L1: the `(epoch, idx)` of generation `gen`'s newest own row whose root
     /// append the pre-S3 stream delivered here ([`deleg_streamed_key`]);
     /// `None` when there is none, or after the log's `DelegateNodeEnded`
@@ -1492,6 +1570,46 @@ impl Meta {
         // but release records, before a row.
         let _d = journal::PendingDelegate::set_release(gen, deps, records)?;
         self.apply_records_journaled_inner(records, None, Journaled::Plain)?;
+        self.delegate_idx(gen)
+    }
+
+    /// Plan 46 M1.3 step 15b (ADR-63): the delegate of `gen` journals its
+    /// `ReleaseCut` for `dirs` as the next transaction of its stream, with
+    /// no rid and no op: it stopped executing under them after index `at`.
+    /// The table of every replica that applies the row marks the subtrees
+    /// cut; here, in the same transaction, the node-local `deleg_own_cut`
+    /// key is written, which takes the subtrees out of this node's own view
+    /// ([`Self::delegation_table`]) from this commit on. Returns the stream
+    /// index.
+    ///
+    /// `node` is the holder's id, which the store does not know. A cut is not
+    /// a release: it goes through the gate fence of `begin_local` like any
+    /// execution, so a generation the takeover gate ended refuses it
+    /// (`MetaError::NotAdmitted`, nothing written; such a stream releases
+    /// rowless).
+    pub fn delegate_cut(
+        &self,
+        node: u64,
+        gen: u64,
+        dirs: &[Ino],
+        at: u64,
+        deps: crate::session::Position,
+    ) -> Result<u64, MetaError> {
+        let mut dirs = dirs.to_vec();
+        dirs.sort_unstable();
+        dirs.dedup();
+        let record = LogRecord::ReleaseCut {
+            node,
+            gen,
+            dirs,
+            at,
+        };
+        let _d = journal::PendingDelegate::set(gen, None, deps);
+        let _c = journal::PendingOwnCut::set(gen);
+        // Raised before the commit: a reader that sees it clear is one the
+        // commit has not reached.
+        self.own_cut_any.store(true, Ordering::Release);
+        self.apply_records_journaled_inner(&[record], None, Journaled::Plain)?;
         self.delegate_idx(gen)
     }
 
@@ -3488,6 +3606,214 @@ mod root_substitution_tests {
         assert!(meta.lookup(ROOT_INO, "f4").unwrap().is_none());
     }
 
+    /// ADR-63 fixture: a store holding `/d` and `/e` as one placed stream
+    /// `(1, 5)`.
+    fn cut_fixture() -> (Meta, Ino, Ino) {
+        let meta = Meta::open_in_memory().unwrap();
+        let (d, e) = ((3 << 40) | 900, (3 << 40) | 901);
+        let mkdir = |name: &str, ino: u64| LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: name.into(),
+            ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        };
+        meta.apply_records(&[
+            mkdir("d", d),
+            mkdir("e", e),
+            LogRecord::DelegateNode {
+                node: 1,
+                gen: 5,
+                dirs: vec![
+                    crate::record::SubtreeGrant {
+                        dir: d,
+                        kind: crate::record::SubtreeKind::Placed,
+                    },
+                    crate::record::SubtreeGrant {
+                        dir: e,
+                        kind: crate::record::SubtreeKind::Placed,
+                    },
+                ],
+            },
+        ])
+        .unwrap();
+        (meta, d, e)
+    }
+
+    fn name_key(parent: Ino, name: &str) -> TouchSet {
+        let mut k = TouchSet::default();
+        k.dentries.insert((parent, name.to_string()));
+        k
+    }
+
+    /// ADR-63: the holder's own view forgets the subtrees its `ReleaseCut`
+    /// row cut, from the commit of that row, while the raw fold (and every
+    /// other replica) still lists them as the stream's with the cut mark; its
+    /// release row clears the mark and the node-local key; a replica that
+    /// merely applies the row writes no key.
+    #[test]
+    fn the_holders_view_forgets_its_own_cut_subtrees() {
+        use crate::delegation::Ownership;
+        let (meta, d, e) = cut_fixture();
+        assert_eq!(meta.delegation_table(), meta.delegation_table_folded());
+        assert!(meta.own_cut_dirs(5).is_empty());
+        let idx = meta
+            .delegate_cut(1, 5, &[d], 0, Default::default())
+            .unwrap();
+        assert_eq!(idx, 1, "the stream's next row");
+        assert!(meta.delegate_tx_pending(5, 1).unwrap());
+        assert_eq!(meta.own_cut_dirs(5), BTreeSet::from([d]));
+        // The raw fold: still the stream's, marked cut.
+        let folded = meta.delegation_table_folded();
+        assert_eq!(folded.get(d).map(|x| x.stream()), Some((1, 5)));
+        assert_eq!(folded.cut_of(d), Some((1, 5)));
+        assert!(folded.get(e).is_some() && folded.cut_of(e).is_none());
+        // The view: `/d` is gone, `/e` is not.
+        let view = meta.delegation_table();
+        assert!(view.get(d).is_none() && view.cut_of(d).is_none());
+        assert!(view.get(e).is_some());
+        assert!(view.has_gen(5), "the stream lives on");
+        assert_eq!(
+            meta.resolve_ownership(&name_key(d, "x")),
+            Ownership::Root,
+            "the holder resolves its cut subtree to the root"
+        );
+        assert!(matches!(
+            meta.resolve_ownership(&name_key(e, "x")),
+            Ownership::Delegated(_)
+        ));
+        assert!(
+            !meta.settle_at_cut(&name_key(d, "x")),
+            "the holder's own view has no mark"
+        );
+        assert!(folded.settle_at_cut(&meta, &name_key(d, "x")));
+        // Another replica applying the row marks the table and writes no key.
+        let (other, od, _) = cut_fixture();
+        other
+            .apply_records(&[LogRecord::ReleaseCut {
+                node: 1,
+                gen: 5,
+                dirs: vec![od],
+                at: 0,
+            }])
+            .unwrap();
+        assert_eq!(other.delegation_table_folded().cut_of(od), Some((1, 5)));
+        assert!(other.own_cut_dirs(5).is_empty());
+        assert_eq!(other.delegation_table(), other.delegation_table_folded());
+        // The release row of `/d` clears the mark and the key; `/e` is cut
+        // next and the stream's whole release clears that.
+        meta.delegate_release(
+            &[LogRecord::SubtreeReleased {
+                node: 1,
+                gen: 5,
+                dir: d,
+                at: 0,
+            }],
+            5,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(meta.own_cut_dirs(5).is_empty());
+        assert!(meta.delegation_table_folded().cut_of(d).is_none());
+        meta.delegate_cut(1, 5, &[e], 1, Default::default())
+            .unwrap();
+        assert_eq!(meta.own_cut_dirs(5), BTreeSet::from([e]));
+        meta.delegate_release(
+            &[LogRecord::StreamReleased {
+                node: 1,
+                gen: 5,
+                through: 3,
+            }],
+            5,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(meta.own_cut_dirs(5).is_empty());
+        assert_eq!(meta.delegation_table(), meta.delegation_table_folded());
+    }
+
+    /// ADR-63's store fence: after the cut an execution touching the cut
+    /// subtree is refused `NotAdmitted` with nothing written and counted;
+    /// one in the stream's other subtree, or the root's, goes through.
+    #[test]
+    fn a_cut_subtree_refuses_an_execution_in_the_store() {
+        let (meta, d, e) = cut_fixture();
+        let tag = crate::locks::LockTag::NONE;
+        let create = |parent: Ino, name: &str, n: u64| MutateOp::Create {
+            parent,
+            name: name.into(),
+            ino: (3 << 40) | n,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let run = |op: &MutateOp, seq: u64| {
+            meta.delegate_execute(
+                op,
+                Some(Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq,
+                }),
+                5,
+                Default::default(),
+                &tag,
+                Now::same(0),
+            )
+        };
+        run(&create(d, "before", 1), 1).unwrap();
+        meta.delegate_cut(1, 5, &[d], 2, Default::default())
+            .unwrap();
+        assert_eq!(meta.take_deleg_exec_in_cut(), 0);
+        let journal = meta.journal_len().unwrap();
+        let refused = run(&create(d, "after", 2), 2);
+        assert!(
+            matches!(refused, Err(MetaError::NotAdmitted)),
+            "{refused:?}"
+        );
+        assert_eq!(meta.journal_len().unwrap(), journal, "nothing was written");
+        assert!(meta.lookup(d, "after").unwrap().is_none());
+        assert_eq!(meta.take_deleg_exec_in_cut(), 1);
+        run(&create(e, "other", 3), 3).unwrap();
+        assert_eq!(meta.take_deleg_exec_in_cut(), 0);
+        // Once released the subtree is the root's: the delegate no longer
+        // holds it, and the fence has nothing to say (the core refuses).
+        meta.delegate_release(
+            &[LogRecord::SubtreeReleased {
+                node: 1,
+                gen: 5,
+                dir: d,
+                at: 2,
+            }],
+            5,
+            Default::default(),
+        )
+        .unwrap();
+        run(&create(d, "later", 4), 4).unwrap();
+        assert_eq!(meta.take_deleg_exec_in_cut(), 0);
+    }
+
+    /// ADR-63: no cut is journaled on a generation the takeover gate ended
+    /// (such a stream releases rowless): the store fence refuses it with
+    /// nothing written, and the node-local key is not set.
+    #[test]
+    fn a_gate_ended_generation_refuses_a_cut_row() {
+        let (meta, d, _) = cut_fixture();
+        meta.strand_for_takeover(2, &[5], None).unwrap();
+        assert!(meta.deleg_ended_at_gate(5).unwrap());
+        let journal = meta.journal_len().unwrap();
+        let refused = meta.delegate_cut(1, 5, &[d], 0, Default::default());
+        assert!(
+            matches!(refused, Err(MetaError::NotAdmitted)),
+            "{refused:?}"
+        );
+        assert_eq!(meta.journal_len().unwrap(), journal, "nothing was written");
+        assert!(meta.own_cut_dirs(5).is_empty());
+        assert!(meta.delegation_table_folded().cut_of(d).is_none());
+    }
+
     /// A takeover's strand of this node's own delegate rows takes them out
     /// of the journal and sets the stream counter to the log's index (no
     /// hole: step 6); every generation this node holds is marked in the
@@ -3645,6 +3971,88 @@ pub(crate) fn deleg_idx_assigned_tx(
 /// copied by the in-process rebuild ([`Meta::replace_ns_from_rebuilt`]).
 pub(crate) const DELEG_LOG_IDX_PREFIX: &str = "deleg_log_idx:";
 pub(crate) const DELEG_VOID_CUT_PREFIX: &str = "deleg_void_cut:";
+/// `local` kv (plan 46 M1.3 step 15b, ADR-63): the subtrees this node's own
+/// stream `gen` cut and has not released, sorted, comma-separated. Written in
+/// the transaction of the `ReleaseCut` row ([`Meta::delegate_cut`]); cleared
+/// by the apply of the stream's release row for that subtree, its
+/// `StreamReleased` or its `DelegateNodeEnded`, wherever that runs.
+pub(crate) const DELEG_OWN_CUT_PREFIX: &str = "deleg_own_cut:";
+
+fn deleg_own_cut_key(gen: u64) -> String {
+    format!("{DELEG_OWN_CUT_PREFIX}{gen}")
+}
+
+fn parse_own_cut(v: &str) -> std::collections::BTreeSet<Ino> {
+    v.split(',').filter_map(|d| d.parse().ok()).collect()
+}
+
+pub(crate) fn own_cut_dirs_tx(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) -> Result<std::collections::BTreeSet<Ino>, MetaError> {
+    Ok(kv_get_tx(r, local, &deleg_own_cut_key(gen))?
+        .map(|v| parse_own_cut(&v))
+        .unwrap_or_default())
+}
+
+fn put_own_cut_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+    dirs: &std::collections::BTreeSet<Ino>,
+) {
+    if dirs.is_empty() {
+        tx.remove(local, deleg_own_cut_key(gen).into_bytes());
+    } else {
+        let v = dirs
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        kv_set_tx(tx, local, &deleg_own_cut_key(gen), &v);
+    }
+}
+
+/// This node's stream `gen` cut `dirs`: they join its own-cut key.
+pub(crate) fn mark_own_cut_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    gen: u64,
+    dirs: &[Ino],
+) -> Result<(), MetaError> {
+    let mut set = own_cut_dirs_tx(&*tx, &meta.local, gen)?;
+    set.extend(dirs.iter().copied());
+    meta.own_cut_any.store(true, Ordering::Release);
+    put_own_cut_tx(tx, &meta.local, gen, &set);
+    Ok(())
+}
+
+/// The apply of stream `gen`'s release row: `dir` (`None`: every subtree)
+/// leaves its own-cut key. A no-op where the key is not (every replica but
+/// the holder, and the holder before any cut: one atomic load).
+pub(crate) fn clear_own_cut_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    gen: u64,
+    dir: Option<Ino>,
+) -> Result<(), MetaError> {
+    if !meta.own_cut_any.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut set = own_cut_dirs_tx(&*tx, &meta.local, gen)?;
+    if set.is_empty() {
+        return Ok(());
+    }
+    match dir {
+        Some(d) => {
+            set.remove(&d);
+        }
+        None => set.clear(),
+    }
+    put_own_cut_tx(tx, &meta.local, gen, &set);
+    Ok(())
+}
 
 /// `local` kv: the highest index of generation `gen` this replica holds
 /// *from the log* (appended in the root's journal here, or applied from

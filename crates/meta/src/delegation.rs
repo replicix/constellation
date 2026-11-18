@@ -304,6 +304,20 @@ impl DelegationTable {
             .collect()
     }
 
+    /// Whether any key of `keys` lies in a subtree of stream `gen` that its
+    /// holder cut and has not released (ADR-63's store fence).
+    pub fn touches_cut(&self, ns: &dyn Namespace, keys: &TouchSet, gen: Gen) -> bool {
+        if self.cut.is_empty() {
+            return false;
+        }
+        let hit = |ino: Ino| {
+            self.covering(ns, ino)
+                .is_some_and(|d| d.gen == gen && self.cut_of(d.dir) == Some(d.stream()))
+        };
+        keys.dentries.iter().any(|(parent, _)| hit(*parent))
+            || keys.inos.iter().chain(keys.shared.iter()).any(|i| hit(*i))
+    }
+
     /// Whether a settle on `keys` is answered at a cut (ADR-63): at least one
     /// key's covering delegation is a subtree its holder cut, and every key's
     /// is either the root's (`None`) or such a cut one. A key under a live,
@@ -646,10 +660,40 @@ impl Meta {
     /// The live delegation table as this replica knows it: the fold of
     /// every `DelegateNode`/`SubtreeReleased`/`StreamReleased`/
     /// `DelegateNodeEnded` record it applied (its journal
-    /// included, on the root). One point read of a small key.
+    /// included, on the root), **less the subtrees this node's own stream
+    /// cut** (plan 46 M1.3 step 15b, ADR-63): from the `ReleaseCut` row the
+    /// holder stopped executing there, so its own view forgets them as its
+    /// release row would, while every other replica's table still lists them
+    /// as the stream's until the release row. One point read of a small key,
+    /// and no look at the node-local cut keys while none was ever written.
     pub fn delegation_table(&self) -> DelegationTable {
         let r = self.db.read_tx();
+        let mut table = read_table_tx(&r, self).unwrap_or_default();
+        if self.own_cut_any.load(std::sync::atomic::Ordering::Acquire) {
+            for (gen, dirs) in self.own_cuts_tx(&r).unwrap_or_default() {
+                let Some(node) = table.node_of_gen(gen) else {
+                    continue;
+                };
+                for dir in dirs {
+                    table.apply(DelegationRecord::SubtreeReleased { node, gen, dir });
+                }
+            }
+        }
+        table
+    }
+
+    /// The raw fold: [`Self::delegation_table`] with this node's own cut
+    /// subtrees still listed as its stream's, and the marks of every
+    /// stream's cut. For tests, the holder's re-drive and the store fence.
+    pub fn delegation_table_folded(&self) -> DelegationTable {
+        let r = self.db.read_tx();
         read_table_tx(&r, self).unwrap_or_default()
+    }
+
+    /// ADR-63: whether a settle on `keys` is answered at a cut, on this
+    /// replica's view of the table.
+    pub fn settle_at_cut(&self, keys: &TouchSet) -> bool {
+        self.delegation_table().settle_at_cut(self, keys)
     }
 
     /// Plan 43 C2: generation `gen`'s configuration as this replica's table

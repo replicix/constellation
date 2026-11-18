@@ -663,6 +663,14 @@ pub struct Meta {
     /// root's FUSE fast path reads this atomic before it looks at the
     /// table at all, so a cluster without delegations pays nothing.
     pub(crate) deleg_any: AtomicBool,
+    /// Plan 46 M1.3 step 15b (ADR-63): a node-local `deleg_own_cut` key was
+    /// written here (or found at open). Raised only: while it is clear,
+    /// [`Meta::delegation_table`] is the raw fold with no look at the keys.
+    pub(crate) own_cut_any: AtomicBool,
+    /// Executions the store refused because they touch a subtree this node's
+    /// stream cut (ADR-63's fence, `deleg_exec_in_cut`); read by
+    /// [`Meta::take_deleg_exec_in_cut`].
+    deleg_exec_in_cut: AtomicU64,
     /// Plan 30 §M12: the root's FUSE fast path holds this *shared*
     /// from its ownership check through its execution; a transaction
     /// that journals a `DelegateNode` or `DelegateNodeEnded` record here
@@ -1201,6 +1209,13 @@ impl Meta {
         self.deleg_append_uncompleted.swap(0, Ordering::Relaxed)
     }
 
+    /// Plan 46 M1.3 step 15b: the executions refused since the last call
+    /// because they touch a subtree this node's stream cut (must stay 0: the
+    /// core never admits one).
+    pub fn take_deleg_exec_in_cut(&self) -> u64 {
+        self.deleg_exec_in_cut.swap(0, Ordering::Relaxed)
+    }
+
     pub fn take_deleg_append_skipped(&self) -> u64 {
         self.deleg_append_skipped.swap(0, Ordering::Relaxed)
     }
@@ -1412,6 +1427,8 @@ impl Meta {
             journal_read_faults: std::sync::atomic::AtomicU32::new(0),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
+            own_cut_any: AtomicBool::new(false),
+            deleg_exec_in_cut: AtomicU64::new(0),
             deleg_gate: std::sync::RwLock::new(()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
@@ -1493,6 +1510,7 @@ impl Meta {
         meta.load_stream_fills()?;
         meta.load_read_holds()?;
         meta.refresh_holder_append_tip()?;
+        meta.load_own_cut_flag()?;
         meta.build_pending_by_ino()?;
         meta.verify_mark_counts()?;
         {
