@@ -1295,14 +1295,15 @@ fn next_spec_seq_tx(
 /// segment on it), and otherwise proportional to what is outstanding —
 /// both scans start at their floors, past the retired history.
 fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, MetaError> {
+    live_scan::note_read_live();
+    let mut out = live_non_local_uncounted_call(r, meta)?;
+    out.extend(live_local(r, meta)?);
+    Ok(out)
+}
+
+/// The own `Local` transactions of [`read_live`] (the tail of its result).
+fn live_local(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, MetaError> {
     let mut out = Vec::new();
-    if counter_get(r, &meta.local, KV_SPEC_LIVE_COUNT)? > 0 {
-        let floor = counter_get(r, &meta.local, KV_SPEC_FLOOR)?;
-        for guard in r.range(&meta.spec_live, seq_key(floor)..) {
-            let (k, v) = guard.into_inner()?;
-            out.push((decode_seq(&k)?, crate::record::from_bytes_exact(&v)?));
-        }
-    }
     if counter_get(r, &meta.local, KV_LOCAL_SPEC_COUNT)? == 0 {
         return Ok(out);
     }
@@ -1319,6 +1320,7 @@ fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, Me
             ));
         }
     }
+    live_scan::note_decoded(out.len());
     Ok(out)
 }
 
@@ -1326,6 +1328,16 @@ fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, Me
 /// normally empty): one counter read when there are none, and never a
 /// scan of this node's own `Local` backlog.
 fn live_non_local(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, MetaError> {
+    live_scan::note_read_live();
+    live_non_local_uncounted_call(r, meta)
+}
+
+/// [`live_non_local`]'s scan, without counting a call (`read_live` counts
+/// its own).
+fn live_non_local_uncounted_call(
+    r: &impl Readable,
+    meta: &Meta,
+) -> Result<Vec<(u64, LiveEntry)>, MetaError> {
     let mut out = Vec::new();
     if counter_get(r, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {
         return Ok(out);
@@ -1335,7 +1347,130 @@ fn live_non_local(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)
         let (k, v) = guard.into_inner()?;
         out.push((decode_seq(&k)?, crate::record::from_bytes_exact(&v)?));
     }
+    live_scan::note_decoded(out.len());
     Ok(out)
+}
+
+/// One `StreamAhead` install transaction's view of the outstanding
+/// entries (O1): `spec_live` read once, this node's own `Local` rows read
+/// only if a helper needs them. A helper that is handed it sees exactly
+/// what its own [`read_live`] would see at that point of the transaction,
+/// provided the snapshot is read again after every step that writes
+/// `spec_live` or the journal tx heads; debug builds check that at each
+/// use ([`Self::check`]).
+struct LiveSnap {
+    non_local: Vec<(u64, LiveEntry)>,
+    local: Option<Vec<(u64, LiveEntry)>>,
+}
+
+impl LiveSnap {
+    fn read(r: &impl Readable, meta: &Meta) -> Result<Self, MetaError> {
+        live_scan::note_read_live();
+        Ok(Self {
+            non_local: live_non_local_uncounted_call(r, meta)?,
+            local: None,
+        })
+    }
+
+    /// What [`read_live`] returns, as a map; reads the `Local` rows the
+    /// first time.
+    fn map(
+        &mut self,
+        r: &impl Readable,
+        meta: &Meta,
+    ) -> Result<HashMap<u64, LiveEntry>, MetaError> {
+        if self.local.is_none() {
+            self.local = Some(live_local(r, meta)?);
+        }
+        let local = self.local.iter().flatten();
+        Ok(self.non_local.iter().chain(local).copied().collect())
+    }
+
+    /// Debug builds: the snapshot equals a fresh read at this point.
+    fn check(&self, r: &impl Readable, meta: &Meta, site: &str) {
+        #[cfg(debug_assertions)]
+        {
+            let _quiet = live_scan::Quiet::new();
+            let fresh = live_non_local_uncounted_call(r, meta).expect("cross-check read");
+            assert_eq!(
+                self.non_local, fresh,
+                "shared live snapshot diverged from a fresh read_live at {site}"
+            );
+            if let Some(local) = &self.local {
+                let fresh = live_local(r, meta).expect("cross-check read");
+                assert_eq!(
+                    local, &fresh,
+                    "shared live snapshot (Local rows) diverged from a fresh read_live at {site}"
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = (r, meta, site);
+    }
+}
+
+/// Test-only counters of the live scans (`read_fault`'s pattern): how many
+/// times a scan of the outstanding entries started, and how many entries
+/// it decoded, on this thread.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) mod live_scan {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+        static DECODED: Cell<u64> = const { Cell::new(0) };
+        static QUIET: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn note_read_live() {
+        if !QUIET.with(Cell::get) {
+            CALLS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    pub(crate) fn note_decoded(n: usize) {
+        if !QUIET.with(Cell::get) {
+            DECODED.with(|c| c.set(c.get() + n as u64));
+        }
+    }
+
+    /// `(scans started, entries decoded)` on this thread since its start.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn totals() -> (u64, u64) {
+        (CALLS.with(Cell::get), DECODED.with(Cell::get))
+    }
+
+    /// Keeps the debug cross-check's own reads out of the counters.
+    #[cfg(debug_assertions)]
+    pub(crate) struct Quiet(bool);
+
+    #[cfg(debug_assertions)]
+    impl Quiet {
+        pub(crate) fn new() -> Self {
+            Self(QUIET.with(|q| q.replace(true)))
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            QUIET.with(|q| q.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "test-util")))]
+mod live_scan {
+    pub(super) fn note_read_live() {}
+    pub(super) fn note_decoded(_: usize) {}
+    #[cfg(debug_assertions)]
+    pub(super) struct Quiet;
+    #[cfg(debug_assertions)]
+    impl Quiet {
+        pub(super) fn new() -> Self {
+            Self
+        }
+    }
 }
 
 /// Plan 30 §M9: the live `Streamed` entry whose records complete `rid`,
@@ -1480,7 +1615,19 @@ fn shadow_row_for(
     meta: &Meta,
     rid: Rid,
 ) -> Result<Option<(u64, u64, MutateOp, LockTag)>, MetaError> {
-    for (seq, entry) in read_live(r, meta)? {
+    shadow_row_in(r, meta, &LiveSnap::read(r, meta)?, rid)
+}
+
+/// [`shadow_row_for`] over a snapshot the install transaction already
+/// holds (a shadow is a `spec_live` entry: the `Local` rows are no use).
+fn shadow_row_in(
+    r: &impl Readable,
+    meta: &Meta,
+    snap: &LiveSnap,
+    rid: Rid,
+) -> Result<Option<(u64, u64, MutateOp, LockTag)>, MetaError> {
+    snap.check(r, meta, "shadow_row_for");
+    for &(seq, entry) in &snap.non_local {
         if !matches!(entry, LiveEntry::Shadow { rid: r2, .. } if r2 == rid) {
             continue;
         }
@@ -3093,19 +3240,23 @@ fn incoming_touches(
 fn streamed_out_of_place(
     r: &impl Readable,
     meta: &Meta,
+    snap: &mut LiveSnap,
     epoch: u64,
     adopt: Option<u64>,
     records: &[LogRecord],
 ) -> Result<Option<u64>, MetaError> {
-    let Some(cutoff) = live_non_local(r, meta)?
-        .into_iter()
+    snap.check(r, meta, "streamed_out_of_place");
+    let Some(cutoff) = snap
+        .non_local
+        .iter()
         .filter(|(_, entry)| matches!(entry, LiveEntry::Shadow { .. }))
-        .map(|(seq, _)| seq)
+        .map(|(seq, _)| *seq)
         .min()
     else {
         return Ok(None);
     };
-    let live: HashMap<u64, LiveEntry> = read_live(r, meta)?.into_iter().collect();
+    let live = snap.map(r, meta)?;
+    snap.check(r, meta, "streamed_out_of_place (Local rows)");
     let rows = read_rows_from(r, &meta.spec, cutoff)?;
     let touches = match adopt {
         Some(x) => match rows.iter().find(|(seq, _)| *seq == x) {
@@ -3161,10 +3312,13 @@ fn insert_streamed_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     staged: &UsageTracker,
+    snap: &mut LiveSnap,
     cutoff: u64,
     t: StreamedTx<'_>,
 ) -> Result<(), MetaError> {
-    let mut live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
+    snap.check(&*tx, meta, "insert_streamed_tx");
+    let mut live = snap.map(&*tx, meta)?;
+    snap.check(&*tx, meta, "insert_streamed_tx (Local rows)");
     let rows = read_rows_from(tx, &meta.spec, cutoff)?;
     let plain = meta.dirty_for_ns();
     for (_, row) in rows.iter().rev() {
@@ -3480,13 +3634,20 @@ fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<
     if counter_get(r, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {
         return Ok(None);
     }
-    Ok(read_live(r, meta)?
-        .into_iter()
-        .filter_map(|(_, entry)| match entry {
+    Ok(streamed_tip_in(r, meta, &LiveSnap::read(r, meta)?, epoch))
+}
+
+/// [`streamed_tip_tx`] over a snapshot the install transaction already
+/// holds (a streamed entry is a `spec_live` entry).
+fn streamed_tip_in(r: &impl Readable, meta: &Meta, snap: &LiveSnap, epoch: u64) -> Option<u64> {
+    snap.check(r, meta, "streamed_tip");
+    snap.non_local
+        .iter()
+        .filter_map(|&(_, entry)| match entry {
             LiveEntry::Streamed { epoch: e, last, .. } if e == epoch => Some(last),
             _ => None,
         })
-        .max())
+        .max()
 }
 
 /// Whether the log carries `rid`'s outcome already: a row applied from a
@@ -5183,7 +5344,10 @@ impl Meta {
         // stream is contiguous and in order, so a transaction at or
         // below the highest installed one of this epoch is one this
         // replica has (or a hole it stepped over).
-        if streamed_tip_tx(&tx, self, epoch)?.is_some_and(|tip| first <= tip) {
+        // One read of the outstanding entries serves every helper below
+        // (O1); it is read again after each step that writes them.
+        let mut live = LiveSnap::read(&tx, self)?;
+        if streamed_tip_in(&tx, self, &live, epoch).is_some_and(|tip| first <= tip) {
             if marked {
                 tx.commit()?;
                 self.flush_held_releases();
@@ -5212,6 +5376,7 @@ impl Meta {
             let rolled = super::member::rolled_back_idents(records);
             if !rolled.is_empty() {
                 Self::retract_rolled_back_tx(&mut tx, self, &staged, &rolled)?;
+                live = LiveSnap::read(&tx, self)?;
             }
         }
         // Seed 1678: this node's append, as the root of an earlier
@@ -5255,6 +5420,7 @@ impl Meta {
                     None,
                     |e| matches!(e, LiveEntry::Local { first, .. } if sup.contains(first)),
                 )?;
+                live = LiveSnap::read(&tx, self)?;
             }
         }
         let mut adopt: Option<(u64, Rid, MutateOp, LockTag)> = None;
@@ -5276,7 +5442,7 @@ impl Meta {
                     }
                     return Ok(());
                 }
-                if let Some((seq, _, op, tag)) = shadow_row_for(&tx, self, *rid)? {
+                if let Some((seq, _, op, tag)) = shadow_row_in(&tx, self, &live, *rid)? {
                     adopt = Some((seq, *rid, op, tag));
                     break;
                 }
@@ -5322,8 +5488,14 @@ impl Meta {
         // other replica ended on node 0's). When that order matters (the
         // keys overlap), roll back to the oldest outstanding shadow and
         // redo in the log's order.
-        let out_of_place =
-            streamed_out_of_place(&tx, self, epoch, adopt.as_ref().map(|a| a.0), records)?;
+        let out_of_place = streamed_out_of_place(
+            &tx,
+            self,
+            &mut live,
+            epoch,
+            adopt.as_ref().map(|a| a.0),
+            records,
+        )?;
         let cutoff = match (out_of_place, shadow_lacks_effect) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -5333,6 +5505,7 @@ impl Meta {
                 &mut tx,
                 self,
                 &staged,
+                &mut live,
                 cutoff,
                 StreamedTx {
                     epoch,

@@ -70706,3 +70706,62 @@ own gap arm), so the keepers queue the copies past the cut to replay by rid inst
 `tail_beyond_gap_dropped` residual (17 rows over the sweeps) was replayed seed by seed with throwaway instrumentation (not committed):
 16 rows were carried by the log at the drop (benign), 1 was a refusal row past a pipelined hold whose rid is in the final log; no
 acknowledged row was lost. Not fixed here (the counter still mixes the classes).
+
+## O1: one live read per `StreamAhead` install transaction (2026-11-18)
+
+Spec B of the round-trip profile (rtprof), step 1 only. `Meta::install_streamed_committed` read the outstanding entries (`read_live`: a range scan of
+`spec_live` and the journal tx heads, every entry postcard-decoded) once per helper: `streamed_tip_tx`, `shadow_row_for` (once per `Completed`
+record), `streamed_out_of_place` (`live_non_local` and `read_live`), and `insert_streamed_tx`. A backup's install therefore cost a multiple of the
+speculation outstanding since the last segment apply.
+
+**Change.** `spec::LiveSnap` holds the `spec_live` entries read once (and this node's own `Local` rows, read lazily, only by the helpers that need them,
+so a node with a `Local` backlog and an empty `spec_live` still reads none). The four helpers have snapshot forms (`streamed_tip_in`, `shadow_row_in`,
+`streamed_out_of_place`, `insert_streamed_tx` take the snapshot); `streamed_tip_tx` and `shadow_row_for` keep their signatures as thin wrappers for their
+other callers. The snapshot is read again after each step of the transaction that writes `spec_live` or the journal tx heads: after
+`retract_rolled_back_tx` and after the `strand_tx` of superseded root appends. In debug builds every use asserts the snapshot equals a fresh read
+("shared live snapshot diverged from a fresh read_live at <site>"). `promote_streamed` keeps its own read (once per batch).
+
+**Counters.** `spec::live_scan` (`cfg(any(test, feature = "test-util"))`, thread-local like `read_fault`): scans started and entries decoded.
+
+**Fail-before** (`store/live_scan_tests.rs`: one outstanding shadow, then 400 streamed creates of one epoch with a `Completed` each and no segment in
+between). On the base with only the counters added: install #10 decodes 40 entries, install #400 decodes 1,600 (4 x the 400 outstanding: tip, non-local,
+read_live, one `shadow_row_for`); `install_streamed_decodes_at_most_twice_the_outstanding_entries` (bound 2 x 400) fails there. With the change: 10 and
+400 (one read, linear in the outstanding entries); the test passes. The spec expected about 5 x on the base; without a `Completed` record it is 3 x, with
+one 4 x, so the bound is 2 x. `install_streamed_scans_do_not_grow_with_outstanding` (#400 within #10 + 8) is `#[ignore]`d ("Step 2"): it still fails,
+as the spec says it must (10 vs 400).
+
+**Gates.** fmt; clippy `--workspace --all-targets -D warnings`; lib tests of meta, authority and engine in debug (1,702 / 991 / 478 passed) and release
+(1,702 / 991 / 477); `cargo test -p constellation-authority --release` including the sim suite (575 passed, 0 failed, 16 ignored). The debug runs
+exercise the cross-check on every install.
+
+**Sims, base (origin/main) vs fix, 2,000 seeds, release.** 40 labels: the `links`, `flex`, `backup-crash`, `ahead` and `delegated*` labels of the
+hlfix2 C1/C2 lists that stream and speculate (the full 242-label union was about 11 h on this loaded box and was not run). Same failing seeds on both
+sides in every label (18 seeds in 4 `+commit+unsettled` labels on each side, the known I4 set), identical failure messages, no new I-class or lock failure,
+one sweep-join panic per failing label on both sides. Fingerprints differ seed by seed as before (this sim's run-to-run noise), not compared.
+Debug sim (cross-check live): 6 labels at 300 seeds and `long-delegated-backup+links` at 2,000 (a debug seed is ~7 x slower; the other three 2,000-seed debug labels were cut): 0 failures, 0 panics, the message above never appears.
+
+**Round-trip A/B** (`hardlink-burst`, seed 42, two nodes, release, box load 37-96 from other jobs, so spread is wide).
+Plain build, 3 interleaved rounds per file system, median [min-max] (total link time of 8,192 links; client `took` p50 and p99):
+
+| fs | build | total s | p50 us | p99 us |
+|---|---|---|---|---|
+| tmpfs (load 37-40) | base | 12.4 [11.2-12.6] | 579 [522-625] | 8,279 [7,535-8,390] |
+| tmpfs | O1 | 11.2 [9.9-12.1] | 545 [500-574] | 7,257 [6,478-8,229] |
+| ext4 (load 31-39, second set) | base | 10.6 [8.1-11.1] | 611 [502-660] | 6,574 [4,698-6,707] |
+| ext4 | O1 | 9.6 [8.5-9.8] | 540 [518-581] | 6,195 [4,894-6,339] |
+
+(A first ext4 set ran at box load 37-96 and is not usable: base 13.7 s [11.7-26.6], O1 21.1 s [8.9-22.5].) The direction is faster on both file systems, but the
+spread of the rounds is as wide as the difference; read it as "no regression, small gain".
+
+Instrumented builds (`instr.patch`, trace points, so absolute values are higher), stage 10 (B's driver wait) and B's `StreamAhead` step sum:
+
+| run | stage 10 p50 / mean us | `StreamAhead` n, sum ms |
+|---|---|---|
+| tmpfs base r1 / r2 | 15 / 151, 16 / 156 | 1,366: 1,256; 1,463: 1,371 |
+| tmpfs O1 r1 / r2 | 14 / 101, 16 / 183 | 1,225: 846; 1,981: 1,228 |
+| ext4 base | 15 / 120 | 1,430: 1,236 |
+| ext4 O1 | 16 / 101 | 1,291: 922 |
+
+**Result.** The `StreamAhead` sum falls by about a quarter to a third (1.26-1.37 s to 0.85-1.23 s), not to the ~0.4 s the spec hoped for, and stage 10's mean
+stays at 100-180 us (above the 60 us bar). The remaining cost is the same linear scans (`read_rows_from` decodes every row from the oldest shadow's
+seq on, the one snapshot read, memcpy): Step 2's trigger holds, and it needs an Opus design pass and a fable review before any code.

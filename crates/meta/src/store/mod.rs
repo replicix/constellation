@@ -112,6 +112,8 @@ mod close_tests;
 pub mod held;
 pub mod inbox;
 pub(crate) mod journal;
+#[cfg(test)]
+mod live_scan_tests;
 pub(crate) mod local;
 #[cfg(test)]
 mod lock_bench;
