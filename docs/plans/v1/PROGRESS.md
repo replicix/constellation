@@ -71220,3 +71220,14 @@ PUT can land after the read and release the lease under a node that went on as h
 - **Gates** (final tree, box2, fresh build, 6 threads): fmt, `clippy --workspace --all-targets -D warnings` clean; lib tests debug and release:
   authority 1778, engine 1003, meta 486/485, 0 failed; the release sim suite 584 passed, 0 failed, 16 ignored, with
   `m03_the_configurations_at_zero_violations_stay_there` and the ceilings unchanged (none raised).
+### Sim determinism: `seed -> fingerprint` is a pure function (2026-11-18)
+
+Five sources made two runs of one seed differ (diagnosis: simdet; 432 differing seeds of 12,000 between 2 and 8 sweep threads on main). Fixed, one commit each: the sim's crash drops
+its waiters' reply/control senders in key order (`Shared::replies`/`controls` are `BTreeMap`s; the drop order was a random hash order that reordered the woken
+clients' submits and the bus RNG draws); `Stats::reship_duration_ms_max` reads the node's wait clock (`Meta::wait_clock_ms`, as `held_copy_now_ms`), not
+the host `Instant` (load-dependent 0..4 ms in the fingerprint); the placement walks directories in `Ino` order, so an exact tie takes the lowest inode (product
+change: placement was hash-ordered on ties, and the status list is tie-broken too); `AUTHORITY_SIM_FP_FILE` writes fingerprint lines whole; `run_seed`'s
+`select!` is biased and the checkers' failure text no longer depends on map order. Pinned by `seed_runs_are_repeatable` (flex+links 955),
+`seed_runs_are_repeatable_across_a_placement_tie` (placement-hot+links 235), core `a_placement_tie_takes_the_lowest_directory`, meta
+`reship_hold_ms_reads_the_wait_clock`, `fp_file_lines_are_written_whole`; gated by `tools/sim-determinism-gate.sh` (TESTING.md, "The determinism gate").
+Not in scope: HLC stamps from the host clock in record payloads, and the 10 s / 300 s host-clock thresholds (session watermark TTL, `atime_stale`).

@@ -4627,6 +4627,31 @@ AUTHORITY_SIM_CONFIG=long-backup AUTHORITY_SIM_START=50000 AUTHORITY_SIM_SEEDS=1
   cargo test -p constellation-authority --release --test sim -- --ignored --exact sweep_config --nocapture
 ```
 
+### The determinism gate
+
+A seed's run is a pure function of the seed: `seed -> fingerprint`, whatever
+the machine's load or the sweep's thread count (the contract is the doc of
+`run_seed`). `AUTHORITY_SIM_FINGERPRINT=1` makes `sweep_config` print a
+`SWEEP-FP` line per seed; `AUTHORITY_SIM_FP_FILE=<path>` also appends
+`<label> <seed> <fingerprint>` to a file, each line whole under one lock (the
+stderr line can be lost or spliced with another thread's tracing line, which
+reads as a false difference: compare the file, sorted). The landing gate
+runs, from the repository root,
+
+```bash
+tools/sim-determinism-gate.sh 300 /tmp/det   # 8 labels x 300 seeds at 2 and at 16 threads, ~4 min on 16 cores
+```
+
+which passes when the sorted fingerprint files and the failing seed sets of
+the two arms are identical. A difference is a nondeterminism source: find
+the seed, run it repeatedly on one thread (`seed_runs_are_repeatable` is the
+shape), and diff the traces (`RUST_LOG=constellation_authority=debug`). The
+sources found so far: a crash dropped its waiters in hash order, a duration
+read from the host clock reached `Stats`, a placement tie went to the hash
+order, a lost `SWEEP-FP` line. Record payloads still carry host-clock HLC
+stamps (segment bytes and `SWEEP-SIG stored` differ per run; schedule and
+fingerprint do not).
+
 `sweep_config` runs any `long_*` configuration in parallel, prints every
 failing seed (`SWEEP-FAIL`), and fails at the end: `long-sessions`
 (`long_random`), `long-strict`, `long-backup` and `long-acks3`
