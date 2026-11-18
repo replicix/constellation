@@ -3473,6 +3473,17 @@ mod tests {
         assert!(!inner
             .p2p
             .is_allowed(&asker.inner.as_ref().unwrap().p2p.pubkey_hex()));
+        // The subscription it opened earlier gets no further frame. This is asserted
+        // before any new stream from the revoked key: that closes the whole
+        // connection, the log stream with it, and would hide a missing check.
+        let _ = feed.send(frame(1)).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), log.recv())
+            .await
+            .expect("the revoked subscription was left open");
+        assert!(
+            !matches!(got, Some(crate::endpoint::LogEvent::Frame { .. })),
+            "a revoked node received a log frame: {got:?}"
+        );
         for payload in [&ping, &lease] {
             assert!(
                 asker.request_raw(to.clone(), payload).await.is_err(),
@@ -3483,15 +3494,6 @@ mod tests {
             service.lease_asks.lock().unwrap().len(),
             1,
             "the revoked key's request must never reach the service"
-        );
-        // The subscription it opened earlier gets no further frame.
-        let _ = feed.send(frame(1)).await;
-        let got = tokio::time::timeout(Duration::from_secs(5), log.recv())
-            .await
-            .expect("the revoked subscription was left open");
-        assert!(
-            !matches!(got, Some(crate::endpoint::LogEvent::Frame { .. })),
-            "a revoked node received a log frame: {got:?}"
         );
     }
 
