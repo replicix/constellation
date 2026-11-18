@@ -4724,6 +4724,144 @@ mod verbatim_append_tests {
         assert_eq!(meta.delegate_idx(GEN).unwrap(), 2);
     }
 
+    /// ADR-60 / stickyfix review S1: a claim's release row that the log does
+    /// not carry yet is an own row of the next takeover gate. The strand
+    /// puts it back verbatim, like the rows below it (it has no rid, and
+    /// nothing replays it), instead of halting the re-append and leaving
+    /// every row after it to the replay by rid.
+    #[test]
+    fn a_second_gate_reappends_an_unshipped_release_row() {
+        use crate::store::spec::{StrandArgs, TailArgs};
+        const GEN: u64 = 7;
+        let meta = Meta::open_in_memory().unwrap();
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        meta.apply_segment(
+            1,
+            1,
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::delegate_one(3, GEN, dir, crate::SubtreeKind::Placed),
+            ],
+            &crate::replay::TouchSet::default(),
+        )
+        .unwrap();
+        for n in 1..=2 {
+            let op = crate::mutate::MutateOp::Create {
+                parent: dir,
+                name: format!("r{n}"),
+                ino: meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            meta.delegate_execute(
+                &op,
+                Some(rid(n)),
+                GEN,
+                Default::default(),
+                &Default::default(),
+                constellation_types::clock::Now::same(0),
+            )
+            .unwrap();
+        }
+        let tail = crate::BackupTx {
+            first: 1,
+            last: 2,
+            records: vec![
+                create("t", 9),
+                LogRecord::Completed {
+                    rid: Rid {
+                        node: 1,
+                        incarnation: 1,
+                        seq: 9,
+                    },
+                },
+            ],
+            origin: (0, 0),
+        };
+        meta.backup_append(1, std::slice::from_ref(&tail)).unwrap();
+        let (carried, proof) = (Default::default(), Default::default());
+        let reship = |meta: &Meta, epoch: u64, tail: Option<TailArgs>| {
+            meta.reship_at_takeover(
+                Some(StrandArgs {
+                    epoch,
+                    own_gens: &[GEN],
+                    abandoned: None,
+                    carried: &carried,
+                    proof: &proof,
+                    marker: &[],
+                    own_lost_from: &Default::default(),
+                    reappend_version: 1,
+                }),
+                tail,
+            )
+            .unwrap()
+        };
+        let first = reship(
+            &meta,
+            2,
+            Some(TailArgs {
+                epoch: 1,
+                through: 2,
+                config_version: 3,
+                class: None,
+            }),
+        );
+        assert_eq!(first.own_reappended, 2, "{first:?}");
+        // The claim's release row through the gate, unshipped.
+        let released = meta
+            .delegate_release(
+                &[LogRecord::StreamReleased {
+                    node: 1,
+                    gen: GEN,
+                    through: 2,
+                }],
+                GEN,
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(released, 3);
+        // The claimant dies before the log carries it: the next gate.
+        let tail2 = crate::BackupTx {
+            first: 1,
+            last: 1,
+            records: vec![
+                create("t2", 10),
+                LogRecord::Completed {
+                    rid: Rid {
+                        node: 1,
+                        incarnation: 1,
+                        seq: 10,
+                    },
+                },
+            ],
+            origin: (0, 0),
+        };
+        meta.backup_append(2, std::slice::from_ref(&tail2)).unwrap();
+        let second = reship(
+            &meta,
+            3,
+            Some(TailArgs {
+                epoch: 2,
+                through: 1,
+                config_version: 3,
+                class: None,
+            }),
+        );
+        assert!(second.own_halted_gens.is_empty(), "{second:?}");
+        assert_eq!(second.own_reappended, 3, "{second:?}");
+        assert_eq!(meta.log_stream_idx(GEN).unwrap(), 3);
+        assert!(meta.pending_replays().unwrap().is_empty());
+    }
+
     /// The self-seal of epoch 1 and the self-reclaim at epoch 2: the
     /// journal becomes the member copy and the tail the claim carries, with
     /// `through` as the sealed hold's contiguous prefix.

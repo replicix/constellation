@@ -7162,7 +7162,8 @@ impl Meta {
     /// go back nothing more of any generation does (a row of one generation
     /// may depend on an earlier row of another, ADR-39): one the tail ended,
     /// the table does not list after the tail (ADR-43, orphan grants), that
-    /// is not the log's next index, without an outcome rid, past a lost
+    /// is not the log's next index, without an outcome rid (a release row
+    /// of a claim excepted: it has nothing to replay), past a lost
     /// dependency (`own_lost_from`, or its own `deps`), or that depends on
     /// an own generation's row not yet in the log. Those stay queued for
     /// replay by rid, as the strand queued them. The rids that went back
@@ -7267,11 +7268,21 @@ impl Meta {
                     }
                 }
             }
+            // A claim's release row (ADR-60) has no rid and no op: nothing
+            // replays it, and it goes back verbatim like the rows below it.
+            let release_only = outcome.is_none()
+                && !row.records.is_empty()
+                && row.records.iter().all(|r| {
+                    matches!(
+                        r,
+                        LogRecord::StreamReleased { .. } | LogRecord::SubtreeReleased { .. }
+                    )
+                });
             if halted
                 || ended.contains(&gen)
                 || !listed.contains(&gen)
                 || idx != cursor + 1
-                || outcome.is_none()
+                || (outcome.is_none() && !release_only)
                 || lost
             {
                 halted = true;

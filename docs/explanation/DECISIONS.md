@@ -5623,7 +5623,17 @@ ahead of rows it covers.
   or a `DropHeld` fills them (causal cut and acked-at-or-below-cut unchanged);
   (4) it hands no lock or grant to a third node: the claimant is root and
   holder, and the stream is `stopped` from the row on. Without it the claim's
-  end was rowless (seed 226 of `far-root-writes+lost-chunk-late`).
+  end was rowless (seed 226 of `far-root-writes+lost-chunk-late`). The
+  exemption is in the type: `set_release` checks the records and the flag is
+  private. A routing note for (1): the row's local apply drops `by_dir` for the
+  claimant's own stream, so routing changes at the journal, not at the log. A
+  release row the log does not carry yet when the next takeover gate strands
+  (the claimant died inside its wait) goes back verbatim with the other own
+  rows (`reappend_own_rows_tx`: it has no rid, so it is not halted for want of
+  an outcome). `Meta::delegate_release`'s other caller, `release_subtrees`,
+  never reaches the exemption on a gate-ended generation: `stopped` is set from
+  `deleg_ended_at_gate` both at the strand event and at install, and a stopped
+  stream is released rowless there.
 - The end waits (`Core::claim_end`, re-checked on every event and on the
   holder's release timer) while the stream holds a pending drop or one of its
   rows is held back from shipping (`journal_held_back`), at most
