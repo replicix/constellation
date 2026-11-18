@@ -70703,5 +70703,6 @@ own gap arm), so the keepers queue the copies past the cut to replay by rid inst
 `a_re_adopting_gate_never_carries_the_no_tail_record_for_its_union` pins `own_names_tail`, with the log carrying one row and every row.
 (S3) every change of the round-2 and round-3 fixes was reverted in turn on a copy of the tree and its test failed (`logs4/fb-*.log`,
 `revert-*.diff`). (S4) `regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822` pins the rebuilt gate and 0 dropped rows. The
-`tail_beyond_gap_dropped` residual (17 rows over the sweeps) was replayed with throwaway instrumentation, not fixed here: see the
-round-4 report.
+`tail_beyond_gap_dropped` residual (17 rows over the sweeps) was replayed seed by seed with throwaway instrumentation (not committed):
+16 rows were carried by the log at the drop (benign), 1 was a refusal row past a pipelined hold whose rid is in the final log; no
+acknowledged row was lost. Not fixed here (the counter still mixes the classes).
