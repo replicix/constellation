@@ -73,15 +73,15 @@ fn decoded_per_install(n: u64) -> Vec<u64> {
     out
 }
 
-/// The shared read: an install decodes the outstanding entries about
-/// once, not once per helper.
+/// The shared read: an install decodes the outstanding entries once
+/// (plus a small constant), not once per helper.
 #[test]
-fn install_streamed_decodes_at_most_twice_the_outstanding_entries() {
+fn install_streamed_decodes_the_outstanding_entries_once() {
     let n = 400;
     let d = decoded_per_install(n);
     let last = d[n as usize - 1];
     assert!(
-        last <= 2 * n,
+        last <= n + 8,
         "install #{n} decoded {last} live entries (outstanding {n}); install #10 decoded {}",
         d[9]
     );

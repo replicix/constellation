@@ -70725,20 +70725,20 @@ other callers. The snapshot is read again after each step of the transaction tha
 
 **Fail-before** (`store/live_scan_tests.rs`: one outstanding shadow, then 400 streamed creates of one epoch with a `Completed` each and no segment in
 between). On the base with only the counters added: install #10 decodes 40 entries, install #400 decodes 1,600 (4 x the 400 outstanding: tip, non-local,
-read_live, one `shadow_row_for`); `install_streamed_decodes_at_most_twice_the_outstanding_entries` (bound 2 x 400) fails there. With the change: 10 and
+read_live, one `shadow_row_for`); `install_streamed_decodes_the_outstanding_entries_once` (bound n + 8 = 408) fails there. With the change: 10 and
 400 (one read, linear in the outstanding entries); the test passes. The spec expected about 5 x on the base; without a `Completed` record it is 3 x, with
-one 4 x, so the bound is 2 x. `install_streamed_scans_do_not_grow_with_outstanding` (#400 within #10 + 8) is `#[ignore]`d ("Step 2"): it still fails,
+one 4 x; the bound is n + 8, so one extra scan (2 x) fails too. `install_streamed_scans_do_not_grow_with_outstanding` (#400 within #10 + 8) is `#[ignore]`d ("Step 2"): it still fails,
 as the spec says it must (10 vs 400).
 
 **Gates.** fmt; clippy `--workspace --all-targets -D warnings`; lib tests of meta, authority and engine in debug (1,702 / 991 / 478 passed) and release
 (1,702 / 991 / 477); `cargo test -p constellation-authority --release` including the sim suite (575 passed, 0 failed, 16 ignored). The debug runs
 exercise the cross-check on every install.
 
-**Sims, base (origin/main) vs fix, 2,000 seeds, release.** 40 labels: the `links`, `flex`, `backup-crash`, `ahead` and `delegated*` labels of the
+**Sims, base (origin/main) vs fix, 2,000 seeds, release.** 40 of the 115 labels the spec pattern (`*links*`, `flex*`, `delegated*`, `backup-crash*`, `*ahead*`) matches; the `links`, `flex`, `backup-crash`, `ahead` and `delegated*` labels of the
 hlfix2 C1/C2 lists that stream and speculate (the full 242-label union was about 11 h on this loaded box and was not run). Same failing seeds on both
-sides in every label (18 seeds in 4 `+commit+unsettled` labels on each side, the known I4 set), identical failure messages, no new I-class or lock failure,
+sides in every label (37 I4 seeds in 5 `+commit+unsettled` labels on each side, the known I4 set: delegated-backup 2, delegated-holder-cut 3, long-delegated-backup 13, delegated-no-backup-root-near 5, long-delegated-late-answers 14), identical failure messages, no new I-class or lock failure,
 one sweep-join panic per failing label on both sides. Fingerprints differ seed by seed as before (this sim's run-to-run noise), not compared.
-Debug sim (cross-check live): 6 labels at 300 seeds and `long-delegated-backup+links` at 2,000 (a debug seed is ~7 x slower; the other three 2,000-seed debug labels were cut): 0 failures, 0 panics, the message above never appears.
+Debug sim (cross-check live): 6 labels at 300 seeds (a debug seed is ~7 x slower; no 2,000-seed debug run): 0 failures, 0 panics, the message above never appears.
 
 **Round-trip A/B** (`hardlink-burst`, seed 42, two nodes, release, box load 37-96 from other jobs, so spread is wide).
 Plain build, 3 interleaved rounds per file system, median [min-max] (total link time of 8,192 links; client `took` p50 and p99):
