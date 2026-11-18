@@ -384,6 +384,7 @@ impl TouchSet {
     pub fn names_cross_check() -> NamesCrossCheck {
         NamesCrossCheck {
             before: NAMES_CROSS_CHECK.with(|c| c.replace(true)),
+            _not_send: std::marker::PhantomData,
         }
     }
 
@@ -571,6 +572,9 @@ thread_local! {
 #[must_use = "the cross-check ends when the guard drops"]
 pub struct NamesCrossCheck {
     before: bool,
+    /// The flag is the creating thread's: the guard stays on it (`!Send`),
+    /// and nested guards drop in reverse order of creation.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -621,6 +625,8 @@ fn replay_name_moves(
             return None;
         }
         let next = min_now(&overlay);
+        // An unfetched `next` is an arrival, which the op already holds
+        // (`from_op`); the check mirrors the reference's `orig.contains`.
         if let (Some(primary), Some(next)) = (primary, next) {
             if next != primary && fetched.binary_search(&next).is_ok() {
                 holds.push(next);

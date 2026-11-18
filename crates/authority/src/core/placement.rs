@@ -728,13 +728,12 @@ impl Core {
             // call returns early while one is under way or not yet possible).
             if self.singleton_now() {
                 let before = self.stats.place_root_own_released;
-                let dir_list = dirs.clone();
-                self.own_sticky_release(now, gen, dirs.into_iter().collect(), replica, out);
+                self.own_sticky_release(now, gen, dirs.iter().copied().collect(), replica, out);
                 if self.stats.place_root_own_released > before {
                     self.stats.place_root_own_released_singleton += 1;
                     tracing::info!(
                         node = me,
-                        dirs = ?dir_list,
+                        dirs = ?dirs,
                         gen = %constellation_meta::delegation::GenLabel::of(gen),
                         "the root releases its own sticky subtrees (it is a singleton again)"
                     );
