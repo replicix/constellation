@@ -70377,3 +70377,14 @@ as "no copy" (it asks `member_copy_held` first: `None`, and a held copy that the
 `finish_acquire(false)`, retried at the next attempt like a failed seal; only `Some(false)` goes on with no tail). Test hook:
 the member-copy read honours `fail_store_reads_after_on_this_thread_for_tests`. Tests:
 `a_self_claim_with_an_unreadable_member_copy_ends`, `a_self_claim_with_no_member_copy_goes_on`.
+
+M1.2 review S1 and S2 (tail claim): `prepare_tail_for_claim`'s self-sealed branch no longer reads a member-copy store
+read error as "no copy" (it asks `member_copy_held` first: `None` and an unreadable held copy end the claim; only
+`Some(false)` goes on with no tail), and a gap in the copy (`check_tail_answer_contiguous` now returns whether the answer
+is contiguous) ends the claim in every build before its CAS instead of writing a marker whose `through` drops the rows
+past the gap. Both are the claim's ordinary refusal (`finish_acquire(false)`, as a failed seal or role write): the next
+acquisition attempt reads again; a gap stays counted (`tail_answer_gaps`) and logged at error level at every attempt, and
+the sim fails the seed. While it lasts the group has no holder from this node; another member's claim fetches the copy as
+the tail. The fetched answer's check keeps its debug assertion; `tail_own_gated_beyond_gap` (after the marker) is unchanged.
+Tests: `a_self_claim_with_an_unreadable_member_copy_ends`, `a_self_claim_with_no_member_copy_goes_on`,
+`a_self_claim_over_a_copy_with_a_gap_ends`.

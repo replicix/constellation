@@ -1777,8 +1777,10 @@ so the copy's contiguous hold stopped below it, a self-claim's `through` with
 it, and the gate dropped the rows past the gap, answered ones included
 (`metered-shared` seed 218, where none had been answered). A tail answer that
 is not contiguous is a bug, and the sim fails a seed that gives one
-(`tail_answer_gaps`); a member copy that cannot be read is not "no copy": a self-sealed
-claim ends (`member_copy_held`). Member copies keep the tail's holes: a successor's copy
+(`tail_answer_gaps`); a self-sealed claim whose own copy has a gap ends in every
+build (integrity over availability, as `reship_failed` does) and tries again at the
+next attempt, and a copy that cannot be read is not "no copy": the claim ends
+too (`member_copy_held`). Member copies keep the tail's holes: a successor's copy
 of a sealed tail it re-ships holds a record-less row for every transaction of
 the sealed prefix below its top moved row that it does not keep with records
 (a hole, a delegate's row, a dedup, one the log carries or a drop-held

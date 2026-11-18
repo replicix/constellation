@@ -1032,7 +1032,11 @@ impl Core {
         self.bk.acked = acked.unwrap_or(0);
         // (A store read error is not a gap: only a hold that was read counts.)
         if let Some(acked) = acked {
-            self.check_tail_answer_contiguous("fetched", ch.epoch, acked, &ch.txs);
+            let contiguous = self.check_tail_answer_contiguous("fetched", ch.epoch, acked, &ch.txs);
+            debug_assert!(
+                contiguous,
+                "a tail answer is not contiguous: the rows past its gap would be dropped"
+            );
         }
         self.bk.held.clear();
         // The members of the old group: who held the tail a later claimant
@@ -1359,7 +1363,15 @@ impl Core {
                     return false;
                 };
                 self.bk.acked = acked;
-                self.check_tail_answer_contiguous("member copy", prev.epoch, acked, &txs);
+                // A gap in the copy ends the claim (integrity over
+                // availability, as `reship_failed` and `TailDiverged` do):
+                // the marker's `through` would stop below the rows past the
+                // gap and drop them, answered ones included. The copy keeps
+                // them; the next attempt, or another member's fetch, sees
+                // them again.
+                if !self.check_tail_answer_contiguous("member copy", prev.epoch, acked, &txs) {
+                    return false;
+                }
                 let mut members: Vec<NodeId> = prev.backups.clone();
                 members.push(me);
                 members.sort_unstable();
@@ -1404,17 +1416,19 @@ impl Core {
     /// for a covered row below a live one, a successor's copy of a tail
     /// keeps the tail's holes as fillers, and a tail kept as a member copy
     /// keeps the spans it shipped): a violation is a bug, counted
-    /// in `tail_answer_gaps` (the sim fails a seed that has one).
+    /// in `tail_answer_gaps` (the sim fails a seed that has one). Returns
+    /// whether the answer is contiguous; the caller that can still end its
+    /// claim does so on `false`, in every build.
     fn check_tail_answer_contiguous(
         &mut self,
         source: &'static str,
         epoch: Epoch,
         acked: u64,
         txs: &[BackupTx],
-    ) {
+    ) -> bool {
         let tip = txs.iter().map(|t| t.last).max().unwrap_or(0);
         if acked >= tip {
-            return;
+            return true;
         }
         self.stats.tail_answer_gaps += 1;
         tracing::error!(
@@ -1425,10 +1439,7 @@ impl Core {
             tip,
             "a tail answer is not contiguous: the rows past its gap would be dropped as never committed"
         );
-        debug_assert!(
-            false,
-            "a tail answer is not contiguous: the rows past its gap would be dropped"
-        );
+        false
     }
 
     /// The wait of a claim for `prev`'s group (`status.lease.waiting_for_group`)

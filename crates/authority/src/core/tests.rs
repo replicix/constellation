@@ -87233,7 +87233,8 @@ mod step8_handover_root {
 
 /// The tripwire where a tail answer's gap forms (`tail_answer_gaps`): a
 /// self-sealed claim's member copy, and a fetched tail, whose contiguous hold
-/// is below their tip. Release counts it; a debug build also asserts.
+/// is below their tip. Both count it; the claim over a member copy ends, and
+/// a debug build asserts at the fetch.
 mod tail_answer_gaps {
     use super::seal_tail::{Chosen, TailFetch};
     use super::*;
@@ -87270,17 +87271,20 @@ mod tail_answer_gaps {
     /// A1: a copy with a gap in the middle (hand-made: rows 1 and 3) is
     /// counted when the claim takes it as the tail.
     #[test]
-    fn a_self_claim_over_a_copy_with_a_gap_is_counted() {
+    fn a_self_claim_over_a_copy_with_a_gap_ends() {
         let (mut h, prev) = self_sealed(&[(1, 1), (3, 3)]);
-        let run = catch_unwind(AssertUnwindSafe(|| {
-            h.core.prepare_tail_for_claim(&prev, &h.meta)
-        }));
+        // S2 (M1.2 review): the claim ends in every build (it used to go on,
+        // and its marker's `through` dropped the row past the gap); the copy
+        // keeps both rows and names no tail.
+        assert!(!h.core.prepare_tail_for_claim(&prev, &h.meta));
         assert_eq!(h.core.stats.tail_answer_gaps, 1);
-        if cfg!(debug_assertions) {
-            assert!(run.is_err(), "a debug build asserts");
-        } else {
-            assert!(run.unwrap());
-        }
+        assert!(h.core.bk.fetched.is_empty());
+        let (_, kept) = h.meta.member_copy(1).unwrap().unwrap();
+        assert_eq!(kept.len(), 2, "the row past the gap is kept");
+        // Every attempt sees it again (counted again): it does not wedge
+        // silently.
+        assert!(!h.core.prepare_tail_for_claim(&prev, &h.meta));
+        assert_eq!(h.core.stats.tail_answer_gaps, 2);
     }
 
     /// S1 (M1.2 review): a store read error of the member copy is not "no
