@@ -70242,3 +70242,26 @@ The ignored meta pin `an_orphan_end_queues_a_delegates_answered_gated_row` is re
 uncommitted streamed entry is in `uncommitted_streamed_grants`, so the delegate never honoured it, and its gated row is dropped at the orphan cut of 0
 with nothing queued. ADR-43's orphan-rows paragraph now carries the unreachability argument (witnesses: `acked_at_or_below_cut` strict, the step 8b core
 test, the new test) and an "Amended at plan 46 M1.2 close" line; plan 46's L2b note says how M1.2 closed L2b. No product code changed.
+
+### C3 item 3 made crash-atomic: the gate's strand and the verbatim re-append in one transaction (2026-11-18)
+
+Review M1.2 S3. The takeover gate's strand (`Meta::reship_epochs_at_takeover`) took this node's own delegate rows out of
+the journal and queued them for replay by rid; the core re-appended them, verbatim under `(gen, idx)`, in a later call
+(`Core::reappend_own_delegate_rows`), from a capture it kept in memory (`bk.gate_own_rows`). A process crash between the two
+lost the capture: the restarted gate found no own rows, and the replay re-executed them by rid as root rows of the new
+tenure, so committed, answered delegate rows landed under a new identity (I2c; no loss, exactly-once by rid held). The sims
+cannot reach the window (both happen in one core event).
+
+Fix (option A, c3-spec 5.1 as written). The re-append runs inside the re-ship's transaction: it reads the own rows (records,
+origin, deps) before the strand, applies the same skip and halt rules after the tail (carried by origin, in the log, ended by
+the tail, unlisted, not the next index, no outcome rid, lost or uncaptured deps, a dependency on an own generation's row not
+yet in the log), journals the rest with `journal_adopted_from_tx` (the transaction form of `apply_adopted_records_from`,
+`bump_log_idx_tx` included), takes the re-appended rids out of the replay queue the strand filled in the same transaction
+(`drop_queued_of_rids_tx`; the queue never holds them at a commit), and ends the own streams at the log
+(`end_own_streams_at_log_tx`). `StrandArgs` carries what only the core knows (`own_lost_from`, `reappend_version`);
+`ReshipReport` returns `own_reappended` and `own_halted_gens`. The core keeps `bk.gate_own_rows` no more: its half is
+`stats.own_deleg_rows_reappended` and `claim_replayed`. The re-append's own store failure now fails the whole re-ship (all or
+nothing; the gate retries) instead of halting the row. `own_deleg_reappend_forget_failed` and `Replica::end_own_streams_at_log`
+are gone. Tests: `a_crash_between_the_gate_strand_and_the_re_append_keeps_the_rows_identity` (fails on the parent),
+`reship_reappends_own_rows_in_its_own_transaction` (an injected fault before the commit leaves everything as before),
+`the_takeover_gate_re_appends_no_row_from_a_lost_dependency_on` (replaces the uncaptured-deps test: the deps are always read now).

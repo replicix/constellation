@@ -117,7 +117,7 @@ use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, apply_record, ApplyCx, TouchSet};
 use crate::rid::Rid;
 use crate::session::{JournalPos, Position, Streams};
-use crate::store::local::{self, LogPrefixView, RowCommit};
+use crate::store::local::{self, GroupOn, LogPrefixView, RowCommit};
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, kv_get_tx, kv_set_tx, misc, ns,
     Meta, UsageTracker, KV_APPLIED_SEQ, KV_DELEG_SPEC_COUNT, KV_LOCAL_SPEC_COUNT, KV_NEXT_SPEC_SEQ,
@@ -129,7 +129,7 @@ use constellation_mtree::record::{InodeRecord, Payload};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// The incarnation of the rid a stranded `Local` transaction without one
 /// of its own (a local manifest commit, a snapshot row, a conflict copy)
@@ -768,6 +768,14 @@ fn reship_sync(meta: &Meta) -> Result<(), MetaError> {
 #[cfg(any(test, feature = "test-util"))]
 thread_local! {
     static FAIL_RESHIP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_RESHIP_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: the next re-ship's transaction on this thread fails after the
+/// tail and the own rows' re-append, just before it commits.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_next_reship_before_commit_on_this_thread_for_tests() {
+    FAIL_RESHIP_BEFORE_COMMIT.with(|c| c.set(true));
 }
 
 /// Test hook: the next sync after a re-ship's commit on this thread fails.
@@ -792,6 +800,16 @@ pub struct StrandArgs<'a> {
     /// of rows past a sealed `through`, and of the epochs a claim that carries
     /// no tail settles, neither stay nor hold their readers.
     pub marker: &'a [LogRecord],
+    /// Per own generation the core holds as its delegate, the stream index
+    /// from which a batch found a lost dependency (`DelegateState::lost_from`,
+    /// in memory only). The re-append of this node's own rows in the same
+    /// transaction halts at such a row. Read only with a tail and `own_gens`.
+    pub own_lost_from: &'a BTreeMap<u64, u64>,
+    /// The configuration version the re-appended own rows are stamped with
+    /// (this tenure's lease, `PendingClass::set(RowCommit::group(v,
+    /// GroupOn::Root))`): the version of the journal they go back into, not
+    /// of the group that committed them (plan 46 M1.1 step 5).
+    pub reappend_version: u64,
 }
 
 /// The tail half of [`Meta::reship_at_takeover`]: the sealed tail of
@@ -814,9 +832,16 @@ pub struct TailArgs {
 type FollowingAppends = HashMap<(u64, u64), RowCommit>;
 
 /// What [`Meta::reship_at_takeover`] did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReshipReport {
     pub stranded: Stranded,
+    /// Plan 43 C3 item 3: this node's own delegate rows put back after the
+    /// tail, verbatim under their `(gen, idx)`, in the transaction that
+    /// stranded them (`StrandArgs::own_gens`).
+    pub own_reappended: u64,
+    /// The own generations a row of which did not go back (it and the rows
+    /// after it are queued for replay by rid): the core's `claim_replayed`.
+    pub own_halted_gens: BTreeSet<u64>,
     /// Tail transactions journaled.
     pub tail_applied: usize,
     /// Transactions past the sealed hold's contiguous prefix, not re-shipped.
@@ -872,6 +897,15 @@ struct StrandPart {
     /// The generations this strand ended at the gate (marked,
     /// [`Meta::deleg_ended_at_gate`]).
     ended: Vec<u64>,
+}
+
+/// One of this node's own journal transactions as the delegate of a
+/// generation, read before the takeover's strand takes it out
+/// ([`Meta::own_delegate_rows_tx`]).
+struct OwnRow {
+    origin: (u64, u64),
+    records: Vec<LogRecord>,
+    deps: crate::session::Position,
 }
 
 /// What a stranding pass rolled back.
@@ -6387,7 +6421,7 @@ impl Meta {
     /// back is replayed by rid as root rows), so the stream has no hole:
     /// its counter is set to what the log holds of it at the end of this
     /// transaction, and again after the gate's re-append
-    /// ([`Meta::end_own_streams_at_log`]). The generation ends at that,
+    /// ([`local::end_own_streams_at_log_tx`]). The generation ends at that,
     /// by this node once its gate opens, or by whichever root inherits it
     /// if this node crashes or loses the lease first
     /// (`locks-unlinked-delegated-dbackup-random` seeds 2477 and 2982: the
@@ -6456,6 +6490,8 @@ impl Meta {
                     carried,
                     proof,
                     marker: &[],
+                    own_lost_from: &BTreeMap::new(),
+                    reappend_version: 0,
                 }),
                 None,
             )?
@@ -6609,10 +6645,11 @@ impl Meta {
         // Plan 30 §M12: a grant or a recall changes who may execute what;
         // the fast path checks that under the shared side. Taken before the
         // write transaction (the fast path's order: gate, then database).
-        let _gate = txs
-            .iter()
-            .flat_map(|t| t.records.iter())
-            .any(|r| {
+        // (Also with own rows to put back after the tail: a delegate's row
+        // may carry a release record.)
+        let reappends_own = !tails.is_empty() && strand.is_some_and(|a| !a.own_gens.is_empty());
+        let _gate = (reappends_own
+            || txs.iter().flat_map(|t| t.records.iter()).any(|r| {
                 matches!(
                     r,
                     LogRecord::DelegateNode { .. }
@@ -6620,8 +6657,8 @@ impl Meta {
                         | LogRecord::StreamReleased { .. }
                         | LogRecord::DelegateNodeEnded { .. }
                 )
-            })
-            .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
+            }))
+        .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
         let held_since = std::time::Instant::now();
         let staged = UsageTracker::staging();
@@ -6665,6 +6702,13 @@ impl Meta {
                     })
             })
             .collect();
+        // Plan 43 C3 item 3: this node's own rows as the delegate of its
+        // generations, as the journal holds them now (the strand takes them
+        // out), to be put back after the tail in this same transaction.
+        let own_rows = match strand {
+            Some(args) if reappends_own => self.own_delegate_rows_tx(&tx, args.own_gens)?,
+            _ => Vec::new(),
+        };
         if let Some(args) = strand {
             part = self.strand_part_tx(&mut tx, &staged, args, &tail_idents, &follows)?;
             report.stranded = part.stranded;
@@ -6968,6 +7012,18 @@ impl Meta {
                 },
             )?;
         }
+        let mut own_journaled: Vec<((u64, u64), local::JournaledTx)> = Vec::new();
+        if let (Some(args), false) = (strand, own_rows.is_empty()) {
+            self.reappend_own_rows_tx(
+                &mut tx,
+                args,
+                &own_rows,
+                &tail_txs,
+                &part.orphan_cuts,
+                &mut report,
+                &mut own_journaled,
+            )?;
+        }
         if !part.work && tails.is_empty() && member == Default::default() && !facts_noted {
             // Nothing to strand and no tail: nothing to commit.
             return Ok(report);
@@ -6976,7 +7032,24 @@ impl Meta {
         compact_tx(&mut tx, self, from)?;
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        #[cfg(any(test, feature = "test-util"))]
+        if FAIL_RESHIP_BEFORE_COMMIT.with(|c| c.replace(false)) {
+            return Err(MetaError::Io(std::io::Error::other(
+                "injected re-ship commit fault (testing only)",
+            )));
+        }
         tx.commit()?;
+        for ((gen, idx), one) in own_journaled {
+            one.staged.drain_into(self.usage_tracker());
+            one.moved.drain_into(self.usage_tracker());
+            self.note_unshipped(&one.applied);
+            // (As `Replica::apply_backup_tx_journaled`: the session's
+            // position of the generation follows the row.)
+            self.session.note_stream(gen, idx);
+        }
+        if report.own_reappended > 0 {
+            self.flush_held_releases();
+        }
         if member != Default::default() {
             if let Err(error) = self.refresh_member_copy_flag() {
                 tracing::warn!(%error, "the member copy flag could not be refreshed after the gate's marker rules");
@@ -7030,20 +7103,204 @@ impl Meta {
         Ok(report)
     }
 
-    /// Plan 46 M1.2 step 6: the stream counters of the generations this
-    /// node's takeover gate ended are the log's index of each, after the
-    /// gate re-appended its own rows under them (`Core::reappend_own_delegate_rows`),
-    /// which raised the log's index past what the tail left. Only
-    /// generations the gate ended ([`Meta::deleg_ended_at_gate`]).
-    pub fn end_own_streams_at_log(&self, gens: &[u64]) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        for gen in gens {
-            if local::deleg_ended_at_gate_tx(&tx, &self.local, *gen)? {
-                local::settle_deleg_idx_at_log_tx(&mut tx, &self.local, *gen)?;
+    /// Plan 43 C3 item 3: this node's own journal transactions of the
+    /// delegation generations `gens`, whole and in journal order (which is
+    /// each generation's index order), with the dependencies each was
+    /// journaled with. Read before the strand takes them out.
+    fn own_delegate_rows_tx(
+        &self,
+        tx: &impl Readable,
+        gens: &[u64],
+    ) -> Result<Vec<OwnRow>, MetaError> {
+        let mut firsts: Vec<u64> = Vec::new();
+        for gen in gens.iter().filter(|g| **g != 0) {
+            for found in local::journal_origins_from(tx, self, *gen, 0)? {
+                firsts.push(found?.1);
             }
         }
-        tx.commit()?;
-        Ok(())
+        firsts.sort_unstable();
+        firsts.dedup();
+        let mut out = Vec::with_capacity(firsts.len());
+        for first in firsts {
+            let Some(row) = local::get_journal_tx(tx, self, first)? else {
+                continue;
+            };
+            if !gens.contains(&row.gen) {
+                continue;
+            }
+            let records: Vec<LogRecord> = local::journal_records(tx, self, first, row.last)?
+                .into_iter()
+                .map(|(_, rec)| rec)
+                .collect();
+            if records.is_empty() {
+                continue;
+            }
+            out.push(OwnRow {
+                origin: (row.gen, row.idx),
+                records,
+                deps: row.deps,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Plan 43 C3 item 3 (§5.4: a delegate that takes the root over): this
+    /// node's own rows as the delegate of a generation, which the strand
+    /// above took out ahead of the predecessor's tail, go back into the
+    /// journal after it, verbatim and under their stream origin `(gen,
+    /// idx)`, in index order: the root's append of its own stream. All in the
+    /// re-ship's transaction, so no crash leaves the strand without them (the
+    /// restarted gate would find nothing to put back and re-execute them by
+    /// rid under a new identity: I2c).
+    ///
+    /// A row the tail carries already (by origin) or the log carries
+    /// (`idx <= log_stream_idx`) is skipped. From the first row that cannot
+    /// go back nothing more of any generation does (a row of one generation
+    /// may depend on an earlier row of another, ADR-39): one the tail ended,
+    /// the table does not list after the tail (ADR-43, orphan grants), that
+    /// is not the log's next index, without an outcome rid, past a lost
+    /// dependency (`own_lost_from`, or its own `deps`), or that depends on
+    /// an own generation's row not yet in the log. Those stay queued for
+    /// replay by rid, as the strand queued them. The rids that went back
+    /// leave the queue.
+    ///
+    /// Why they apply as they did (the ownership argument): the root
+    /// executes nothing on the keys of a live generation, so no tail row but
+    /// the generation's own touches them, unless the tail ends the
+    /// generation, after which root rows may. Such a generation's rows are
+    /// left to the replay: those above the cut were never committed.
+    #[allow(clippy::too_many_arguments)]
+    fn reappend_own_rows_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        args: StrandArgs<'_>,
+        rows: &[OwnRow],
+        tail_txs: &[(TailArgs, Vec<crate::BackupTx>)],
+        orphan_cuts: &[(u64, u64)],
+        report: &mut ReshipReport,
+        journaled: &mut Vec<((u64, u64), local::JournaledTx)>,
+    ) -> Result<(), MetaError> {
+        let own_gens: BTreeSet<u64> = rows.iter().map(|r| r.origin.0).collect();
+        let mut carried: HashSet<(u64, u64)> = HashSet::new();
+        let mut ended: BTreeSet<u64> = BTreeSet::new();
+        for (t, txs) in tail_txs {
+            for bt in txs
+                .iter()
+                .filter(|bt| !bt.records.is_empty() && bt.last <= t.through)
+            {
+                if bt.origin.0 != 0 {
+                    carried.insert(bt.origin);
+                }
+                for r in &bt.records {
+                    if let LogRecord::DelegateNodeEnded { gen, .. } = r {
+                        ended.insert(*gen);
+                    }
+                }
+            }
+        }
+        let log_idx = |tx: &SingleWriterWriteTx, gen: u64| -> Result<u64, MetaError> {
+            Ok(kv_get_tx(tx, &self.local, &local::deleg_log_idx_key(gen))?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0))
+        };
+        // The generation the table does not list once the tail is
+        // re-applied has no grant in the log (one the tail or the log ended
+        // is in `ended`, or its rows were stranded by the log's recall).
+        let listed: BTreeSet<u64> = crate::delegation::read_table_tx(&*tx, self)?
+            .gens()
+            .collect();
+        // (This transaction's orphan cuts are voided in the session after
+        // it commits: a dependency past one is lost all the same.)
+        let orphan_lost = |deps: &crate::session::Position| {
+            deps.streams.iter().any(|(g, i)| {
+                orphan_cuts
+                    .iter()
+                    .any(|(og, cut)| *og == g && i > 0 && i > *cut)
+            })
+        };
+        // Stamped with the configuration in force in this tenure's journal.
+        let _class = crate::store::journal::PendingClass::set(RowCommit::group(
+            args.reappend_version,
+            GroupOn::Root,
+        ));
+        let mut halted = false;
+        let mut appended: HashSet<Rid> = HashSet::new();
+        for row in rows {
+            let (gen, idx) = row.origin;
+            let cursor = log_idx(tx, gen)?;
+            tracing::debug!(
+                gen = %crate::delegation::GenLabel::of(gen),
+                idx,
+                cursor,
+                carried = carried.contains(&row.origin),
+                ended = ended.contains(&gen),
+                halted,
+                "own delegate row at the gate"
+            );
+            if carried.contains(&row.origin) || idx <= cursor {
+                // The tail or the log carries it already.
+                continue;
+            }
+            // Its outcome's rid: a row without one could not leave the
+            // replay queue by it.
+            let outcome = row.records.iter().find_map(|r| match r {
+                LogRecord::Completed { rid } | LogRecord::Refused { rid, .. } => Some(*rid),
+                _ => None,
+            });
+            // Past a lost dependency the row was never committed (the stream
+            // stops there, ADR-39), whether or not a batch found it before
+            // (`own_lost_from`, in memory only): judged by the row's own
+            // deps too. A dependency on another of this node's generations
+            // must be in the log or re-appended already.
+            let mut lost = args.own_lost_from.get(&gen).is_some_and(|l| idx >= *l)
+                || self.deps_lost_deps(&row.deps)
+                || orphan_lost(&row.deps);
+            if !lost {
+                for (g, i) in row.deps.streams.iter() {
+                    if g != gen && own_gens.contains(&g) && i > log_idx(tx, g)? {
+                        lost = true;
+                        break;
+                    }
+                }
+            }
+            if halted
+                || ended.contains(&gen)
+                || !listed.contains(&gen)
+                || idx != cursor + 1
+                || outcome.is_none()
+                || lost
+            {
+                halted = true;
+                report.own_halted_gens.insert(gen);
+                continue;
+            }
+            // (The rid the transaction completes, as the tail passes it; a
+            // refusal's row carries its outcome as a record.)
+            let completes = row.records.iter().find_map(|r| match r {
+                LogRecord::Completed { rid } => Some(*rid),
+                _ => None,
+            });
+            let one = self.journal_adopted_from_tx(tx, &row.records, completes, row.origin)?;
+            journaled.push((row.origin, one));
+            report.own_reappended += 1;
+            appended.extend(outcome);
+        }
+        if !appended.is_empty() {
+            // (Queued by the strand above in this transaction; never to
+            // run: the log is to carry the row as it stands.)
+            drop_queued_of_rids_tx(tx, self, &appended)?;
+            tracing::info!(
+                rows = appended.len(),
+                "re-appended this node's own delegate rows after the predecessor's tail"
+            );
+        }
+        // Plan 46 M1.2 step 6 (c3-spec D7): the generations end here at what
+        // the log holds of them, the rows just re-appended counted. A row
+        // that did not go back left the journal (replayed by rid as a root
+        // row), so no stream index of the generation is past the log's: no
+        // hole, and a recall of it is answered from the counter.
+        let gens: Vec<u64> = own_gens.into_iter().collect();
+        local::end_own_streams_at_log_tx(tx, &self.local, &gens)
     }
 
     /// The strand of [`Self::reship_at_takeover`], in the caller's
@@ -7062,7 +7319,7 @@ impl Meta {
             abandoned,
             carried,
             proof,
-            marker: _,
+            ..
         } = args;
         let listed_before = if proof.is_empty() {
             Default::default()

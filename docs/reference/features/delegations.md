@@ -1284,10 +1284,11 @@ holder's own unsynced writes are (a forwarded op's requester replays it).
   row of a generation the tail ends, or one that does not continue the
   stream, was never committed and its client retries by rid. The generation
   still ends at that gate, and its stream counter is then the log's index of
-  it, past the re-appended rows (`Meta::end_own_streams_at_log`), so the
-  node never executes in it again. The mark of the end is also the gate's
-  fence: the strand, the tail and the re-append are separate store
-  transactions, and the node's own writes in its subtree execute on the
+  it, past the re-appended rows, so the node never executes in it again.
+  The strand, the tail and the re-append are one store transaction
+  (`Meta::reship_epochs_at_takeover`): a crash leaves the rows where they
+  were or put back, never queued for a replay by rid under a new identity.
+  The mark of the end is also the gate's fence: the node's own writes in its subtree execute on the
   store directly, admitted by a mirror of the delegation table that lags the
   core by an event. A write admitted before the strand and reaching the
   store's writer lock after it is refused there (the store's `NotAdmitted`,

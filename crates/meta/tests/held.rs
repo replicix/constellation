@@ -2318,6 +2318,8 @@ fn a_drop_of_a_re_shipped_tail_row_leaves_nothing_of_its_identity_to_ship() {
             carried: &carried,
             proof: &proof,
             marker: &[],
+            own_lost_from: &Default::default(),
+            reappend_version: 0,
         }),
         Some(TailArgs {
             epoch: 1,

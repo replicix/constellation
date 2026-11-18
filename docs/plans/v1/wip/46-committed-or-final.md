@@ -370,7 +370,9 @@ DelegateNodeEnded { node, gen, through }                   // root record: the g
   a sealed stream is applied verbatim in one transaction
   (`MetaError::TailDiverged`); a delegate taking the root over re-appends
   its own stream's rows the tail lacks, verbatim, before ending its
-  generation; a deposed root keeps another node's appended rows as a
+  generation (crash-atomic: the strand, the tail and this re-append are one
+  store transaction, `Meta::reship_epochs_at_takeover`, so no crash leaves
+  the rows queued for replay by rid under a new identity: review M1.2 S3); a deposed root keeps another node's appended rows as a
   member copy and the next root seals the predecessor's stream (C3 §5.4
   item 4; the open `placement-hot` seed). Holed generations and the deposed
   root's rebuild-replay of a delegate's rows go here, not in stage 2, because

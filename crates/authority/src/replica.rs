@@ -503,10 +503,6 @@ pub trait Replica {
     /// not commit (`Meta::uncommitted_streamed_grants`). Such a grant is
     /// not honoured until the log carries it.
     fn deleg_grants_uncommitted(&self) -> Result<std::collections::BTreeSet<u64>, String>;
-    /// The gate's re-append of its own rows under `gens` is done: their
-    /// stream counters are the log's index of each, no hole
-    /// (`Meta::end_own_streams_at_log`).
-    fn end_own_streams_at_log(&self, gens: &[u64]) -> Result<(), String>;
     /// Plan 43 C2e follow-up: record (synced) that this node holds a grant of
     /// `gen` on boot `boot` (`Meta::deleg_note_held`); `false`: it could not
     /// be, and the grant must not be used.
@@ -1748,10 +1744,6 @@ impl Replica for Meta {
 
     fn deleg_grants_uncommitted(&self) -> Result<std::collections::BTreeSet<u64>, String> {
         Meta::uncommitted_streamed_grants(self).map_err(|e| e.to_string())
-    }
-
-    fn end_own_streams_at_log(&self, gens: &[u64]) -> Result<(), String> {
-        Meta::end_own_streams_at_log(self, gens).map_err(|e| e.to_string())
     }
 
     fn deleg_note_held(&self, gen: u64, boot: u64) -> bool {

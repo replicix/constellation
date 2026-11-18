@@ -542,7 +542,7 @@ pub(crate) fn remove_journal_origin(
 /// within one index), lazily: one seek, then a row per transaction
 /// taken. Rows at or below the acked watermark are left out, as every
 /// journal scan does ([`read_journal_tx_heads`]).
-fn journal_origins_from<'a>(
+pub(crate) fn journal_origins_from<'a>(
     r: &'a impl Readable,
     meta: &'a Meta,
     gen: u64,
@@ -1235,7 +1235,7 @@ impl Meta {
     /// re-appended under the generation or replayed by rid, and the node
     /// never executes in it again. Never cleared (generations are not
     /// reused, ADR-43). The stream has no hole: its counter is the log's
-    /// ([`Meta::end_own_streams_at_log`]).
+    /// ([`local::end_own_streams_at_log_tx`]).
     pub fn deleg_ended_at_gate(&self, gen: u64) -> Result<bool, MetaError> {
         let r = self.db.read_tx();
         deleg_ended_at_gate_tx(&r, &self.local, gen)
@@ -2141,6 +2141,28 @@ impl Meta {
         if gen != 0 {
             bump_log_idx_tx(tx, self, gen, idx)?;
         }
+        Ok(done)
+    }
+
+    /// [`Self::apply_adopted_records_from`] inside the caller's transaction
+    /// ([`Meta::reship_at_takeover`]): `records` journaled as an adopted
+    /// transaction under the delegation origin `(gen, idx)`, and the log
+    /// index of `gen` raised to `idx`. The caller commits, drains the usage
+    /// trackers, notes the unshipped rows and the session's stream.
+    pub(crate) fn journal_adopted_from_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        (gen, idx): (u64, u64),
+    ) -> Result<JournaledTx, MetaError> {
+        let done = {
+            let _d = (gen != 0).then(|| {
+                journal::PendingDelegate::set(gen, Some(idx), crate::session::Position::ZERO)
+            });
+            self.journal_records_tx(tx, records, rid, Journaled::Adopted)?
+        };
+        bump_log_idx_tx(tx, self, gen, idx)?;
         Ok(done)
     }
 
@@ -3620,6 +3642,23 @@ pub(crate) fn mark_deleg_ended_at_gate_tx(
     kv_set_tx(tx, local, &deleg_ended_at_gate_key(gen), "1");
 }
 
+/// Plan 46 M1.2 step 6: the stream counters of the generations this node's
+/// takeover gate ended are the log's index of each, once the gate re-appended
+/// its own rows under them ([`settle_deleg_idx_at_log_tx`], for the
+/// generations the gate ended only).
+pub(crate) fn end_own_streams_at_log_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gens: &[u64],
+) -> Result<(), MetaError> {
+    for gen in gens {
+        if deleg_ended_at_gate_tx(&*tx, local, *gen)? {
+            settle_deleg_idx_at_log_tx(tx, local, *gen)?;
+        }
+    }
+    Ok(())
+}
+
 /// Plan 46 M1.2 step 6 (c3-spec D7): an ended-at-the-gate generation's stream
 /// counter is the log's index of it: the rows the gate did not re-append
 /// left the journal and are replayed by rid, as root rows, so the stream
@@ -3761,7 +3800,7 @@ pub(crate) fn bump_log_idx_tx(
         // so a row appended later (the gate's re-append of its own rows)
         // raises it in the very transaction that raises the log's index: a
         // failure or a crash between that commit and the gate's own settle
-        // (`Meta::end_own_streams_at_log`) leaves no counter behind the log.
+        // (`local::end_own_streams_at_log_tx`) leaves no counter behind the log.
         // Raised only: an own row still in the journal keeps its index.
         if deleg_ended_at_gate_tx(&*tx, local, gen)? {
             let counter = kv_get_tx(&*tx, local, &deleg_idx_key(gen))?
@@ -4429,6 +4468,144 @@ mod verbatim_append_tests {
         .unwrap();
     }
 
+    /// Review M1.2 S3 (plan 43 C3 item 3): the re-ship puts this node's own
+    /// delegate rows back after the tail in its own transaction. A fault after
+    /// the tail and the re-append, before the commit, leaves the journal, the
+    /// replay queue, the tail and the counters as they were before the call;
+    /// the retry then puts the rows back, verbatim under their origin, and
+    /// queues nothing.
+    #[test]
+    fn reship_reappends_own_rows_in_its_own_transaction() {
+        use crate::store::spec::{StrandArgs, TailArgs};
+        const GEN: u64 = 7;
+        let meta = Meta::open_in_memory().unwrap();
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        meta.apply_segment(
+            1,
+            1,
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::delegate_one(3, GEN, dir, crate::SubtreeKind::Placed),
+            ],
+            &crate::replay::TouchSet::default(),
+        )
+        .unwrap();
+        for n in 1..=2 {
+            let op = crate::mutate::MutateOp::Create {
+                parent: dir,
+                name: format!("r{n}"),
+                ino: meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            let (_, idx) = meta
+                .delegate_execute(
+                    &op,
+                    Some(rid(n)),
+                    GEN,
+                    Default::default(),
+                    &Default::default(),
+                    constellation_types::clock::Now::same(0),
+                )
+                .unwrap();
+            assert_eq!(idx, n);
+        }
+        let tail_rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 9,
+        };
+        let tail = crate::BackupTx {
+            first: 1,
+            last: 2,
+            records: vec![create("t", 9), LogRecord::Completed { rid: tail_rid }],
+            origin: (0, 0),
+        };
+        meta.backup_append(1, std::slice::from_ref(&tail)).unwrap();
+        let own_before: Vec<crate::BackupTx> = meta
+            .journal_txs_from(0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.origin.0 == GEN)
+            .collect();
+        assert_eq!(own_before.len(), 2);
+        let state = |meta: &Meta| {
+            (
+                meta.journal_txs_from(0, usize::MAX).unwrap(),
+                meta.pending_replays().unwrap().len(),
+                meta.backup_tail(1).unwrap().len(),
+                meta.log_stream_idx(GEN).unwrap(),
+                meta.delegate_idx(GEN).unwrap(),
+                meta.deleg_ended_at_gate(GEN).unwrap(),
+            )
+        };
+        let before = state(&meta);
+        let (carried, proof) = (Default::default(), Default::default());
+        let reship = |meta: &Meta| {
+            meta.reship_at_takeover(
+                Some(StrandArgs {
+                    epoch: 2,
+                    own_gens: &[GEN],
+                    abandoned: None,
+                    carried: &carried,
+                    proof: &proof,
+                    marker: &[],
+                    own_lost_from: &Default::default(),
+                    reappend_version: 1,
+                }),
+                Some(TailArgs {
+                    epoch: 1,
+                    through: 2,
+                    config_version: 3,
+                    class: None,
+                }),
+            )
+        };
+        crate::store::spec::fail_next_reship_before_commit_on_this_thread_for_tests();
+        assert!(reship(&meta).is_err(), "the injected fault fails the call");
+        assert_eq!(state(&meta), before, "nothing of the call is visible");
+        let report = reship(&meta).unwrap();
+        assert_eq!(report.own_reappended, 2, "{report:?}");
+        assert!(report.own_halted_gens.is_empty(), "{report:?}");
+        let journal = meta.journal_txs_from(0, usize::MAX).unwrap();
+        let at_tail = journal
+            .iter()
+            .position(|t| t.records.ends_with(&tail.records))
+            .expect("the tail is in the journal");
+        let own: Vec<(usize, &crate::BackupTx)> = journal
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.origin.0 == GEN)
+            .collect();
+        assert_eq!(
+            own.iter().map(|(_, t)| t.origin).collect::<Vec<_>>(),
+            vec![(GEN, 1), (GEN, 2)]
+        );
+        assert!(own.iter().all(|(i, _)| *i > at_tail), "{journal:?}");
+        assert_eq!(
+            own.iter()
+                .map(|(_, t)| t.records.clone())
+                .collect::<Vec<_>>(),
+            own_before
+                .iter()
+                .map(|t| t.records.clone())
+                .collect::<Vec<_>>(),
+            "verbatim"
+        );
+        assert!(meta.pending_replays().unwrap().is_empty());
+        assert_eq!(meta.log_stream_idx(GEN).unwrap(), 2);
+        assert_eq!(meta.delegate_idx(GEN).unwrap(), 2);
+    }
+
     /// The self-seal of epoch 1 and the self-reclaim at epoch 2: the
     /// journal becomes the member copy and the tail the claim carries, with
     /// `through` as the sealed hold's contiguous prefix.
@@ -4464,6 +4641,8 @@ mod verbatim_append_tests {
                 carried: &carried,
                 proof: &proof,
                 marker: &[],
+                own_lost_from: &Default::default(),
+                reappend_version: 0,
             }),
             Some(crate::store::spec::TailArgs {
                 epoch: 1,
@@ -4955,6 +5134,8 @@ mod verbatim_append_tests {
                     carried: &carried,
                     proof: &proof,
                     marker: &marker,
+                    own_lost_from: &Default::default(),
+                    reappend_version: 0,
                 }),
                 Some(crate::store::spec::TailArgs {
                     epoch: 1,

@@ -6408,6 +6408,8 @@ fn a_retired_hold_owners_acked_row_is_replayed() {
                 carried: &carried,
                 proof: &proof,
                 marker: &[],
+                own_lost_from: &Default::default(),
+                reappend_version: 0,
             }),
             None,
         )
@@ -19412,16 +19414,134 @@ mod locks {
         assert_eq!(h.meta.delegate_idx(7).unwrap(), 2);
     }
 
+    /// Review M1.2 S3 (pin): C3 item 3 across a crash. The gate's re-ship
+    /// (the strand, the tail, and the re-append of the delegate's own rows of
+    /// generation 7) is one store transaction, so a process that dies right
+    /// after it commits has lost nothing: the rows are in the journal after the
+    /// tail, verbatim under their stream origin, and nothing is queued for a
+    /// replay by rid (which would re-execute them as root rows of the new
+    /// tenure, under a new identity: I2c). Before, the strand committed alone,
+    /// the rows waited in the core's memory for the re-append, and a crash
+    /// between the two queued them for replay. Fails on the parent: the
+    /// strand alone leaves them queued, and the restarted gate journals them
+    /// as root rows, origin `(0, 0)`.
+    #[test]
+    fn a_crash_between_the_gate_strand_and_the_re_append_keeps_the_rows_identity() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        two_delegate_rows(&h, dir);
+        let own_before: Vec<Vec<LogRecord>> =
+            crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+                .into_iter()
+                .filter(|tx| tx.origin.0 == 7)
+                .map(|tx| tx.records)
+                .collect();
+        assert_eq!(own_before.len(), 2);
+        let tail_rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 9,
+        };
+        let tail = vec![
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "t".into(),
+                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 5,
+            },
+            LogRecord::Completed { rid: tail_rid },
+        ];
+        h.meta
+            .backup_append(
+                1,
+                &[constellation_meta::BackupTx {
+                    first: 1,
+                    last: 2,
+                    records: tail.clone(),
+                    origin: (0, 0),
+                }],
+            )
+            .unwrap();
+        let gate = PendingGate {
+            epoch: 2,
+            takeover: true,
+            marker_shipped: true,
+            drained: false,
+            fast_prev: false,
+            backup_tail_epoch: Some(1),
+            shippable: true,
+        };
+        h.hold(2, Some(gate));
+        h.core.bk.tail_through = 2;
+        // The gate's re-ship commits, with the arguments the gate passes ...
+        let (carried, proof) = (Default::default(), Default::default());
+        let tails = h.core.gate_tail_args(&gate);
+        let report = h
+            .meta
+            .reship_epochs_at_takeover(
+                Some(constellation_meta::StrandArgs {
+                    epoch: 2,
+                    own_gens: &[7],
+                    abandoned: None,
+                    carried: &carried,
+                    proof: &proof,
+                    marker: &[],
+                    own_lost_from: &Default::default(),
+                    reappend_version: h.core.root_config_version(),
+                }),
+                &tails,
+            )
+            .unwrap();
+        assert_eq!(report.own_reappended, 2, "{report:?}");
+        // ... and the process dies: a new core over the same store.
+        h.core = Core::new(h.core.cfg.clone());
+        h.hold(
+            2,
+            Some(PendingGate {
+                backup_tail_epoch: None,
+                ..gate
+            }),
+        );
+        let mut out = Vec::new();
+        h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        let journal = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX);
+        let at_tail = journal
+            .iter()
+            .position(|tx| tx.records.ends_with(&tail))
+            .expect("the tail is in the journal");
+        let own: Vec<(usize, &constellation_meta::BackupTx)> = journal
+            .iter()
+            .enumerate()
+            .filter(|(_, tx)| tx.origin.0 == 7)
+            .collect();
+        assert_eq!(
+            own.iter().map(|(_, tx)| tx.origin).collect::<Vec<_>>(),
+            vec![(7, 1), (7, 2)],
+            "the delegate's own rows keep their identity across the crash: {journal:?}"
+        );
+        assert!(
+            own.iter().all(|(i, _)| *i > at_tail),
+            "after the tail: {journal:?}"
+        );
+        let own_after: Vec<Vec<LogRecord>> = own.iter().map(|(_, tx)| tx.records.clone()).collect();
+        assert_eq!(own_after, own_before, "verbatim");
+        assert!(h.meta.pending_replays().unwrap().is_empty());
+        assert_eq!(h.meta.log_stream_idx(7).unwrap(), 2);
+        assert_eq!(h.meta.delegate_idx(7).unwrap(), 2);
+    }
+
     /// Plan 46 M1.2 step 6 (review fix): the stream counter of an ended
     /// generation follows the log in the very commit that re-appends the
-    /// node's own rows, not in a later call. A failure after the re-append
-    /// (the replay queue unreadable, the settle erroring) makes the retried
-    /// gate pass see an emptied capture and return before the settle; a crash
-    /// there is not settled at boot either. Here the settle (`Meta::
-    /// end_own_streams_at_log`) never runs after the re-append: the counter
-    /// equals the log all the same (a, b: a retried pass and a restart find
-    /// it so), and a later strand counts the re-appended rows as this node's
-    /// own (c). Fails on the parent: the counter stayed 0 with the log at 2,
+    /// node's own rows, not in a later call. Here the settle
+    /// (`local::end_own_streams_at_log_tx`) never runs after the re-append:
+    /// the counter equals the log all the same (a: a restart finds it so),
+    /// and a later strand counts the re-appended rows as this node's own
+    /// (b). Fails on the parent: the counter stayed 0 with the log at 2,
     /// and the generation was not among the journal's own.
     #[test]
     fn the_counter_of_an_ended_generation_follows_the_re_append_without_the_settle() {
@@ -19462,35 +19582,16 @@ mod locks {
             );
         };
         check(&h);
-        // (a) The retried pass: its capture is empty, nothing re-appends and
-        // nothing settles; the counter is where the re-append left it.
-        h.hold(
-            2,
-            Some(PendingGate {
-                epoch: 2,
-                takeover: true,
-                marker_shipped: true,
-                drained: false,
-                fast_prev: false,
-                backup_tail_epoch: Some(1),
-                shippable: true,
-            }),
-        );
-        h.core.bk.gate_own_rows = Some((2, Vec::new()));
-        h.core
-            .reappend_own_delegate_rows(2, &[], 0, &h.meta)
-            .unwrap();
-        check(&h);
-        // (b) The restart: a new core over the same store.
+        // (a) The restart: a new core over the same store.
         h.core = Core::new(h.core.cfg.clone());
         check(&h);
-        // (c) A later strand counts the re-appended rows as this node's own.
+        // (b) A later strand counts the re-appended rows as this node's own.
         assert!(h.meta.journal_own_gens().unwrap().contains(&7));
     }
 
     /// Plan 46 M1.2 step 6 (c3-spec D7): a row the gate does not re-append
-    /// (here: its dependencies were not captured, so it and the rest replay
-    /// by rid as root rows) leaves no hole in its stream. The counter is the
+    /// (here: a batch found a lost dependency at the first row, so it and the
+    /// rest replay by rid as root rows) leaves no hole in its stream. The counter is the
     /// log's index, which is the generation's end, and a recall of it
     /// afterwards, at this node as the generation's delegate again, is
     /// answered from the log, `through` the log's index and never the rows
@@ -19503,14 +19604,15 @@ mod locks {
         h.core.cfg.p2p = true;
         let (dir, _) = delegated_file(&h.meta);
         two_delegate_rows(&h, dir);
-        let rows: Vec<_> = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
-            .into_iter()
-            .filter(|tx| tx.origin.0 == 7)
-            .map(|tx| (tx, None))
-            .collect();
-        assert_eq!(rows.len(), 2);
         assert_eq!(h.meta.delegate_idx(7).unwrap(), 2);
+        // The restart re-adopts the generation; a batch had found a lost
+        // dependency at its first row (`lost_from`, in memory only), so no
+        // row goes back.
         h.core = Core::new(h.core.cfg.clone());
+        h.core.lease.cached_holder = Some(1);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.dl.mine.get_mut(&7).expect("re-adopted").lost_from = Some(1);
         h.hold(
             2,
             Some(PendingGate {
@@ -19523,10 +19625,9 @@ mod locks {
                 shippable: true,
             }),
         );
-        h.core.bk.gate_own_rows = Some((2, rows));
-        let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
         assert_eq!(h.core.stats.own_deleg_rows_reappended, 0);
+        assert!(h.core.dl.claim_replayed.contains(&7));
         assert!(h.meta.deleg_ended_at_gate(7).unwrap());
         assert_eq!(h.meta.log_stream_idx(7).unwrap(), 0);
         assert_eq!(
@@ -19610,24 +19711,22 @@ mod locks {
         assert_eq!(own, 0);
     }
 
-    /// A row whose `deps` were not captured (no journal head recorded them)
-    /// is not re-appended, nor is anything after it: the rows replay by rid.
-    /// Fails on the parent (an uncaptured row skipped the dependency check
-    /// and was re-appended).
+    /// A row past a lost dependency (`lost_from`, in memory only) is not
+    /// re-appended, nor is anything after it: it replays by rid, and the row
+    /// before it goes back. Fails on the parent of the transaction move: the
+    /// capture, taken by the core, was the only place the cut was applied.
     #[test]
-    fn the_takeover_gate_re_appends_no_row_whose_deps_were_not_captured() {
+    fn the_takeover_gate_re_appends_no_row_from_a_lost_dependency_on() {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
         let (dir, _) = delegated_file(&h.meta);
         two_delegate_rows(&h, dir);
-        let rows: Vec<_> = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
-            .into_iter()
-            .filter(|tx| tx.origin.0 == 7)
-            .map(|tx| (tx, None))
-            .collect();
-        assert_eq!(rows.len(), 2);
         h.core = Core::new(h.core.cfg.clone());
+        h.core.lease.cached_holder = Some(1);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.core.dl.mine.get_mut(&7).expect("re-adopted").lost_from = Some(2);
         h.hold(
             2,
             Some(PendingGate {
@@ -19640,16 +19739,35 @@ mod locks {
                 shippable: true,
             }),
         );
-        // The capture as if no head had recorded the rows' deps.
-        h.core.bk.gate_own_rows = Some((2, rows));
-        let mut out = Vec::new();
         h.core.complete_gate(h.clk(), &h.meta, &mut out);
-        assert_eq!(h.core.stats.own_deleg_rows_reappended, 0);
-        let own = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
-            .into_iter()
+        assert_eq!(h.core.stats.own_deleg_rows_reappended, 1);
+        let journal = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX);
+        let own: Vec<(u64, u64)> = journal
+            .iter()
             .filter(|tx| tx.origin.0 == 7)
-            .count();
-        assert_eq!(own, 0, "re-appended without its deps");
+            .map(|tx| tx.origin)
+            .collect();
+        assert_eq!(
+            own,
+            vec![(7, 1)],
+            "the row past the lost dependency stays out"
+        );
+        let creates_as_root = |name: &str| {
+            journal.iter().any(|tx| {
+                tx.origin == (0, 0)
+                    && tx.records.iter().any(
+                        |r| matches!(r, LogRecord::Create { name: n, .. } if n.as_str() == name),
+                    )
+            })
+        };
+        assert!(
+            creates_as_root("r2"),
+            "it replays by rid, as a root row: {journal:?}"
+        );
+        assert!(
+            !creates_as_root("r1"),
+            "the re-appended one does not: {journal:?}"
+        );
     }
 
     /// ADR-43 (orphan grants): a node that is the delegate of `g`, a grant
@@ -65177,6 +65295,8 @@ mod await_retry {
                     carried: &carried,
                     proof: &proof,
                     marker: &[],
+                    own_lost_from: &Default::default(),
+                    reappend_version: 0,
                 }),
                 Some(TailArgs {
                     epoch: 1,
@@ -68662,6 +68782,8 @@ mod hold_ack {
                     carried: &carried,
                     proof: &proof,
                     marker: &[],
+                    own_lost_from: &Default::default(),
+                    reappend_version: 0,
                 }),
                 None,
             )

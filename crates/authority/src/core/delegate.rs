@@ -9054,7 +9054,7 @@ impl Core {
         // The stream's counter is what its rows are: a generation this
         // node's takeover gate ended has the log's index of it (the rows
         // the gate re-appended counted, the others replayed by rid as root
-        // rows, `Meta::end_own_streams_at_log`): no hole. Not past this
+        // rows, `local::end_own_streams_at_log_tx`): no hole. Not past this
         // node's own holder appends its tenure has not committed (a
         // takeover gate's re-append, unshipped, perhaps never: a node
         // deposed before its gate's segment ships): the next root's log

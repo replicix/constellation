@@ -1559,6 +1559,8 @@ fn takeover_with_marker(meta: &Meta, epoch: u64, marker: &[LogRecord]) {
             carried: &carried,
             proof: &proof,
             marker,
+            own_lost_from: &Default::default(),
+            reappend_version: 0,
         }),
         None,
     )

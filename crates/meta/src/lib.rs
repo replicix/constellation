@@ -73,12 +73,15 @@ pub use store::member::{
     DEFAULT_READ_HOLD_SPAN_MS,
 };
 pub use store::remote::RemoteBlockers;
-#[cfg(any(test, feature = "test-util"))]
-pub use store::spec::fail_next_reship_sync_on_this_thread_for_tests;
 pub use store::spec::{
     created_ino_of, AwaitRetry, OrphanProof, QueueSnapshot, Refusal, ReshipReport, SegmentApplied,
     SpecKind, SpeculationCounts, StrandArgs, Stranded, StrandedOp, TailArgs,
     LOCAL_REPLAY_INCARNATION,
+};
+#[cfg(any(test, feature = "test-util"))]
+pub use store::spec::{
+    fail_next_reship_before_commit_on_this_thread_for_tests,
+    fail_next_reship_sync_on_this_thread_for_tests,
 };
 pub use store::{
     fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,

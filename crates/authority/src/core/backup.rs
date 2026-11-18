@@ -989,19 +989,6 @@ pub(crate) struct BackupState {
     /// its member copies by them, not by a marker recomputed from state a
     /// restart has rebuilt.
     pub(crate) gate_marker: Option<(Epoch, Vec<constellation_meta::LogRecord>)>,
-    /// Plan 43 C3 (a delegate that takes the root over): this node's own
-    /// rows as the delegate of the generations the open gate strands, as
-    /// its journal held them, until the gate re-appends them after the
-    /// tail (`Core::reappend_own_delegate_rows`), each with its `deps`, and
-    /// with the gate's epoch (a later gate captures its own).
-    #[allow(clippy::type_complexity)]
-    pub(crate) gate_own_rows: Option<(
-        Epoch,
-        Vec<(
-            constellation_meta::BackupTx,
-            Option<constellation_meta::Position>,
-        )>,
-    )>,
     pub(crate) member_epochs: Vec<Epoch>,
     /// Plan 46 M1.2 step 5: when the ERROR of a diverged tail was last
     /// logged and how many passes it has stood for since (it repeats every

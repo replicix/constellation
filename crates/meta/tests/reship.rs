@@ -66,6 +66,8 @@ fn reship(
             carried: &carried,
             proof: &proof,
             marker: &[],
+            own_lost_from: &Default::default(),
+            reappend_version: 0,
         }),
         Some(constellation_meta::TailArgs {
             epoch: EPOCH_PREV,
@@ -702,6 +704,8 @@ fn reship_lock_hold_over_a_large_tail() {
                 carried: &carried,
                 proof: &proof,
                 marker: &[],
+                own_lost_from: &Default::default(),
+                reappend_version: 0,
             }),
             Some(constellation_meta::TailArgs {
                 epoch: EPOCH_PREV,
@@ -747,6 +751,8 @@ fn a_member_keeps_a_row_it_acknowledged_when_no_tail_names_it() {
             carried: &carried,
             proof: &proof,
             marker: &[],
+            own_lost_from: &Default::default(),
+            reappend_version: 0,
         }),
         None,
     )
@@ -793,6 +799,8 @@ fn promote_streamed_flips_gated_in_both_rows() {
             carried: &carried,
             proof: &proof,
             marker: &[],
+            own_lost_from: &Default::default(),
+            reappend_version: 0,
         }),
         None,
     )
@@ -874,6 +882,8 @@ fn an_abandon_after_partial_answers_queues_only_what_the_tail_does_not_name() {
             carried: &carried,
             proof: &proof,
             marker: &[],
+            own_lost_from: &Default::default(),
+            reappend_version: 0,
         }),
         Some(constellation_meta::TailArgs {
             epoch: EPOCH_PREV,
@@ -936,6 +946,8 @@ fn a_member_copy_named_only_by_a_tx_past_the_gap_survives_as_a_replay() {
                 carried: &carried,
                 proof: &proof,
                 marker: &[],
+                own_lost_from: &Default::default(),
+                reappend_version: 0,
             }),
             Some(constellation_meta::TailArgs {
                 epoch: EPOCH_PREV,
@@ -1047,6 +1059,8 @@ fn the_gate_holds_a_rolled_back_acknowledged_row_until_its_tail_re_applies_it() 
             carried: &carried,
             proof: &proof,
             marker: &[],
+            own_lost_from: &Default::default(),
+            reappend_version: 0,
         }),
         None,
     )

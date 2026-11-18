@@ -8486,6 +8486,12 @@ fn sweep_config() {
                         );
                     }
                     eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
+                    // Plan 43 C3 item 3: this node's own delegate rows the
+                    // takeover gate put back verbatim after the tail.
+                    let reappended = c9(|s| s.own_deleg_rows_reappended);
+                    if reappended > 0 {
+                        eprintln!("SWEEP-REAPPENDED {label} seed {seed}: {reappended}");
+                    }
                     if report.unsettled_held_lost_chunk > 0 {
                         eprintln!(
                             "SWEEP-LOST-CHUNK {label} seed {seed}: {}",
