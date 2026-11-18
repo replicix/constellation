@@ -18,7 +18,7 @@ use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, DentryRecord, Kind};
 use constellation_types::Rdev;
 use fjall::{Readable, SingleWriterWriteTx};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Which dentries/inos a batch of records touches, used to suppress a
 /// foreign record that collides with the caller's own not-yet-shipped
@@ -312,12 +312,15 @@ impl TouchSet {
     /// is no table to consult (`Meta::names_of_ino`). A name the op adds to
     /// the inode needs no hold here: its dentry is held already.
     ///
-    /// Only a prefix of the names is read: one live name when the name
-    /// leaving is not the primary one, two when it is (an unlink of a
-    /// name of an inode with 8,192 names does not read 8,192). Per inode,
-    /// the moves are replayed against `limit` = 1 names, and again against
-    /// twice as many (from a fresh `names` call, so every attempt sees one
-    /// snapshot) until the outcome is decided.
+    /// Only a prefix of the names is read: two names at most for the usual
+    /// op, and one for an inode that has only one (an unlink of a name of
+    /// an inode with 8,192 names does not read 8,192). Per inode, the moves
+    /// are replayed against `limit` = 2 names, and again against twice as
+    /// many (from a fresh `names` call, so every attempt sees one snapshot)
+    /// until the outcome is decided. Two, not one: with one name fetched
+    /// out of a single-name inode the prefix could not tell that it was
+    /// complete, and every unlink or rename of an ordinary file would read
+    /// twice.
     ///
     /// Why that is exact. The fetched names are a prefix of the snapshot's
     /// names in key order, which is `(u64, String)`'s `Ord` (the `RDentry`
@@ -330,7 +333,7 @@ impl TouchSet {
     /// the fetched names equals "the inode had it before the op". With
     /// every name fetched this is the full computation
     /// (`from_op_in_names_reference`, which the simulation and the meta
-    /// tests compare against, `Self::set_names_cross_check`).
+    /// tests compare against, `Self::names_cross_check`).
     pub fn from_op_in_names(
         op: &crate::mutate::MutateOp,
         lookup: &dyn Fn(u64, &str) -> Option<u64>,
@@ -340,13 +343,12 @@ impl TouchSet {
         // The moves of one inode, in the op's order. The inodes are
         // independent (the holds go into ordered sets), so the grouping
         // does not change the result.
-        let mut by_ino: std::collections::BTreeMap<u64, Vec<NameMove>> =
-            std::collections::BTreeMap::new();
+        let mut by_ino: BTreeMap<u64, Vec<NameMove>> = BTreeMap::new();
         for (ino, gone, arrives) in moves {
             by_ino.entry(ino).or_default().push((gone, arrives));
         }
         for (ino, moves) in by_ino {
-            let mut limit = 1usize;
+            let mut limit = FIRST_NAMES_LIMIT;
             let holds = loop {
                 match replay_name_moves(&moves, limit, names(ino, limit)) {
                     Some(holds) => break holds,
@@ -359,7 +361,7 @@ impl TouchSet {
             }
         }
         #[cfg(any(test, feature = "test-util"))]
-        if NAMES_CROSS_CHECK.load(std::sync::atomic::Ordering::Relaxed) {
+        if NAMES_CROSS_CHECK.with(std::cell::Cell::get) {
             let reference = Self::from_op_in_names_reference(op, lookup, names);
             assert_eq!(
                 set, reference,
@@ -369,13 +371,20 @@ impl TouchSet {
         set
     }
 
-    /// Whether [`Self::from_op_in_names`] also computes the keys the
-    /// unbounded way and asserts that they are the same (the simulation and
-    /// the meta tests turn it on; off by default, and not built in release
-    /// builds, which do not have the `test-util` feature).
+    /// Makes [`Self::from_op_in_names`], on this thread, also compute the
+    /// keys the unbounded way and assert that they are the same, until the
+    /// guard drops (the simulation turns it on for the thread of a seed, and
+    /// a meta test for its own). It is per thread because the two
+    /// computations read the store one after the other: another thread
+    /// linking or unlinking in between would make them differ without any
+    /// bug (the simulation's held-write threads are such threads, and are
+    /// not checked). Off by default, and not built in release builds, which
+    /// do not have the `test-util` feature.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn set_names_cross_check(on: bool) {
-        NAMES_CROSS_CHECK.store(on, std::sync::atomic::Ordering::Relaxed);
+    pub fn names_cross_check() -> NamesCrossCheck {
+        NamesCrossCheck {
+            before: NAMES_CROSS_CHECK.with(|c| c.replace(true)),
+        }
     }
 
     /// [`Self::from_op_in`] and the name moves of the op, in the order the
@@ -547,8 +556,29 @@ type NameMove = ((u64, String), Option<(u64, String)>);
 /// An inode, with one [`NameMove`].
 type Move = (u64, (u64, String), Option<(u64, String)>);
 
+/// The first `limit` of the names asked for: two, so that an inode with a
+/// single name is seen complete at once (`TouchSet::from_op_in_names`).
+const FIRST_NAMES_LIMIT: usize = 2;
+
 #[cfg(any(test, feature = "test-util"))]
-static NAMES_CROSS_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static NAMES_CROSS_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`TouchSet::names_cross_check`]'s guard: the previous state comes back
+/// when it drops.
+#[cfg(any(test, feature = "test-util"))]
+#[must_use = "the cross-check ends when the guard drops"]
+pub struct NamesCrossCheck {
+    before: bool,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Drop for NamesCrossCheck {
+    fn drop(&mut self) {
+        NAMES_CROSS_CHECK.with(|c| c.set(self.before));
+    }
+}
 
 /// The moves of one inode judged against the first `limit` of its names
 /// (`fetched`, in key order): the names that become primary and were the
@@ -562,18 +592,15 @@ fn replay_name_moves(
     debug_assert!(fetched.is_sorted(), "names come in key order");
     let complete = fetched.len() < limit;
     // A name the moves so far removed (`false`) or added (`true`).
-    let mut overlay: std::collections::BTreeMap<(u64, String), bool> =
-        std::collections::BTreeMap::new();
-    let survivor = |overlay: &std::collections::BTreeMap<(u64, String), bool>| {
+    let mut overlay: BTreeMap<(u64, String), bool> = BTreeMap::new();
+    let survivor = |overlay: &BTreeMap<(u64, String), bool>| {
         fetched.iter().find(|n| overlay.get(*n) != Some(&false))
     };
     // Every name that sorts after the fetched ones is unfetched: the
     // outcome is decided once a fetched name survives (the true minimum is
     // then known) or every name is in hand.
-    let exact = |overlay: &std::collections::BTreeMap<(u64, String), bool>| {
-        complete || survivor(overlay).is_some()
-    };
-    let min_now = |overlay: &std::collections::BTreeMap<(u64, String), bool>| {
+    let exact = |overlay: &BTreeMap<(u64, String), bool>| complete || survivor(overlay).is_some();
+    let min_now = |overlay: &BTreeMap<(u64, String), bool>| {
         let added = overlay.iter().find(|(_, on)| **on).map(|(n, _)| n);
         match (survivor(overlay), added) {
             (Some(a), Some(b)) => Some(a.min(b).clone()),
@@ -2271,26 +2298,24 @@ mod tests {
     }
 
     /// ADR-42's cost: the names of an inode are read in key order only
-    /// until the outcome is decided. An unlink of a name that is not the
-    /// primary one reads one name, of the primary one two, whatever the
-    /// inode's name count. (Fails before: the one-argument `names` listed
-    /// all 8,192 at every call.)
+    /// until the outcome is decided: one read of at most two names, whatever
+    /// the inode's name count, whether the name that leaves is the primary
+    /// one or not. (Fails before: the one-argument `names` listed all 8,192
+    /// at every call.)
     #[test]
-    fn an_unlink_of_a_name_that_is_not_the_primary_reads_one_name() {
+    fn an_unlink_of_a_name_that_is_not_the_primary_reads_two_names() {
         use crate::mutate::MutateOp;
         use crate::replay::TouchSet;
         use std::cell::Cell;
-        // (The cross-check, when another test has it on, reads them all with
-        // `usize::MAX`: not counted.)
         let all: Vec<(u64, String)> = (0..8_192).map(|i| (2, format!("n{i:05}"))).collect();
         let lookup = |p: u64, n: &str| (p == 2 && n.starts_with('n')).then_some(10);
-        let read = Cell::new(0usize);
+        let (reads, read) = (Cell::new(0usize), Cell::new(0usize));
         let names = |i: u64, limit: usize| {
             assert_eq!(i, 10);
+            assert!(limit <= 2, "a read of {limit} names");
             let got: Vec<_> = all.iter().take(limit).cloned().collect();
-            if limit != usize::MAX {
-                read.set(read.get() + got.len());
-            }
+            reads.set(reads.get() + 1);
+            read.set(read.get() + got.len());
             got
         };
         let unlink = |name: &str| MutateOp::Unlink {
@@ -2298,13 +2323,51 @@ mod tests {
             name: name.into(),
         };
         let k = TouchSet::from_op_in_names(&unlink("n04000"), &lookup, &names);
-        assert!(read.get() <= 1, "read {} names", read.get());
+        assert_eq!((reads.get(), read.get()), (1, 2), "one read of two names");
         assert!(!k.dentries.contains(&(2, "n00001".to_string())), "{k:?}");
+        reads.set(0);
         read.set(0);
         let k = TouchSet::from_op_in_names(&unlink("n00000"), &lookup, &names);
-        assert!(read.get() <= 3, "read {} names", read.get());
+        assert_eq!((reads.get(), read.get()), (1, 2), "one read of two names");
         assert!(k.dentries.contains(&(2, "n00001".to_string())), "{k:?}");
         assert!(k.shared.contains(&2));
+    }
+
+    /// An unlink or a rename of a file that has one name is as cheap as it
+    /// was before the names were bounded: one read of one name. (Fails
+    /// with a first limit of 1: the prefix could not tell that the one name
+    /// was all of them, and the op read twice.)
+    #[test]
+    fn an_unlink_or_a_rename_of_a_single_name_file_reads_once() {
+        use crate::mutate::MutateOp;
+        use crate::replay::TouchSet;
+        use std::cell::Cell;
+        let lookup = |p: u64, n: &str| (p == 2 && n == "f").then_some(10);
+        let (reads, read) = (Cell::new(0usize), Cell::new(0usize));
+        let names = |i: u64, limit: usize| {
+            assert_eq!(i, 10);
+            let got: Vec<_> = [(2u64, "f".to_string())].into_iter().take(limit).collect();
+            reads.set(reads.get() + 1);
+            read.set(read.get() + got.len());
+            got
+        };
+        let unlink = MutateOp::Unlink {
+            parent: 2,
+            name: "f".into(),
+        };
+        let k = TouchSet::from_op_in_names(&unlink, &lookup, &names);
+        assert_eq!((reads.get(), read.get()), (1, 1), "unlink: {k:?}");
+        reads.set(0);
+        read.set(0);
+        let rename = MutateOp::Rename {
+            parent: 2,
+            name: "f".into(),
+            new_parent: 3,
+            new_name: "g".into(),
+            noreplace: false,
+        };
+        let k = TouchSet::from_op_in_names(&rename, &lookup, &names);
+        assert_eq!((reads.get(), read.get()), (1, 1), "rename: {k:?}");
     }
 
     mod bounded_names {
@@ -2434,22 +2497,48 @@ mod tests {
             }
         }
 
+        /// The names the closure serves: the table the lookup uses, one of
+        /// its own (a lookup that is stale against the names snapshot, as
+        /// a concurrent link or unlink makes it), or none (no delegation).
+        #[derive(Debug, Clone)]
+        enum Names {
+            Same,
+            Own(Vec<Option<u64>>),
+            Empty,
+        }
+
+        fn names_table() -> impl Strategy<Value = Names> {
+            prop_oneof![
+                2 => Just(Names::Same),
+                2 => prop::collection::vec(prop::option::weighted(0.7, 0u64..3), SLOTS)
+                    .prop_map(Names::Own),
+                1 => Just(Names::Empty),
+            ]
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(4_000))]
 
             /// Reading a prefix of the names gives the keys that reading
-            /// every name gives, for every op shape, whatever the names.
+            /// every name gives, for every op shape, whatever the names,
+            /// and whether or not the lookup agrees with them.
             #[test]
             fn bounded_name_reads_give_the_keys_of_reading_every_name(
                 table in prop::collection::vec(prop::option::weighted(0.7, 0u64..3), SLOTS),
+                served in names_table(),
                 spec in spec(),
             ) {
                 let lookup = |p: u64, n: &str| {
                     (0..SLOTS).find(|s| slot(*s) == (p, n.to_string())).and_then(|s| table[s]).map(|i| 10 + i)
                 };
                 let names = |i: u64, limit: usize| {
+                    let from = match &served {
+                        Names::Same => &table,
+                        Names::Own(own) => own,
+                        Names::Empty => return Vec::new(),
+                    };
                     let mut all: Vec<(u64, String)> = (0..SLOTS)
-                        .filter(|s| table[*s].map(|t| 10 + t) == Some(i))
+                        .filter(|s| from[*s].map(|t| 10 + t) == Some(i))
                         .map(slot)
                         .collect();
                     all.sort();
@@ -2464,6 +2553,112 @@ mod tests {
         }
     }
 
+    mod store_names {
+        use crate::record::LogRecord;
+        use crate::store::Meta;
+        use constellation_fs_core::types::ROOT_INO;
+        use proptest::prelude::*;
+        use std::collections::BTreeSet;
+
+        /// Names that are prefixes of one another, carry a NUL, sort
+        /// differently by bytes than by length, and are multi-byte UTF-8.
+        const NAMES: [&str; 12] = [
+            "a",
+            "aa",
+            "a\u{0}",
+            "a\u{1}b",
+            "b",
+            "\u{e9}",
+            "e",
+            "\u{65e5}\u{672c}",
+            "\u{65e5}",
+            "\u{10000}",
+            "\u{ffff}",
+            "z",
+        ];
+        /// Directories above 2^32 (and the root, which sorts first).
+        const PARENTS: [u64; 4] = [1, (1 << 33) | 2, (1 << 40) | 3, (1 << 48) | 4];
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            /// `names_of_ino(i, k)` is the first `k` of the names in
+            /// `(parent, name)` order, whatever the names are (the order the
+            /// bounded computation in `from_op_in_names` relies on): the
+            /// full list is sorted under `(u64, String)`'s order, and every
+            /// bounded read is its prefix.
+            #[test]
+            fn the_names_of_an_inode_come_in_tuple_order_and_a_limit_takes_a_prefix(
+                picks in prop::collection::btree_set((0..PARENTS.len(), 0..NAMES.len()), 1..24),
+            ) {
+                let meta = Meta::open_in_memory().unwrap();
+                let mkdir = |name: &str, ino: u64| LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: name.into(),
+                    ino,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                };
+                let dirs: Vec<LogRecord> = PARENTS
+                    .iter()
+                    .filter(|p| **p != ROOT_INO)
+                    .map(|p| mkdir(&format!("d{p}"), *p))
+                    .collect();
+                meta.apply_records(&dirs).unwrap();
+                let f = (1u64 << 40) | 9;
+                let mut wanted: BTreeSet<(u64, String)> = BTreeSet::new();
+                let mut records = Vec::new();
+                for (pi, ni) in &picks {
+                    let (parent, name) = (PARENTS[*pi], NAMES[*ni].to_string());
+                    // The names of one file in one directory are distinct.
+                    wanted.insert((parent, name.clone()));
+                    records.push((parent, name));
+                }
+                let mut it = records.into_iter();
+                let (parent, name) = it.next().unwrap();
+                let mut recs = vec![LogRecord::Create {
+                    parent,
+                    name,
+                    ino: f,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                }];
+                recs.extend(it.map(|(parent, name)| LogRecord::Link {
+                    ino: f,
+                    parent,
+                    name,
+                    time_ns: 1,
+                }));
+                meta.apply_records(&recs).unwrap();
+                // A delegation, for the names to be read at all.
+                meta.apply_segment(
+                    1,
+                    1,
+                    &[LogRecord::delegate_one(
+                        4,
+                        (1 << 32) | 1,
+                        PARENTS[1],
+                        crate::SubtreeKind::Placed,
+                    )],
+                    &crate::replay::TouchSet::default(),
+                )
+                .unwrap();
+                let expected: Vec<(u64, String)> = wanted.into_iter().collect();
+                let full = meta.names_of_ino(f, usize::MAX);
+                prop_assert_eq!(&full, &expected);
+                prop_assert!(full.is_sorted());
+                for k in 0..=expected.len() + 1 {
+                    let got = meta.names_of_ino(f, k);
+                    prop_assert_eq!(&got[..], &expected[..k.min(expected.len())]);
+                }
+            }
+        }
+    }
+
     /// The store's `names_of_ino` stops at the `limit`th name, and the
     /// root's fast path admits what it admitted when it read every name
     /// (the cross-check compares the two in every call here).
@@ -2471,7 +2666,7 @@ mod tests {
     fn the_store_reads_a_prefix_of_the_names_and_the_fast_path_admits_as_before() {
         use crate::mutate::MutateOp;
         use crate::replay::TouchSet;
-        TouchSet::set_names_cross_check(true);
+        let _cross_check = TouchSet::names_cross_check();
         let meta = Meta::open_in_memory().unwrap();
         let (p1, p2, p3) = (1u64 << 40 | 2, 1u64 << 40 | 3, 1u64 << 40 | 4);
         let mkdir = |name: &str, ino: u64| LogRecord::Mkdir {

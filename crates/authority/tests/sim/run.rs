@@ -5618,9 +5618,13 @@ pub fn last_run_sim_ms() -> u64 {
 /// Run one seed. `Err` carries the failure and the replay command.
 pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
     constellation_store_s3::adapters::install();
-    // ADR-42: every ownership check also reads every name and compares the
-    // keys (a bounded read that changed them fails the seed).
-    constellation_meta::TouchSet::set_names_cross_check(true);
+    // ADR-42: every ownership check on this thread also reads every name and
+    // compares the keys (a bounded read that changed them fails the seed).
+    // The seed's held-write threads are not checked: a write that commits
+    // between the bounded and the full read would make them differ with no
+    // bug, so a firing here is a real one (a thread's own two reads see one
+    // store).
+    let _names_cross_check = constellation_meta::TouchSet::names_cross_check();
     // Plan 46 M1.1 step 7: every delegated configuration judges I1, the
     // answer's claim and the rows' versions, unless it carries a documented
     // exception.

@@ -2947,12 +2947,13 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
   (`delegate_dir`'s read recalls then cover the file). It closes the same race
   for a usable root. Cost: only while a delegation exists, in `keys_of_op_in`
   and the FUSE fast paths, the inode's names are read in key order only until
-  the outcome is decided: one live name when the name leaving is not the
-  primary one, two when it is (the first review's text claimed one `RDentry`
-  range seek, which did not hold: the check listed every name of the inode,
-  O(links) per op). The keys are unchanged (an implementation note, no
-  decision change: `from_op_in_names` asks `names(ino, limit)` for a prefix,
-  doubling it until some fetched name survives the op's moves, and the
+  the outcome is decided: one range seek and at most two live names, whether
+  the name leaving is the primary one or not, and one name for an inode that
+  has only one (the first review's text claimed one `RDentry` range seek,
+  which did not hold: the check listed every name of the inode, O(links) per
+  op). The keys are unchanged (an implementation note, no decision change:
+  `from_op_in_names` asks `names(ino, limit)` for a prefix, starting at two
+  and doubling it until some fetched name survives the op's moves, and the
   simulation and the meta tests compare it with the full computation); the
   ops it makes cross-subtree are those of an inode with several
   names whose primary name leaves while another name is in a delegated

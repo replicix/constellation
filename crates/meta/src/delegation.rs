@@ -845,6 +845,9 @@ impl Meta {
                 parent_ino, name, ..
             }) = keys::Key::parse(&k)
             {
+                // (Key order is `(u64, String)` order only while names are valid
+                // UTF-8, as the store's `String` names are: the bounded
+                // computation in `TouchSet::from_op_in_names` relies on it.)
                 out.push((parent_ino, String::from_utf8_lossy(name).into_owned()));
                 if out.len() >= limit {
                     break;

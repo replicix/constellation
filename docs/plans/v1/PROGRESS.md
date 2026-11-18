@@ -70239,9 +70239,10 @@ Status: `delegation.root_own.skipped_no_peer` and `released_singleton`. ADR-55 a
 while any delegation existed: an unlink of one name of an 8,192-name file cost O(8,192) in `Meta::root_fast_path`, the
 delegate's `admit_for`, the core's `keys_of_op_in` and the sim's model, several times per op (about 1.6 ms per unlink on
 every file system in the bisect's profile). `names_of_ino(ino, limit)` now stops its range at `limit` names, and the
-hold is computed over a prefix (limit 1, doubled and replayed from a fresh read until some fetched name survives the
-op's moves): one live name when the name leaving is not the primary, two when it is. The key set is unchanged: the
-private reference (today's computation, `test-util`) is compared in every sim run (`TouchSet::set_names_cross_check`)
+hold is computed over a prefix (limit 2, doubled and replayed from a fresh read until some fetched name survives the
+op's moves): one read of at most two live names, and of one for an inode with a single name, so the common unlink or
+rename of a single-name file reads once, as before. The key set is unchanged: the private reference (today's
+computation, `test-util`) is compared in every sim run (`TouchSet::names_cross_check`, scoped to the seed's thread)
 and by a proptest. ADR-42's cost claim ("one range seek") is corrected. Measured on btrfs, ext4 and tmpfs (8,192
 names of one file, a lapse-forced own grant so that the names are read, two runs each): the unlink phase took 14.4 to
 16.1 s on main (per-500 block means 1.6 to 3.5 ms) and 0.71 to 0.90 s with this change (59 to 135 us). With
