@@ -86932,6 +86932,86 @@ mod root_own_sticky {
         assert!(d.parked.is_empty(), "the kept state holds a parked op");
     }
 
+    /// ADR-61 step 14 with 996 B1 (sim `sticky-leave-root-self` seed 0): the
+    /// state a claimed own stream keeps past its end for the release row goes
+    /// once the row has shipped in the root's own segment, and the root's own
+    /// leave is answered. Nothing else lets it go: no stream acknowledges a
+    /// row the root shipped itself, and the end has passed. Fails on the
+    /// parent: the state stayed (`release_acked` never set) and the leave
+    /// answered "not ended yet" at its deadline.
+    #[test]
+    fn a_kept_claimed_stream_goes_once_its_row_ships_and_the_roots_leave_is_answered() {
+        let answer_of = |out: &[Action]| {
+            out.iter().find_map(|a| match a {
+                Action::ControlDone { op, result } if *op == OpId(953) => Some(result.clone()),
+                _ => None,
+            })
+        };
+        let (mut h, _dirs, gen, _record, row) = claimed_and_ended();
+        assert!(
+            h.core.dl.mine.contains_key(&gen),
+            "the end dropped the state: the test proves nothing"
+        );
+        // The ended generation is forgotten while the row waits behind the
+        // held one (the simulation's schedule): from then on nothing names
+        // the stream as the root's own.
+        for _ in 0..400 {
+            if !h.core.dl.gens.contains_key(&gen) {
+                break;
+            }
+            h.advance(500);
+            h.hold(3, None);
+            activity(&mut h);
+        }
+        assert!(
+            !h.core.dl.gens.contains_key(&gen),
+            "the ended generation was not forgotten"
+        );
+        assert!(
+            h.core.dl.mine.contains_key(&gen),
+            "the state went before its row shipped"
+        );
+        h.meta.drop_held_cancel(99).unwrap();
+        let mut out = h.step(Event::Control {
+            op: OpId(953),
+            req: Control::ReleaseGrants,
+        });
+        let deadline = h.core.leave_wait_ms() as u64;
+        let mut waited = 0;
+        while waited < deadline && answer_of(&out).is_none() {
+            // (The root's segments ship: its journal leaves the disk.)
+            let batch = Replica::take_journal(&h.meta, 100).unwrap();
+            let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+            Replica::ack_journal(&h.meta, &seqs, 3, None).unwrap();
+            h.core.note_shipped(&seqs, 0);
+            out = archive_and_step(&mut h);
+            h.advance(500);
+            waited += 500;
+            // (The root keeps its lease.)
+            h.hold(3, None);
+            h.core.on_leave_wait_timer(h.clk(), &h.meta, &mut out);
+        }
+        assert!(
+            Replica::log_stream_idx(&h.meta, gen) >= row,
+            "the release row did not ship"
+        );
+        match answer_of(&out) {
+            Some(Ok(_)) => {}
+            other => panic!(
+                "the root's own leave: {other:?} (kept state: {:?})",
+                h.core
+                    .dl
+                    .mine
+                    .get(&gen)
+                    .map(|d| (d.remnant, d.release_acked))
+            ),
+        }
+        assert!(
+            !h.core.dl.mine.contains_key(&gen),
+            "the state outlived its shipped release row"
+        );
+    }
+
     /// The first batch of stream `gen` to node 2: its row indices.
     fn stream_idxs_to_2(h: &mut Harness, gen: u64, first: &mut Vec<Action>) -> Option<Vec<u64>> {
         h.advance(h.core.cfg.delegation_stream_tick_ms + 1);

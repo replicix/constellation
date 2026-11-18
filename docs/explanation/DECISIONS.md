@@ -4669,7 +4669,12 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   (ADR-60): it is the stream's pending release, journaled by the claim, and the
   state stays through the claim's end (one predicate, `release_row_unshipped`:
   an ending release row still in this journal and not in the log, which a
-  strand or the row's shipping ends) and through a deposition. A restart
+  strand or the row's shipping ends; it holds for a non-stealable stream, the
+  root's own stream or a remnant, never for a stealable one, whose recall the
+  root's expiry outwaits) and through a deposition. Once the row has shipped
+  or left the journal, the state goes as the end would have dropped it: a
+  claim's row ships in the root's own segment, no stream acknowledges it, and
+  a kept state would otherwise hold the root's own leave for ever. A restart
   re-creates it: a node that holds no root tenure and whose journal holds
   its own unshipped end of a stream and that stream's unshipped release row
   (its replica applied the end, so the table no longer lists the stream)

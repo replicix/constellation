@@ -867,6 +867,14 @@ pub(crate) struct DelegateState {
     /// which is what lets [`DelegateState::remnant_decides_held_drop`] decide
     /// the drop of its held rows (996 B).
     pub remnant: bool,
+    /// ADR-55: the state outlived the end of its generation, or the table's
+    /// forgetting it, only for its release row
+    /// ([`Core::release_row_unshipped`]): [`Core::kept_row_progress`] lets it
+    /// go once the row has shipped or left the journal, as the end or the
+    /// sync would have at once without the row (`sticky-leave-root-self`
+    /// seed 0: a kept state whose row shipped stayed, and the root's own
+    /// leave waited for it for ever).
+    pub kept_for_row: bool,
     /// Plan 46 M1.2 step 10: the subtrees this node released from the stream
     /// (a repeated or late request for one is not news: it is not a subtree
     /// the node has yet to learn). A subtree granted to the stream again
@@ -2318,6 +2326,35 @@ impl Core {
         }
     }
 
+    /// ADR-55: a state kept only for its release row
+    /// ([`DelegateState::kept_for_row`]) goes once the row has shipped or a
+    /// strand took it out of the journal: the sync then does what the end or
+    /// the sync that kept it would have done without the row. Nothing else
+    /// ever lets it go: a claim's row ships in this node's own segment, no
+    /// stream acknowledges it, and the generation's end has already passed
+    /// (`sticky-leave-root-self` seed 0: the root's own leave waited for the
+    /// kept state, `release_acked` never set, until the operator abandon).
+    /// Checked on every event; the predicate reads the journal only while
+    /// the row is not in the log.
+    fn kept_row_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let shipped: Vec<u64> = self
+            .dl
+            .mine
+            .iter()
+            .filter(|(g, d)| d.kept_for_row && self.release_row_unshipped(**g, replica).is_none())
+            .map(|(g, _)| *g)
+            .collect();
+        if shipped.is_empty() {
+            return;
+        }
+        for gen in shipped {
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                d.kept_for_row = false;
+            }
+        }
+        self.delegation_sync(now, replica, out);
+    }
+
     /// ADR-55 (R-I4), audited in the simulation only (`track_fence_audit`):
     /// the root's own path is about to execute `op`; none of its keys may be
     /// under the root's own live sticky stream.
@@ -2392,15 +2429,25 @@ impl Core {
     /// node assigned (`journal_own_gens`; a strand that rolled the row back
     /// ends the wait). The row leaves the journal by shipping (the log's
     /// index reaches `r`) or by a strand, so the keep terminates.
+    ///
+    /// Only for a non-stealable stream, this node's own stream as the root
+    /// (minted or granted here) or a remnant (a claim's row,
+    /// [`Self::claim_releases`], or one a restart installed again): a
+    /// stealable stream's recall is outwaited by the root's expiry whatever
+    /// its row did, and its ended state is the table's to drop, as before.
+    /// Kept for a stealable stream too, the state outlived its end and moved
+    /// the `long-delegated` schedules (no settle held for an outwait in seeds
+    /// 0 to 2,000, where main holds three; half the outwait extensions).
     pub(crate) fn release_row_unshipped(&self, gen: u64, replica: &dyn Replica) -> Option<u64> {
-        let r = self
-            .dl
-            .mine
-            .get(&gen)?
-            .release
-            .as_ref()
-            .filter(|r| r.ends)?
-            .row?;
+        let d = self.dl.mine.get(&gen)?;
+        if !(d.non_stealable
+            || d.remnant
+            || self.dl.own_minted.contains(&gen)
+            || self.is_own_stream(gen))
+        {
+            return None;
+        }
+        let r = d.release.as_ref().filter(|r| r.ends)?.row?;
         (replica.log_stream_idx(gen) < r && replica.journal_own_gens().contains(&gen)).then_some(r)
     }
 
@@ -2916,6 +2963,7 @@ impl Core {
             .filter(|s| s.node == me)
             .map(|s| s.gen)
             .collect();
+        let mut kept_for_row: Vec<u64> = Vec::new();
         let ended: Vec<u64> = self
             .dl
             .mine
@@ -2936,15 +2984,29 @@ impl Core {
                 // The same holds for a release row that ends the stream and
                 // is still in this journal, whatever the table says
                 // ([`Self::release_row_unshipped`]).
-                !(((d.non_stealable || d.remnant)
+                // (Kept for its row alone, the state is let go once the row
+                // has shipped: [`Self::kept_row_progress`].)
+                let listed = (d.non_stealable || d.remnant)
                     && unlogged
-                    && (streams_mine.contains(g) || self.dl.own_minted.contains(g)))
-                    || self.release_row_unshipped(**g, replica).is_some())
+                    && (streams_mine.contains(g) || self.dl.own_minted.contains(g));
+                if listed {
+                    return false;
+                }
+                if self.release_row_unshipped(**g, replica).is_some() {
+                    kept_for_row.push(**g);
+                    return false;
+                }
+                true
             })
             .map(|(g, _)| *g)
             .collect();
         for gen in ended {
             self.drop_delegate_state(now, gen, replica, out);
+        }
+        for gen in kept_for_row {
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                d.kept_for_row = true;
+            }
         }
         // A state kept for its release row after the table forgot the
         // generation holds nothing the ordinary route does not.
@@ -3209,6 +3271,7 @@ impl Core {
                     designated: !d.dirs.is_empty()
                         && d.dirs.iter().all(|(_, k)| *k == SubtreeKind::Designated),
                     remnant,
+                    kept_for_row: false,
                     last_root: self.holder_root(),
                     known_root: self.holder_root(),
                     backup: None,
@@ -6384,6 +6447,7 @@ impl Core {
         self.sticky_release_progress(now, replica, out);
         self.idle_release_progress(now, replica, out);
         self.own_release_progress(now, replica, out);
+        self.kept_row_progress(now, replica, out);
         self.abandon_progress(now, replica, out);
         self.deleg_restart_void_round(now, replica, out);
         // Plan 43 C2e (D8): a strict member's sealed tail that the drain
@@ -12923,6 +12987,9 @@ impl Core {
             .is_some_and(|row| row <= through);
         if self.dl.mine.contains_key(&gen) {
             if own_release_unshipped {
+                if let Some(d) = self.dl.mine.get_mut(&gen) {
+                    d.kept_for_row = true;
+                }
                 self.hand_back_kept_parks(now, gen, replica, out);
             } else {
                 self.drop_delegate_state(now, gen, replica, out);

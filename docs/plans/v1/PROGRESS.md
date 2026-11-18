@@ -70801,3 +70801,27 @@ A kept state after the claim's end gives its parked ops back (`hand_back_kept_pa
 `a_deposition_does_not_release_an_own_stream_op_waiting_for_a_root_row` left an own client op parked for good.
 Sweeps (2,000 seeds, base vs fix): identical failing sets over the 22 labels (only `far-root-writes+lost-chunk-late` [1810]).
 Not done here (not on main): the held-own labels and the knob control; spec-1510 lands after this.
+
+Round 2 (2026-11-18). Four release sim-suite tests failed with the commit above and pass on main.
+- `a_node_that_leaves_ends_its_grants_first` and `m03_the_configurations_at_zero_violations_stay_there` (`sticky-leave-root-self`
+  seed 0, also `+unsettled`): the leave of node 1 never completed. The root rebooted, claimed its own stream, and the claim's end kept the
+  state for the release row (F2). The row then shipped in the root's own segment, but nothing let the state go. The end had passed, the
+  generation was forgotten (`gens`), and `own_minted` was empty after the restart, so `own_release_progress` never acknowledged the
+  release. No sync ran after the ship, and the leave waited for `release_acked` until its deadline. `DelegateState::kept_for_row` now
+  marks a state kept for its row alone (by `end_generation` or by the sync), and `Core::kept_row_progress` (every event) syncs once the
+  row has shipped or left the journal. The sync then drops the state, as the end would have done without the row, so ADR-61's
+  step 14 ("Leave ends grants first") holds. Core fail-before:
+  `a_kept_claimed_stream_goes_once_its_row_ships_and_the_roots_leave_is_answered` (on the parent the state stays and the leave answers
+  "not ended yet").
+- `a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late` (seed 15798) and
+  `long_delegated_settles_outlast_the_roots_outwait` (seed 1089): the pins did not need moving. F2's predicate kept the ended state of
+  every stream with an unshipped ending release row, a stealable far delegate's too, and that moved the `long-delegated` schedules. With
+  it, seeds 0 to 2,000 of `long-delegated+settle` held no settle (main holds one in 618, 698 and 1264), and 40 seeds extended one (88 on
+  main). `Core::release_row_unshipped` now holds only for a non-stealable stream, the root's own stream, or a remnant. A stealable
+  stream's recall is outwaited by the root's expiry whatever its row did, as the sync's own rule already said. With that change the scan
+  equals main seed for seed (held in 618, 698 and 1264; 88 extended; the same `+unsettled` I4 on 1516, which main has too), and both
+  tests pass on their pins unchanged.
+- F3 against fix1810's real strand: in a throwaway merge of this branch onto fix1810, a restart without the lease that runs
+  `Core::strand_unshipped_appends` at a newer epoch, before `start` and after it, rolls back none of the node's own stream rows or its
+  own end (0 rows), and the sync still re-creates the remnant with its release row. The 996 and 1810 sim pins and
+  `a_node_that_leaves_ends_its_grants_first` pass on the merge.
