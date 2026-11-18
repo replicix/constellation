@@ -406,54 +406,7 @@ unsynced journal tail; that is upstream's behaviour, with or without this
 change. Upstream's own one-call rotation (`Writer::rotate`, used by its
 journal unit tests, and compiled only for tests) runs the same steps.
 
-### Change 12: version GC frees outside the keyspaces lock
-
-Change 6 moved the freeing of stale versions out of each tree's version
-lock, but the GC loop in `Keyspace::inner_rotate_memtable` still ran, for
-every keyspace, inside the guard of `supervisor.keyspaces.read()`.
-`StaleVersions::remove` drops the old versions, including whole sealed
-memtables (a large skiplist free), and unlinks their files: 0.56-0.86 s in
-that guard under load. A journal rotation (`journal/rotation.rs::rotate`,
-step 2) holds the journal writer and the journal manager while it waits for
-`keyspaces.write()`, and every commit takes the journal writer. So each
-commit waited as long as the free, in its `journal_lock` phase (380-645 ms
-seen in every heavy run on tmpfs, ext4, xfs and btrfs), and a core step
-lapsed.
-
-Now the guard only collects: it calls `take_garbage` for each keyspace
-(under that tree's version lock, with the watermark read where it was) and
-keeps each non-empty `StaleVersions` with the keyspace name in a local
-`Vec`. After the guard is dropped, each one is `remove()`d, with the same
-`log::warn!` on error. The journal manager's `maintenance()` still follows
-the loop. `StaleVersions::is_empty` (vendored lsm-tree) is new.
-
-No integrity change: `take_garbage` decides what is stale, under the version
-lock, as before. Removal already ran outside the version lock (change 6),
-and only the outer read guard is released earlier. A keyspace deleted between
-the guard and `remove` is harmless: `remove` treats a missing file as done
-(`try_exists`) and the `StaleVersions` own their `Arc`s. No journal file,
-rotation marker or seqno map is touched.
-
-The other `StaleVersions::remove` sites do not hold a `keyspaces` guard:
-`lsm-tree/src/tree/mod.rs` (~506) and `compaction/worker.rs` (~255, ~615,
-~684) are in lsm-tree, which has no notion of fjall's keyspace map, and
-fjall's worker pool, flush and compaction code never takes
-`supervisor.keyspaces`. The only other holders are `Database::keyspace`
-(write, creation), recovery and the post-recovery check (read), and
-`rotation::rotate`.
-
-Considered, not done: `rotate`'s `keyspaces.write()` could be a `read()`
-(commits hold the journal writer through the memtable insert, so building the
-seqno map under a read guard would be sound). It is not needed once the long
-reader is gone, and it is a lock-semantics change.
-
-The test is `keyspace::stale_gc_test::a_slow_version_gc_does_not_stall_commits_behind_a_journal_rotation`:
-a test-only hook (`stale_gc_hook`) sleeps 300 ms while a rotation handles a
-keyspace's stale versions; a forced journal rotation
-(`rotate_journal_and_evict`) waits for `keyspaces.write()` meanwhile, and a
-commit into another keyspace must take under 100 ms (before: 249 ms).
-
-## Tests
+### Tests
 
 `src/journal/rotation_test.rs` (in `cargo test --manifest-path
 vendor/fjall/Cargo.toml --lib`), with test-only hooks keyed by database
@@ -600,6 +553,53 @@ The tests: `journal::rotation_test::an_eviction_on_demand_keeps_what_a_keyspace_
 and a crash; once it flushed, the next call deletes it), and
 `crates/meta/src/store/close_tests.rs` (writes racing the close, a flush
 that fails, the open and close times).
+
+## Change 12: version GC frees outside the keyspaces lock
+
+Change 6 moved the freeing of stale versions out of each tree's version
+lock, but the GC loop in `Keyspace::inner_rotate_memtable` still ran, for
+every keyspace, inside the guard of `supervisor.keyspaces.read()`.
+`StaleVersions::remove` drops the old versions, including whole sealed
+memtables (a large skiplist free), and unlinks their files: 0.56-0.86 s in
+that guard under load. A journal rotation (`journal/rotation.rs::rotate`,
+step 2) holds the journal writer and the journal manager while it waits for
+`keyspaces.write()`, and every commit takes the journal writer. So each
+commit waited as long as the free, in its `journal_lock` phase (380-645 ms
+seen in every heavy run on tmpfs, ext4, xfs and btrfs), and a core step
+lapsed.
+
+Now the guard only collects: it calls `take_garbage` for each keyspace
+(under that tree's version lock, with the watermark read where it was) and
+keeps each non-empty `StaleVersions` with the keyspace name in a local
+`Vec`. After the guard is dropped, each one is `remove()`d, with the same
+`log::warn!` on error. The journal manager's `maintenance()` still follows
+the loop. `StaleVersions::is_empty` (vendored lsm-tree) is new.
+
+No integrity change: `take_garbage` decides what is stale, under the version
+lock, as before. Removal already ran outside the version lock (change 6),
+and only the outer read guard is released earlier. A keyspace deleted between
+the guard and `remove` is harmless: `remove` treats a missing file as done
+(`try_exists`) and the `StaleVersions` own their `Arc`s. No journal file,
+rotation marker or seqno map is touched.
+
+The other `StaleVersions::remove` sites do not hold a `keyspaces` guard:
+`lsm-tree/src/tree/mod.rs` (~506) and `compaction/worker.rs` (~255, ~615,
+~684) are in lsm-tree, which has no notion of fjall's keyspace map, and
+fjall's worker pool, flush and compaction code never takes
+`supervisor.keyspaces`. The only other holders are `Database::keyspace`
+(write, creation), recovery and the post-recovery check (read), and
+`rotation::rotate`.
+
+Considered, not done: `rotate`'s `keyspaces.write()` could be a `read()`
+(commits hold the journal writer through the memtable insert, so building the
+seqno map under a read guard would be sound). It is not needed once the long
+reader is gone, and it is a lock-semantics change.
+
+The test is `keyspace::stale_gc_test::a_slow_version_gc_does_not_stall_commits_behind_a_journal_rotation`:
+a test-only hook (`stale_gc_hook`) sleeps 300 ms while a rotation handles a
+keyspace's stale versions; a forced journal rotation
+(`rotate_journal_and_evict`) waits for `keyspaces.write()` meanwhile, and a
+commit into another keyspace must take under 100 ms (before: 249 ms).
 
 ## Tests
 

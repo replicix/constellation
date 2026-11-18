@@ -23,7 +23,10 @@ edits in place, each marked `CONSTELLATION PATCH`.
    under the lock) and `StaleVersions::remove` (dropping the old versions
    and removing their files, after it; it tries every file and returns the
    first error). `StaleVersions` is re-exported from `src/version/mod.rs`
-   (marked). A lost serialization of version changes is an `Err`, not an
+   (marked), with a new `StaleVersions::is_empty` (whether `take_garbage`
+   found nothing to free, so a caller can skip the empty ones and keep only
+   the others to `remove` after it has released its own lock; fjall's change
+   12 uses it). A lost serialization of version changes is an `Err`, not an
    `assert_eq!` that would poison the history lock.
 2. **`src/compaction/worker.rs`, `src/compaction/flavour.rs`**: a
    compaction finishes its output files (`CompactionFlavour::finish_files`)
