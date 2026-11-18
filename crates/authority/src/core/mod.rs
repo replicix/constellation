@@ -179,6 +179,12 @@ pub struct Config {
     /// previous process granted (ADR-46, `Core::deleg_restart_quarantined`).
     /// The sim's close-to-open oracle must then fail the run.
     pub restart_skips_write_quarantine: bool,
+    /// Plan 46 M1.3 step 15b (ADR-63): a holder asked to release subtrees
+    /// whose read delegations it must still recall journals a `ReleaseCut`
+    /// row at once and its release row once they are gone, instead of the
+    /// release row held back with everything after it. `false` is the held
+    /// release (the simulation's control, `AUTHORITY_SIM_NO_RELEASE_CUT`).
+    pub release_cut: bool,
     /// Fault injection for the simulation's negative control (never set by
     /// the engine): a holder's release of sticky subtrees journals its row
     /// at once, without draining its in-flight ops there and waiting for
@@ -760,6 +766,7 @@ impl Config {
             skip_deleg_dep_wait: false,
             ttl_reclaims_sticky: false,
             restart_skips_write_quarantine: false,
+            release_cut: true,
             holder_releases_before_drain: false,
             claim_ends_silently: false,
             partial_release_ends_stream: false,
@@ -1328,6 +1335,25 @@ pub struct Stats {
     /// ADR-59 part B: release requests deferred because this node's drop as
     /// the stream's holder had not reached the log yet.
     pub deleg_release_drop_pending: u64,
+    /// ADR-63: `ReleaseCut` rows this node journaled as a delegate.
+    pub deleg_cuts: u64,
+    /// ADR-63: the root's repeated release request for subtrees a pending
+    /// cut covers (the cut and its batch are sent again).
+    pub deleg_cut_repeated: u64,
+    /// ADR-63: pending cuts dropped because the claim of the lease released
+    /// the whole stream by its own row.
+    pub deleg_cut_left_to_claim: u64,
+    /// ADR-63: a cut whose release row could not be journaled once the reads
+    /// were clear (a lost dependency, rows its tenure has not committed): the
+    /// release went rowless.
+    pub deleg_cut_rowless_after: u64,
+    /// ADR-63: a release that held its note back from the stream for the read
+    /// recalls although it journaled no row (RC-1: rowless releases keep the
+    /// held note).
+    pub deleg_release_rowless_held: u64,
+    /// ADR-63's store fence: executions refused because they touch a
+    /// subtree this node's stream cut (must stay 0).
+    pub deleg_exec_in_cut: u64,
     pub deleg_release_rowless_partial: u64,
     /// Delegate (plan 46 M1.2 step 14): rowless releases by reason: the cut
     /// capped below the delegate's holder appends, a stream never installed

@@ -210,6 +210,9 @@ pub(crate) enum ParkedWhat {
     /// Phase 2b: a delegate's release of subtrees (plan 46 M1.2 step 10)
     /// streams once the read delegations it granted under them are recalled.
     ReleaseHeld { gen: u64 },
+    /// ADR-63: a delegate's cut row went out; its release row journals once
+    /// the read delegations under the cut subtrees are recalled.
+    ReleaseCutHeld { gen: u64, cut_row: u64 },
 }
 
 impl ParkedWhat {
@@ -2086,6 +2089,10 @@ impl Core {
                     // grants by its horizon anyway.
                     self.deleg_release_unheld(now, gen, replica, out);
                 }
+                ParkedWhat::ReleaseCutHeld { gen, cut_row } => {
+                    // The same, for the release row after a cut.
+                    self.deleg_cut_reads_clear(now, gen, cut_row, replica, out);
+                }
             }
         }
         n
@@ -3174,6 +3181,10 @@ impl Core {
                     // Released as it stands: the root outwaits the read
                     // grants by its horizon anyway.
                     self.deleg_release_unheld(now, gen, replica, out);
+                }
+                ParkedWhat::ReleaseCutHeld { gen, cut_row } => {
+                    // The same, for the release row after a cut.
+                    self.deleg_cut_reads_clear(now, gen, cut_row, replica, out);
                 }
                 ParkedWhat::ExecuteLocal { rid } => {
                     self.dl.pending_exec.remove(&rid);

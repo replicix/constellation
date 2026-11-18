@@ -76613,6 +76613,8 @@ mod step9_one_stream_per_node {
     #[test]
     fn a_release_merges_into_one_the_root_has_not_acknowledged() {
         let (mut h, d1, d2, d3, f1, f2) = delegate_of_three();
+        // (The held release: `release_cut` is the ReleaseCut path.)
+        h.core.cfg.release_cut = false;
         let until = h.clk().wait.plus(5_000);
         h.meta.read_delegations().grant(2, d1, until);
         let out = release_request(&mut h, 5, vec![d1]);
@@ -76660,6 +76662,114 @@ mod step9_one_stream_per_node {
         let r = h.core.dl.mine[&7].release.clone().expect("the release");
         let note = r.note_at(h.clk().wait);
         assert_eq!(note.locks.grants.len(), 2);
+    }
+
+    /// ADR-63 (test 4): two releases with live read grants, the second after
+    /// the first's cut: each journals its own cut row at once, and the first
+    /// release row follows its own reads, not the second's.
+    #[test]
+    fn merged_releases_each_cut_at_once() {
+        let (mut h, d1, d2, _d3, f1, f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        h.meta.read_delegations().grant(2, d2, until);
+        let recall_of = |out: &[Action], ino| {
+            sends(out).into_iter().find_map(|(_, m)| match m {
+                PeerMsg::DelegationRecall { req, ino: i, .. } if *i == ino => Some(*req),
+                _ => None,
+            })
+        };
+        let out = release_request(&mut h, 5, vec![d1]);
+        let r1 = recall_of(&out, d1).expect("recall of d1");
+        let out = release_request(&mut h, 6, vec![d2]);
+        let r2 = recall_of(&out, d2).expect("recall of d2");
+        let recs: Vec<LogRecord> =
+            crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
+                .into_iter()
+                .flat_map(|t| t.records)
+                .collect();
+        assert_eq!(
+            recs.iter()
+                .filter(|r| matches!(r, LogRecord::ReleaseCut { .. }))
+                .count(),
+            2,
+            "{recs:?}"
+        );
+        assert!(
+            !recs
+                .iter()
+                .any(|r| matches!(r, LogRecord::SubtreeReleased { .. })),
+            "{recs:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].cuts.len(), 2);
+        // The second request's batch carries both cuts, held for nothing.
+        let sent = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::DelegateStream { txs, released, .. } => {
+                    Some((txs.len(), released.is_none()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no batch: {out:?}"));
+        assert_eq!(sent, (2, true));
+        // d1's reads clear first: its release row follows, d2's cut waits.
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: r1 },
+        });
+        let recs: Vec<LogRecord> =
+            crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
+                .into_iter()
+                .flat_map(|t| t.records)
+                .collect();
+        assert!(
+            matches!(recs.last().unwrap(), LogRecord::SubtreeReleased { dir, .. } if *dir == d1),
+            "{recs:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].cuts.len(), 1);
+        assert_eq!(h.core.dl.mine[&7].cuts[0].dirs, [d2].into_iter().collect());
+        let _ = (f1, f2, r2);
+    }
+
+    /// ADR-63 (test 7): the lock grants a cut hands back ride the release
+    /// row's batch only: the batches between the cut and the release carry
+    /// no note and no `leaving` grant of the cut subtree, and the note's rows
+    /// name the release row.
+    #[test]
+    fn a_cut_hands_back_its_locks_with_the_release_row_only() {
+        let (mut h, d1, _d2, _d3, f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        let out = release_request(&mut h, 5, vec![d1]);
+        let recall = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::DelegationRecall { req, .. } => Some(*req),
+                _ => None,
+            })
+            .expect("recall");
+        assert_eq!(h.core.dl.mine[&7].cuts[0].note.locks.grants.len(), 1);
+        for (_, m) in sends(&out) {
+            if let PeerMsg::DelegateStream {
+                released, leaving, ..
+            } = m
+            {
+                assert!(released.is_none(), "the note rode the cut's batch");
+                assert!(leaving.iter().all(|g| g.ino != f1), "{leaving:?}");
+            }
+        }
+        // The holder grants no lock under the cut subtree any more.
+        assert!(h.meta.locks().grants_snapshot().iter().all(|g| g.ino != f1));
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        let _ = out;
+        let r = h.core.dl.mine[&7].release.clone().expect("the release");
+        let row = r.row.expect("a release row");
+        assert_eq!(r.note.locks.grants.len(), 1);
+        assert!(r.note.locks.rows.iter().all(|(_, at)| *at == row));
     }
 
     /// A partial request that cannot journal a row (a row of the stream is
@@ -79649,6 +79759,31 @@ mod step5_sticky_release {
         Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
     }
 
+    /// What the stream sends after `out`, until it is quiet: each batch is
+    /// acknowledged by the root and each sync asked for is done. Every
+    /// action seen, in order.
+    fn drain_stream(h: &mut Harness, out: Vec<Action>) -> Vec<Action> {
+        let mut all = Vec::new();
+        let mut cur = out;
+        for _ in 0..8 {
+            if let Some((rq, rd, l)) = batch(&cur) {
+                all.extend(cur);
+                cur = h.step(stream_ack(1, rq, rd, l));
+            } else if cur
+                .iter()
+                .any(|a| matches!(a, Action::SyncDelegStream { gen: 7, .. }))
+            {
+                let next = flush(h, &cur);
+                all.extend(cur);
+                cur = next;
+            } else {
+                break;
+            }
+        }
+        all.extend(cur);
+        all
+    }
+
     fn last_is_release(h: &Harness) -> bool {
         rows(h).last().is_some_and(|t| {
             matches!(
@@ -79844,6 +79979,8 @@ mod step5_sticky_release {
     fn the_read_delegations_of_the_subtree_are_recalled_before_the_row_streams() {
         let (mut h, dirs) = sticky_holder(&["a"]);
         h.core.cfg.read_delegations = true;
+        // (The held release: `release_cut` is the ReleaseCut path, below.)
+        h.core.cfg.release_cut = false;
         let until = h.clk().wait.plus(5_000);
         h.meta.read_delegations().grant(2, dirs[0], until);
         let out = release(&mut h, 50, Vec::new(), true);
@@ -79870,6 +80007,204 @@ mod step5_sticky_release {
         assert!(answer(&out, 50).is_none());
         let out = h.step(stream_ack(1, req, round, last));
         assert!(answer(&out, 50).is_some_and(|r| r.is_ok()), "{out:?}");
+    }
+
+    /// The recall request of the read delegation under `ino` in `out`.
+    fn recall_of(out: &[Action], ino: constellation_fs_core::Ino) -> Option<OpId> {
+        sends(out).into_iter().find_map(|(_, m)| match m {
+            PeerMsg::DelegationRecall { req, ino: i, .. } if *i == ino => Some(*req),
+            _ => None,
+        })
+    }
+
+    /// The rows of stream 7 in the order they were journaled, as records.
+    fn records(h: &Harness) -> Vec<LogRecord> {
+        rows(h).into_iter().flat_map(|t| t.records).collect()
+    }
+
+    fn has_release_row(h: &Harness) -> bool {
+        records(h).iter().any(|r| {
+            matches!(
+                r,
+                LogRecord::SubtreeReleased { .. } | LogRecord::StreamReleased { .. }
+            )
+        })
+    }
+
+    /// ADR-63 (the settle spec's `a_delegate_sends_its_cut_before_its_read_recalls`):
+    /// asked to release a subtree a read delegation lies under, the holder
+    /// journals a `ReleaseCut` at once and ships it; the rows of its other
+    /// subtree ship behind it, not held; the release row is journaled once
+    /// the reads are recalled. Fails on the parent: the release row was
+    /// journaled at the request and held back, with everything after it.
+    #[test]
+    fn a_delegate_sends_its_cut_before_its_read_recalls() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        let out = release(&mut h, 50, vec![dirs[0]], false);
+        let recall = recall_of(&out, dirs[0])
+            .unwrap_or_else(|| panic!("the read delegation was not recalled: {out:?}"));
+        // The cut is journaled; the release is not.
+        assert!(
+            matches!(
+                rows(&h).last().unwrap().records.as_slice(),
+                [LogRecord::ReleaseCut { gen: 7, dirs: d, .. }] if *d == vec![dirs[0]]
+            ),
+            "{:?}",
+            rows(&h)
+        );
+        assert!(!has_release_row(&h));
+        assert_eq!(h.core.stats.deleg_cuts, 1);
+        assert_eq!(h.core.dl.mine[&7].cuts.len(), 1);
+        assert!(h.core.dl.mine[&7].release.is_none());
+        // It ships at once.
+        let out = flush(&mut h, &out);
+        let (req, round, last) =
+            batch(&out).unwrap_or_else(|| panic!("the cut did not ship: {out:?}"));
+        let cut_idx = last;
+        // A row of the other subtree is not held behind the release.
+        let out = create_in(&mut h, dirs[1], 1);
+        assert_eq!(h.core.dl.mine[&7].executed, 1, "{out:?}");
+        let out = h.step(stream_ack(1, req, round, last));
+        let out = flush(&mut h, &out);
+        let (req, round, last) = batch(&out)
+            .unwrap_or_else(|| panic!("the later row of the other subtree was held: {out:?}"));
+        assert!(last > cut_idx);
+        assert!(!has_release_row(&h));
+        // The reads are gone: the release row is journaled after the cut and
+        // the row of the other subtree.
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        let recs = records(&h);
+        assert!(
+            matches!(
+                recs.last().unwrap(),
+                LogRecord::SubtreeReleased { gen: 7, dir, .. } if *dir == dirs[0]
+            ),
+            "{recs:?}"
+        );
+        assert!(h.core.dl.mine[&7].cuts.is_empty());
+        let r = h.core.dl.mine[&7].release.clone().expect("the release");
+        assert!(!r.held && r.row.is_some());
+        // (A batch in flight is taken as given up: the row goes out at once.)
+        let _ = (req, round, last);
+        let out = drain_stream(&mut h, out);
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no note: {out:?}"));
+        assert_eq!(note.dirs, vec![dirs[0]]);
+    }
+
+    /// With `release_cut` off the release is the held one (the control).
+    #[test]
+    fn release_cut_off_keeps_the_held_release() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.read_delegations = true;
+        h.core.cfg.release_cut = false;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        let out = release(&mut h, 50, Vec::new(), false);
+        assert!(recall_of(&out, dirs[0]).is_some());
+        assert!(last_is_release(&h));
+        assert!(h.core.dl.mine[&7].release.as_ref().unwrap().held);
+        assert!(h.core.dl.mine[&7].cuts.is_empty());
+        assert_eq!(h.core.stats.deleg_cuts, 0);
+        assert!(!records(&h)
+            .iter()
+            .any(|r| matches!(r, LogRecord::ReleaseCut { .. })));
+    }
+
+    /// ADR-63 (test 6): nothing executes under a cut: an op in the cut
+    /// subtree gets no row, and the store fence never fired.
+    #[test]
+    fn nothing_executes_or_refuses_in_stream_under_a_cut() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        release(&mut h, 50, vec![dirs[0]], false);
+        let before = rows(&h).len();
+        let out = create_in(&mut h, dirs[0], 1);
+        assert_eq!(h.core.dl.mine[&7].executed, 0, "{out:?}");
+        assert_eq!(rows(&h).len(), before, "a row was journaled under the cut");
+        assert_eq!(h.core.stats.deleg_exec_in_cut, 0);
+        // The raw table still lists the subtree as the stream's; this node's
+        // view does not.
+        assert!(h.meta.delegation_table_folded().get(dirs[0]).is_some());
+        assert!(h.meta.delegation_table().get(dirs[0]).is_none());
+        // The other subtree executes as before.
+        create_in(&mut h, dirs[1], 2);
+        assert_eq!(h.core.dl.mine[&7].executed, 1);
+    }
+
+    /// ADR-63 (test 8): a cut subtree gets no read delegation from the
+    /// holder (its view does not list it), the other subtree still does.
+    #[test]
+    fn a_holder_grants_no_read_delegation_under_a_cut() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        h.core.cfg.read_delegations = true;
+        h.core.dl.mine.get_mut(&7).unwrap().answered_sent = h.clk().honour;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(3, dirs[0], until);
+        release(&mut h, 50, vec![dirs[0]], false);
+        match h.deleg_read_index(h.clk(), 2, dirs[0], Some("x")) {
+            None => {}
+            Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => {
+                assert!(grant.is_none(), "a grant under a cut: {grant:?}")
+            }
+            other => panic!("{other:?}"),
+        }
+        match h.deleg_read_index(h.clk(), 2, dirs[1], Some("x")) {
+            Some(crate::event::ReadIndexOutcome::Ok { grant, .. }) => {
+                assert!(grant.is_some(), "no grant in the other subtree")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// ADR-63 (test 10): no cut while the holder's drop is pending (the
+    /// release is deferred as before), and a due cut waits for it too: the
+    /// release row is journaled once the drop is applied.
+    #[test]
+    fn a_cut_waits_for_a_pending_drop() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        h.meta.put_stream_drop_plan_for_tests(99, 7, 1);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(records(&h).is_empty(), "{:?}", records(&h));
+        assert!(h.core.stats.deleg_release_drop_pending >= 1);
+        assert_eq!(h.core.stats.deleg_cuts, 0);
+    }
+
+    #[test]
+    fn release_after_cut_waits_for_a_pending_drop() {
+        let (mut h, dirs) = sticky_holder(&["a", "b"]);
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        let out = release(&mut h, 50, vec![dirs[0]], false);
+        let recall = recall_of(&out, dirs[0]).expect("recall");
+        assert_eq!(h.core.stats.deleg_cuts, 1);
+        // A drop decided meanwhile: the reads clear, the release row waits.
+        h.meta.put_stream_drop_plan_for_tests(99, 7, 1);
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: recall },
+        });
+        assert!(!has_release_row(&h), "released with the drop pending");
+        assert!(h.core.dl.mine[&7].cuts.iter().all(|c| c.due));
+        assert!(h.core.stats.deleg_release_drop_pending >= 1);
+        // The drop applied: the next stream tick journals the release.
+        h.meta.drop_held_cancel(99).unwrap();
+        h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+        let id = h.core.dl.stream_timer.expect("no stream tick armed");
+        h.step(Event::Timer { id });
+        assert!(has_release_row(&h), "not released after the apply");
+        assert!(h.core.dl.mine[&7].cuts.is_empty());
     }
 
     /// The commands give up when the root never has the row: `wait` is
@@ -82352,24 +82687,34 @@ mod step5_sticky_release {
     }
 
     /// Expectation (fail-before: the row streamed at once): a restarted
-    /// holder told to release journals its release row but does not stream
-    /// it before the previous process's read grants have expired.
+    /// holder told to release journals its cut at once and ships it, and its
+    /// release row only once the previous process's read grants have expired
+    /// (ADR-46, ADR-63).
     #[test]
     fn a_restarted_holders_release_row_waits_for_the_quarantine() {
         let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
         let (mut r, _dirs, _) = restart_holder(&h, 2_000, SubtreeKind::Sticky, true);
         let out = release(&mut r, 50, Vec::new(), true);
-        assert!(last_is_release(&r), "{out:?}");
         assert!(
-            batch(&out).is_none(),
-            "the row streamed inside the quarantine: {out:?}"
+            matches!(
+                rows(&r).last().unwrap().records.as_slice(),
+                [LogRecord::ReleaseCut { gen: 7, .. }]
+            ),
+            "{:?}",
+            rows(&r)
         );
-        assert!(r.core.dl.mine[&7].release.as_ref().unwrap().held);
+        assert!(!last_is_release(&r), "{out:?}");
+        assert!(answer(&out, 50).is_none(), "the wait ended at the cut");
+        assert!(r.core.dl.mine[&7].release.is_none());
+        assert_eq!(r.core.dl.mine[&7].cuts.len(), 1);
+        let out = flush(&mut r, &out);
+        assert!(batch(&out).is_some(), "the cut did not ship: {out:?}");
         let id = restart_timer(&r);
         let until = r.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
         r.advance(until.since(r.clk().wait) as u64);
         let out = r.step(Event::Timer { id });
-        let out = flush(&mut r, &out);
+        assert!(last_is_release(&r), "no release row after the quarantine");
+        let out = drain_stream(&mut r, out);
         assert!(
             batch(&out).is_some(),
             "no row once the quarantine ended: {out:?}"
@@ -90391,6 +90736,34 @@ mod root_own_sticky {
             h.core.stats.sticky_ended[crate::core::StickyEnd::Command.index()],
             0
         );
+    }
+
+    /// ADR-63 (test 11): the root's own stream is never cut: its release is
+    /// the root's own row (ADR-55), whatever read delegations lie under it.
+    #[test]
+    fn the_root_own_stream_never_cuts() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        root_dominates(&mut h, dirs[0]);
+        archive_and_step(&mut h);
+        h.core.cfg.read_delegations = true;
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, dirs[0], until);
+        h.step(Event::Control {
+            op: OpId(700),
+            req: Control::StickyRelease {
+                dirs: Vec::new(),
+                wait: false,
+                why: crate::event::StickyReleaseWhy::Command,
+            },
+        });
+        for _ in 0..4 {
+            h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+            if let Some(id) = h.core.dl.stream_timer {
+                h.step(Event::Timer { id });
+            }
+        }
+        assert_eq!(h.core.stats.deleg_cuts, 0);
+        assert!(h.core.dl.mine.values().all(|d| d.cuts.is_empty()));
     }
 
     // ---- ADR-55 step 9, the own stream across a deposition (R-H, R-X, R-D, R-J) ----
