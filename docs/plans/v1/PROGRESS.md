@@ -70013,6 +70013,20 @@ seeds of `far-root-writes+lost-chunk-late` go [226, 996, 1810] -> [996, 1810], `
 are independent failures of the `+lost-chunk-late` variant, left. The variant came with the drop-held fix; its seed 226
 pin (`a_reappended_seed_is_dropped_under_its_own_rid`) is tightened here to a full `.unwrap()`.
 
+Review round 2 of that fix (2026-11-18): `PendingDelegate::set_release` now checks the records and returns
+`MetaError::Invalid`, and the `release_only` field is private, so no caller can mark a row that carries an op. A
+`held.rs` test (`a_release_row_stays_behind_a_held_row_of_its_stream`) pins the ship order the cap removal relies on.
+A release row the log does not carry yet when the claimant dies inside its wait went back through the next gate's
+strand as an own row without an outcome rid and halted the re-append (`claim_own_rows_halted_non_stealable`); a row of
+release records only now goes back verbatim. Fail-before:
+`a_second_gate_reappends_an_unshipped_release_row` (meta; on the parent `own_halted_gens` is `{7}` and 2 of 3 rows go
+back). `release_subtrees` needs no change: `stopped` is set from `deleg_ended_at_gate` at the strand event and at
+install, so a gate-ended stream is released rowless there (ADR-60). Gates on the final head: fmt, clippy `-D warnings`,
+meta and authority lib tests in debug and release, the release sim suite (570 passed). Sweeps, release, x2,000 each,
+origin/main versus the branch: failing seeds identical for all 15 labels except `far-root-writes+lost-chunk-late`
+[226, 996, 1810] -> [996, 1810]; claim totals (journaled/rowless/waits/outrun) identical except that label
+(1593/0/10/3 -> 1595/0/11/4).
+
 
 ### M1.3 step 14: Leave ends grants first (2026-11-14)
 
