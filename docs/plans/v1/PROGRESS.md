@@ -70771,3 +70771,33 @@ Instrumented builds (`instr.patch`, trace points, so absolute values are higher)
 **Result.** The `StreamAhead` sum falls by about a quarter to a third (1.26-1.37 s to 0.85-1.23 s), not to the ~0.4 s the spec hoped for, and stage 10's mean
 stays at 100-180 us (above the 60 us bar). The remaining cost is the same linear scans (`read_rows_from` decodes every row from the oldest shadow's
 seq on, the one snapshot read, memcpy): Step 2's trigger holds, and it needs an Opus design pass and a fable review before any code.
+
+### Finding 996 part B: a claimed or restarted own stream keeps its holder state until its release row ships (2026-11-18)
+
+`far-root-writes-paused+lost-chunk-late` 996: a restarted root claims its own sticky stream (the claim journals the stream's
+`StreamReleased`), its end waits out `drop_held_await`, the lease is lost, and the `DelegateNodeEnded` it journaled never reaches the
+log. The new root keeps the stream live (holder: this node) and waits for rows nobody streams. Two gaps broke ADR-55's "the holder
+state stays until the release row has shipped": B1, `claim_releases` journaled the row but recorded no `PendingRelease`, so the same
+event's `delegation_sync` dropped the state; B2, the kept state is in memory, so after a reboot the replica (which applied the node's own
+unshipped end) no longer lists the stream and the remnant install never ran.
+F1: the claim's row is the stream's `PendingRelease` (`ends`, `dirs` moved to `released_dirs`, `to` this node; nothing is sent), and the
+state is a `remnant` from then on, which is what lets part A's `remnant_decides_held_drop` decide a held row's drop (a bare
+`dirs.is_empty() && row` widening would break part A's negative case "a stopped stream that is not a remnant"). F2: one predicate,
+`Core::release_row_unshipped` (the ending release's row `r`, `log_stream_idx < r`, the gen still in `journal_own_gens`), keeps the state in
+`delegation_sync` and in `end_generation` (there only for `r <= through`: an end that cuts below the row voids it); it replaces
+`end_generation`'s `own_minted && release.is_some()`. F3: `Core::own_end_remnants` (no root tenure, a stream the table does not list for
+this node, not in `mine`, with its own unshipped `StreamReleased` and its own unshipped `DelegateNodeEnded` in the journal) feeds the
+install loop as a remnant and skips the `awaiting_end` fence for that stream. The "no segment applied here ended G" check is the journal
+itself: the node's own end is a root row above `journal_acked_seq`, which an applied segment's end never leaves. fix1810's restart strand
+(`strand_appended_below`) strands appended rows of other streams only, never the node's own stream rows or its own end, so F3 reinstalls with
+or without it (test `the_remnant_is_reinstalled_after_the_restart_strand_ran` runs the strand-shaped `strand_deposed` first); were a strand to
+roll the end back, the stream is listed again and F3 does nothing, the ordinary remnant install covering it.
+Fail-before: core `a_claims_release_row_is_the_streams_pending_release`, `a_claimed_stream_keeps_its_state_through_the_end_and_a_deposition`
+(also: no lock grant under the kept state), `a_restart_over_its_own_unshipped_end_reinstalls_the_stream_as_a_remnant`,
+`the_remnant_is_reinstalled_after_the_restart_strand_ran`, `a_holder_whose_generation_the_log_ended_below_its_release_row_keeps_no_state`;
+limit `a_restart_over_an_end_the_log_carried_installs_no_remnant`; sim `a_claimed_stream_whose_end_never_ships_still_ships_its_release_row_996`.
+The sim pin passes on main as well (main's seed-996 schedule no longer reaches the unshipped end; the core tests are the fail-before).
+A kept state after the claim's end gives its parked ops back (`hand_back_kept_parks`), as `drop_delegate_state` would: without it
+`a_deposition_does_not_release_an_own_stream_op_waiting_for_a_root_row` left an own client op parked for good.
+Sweeps (2,000 seeds, base vs fix): identical failing sets over the 22 labels (only `far-root-writes+lost-chunk-late` [1810]).
+Not done here (not on main): the held-own labels and the knob control; spec-1510 lands after this.

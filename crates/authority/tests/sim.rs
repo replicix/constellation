@@ -22202,6 +22202,23 @@ fn a_remnant_holding_its_release_row_decides_the_drop_996() {
     .unwrap();
 }
 
+/// `far-root-writes-paused+lost-chunk-late` 996 (996 B1): a restarted root
+/// claims its own sticky stream, whose release row sits behind a row held on a
+/// lost chunk; the claim's end waits out `drop_held_await` and the lease is
+/// lost. The claim's row is the stream's pending release, so the holder state
+/// stays, streams the rows to the new root, and decides the drop in-stream
+/// (ADR-55 restart and claim: the state stays until the row has shipped).
+/// Before, the claim dropped the state, the end shipped nowhere and the new
+/// root waited for the stream's rows for ever (540 s liveness).
+#[test]
+fn a_claimed_stream_whose_end_never_ships_still_ships_its_release_row_996() {
+    run_seed(
+        996,
+        config_variant(far_root_writes_paused_config(), "lost-chunk-late"),
+    )
+    .unwrap();
+}
+
 /// ADR-59 part B, D1 widened (`far-placement+lost-chunk` 326): node 1 lost a
 /// chunk of its own sticky stream's seed, was deposed (node 3 took over), and
 /// kept its stream as a holder (R-I5); `repair drop-held` there was refused

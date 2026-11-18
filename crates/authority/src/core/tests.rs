@@ -77472,6 +77472,46 @@ mod step5_sticky_release {
         );
     }
 
+    /// 996 B, F2: a far holder whose release row is in its journal keeps the
+    /// state while the row is unshipped, and none once the log ended the
+    /// generation at a cut below the row (the strand takes the row out of
+    /// the journal: nothing is left to ship).
+    #[test]
+    fn a_holder_whose_generation_the_log_ended_below_its_release_row_keeps_no_state() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        let row = Replica::delegate_idx(&h.meta, 7);
+        assert_eq!(h.core.release_row_unshipped(7, &h.meta), Some(row));
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine.contains_key(&7),
+            "dropped with its row to ship"
+        );
+        let seq = Replica::applied_seq(&h.meta).unwrap_or(0) + 1;
+        Replica::apply_segment(
+            &h.meta,
+            seq,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: row - 1,
+            }],
+        )
+        .unwrap();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.release_row_unshipped(7, &h.meta), None);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the state outlived a row the log's end voided"
+        );
+    }
+
     /// The predicate's limits: each of these is refused, as before the fix.
     #[test]
     fn only_a_remnant_with_its_release_to_ship_decides_the_drop_of_held_rows() {
@@ -86780,6 +86820,239 @@ mod root_own_sticky {
                     .any(|r| matches!(r, LogRecord::StreamReleased { gen: g, .. } if *g == gen))
             })
             .map(|t| t.origin.1)
+    }
+
+    /// The claim of `restarted_root_with_own_stream` with its end waiting on
+    /// a drop plan; then the wait runs out and the end is journaled. Returns
+    /// the release row's index too.
+    fn claimed_and_ended() -> (Harness, Vec<Ino>, u64, u64, u64) {
+        let (mut h, dirs, gen, record) = restarted_root_with_own_stream();
+        h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
+        claim(&mut h);
+        let row = release_row_idx(&h, gen, record).expect("the claim journaled no release row");
+        h.advance(h.core.dl_t().drop_held_await + 1);
+        activity(&mut h);
+        assert!(
+            h.core.dl.gens.get(&gen).is_none_or(|g| g.ended),
+            "the end did not proceed once the wait ran out"
+        );
+        (h, dirs, gen, record, row)
+    }
+
+    /// 996 B1: a claim's release row is the stream's pending release, as a
+    /// whole release's is. Fails on the parent: the claim left no pending
+    /// release (`release` `None`), the subtree in `dirs`, and the same
+    /// event's sync dropped the state.
+    #[test]
+    fn a_claims_release_row_is_the_streams_pending_release() {
+        let (mut h, _dirs, gen, record) = restarted_root_with_own_stream();
+        h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
+        claim(&mut h);
+        let row = release_row_idx(&h, gen, record).expect("the claim journaled no release row");
+        let d = h
+            .core
+            .dl
+            .mine
+            .get(&gen)
+            .expect("the claim dropped the holder state");
+        assert!(d.stopped && d.dirs.is_empty(), "stopped, no subtree");
+        let r = d.release.as_ref().expect("no pending release");
+        assert!(r.ends && r.row == Some(row) && r.first_row == Some(row));
+        assert!(!r.held && r.to == 1, "no message to anyone else");
+        assert!(!d.release_acked);
+        assert!(!d.released_dirs.is_empty(), "the subtree moved to released");
+        // Part A's decision rule accepts it.
+        assert!(d.remnant_decides_held_drop());
+        assert_eq!(h.core.release_row_unshipped(gen, &h.meta), Some(row));
+    }
+
+    /// 996 B1: the state stays through the end that the wait's run-out
+    /// journals, and through a deposition after it: the node streams its
+    /// stream's rows to the new root, the release row last. Fails on the
+    /// parent: the state is gone at the claim and nothing streams again.
+    #[test]
+    fn a_claimed_stream_keeps_its_state_through_the_end_and_a_deposition() {
+        let (mut h, _dirs, gen, _record, row) = claimed_and_ended();
+        assert!(
+            h.core.dl.mine.contains_key(&gen),
+            "the end dropped the state"
+        );
+        h.meta.drop_held_cancel(99).unwrap();
+        let mut first = depose_to_node_2(&mut h);
+        assert!(
+            h.core.dl.mine.contains_key(&gen),
+            "the deposition dropped the state"
+        );
+        let idxs = stream_idxs_to_2(&mut h, gen, &mut first).expect("nothing was streamed");
+        assert_eq!(idxs.last(), Some(&row), "the release row is last: {idxs:?}");
+        assert!(idxs.len() >= 2, "the stream's rows go with it: {idxs:?}");
+        // No lock is granted under a stopped stream with no subtree.
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockRequest {
+                req: OpId(78),
+                ino: _dirs[0],
+                mode: constellation_meta::locks::LockMode::Exclusive,
+                blocking: false,
+                sent: h.honour(),
+                incarnation: 1,
+                waited_ms: 0,
+            },
+        });
+        assert!(
+            !sends(&out).into_iter().any(|(_, m)| matches!(
+                m,
+                PeerMsg::LockReply {
+                    outcome: LockOutcome::Granted { .. },
+                    ..
+                }
+            )),
+            "a lock was granted under the kept state: {out:?}"
+        );
+    }
+
+    /// 996 B1: the state kept past the claim's end gives back what waited in
+    /// the stream (an op parked in it), as `drop_delegate_state` would have:
+    /// it goes back to the ordinary route and runs there. Fails on the
+    /// parent: the state is dropped at the end.
+    #[test]
+    fn a_kept_state_hands_its_parked_ops_back_at_the_end() {
+        let (mut h, dirs, gen, _record) = restarted_root_with_own_stream();
+        h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
+        claim(&mut h);
+        drive_ops_during_the_wait(&mut h, dirs[0], gen);
+        assert!(
+            !h.core.dl.mine[&gen].parked.is_empty(),
+            "the op did not stay parked while the end waited"
+        );
+        h.advance(h.core.dl_t().drop_held_await + 1);
+        activity(&mut h);
+        assert!(h.core.dl.gens.get(&gen).is_none_or(|g| g.ended));
+        let d = h.core.dl.mine.get(&gen).expect("the end dropped the state");
+        assert!(d.parked.is_empty(), "the kept state holds a parked op");
+    }
+
+    /// The first batch of stream `gen` to node 2: its row indices.
+    fn stream_idxs_to_2(h: &mut Harness, gen: u64, first: &mut Vec<Action>) -> Option<Vec<u64>> {
+        h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+        for _ in 0..6 {
+            let mut all = activity(h);
+            all.append(first);
+            if let Some(id) = h.core.dl.stream_timer {
+                all.extend(h.step(Event::Timer { id }));
+            }
+            let syncs: Vec<(u64, u64)> = all
+                .iter()
+                .filter_map(|a| match a {
+                    Action::SyncDelegStream { gen, through } => Some((*gen, *through)),
+                    _ => None,
+                })
+                .collect();
+            for (g, through) in syncs {
+                all.extend(h.step(Event::DelegStreamSynced {
+                    gen: g,
+                    through,
+                    ok: true,
+                }));
+            }
+            let found = sends(&all).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegateStream { gen: g, txs, .. } if to == 2 && *g == gen => {
+                    Some(txs.iter().map(|t| t.idx).collect::<Vec<_>>())
+                }
+                _ => None,
+            });
+            if found.is_some() {
+                return found;
+            }
+            h.advance(h.core.cfg.delegation_stream_tick_ms + 1);
+        }
+        None
+    }
+
+    /// 996 B2: a restart over the node's own unshipped release row and end
+    /// (the table applied the end, so it no longer lists the stream)
+    /// installs the stream as a remnant, which streams the row to the root.
+    /// Fails on the parent: nothing is installed and the row is never sent.
+    #[test]
+    fn a_restart_over_its_own_unshipped_end_reinstalls_the_stream_as_a_remnant() {
+        let (mut h, _dirs, gen, _record, row) = claimed_and_ended();
+        h.meta.drop_held_cancel(99).unwrap();
+        assert!(
+            h.meta.delegation_table().stream(1, gen).is_none(),
+            "the node's own end left the stream listed"
+        );
+        let mut first = restart_without_lease(&mut h);
+        let d = h.core.dl.mine.get(&gen).expect("no remnant was installed");
+        assert!(d.stopped && d.remnant && d.dirs.is_empty());
+        assert_eq!(d.release.as_ref().and_then(|r| r.row), Some(row));
+        // A later sync keeps it, and a lease holder gets the rows.
+        let mut again = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut again);
+        assert!(h.core.dl.mine.contains_key(&gen), "a sync dropped it");
+        let idxs = stream_idxs_to_2(&mut h, gen, &mut first).expect("nothing was streamed");
+        assert_eq!(idxs.last(), Some(&row), "the release row is last: {idxs:?}");
+    }
+
+    /// The core restarted over the same replica, without the lease; node 2
+    /// is the one that holds it.
+    fn restart_without_lease(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.lease.cached_holder = Some(2);
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// 996 B2, the limit: an end that came from an applied segment (not the
+    /// node's own unshipped record) installs nothing.
+    #[test]
+    fn a_restart_over_an_end_the_log_carried_installs_no_remnant() {
+        let (mut h, _dirs, gen, record) = restarted_root_with_own_stream();
+        h.meta.put_stream_drop_plan_for_tests(99, gen, 1);
+        claim(&mut h);
+        let row = release_row_idx(&h, gen, record).expect("no release row");
+        // The log's end of the stream, at the release row (applied here).
+        let seq = Replica::applied_seq(&h.meta).unwrap_or(0) + 1;
+        Replica::apply_segment(
+            &h.meta,
+            seq,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 1,
+                gen,
+                through: row,
+            }],
+        )
+        .unwrap();
+        assert!(h.meta.delegation_table().stream(1, gen).is_none());
+        h.meta.drop_held_cancel(99).unwrap();
+        let _ = restart_without_lease(&mut h);
+        assert!(
+            !h.core.dl.mine.contains_key(&gen),
+            "a remnant was installed for an end the log carried"
+        );
+    }
+
+    /// The restart strand (a node without the lease that meets a newer
+    /// tenure strands the appended rows of an older one,
+    /// `Replica::strand_deposed`) takes neither the node's own stream rows
+    /// nor its own end: the remnant is installed after it as before it.
+    #[test]
+    fn the_remnant_is_reinstalled_after_the_restart_strand_ran() {
+        let (mut h, _dirs, gen, _record, row) = claimed_and_ended();
+        h.meta.drop_held_cancel(99).unwrap();
+        let stranded = Replica::strand_deposed(&h.meta, 2, false).unwrap();
+        assert!(
+            !stranded.any(),
+            "the strand took the node's own rows: {stranded:?}"
+        );
+        let _ = restart_without_lease(&mut h);
+        let d = h.core.dl.mine.get(&gen).expect("no remnant was installed");
+        assert_eq!(d.release.as_ref().and_then(|r| r.row), Some(row));
     }
 
     /// One own client op on the stream's subtree, and one op parked in the

@@ -861,7 +861,11 @@ pub(crate) struct DelegateState {
     /// Installed again after a restart for the release row of a stream that
     /// released every subtree, and nothing else (no subtree is left to tell
     /// its kind by, so `non_stealable` is false): the state a sync must keep
-    /// while the row is unacknowledged (`Core::delegation_sync`).
+    /// while the row is unacknowledged (`Core::delegation_sync`). A claimed
+    /// own stream is one too from its release row on
+    /// ([`Core::claim_releases`]: no subtree, stopped, only the row to ship),
+    /// which is what lets [`DelegateState::remnant_decides_held_drop`] decide
+    /// the drop of its held rows (996 B).
     pub remnant: bool,
     /// Plan 46 M1.2 step 10: the subtrees this node released from the stream
     /// (a repeated or late request for one is not news: it is not a subtree
@@ -2378,6 +2382,83 @@ impl Core {
         }
     }
 
+    /// ADR-55: the index of stream `gen`'s release row that ends the stream,
+    /// while the row is still to ship from this node's journal: the holder
+    /// state stays until it has (to stream the row to the next root, or to
+    /// the log through this node's own segment), whatever this node's table
+    /// or its own end of the generation says. All of: the stream's pending
+    /// release ends it and journaled a row `r`; the log's index of the
+    /// stream is below `r`; and the journal still holds rows of `gen` this
+    /// node assigned (`journal_own_gens`; a strand that rolled the row back
+    /// ends the wait). The row leaves the journal by shipping (the log's
+    /// index reaches `r`) or by a strand, so the keep terminates.
+    pub(crate) fn release_row_unshipped(&self, gen: u64, replica: &dyn Replica) -> Option<u64> {
+        let r = self
+            .dl
+            .mine
+            .get(&gen)?
+            .release
+            .as_ref()
+            .filter(|r| r.ends)?
+            .row?;
+        (replica.log_stream_idx(gen) < r && replica.journal_own_gens().contains(&gen)).then_some(r)
+    }
+
+    /// ADR-55 (restart and claim): the streams this node held as the root
+    /// whose release row and own end it journaled and never shipped, and
+    /// that a restart left without holder state. Its replica applied the
+    /// node's own unshipped end, so the table no longer lists the stream and
+    /// no install would ever stream the row to the root that took the lease
+    /// (which keeps the stream live, holder this node). Each is returned as
+    /// a remnant stream with no subtrees. The end must be this node's own
+    /// unshipped record in the journal (a root row of origin 0): the end of
+    /// a segment applied here leaves no such row (the segment's apply
+    /// strands the journal's superseded rows), so the log's end installs
+    /// nothing. A node that holds a root tenure installs nothing: the claim
+    /// ([`Self::claim_releases`]) keeps the state itself.
+    fn own_end_remnants(
+        &self,
+        listed: &BTreeSet<u64>,
+        replica: &dyn Replica,
+    ) -> Vec<constellation_meta::delegation::NodeStream> {
+        if self.root_tenure() || !replica.journal_has_undelegated() {
+            return Vec::new();
+        }
+        let me = self.me();
+        let cands: Vec<u64> = replica
+            .journal_own_gens()
+            .into_iter()
+            .filter(|g| !listed.contains(g) && !self.dl.mine.contains_key(g))
+            .collect();
+        if cands.is_empty() {
+            return Vec::new();
+        }
+        let from = replica.journal_acked_seq().unwrap_or(0) + 1;
+        let txs = replica.journal_txs_from(from, usize::MAX);
+        cands
+            .into_iter()
+            .filter(|g| {
+                let released = txs.iter().filter(|t| t.origin.0 == *g).any(|t| {
+                    t.records
+                        .iter()
+                        .any(|r| matches!(r, LogRecord::StreamReleased { gen, .. } if gen == g))
+                });
+                let ended = txs.iter().filter(|t| t.origin.0 == 0).any(|t| {
+                    t.records.iter().any(|r| {
+                        matches!(r, LogRecord::DelegateNodeEnded { node, gen, .. }
+                            if gen == g && *node == me)
+                    })
+                });
+                released && ended && replica.delegate_idx(*g) > replica.log_stream_idx(*g)
+            })
+            .map(|gen| constellation_meta::delegation::NodeStream {
+                node: me,
+                gen,
+                subtrees: Vec::new(),
+            })
+            .collect()
+    }
+
     /// This node holds a root tenure: the lease, or the hold of a
     /// continuation epoch. A deposed root keeps streaming its own grant as
     /// a holder, and then waits for the log to carry its dependencies like
@@ -2852,14 +2933,30 @@ impl Core {
                 // ADR-55: the root's own stream ended at its inline append
                 // (the table forgot it) but its release row has not shipped:
                 // the state stays to stream it to the next root.
-                !((d.non_stealable || d.remnant)
+                // The same holds for a release row that ends the stream and
+                // is still in this journal, whatever the table says
+                // ([`Self::release_row_unshipped`]).
+                !(((d.non_stealable || d.remnant)
                     && unlogged
                     && (streams_mine.contains(g) || self.dl.own_minted.contains(g)))
+                    || self.release_row_unshipped(**g, replica).is_some())
             })
             .map(|(g, _)| *g)
             .collect();
         for gen in ended {
             self.drop_delegate_state(now, gen, replica, out);
+        }
+        // A state kept for its release row after the table forgot the
+        // generation holds nothing the ordinary route does not.
+        let kept_parked: Vec<u64> = self
+            .dl
+            .mine
+            .iter()
+            .filter(|(g, d)| !live_mine.contains(g) && !d.parked.is_empty())
+            .map(|(g, _)| *g)
+            .collect();
+        for gen in kept_parked {
+            self.hand_back_kept_parks(now, gen, replica, out);
         }
         self.dl.handed_back.retain(|gen, (_, at, seen)| {
             if live_mine.contains(gen) {
@@ -2892,7 +2989,18 @@ impl Core {
         }
         let mut commit_now: BTreeSet<u64> = BTreeSet::new();
         let mut retry = false;
-        for st in table.streams().filter(|s| s.node == me) {
+        // A restart that lost the holder state of a stream whose release and
+        // end are in this journal, unshipped ([`Self::own_end_remnants`]):
+        // installed as a remnant like the one below, and exempt from the
+        // fence for ended generations for itself (its own rows are what must
+        // ship).
+        let remnants_own_end = self.own_end_remnants(&streams_mine, replica);
+        let own_end_gens: BTreeSet<u64> = remnants_own_end.iter().map(|s| s.gen).collect();
+        for st in table
+            .streams()
+            .filter(|s| s.node == me)
+            .chain(remnants_own_end)
+        {
             // A stream that released every subtree holds nothing to install,
             // unless its release row is still to ship: a restart between the
             // row and the root's append (plan 46 M1.3 step 5) left it in the
@@ -2927,7 +3035,9 @@ impl Core {
                 let live: BTreeSet<u64> = table.gens().collect();
                 replica.deleg_gens_awaiting_end(&live)
             });
-            if awaiting.as_ref().is_none_or(|gens| !gens.is_empty()) {
+            if !own_end_gens.contains(&d.gen)
+                && awaiting.as_ref().is_none_or(|gens| !gens.is_empty())
+            {
                 let ended = awaiting.clone();
                 self.deleg_note_install_wait(now, d.dir_list(), d.gen, ended);
                 waiting_now.insert(d.gen);
@@ -12806,10 +12916,46 @@ impl Core {
         // that was the delegate) ends on the delegate side too.
         // (ADR-55: not while the release of the root's own stream has not
         // shipped: this node, deposed, streams the row to the next root.)
-        let own_release_unshipped = self.dl.own_minted.contains(&gen)
-            && self.dl.mine.get(&gen).is_some_and(|d| d.release.is_some());
-        if self.dl.mine.contains_key(&gen) && !own_release_unshipped {
-            self.drop_delegate_state(now, gen, replica, out);
+        // An end that cuts below the release row voids the row (the log never
+        // carries it), and the state goes with it.
+        let own_release_unshipped = self
+            .release_row_unshipped(gen, replica)
+            .is_some_and(|row| row <= through);
+        if self.dl.mine.contains_key(&gen) {
+            if own_release_unshipped {
+                self.hand_back_kept_parks(now, gen, replica, out);
+            } else {
+                self.drop_delegate_state(now, gen, replica, out);
+            }
+        }
+    }
+
+    /// The state of the ended generation `gen` stays for its release row
+    /// ([`Self::release_row_unshipped`]) and executes nothing: what waited in
+    /// it, which `drop_delegate_state` would have given back, goes back to the
+    /// ordinary route now (the ops parked in the stream, the acknowledgements
+    /// that waited for a row past the end's cut).
+    fn hand_back_kept_parks(
+        &mut self,
+        now: Now,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let through = replica.void_cut(gen).unwrap_or(0);
+        self.deleg_abort_stream_parks_past(now, gen, through, replica, out);
+        let parked = self
+            .dl
+            .mine
+            .get_mut(&gen)
+            .map(|d| std::mem::take(&mut d.parked))
+            .unwrap_or_default();
+        if parked.is_empty() {
+            return;
+        }
+        let root = self.holder_root().unwrap_or(0);
+        for p in parked {
+            self.answer_not_owner(now, p, root, replica, out);
         }
     }
 
@@ -13788,7 +13934,7 @@ impl Core {
             through: idx,
         }];
         match replica.delegate_release(&records, gen, Position::ZERO) {
-            Ok(_) => {
+            Ok(row) => {
                 self.stats.claim_released += 1;
                 if let Some(d) = self.dl.mine.get(&gen) {
                     Self::note_sticky_end(
@@ -13806,8 +13952,36 @@ impl Core {
                 // parked in it stay parked, and the end routes them as a
                 // dropped stream's are, once the table no longer lists the
                 // subtree: routed now they would meet the stream again).
+                //
+                // ADR-55: the row is the stream's pending release, as a whole
+                // release's is: the holder state stays until the row has
+                // shipped, to stream it to the next root should this node be
+                // deposed first. Nothing is sent: the claimant is the root,
+                // and the claim's end cuts at the row.
+                let wait = self.clk.wait;
                 if let Some(d) = self.dl.mine.get_mut(&gen) {
                     d.stopped = true;
+                    d.remnant = true;
+                    let dirs: Vec<Ino> = d.dirs.iter().copied().collect();
+                    d.released_dirs.extend(dirs.iter().copied());
+                    d.dirs.clear();
+                    let release = PendingRelease {
+                        note: constellation_meta::locks::ReleaseNote {
+                            dirs,
+                            ..Default::default()
+                        },
+                        row: Some(row),
+                        first_row: Some(row),
+                        held: false,
+                        holds: 0,
+                        left_at: wait,
+                        to: me,
+                        ends: true,
+                    };
+                    d.release = Some(match d.release.take() {
+                        Some(old) => old.merge(release, wait),
+                        None => release,
+                    });
                 }
             }
             Err(error) => {

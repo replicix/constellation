@@ -4665,7 +4665,19 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   not honoured, also after a deposition and after a restart over the journal
   (the record's row is found in the journal again, M3). The root's release of its own stream
   is complete when its row has shipped; until then the holder state stays, to
-  stream the row to the next root. The loop-back is for the delegate family
+  stream the row to the next root. That holds for the claim's release row too
+  (ADR-60): it is the stream's pending release, journaled by the claim, and the
+  state stays through the claim's end (one predicate, `release_row_unshipped`:
+  an ending release row still in this journal and not in the log, which a
+  strand or the row's shipping ends) and through a deposition. A restart
+  re-creates it: a node that holds no root tenure and whose journal holds
+  its own unshipped end of a stream and that stream's unshipped release row
+  (its replica applied the end, so the table no longer lists the stream)
+  installs the stream again as a remnant (stopped, no subtree, holding the
+  row), exempt from the fence for ended generations, which the end it
+  journaled itself would trip; an end an applied segment carried installs
+  nothing. Nothing executes under the kept or re-created state (`finding 996 B`: the new root otherwise waits for the
+  stream's rows for ever, the holder having none left to send). The loop-back is for the delegate family
   (stream, acknowledgement, renewal, release request, seal, recall, read-grant
   void); lock messages keep the driver's path.
 - **The root releases its own grant only as its holder** (R-I6): after the long
@@ -5738,6 +5750,10 @@ ahead of rows it covers.
 - The sim no longer excuses an end by the holder's claim
   (`sticky_ends_only_by_holder_or_operator`); the knob `claim_ends_silently` is
   the old behaviour as a negative control.
+- A claimed stream's end that runs out leaves the holder state until its
+  release row ships: the end of the wait journals the end, and the state stays
+  while the row is in the journal and not in the log (ADR-55, restart and
+  claim; `Core::release_row_unshipped`). The bound itself is unchanged.
 - **The idle release** lives in the core (`Core::idle_release_progress`), not
   an engine module: the engine has no idle state the core lacks. A held sticky
   subtree whose holder's own ops have not touched it for
