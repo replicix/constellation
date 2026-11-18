@@ -2108,7 +2108,10 @@ impl Meta {
                 continue;
             };
             if let Some(rid) = row.rid {
-                if !(row.class.gated() && unanswered(rid)) {
+                // A row this node re-appended carries the re-append's gated
+                // class, not the rule its answer was given under: no class,
+                // so listed.
+                if row.appended || !(row.class.gated() && unanswered(rid)) {
                     plan.acked_lost
                         .push((rid, format!("wrote chunk(s) of inode {ino} that are gone")));
                 }
@@ -2714,16 +2717,22 @@ impl Meta {
             ts_unix: now_unix,
         };
         // The rolled-back rows with no rid at all (a local manifest commit, a
-        // snapshot row) are queued under the synthetic one by the strand, and
-        // a seed is named by it here when nothing was queued.
-        let mut synthetic_seed_rids: Vec<crate::rid::Rid> = Vec::new();
-        for row in walked
-            .rows
-            .iter()
-            .filter(|row| row.in_s && row.rid.is_none())
-        {
-            synthetic_seed_rids.push(spec::replay_rid_for(&tx, self, row.first)?);
-        }
+        // snapshot row) are listed under the synthetic one (the strand's, for
+        // a queued row; an appended row with no rid is never queued, and a
+        // seed of that kind is named by it here too). Only the debug check
+        // below reads the set.
+        #[cfg(debug_assertions)]
+        let synthetic_rids: Vec<crate::rid::Rid> = {
+            let mut rids = Vec::new();
+            for row in walked
+                .rows
+                .iter()
+                .filter(|row| row.in_s && row.rid.is_none())
+            {
+                rids.push(spec::replay_rid_for(&tx, self, row.first)?);
+            }
+            rids
+        };
         // Each seed: its queued replay becomes a refused one carrying the
         // manifest with the lost chunks as holes, so the drain makes the
         // conflict copy and never re-executes the seed.
@@ -2746,7 +2755,10 @@ impl Meta {
             // queued, yet has a real rid, the one the record names.
             let own = walked.rows.iter().find(|row| row.first == t.first);
             let own_rid = own.and_then(|row| row.rid);
-            let own_class = own.and_then(|row| row.class);
+            // A re-appended row's class is the re-append's gated `Group{Root}`,
+            // not the rule its answer was given under (an epoch's hold, Final,
+            // Singleton: it may have left before it shipped): no class, listed.
+            let own_class = own.filter(|row| !row.appended).and_then(|row| row.class);
             let rid = match (queued, own_rid) {
                 (Some((rid, _)), _) => rid,
                 (None, Some(rid)) => rid,
@@ -2857,10 +2869,11 @@ impl Meta {
             queued_dropped += 1;
         }
         // The node never reports a loss the record does not name.
+        #[cfg(debug_assertions)]
         debug_assert!(
             acked_lost.iter().all(|(rid, _)| plan.rids.contains(rid)
                 || plan.queued.iter().any(|(_, q)| q == rid)
-                || synthetic_seed_rids.contains(rid)),
+                || synthetic_rids.contains(rid)),
             "the apply of the drop of inode {ino} lists a loss the DropHeld does not name: \
              {acked_lost:?}"
         );

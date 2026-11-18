@@ -2007,6 +2007,22 @@ fn a_drop_leaves_a_queued_replay_of_a_delegates_shadow_alone() {
 /// the parent: the synthetic rid is listed and refused, the real one is not.
 #[test]
 fn a_drop_names_a_reappended_seed_by_its_own_rid() {
+    a_reappended_seed_drop(false);
+}
+
+/// The same with the retry of the seed's rid parked behind the row (its
+/// answer certainly not given). A re-appended row carries the re-append's
+/// gated class, not the rule its first answer was given under (an epoch's
+/// hold, Final, Singleton: the client may have been told OK before the root
+/// crashed), so the class says nothing and the loss is still listed. Fails
+/// before the fix: the gated class and the parked answer left it out of
+/// `acked_lost`.
+#[test]
+fn a_parked_reappended_seed_is_still_an_acknowledged_loss() {
+    a_reappended_seed_drop(true);
+}
+
+fn a_reappended_seed_drop(parked: bool) {
     let meta = Meta::open_in_memory().unwrap();
     meta.set_node_prefix(1).unwrap();
     meta.set_holder_epoch(1);
@@ -2039,7 +2055,7 @@ fn a_drop_names_a_reappended_seed_by_its_own_rid() {
             broken,
             1,
             false,
-            &|_| false,
+            &|r| parked && r == rid,
             &|_| Vec::new(),
             &Default::default(),
             true,
@@ -2060,7 +2076,7 @@ fn a_drop_names_a_reappended_seed_by_its_own_rid() {
         .drop_held_apply(
             broken,
             1,
-            &|_| false,
+            &|r| parked && r == rid,
             &|_| Vec::new(),
             &Default::default(),
             true,

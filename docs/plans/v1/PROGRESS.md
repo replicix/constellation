@@ -70295,3 +70295,16 @@ seed 226 differs; it asserts the drop oracle only). Seed 226 still fails after t
 that closes. Sweeps, release, 2,000 seeds, parent / fix: failing seeds are equal on every label (`far-root-writes+lost-chunk-late` [226, 996, 1810]
 on both, 226 now the sticky finding; the other nine labels none); `acked_lost` totals over the drop counters are equal on the first five labels
 (80, 50, 48, 1445, 41) and within a few of each other on the backed chains (4817/4812, 4813/4817).
+
+Review follow-up (same entry, 2026-11-18): a re-appended row's journal class is the re-append's gated `Group{Root}`, not the rule its answer was first
+given under (an epoch's hold, Final, Singleton), so a retry parked behind it would have left an acknowledged, lost write out of `acked_lost`. The apply's
+seed loop and the decision's `plan.acked_lost` now take the row's own class only for a row that was not appended; an appended row has no class and is
+listed. New meta test `a_parked_reappended_seed_is_still_an_acknowledged_loss` (the retry parked; fails before the fix: the seed was left out of
+`acked_lost`); the first test runs the same body unparked. The sim pin now asserts that the drop was reached: a pass needs drops > 0, a failure must carry the
+`DroppedHeld` listing the seed's real rid as refused and acknowledged-lost (release), or the apply's own stream-index assert (debug: a pre-existing finding,
+the same on the base, which trips before the sticky one). The `synthetic_rids` set (renamed; it covers dependents too) and its `debug_assert!` are
+debug-only. Left as follow-ups: an appended seed with no rid is listed under a synthetic rid no `DropHeld` names and is not a client's op; an appended
+dependent with a real rid is neither listed nor rolled back; a failed `forget_replay` in the re-append leaves a gen-0 queue entry of the seed's rid, so the
+drop would refuse and list it twice (dedup by rid). Sweeps, release, 2,000 seeds, base (origin/main plus the test-only commit, which carries the
+`lost-chunk-late` variant) / fix, ten labels: failing sets equal (`lost-chunk-late` [226, 996, 1810] on both, none elsewhere); `acked_lost` totals 80, 50, 48,
+1445, 41, 265, 1000, 0 equal, backed chain 4817/4814 and backed+commit 4817/4816 (simdet nondeterminism, as in round 1).
