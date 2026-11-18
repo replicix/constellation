@@ -453,6 +453,14 @@ const TRACES: &[(&str, &str, usize)] = &[
         "settle_after_reads_recalled",
         9,
     ),
+    ("c9-t1+execute_at_cut", "settle_after_reads_recalled", 9),
+    ("c11-x2r+refuse_at_holder_cut", "eio_never_lands_late", 9),
+    ("c11-x2r+exec_past_cut", "no_row_past_cut", 6),
+    (
+        "c11-x2r+cut_counts_as_release",
+        "sticky_ends_only_by_holder_or_operator",
+        6,
+    ),
     ("c9-t2+settle_unowned", "eio_never_lands_late", 11),
     ("c9-t3+server_replay_queue", "one_executable_copy", 8),
     ("t1+lone_delegate", "ack_implies_committed_by_config", 17),
@@ -1599,6 +1607,75 @@ fn c9_knob_server_replay_queue_is_found() {
         "c9-t3+server_replay_queue",
         &m,
         "one_executable_copy",
+        CAP_LARGE,
+    );
+}
+
+// ---------------------------------- plan 46 M1.3 step 15b: `ReleaseCut` (ADR-63)
+
+/// The model before the cut: a release waits for the read recall (the old
+/// behaviour, the control of the sim's `AUTHORITY_SIM_NO_RELEASE_CUT`).
+#[test]
+fn c9_design_t1_without_release_cut_is_the_old_model() {
+    let mut m = c9_t1();
+    m.release_cut = false;
+    assert_clean_within("c9-t1+no_release_cut", &m, CAP_LARGE);
+}
+
+/// X2r with a voluntary release too: the holder's `CutAll` while its read
+/// delegation is out, the release row after the recall.
+#[test]
+fn c11_design_x2r_without_release_cut_is_the_old_model() {
+    let mut m = c11_x2r_reads_and_deadlines();
+    m.release_cut = false;
+    assert_clean_within("c11-x2r+no_release_cut", &m, CAP_LARGE);
+}
+
+/// The root refuses at the holder's cut before it appended the stream to
+/// it: the holder's row of the settled op lands after the `EIO`.
+#[test]
+fn c11_knob_refuse_at_holder_cut_is_found() {
+    let mut m = c11_x2r_reads_and_deadlines();
+    m.refuse_at_holder_cut = true;
+    assert_finds_within(
+        "c11-x2r+refuse_at_holder_cut",
+        &m,
+        "eio_never_lands_late",
+        CAP_LARGE,
+    );
+}
+
+/// An appended cut flips the table: the root executes in the subtree while
+/// the read delegation is out.
+#[test]
+fn c9_knob_execute_at_cut_is_found() {
+    let mut m = c9_t1();
+    m.execute_at_cut = true;
+    assert_finds_within(
+        "c9-t1+execute_at_cut",
+        &m,
+        "settle_after_reads_recalled",
+        CAP_LARGE,
+    );
+}
+
+/// The holder keeps executing in a subtree it cut.
+#[test]
+fn c11_knob_exec_past_cut_is_found() {
+    let mut m = c11_x2r_reads_and_deadlines();
+    m.exec_past_cut = true;
+    assert_finds_within("c11-x2r+exec_past_cut", &m, "no_row_past_cut", CAP_LARGE);
+}
+
+/// The root takes the cut for the holder's release of the stream and ends it.
+#[test]
+fn c11_knob_cut_counts_as_release_is_found() {
+    let mut m = c11_x2r_reads_and_deadlines();
+    m.cut_counts_as_release = true;
+    assert_finds_within(
+        "c11-x2r+cut_counts_as_release",
+        &m,
+        "sticky_ends_only_by_holder_or_operator",
         CAP_LARGE,
     );
 }

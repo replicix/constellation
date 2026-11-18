@@ -321,6 +321,23 @@
 //! - **No server queue**: a deposed root's parked ops die with its tenure;
 //!   the requester's retry is the only source of another copy.
 //!
+//! ## Step 15b: `ReleaseCut` (ADR-63)
+//!
+//! - **The cut row** ([`RowKind::Cut`], [`Action::Cut`], [`Action::CutAll`],
+//!   [`NodeStreamModel::release_cut`]): a holder asked to release a subtree
+//!   whose read delegation is outstanding journals a cut at once and stops
+//!   executing there (its own view forgets the subtree, [`deleg_owns`]); the
+//!   release row follows once the read is recalled ([`Action::Release`]).
+//!   The root's table does not change at a cut.
+//! - **The settle at the cut**: a root that has the cut row in order has
+//!   every row of the stream that touched the keys and the holder executes
+//!   nothing more there, so it answers the settle (the outcome, else a
+//!   refusal) before the release row, with the read delegation still out
+//!   (`settle_refused_at_cut`). Requesters send such a settle to the lease
+//!   holder. `check_reads` still stops an execution at a cut.
+//! - [`no_row_past_cut`]: no op or refusal row of a node stream touches a
+//!   directory after the stream's cut of it.
+//!
 //! ## Chunk 12: the roster object and stale views (plan 46 M1.3 step 10, ADR-50)
 //!
 //! - **Reads** ([`Action::SeeRoster`], [`Action::SeeOldRoster`],
@@ -520,6 +537,13 @@
 //!   refuses keys a node stream holds at once (no release).
 //! - `cut_before_read_recall` (chunk 9, S4): a holder releases with its
 //!   read delegation outstanding.
+//! - `refuse_at_holder_cut` (step 15b, ADR-63): the root refuses a settle at
+//!   the holder's cut before it appended the stream to the cut row.
+//! - `execute_at_cut` (step 15b): an appended cut flips the table, so the
+//!   root executes in the subtree before the release row and the recall.
+//! - `exec_past_cut` (step 15b): the holder keeps executing in a cut subtree.
+//! - `cut_counts_as_release` (step 15b): the root takes a cut for the
+//!   holder's release of the stream.
 //! - `server_replay_queue` (chunk 9): a deposed root's parked ops are handed
 //!   to the claimant.
 //! - `roster_installs_old_read` (chunk 12): a read older than the installed
@@ -623,6 +647,12 @@ pub enum RowKind {
     /// `StreamReleased` (every subtree it held): `at` is one past the last
     /// index of the stream that touched `dirs`.
     Released { dirs: u8, at: u8 },
+    /// Step 15b (ADR-63): a node stream's `ReleaseCut { dirs, at }`. The
+    /// holder stopped executing in `dirs` after index `at` (one past the
+    /// last index of the stream that touched them); the release row follows
+    /// once the stream's read delegation is recalled. It ends and releases
+    /// nothing: the root's table does not change.
+    Cut { dirs: u8, at: u8 },
     /// The root's `DelegateNode` record growing `stream`'s set.
     Grow { stream: u8, dirs: u8 },
     /// The root's `DelegateNodeEnded { through }` for `stream`.
@@ -906,6 +936,11 @@ pub const SAW_GRANT_BLOCKS_SINGLETON: u64 = 1 << 51;
 /// Chunk 14: the new root appended a row of the deposed root's own stream
 /// that was journaled after the deposition.
 pub const SAW_DEPOSED_ROOT_STREAMS: u64 = 1 << 52;
+/// Step 15b (ADR-63): a holder journaled a `ReleaseCut` row.
+pub const SAW_CUT: u64 = 1 << 53;
+/// Step 15b (ADR-63): the root refused a settle at a holder's appended cut
+/// while that stream's read delegation was still outstanding.
+pub const SAW_CUT_SETTLE: u64 = 1 << 54;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -1052,8 +1087,14 @@ pub enum Action {
     /// The holder of `stream` answers the root's request with
     /// `SubtreeReleased` for `dirs`.
     Release { stream: u8, dirs: u8 },
+    /// Step 15b (ADR-63): the holder of `stream` journals `ReleaseCut` for
+    /// `dirs` while its read delegation is outstanding (`release_subtrees`).
+    Cut { stream: u8, dirs: u8 },
     /// The holder of stream `g` releases every subtree (`StreamReleased`).
     ReleaseAll(u8),
+    /// Step 15b: the holder of stream `g` journals `ReleaseCut` for every
+    /// subtree it holds, for a voluntary release whose reads are not clear.
+    CutAll(u8),
     /// The root journals the planned growth `grows[k]`.
     Grow(u8),
     /// The holder of stream `g` stops honouring (abstract TTL).
@@ -1249,6 +1290,22 @@ pub struct NodeStreamModel {
     /// Chunk 14, the knob: a deposition discards the deposed root's own
     /// stream rows past the adopted prefix with the root's rows.
     pub deposed_root_drops_own_stream: bool,
+    /// Step 15b (ADR-63): a holder whose read delegation is outstanding
+    /// journals `ReleaseCut` first and the release row after the recall,
+    /// and the root answers a settle at the appended cut. `false` is the
+    /// model before (the release waits for the recall).
+    pub release_cut: bool,
+    /// Step 15b, the knob: the root refuses at the holder's cut as soon as
+    /// the holder journaled it, before the root appended the stream to it.
+    pub refuse_at_holder_cut: bool,
+    /// Step 15b, the knob: an appended cut flips the table (the root
+    /// executes in the directory) before the release row.
+    pub execute_at_cut: bool,
+    /// Step 15b, the knob: the holder keeps executing in a cut subtree.
+    pub exec_past_cut: bool,
+    /// Step 15b, the knob: the root takes a cut row for the holder's
+    /// release of the stream (it may end the stream after it).
+    pub cut_counts_as_release: bool,
 }
 
 /// Where a received op stands at a sequencer.
@@ -1343,6 +1400,11 @@ impl NodeStreamModel {
             singleton_with_foreign_grant: false,
             max_resumes: 0,
             deposed_root_drops_own_stream: false,
+            release_cut: true,
+            refuse_at_holder_cut: false,
+            execute_at_cut: false,
+            exec_past_cut: false,
+            cut_counts_as_release: false,
         }
     }
 
@@ -1697,6 +1759,14 @@ fn table_upto(m: &NodeStreamModel, s: &State, upto: usize, early: bool, slash: b
                     }
                 }
             }
+            // Step 15b: a cut flips nothing (the knob: it does).
+            RowKind::Cut { dirs, .. } if r.stream != ROOT && m.execute_at_cut => {
+                for d in bits(dirs) {
+                    if t[d] == r.stream {
+                        t[d] = ROOT;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1765,6 +1835,33 @@ fn deleg_owns(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
 /// which it has from the moment it mints the record, so a forward not routed
 /// by it is fenced instead of parked (and run unfenced at the commit).
 fn deleg_owns_at(m: &NodeStreamModel, s: &State, g: u8, dir: usize, minted: bool) -> bool {
+    deleg_view(m, s, g, dir, minted, !m.exec_past_cut)
+}
+
+/// The holder still holds `dir` for a release row (its own view, whether or
+/// not it stopped executing there at a cut): what the release actions offer.
+fn deleg_holds(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
+    deleg_view(m, s, g, dir, false, false)
+}
+
+/// Stream `g` journaled a `ReleaseCut` covering `dir`.
+fn deleg_cut(s: &State, g: u8, dir: usize) -> bool {
+    s.streams[g as usize]
+        .rows
+        .iter()
+        .any(|r| matches!(r.kind, RowKind::Cut { dirs, .. } if dirs & (1 << dir) != 0))
+}
+
+/// [`deleg_owns_at`]; `cut_stops`: the holder stopped executing in a
+/// directory it cut (its view forgets it from the cut row on, ADR-63).
+fn deleg_view(
+    m: &NodeStreamModel,
+    s: &State,
+    g: u8,
+    dir: usize,
+    minted: bool,
+    cut_stops: bool,
+) -> bool {
     let st = &s.streams[g as usize];
     if st.stopped {
         return false;
@@ -1795,7 +1892,8 @@ fn deleg_owns_at(m: &NodeStreamModel, s: &State, g: u8, dir: usize, minted: bool
             .rows
             .iter()
             .any(|r| matches!(r.kind, RowKind::Released { dirs, .. } if dirs & (1 << dir) != 0));
-    (initial || grown) && !released
+    let cut = cut_stops && deleg_cut(s, g, dir);
+    (initial || grown) && !released && !cut
 }
 
 /// Oracle (`recall_safety`): stream `g` may hold `dir` by the stores.
@@ -2004,7 +2102,12 @@ fn has_peer(s: &State, mask: u8) -> bool {
 /// S4 (chunk 9): the root acts in `dirs` (an op or a settle's refusal);
 /// every node stream that held one of them and released it (or ended)
 /// has recalled its read delegation.
-fn check_reads(m: &NodeStreamModel, s: &mut State, dirs: u8, rid: Rid, idx: u8) {
+///
+/// `exec`: the root executes an op in `dirs`; a holder's appended cut counts
+/// as gone then (nothing may execute at a cut). A settle's refusal (`exec`
+/// false) at a cut needs no recall: it changes nothing a reader can see
+/// (ADR-63); after a release it still does.
+fn check_reads(m: &NodeStreamModel, s: &mut State, dirs: u8, rid: Rid, idx: u8, exec: bool) {
     if s.reads == 0 {
         return;
     }
@@ -2018,10 +2121,11 @@ fn check_reads(m: &NodeStreamModel, s: &mut State, dirs: u8, rid: Rid, idx: u8) 
                         matches!(r.kind, RowKind::Grow { stream, dirs } if stream == hs && dirs & (1 << d) != 0)
                     });
                 let gone = ended(s, hs).is_some()
-                    || s.streams[h]
-                        .rows
-                        .iter()
-                        .any(|r| matches!(r.kind, RowKind::Released { dirs, .. } if dirs & (1 << d) != 0));
+                    || s.streams[h].rows.iter().any(|r| match r.kind {
+                        RowKind::Released { dirs, .. } => dirs & (1 << d) != 0,
+                        RowKind::Cut { dirs, .. } => exec && dirs & (1 << d) != 0,
+                        _ => false,
+                    });
                 held && gone
             })
     });
@@ -2308,11 +2412,19 @@ fn holder_released(m: &NodeStreamModel, s: &State, g: u8) -> bool {
 /// held set (the knob `partial_release_ends_stream`: of anything).
 fn release_shown(m: &NodeStreamModel, s: &State, g: u8) -> bool {
     let rows = &s.streams[ROOT as usize].rows;
-    let any = rows
+    let counts = |r: &Row| match r.kind {
+        RowKind::Released { .. } => true,
+        RowKind::Cut { .. } => m.cut_counts_as_release,
+        _ => false,
+    };
+    let any = rows.iter().any(|r| r.stream == g && counts(r));
+    let covered = rows
         .iter()
-        .any(|r| r.stream == g && matches!(r.kind, RowKind::Released { .. }));
-    any && (m.partial_release_ends_stream
-        || released_dirs(rows, g) & held_dirs(m, s, g) == held_dirs(m, s, g))
+        .fold(released_dirs(rows, g), |acc, r| match r.kind {
+            RowKind::Cut { dirs, .. } if r.stream == g && m.cut_counts_as_release => acc | dirs,
+            _ => acc,
+        });
+    any && (m.partial_release_ends_stream || covered & held_dirs(m, s, g) == held_dirs(m, s, g))
 }
 
 /// M1.0 review SHOULD-2: node `node` holds a live grant (minted, not ended).
@@ -2477,6 +2589,21 @@ pub fn journal_valid(m: &NodeStreamModel, s: &State) -> bool {
         }
     }
     true
+}
+
+/// Step 15b (ADR-63): no `Op` or `Refused` row of a node stream touching a
+/// directory comes after the stream's `ReleaseCut` of it. The holder
+/// stopped executing there at the cut row.
+pub fn no_row_past_cut(s: &State) -> bool {
+    s.streams[1..].iter().all(|st| {
+        st.rows.iter().all(|c| match c.kind {
+            RowKind::Cut { dirs, .. } => st
+                .rows
+                .iter()
+                .all(|r| r.idx <= c.idx || r.record() || op_dirs(r.op) & dirs == 0),
+            _ => true,
+        })
+    })
 }
 
 /// Every root row in a directory a node stream held comes after that
@@ -2906,7 +3033,7 @@ fn execute(
         }
     } else if dirs & m.delegated_dirs() != 0 {
         s.saw |= SAW_RELEASED_EXEC;
-        check_reads(m, s, dirs, rid, idx);
+        check_reads(m, s, dirs, rid, idx, true);
     }
     // The root executes against its journal, a delegate against its keys.
     let base = if stream == ROOT {
@@ -3079,6 +3206,17 @@ fn receive_settle(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: Writ
     match status(m, s, at, op, &[0; MAXS]) {
         Status::Run(g) => refuse(m, s, at, g, rid, op),
         _ if m.settle_unowned && at == s.root => refuse(m, s, at, ROOT, rid, op),
+        // Step 15b (ADR-63): the root has the holder's cut row in order, so
+        // it has every row of the stream that touched the keys, and the
+        // holder executes nothing more there: the settle is answered here,
+        // before the release row (and the read recall).
+        Status::Blocked(false) | Status::Bounce if at == s.root && settle_at_cut(m, s, op) => {
+            let t = table(m, s);
+            if bits(op_dirs(op)).any(|d| t[d] != ROOT && s.reads & (1 << t[d]) != 0) {
+                s.saw |= SAW_CUT_SETTLE;
+            }
+            refuse(m, s, at, ROOT, rid, op)
+        }
         Status::Blocked(_) => s.waiting.push(Wait {
             node: at,
             rid,
@@ -3090,6 +3228,52 @@ fn receive_settle(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: Writ
     }
 }
 
+/// The root's journal (the knob: the holder's own stream) has stream `g`'s
+/// `ReleaseCut` covering `dir`.
+fn cut_appended(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
+    let rows = if m.refuse_at_holder_cut {
+        &s.streams[g as usize].rows
+    } else {
+        &s.streams[ROOT as usize].rows
+    };
+    rows.iter().any(|r| {
+        r.stream == g && matches!(r.kind, RowKind::Cut { dirs, .. } if dirs & (1 << dir) != 0)
+    })
+}
+
+/// `settle_at_cut` (ADR-63): at least one of `op`'s directories is a node
+/// stream's whose appended cut the table still lists, and every other one is
+/// the root's or such a cut one. A directory under a live, uncut grant makes
+/// it false.
+fn settle_at_cut(m: &NodeStreamModel, s: &State, op: WriteOp) -> bool {
+    if !m.release_cut {
+        return false;
+    }
+    let t = table(m, s);
+    let mut cut = false;
+    for d in bits(op_dirs(op)) {
+        if t[d] == ROOT {
+            continue;
+        }
+        if !cut_appended(m, s, t[d], d) {
+            return false;
+        }
+        cut = true;
+    }
+    cut
+}
+
+/// Where node `i`'s settle of `op` goes: the sequencer in force by the
+/// root's table (the `settle_unowned` knob: the root); a settle at a cut goes
+/// to the lease holder, not the stopped holder (R5).
+fn settle_dest(m: &NodeStreamModel, s: &State, op: WriteOp) -> u8 {
+    if m.settle_unowned || settle_at_cut(m, s, op) {
+        s.root
+    } else {
+        m.executor(s, route(m, s, op))
+    }
+}
+
 /// `at` journals `Refused { rid, ABANDONED }` in `stream` and answers it
 /// once committed; the settle supersedes a parked copy of the op.
 fn refuse(m: &NodeStreamModel, s: &mut State, at: u8, stream: u8, rid: Rid, op: WriteOp) {
@@ -3097,7 +3281,7 @@ fn refuse(m: &NodeStreamModel, s: &mut State, at: u8, stream: u8, rid: Rid, op: 
     let dirs = op_dirs(op);
     if stream == ROOT && dirs & m.delegated_dirs() != 0 {
         s.saw |= SAW_SETTLE_RELEASE;
-        check_reads(m, s, dirs, rid, idx);
+        check_reads(m, s, dirs, rid, idx, false);
     }
     let alone = stream == ROOT && quiet(m, s, s.view_roster, s.view_partial);
     let told = stream == ROOT && told_peer(s);
@@ -3123,11 +3307,7 @@ fn refuse(m: &NodeStreamModel, s: &mut State, at: u8, stream: u8, rid: Rid, op: 
 /// Node `i` sends the settle of its outstanding `rid` to the sequencer in
 /// force by the root's table (the `settle_unowned` knob: to the root).
 fn submit_settle(m: &NodeStreamModel, s: &mut State, i: u8, rid: Rid, op: WriteOp) {
-    let to = if m.settle_unowned {
-        s.root
-    } else {
-        m.executor(s, route(m, s, op))
-    };
+    let to = settle_dest(m, s, op);
     s.nodes[i as usize].sent_to = to;
     if to == i {
         receive_settle(m, s, i, rid, op);
@@ -3345,12 +3525,10 @@ impl Model for NodeStreamModel {
             } else {
                 if !s.live(node.sent_to) || self.stopped_node(s, node.sent_to) {
                     let op = self.scripts[i as usize][node.next as usize - 1];
-                    let to = if s.settling & (1 << i) != 0 && self.settle_unowned {
-                        s.root
-                    } else if s.settling & (1 << i) == 0 {
+                    let to = if s.settling & (1 << i) == 0 {
                         target(self, s, i, op).0
                     } else {
-                        self.executor(s, route(self, s, op))
+                        settle_dest(self, s, op)
                     };
                     if s.live(to) && !self.stopped_node(s, to) {
                         actions.push(Action::Retry(i));
@@ -3366,7 +3544,10 @@ impl Model for NodeStreamModel {
         }
         for (k, w) in s.waiting.iter().enumerate() {
             let deps = if w.settle { [0; MAXS] } else { w.deps };
-            if s.live(w.node) && !matches!(status(self, s, w.node, w.op, &deps), Status::Blocked(_))
+            // A parked settle wakes when the cut row is appended (R4).
+            let at_cut = w.settle && w.node == s.root && settle_at_cut(self, s, w.op);
+            if s.live(w.node)
+                && (at_cut || !matches!(status(self, s, w.node, w.op, &deps), Status::Blocked(_)))
             {
                 actions.push(Action::Exec(k));
             }
@@ -3435,33 +3616,57 @@ impl Model for NodeStreamModel {
                 // The root's request: a parked op needs a directory this
                 // stream holds.
                 let t = table(self, s);
+                // The directories the request names that the holder still
+                // holds for a release row, and those it still executes in.
                 let mut asked = 0u8;
+                let mut asked_exec = 0u8;
                 for w in s.waiting.iter().filter(|w| w.node == s.root) {
                     for d in bits(op_dirs(w.op)) {
-                        if t[d] == stream && deleg_owns(self, s, stream, d) {
+                        if t[d] == stream && deleg_holds(self, s, stream, d) {
                             asked |= 1 << d;
+                        }
+                        if t[d] == stream && deleg_owns(self, s, stream, d) {
+                            asked_exec |= 1 << d;
                         }
                     }
                 }
-                // S4 (chunk 9): the cut is answered only after the read
-                // recall.
+                // S4 (chunk 9): the release row is journaled only after the
+                // read recall; before it, step 15b's `ReleaseCut` (ADR-63).
                 let reads_clear = s.reads & (1 << stream) == 0 || self.cut_before_read_recall;
                 if reads_clear {
-                    for d in bits(asked) {
+                    // The directories already cut wait for this row.
+                    let pending_cut = (1..DIRS)
+                        .filter(|&d| deleg_cut(s, stream, d) && deleg_holds(self, s, stream, d))
+                        .fold(0u8, |m, d| m | (1 << d));
+                    for d in bits(asked | pending_cut) {
                         actions.push(Action::Release {
                             stream,
                             dirs: 1 << d,
                         });
                     }
+                } else if self.release_cut {
+                    for d in bits(asked_exec) {
+                        if !deleg_cut(s, stream, d) {
+                            actions.push(Action::Cut {
+                                stream,
+                                dirs: 1 << d,
+                            });
+                        }
+                    }
                 }
-                let owned = (1..DIRS).any(|d| deleg_owns(self, s, stream, d));
+                let owned = (1..DIRS).any(|d| deleg_holds(self, s, stream, d));
+                let owned_exec = (1..DIRS).any(|d| deleg_owns(self, s, stream, d));
                 // A non-stealable holder releases only once drained: the
                 // root has appended through its last row (chunk 7).
                 let drained_all = !self.non_stealable(stream)
                     || self.holder_releases_before_drain
                     || st.root_appended as usize == st.rows.len();
-                if self.stream_releases.contains(&stream) && owned && drained_all && reads_clear {
-                    actions.push(Action::ReleaseAll(stream));
+                if self.stream_releases.contains(&stream) && owned && drained_all {
+                    if reads_clear {
+                        actions.push(Action::ReleaseAll(stream));
+                    } else if self.release_cut && owned_exec {
+                        actions.push(Action::CutAll(stream));
+                    }
                 }
                 if self.ttl(stream) {
                     actions.push(Action::Stop(stream));
@@ -3470,7 +3675,7 @@ impl Model for NodeStreamModel {
                 // directories are the root's again).
                 if self.reads & (1 << stream) != 0
                     && s.reads_granted & (1 << stream) == 0
-                    && owned
+                    && owned_exec
                     && end.is_none()
                 {
                     actions.push(Action::GrantRead(stream));
@@ -3828,7 +4033,8 @@ impl Model for NodeStreamModel {
                 let justified = s
                     .waiting
                     .iter()
-                    .any(|w| w.node == s.root && op_dirs(w.op) & dirs != 0 && spans(w.op));
+                    .any(|w| w.node == s.root && op_dirs(w.op) & dirs != 0 && spans(w.op))
+                    || bits(dirs).any(|d| deleg_cut(&s, stream, d));
                 let idx = s.streams[stream as usize].rows.len() as u8;
                 if !justified {
                     s.violate(
@@ -3846,9 +4052,20 @@ impl Model for NodeStreamModel {
                 }
                 push_release(&mut s, stream, dirs);
             }
-            Action::ReleaseAll(g) => {
+            Action::Cut { stream, dirs } => {
+                s.saw |= SAW_CUT;
+                push_cut(&mut s, stream, dirs);
+            }
+            Action::CutAll(g) => {
                 let dirs = (1..DIRS)
                     .filter(|&d| deleg_owns(self, &s, g, d))
+                    .fold(0u8, |m, d| m | (1 << d));
+                s.saw |= SAW_CUT;
+                push_cut(&mut s, g, dirs);
+            }
+            Action::ReleaseAll(g) => {
+                let dirs = (1..DIRS)
+                    .filter(|&d| deleg_holds(self, &s, g, d))
                     .fold(0u8, |m, d| m | (1 << d));
                 s.saw |= SAW_STREAM_RELEASED;
                 if s.reads_granted & (1 << g) != 0 && s.reads & (1 << g) == 0 {
@@ -4503,6 +4720,7 @@ impl Model for NodeStreamModel {
                 acked_at_or_below_cut(s)
             }),
             Property::always("verbatim_identity", |_, s: &State| verbatim_identity(s)),
+            Property::always("no_row_past_cut", |_, s: &State| no_row_past_cut(s)),
             Property::sometimes("all_answered", |m: &NodeStreamModel, s: &State| {
                 s.nodes
                     .iter()
@@ -4853,6 +5071,20 @@ impl NodeStreamModel {
         if self.reads != 0 && cuts && !self.cut_before_read_recall {
             w!("read_recalled_before_cut", SAW_READ_RECALLED);
         }
+        // Step 15b: the cut is reached, and where a deadline may fall on a
+        // cut subtree the settle is answered at the cut with the read
+        // delegation still out (the S4 window reached and closed).
+        let knobs = self.refuse_at_holder_cut
+            || self.execute_at_cut
+            || self.exec_past_cut
+            || self.cut_counts_as_release
+            || self.cut_before_read_recall;
+        if self.release_cut && self.reads != 0 && cuts && !knobs {
+            w!("cut_journaled", SAW_CUT);
+            if self.max_deadlines > 0 {
+                w!("settle_refused_at_cut", SAW_CUT_SETTLE);
+            }
+        }
     }
 }
 
@@ -4938,6 +5170,36 @@ fn export_void(s: &mut State, g: u8) {
     s.exported.extend(rids);
     s.exported.sort_unstable();
     s.exported.dedup();
+}
+
+/// Stream `g`'s holder journals `ReleaseCut` for `dirs`: it stopped executing
+/// there; `at` is one past the last index of the stream that touched them.
+fn push_cut(s: &mut State, g: u8, dirs: u8) {
+    let st = &mut s.streams[g as usize];
+    let idx = st.rows.len() as u8;
+    let at = st
+        .rows
+        .iter()
+        .filter(|r| r.kind == RowKind::Op && op_dirs(r.op) & dirs != 0)
+        .map(|r| r.idx + 1)
+        .max()
+        .unwrap_or(0);
+    let version = (st.cfgs.len() - 1) as u8;
+    st.rows.push(Row {
+        stream: g,
+        idx,
+        rid: Rid {
+            node: RECORD_NODE,
+            seq: idx,
+        },
+        op: WriteOp::Create(0),
+        ret: Ret::Ok,
+        version,
+        kind: RowKind::Cut { dirs, at },
+        deps: [0; MAXS],
+        alone: false,
+        told: false,
+    });
 }
 
 /// Stream `g`'s holder journals the release of `dirs`.
