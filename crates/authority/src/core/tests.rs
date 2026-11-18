@@ -71153,6 +71153,71 @@ mod kept_fetch {
         assert!(got.contains(&(2, upper[0].first)), "{got:?}");
         assert_eq!(h.core.stats.tail_beyond_gap_dropped, 0);
     }
+
+    /// A re-adoption whose kept union's stored tail cannot be read has no
+    /// tails to re-ship: `None`, never the lease's own `through` as a stand-in
+    /// (which could re-ship a cut silently). Each read of the function is
+    /// failed in turn.
+    #[test]
+    fn a_kept_union_that_cannot_be_read_names_no_readoption_tails() {
+        let (h, sent, txs) = in_doubt_kept_claim(Some(rows_at_epoch_2(2)));
+        let want = h
+            .core
+            .kept_tails_readopted(Some(&sent), &h.meta)
+            .expect("readable");
+        assert_eq!(want.first(), Some(&(1, txs[2].last)), "{want:?}");
+        let mut failed = 0;
+        for after in 0..8 {
+            constellation_meta::fail_store_reads_after_on_this_thread_for_tests(after, 1);
+            let got = h.core.kept_tails_readopted(Some(&sent), &h.meta);
+            constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+            match got {
+                None => failed += 1,
+                Some(v) => assert_eq!(v, want, "after {after}"),
+            }
+        }
+        assert!(failed >= 4, "the faults hit the reads: {failed}");
+    }
+
+    /// The acquisition of a re-adoption whose kept union cannot be read ends
+    /// without adopting a gate: nothing is re-shipped from a stand-in hold.
+    /// A fault is injected at each read of the acquisition in turn; wherever
+    /// it lands in the union's reads (`kept_readopt_unreadable`), the claim
+    /// is not adopted, and the next attempt, with the store readable, re-ships
+    /// the union.
+    #[test]
+    fn a_readoption_that_cannot_read_its_kept_union_ends_the_acquisition() {
+        let mut hit = 0;
+        for after in 0..60 {
+            let (mut h, sent, txs) = in_doubt_kept_claim(None);
+            constellation_meta::fail_store_reads_after_on_this_thread_for_tests(after, 1);
+            let out = acquire(&mut h, &sent);
+            let out = win(&mut h, out, &sent);
+            constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+            drop(out);
+            if h.core.stats.kept_readopt_unreadable == 0 {
+                continue;
+            }
+            hit += 1;
+            assert!(
+                h.core.bk.gate_tails.is_empty(),
+                "after {after}: a gate was built"
+            );
+            assert!(
+                !reshipped(&h).contains(&(1, txs[2].first)),
+                "after {after}: re-shipped from a stand-in"
+            );
+            let out = acquire(&mut h, &sent);
+            let _ = win(&mut h, out, &sent);
+            let got = reshipped(&h);
+            assert!(got.contains(&(1, txs[0].first)), "after {after}: {got:?}");
+            assert!(got.contains(&(1, txs[2].first)), "after {after}: {got:?}");
+        }
+        assert!(
+            hit > 0,
+            "no injected fault landed in the kept union's reads"
+        );
+    }
 }
 
 /// ADR-51: the member side of a claimant's kept fetch: what an epoch

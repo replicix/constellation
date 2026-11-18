@@ -4333,11 +4333,16 @@ Amended by the kept-union adoption fix (2026-11-18). The merge skips every copy 
 the middle of the union left a gap in the stored tail, and the store's contiguous hold (`backup_acked`) stopped below the union's tip;
 correctness then rested on the in-memory `bk.fetched`. `kept_install` now stores each epoch's union contiguous to its tip: record-less
 filler spans (the shape of the holder's own sealed tail, which the re-ship skips) cover the seqs the log carries between copies, and
-the hold the store would count is checked in memory, for every epoch, before any `backup_append`, role or seal. A hold below the tip
-(or an unreadable store) is counted (`kept_install_gaps`, which fails a sim seed), logged at error, and ends the attempt in every build.
-The gate no longer depends on `bk.fetched` for a union this node's own lease names (`inherited_tail.kept`, an epoch below the lease's):
-`acquire_won` rebuilds the tails from the store (epochs `t.epoch` and `t.epoch + 1` with a record-bearing tail, `through =
-backup_acked`); an unreadable store falls back to the lease's own `through` for `t.epoch` and logs. Fail-before tests:
+the store's own append decides whether the hold reaches the tip (`Replica::backup_append_contiguous`, the m12tail transaction-level check: the
+merge runs inside the write transaction, so no kept-local copy of it can disagree with the store). It runs for each epoch before any role or
+seal, and on `Gap` nothing is written, the error is logged, `kept_install_gaps` counts it (a sim-failing seed) and the attempt ends in every
+build; an unreadable stored tail is counted apart (`kept_install_unreadable`). The gate no longer depends on `bk.fetched` for a union this
+node's own lease names (`inherited_tail.kept`, an epoch below the lease's): `acquire_won` rebuilds the tails from the store (epochs
+`t.epoch` and `t.epoch + 1` with a record-bearing tail, `through = backup_acked`). An unreadable store is no stand-in: the lease's own
+`through` is not used (it could re-ship a cut silently); the acquisition ends (`kept_readopt_unreadable`), before the CAS when the read
+fails there (`acquire_cas`), and after it, as a re-adoption that is not adopted, when it fails in between; the next attempt reads the
+lease again. Fault-injection tests: `a_kept_union_that_cannot_be_read_names_no_readoption_tails`,
+`a_readoption_that_cannot_read_its_kept_union_ends_the_acquisition`. Fail-before tests:
 `a_kept_union_over_a_seq_the_log_carries_is_held_to_its_tip`, `a_readopted_kept_claim_reships_the_rows_past_a_seq_the_log_carries`,
 `a_readopted_two_epoch_kept_union_reships_both_epochs`. Not changed: `core/seal_tail.rs` (its role answers are no longer cut once the
 tail is stored contiguous).

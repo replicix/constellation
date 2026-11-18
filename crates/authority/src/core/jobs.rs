@@ -3979,6 +3979,13 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
             return;
         }
+        // The kept union a re-adoption re-ships is read from the store at the
+        // win; an unreadable store ends the attempt here, before the CAS
+        // (`acquire_won` checks again for one that fails in between).
+        if self.kept_gate_tails(Some(prev), replica).is_none() {
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
         lease.inherited_tail =
             if prev.holder == self.cfg.node_id && !prev.released && self.bk.sealed < prev.epoch {
                 self.own_group_tail(prev, replica)
@@ -4105,6 +4112,29 @@ impl Core {
                 return;
             }
         }
+        // A re-adoption of this node's own kept union that cannot read the
+        // union's tails from the store ends here, as a re-adoption that is
+        // not adopted (the lease it wrote is read again at the next attempt):
+        // re-shipping from the lease's own hold instead could cut the union
+        // silently (`kept_tails_readopted`).
+        // (The predecessor is the one the gate below works from: the lease an
+        // earlier ambiguous takeover CAS replaced, when that one landed.)
+        let gate_prev: Option<Lease> = match (&plan, &self.lease.ambiguous_claim) {
+            (Plan::Claim { prev, .. }, Some((claimed, replaced)))
+                if prev.holder == self.cfg.node_id
+                    && prev.epoch == *claimed
+                    && sent.epoch == *claimed =>
+            {
+                Some(replaced.clone())
+            }
+            (Plan::Claim { prev, .. }, _) => Some(prev.clone()),
+            _ => None,
+        };
+        let Some(readopted) = self.kept_gate_tails(gate_prev.as_ref(), replica) else {
+            self.note_acquire_cas_in_doubt(&plan, &sent);
+            self.finish_acquire(now, false, replica, out);
+            return;
+        };
         let (prev, takeover, marker) = match plan {
             Plan::Claim {
                 prev,
@@ -4338,19 +4368,9 @@ impl Core {
         // (An inherited tail of an older epoch the union does not cover rides
         // along, in epoch order.)
         let kept_fetched = self.bk.fetched.iter().any(|f| f.kept_owner.is_some());
-        let kept_tails: Vec<(Epoch, u64)> = if kept_fetched {
-            self.bk
-                .fetched
-                .iter()
-                .map(|f| (f.epoch, f.through))
-                .collect()
-        } else {
-            // `bk.fetched` is gone (the claim's CAS applied though the
-            // acquisition ended, or a restart): the union this node's own
-            // lease names is read from the store, where it was installed
-            // contiguous to its tip.
-            self.kept_tails_readopted(prev.as_ref(), replica)
-        };
+        // (Read, and judged readable, before anything here changes state: the
+        // check at the top of this function.)
+        let kept_tails: Vec<(Epoch, u64)> = readopted;
         if !kept_fetched && !kept_tails.is_empty() {
             self.bk.gate_tails_from = kept_tails[0].0;
         }

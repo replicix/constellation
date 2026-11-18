@@ -70674,6 +70674,9 @@ against itself (`SWEEP-SIG`/`SEGMENTS` stored bytes, `far-root-writes` seed 110 
 A kept union over a seq the claimant's log carries was stored with a gap there, so the store's contiguous hold stopped below the union's
 tip and a gate that had lost `bk.fetched` (a claim CAS that applied but answered `Conflict`, a restart, an in-doubt CAS) cut at the gap
 and dropped committed rows as beyond it (`drop-held-chain-backed` seed 1822: an acknowledged write would have been lost). Fix (A):
-`kept_install` fills the log-carried seqs with record-less spans and checks every epoch's hold in memory before any write
-(`kept_install_gaps`, sim-failing). Fix (B): `acquire_won` rebuilds the kept tails of a re-adopted own lease from the store. Three
-fail-before tests in `mod kept_fetch`. See ADR-51's amendment.
+`kept_install` fills the log-carried seqs with record-less spans and writes each epoch through the store's own
+`backup_append_contiguous` (round 2: the in-memory `hold_after_append` copy of the merge is gone, as m12tail S1 showed such a copy
+causes false gaps), ending the attempt on `Gap` before any role or seal (`kept_install_gaps`, sim-failing). Fix (B): `acquire_won`
+rebuilds the kept tails of a re-adopted own lease from the store; an unreadable store now ends the acquisition (before the CAS, else as
+a re-adoption not adopted; `kept_readopt_unreadable`) instead of falling back to the lease's `through`, with fault-injection tests.
+Three fail-before tests in `mod kept_fetch`. See ADR-51's amendment.
