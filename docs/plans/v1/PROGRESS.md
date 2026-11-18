@@ -70394,3 +70394,14 @@ durability-and-failover.md ("A tail answer is not contiguous"). `tail_own_gated_
 Tests: `a_self_claim_with_an_unreadable_member_copy_ends`, `a_self_claim_with_a_copy_that_fails_its_read_ends`,
 `a_self_claim_with_no_member_copy_goes_on`, `a_self_claim_over_a_copy_with_a_gap_ends`,
 `a_gap_ended_claim_leaves_no_role_to_answer_from`, `a_fetched_tail_with_a_gap_is_counted`.
+m12tail round 3 (review M1, S1-S4): `status.ack.tail_answer_gaps` now exists (`AckStatus`, `service.rs`, schema re-blessed), so
+the recovery doc's field is real. S1: the in-memory model `acked_after_append` is gone; `Meta::backup_append_contiguous`
+runs the append's own merge (holes and late copies) in the write transaction and commits only when the contiguous hold
+reaches the batch's tip, else it writes nothing and reports `TailAppend::Gap { acked }`; both adoption sites
+(`tail_fetch_complete`, the self-sealed `prepare_tail_for_claim`) go through `Core::adopt_tail`, so the decision cannot
+drift from the store. A store error there ends the claim and is not counted as a gap. S2: the doc now says a listed backup
+with its own contiguous tail succeeds and the stall is real only where the gapped copy is the sole source. Tests:
+`a_late_copy_inside_a_held_hole_is_no_gap` (fails on 49f629ad), `a_fetched_tail_is_merged_with_the_rows_already_held`,
+`an_abandon_after_a_fetched_gap_lets_the_next_attempt_claim`, `a_self_claim_whose_tail_cannot_be_written_ends`,
+`a_member_copy_read_error_answers_nothing_to_a_claimant`. Not done: the mutation fail-before of
+`a_self_claim_with_a_copy_that_fails_its_read_ends` (review S5), the kept-fetch adoption (S6, another agent), a scoped abandon.

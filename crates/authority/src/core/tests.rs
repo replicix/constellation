@@ -87233,14 +87233,13 @@ mod step8_handover_root {
 
 /// The tripwire where a tail answer's gap forms (`tail_answer_gaps`): a
 /// self-sealed claim's member copy, and a fetched tail, whose contiguous hold
-/// is below their tip. Both count it and end the claim, before any write, in
+/// is below their tip. Both count it and end the claim, writing nothing, in
 /// every build.
 mod tail_answer_gaps {
     use super::seal_tail::{Chosen, TailFetch};
     use super::*;
     use constellation_meta::{BackupTx, MemberTx, RowCommit};
     use std::collections::BTreeMap;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn row(h: &Harness, first: u64, last: u64) -> MemberTx {
         MemberTx {
@@ -87384,46 +87383,241 @@ mod tail_answer_gaps {
         assert_eq!(h.core.stats.tail_answer_gaps, 0);
     }
 
+    fn hole(first: u64, last: u64) -> BackupTx {
+        BackupTx {
+            first,
+            last,
+            records: Vec::new(),
+            origin: (0, 0),
+        }
+    }
+
+    /// A node of epoch 1 (lease held, as the other tests here) that has
+    /// opened its wait for the group and is about to complete a fetch of
+    /// `txs`: the fetch's completion, with the stats it left.
+    fn fetch_setup(h: &mut Harness, txs: Vec<BackupTx>) -> (Lease, Chosen) {
+        let prev = h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap();
+        let clk = h.clk();
+        h.core.open_group_wait(clk, &prev, vec![3]);
+        h.core.bk.tf = Some(TailFetch {
+            prev: prev.clone(),
+            tag: tag(),
+            asked: BTreeMap::new(),
+            chosen: None,
+            timer: None,
+            unproven: false,
+        });
+        let ch = Chosen {
+            node: 3,
+            epoch: prev.epoch,
+            config_version: 1,
+            req: OpId(0),
+            through: txs.iter().map(|t| t.last).max().unwrap(),
+            txs,
+        };
+        (prev, ch)
+    }
+
+    fn complete(h: &mut Harness, ch: Chosen) {
+        let mut out = Vec::new();
+        let clk = h.clk();
+        h.core
+            .tail_fetch_complete(clk, ch, false, &h.meta, &mut out);
+    }
+
     /// A2: a fetched tail (another member's answer) with a gap is counted
-    /// when the fetch completes, and ends the attempt; a contiguous one counts
-    /// nothing.
+    /// when the fetch completes, and ends the attempt before anything is
+    /// written; a contiguous one counts nothing and is taken.
     #[test]
-    fn a_fetched_tail_with_a_gap_is_counted() {
+    fn a_fetched_tail_with_a_gap_ends_the_attempt() {
         for (spans, gaps) in [(vec![(1, 1), (3, 3)], 1), (vec![(1, 1), (2, 3)], 0)] {
             let mut h = Harness::new(2);
             h.hold(1, None);
-            let prev = h.core.lease.held.as_ref().map(|(l, _)| l.clone()).unwrap();
             let txs: Vec<BackupTx> = spans.iter().map(|&(f, l)| row(&h, f, l).tx).collect();
-            h.core.bk.tf = Some(TailFetch {
-                prev: prev.clone(),
-                tag: tag(),
-                asked: BTreeMap::new(),
-                chosen: None,
-                timer: None,
-                unproven: false,
-            });
-            let ch = Chosen {
-                node: 3,
-                epoch: prev.epoch,
-                config_version: 1,
-                req: OpId(0),
-                through: txs.iter().map(|t| t.last).max().unwrap(),
-                txs,
-            };
-            let mut out = Vec::new();
-            let clk = h.clk();
-            let run = catch_unwind(AssertUnwindSafe(|| {
-                h.core
-                    .tail_fetch_complete(clk, ch, false, &h.meta, &mut out)
-            }));
+            let (_, ch) = fetch_setup(&mut h, txs);
+            complete(&mut h, ch);
             assert_eq!(h.core.stats.tail_answer_gaps, gaps);
-            // M2 (m12tail review): a gapped answer ends the attempt in every
-            // build, before anything is written; a contiguous one is taken.
-            assert!(run.is_ok());
             assert_eq!(h.core.bk.fetched.is_empty(), gaps == 1);
             assert_eq!(h.core.bk.role.is_none(), gaps == 1);
             assert_eq!(h.meta.backup_role().unwrap().is_none(), gaps == 1);
             assert_eq!(h.meta.backup_tail(1).unwrap().is_empty(), gaps == 1);
         }
+    }
+
+    /// S1 (m12tail round 3): the store's own merge decides, so a held hole
+    /// that spans a late copy is no gap. The claimant holds the hole 1..=10
+    /// and the row 11..=12; the answer has the copy 7..=10 (a late copy of
+    /// rows the hole spans, dropped by the store), 11..=12 and 13..=14. The
+    /// hold is 14. Fails on the in-memory model (it kept 7..=10 beside the
+    /// hole, broke the walk at 7 and ended every attempt).
+    #[test]
+    fn a_late_copy_inside_a_held_hole_is_no_gap() {
+        let mut h = Harness::new(2);
+        h.hold(1, None);
+        h.meta
+            .backup_append(1, &[hole(1, 10), row(&h, 11, 12).tx])
+            .unwrap();
+        let txs = vec![row(&h, 7, 10).tx, row(&h, 11, 12).tx, row(&h, 13, 14).tx];
+        let (_, ch) = fetch_setup(&mut h, txs);
+        complete(&mut h, ch);
+        assert_eq!(h.core.stats.tail_answer_gaps, 0);
+        assert_eq!(h.core.bk.fetched.len(), 1, "the claim went on");
+        assert!(h.core.bk.role.is_some());
+        assert_eq!(h.meta.backup_acked(1).unwrap(), 14);
+    }
+
+    /// S4 (m12tail round 3): the merge with rows already held. Rows held
+    /// below the answer's gap are filled by it (the claim goes on); a gap
+    /// that the held rows do not fill ends it and leaves the held tail as it
+    /// was.
+    #[test]
+    fn a_fetched_tail_is_merged_with_the_rows_already_held() {
+        // The held row 2 fills the answer's gap: 1, 2 (held), 3.
+        let mut h = Harness::new(2);
+        h.hold(1, None);
+        h.meta.backup_append(1, &[row(&h, 2, 2).tx]).unwrap();
+        let txs = vec![row(&h, 1, 1).tx, row(&h, 3, 3).tx];
+        let (_, ch) = fetch_setup(&mut h, txs);
+        complete(&mut h, ch);
+        assert_eq!(h.core.stats.tail_answer_gaps, 0);
+        assert_eq!(h.core.bk.fetched.len(), 1);
+        assert_eq!(h.meta.backup_acked(1).unwrap(), 3);
+        // The held row 1 sits below the gap: 1 (held), 3.
+        let mut h = Harness::new(2);
+        h.hold(1, None);
+        h.meta.backup_append(1, &[row(&h, 1, 1).tx]).unwrap();
+        let txs = vec![row(&h, 3, 3).tx];
+        let (_, ch) = fetch_setup(&mut h, txs);
+        complete(&mut h, ch);
+        assert_eq!(h.core.stats.tail_answer_gaps, 1);
+        assert!(h.core.bk.fetched.is_empty());
+        assert!(h.core.bk.role.is_none());
+        let tail = h.meta.backup_tail(1).unwrap();
+        assert_eq!(
+            tail.iter().map(|t| (t.first, t.last)).collect::<Vec<_>>(),
+            vec![(1, 1)],
+            "the gap wrote nothing"
+        );
+    }
+
+    /// S3 (m12tail round 3): the documented remedy of a fetched gap. The
+    /// attempt ended, the wait for the group is still open, so `repair
+    /// abandon --epoch E` is accepted and the next attempt claims without
+    /// the tail (no fetch is opened). Fails when the gap end drops the wait.
+    #[test]
+    fn an_abandon_after_a_fetched_gap_lets_the_next_attempt_claim() {
+        let mut h = Harness::new(2);
+        h.hold(1, None);
+        let txs = vec![row(&h, 1, 1).tx, row(&h, 3, 3).tx];
+        let (prev, ch) = fetch_setup(&mut h, txs);
+        complete(&mut h, ch);
+        assert_eq!(h.core.stats.tail_answer_gaps, 1);
+        assert!(h.core.bk.tf.is_none());
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::Abandon {
+                target: crate::AbandonTarget::Epoch(prev.epoch),
+                force: false,
+            },
+        });
+        let answer = out.iter().find_map(|a| match a {
+            Action::ControlDone {
+                op: OpId(77),
+                result,
+            } => Some(result.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(answer, Some(Ok(_))),
+            "the abandon was refused: {answer:?}"
+        );
+        assert_eq!(h.core.bk.abandon, Some(prev.epoch));
+        // The next attempt: it claims without the tail and opens no fetch.
+        let attempts = h.core.stats.tail_fetch_attempts;
+        let mut out = Vec::new();
+        let clk = h.clk();
+        h.core.begin_tail_fetch(
+            clk,
+            prev.clone(),
+            tag(),
+            vec![(3, prev.epoch, 1)],
+            &h.meta,
+            &mut out,
+        );
+        assert_eq!(h.core.stats.groups_abandoned, 1);
+        assert_eq!(h.core.stats.tail_fetch_attempts, attempts);
+        assert!(h.core.bk.tf.is_none());
+        assert!(h.core.bk.fetched.is_empty());
+    }
+
+    /// S4 (m12tail round 3): the claimed tail cannot be written (the store
+    /// fails in the append's transaction): the claim ends, counts no gap,
+    /// leaves no role and no tail; the retry goes on.
+    #[test]
+    fn a_self_claim_whose_tail_cannot_be_written_ends() {
+        let (mut h, prev) = self_sealed(&[(1, 1), (2, 2)]);
+        // The member copy is held and read; the append's read then fails.
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(2, 1);
+        let went_on = h.core.prepare_tail_for_claim(&prev, &h.meta);
+        constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+        assert!(!went_on);
+        assert_eq!(h.core.stats.tail_answer_gaps, 0, "a store error is no gap");
+        assert!(h.core.bk.fetched.is_empty());
+        assert!(h.core.bk.role.is_none());
+        assert!(h.meta.backup_role().unwrap().is_none());
+        assert!(h.meta.backup_tail(1).unwrap().is_empty());
+        assert!(h.core.prepare_tail_for_claim(&prev, &h.meta));
+        assert_eq!(h.core.bk.fetched.len(), 1);
+    }
+
+    /// S4 (m12tail round 3): a claimant's `SealTail` for an epoch this node
+    /// holds a member copy of, while a store read fails: no answer at all
+    /// (`seal_tail_unreadable`), never a refusal, which a claimant counts as
+    /// "holds nothing". Fails when a read error of case 3 is mapped to `?`
+    /// (a refusal) or to "none held".
+    #[test]
+    fn a_member_copy_read_error_answers_nothing_to_a_claimant() {
+        let mut unreadable_runs = 0;
+        for after in 0..6 {
+            let (mut h, prev) = self_sealed(&[(1, 1), (2, 2)]);
+            h.core.lease.held = None;
+            h.core.lease.lost = true;
+            let mut other = prev.clone();
+            other.holder = 3;
+            constellation_meta::fail_store_reads_after_on_this_thread_for_tests(after, 1);
+            let out = h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::SealTail {
+                    req: OpId(90),
+                    epoch: 1,
+                    config_version: 1,
+                    from: 0,
+                    key: other.renewal_key(),
+                    kept: false,
+                    tenure: (0, 0),
+                    closed_hold: false,
+                },
+            });
+            constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
+            let replies: Vec<bool> = out
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Send {
+                        msg: PeerMsg::SealedTail { held, .. },
+                        ..
+                    } => Some(*held),
+                    _ => None,
+                })
+                .collect();
+            if h.core.stats.seal_tail_unreadable == 1 {
+                unreadable_runs += 1;
+                assert!(replies.is_empty(), "after {after}: answered {replies:?}");
+                assert!(!h.core.bk.seal_unreadable, "the flag is taken");
+                assert_eq!(h.core.stats.seal_tail_refused, 0, "after {after}");
+            } else {
+                assert_eq!(replies, vec![true], "after {after}");
+            }
+        }
+        assert!(unreadable_runs >= 1, "no read of the answer was faulted");
     }
 }

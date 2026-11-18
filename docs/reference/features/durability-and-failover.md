@@ -1688,16 +1688,22 @@ The error log says "a tail answer is not contiguous" and
 The copy a claim would take as the tail of an epoch (its own member copy, or
 the answer it fetched) holds contiguously only up to a point below its tip. A
 marker built from it would drop the rows past the gap as never committed,
-answered ones included, so the claim ends before anything is written: no role
-and no tail are persisted, the copy keeps all the rows, and any later claimant
-is answered from the copy, gap and tip, and ends the same way. This is a bug
-to report (with the log and the status); integrity is chosen over
-availability, so while it lasts the volume can have no holder.
+answered ones included, so the claim ends before this node's backup state is
+written: no role and no tail are persisted here and the copy keeps all the
+rows (a fetching claim has already sealed the members it asked). A later
+claimant that takes the gapped copy as its source ends the same way; one with
+another source does not: a listed backup answers with its own contiguous hold
+and claims with it, which loses nothing under write-all (the rows past its hold
+were never answered). The stall is real only where the gapped copy is the sole
+source: a lone node, or other nodes that held no role of the epoch. This is a
+bug to report (with the log and the status); integrity is chosen over
+availability, so while it lasts such a volume can have no holder.
 
 What works:
 
 - A claim that fetched the gapped answer (the log line is on that node, and
-  `status.lease.waiting_for_group` names the epoch): `constellation repair
+  `status.lease.waiting_for_group` names the epoch, while an op waits and for
+  a while after the last attempt): `constellation repair
   abandon myfs --epoch E` on that node lets its next attempt claim without the
   tail. The rows of that epoch's group are then lost or replayed as for any
   abandon (see above): rows only the gapped copy held are gone.

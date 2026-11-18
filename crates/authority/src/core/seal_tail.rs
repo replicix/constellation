@@ -49,7 +49,7 @@ use crate::action::Action;
 use crate::event::{PeerMsg, SealRefusal};
 use crate::ids::{Epoch, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
-use constellation_meta::{BackupRole, BackupTx};
+use constellation_meta::{BackupRole, BackupTx, TailAppend};
 use replicix_objcas::{AckPolicy, InheritedTail, Lease, LeaseTag, RenewalKey};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1016,23 +1016,13 @@ impl Core {
         }
         self.bk.tf_round = None;
         let prev = tf.prev;
-        // The gap is decided in memory, before any write: a role and a tail
-        // left behind would answer a later claimant truncated at the gap.
-        // The attempt ends in every build (integrity over availability);
-        // the holder's copy still has the rows.
-        let Some(held) = Self::acked_after_append(replica, ch.epoch, &ch.txs) else {
-            tracing::error!(
-                node = self.cfg.node_id,
-                "the held tail could not be read: the claim ends"
-            );
-            self.end_acquire_attempt(now, replica, out);
-            return;
-        };
-        if !self.check_tail_answer_contiguous("fetched", ch.epoch, held, &ch.txs) {
-            self.end_acquire_attempt(now, replica, out);
-            return;
-        }
-        if !replica.backup_append(ch.epoch, &ch.txs) {
+        // The tail is written only if it holds contiguously to its tip, which
+        // the store decides in the append's own transaction (its merge of
+        // holes and late copies included): a gap writes nothing, as a role
+        // and a tail left behind would answer a later claimant truncated at
+        // the gap. The attempt ends in every build (integrity over
+        // availability); the holder's copy still has the rows.
+        if !self.adopt_tail("fetched", ch.epoch, &ch.txs, replica) {
             self.end_acquire_attempt(now, replica, out);
             return;
         }
@@ -1369,23 +1359,14 @@ impl Core {
                 // A gap in the copy ends the claim (integrity over
                 // availability, as `reship_failed` and `TailDiverged` do):
                 // the marker's `through` would stop below the rows past the
-                // gap and drop them, answered ones included. Decided in
-                // memory, before any write: a role or tail left behind would
-                // answer a later claimant's `SealTail` truncated at the gap.
-                // The copy keeps the rows; a claimant is answered from it
-                // (the gap and the tip) and ends the same way.
-                let Some(held) = Self::acked_after_append(replica, prev.epoch, &txs) else {
-                    tracing::error!(
-                        node = me,
-                        epoch = prev.epoch,
-                        "the held tail could not be read: the claim ends"
-                    );
-                    return false;
-                };
-                if !self.check_tail_answer_contiguous("member copy", prev.epoch, held, &txs) {
-                    return false;
-                }
-                if !replica.backup_append(prev.epoch, &txs) {
+                // gap and drop them, answered ones included. The store
+                // decides it in the append's own transaction and writes
+                // nothing on a gap: a role or tail left behind would answer
+                // a later claimant's `SealTail` truncated at the gap. The
+                // copy keeps the rows; a claimant that takes it as its
+                // source is answered from it (the gap and the tip) and ends
+                // the same way.
+                if !self.adopt_tail("member copy", prev.epoch, &txs, replica) {
                     return false;
                 }
                 let role = BackupRole {
@@ -1434,36 +1415,6 @@ impl Core {
         true
     }
 
-    /// The contiguous hold `backup_append(epoch, txs)` would leave, computed
-    /// in memory from what the backup tail of `epoch` holds now and `txs`
-    /// (a span supersedes the entries it covers, as the append does), so a
-    /// gap is decided before anything is written. `None`: the tail could
-    /// not be read.
-    fn acked_after_append(replica: &dyn Replica, epoch: Epoch, txs: &[BackupTx]) -> Option<u64> {
-        let mut held: std::collections::BTreeMap<u64, u64> = replica
-            .backup_tail(epoch)?
-            .iter()
-            .map(|t| (t.first, t.last))
-            .collect();
-        for t in txs {
-            let covered: Vec<u64> = held.range(t.first..=t.last).map(|(&f, _)| f).collect();
-            for f in covered {
-                held.remove(&f);
-            }
-            held.insert(t.first, t.last);
-        }
-        let mut acked = 0;
-        let mut prev: Option<u64> = None;
-        for (&first, &last) in &held {
-            if prev.is_some_and(|p| first != p + 1) {
-                break;
-            }
-            acked = last;
-            prev = Some(last);
-        }
-        Some(acked)
-    }
-
     /// Tripwire where a gap in a tail answer forms: the copy a claim takes
     /// as the tail (its own member copy, or the answer it fetched) must hold
     /// contiguously up to its tip, or the gate's `through`
@@ -1474,31 +1425,45 @@ impl Core {
     /// for a covered row below a live one, a successor's copy of a tail
     /// keeps the tail's holes as fillers, and a tail kept as a member copy
     /// keeps the spans it shipped): a violation is a bug, counted
-    /// in `tail_answer_gaps` (the sim fails a seed that has one). Returns
-    /// whether the answer is contiguous; the caller that can still end its
-    /// claim does so on `false`, in every build.
-    fn check_tail_answer_contiguous(
+    /// in `tail_answer_gaps` (the sim fails a seed that has one).
+    ///
+    /// Writes the tail through `Replica::backup_append_contiguous`: the store
+    /// commits only when the hold reaches the tip, so a gap leaves nothing
+    /// behind. Returns whether the tail was written; the caller ends its
+    /// claim on `false`, in every build.
+    fn adopt_tail(
         &mut self,
         source: &'static str,
         epoch: Epoch,
-        acked: u64,
         txs: &[BackupTx],
+        replica: &dyn Replica,
     ) -> bool {
-        let tip = txs.iter().map(|t| t.last).max().unwrap_or(0);
-        if acked >= tip {
-            return true;
+        match replica.backup_append_contiguous(epoch, txs) {
+            Some(TailAppend::Held) => true,
+            Some(TailAppend::Gap { acked }) => {
+                let tip = txs.iter().map(|t| t.last).max().unwrap_or(0);
+                self.stats.tail_answer_gaps += 1;
+                tracing::error!(
+                    node = self.cfg.node_id,
+                    epoch,
+                    source,
+                    acked,
+                    tip,
+                    "a tail answer is not contiguous: the claim ends, as the rows past its gap would be dropped as never committed \
+                     (operator remedy: see \"A tail answer is not contiguous\" in the durability and failover reference)"
+                );
+                false
+            }
+            None => {
+                tracing::error!(
+                    node = self.cfg.node_id,
+                    epoch,
+                    source,
+                    "the claimed tail could not be written: the claim ends"
+                );
+                false
+            }
         }
-        self.stats.tail_answer_gaps += 1;
-        tracing::error!(
-            node = self.cfg.node_id,
-            epoch,
-            source,
-            acked,
-            tip,
-            "a tail answer is not contiguous: the claim ends, as the rows past its gap would be dropped as never committed \
-             (operator remedy: docs/reference/features/durability-and-failover.md, \"A tail answer is not contiguous\")"
-        );
-        false
     }
 
     /// The wait of a claim for `prev`'s group (`status.lease.waiting_for_group`)

@@ -767,6 +767,15 @@ pub trait Replica {
     /// Backup side: persist the holder's transactions (`true` when
     /// committed — the acknowledgement's meaning).
     fn backup_append(&self, epoch: Epoch, txs: &[BackupTx]) -> bool;
+    /// [`Replica::backup_append`] for a tail a claim adopts, committed only
+    /// when the epoch's contiguous hold then reaches the tip of `txs` (the
+    /// store's own merge decides, in one transaction); `Gap` leaves nothing
+    /// written. `None`: the store failed (nothing written).
+    fn backup_append_contiguous(
+        &self,
+        epoch: Epoch,
+        txs: &[BackupTx],
+    ) -> Option<constellation_meta::TailAppend>;
     /// The highest journal seq held contiguously for `epoch`; `None`: the
     /// store could not be read (not "nothing held": no answer is built on
     /// it).
@@ -2086,6 +2095,18 @@ impl Replica for Meta {
                 false
             }
         }
+    }
+
+    fn backup_append_contiguous(
+        &self,
+        epoch: Epoch,
+        txs: &[BackupTx],
+    ) -> Option<constellation_meta::TailAppend> {
+        Meta::backup_append_contiguous(self, epoch, txs)
+            .inspect_err(|error| {
+                tracing::warn!(%error, epoch, "persisting an adopted tail failed; the claim ends");
+            })
+            .ok()
     }
 
     fn backup_acked(&self, epoch: Epoch) -> Option<u64> {

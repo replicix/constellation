@@ -47,7 +47,7 @@ pub use store::backup::{
     fail_deleg_backup_reads_on_this_thread_for_tests,
     fail_store_reads_after_on_this_thread_for_tests,
 };
-pub use store::backup::{BackupRole, BackupTx};
+pub use store::backup::{BackupRole, BackupTx, TailAppend};
 #[cfg(any(test, feature = "test-util"))]
 pub use store::held::{
     fail_drop_applies_on_this_thread_for_tests, fail_drop_plan_reads_on_this_thread_for_tests,

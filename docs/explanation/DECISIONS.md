@@ -1778,13 +1778,13 @@ it, and the gate dropped the rows past the gap, answered ones included
 (`metered-shared` seed 218, where none had been answered). A tail answer that
 is not contiguous is a bug, and the sim fails a seed that gives one
 (`tail_answer_gaps`); a self-sealed claim whose own copy has a gap, and a claim
-that fetched a gapped answer, end in every build, decided in memory before any
-write so that no role or tail is left to answer a later claimant truncated at the
+that fetched a gapped answer, end in every build, decided by the store in the append's own transaction
+(which commits only when the hold reaches the tip) so that no role or tail is left to answer a later claimant truncated at the
 gap (integrity over availability, as `reship_failed` does). The trade-off is a
 possibly permanent stall: the copy keeps the gap, every claimant ends, and a
 self-sealed holder has no `repair abandon` for it (the operator remedy is in
-durability-and-failover.md, "A tail answer is not contiguous"). A copy that cannot be read is not "no copy":
-the claim ends too (`member_copy_held`), and a `SealTail` answer from the copy
+durability-and-failover.md, "A tail answer is not contiguous"). A copy that cannot be read is not
+"no copy": the claim ends too (`member_copy_held`), and a `SealTail` answer from the copy
 is no answer (`seal_unreadable`). Member copies keep the tail's holes: a successor's copy
 of a sealed tail it re-ships holds a record-less row for every transaction of
 the sealed prefix below its top moved row that it does not keep with records

@@ -50,6 +50,17 @@ const KV_BACKUP_SEALED: &str = "backup_sealed";
 /// kept fetch, as `holder:epoch` pairs joined by commas.
 const KV_SEALED_TENURES: &str = "sealed_tenures";
 
+/// The outcome of [`Meta::backup_append_contiguous`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum TailAppend {
+    /// Committed: the epoch's hold reaches the tip of the batch.
+    Held,
+    /// Not committed, nothing written: the append would leave the hold
+    /// (contiguous from the epoch's oldest span) at `acked`, below the tip.
+    Gap { acked: u64 },
+}
+
 /// One holder journal transaction as streamed to a backup: its rows
 /// `first..=last` and their records, in order. Whole transactions only
 /// (plan 30 §M3b: an op's records and its `Completed` never split), so a
@@ -255,8 +266,34 @@ impl Meta {
     /// before returning: the acknowledgement the caller sends means
     /// exactly this.
     pub fn backup_append(&self, epoch: u64, txs: &[BackupTx]) -> Result<(), MetaError> {
+        self.backup_append_inner(epoch, txs, false).map(|_| ())
+    }
+
+    /// [`Meta::backup_append`] for a tail a claim adopts: the append's own
+    /// merge (holes, late copies and all) is run in the write transaction,
+    /// and the transaction commits only when the epoch's hold, contiguous
+    /// from its oldest span, reaches the tip of `txs`. Else nothing is
+    /// written and the hold the merge would have left is reported.
+    pub fn backup_append_contiguous(
+        &self,
+        epoch: u64,
+        txs: &[BackupTx],
+    ) -> Result<TailAppend, MetaError> {
+        self.backup_append_inner(epoch, txs, true)
+    }
+
+    fn backup_append_inner(
+        &self,
+        epoch: u64,
+        txs: &[BackupTx],
+        contiguous: bool,
+    ) -> Result<TailAppend, MetaError> {
         if txs.is_empty() {
-            return Ok(());
+            return Ok(TailAppend::Held);
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        if contiguous {
+            read_fault::check()?;
         }
         // Every live key of the tail is at or above the floor (`backup_trim`
         // keeps it; a resend lowers it below, after the commit), so the
@@ -439,6 +476,28 @@ impl Meta {
         // holder deposed before the record ships leaves its tail's rows
         // standing; the log's segment that carries the record holes them,
         // `hole_tail_rolled_back_tx` from the segment apply.)
+        if contiguous {
+            // The hold the merge left, walked as `backup_acked` does, in the
+            // same transaction: a gap drops it (nothing was written).
+            let tip = txs.iter().map(|t| t.last).max().unwrap_or(0);
+            let mut acked = 0;
+            let mut prev: Option<u64> = None;
+            for guard in tx.range(
+                &self.backup_tail,
+                tail_key(epoch, 0)..=tail_key(epoch, u64::MAX),
+            ) {
+                let (_, v) = guard.into_inner()?;
+                let o: BackupTx = crate::record::from_bytes_exact(&v)?;
+                if prev.is_some_and(|p| o.first != p + 1) {
+                    break;
+                }
+                acked = o.last;
+                prev = Some(o.last);
+            }
+            if acked < tip {
+                return Ok(TailAppend::Gap { acked });
+            }
+        }
         tx.commit()?;
         // A resend can land below the floor (from the contiguous
         // acknowledgement, under a batch held ahead of a gap).
@@ -447,7 +506,7 @@ impl Meta {
             *floor = Some(f.min((epoch, lowest)));
         }
         *self.backup_tail_top.lock().unwrap() = top;
-        Ok(())
+        Ok(TailAppend::Held)
     }
 
     /// The highest `last` held for `epoch` (0: nothing).
