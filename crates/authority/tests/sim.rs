@@ -320,6 +320,8 @@ fn replay_seed() {
         Ok("sticky-holder-dies") => sticky_holder_dies_config(),
         Ok("sticky-holder-returns") => sticky_holder_returns_config(),
         Ok("sticky-holder-restarts") => sticky_holder_restarts_config(),
+        Ok("sticky-s4-idle") => sticky_s4_idle_config(),
+        Ok("sticky-s4-leave") => sticky_s4_leave_config(),
         Ok("sticky-holder-restarts-placed") => sticky_holder_restarts_placed_config(),
         Ok("sticky-holder-fresh") => sticky_holder_fresh_config(),
         Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
@@ -2477,6 +2479,55 @@ fn sticky_holder_restarts_config() -> SimConfig {
             },
         ],
         ..delegated_config()
+    }
+}
+
+/// Plan 46 M1.3 step 15a, S4 (review MUST-2): the hazard itself. Node 2
+/// holds a sticky `d2`, node 3 reads it under read delegations from the
+/// holder, and the holder is cut from the reader for longer than `read_span`
+/// from 1.8 s. The holder's idle release (1.2 s idle, `idle_gaps`) then waits
+/// on a recall the reader cannot answer, until its grants lapse, while nodes
+/// 1 and 2 write in `d2`. No crash: `sticky-holder-restarts` without it.
+fn sticky_s4_idle_config() -> SimConfig {
+    SimConfig {
+        sticky_idle_ms: Some(1_200),
+        idle_gaps: true,
+        faults: vec![ScheduledFault {
+            at_ms: 1_800,
+            kind: FaultKind::Partition {
+                a: 2,
+                b: 3,
+                for_ms: 9_000,
+            },
+        }],
+        ..sticky_holder_restarts_config()
+    }
+}
+
+/// `sticky-s4-idle` with the holder's leave in place of the idle release:
+/// node 2 runs `ReleaseGrants` at 2.5 s, as `sticky-leave`, with its reader
+/// cut off from it from 2 s.
+fn sticky_s4_leave_config() -> SimConfig {
+    SimConfig {
+        faults: vec![
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::Partition {
+                    a: 2,
+                    b: 3,
+                    for_ms: 9_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_500,
+                kind: FaultKind::LeaveNode {
+                    node: 2,
+                    admin: false,
+                    within_ms: 30_000,
+                },
+            },
+        ],
+        ..sticky_holder_restarts_config()
     }
 }
 
@@ -7769,6 +7820,8 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-holder-dies" => sticky_holder_dies_config(),
         "sticky-holder-returns" => sticky_holder_returns_config(),
         "sticky-holder-restarts" => sticky_holder_restarts_config(),
+        "sticky-s4-idle" => sticky_s4_idle_config(),
+        "sticky-s4-leave" => sticky_s4_leave_config(),
         "sticky-holder-restarts-placed" => sticky_holder_restarts_placed_config(),
         "sticky-holder-fresh" => sticky_holder_fresh_config(),
         "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
@@ -10225,6 +10278,7 @@ struct OracleTotals {
     /// stream's release waited on read recalls (all, violations among them,
     /// seeds with one), and the I4 violations by cause (`SWEEP-I4-CAUSES`).
     s4: (u64, u64, u64),
+    s4_excused: (u64, u64),
     s4_spans: (u64, u64),
     violation_causes: std::collections::BTreeMap<String, u64>,
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
@@ -10457,6 +10511,8 @@ impl OracleTotals {
         self.s4.0 += r.unsettled_s4 as u64;
         self.s4.1 += r.unsettled_s4_violations as u64;
         self.s4.2 += u64::from(r.unsettled_s4 > 0);
+        self.s4_excused.0 += r.unsettled_s4_excused as u64;
+        self.s4_excused.1 += u64::from(r.unsettled_s4_excused > 0);
         self.s4_spans.0 += r.held_release_spans as u64;
         self.s4_spans.1 += u64::from(r.held_release_spans > 0);
         for (k, n) in &r.unsettled_violation_causes {
@@ -10655,6 +10711,23 @@ impl OracleTotals {
         }
     }
 
+    /// The `SWEEP-S4` line: the tag over the classified unsettled EIOs and,
+    /// apart, over the excused ones (a sticky stream's are `designation_held`).
+    fn s4_line(&self, label: &str, seeds: u64) -> String {
+        format!(
+            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds",
+            self.seeds,
+            self.s4.0,
+            self.s4.1,
+            self.s4.0.saturating_sub(self.s4.1),
+            self.s4.2,
+            self.s4_excused.0,
+            self.s4_excused.1,
+            self.s4_spans.0,
+            self.s4_spans.1
+        )
+    }
+
     fn print(&self, label: &str, seeds: u64) {
         let i1: usize = self.uncommitted.values().sum();
         let unjournaled: usize = self.unjournaled.values().sum();
@@ -10715,16 +10788,7 @@ impl OracleTotals {
             "SWEEP-HELD-LOST-CHUNK {label} seeds {}/{seeds}: held-behind-lost-chunk unsettled EIOs (allowed: the row waits behind a chunk that exists nowhere; checked against the chunk ledger) {} (in {} seeds)",
             self.seeds, self.held_lost_chunk.0, self.held_lost_chunk.1
         );
-        eprintln!(
-            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; held-release spans seen {} in {} seeds",
-            self.seeds,
-            self.s4.0,
-            self.s4.1,
-            self.s4.0 - self.s4.1,
-            self.s4.2,
-            self.s4_spans.0,
-            self.s4_spans.1
-        );
+        eprintln!("{}", self.s4_line(label, seeds));
         eprintln!(
             "SWEEP-I4-CAUSES {label} seeds {}/{seeds}: violations by cause {:?}",
             self.seeds, self.violation_causes

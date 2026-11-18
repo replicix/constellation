@@ -1817,6 +1817,10 @@ pub struct Report {
     /// violations among them.
     pub unsettled_s4: usize,
     pub unsettled_s4_violations: usize,
+    /// The tagged ones among the excused (`designation_held`,
+    /// `isolated_from_s3`, held behind a lost chunk), which `unsettled_s4`
+    /// does not count.
+    pub unsettled_s4_excused: usize,
     /// The held-release spans the run saw (`HeldReleases::spans`).
     pub held_release_spans: usize,
     /// The I4 violations by `Unsettled::cause`.
@@ -5504,6 +5508,21 @@ fn record_applied_drops(
     }
 }
 
+/// The `, N of them release waited on read recalls` tail of a strict
+/// failure, for the unsettled-I4 list only (`list` is that list: it is the
+/// only one whose entries can carry the tag); every other list says nothing
+/// about S4.
+fn s4_note(list: &[String], unsettled: &[String]) -> String {
+    if std::ptr::eq(list, unsettled) {
+        format!(
+            ", {} of them {S4_MARK}",
+            list.iter().filter(|m| m.contains(S4_MARK)).count()
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Plan 46 M0.3: classify and count every unsettled `EIO` the run told
 /// (`Report::unsettled_*`); returns the violations described. Called by
 /// every run that reaches its end checks, the ones that end with a claim
@@ -5546,6 +5565,14 @@ fn count_unsettled(
     report.unsettled_violations = bad.len();
     report.held_release_spans = oracles.held_releases.lock().unwrap().spans();
     report.unsettled_s4 = all.iter().filter(|u| u.release_read_recall).count();
+    // MUST-1: the tag over the excused ones too (non-stealable holder,
+    // isolated from S3, held behind a lost chunk): a sticky stream's
+    // release is the case S4 is about, and its EIOs are `designation_held`.
+    report.unsettled_s4_excused = everything
+        .iter()
+        .filter(|u| u.release_read_recall)
+        .count()
+        - report.unsettled_s4;
     report.unsettled_s4_violations = all
         .iter()
         .filter(|u| u.release_read_recall && !u.verdict.allowed())
@@ -8328,9 +8355,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         if strict {
             if let Some(first) = list.first() {
                 return Err(format!(
-                    "{first}\n  ({} {what} violation(s), {} of them {S4_MARK})\n  {counters}\n  faults: {:?}",
+                    "{first}\n  ({} {what} violation(s){})\n  {counters}\n  faults: {:?}",
                     list.len(),
-                    list.iter().filter(|m| m.contains(S4_MARK)).count(),
+                    s4_note(list, &unsettled_violations),
                     report.faults
                 ));
             }
