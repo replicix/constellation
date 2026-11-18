@@ -700,15 +700,21 @@ impl Core {
             // A root that is a singleton again gains nothing from the stream
             // (its own ops answer locally), and the stream is what turns
             // every op's ownership check on: the holder releases it now.
+            // Counted and logged once, when a release actually starts (the
+            // call returns early while one is under way or not yet possible).
             if self.singleton_now() {
-                self.stats.place_root_own_released_singleton += 1;
-                tracing::info!(
-                    node = me,
-                    dirs = ?dirs,
-                    gen = %constellation_meta::delegation::GenLabel::of(gen),
-                    "the root releases its own sticky subtrees (it is a singleton again)"
-                );
+                let before = self.stats.place_root_own_released;
+                let dir_list = dirs.clone();
                 self.own_sticky_release(now, gen, dirs.into_iter().collect(), replica, out);
+                if self.stats.place_root_own_released > before {
+                    self.stats.place_root_own_released_singleton += 1;
+                    tracing::info!(
+                        node = me,
+                        dirs = ?dir_list,
+                        gen = %constellation_meta::delegation::GenLabel::of(gen),
+                        "the root releases its own sticky subtrees (it is a singleton again)"
+                    );
+                }
                 continue;
             }
             let mut keep = false;

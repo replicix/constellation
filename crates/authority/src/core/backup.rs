@@ -2199,8 +2199,9 @@ impl Core {
     /// the archive: it holds the lease, is no singleton (a write-eligible
     /// peer is listed, or nothing says it is alone: `!singleton_now` also
     /// holds with no read, an incomplete read or a lapse; the sticky grant
-    /// asks for more, [`Self::root_peer_evident`]), has no group (no backup in the lease or in doubt), no
-    /// continuation epoch and no takeover gate, and is not under `ack=s3`
+    /// asks for more, [`Self::root_peer_evident`]), has no group (no backup in
+    /// the lease or in doubt), no continuation epoch and no takeover gate, and
+    /// is not under `ack=s3`
     /// (which asks the archive of every answer, a sticky grant's included).
     /// Exactly when its own ops would otherwise wait for the archive.
     pub(crate) fn root_commits_by_archive(&self) -> bool {

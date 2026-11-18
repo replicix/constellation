@@ -84705,6 +84705,53 @@ mod root_own_sticky {
         assert_eq!(h.core.stats.place_recalled, 0);
     }
 
+    /// The singleton release is counted (and logged) once, when it starts:
+    /// a drain that spans several placement ticks does not count again, so
+    /// `released_singleton` stays a subset of the releases made.
+    /// (Fails before: one count per tick while the release drains.)
+    #[test]
+    fn a_singleton_release_that_drains_over_several_ticks_is_counted_once() {
+        let (mut h, dirs) = root_with_peer(Some(500));
+        h.core.cfg.fast_path_sampled = true;
+        root_dominates(&mut h, dirs[0]);
+        let gen = own_grant_of(&h, dirs[0]).expect("granted").gen;
+        archive_and_step(&mut h);
+        make_alone(&mut h);
+        // An op of the root's own is in flight under the stream (the engine's
+        // fast-path report), so the release cannot drain.
+        let now = h.now;
+        h.core
+            .deleg_note_local(Now::same(now.0), &[], &[(gen, dirs[0], 1)]);
+        for _ in 0..5 {
+            root_dominates(&mut h, dirs[0]);
+            let now = h.now;
+            h.core
+                .deleg_note_local(Now::same(now.0), &[], &[(gen, dirs[0], 1)]);
+        }
+        assert!(
+            own_grant_of(&h, dirs[0]).is_some(),
+            "premise: still draining"
+        );
+        assert_eq!(h.core.dl.sticky_cmds.len(), 1, "one release command");
+        assert_eq!(h.core.stats.place_root_own_released, 1);
+        assert_eq!(h.core.stats.place_root_own_released_singleton, 1);
+        // The op drains; the release completes, and the count is still one.
+        for _ in 0..3 {
+            let now = h.now;
+            h.core.deleg_note_local(Now::same(now.0), &[], &[]);
+            root_dominates(&mut h, dirs[0]);
+            archive_and_step(&mut h);
+        }
+        assert!(
+            own_grant_of(&h, dirs[0]).is_none(),
+            "released after the drain"
+        );
+        assert_eq!(h.core.stats.place_root_own_released_singleton, 1);
+        assert!(
+            h.core.stats.place_root_own_released_singleton <= h.core.stats.place_root_own_released
+        );
+    }
+
     /// Test 4 (R-I3): the root executes under its own grant once the
     /// archive carries the record: the first own op parks, the next is
     /// answered at once.
