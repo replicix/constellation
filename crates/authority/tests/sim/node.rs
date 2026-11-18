@@ -2573,6 +2573,16 @@ impl Driver {
                 .note_release_rows(self.id, &self.meta, own_releases > self.releases_seen);
             self.releases_seen = own_releases;
             {
+                // Plan 46 M1.3 step 15a (S4): the spans in which a release of
+                // this node waited on read recalls.
+                let held = self.core.deleg_releases_held();
+                self.oracles.held_releases.lock().unwrap().note(
+                    self.id,
+                    &held,
+                    self.oracles.reach.now_ms(),
+                );
+            }
+            {
                 let mut holds = self.oracles.epoch_holds.lock().unwrap();
                 if self.core.lease().epoch_held() {
                     holds.insert(self.id);

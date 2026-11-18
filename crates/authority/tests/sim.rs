@@ -10221,6 +10221,12 @@ struct OracleTotals {
     nonstealable_in_doubt: (u64, u64),
     /// ADR-58 C3: `held-behind-lost-chunk` unsettled `EIO`s and the seeds with one.
     held_lost_chunk: (u64, u64),
+    /// Plan 46 M1.3 step 15a (`SWEEP-S4`): unsettled EIOs while the owning
+    /// stream's release waited on read recalls (all, violations among them,
+    /// seeds with one), and the I4 violations by cause (`SWEEP-I4-CAUSES`).
+    s4: (u64, u64, u64),
+    s4_spans: (u64, u64),
+    violation_causes: std::collections::BTreeMap<String, u64>,
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
     /// takeover gate took on, renewals it granted, transactions it appended,
     /// settles it redirected.
@@ -10448,6 +10454,14 @@ impl OracleTotals {
         self.nonstealable_in_doubt.1 += u64::from(r.unsettled_nonstealable_holder > 0);
         self.held_lost_chunk.0 += r.unsettled_held_lost_chunk as u64;
         self.held_lost_chunk.1 += u64::from(r.unsettled_held_lost_chunk > 0);
+        self.s4.0 += r.unsettled_s4 as u64;
+        self.s4.1 += r.unsettled_s4_violations as u64;
+        self.s4.2 += u64::from(r.unsettled_s4 > 0);
+        self.s4_spans.0 += r.held_release_spans as u64;
+        self.s4_spans.1 += u64::from(r.held_release_spans > 0);
+        for (k, n) in &r.unsettled_violation_causes {
+            *self.violation_causes.entry(k.clone()).or_default() += *n as u64;
+        }
         for st in r.stats.values() {
             for (c, n) in self.rowless.iter_mut().zip([
                 st.deleg_release_rowless_capped,
@@ -10700,6 +10714,20 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-HELD-LOST-CHUNK {label} seeds {}/{seeds}: held-behind-lost-chunk unsettled EIOs (allowed: the row waits behind a chunk that exists nowhere; checked against the chunk ledger) {} (in {} seeds)",
             self.seeds, self.held_lost_chunk.0, self.held_lost_chunk.1
+        );
+        eprintln!(
+            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; held-release spans seen {} in {} seeds",
+            self.seeds,
+            self.s4.0,
+            self.s4.1,
+            self.s4.0 - self.s4.1,
+            self.s4.2,
+            self.s4_spans.0,
+            self.s4_spans.1
+        );
+        eprintln!(
+            "SWEEP-I4-CAUSES {label} seeds {}/{seeds}: violations by cause {:?}",
+            self.seeds, self.violation_causes
         );
         eprintln!(
             "SWEEP-NONSTEALABLE-IN-DOUBT {label} seeds {}/{seeds}: unsettled EIOs of ops a non-stealable holder's refusal was held back for (allowed: the holder may have run them, its row lands late) {} (in {} seeds)",

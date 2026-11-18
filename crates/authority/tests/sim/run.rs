@@ -9,6 +9,7 @@ use super::clock::Clock;
 use super::history::dir_of;
 use super::history::{check_linearizable, check_linearizable_witnessed_with, History, NsOp, NsRet};
 use super::node::{read_lease, CommitRecord, NodeEnv, NodeHandle, PEERS_TICK_MS};
+use super::oracle::S4_MARK;
 use super::store::{Bucket, Fault, OpKind, Rule, When};
 use constellation_authority::{ClientReply, Config, NodeId, Stats};
 use constellation_fs_core::types::ROOT_INO;
@@ -1810,6 +1811,16 @@ pub struct Report {
     /// held it; the row lands only after an operator's drop, or never):
     /// `held-behind-lost-chunk`, allowed and counted apart.
     pub unsettled_held_lost_chunk: usize,
+    /// Plan 46 M1.3 step 15a, S4 (diagnostic): the classified unsettled
+    /// `EIO`s whose owning stream's release waited on read recalls during
+    /// their window (`Unsettled::release_read_recall`), all and the I4
+    /// violations among them.
+    pub unsettled_s4: usize,
+    pub unsettled_s4_violations: usize,
+    /// The held-release spans the run saw (`HeldReleases::spans`).
+    pub held_release_spans: usize,
+    /// The I4 violations by `Unsettled::cause`.
+    pub unsettled_violation_causes: BTreeMap<String, usize>,
     pub unsettled_examples: Vec<String>,
     pub unsettled_causes: BTreeMap<String, usize>,
     /// Sync-on-silence C1: the unsettled `EIO`s whose generation tail the
@@ -5533,7 +5544,19 @@ fn count_unsettled(
         .map(|u| u.describe())
         .collect();
     report.unsettled_violations = bad.len();
+    report.held_release_spans = oracles.held_releases.lock().unwrap().spans();
+    report.unsettled_s4 = all.iter().filter(|u| u.release_read_recall).count();
+    report.unsettled_s4_violations = all
+        .iter()
+        .filter(|u| u.release_read_recall && !u.verdict.allowed())
+        .count();
     for u in all.iter() {
+        if !u.verdict.allowed() {
+            *report
+                .unsettled_violation_causes
+                .entry(u.cause())
+                .or_default() += 1;
+        }
         *report.unsettled_causes.entry(u.cause()).or_default() += 1;
         if let Some(c) = &u.silence {
             *report.unsettled_silence.entry(c.clone()).or_default() += 1;
@@ -7087,9 +7110,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             if let Some(first) = unsettled_violations.first() {
                 return Err(format!(
                     "{first}\n  ({} I4 (unsettled EIO of a requester that was not isolated) \
-                     violation(s); the run ended with a claim waiting for a group's tail)\n  \
-                     faults: {:?}",
+                     violation(s), {} of them {S4_MARK}; the run ended with a claim waiting for \
+                     a group's tail)\n  faults: {:?}",
                     unsettled_violations.len(),
+                    unsettled_violations
+                        .iter()
+                        .filter(|m| m.contains(S4_MARK))
+                        .count(),
                     report.faults
                 ));
             }
@@ -8301,8 +8328,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         if strict {
             if let Some(first) = list.first() {
                 return Err(format!(
-                    "{first}\n  ({} {what} violation(s))\n  {counters}\n  faults: {:?}",
+                    "{first}\n  ({} {what} violation(s), {} of them {S4_MARK})\n  {counters}\n  faults: {:?}",
                     list.len(),
+                    list.iter().filter(|m| m.contains(S4_MARK)).count(),
                     report.faults
                 ));
             }

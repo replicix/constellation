@@ -264,6 +264,10 @@ pub struct Oracles {
     /// release (a note on its stream: a row, or the cut a rowless release
     /// ends at; the latter leaves nothing in the log).
     pub sticky_released: Mutex<BTreeMap<u64, super::sticky::SentRelease>>,
+    /// Plan 46 M1.3 step 15a (S4): the spans in which a holder's release
+    /// waited on read-delegation recalls, per `(node, gen)`. Diagnostic only
+    /// (`Unsettled::release_read_recall`).
+    pub held_releases: Mutex<HeldReleases>,
     /// ADR-56: the root's handover requests and grants, stamped with the
     /// run's clock (`Core::take_hand_events`): `handover_tenure` and
     /// `one_off_no_handover` judge them.
@@ -282,6 +286,81 @@ pub struct Oracles {
     /// I5 on the root's own stream: the row's rollback is the holder's, not
     /// a requester's shadow of its answer).
     pub rolled_back_nodes: Mutex<BTreeMap<Rid, BTreeSet<NodeId>>>,
+}
+
+/// The note a violation's description carries when `release_read_recall`.
+pub const S4_MARK: &str = "release waited on read recalls";
+
+/// Plan 46 M1.3 step 15a (S4): per `(node, gen)`, the spans `[start, end)` in
+/// ms in which the node's release of the generation was held on read recalls
+/// (`Core::deleg_releases_held`); a span still open has no end yet.
+/// One span of a held release: its start and end (`None`: still open), in ms.
+type Span = (u64, Option<u64>);
+
+#[derive(Default, Debug)]
+pub struct HeldReleases {
+    spans: BTreeMap<(NodeId, u64), Vec<Span>>,
+}
+
+impl HeldReleases {
+    /// `node` holds the releases of `held` at `now_ms`: spans open for the
+    /// new ones and close for those that are no longer held.
+    pub fn note(&mut self, node: NodeId, held: &[u64], now_ms: u64) {
+        for (&(n, gen), spans) in self.spans.iter_mut() {
+            if n == node && !held.contains(&gen) {
+                if let Some(last) = spans.last_mut().filter(|s| s.1.is_none()) {
+                    last.1 = Some(now_ms);
+                }
+            }
+        }
+        for &gen in held {
+            let spans = self.spans.entry((node, gen)).or_default();
+            if spans.last().is_none_or(|s| s.1.is_some()) {
+                spans.push((now_ms, None));
+            }
+        }
+    }
+
+    /// How many spans were seen (the instrument's own check: a sweep that
+    /// tells no S4 EIO says whether any release waited at all).
+    pub fn spans(&self) -> usize {
+        self.spans.values().map(Vec::len).sum()
+    }
+
+    /// Whether a held span of a generation the question rests on overlaps
+    /// its window (`Unsettled::release_read_recall`).
+    pub fn tags(&self, question: &super::reach::Question) -> bool {
+        self.overlaps(&question_gens(question), question.from_ms, question.to_ms)
+    }
+
+    /// Whether a held span of any of `gens` (on any node) overlaps
+    /// `[from_ms, to_ms]`.
+    pub fn overlaps(&self, gens: &BTreeSet<u64>, from_ms: u64, to_ms: u64) -> bool {
+        self.spans.iter().any(|((_, gen), spans)| {
+            gens.contains(gen)
+                && spans
+                    .iter()
+                    .any(|&(s, e)| s <= to_ms && e.is_none_or(|e| e > from_ms))
+        })
+    }
+}
+
+/// The generations a question's answer rests on: its owners' (a delegate's,
+/// or each of a blocked set's) and those it awaits.
+pub fn question_gens(question: &super::reach::Question) -> BTreeSet<u64> {
+    let mut gens: BTreeSet<u64> = question.awaiting.iter().map(|&(_, g)| g).collect();
+    for (_, owner) in &question.owners {
+        match owner {
+            super::reach::Owner::Delegate { gen, .. } => {
+                gens.insert(*gen);
+            }
+            super::reach::Owner::Blocked(involved) => {
+                gens.extend(involved.iter().map(|&(_, g)| g));
+            }
+            super::reach::Owner::Root => {}
+        }
+    }
+    gens
 }
 
 /// The holder's release rows seen, and those journaled before the root had
@@ -328,6 +407,10 @@ pub struct Unsettled {
     /// deferred it behind another node's pending upload, at the `EIO`; one
     /// that waits for the node's own upload does not count.
     pub plan_held: bool,
+    /// Plan 46 M1.3 step 15a, S4 (diagnostic; no verdict reads it): a
+    /// holder's release of a generation the question rests on waited on
+    /// read-delegation recalls during `[from_ms, at]`.
+    pub release_read_recall: bool,
     /// When the `EIO` was told (`tokio` time, as the drops' and the log's).
     pub at: tokio::time::Instant,
 }
@@ -429,6 +512,15 @@ impl Unsettled {
     }
 
     pub fn describe(&self) -> String {
+        let text = self.describe_verdict();
+        if self.release_read_recall {
+            format!("{text} [{S4_MARK}]")
+        } else {
+            text
+        }
+    }
+
+    fn describe_verdict(&self) -> String {
         let span = format!(
             "[{}, {}] ms",
             self.at_ms.saturating_sub(self.window_ms),
@@ -545,6 +637,7 @@ impl Oracles {
             release_drain: Mutex::new(ReleaseDrain::default()),
             causal_cut: Mutex::new(Vec::new()),
             sticky_released: Mutex::new(BTreeMap::new()),
+            held_releases: Mutex::new(HeldReleases::default()),
             hand_events: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
             rolled_back_nodes: Mutex::new(BTreeMap::new()),
@@ -824,6 +917,7 @@ impl Oracles {
             born,
             awaiting,
         };
+        let release_read_recall = self.held_releases.lock().unwrap().tags(&question);
         let verdict = self.reach.classify(question.clone());
         let silence = self.reach.silence_class(&question, &verdict);
         // Late-landing U1(a): a settle that could not write its tombstones
@@ -862,6 +956,7 @@ impl Oracles {
             lost_chunk_label,
             chunk_lost,
             plan_held,
+            release_read_recall,
             at: tokio::time::Instant::now(),
         });
     }
@@ -4049,6 +4144,43 @@ impl LeaseClaims {
 mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
+
+    /// Plan 46 M1.3 step 15a (S4): the tag of an unsettled EIO whose owning
+    /// stream's release waited on read recalls, on a hand-built history.
+    #[test]
+    fn an_unsettled_eio_is_tagged_while_its_streams_release_waits_on_recalls() {
+        use super::super::reach::{Owner, Question};
+        let mut h = HeldReleases::default();
+        h.note(2, &[5], 1_000);
+        h.note(2, &[], 3_000);
+        let ask = |at: u64, owner: Owner| {
+            let mut q = Question::new(1, at - 1_000, at);
+            q.owners = vec![(0, owner)];
+            q
+        };
+        let d = |gen| Owner::Delegate { node: 2, gen };
+        // Inside the span.
+        assert!(h.tags(&ask(2_500, d(5))));
+        // A window that starts after the span ended.
+        assert!(!h.tags(&ask(4_500, d(5))));
+        // Another generation's stream.
+        assert!(!h.tags(&ask(2_500, d(6))));
+        // The root's keys, nothing awaited.
+        assert!(!h.tags(&ask(2_500, Owner::Root)));
+        // A blocked set naming the generation, or an awaited one.
+        assert!(h.tags(&ask(2_500, Owner::Blocked(vec![(3, 7), (2, 5)]))));
+        assert!(h.tags(&ask(2_500, Owner::Root).awaiting(2, 5)));
+        // A window that reaches into the span from after it.
+        assert!(h.tags(&ask(3_500, d(5))));
+        // A span still open overlaps every later window.
+        h.note(3, &[8], 5_000);
+        assert!(h.tags(&ask(9_000, d(8))));
+        assert!(!h.tags(&ask(4_000, d(8))));
+        // A held release that ended and began again keeps its first span.
+        h.note(3, &[], 6_000);
+        h.note(3, &[8], 7_000);
+        assert!(h.tags(&ask(5_500, d(8))));
+    }
     use constellation_meta::{DelegateTx, MutateOp, Position};
     use constellation_types::clock::Now;
     use replicix_objcas::{LeaseMode, LeaseStore};
