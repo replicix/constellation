@@ -44,6 +44,9 @@ pub struct Base {
     pub backup_slow_max: u64,
     /// The store's request timeout (`0`: not known; D13 and D14 are then skipped).
     pub s3_request_timeout: u64,
+    /// Kd: `kernel_cache_ttl_ms`, the kernel drain a lone strict node arms
+    /// once it learns it is not alone (`0`: none, as in the simulation).
+    pub kernel_drain: u64,
 }
 
 impl Base {
@@ -68,6 +71,7 @@ impl Base {
             backup_ack_timeout: cfg.backup_ack_timeout_ms,
             backup_slow_max: cfg.backup_slow_max_ms,
             s3_request_timeout: cfg.s3_request_timeout_ms,
+            kernel_drain: cfg.kernel_cache_ttl_ms,
         }
     }
 }
@@ -176,6 +180,15 @@ pub struct Deadlines {
     /// second of write-ahead (`Core::grant_horizon_covers`) and the second
     /// the write rounds up by.
     pub read_span: u64,
+    /// The longest a delegate's release note is held on read recalls when
+    /// one more release merges into it (D11b): `read_span + max(R + m, Kd)`.
+    /// One held release ends within `read_span` (its grants, `R + m`; the
+    /// ADR-46 restart quarantine, at most boot plus `read_span`; a kernel
+    /// drain armed before it, `Kd`). Each release merged into the held note
+    /// adds its own wait, at most `max(R + m, Kd)` past its own start. Three
+    /// or more merged releases are not bounded by the configuration; the
+    /// simulation's S4 tag covers them.
+    pub held_release_span: u64,
     /// ADR-57: how long a read of a key a pending acknowledged row touches
     /// waits for the row to be re-shipped before it fails with `EIO`: the
     /// client deadline (a write that can still be acknowledged late can
@@ -257,6 +270,53 @@ const LEAVE_NOTE_LAPSE_RESENDS: u64 = 3;
 /// whatever its lock TTL).
 pub fn default_delegation_ttl(lock_ttl_ms: u64) -> u64 {
     lock_ttl_ms.max(5_000)
+}
+
+/// `read_span`: `R + m + 2000`.
+fn read_span_of(read_ttl: u64, margin: u64) -> u64 {
+    read_ttl.saturating_add(margin).saturating_add(2_000)
+}
+
+/// `held_release_span`: `read_span + max(R + m, Kd)`.
+fn held_release_span_of(read_ttl: u64, margin: u64, kernel_drain: u64) -> u64 {
+    read_span_of(read_ttl, margin).saturating_add(read_ttl.saturating_add(margin).max(kernel_drain))
+}
+
+/// The read-delegation TTL a daemon runs with: the configured one, cut to
+/// the longest that keeps D11 and D11b, so that a settle's cap outlasts the
+/// hold of a release with one more merged into it. `None`: not even 1 ms
+/// fits. A shorter TTL only costs more renewals; a longer one lets a held
+/// release outlast the settles parked behind it, which then end in an
+/// unsettled `EIO`.
+///
+/// The settle cap span does not depend on R, and both spans grow with it,
+/// so the longest fitting TTL is found by bisection. The cap is computed
+/// with R = 1, so an unbounded configured TTL cannot overflow a bound.
+pub fn read_ttl_fitting_settle_cap(cfg: &Config) -> Option<u64> {
+    let mut probe = cfg.clone();
+    probe.read_delegation_ttl_ms = 1;
+    let cap = Deadlines::new(&probe).settle_cap_span;
+    let (m, drain) = (cfg.expiry_margin_ms, cfg.kernel_cache_ttl_ms);
+    // D11 (`read_span`) is implied: the held span is at least the read span.
+    let fits = |r: u64| held_release_span_of(r, m, drain) <= cap;
+    let configured = cfg.read_delegation_ttl_ms.max(1);
+    if fits(configured) {
+        return Some(configured);
+    }
+    if !fits(1) {
+        return None;
+    }
+    // `fits(lo)` and not `fits(hi)`.
+    let (mut lo, mut hi) = (1, configured);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
 }
 
 /// The lock TTL a daemon runs with: the configured one, cut to what D8
@@ -359,7 +419,8 @@ impl Deadlines {
                 .max(d.saturating_mul(2)),
             leftover_hold: 4 * a,
             read_block: 2 * (r + m),
-            read_span: r + m + 2_000,
+            read_span: read_span_of(r, m),
+            held_release_span: held_release_span_of(r, m, b.kernel_drain),
             read_hold_span: a + t + f,
             lock_span: lock_ttl + lock_ttl / 4 + m + 1_000,
             floor_span: t + longest_grant + d + 3 * m + 1_000,
@@ -487,6 +548,16 @@ impl Deadlines {
             format!(
                 "settle cap span {} ms is below the read span ({})",
                 self.settle_cap_span, self.read_span
+            ),
+        );
+        fail(
+            "D11b",
+            Class::Warn,
+            self.settle_cap_span >= self.held_release_span,
+            format!(
+                "settle cap span {} ms is below the hold of a release with one more merged into it \
+                 ({}: the read span and max(R + m, Kd))",
+                self.settle_cap_span, self.held_release_span
             ),
         );
         fail(
@@ -747,6 +818,11 @@ impl Deadlines {
             ("leftover_hold", self.leftover_hold, "4A"),
             ("read_block", self.read_block, "2 (R + m)"),
             ("read_span", self.read_span, "R + m + 2000"),
+            (
+                "held_release_span",
+                self.held_release_span,
+                "R + m + 2000 + max(R + m, Kd)",
+            ),
             ("read_hold_span", self.read_hold_span, "A + T + F"),
             ("lock_span", self.lock_span, "max(K, D) * 5/4 + m + 1000"),
             (
@@ -955,6 +1031,8 @@ mod tests {
                 ("read_block", 12_000),
                 // 5000 + 1000 + 1000.
                 ("read_span", 8_000),
+                // 8000 + max(5000 + 1000, 0).
+                ("held_release_span", 14_000),
                 ("read_hold_span", 122000),
                 // ttl = max(20000, 5000); 20000 + 5000 + 1000 + 1000.
                 ("lock_span", 27_000),
@@ -1027,6 +1105,8 @@ mod tests {
                 ("leave_note_lapse", 40_000),
                 ("read_block", 12_000),
                 ("read_span", 8_000),
+                // 8000 + max(5000 + 1000, 0).
+                ("held_release_span", 14_000),
                 ("read_hold_span", 122000),
                 // ttl = max(20000, 20000).
                 ("lock_span", 27_000),
@@ -1097,6 +1177,8 @@ mod tests {
                 ("read_block", 11_000),
                 // 5000 + 500 + 1000.
                 ("read_span", 7_500),
+                // 7500 + max(5000 + 500, 0).
+                ("held_release_span", 13_000),
                 ("read_hold_span", 13900),
                 // ttl = max(1500, 5000); 5000 + 1250 + 500 + 1000.
                 ("lock_span", 7_750),
@@ -1173,6 +1255,8 @@ mod tests {
                 ("leave_note_lapse", 40_000),
                 ("read_block", 11_000),
                 ("read_span", 7_500),
+                // 7500 + max(5000 + 500, 0).
+                ("held_release_span", 13_000),
                 ("read_hold_span", 61900),
                 // ttl = 20000; 20000 + 5000 + 500 + 1000.
                 ("lock_span", 26_500),
@@ -1237,6 +1321,8 @@ mod tests {
                 ("leave_note_lapse", 10_000),
                 ("read_block", 11_000),
                 ("read_span", 7_500),
+                // 7500 + max(5000 + 500, 0).
+                ("held_release_span", 13_000),
                 ("read_hold_span", 13400),
                 ("lock_span", 7_750),
                 // 1000 + 5000 + 5000 + 1500 + 1000.
@@ -1310,6 +1396,8 @@ mod tests {
                 ("leave_note_lapse", 9_000),
                 ("read_block", 200),
                 ("read_span", 2_100),
+                // 2100 + max(100 + 0, 0).
+                ("held_release_span", 2_200),
                 ("read_hold_span", 5008),
                 // ttl = max(10, 50); 50 + 12 + 0 + 1000.
                 ("lock_span", 1_062),
@@ -1436,6 +1524,55 @@ mod tests {
         assert_eq!(e.deleg_lapse_at(0, 0), 50);
     }
 
+    /// The daemon's cut of R (D11, D11b): the longest TTL whose held release
+    /// fits the settle cap, the configured one when it fits, and none when
+    /// not even 1 ms does. The cap does not depend on R, which is what makes
+    /// the cut a bisection over R alone.
+    #[test]
+    fn read_ttl_fitting_settle_cap_is_the_longest_that_keeps_d11b() {
+        let ids = |c: &Config| {
+            Deadlines::new(c)
+                .check()
+                .into_iter()
+                .map(|v| v.id)
+                .collect::<Vec<_>>()
+        };
+        for r in [1, 5_000, 40_000, 1_000_000] {
+            let mut c = engine();
+            c.read_delegation_ttl_ms = r;
+            assert_eq!(Deadlines::new(&c).settle_cap_span, 84_500, "R {r}");
+        }
+        // A strict daemon at the defaults: cap 84500, m 1000, Kd 1500:
+        // 2R + 4000 <= 84500.
+        let mut c = engine();
+        c.kernel_cache_ttl_ms = 1_500;
+        assert_eq!(read_ttl_fitting_settle_cap(&c), Some(5_000));
+        c.read_delegation_ttl_ms = 40_250;
+        assert_eq!(read_ttl_fitting_settle_cap(&c), Some(40_250));
+        assert!(!ids(&c).contains(&"D11b"));
+        for r in [40_251, 100_000, u64::MAX] {
+            c.read_delegation_ttl_ms = r;
+            assert_eq!(read_ttl_fitting_settle_cap(&c), Some(40_250), "R {r}");
+        }
+        c.read_delegation_ttl_ms = 40_251;
+        assert!(ids(&c).contains(&"D11b"));
+        // A short lease (the harness's 1 s): w 500, D 5000, H 5250; cap
+        // 1000 + 5250 + 1500 + 1500 + 500 = 9750; 2R + 2m + 2000 <= 9750.
+        let mut c = engine();
+        c.ttl_ms = 1_000;
+        c.expiry_margin_ms = 250;
+        c.lock_ttl_ms = lock_ttl_fitting_lease(20_000, 1_000, 250);
+        c.delegation_ttl_ms = default_delegation_ttl(c.lock_ttl_ms);
+        assert_eq!(read_ttl_fitting_settle_cap(&c), Some(3_625));
+        c.read_delegation_ttl_ms = 3_625;
+        let v = ids(&c);
+        assert!(!v.contains(&"D11b") && !v.contains(&"D11"), "{v:?}");
+        // A drain longer than the cap: nothing fits.
+        let mut c = engine();
+        c.kernel_cache_ttl_ms = 90_000;
+        assert_eq!(read_ttl_fitting_settle_cap(&c), None);
+    }
+
     /// One failing configuration per invariant (D5, which holds by
     /// construction, on a hand-made cap).
     #[test]
@@ -1505,6 +1642,23 @@ mod tests {
         let mut c = Config::defaults(1, 1);
         c.read_delegation_ttl_ms = 100_000;
         assert!(has(&Deadlines::new(&c), "D11"));
+        // D11b fails first: cap 69500 at the defaults, held span 2R + 4000.
+        c.read_delegation_ttl_ms = 32_750;
+        let d = Deadlines::new(&c);
+        assert!(!has(&d, "D11b") && !has(&d, "D11"), "{:?}", d.check());
+        c.read_delegation_ttl_ms = 32_751;
+        let d = Deadlines::new(&c);
+        assert!(has(&d, "D11b") && !has(&d, "D11"), "{:?}", d.check());
+        assert_eq!(
+            d.check().iter().find(|v| v.id == "D11b").unwrap().class,
+            Class::Warn
+        );
+        // The kernel drain counts when it is longer than R + m.
+        let mut c = Config::defaults(1, 1);
+        c.kernel_cache_ttl_ms = 62_000;
+        assert!(has(&Deadlines::new(&c), "D11b"));
+        c.kernel_cache_ttl_ms = 61_500;
+        assert!(!has(&Deadlines::new(&c), "D11b"));
         // The classes: D1 refuses, D3 warns.
         let mut c = Config::defaults(1, 1);
         c.expiry_margin_ms = 2_500;
@@ -1534,6 +1688,7 @@ mod tests {
     const READ: &str = "CONSTELLATION_READ_DELEGATION_TTL_MS";
     const DELEG: &str = "CONSTELLATION_DELEGATION_TTL_MS";
     const LOCK: &str = "CONSTELLATION_LOCK_TTL_MS";
+    const CTO: &str = "CONSTELLATION_CTO";
     const FORWARD: &str = "CONSTELLATION_FORWARD_TIMEOUT_MS";
     const HANDOVER_GRACE: &str = "CONSTELLATION_STICKY_HANDOVER_GRACE_MS";
     const TAKEOVER: &str = "CONSTELLATION_BACKUP_TAKEOVER_MS";
@@ -1554,6 +1709,11 @@ mod tests {
             &[DELEG, LOCK],
         ),
         ("K", "lock TTL", &[LOCK]),
+        (
+            "Kd",
+            "kernel drain of a strict mount (`--cto strict`: `min(m/2, 1000) + 500`; else 0; 0 at the defaults)",
+            &[CTO, LEASE],
+        ),
         ("F", "forward timeout", &[FORWARD]),
         ("grace", "handover grace (default 5000)", &[HANDOVER_GRACE]),
         ("T", "backup takeover window", &[TAKEOVER]),

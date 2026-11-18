@@ -70935,3 +70935,29 @@ The maintainer approved it after a security review ("safe with changes"); the re
   smoke's list plus every forwarded-mutations, coop, log-sink, transport, p2p, backup, seal, failover and partition scenario): 147 passed, 1 skipped
   (`passthrough-on-every-transport`, needs root), 2 failed for the known environment reasons (`lock-device-stall-lone-node`: no dm device;
   `lock-xcheckfs-cell`: no xcheckfs script).
+
+### D11 in the daemon: the deadline check runs at start, R is cut to fit D11b (2026-11-18)
+
+Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tests, and an unbounded
+`CONSTELLATION_READ_DELEGATION_TTL_MS` broke the settle-cap guarantee silently in the daemon.
+- **D11b** (s4bound D11′): `held_release_span = read_span + max(R + m, Kd)`, the hold of two merged releases, and
+  `settle_cap_span >= held_release_span` (`Warn`). `Kd` is `kernel_cache_ttl_ms`. Pinned in every `pinned_*` table
+  (14,000 at the defaults, 13,000 in the sim). `strict-isolated-reader-long` and `strict-reader-rate-fast` (R = 30 s, no
+  delegate streams) waive it.
+- **The daemon** runs `authority_driver::enforce_deadlines` once the mount has set every knob the check reads (there is
+  no reload; env vars and `--cto`/`--locks` are the only inputs). It cuts R to the longest TTL that keeps D11 and D11b
+  (`read_ttl_fitting_settle_cap`; 40,250 ms at the defaults, 3,625 ms at a 1 s lease, 3,325 ms at 200 ms) with a
+  warning. It refuses `Refuse`-class violations (D1, D5, D6, D7, D9, D16), and logs D2 and the `Warn` class. ADR-48
+  amendment.
+- **Why a cut:** refusing D11b would stop `snapacct` (lease 1 s) and the snapshot churn (200 ms), which fail it at the
+  default R. D2 fails in the same two configurations (a 500 ms forward timeout against a settle window of half the
+  lease), so it is logged, not refused: open item.
+- **Newly refused:** `CONSTELLATION_READ_DELEGATION_TTL_MS` at or below the expiry margin (D1). No harness or documented
+  configuration sets it so low (the lowest is 3,000).
+- Tests: `read_ttl_fitting_settle_cap_is_the_longest_that_keeps_d11b`, D11b cases in
+  `each_invariant_has_a_failing_configuration`; engine `the_daemon_defaults_pass_the_deadline_check`,
+  `a_read_delegation_ttl_past_d11b_is_cut_to_fit` (fails on the parent: no check), `a_refused_deadline_stops_the_start`,
+  `a_short_lease_starts_with_d2_logged`; harness scenario `deadline-check-at-start` (defaults start; R = 100 s starts
+  cut to 40,250; R = 1 s is refused naming D1).
+- Not done here: ReleaseCut; the `GrantQuarantine` wakeup gap; the s4bound part-B core test
+  `a_release_merged_into_a_held_one_extends_the_hold_by_its_own_grants`.

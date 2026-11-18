@@ -290,6 +290,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         ),
     ),
     (
+        "deadline-check-at-start",
+        Skip::Local(&["sets a local daemon's read-delegation TTL (CONSTELLATION_READ_DELEGATION_TTL_MS) and reads its mount log"]),
+    ),
+    (
         "snapacct",
         Skip::Local(&[ADMIN, "refreshes snapshot accounting on scenario timescales (CONSTELLATION_SNAPACCT_*)"]),
     ),

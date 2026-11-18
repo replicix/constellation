@@ -1120,6 +1120,11 @@ impl Engine {
         // Plan 30 §M14: cluster locks need a P2P path to the sequencer.
         let locks_cluster = crate::locks::cluster_effective(locks, peers.is_enabled())?;
         core_config.locks = locks_cluster;
+        // The protocol deadlines, once every knob they read is set (the
+        // promise TTL set below enters none of the checks): the
+        // read-delegation TTL is cut to fit D11/D11b, and a refused
+        // invariant stops the start.
+        crate::authority_driver::enforce_deadlines(&mut core_config)?;
         let lock_owner_wait_max_ms =
             constellation_authority::deadlines::Deadlines::new(&core_config).lock_owner_wait_max;
         let lock_poll_ms =

@@ -1355,6 +1355,11 @@ roots:
   first holder snapshot took 60 s. A barrier then waited for an empty
   journal, and the publish refused while any row was unshipped. A busy
   holder never has an empty journal at that latency.
+- `deadline-check-at-start` (ADR-48 amendment) mounts three daemons on one
+  filesystem, one at a time: at the defaults it starts with the deadline
+  check logged; with `CONSTELLATION_READ_DELEGATION_TTL_MS=100000` it starts
+  with R cut to 40250 ms (D11b); with `1000` (not above the 1 s margin, D1)
+  the start is refused and the error names D1.
 - `snapacct` (plan 32 §11, M5d) is the end-to-end proof that the reclaim
   estimate is the truth. Two nodes (`a` with `CONSTELLATION_SNAPACCT=on`,
   `b` with `auto`, so each builds its own index — incrementally and from

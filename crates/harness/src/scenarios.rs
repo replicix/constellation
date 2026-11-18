@@ -64,6 +64,8 @@ mod m14;
 /// Plan 30 §M4's scenarios and the chaos runs' whole-cluster checks.
 mod m4;
 pub(crate) use m4::{logged_completions, segment_tenures};
+/// D11/D11b at the daemon's start: the deadline check cuts or refuses.
+mod deadlinestart;
 /// Plan 30 §M5 phase 2: the stale-base rule on the wire.
 mod m5;
 mod m6;
@@ -409,6 +411,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: credrot::csi_credential_revocation,
+    },
+    Scenario {
+        name: "deadline-check-at-start",
+        desc: "the daemon checks the protocol deadlines as it starts: the defaults start as configured, a read-delegation TTL past D11b is cut to fit, a refused invariant (D1) stops the start",
+        requires: &[],
+        caps: &[],
+        run: deadlinestart::deadline_check_at_start,
     },
     Scenario {
         name: "snapacct",

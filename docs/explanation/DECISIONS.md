@@ -3967,7 +3967,43 @@ file (the formulas are the point, not the numbers).
 
 **May revert**: no.
 
+**Amendment (2026-11-18): D11b, and the daemon runs the check.**
+- *Context.* `Deadlines::check` ran only in the simulation's tests; the daemon
+  never called it. D11 (`settle_cap_span >= read_span`, a settle's cap outlasts
+  one held release) is what the S4 closure rests on, and the S4 bound analysis
+  showed that a release merged into a held note adds its own wait: two merged
+  releases hold for up to `held_release_span = read_span + max(R + m, Kd)`
+  (`Kd`: a strict mount's kernel drain). With
+  `CONSTELLATION_READ_DELEGATION_TTL_MS` unbounded, that fails above
+  R of about 40 s at the daemon defaults, and at the default R below a lease
+  TTL of about 4.5 s, silently.
+- *Decision.* D11b (`settle_cap_span >= held_release_span`, `Warn`) joins the
+  check; the simulation waives it only for its two R = 30 s configurations,
+  which run no delegate streams. The daemon runs the check once, as it starts
+  (`authority_driver::enforce_deadlines`; there is no reload):
+  - it **cuts R** to the longest TTL that keeps D11 and D11b
+    (`read_ttl_fitting_settle_cap`), with a warning naming both values, and
+    refuses to start if none fits;
+  - it **refuses to start** on any other `Refuse`-class violation, naming the
+    invariant, except D2;
+  - it logs `Warn`-class violations, and D2 as an error.
+- *Why a cut and not a refusal for D11/D11b.* Refusing is the integrity-first
+  default, but it would stop configurations the harness runs and tests:
+  `snapacct` (lease 1 s) and the snapshot churn (lease 200 ms) at the default
+  R fail D11b. A cut keeps the invariant, so it gives up nothing the refusal
+  would keep. R is a lifetime renewed while in use, and a shorter grant only
+  costs renewals. D8 already cuts the lock TTL the same way. Warning only was
+  rejected: it keeps the hazard.
+- *Why D2 is not refused.* It fails at a lease TTL of 1 s or less with the
+  default 500 ms forward timeout, which is where those same two harness
+  configurations run. Refusing it would stop them, and cutting the forward
+  timeout below the settle window is not a narrow change. It stays an open
+  item.
+- *Scope.* D11b covers one merged release. Three or more, a settle that began
+  before the hold, and a redirected settle rest on the simulation's S4 tag.
+
 See: `crates/authority/src/deadlines.rs`,
+`crates/engine/src/authority_driver.rs` (`enforce_deadlines`),
 [configuration reference](../reference/configuration.md#derived-timings),
 [design](DESIGN.md#protocol-bounds).
 

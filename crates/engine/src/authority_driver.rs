@@ -875,6 +875,82 @@ pub fn load_config(
     c
 }
 
+/// The deadline invariants the daemon does not refuse, though their class is
+/// `Refuse`: D2 (a settle window above the forward timeout) fails at a lease
+/// TTL of 1 s or less with the default 500 ms forward timeout, and the
+/// harness's short-lease scenarios (`snapacct` at 1 s, the snapshot churn at
+/// 200 ms) run there. They are logged as errors.
+const DEADLINES_NOT_REFUSED: &[&str] = &["D2"];
+
+/// The protocol deadlines (`constellation_authority::deadlines`) of the
+/// configuration this daemon starts with, the last step before its core is
+/// built: the daemon has no reload, so this is the only time they change.
+///
+/// - **D11 and D11b** (a settle's cap outlasts the hold of a delegate's
+///   release, with one more merged into it): the read-delegation TTL is cut
+///   to the longest that fits (`read_ttl_fitting_settle_cap`), with a
+///   warning, as D8 cuts the lock TTL. A shorter grant only costs renewals.
+/// - **`Refuse`-class violations** stop the start, except those in
+///   [`DEADLINES_NOT_REFUSED`], which are logged as errors.
+/// - **`Warn`-class violations** are logged.
+///
+/// # Errors
+///
+/// A `Refuse`-class violation, or a configuration in which no read-delegation
+/// TTL fits D11b. The message names each invariant and its values.
+pub fn enforce_deadlines(c: &mut Config) -> Result<()> {
+    use constellation_authority::deadlines::{read_ttl_fitting_settle_cap, Class, Deadlines};
+    let configured = c.read_delegation_ttl_ms;
+    let Some(fitted) = read_ttl_fitting_settle_cap(c) else {
+        let mut probe = c.clone();
+        probe.read_delegation_ttl_ms = 1;
+        anyhow::bail!(
+            "deadline D11b: no read-delegation TTL fits the settle cap span ({} ms) with the \
+             kernel drain ({} ms) and the expiry margin ({} ms)",
+            Deadlines::new(&probe).settle_cap_span,
+            c.kernel_cache_ttl_ms,
+            c.expiry_margin_ms
+        );
+    };
+    if fitted != configured {
+        tracing::warn!(
+            configured_read_delegation_ttl_ms = configured,
+            read_delegation_ttl_ms = fitted,
+            "deadline D11b: a held release with one more merged into it would outlast the settle \
+             cap; running with the read-delegation TTL cut to fit"
+        );
+        c.read_delegation_ttl_ms = fitted;
+    }
+    let mut refused = Vec::new();
+    for v in Deadlines::new(c).check() {
+        match v.class {
+            Class::Refuse if !DEADLINES_NOT_REFUSED.contains(&v.id) => {
+                refused.push(format!("{}: {}", v.id, v.msg));
+            }
+            Class::Refuse => tracing::error!(
+                deadline = v.id,
+                "deadline {} fails, not refused (short-lease configurations run there): {}",
+                v.id,
+                v.msg
+            ),
+            Class::Warn => {
+                tracing::warn!(deadline = v.id, "deadline {} fails: {}", v.id, v.msg);
+            }
+        }
+    }
+    if !refused.is_empty() {
+        anyhow::bail!(
+            "the protocol deadlines refuse this configuration: {}",
+            refused.join("; ")
+        );
+    }
+    tracing::info!(
+        read_delegation_ttl_ms = c.read_delegation_ttl_ms,
+        "protocol deadlines checked"
+    );
+    Ok(())
+}
+
 /// Plan 30 §M9: `fs create --ack-policy local|s3`, defaulting to
 /// `CONSTELLATION_ACK`; `None` (neither set) stores no policy (`local`).
 ///
@@ -8336,6 +8412,7 @@ impl Standalone {
 #[cfg(test)]
 mod tests {
     use super::parse_u64_zero_ok;
+    use super::{enforce_deadlines, Config};
     use super::{LeaseMode, LeaseStore, PARTITION};
     use std::sync::Arc;
     use std::time::Duration;
@@ -10762,5 +10839,85 @@ mod tests {
             "the sequencer had the report when the drain returned"
         );
         assert!(upload.take_durable_reports().is_empty(), "sent, not owed");
+    }
+
+    /// The daemon's configuration at its defaults, as `load_config` and the
+    /// mount build it, without reading the environment: L 60 s, m 1 s, the
+    /// delegation TTL the lock TTL's, and a strict mount's kernel drain.
+    fn daemon_defaults() -> Config {
+        let mut c = Config::defaults(1, 1);
+        c.ttl_ms = 60_000;
+        c.expiry_margin_ms = 1_000;
+        c.forward_timeout_ms = 500;
+        c.kernel_cache_ttl_ms = 1_500;
+        c.delegation_ttl_ms = 0;
+        constellation_authority::deadlines::normalize(&mut c);
+        c
+    }
+
+    /// The defaults start as configured: nothing is cut or refused.
+    #[test]
+    fn the_daemon_defaults_pass_the_deadline_check() {
+        let mut c = daemon_defaults();
+        enforce_deadlines(&mut c).unwrap();
+        assert_eq!(c.read_delegation_ttl_ms, 5_000);
+        assert!(constellation_authority::deadlines::Deadlines::new(&c)
+            .check()
+            .is_empty());
+    }
+
+    /// An unbounded read-delegation TTL is cut to the longest D11b allows
+    /// (cap 84500, 2R + 4000), and D11b then holds. Fails on the parent: the
+    /// daemon never ran the check, and R = 100 s ran with a settle cap below
+    /// the hold of a release.
+    #[test]
+    fn a_read_delegation_ttl_past_d11b_is_cut_to_fit() {
+        for r in [40_251, 100_000, u64::MAX] {
+            let mut c = daemon_defaults();
+            c.read_delegation_ttl_ms = r;
+            enforce_deadlines(&mut c).unwrap();
+            assert_eq!(c.read_delegation_ttl_ms, 40_250, "R {r}");
+            let d = constellation_authority::deadlines::Deadlines::new(&c);
+            assert!(d.settle_cap_span >= d.held_release_span, "{d:?}");
+        }
+    }
+
+    /// A `Refuse`-class violation stops the start: a read-delegation TTL not
+    /// above the expiry margin (D1).
+    #[test]
+    fn a_refused_deadline_stops_the_start() {
+        let mut c = daemon_defaults();
+        c.read_delegation_ttl_ms = 1_000;
+        let e = enforce_deadlines(&mut c).unwrap_err().to_string();
+        assert!(e.contains("D1:"), "{e}");
+    }
+
+    /// D2 at the harness's short leases is logged, not refused, and R is cut
+    /// to fit D11b there too (1 s lease: cap 9750, 2R + 2500).
+    #[test]
+    fn a_short_lease_starts_with_d2_logged() {
+        for (lease, r) in [(1_000, 3_625), (200, 3_325)] {
+            let mut c = daemon_defaults();
+            c.ttl_ms = lease;
+            c.expiry_margin_ms = 1_000.min(lease / 4);
+            c.lock_ttl_ms = constellation_authority::deadlines::lock_ttl_fitting_lease(
+                20_000,
+                c.ttl_ms,
+                c.expiry_margin_ms,
+            );
+            c.delegation_ttl_ms = 0;
+            constellation_authority::deadlines::normalize(&mut c);
+            let ids = |c: &Config| {
+                constellation_authority::deadlines::Deadlines::new(c)
+                    .check()
+                    .into_iter()
+                    .map(|v| v.id)
+                    .collect::<Vec<_>>()
+            };
+            assert!(ids(&c).contains(&"D2"), "lease {lease}");
+            enforce_deadlines(&mut c).unwrap();
+            assert_eq!(c.read_delegation_ttl_ms, r, "lease {lease}");
+            assert!(!ids(&c).contains(&"D11b"), "lease {lease}");
+        }
     }
 }

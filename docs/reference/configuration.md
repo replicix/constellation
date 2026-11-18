@@ -531,7 +531,7 @@ Plan 30 M6–M8. See [Close-to-open modes](features/cto-modes.md).
 | `CONSTELLATION_READ_DELEGATIONS` | on | boolean | this node, as sequencer, grants read delegations to strict readers. Off: every strict read costs a round trip. Always off with P2P off |
 | `CONSTELLATION_READ_AHEAD_GRANTS` | `128` | 0 to 512; `0` turns it off | how many children of a directory one ReadIndex answer (a strict listing, or a lookup under a held directory delegation that misses a child's) grants read delegations on, so a cold scan costs a round trip per this many entries, not per entry. Each is an ordinary grant |
 | `CONSTELLATION_READ_GRANTS_PER_NODE` | `8192` | count | the most read delegations one node may hold live from this sequencer before a read-ahead grants it no more (the single grant a read asks for is still made); bounds the grant table every write scans. A directory bigger than this is scanned with a round trip per further child until earlier grants lapse |
-| `CONSTELLATION_READ_DELEGATION_TTL_MS` | `5000` | milliseconds, at least 1 | a read delegation's lifetime, renewed while in use; also capped by the granting lease |
+| `CONSTELLATION_READ_DELEGATION_TTL_MS` | `5000` | milliseconds, above the expiry margin (D1: refused at or below it) | a read delegation's lifetime, renewed while in use; also capped by the granting lease. Cut at start to the longest TTL that keeps D11b (40250 at the defaults; see [Derived timings](#derived-timings)) |
 | `CONSTELLATION_LOG_STREAMS` | on | boolean | followers subscribe to the holder's direct log stream instead of polling S3 (plan 30 M7). Always off with P2P off |
 | `CONSTELLATION_LOG_STREAM_HEARTBEAT_MS` | `1000` | milliseconds; `0` means the default | the holder's heartbeat frame to a subscriber it has sent nothing to |
 | `CONSTELLATION_LOG_STREAM_TIMEOUT_MS` | `3500` | milliseconds; `0` means the default | a subscription with no frame for this long is dead; the subscriber falls back to S3 and resubscribes |
@@ -1354,8 +1354,25 @@ Every deadline, cap, window or horizon that a safety argument rests on is
 computed in one place, `crates/authority/src/deadlines.rs`, from the knobs
 above; a few of them are not knobs and cannot be set. The core, the
 simulation and its oracle read the same values, and `Deadlines::check` states
-the invariants between them (the simulation asserts them for every
-configuration it runs). The table is generated from the module at the defaults (`UPDATE_DOCS=1
+the invariants between them. The simulation asserts them for every
+configuration it runs, and the daemon checks them as it starts
+(`authority_driver::enforce_deadlines`, ADR-48; there is no reload, so this is
+the only time they change):
+
+- **D11 and D11b** (a settle's cap outlasts the hold of a delegate's release,
+  `read_span`, and of a release with one more merged into it,
+  `held_release_span`): the daemon cuts `CONSTELLATION_READ_DELEGATION_TTL_MS`
+  to the longest TTL that fits and logs a warning naming both values. At the
+  defaults (cap 84500 ms) that is 40250 ms; at a 1 s lease, 3625 ms. As D8
+  cuts the lock TTL, a shorter grant only costs renewals.
+- **A `Refuse`-class invariant** (D1, D5, D6, D7, D9, D16) that fails stops
+  the start with an error naming it, for example a read-delegation TTL not
+  above the expiry margin (D1). D2 is the exception: it fails at a lease TTL
+  of 1 s or less with the default forward timeout, where the harness's
+  short-lease scenarios run, and is logged as an error.
+- **A `Warn`-class invariant** that fails is logged.
+
+The table is generated from the module at the defaults (`UPDATE_DOCS=1
 cargo test -p constellation-authority --lib configuration_md_derived_table_is_current`
 rewrites it).
 
@@ -1369,6 +1386,7 @@ rewrites it).
 | `R` | read-delegation TTL | `CONSTELLATION_READ_DELEGATION_TTL_MS` |
 | `D` | write-delegation TTL (unset: `max(K, 5000)`) | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS` |
 | `K` | lock TTL | `CONSTELLATION_LOCK_TTL_MS` |
+| `Kd` | kernel drain of a strict mount (`--cto strict`: `min(m/2, 1000) + 500`; else 0; 0 at the defaults) | `CONSTELLATION_CTO`, `REPLICIX_LEASE_TTL_MS` |
 | `F` | forward timeout | `CONSTELLATION_FORWARD_TIMEOUT_MS` |
 | `grace` | handover grace (default 5000) | `CONSTELLATION_STICKY_HANDOVER_GRACE_MS` |
 | `T` | backup takeover window | `CONSTELLATION_BACKUP_TAKEOVER_MS` |
@@ -1417,6 +1435,7 @@ rewrites it).
 | `leftover_hold` | 480000 | `4A` | `REPLICIX_LEASE_TTL_MS` |
 | `read_block` | 12000 | `2 (R + m)` | `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `read_span` | 8000 | `R + m + 2000` | `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
+| `held_release_span` | 14000 | `R + m + 2000 + max(R + m, Kd)` | `CONSTELLATION_CTO`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `read_hold_span` | 122000 | `A + T + F` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_FORWARD_TIMEOUT_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `lock_span` | 27000 | `max(K, D) * 5/4 + m + 1000` | `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |
 | `floor_span` | 45500 | `T + max(R, K) + D + 3m + 1000` | `CONSTELLATION_BACKUP_TAKEOVER_MS`, `CONSTELLATION_DELEGATION_TTL_MS`, `CONSTELLATION_LOCK_TTL_MS`, `CONSTELLATION_READ_DELEGATION_TTL_MS`, `REPLICIX_LEASE_TTL_MS` |

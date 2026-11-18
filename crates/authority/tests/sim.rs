@@ -4208,6 +4208,11 @@ fn strict_isolated_reader_long_config() -> SimConfig {
         faults,
         client_plan: vec![(1, 0, 2), (2, 1_600, 25), (3, 600, 400)],
         ops_per_client: 400,
+        // R = 30 s puts the hold of two merged releases (63 s) past the
+        // settle cap (37.9 s). No release is held here: the configuration
+        // runs no delegate streams (no `delegations`, `sticky_delegations`
+        // or placement), so D11b covers nothing it runs.
+        deadline_waivers: &["D11b"],
         ..base
     }
 }
