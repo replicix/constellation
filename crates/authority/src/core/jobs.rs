@@ -4117,17 +4117,12 @@ impl Core {
         // not adopted (the lease it wrote is read again at the next attempt):
         // re-shipping from the lease's own hold instead could cut the union
         // silently (`kept_tails_readopted`).
-        // (The predecessor is the one the gate below works from: the lease an
-        // earlier ambiguous takeover CAS replaced, when that one landed.)
-        let gate_prev: Option<Lease> = match (&plan, &self.lease.ambiguous_claim) {
-            (Plan::Claim { prev, .. }, Some((claimed, replaced)))
-                if prev.holder == self.cfg.node_id
-                    && prev.epoch == *claimed
-                    && sent.epoch == *claimed =>
-            {
-                Some(replaced.clone())
-            }
-            (Plan::Claim { prev, .. }, _) => Some(prev.clone()),
+        // (The plan's own predecessor: when it is this node's lease, it names
+        // the union, whether or not an earlier ambiguous takeover CAS landed
+        // behind it. The predecessor that CAS replaced serves the strict-read
+        // floor below, never the union: it is another node's lease.)
+        let gate_prev: Option<Lease> = match &plan {
+            Plan::Claim { prev, .. } => Some(prev.clone()),
             _ => None,
         };
         let Some(readopted) = self.kept_gate_tails(gate_prev.as_ref(), replica) else {
@@ -4166,6 +4161,11 @@ impl Core {
         // CAS whose outcome was unknown is that takeover having landed:
         // its predecessor is the lease that CAS replaced (the sealed
         // holder's), for the strict-read floor and the backup tail alike.
+        // (The own lease's naming of a tail is read before the predecessor an
+        // ambiguous takeover replaced stands in for it.)
+        let own_names_tail = prev.as_ref().is_some_and(|p| {
+            p.holder == self.cfg.node_id && p.epoch == epoch && p.inherited_tail.is_some()
+        });
         let ambiguous = self.lease.ambiguous_claim.take();
         let prev = match (prev, ambiguous) {
             (Some(p), Some((claimed, replaced)))
@@ -4373,6 +4373,7 @@ impl Core {
         let kept_tails: Vec<(Epoch, u64)> = readopted;
         if !kept_fetched && !kept_tails.is_empty() {
             self.bk.gate_tails_from = kept_tails[0].0;
+            self.stats.kept_readoptions += 1;
         }
         let backup_tail_epoch = kept_tails.first().map(|t| t.0).or(backup_tail_epoch);
         if takeover
@@ -4411,9 +4412,7 @@ impl Core {
         };
         self.bk.gate_abandoned = self.bk.abandoned_claim.take();
         self.bk.gate_abandoned_through = std::mem::take(&mut self.bk.abandoned_through);
-        self.bk.gate_names_tail = prev.as_ref().is_some_and(|p| {
-            p.holder == self.cfg.node_id && p.epoch == epoch && p.inherited_tail.is_some()
-        });
+        self.bk.gate_names_tail = own_names_tail;
         self.bk.gate_orphan_proof = self.claim_orphan_proof(replica, prev.as_ref(), epoch, marker);
         // (A takeover that ships no marker proves, and drops, nothing.)
         self.bk.gate_marker = (!marker).then(|| (epoch, Vec::new()));

@@ -71059,9 +71059,17 @@ mod kept_fetch {
     }
 
     /// Answers every S3 request from the bucket holding `body` until the
-    /// claim's CAS is issued; that CAS is answered `Conflict` although it
-    /// applied (the sim's `Fault::AppliedThen`). The lease it wrote.
-    fn win_until_cas_conflicts(h: &mut Harness, mut out: Vec<Action>, body: &Lease) -> Lease {
+    /// claim's CAS is issued; that CAS is answered `failure` (`Conflict`
+    /// although it applied: the sim's `Fault::AppliedThen`). The lease it
+    /// wrote. After a `Failed` the lease is read again, and that read fails
+    /// too: the in-doubt branch that leaves the claim unadopted and the PUT
+    /// applied.
+    fn win_until_cas_fails(
+        h: &mut Harness,
+        mut out: Vec<Action>,
+        body: &Lease,
+        failure: crate::event::CasFailure,
+    ) -> Lease {
         let mut won = None;
         for _ in 0..60 {
             let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
@@ -71073,10 +71081,20 @@ mod kept_fetch {
             for (op, req) in ops {
                 if let S3Op::LeaseSwap { lease, .. } | S3Op::LeaseCreate { lease } = &req {
                     let sent = lease.clone();
-                    h.step(Event::S3 {
+                    let failed = matches!(failure, crate::event::CasFailure::Failed(_));
+                    let after = h.step(Event::S3 {
                         op,
-                        result: S3Result::LeasePut(Err(crate::event::CasFailure::Conflict)),
+                        result: S3Result::LeasePut(Err(failure)),
                     });
+                    if failed {
+                        let (reread, _) = s3_ops(&after)[0];
+                        h.step(Event::S3 {
+                            op: reread,
+                            result: S3Result::LeaseGet(Err(crate::event::S3Failure(
+                                "unreachable".into(),
+                            ))),
+                        });
+                    }
                     return sent;
                 }
                 let result = answer_from_bucket(&req, body, &mut won);
@@ -71090,6 +71108,14 @@ mod kept_fetch {
     /// middle one carried by its log) and, with `upper`, rows at epoch 2, run
     /// to a CAS that applied but answered `Conflict`.
     fn in_doubt_kept_claim(upper: Option<Vec<BackupTx>>) -> (Harness, Lease, Vec<BackupTx>) {
+        in_doubt_kept_claim_with(upper, crate::event::CasFailure::Conflict)
+    }
+
+    /// [`in_doubt_kept_claim`] with the CAS answered `failure`.
+    fn in_doubt_kept_claim_with(
+        upper: Option<Vec<BackupTx>>,
+        failure: crate::event::CasFailure,
+    ) -> (Harness, Lease, Vec<BackupTx>) {
         let (mut h, out) = start(3, &fenced(), &[1, 2, 3], 1, false);
         let txs = rows(3);
         log_carries(&h, 1, &txs[1]);
@@ -71105,7 +71131,7 @@ mod kept_fetch {
             };
             last = h.step(answer_at(*n, *req, *e, served, vec![vec![1, 2]]));
         }
-        let sent = win_until_cas_conflicts(&mut h, last, &fenced());
+        let sent = win_until_cas_fails(&mut h, last, &fenced(), failure);
         (h, sent, txs)
     }
 
@@ -71179,30 +71205,60 @@ mod kept_fetch {
         assert!(failed >= 4, "the faults hit the reads: {failed}");
     }
 
+    /// Whether the acquisition's control op was answered, and `acquired`.
+    fn acquire_answered(out: &[Action]) -> Option<bool> {
+        out.iter().find_map(|a| match a {
+            Action::ControlDone {
+                op: OpId(700),
+                result: Ok(crate::ControlOk::Lease { acquired, .. }),
+            } => Some(*acquired),
+            _ => None,
+        })
+    }
+
     /// The acquisition of a re-adoption whose kept union cannot be read ends
     /// without adopting a gate: nothing is re-shipped from a stand-in hold.
     /// A fault is injected at each read of the acquisition in turn; wherever
     /// it lands in the union's reads (`kept_readopt_unreadable`), the claim
     /// is not adopted, and the next attempt, with the store readable, re-ships
-    /// the union.
+    /// the union. Both branches are hit and told apart: a fault in the check
+    /// before the CAS (none is issued) and one after it (the lease was
+    /// written; the re-adoption is not adopted, whatever it left).
     #[test]
     fn a_readoption_that_cannot_read_its_kept_union_ends_the_acquisition() {
-        let mut hit = 0;
+        let (mut pre, mut post) = (0, 0);
         for after in 0..60 {
             let (mut h, sent, txs) = in_doubt_kept_claim(None);
+            let holder_epoch = h.meta.holder_epoch();
             constellation_meta::fail_store_reads_after_on_this_thread_for_tests(after, 1);
             let out = acquire(&mut h, &sent);
             let out = win(&mut h, out, &sent);
             constellation_meta::fail_store_reads_after_on_this_thread_for_tests(0, 0);
-            drop(out);
             if h.core.stats.kept_readopt_unreadable == 0 {
                 continue;
             }
-            hit += 1;
-            assert!(
-                h.core.bk.gate_tails.is_empty(),
-                "after {after}: a gate was built"
+            let issued = cas(&out).is_some();
+            if issued {
+                post += 1;
+            } else {
+                pre += 1;
+            }
+            assert_eq!(
+                acquire_answered(&out),
+                Some(false),
+                "after {after}: the waiter was told the lease was not acquired"
             );
+            assert_eq!(
+                h.meta.holder_epoch(),
+                holder_epoch,
+                "after {after}: the holder epoch was set (issued {issued})"
+            );
+            assert!(h.core.job.is_none(), "after {after}: the job ended");
+            assert!(
+                h.core.bk.gate_tails.is_empty() && h.core.bk.fetched.is_empty(),
+                "after {after}: a gate was built (issued {issued})"
+            );
+            assert_eq!(h.core.stats.kept_readoptions, 0, "after {after}");
             assert!(
                 !reshipped(&h).contains(&(1, txs[2].first)),
                 "after {after}: re-shipped from a stand-in"
@@ -71213,9 +71269,246 @@ mod kept_fetch {
             assert!(got.contains(&(1, txs[0].first)), "after {after}: {got:?}");
             assert!(got.contains(&(1, txs[2].first)), "after {after}: {got:?}");
         }
+        assert!(pre > 0, "no fault landed in the check before the CAS");
+        assert!(post > 0, "no fault landed in the check after the CAS");
+    }
+
+    /// Node 1's epoch-5 lease, which names a kept union of its epoch 1, fenced
+    /// for its retirement (epoch 6): a claim of it collects the epochs 5 and 6
+    /// of the tenure and 1 and 2 of the union, and its own lease (epoch 7)
+    /// names the first with rows, 1, with the stream at 5 behind it.
+    fn fenced_over_a_union() -> Lease {
+        let mut l = lease_of(1, 5, 0);
+        l.inherited_tail = Some(Box::new(InheritedTail {
+            epoch: 1,
+            config_version: 1,
+            members: vec![2],
+            through: 3,
+            kept: true,
+            holder: 1,
+        }));
+        l.fenced_for_retirement(1, 0)
+    }
+
+    /// `n` transactions of `node`'s journal at `epoch`.
+    fn rows_of(node: NodeId, epoch: Epoch, n: u64) -> Vec<BackupTx> {
+        let holder = Harness::new(node);
+        holder.meta.set_holder_epoch(epoch);
+        for i in 1..=n {
+            let create = holder.create(&format!("h{epoch}{i}"));
+            let rid = Rid {
+                node,
+                incarnation: 1,
+                seq: i,
+            };
+            constellation_meta::execute_mutate(&holder.meta, &create, Some(rid)).unwrap();
+        }
+        holder.meta.journal_txs_from(1, 1000).unwrap()
+    }
+
+    /// Node 3's kept claim of [`fenced_over_a_union`], with rows at the
+    /// union's epoch 1 and the tenure's epoch 5, run to a CAS answered
+    /// `failure`.
+    fn in_doubt_union_claim(
+        failure: crate::event::CasFailure,
+    ) -> (Harness, Lease, Vec<BackupTx>, Vec<BackupTx>) {
+        let prev = fenced_over_a_union();
+        let (mut h, out) = start(3, &prev, &[1, 2, 3], 1, false);
+        let (low, high) = (rows(2), rows_of(4, 5, 2));
+        let a = asks(&out);
+        let epochs: Vec<Epoch> = a.iter().map(|x| x.2).collect();
         assert!(
-            hit > 0,
-            "no injected fault landed in the kept union's reads"
+            [1, 2, 5, 6].iter().all(|e| epochs.contains(e)),
+            "both generations are collected: {epochs:?}"
+        );
+        let out = win(&mut h, out, &prev);
+        assert!(cas(&out).is_none());
+        let mut last = Vec::new();
+        for (n, req, e) in a.iter().filter(|x| x.0 == 2) {
+            let served = match *e {
+                1 => low.clone(),
+                5 => high.clone(),
+                _ => Vec::new(),
+            };
+            last = h.step(answer_at(*n, *req, *e, served, vec![vec![1, 2]]));
+        }
+        let sent = win_until_cas_fails(&mut h, last, &prev, failure);
+        (h, sent, low, high)
+    }
+
+    /// A union can span more than two epochs: the lease it replaces names a
+    /// union of its own (epochs 1 and 2) and ends a tenure with rows (5 and
+    /// 6), and the claimant's install keeps a tail at each epoch that has
+    /// rows. A re-adoption rebuilds every one of them, not only the first two.
+    /// Fails before: the rebuild read epochs 1 and 2 only, and the rows of
+    /// epoch 5 were never re-journaled.
+    #[test]
+    fn a_readopted_union_over_a_second_generation_reships_every_epoch() {
+        let (mut h, sent, low, high) = in_doubt_union_claim(crate::event::CasFailure::Conflict);
+        let t = sent.inherited_tail.clone().expect("names the union");
+        assert!(t.kept && t.epoch == 1, "{t:?}");
+        let have: Vec<Epoch> = (1..sent.epoch)
+            .filter(|e| {
+                h.meta
+                    .backup_tail(*e)
+                    .unwrap()
+                    .iter()
+                    .any(|x| !x.records.is_empty())
+            })
+            .collect();
+        assert_eq!(have, vec![1, 5], "the install stored both generations");
+        let out = acquire(&mut h, &sent);
+        let _ = win(&mut h, out, &sent);
+        let got = reshipped(&h);
+        assert!(got.contains(&(1, low[0].first)), "{got:?}");
+        assert!(got.contains(&(5, high[0].first)), "{got:?}");
+        assert_eq!(h.core.stats.tail_beyond_gap_dropped, 0);
+    }
+
+    /// The in-doubt re-adoption: the claim's CAS answered `Failed`, the
+    /// re-read failed too (the PUT had applied), and the next acquisition
+    /// finds this node's own lease as a takeover, with the predecessor's
+    /// lease recorded (`ambiguous_claim`). The gate rebuilds the union from
+    /// the node's own lease, whatever the predecessor was. Fails before: the
+    /// rebuild worked from the predecessor's lease (not this node's), found
+    /// nothing, and the rows were not re-shipped.
+    #[test]
+    fn an_in_doubt_kept_claim_is_rebuilt_from_its_own_lease() {
+        let failed = || crate::event::CasFailure::Failed("reset".into());
+        for upper in [None, Some(rows_at_epoch_2(2))] {
+            let (mut h, sent, txs) = in_doubt_kept_claim_with(upper.clone(), failed());
+            assert_eq!(
+                h.core.lease.ambiguous_claim.as_ref().map(|a| a.0),
+                Some(sent.epoch),
+                "the takeover is recorded as in doubt"
+            );
+            assert!(h.core.bk.fetched.is_empty(), "the failed claim dropped it");
+            let out = acquire(&mut h, &sent);
+            let _ = win(&mut h, out, &sent);
+            let got = reshipped(&h);
+            assert!(got.contains(&(1, txs[0].first)), "{got:?}");
+            assert!(got.contains(&(1, txs[2].first)), "{got:?}");
+            if let Some(u) = &upper {
+                assert!(got.contains(&(2, u[0].first)), "{got:?}");
+            }
+            assert_eq!(h.core.stats.kept_readoptions, 1);
+            assert_eq!(h.core.stats.tail_beyond_gap_dropped, 0);
+            assert_eq!(h.core.stats.ttl_claims_without_tail, 0);
+        }
+    }
+
+    /// The same for the three-generation union of
+    /// [`a_readopted_union_over_a_second_generation_reships_every_epoch`].
+    #[test]
+    fn an_in_doubt_claim_over_a_second_generation_reships_every_epoch() {
+        let failed = crate::event::CasFailure::Failed("reset".into());
+        let (mut h, sent, low, high) = in_doubt_union_claim(failed);
+        assert!(h.core.lease.ambiguous_claim.is_some());
+        let out = acquire(&mut h, &sent);
+        let _ = win(&mut h, out, &sent);
+        let got = reshipped(&h);
+        assert!(got.contains(&(1, low[0].first)), "{got:?}");
+        assert!(got.contains(&(5, high[0].first)), "{got:?}");
+    }
+
+    /// Node 3's forced claim of `fenced()`: node 2 answers the copies
+    /// `at_one` of epoch 1 (the claimant's log carries `carried`), and the
+    /// attempt runs to its CAS or its end. The claimant's stats and the CAS.
+    fn forced_claim(
+        at_one: Vec<BackupTx>,
+        carried: &BackupTx,
+        force: bool,
+    ) -> (Harness, Option<Lease>) {
+        let mut h = Harness::new(3);
+        h.core.cfg.kept_fetch_skipped = false;
+        h.core.cfg.takeover_promise_check = false;
+        h.core.cfg.epoch_slack = 1;
+        h.core.bk.kept_force = force;
+        h.watch(&fenced());
+        let issued = h.clk().wait;
+        h.step(roster_ev(vec![1, 2, 3], issued));
+        h.advance(10);
+        log_carries(&h, 1, carried);
+        let out = acquire(&mut h, &fenced());
+        let a = asks(&out);
+        let out = win(&mut h, out, &fenced());
+        assert!(cas(&out).is_none());
+        let mut last = Vec::new();
+        for (n, req, e) in a.iter().filter(|x| x.0 == 2) {
+            let served = if *e == 1 { at_one.clone() } else { Vec::new() };
+            last = h.step(answer_at(*n, *req, *e, served, vec![vec![1, 2]]));
+        }
+        let all = win(&mut h, last, &fenced());
+        let written = cas(&all);
+        (h, written)
+    }
+
+    /// A copy whose first-1 is carried but whose run before it (from the copy
+    /// ahead of it) is not: the merge takes it, the store would refuse the
+    /// union. Under `--force` (or an abandon) the union is cut at the first
+    /// uncarried seq and the claim goes on with what is contiguous; without,
+    /// the attempt ends once (`kept_install_gaps`) and writes nothing. Before:
+    /// the forced claim retried the same refusal for ever.
+    #[test]
+    fn an_uncarried_run_under_a_forced_claim_cuts_the_union_there() {
+        let txs = rows(5);
+        let answers = vec![txs[0].clone(), txs[4].clone()];
+        let (h, written) = forced_claim(answers.clone(), &txs[3], true);
+        let sent = written.expect("the forced claim goes on");
+        assert_eq!(h.core.stats.kept_install_gaps, 0);
+        assert_eq!(h.core.stats.kept_past_gap, 1, "the copy past the gap");
+        let got = reshipped(&h);
+        assert_eq!(got, vec![(1, txs[0].first)], "only what is contiguous");
+        assert!(sent.inherited_tail.is_some_and(|t| t.kept && t.epoch == 1));
+        let (h, written) = forced_claim(answers, &txs[3], false);
+        assert!(written.is_none(), "the plain claim writes nothing");
+        assert_eq!(h.core.stats.kept_install_gaps, 1);
+        assert!(h.meta.backup_tail(1).unwrap().is_empty());
+    }
+
+    fn span(first: u64, last: u64, with_rows: bool) -> BackupTx {
+        BackupTx {
+            first,
+            last,
+            records: if with_rows {
+                rows(1)[0].records.clone()
+            } else {
+                Vec::new()
+            },
+            origin: (0, 0),
+        }
+    }
+
+    /// `fill_log_carried`: a run whose first-1 only is carried is not filled
+    /// (and is named as the cut), and the seqs a stored span holds are left to
+    /// it, not widened over.
+    #[test]
+    fn the_filler_covers_exactly_the_carried_seqs_between_copies() {
+        let carried = |s: u64| s == 4 || s == 7 || s == 8;
+        // 1, then 5: the run 2..=4 has uncarried seqs.
+        let (out, cut) = super::super::kept::fill_log_carried(
+            &[],
+            &[span(1, 1, true), span(5, 5, true)],
+            carried,
+        );
+        assert_eq!(cut, Some(2));
+        assert_eq!(out.len(), 2, "no filler over a run with an uncarried seq");
+        // 1, then 9 over a stored span 5..=6: the stored span is left alone,
+        // the carried seqs around it are filled, the rest is the cut.
+        let stored = [span(5, 6, true)];
+        let (out, cut) = super::super::kept::fill_log_carried(
+            &stored,
+            &[span(1, 1, true), span(9, 9, true)],
+            |s| (2..=4).contains(&s) || (7..=8).contains(&s),
+        );
+        assert_eq!(cut, None);
+        let got: Vec<(u64, u64, bool)> = out
+            .iter()
+            .map(|t| (t.first, t.last, !t.records.is_empty()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, 1, true), (2, 4, false), (7, 8, false), (9, 9, true)]
         );
     }
 }

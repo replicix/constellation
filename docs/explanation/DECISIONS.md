@@ -4337,15 +4337,24 @@ the store's own append decides whether the hold reaches the tip (`Replica::backu
 merge runs inside the write transaction, so no kept-local copy of it can disagree with the store). It runs for each epoch before any role or
 seal, and on `Gap` nothing is written, the error is logged, `kept_install_gaps` counts it (a sim-failing seed) and the attempt ends in every
 build; an unreadable stored tail is counted apart (`kept_install_unreadable`). The gate no longer depends on `bk.fetched` for a union this
-node's own lease names (`inherited_tail.kept`, an epoch below the lease's): `acquire_won` rebuilds the tails from the store (epochs
-`t.epoch` and `t.epoch + 1` with a record-bearing tail, `through = backup_acked`). An unreadable store is no stand-in: the lease's own
+node's own lease names (`inherited_tail.kept`, an epoch below the lease's): `acquire_won` rebuilds the tails from the store (every epoch
+from `t.epoch` below the lease's own with a record-bearing tail, `through = backup_acked`; a union spans up to four generations: the
+previous tenure's two epochs and the named union's two), from the node's own lease whether or not an in-doubt takeover CAS had replaced
+another node's lease behind it. An unreadable store is no stand-in: the lease's own
 `through` is not used (it could re-ship a cut silently); the acquisition ends (`kept_readopt_unreadable`), before the CAS when the read
 fails there (`acquire_cas`), and after it, as a re-adoption that is not adopted, when it fails in between; the next attempt reads the
 lease again. Fault-injection tests: `a_kept_union_that_cannot_be_read_names_no_readoption_tails`,
 `a_readoption_that_cannot_read_its_kept_union_ends_the_acquisition`. Fail-before tests:
 `a_kept_union_over_a_seq_the_log_carries_is_held_to_its_tip`, `a_readopted_kept_claim_reships_the_rows_past_a_seq_the_log_carries`,
-`a_readopted_two_epoch_kept_union_reships_both_epochs`. Not changed: `core/seal_tail.rs` (its role answers are no longer cut once the
-tail is stored contiguous).
+`a_readopted_two_epoch_kept_union_reships_both_epochs`, `an_in_doubt_kept_claim_is_rebuilt_from_its_own_lease`,
+`a_readopted_union_over_a_second_generation_reships_every_epoch`. A seq no source covers and the log does not carry between two
+copies (an abandoned or forced claim) cuts the union there (`fill_log_carried`, counted in `kept_past_gap`); the plain claim ends once
+on the store's `Gap`. A two-epoch union's lower epoch may be written before the upper one ends the attempt: no role, no seal,
+idempotent on the retry, trimmed by the next higher-epoch segment. Residual, unchanged: `core/seal_tail.rs` answers a stored tail
+only for the epoch and the one role that match, and a two-epoch install's role is the upper epoch's, so this node's stored copy of
+the lower epoch is not answered to a later claimant of a union (member copies and the kept streams are); the role answers of a
+single-epoch union are no longer cut once it is stored contiguous. Under an operator abandon of the other keepers this copy is the
+last one: follow-up, per-epoch roles or answering from the lease's named union.
 
 ## ADR-52: A singleton answer leaves only on a fresh reading of a usable lease
 

@@ -774,9 +774,11 @@ impl Core {
 
     /// A re-adoption of this node's own lease that names a kept union
     /// (`inherited_tail.kept`, an epoch below the lease's) with `bk.fetched`
-    /// gone: the union's tails from the store, the epochs `t.epoch` and
-    /// `t.epoch + 1` that hold a record-bearing tail, each with its
-    /// contiguous hold (the install stores the union contiguous to its tip).
+    /// gone: the union's tails from the store, every epoch from `t.epoch` up
+    /// to the lease's own that holds a record-bearing tail (a union spans up
+    /// to four generations: the previous tenure's two epochs and the named
+    /// union's two), each with its contiguous hold (the install stores the
+    /// union contiguous to its tip).
     /// `Some(empty)`: nothing to re-adopt. `None`: the store could not be
     /// read; that is not "no tail" and no stand-in (the lease's own `through`)
     /// may take its place, which could re-ship a cut silently: the
@@ -795,7 +797,7 @@ impl Core {
             return Some(Vec::new());
         }
         let mut tails = Vec::new();
-        for e in [t.epoch, t.epoch + 1] {
+        for e in t.epoch..p.epoch {
             let Some(tail) = replica.backup_tail(e) else {
                 tracing::error!(
                     node = me,
@@ -993,7 +995,9 @@ impl Core {
                         let ident =
                             constellation_meta::tail_identity(&t.records).unwrap_or((*e, t.first));
                         debug_assert!(
-                            replica.row_in_log(*e, t.last) || replica.row_retired(ident.0, ident.1),
+                            replica.row_in_log(*e, t.last)
+                                || replica.row_retired(ident.0, ident.1)
+                                || t.last <= carried_through(*e),
                             "a hole {hf}..={} of epoch {e} covers the live copy {}..={}",
                             h.last,
                             t.first,
@@ -1104,10 +1108,12 @@ impl Core {
         // append decides, in its transaction, whether the hold reaches the
         // union's tip (`backup_append_contiguous`: the merge there, not a copy
         // of it here), and writes nothing on a gap, so the attempt ends and
-        // retries with nothing left behind. The fillers are the record-less
-        // spans over the seqs the log carries between the copies (the merge
-        // skipped them).
-        for (e, merged) in merged_by_epoch.iter().filter(|(_, m)| !m.is_empty()) {
+        // retries. (A two-epoch union's lower epoch may already be written
+        // when the upper one ends the attempt: no role, no seal, idempotent on
+        // the retry, and trimmed by the next higher-epoch segment.) The fillers
+        // are the record-less spans over the seqs the log carries between the
+        // copies (the merge skipped them).
+        for (e, merged) in merged_by_epoch.iter_mut().filter(|(_, m)| !m.is_empty()) {
             let Some(stored) = replica.backup_tail(*e) else {
                 self.stats.kept_install_unreadable += 1;
                 tracing::error!(
@@ -1118,9 +1124,29 @@ impl Core {
                 self.end_tail_fetch_attempt(now, replica, out);
                 return false;
             };
-            let filled = fill_log_carried(&stored, merged, |s| {
+            let (mut filled, cut) = fill_log_carried(&stored, merged, |s| {
                 replica.row_in_log(*e, s) || s <= carried_through(*e)
             });
+            // A seq the log does not carry between two copies, with the
+            // sources that held it given up (`--force`, an abandon): the union
+            // is cut there, as at any other gap past which nothing is carried
+            // (the plain case leaves it to the store, which refuses it: the
+            // attempt ends below).
+            if let Some(c) = cut.filter(|_| u.partial || u.force) {
+                let before = merged.len();
+                merged.retain(|t| t.last < c);
+                filled.retain(|t| t.last < c);
+                past_gap += before - merged.len();
+                tracing::warn!(
+                    node = me,
+                    epoch = e,
+                    seq = c,
+                    "a seq no source covers and the log does not carry: the kept union is cut there"
+                );
+                if merged.is_empty() {
+                    continue;
+                }
+            }
             match replica.backup_append_contiguous(*e, &filled) {
                 Some(TailAppend::Held) => {}
                 Some(TailAppend::Gap { acked }) => {
@@ -1267,15 +1293,20 @@ impl Core {
 
 /// The record-less spans that make `merged` contiguous with itself and with
 /// the epoch's already stored tail `stored`, over the seqs `carried` says the
-/// log has (the merge skipped those copies). A run with a seq that is not
-/// carried is left as a gap, which the store's append then refuses (`TailAppend::Gap`).
-fn fill_log_carried(
+/// log has (the merge skipped those copies). The seqs a stored span already
+/// holds are left to it (a span with rows is never widened over). A run with a
+/// seq that is neither carried nor stored is left as a gap, which the store's
+/// append then refuses (`TailAppend::Gap`); the second value is the lowest such
+/// seq (what a forced or abandoned claim cuts the union at).
+pub(super) fn fill_log_carried(
     stored: &[BackupTx],
     merged: &[BackupTx],
     carried: impl Fn(u64) -> bool,
-) -> Vec<BackupTx> {
+) -> (Vec<BackupTx>, Option<u64>) {
+    let in_stored = |s: u64| stored.iter().any(|t| t.first <= s && s <= t.last);
     let mut out: Vec<BackupTx> = Vec::with_capacity(merged.len());
     let mut out_last: Option<u64> = None;
+    let mut cut: Option<u64> = None;
     for tx in merged {
         // A copy a span written just before it covers (a hole the merge
         // widened over the copies it spans) is a late copy of rows gone: the
@@ -1283,24 +1314,43 @@ fn fill_log_carried(
         if out_last.is_some_and(|l| tx.last <= l) {
             continue;
         }
-        // What already holds the seqs below this copy: the stored tail's
-        // highest span below it, or the copies written before it.
-        let below = stored
-            .iter()
-            .map(|t| t.last)
-            .filter(|l| *l < tx.first)
-            .chain(out_last)
-            .max();
-        if let Some(p) = below.filter(|p| tx.first > p + 1 && (p + 1..tx.first).all(&carried)) {
-            out.push(BackupTx {
-                first: p + 1,
-                last: tx.first - 1,
-                records: Vec::new(),
-                origin: (0, 0),
-            });
+        // What already holds the seqs below this copy: the copies written
+        // before it, or (the first) the stored tail's highest span below it.
+        let below = out_last.or_else(|| {
+            stored
+                .iter()
+                .map(|t| t.last)
+                .filter(|l| *l < tx.first)
+                .max()
+        });
+        if let Some(p) = below {
+            let mut s = p + 1;
+            while s < tx.first {
+                if in_stored(s) {
+                    s += 1;
+                    continue;
+                }
+                let from = s;
+                while s < tx.first && !in_stored(s) && carried(s) {
+                    s += 1;
+                }
+                if from < s {
+                    out.push(BackupTx {
+                        first: from,
+                        last: s - 1,
+                        records: Vec::new(),
+                        origin: (0, 0),
+                    });
+                }
+                if s < tx.first && !in_stored(s) {
+                    // Neither carried nor stored: a gap the log does not have.
+                    cut = Some(cut.map_or(s, |c| c.min(s)));
+                    break;
+                }
+            }
         }
         out.push(tx.clone());
         out_last = Some(tx.last);
     }
-    out
+    (out, cut)
 }

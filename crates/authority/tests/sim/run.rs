@@ -7555,6 +7555,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.tail_answer_gaps, report.stats
             ));
         }
+        // (The sim injects no store read fault: an unreadable store here is a
+        // bug, not a fault.)
+        if stats.kept_install_unreadable > 0 || stats.kept_readopt_unreadable > 0 {
+            return Err(format!(
+                "node {id}: a kept union's stored tail was unreadable (kept_install_unreadable {}, kept_readopt_unreadable {})\n  stats: {:#?}",
+                stats.kept_install_unreadable, stats.kept_readopt_unreadable, report.stats
+            ));
+        }
         if stats.kept_install_gaps > 0 {
             return Err(format!(
                 "node {id}: {} kept union(s) would be stored below their tip (kept_install_gaps)\n  stats: {:#?}",

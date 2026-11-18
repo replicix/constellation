@@ -2372,6 +2372,11 @@ pub struct Stats {
     /// could not be read: the acquisition ends rather than re-ship from a
     /// stand-in (a store error).
     pub kept_readopt_unreadable: u64,
+    /// A re-adoption of this node's own kept-union lease whose gate was
+    /// rebuilt from the stored tails (`bk.fetched` gone: a claim CAS that
+    /// applied but did not answer, a restart). Not a failure; the sweeps
+    /// report it per label (`SWEEP-KEPT`) to show the rebuild runs.
+    pub kept_readoptions: u64,
     /// Plan 46 M1.2 step 5 (c3-spec D3): a sealed tail that did not apply
     /// (`MetaError::TailDiverged`), one per pass of the closed gate. Must
     /// stay 0; the sim fails a seed that has one.

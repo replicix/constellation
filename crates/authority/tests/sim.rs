@@ -8489,6 +8489,11 @@ fn sweep_config() {
         std::sync::atomic::AtomicU64::new(0),
     ]);
     let guard_base_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // ADR-51 (keptfix): over the sweep's nodes, [kept unions installed, gates
+    // rebuilt from the store at a re-adoption, seeds with one, tail rows
+    // dropped as beyond a gap, kept rows past a gap] (`SWEEP-KEPT`).
+    let kept_totals: std::sync::Arc<[std::sync::atomic::AtomicU64; 5]> =
+        std::sync::Arc::new(Default::default());
     // Plan 46 M1.2 step 15 (`SWEEP-HELD`): held delegate writes: [held,
     // forced, processed late, refused, accepted, fast-waited, fast-answered,
     // stale turn reads, late unacknowledged turns].
@@ -8519,6 +8524,7 @@ fn sweep_config() {
         let failover_all = failover_all.clone();
         let guard_rises = guard_rises.clone();
         let probe_races = probe_races.clone();
+        let kept_totals = kept_totals.clone();
         let held_totals = held_totals.clone();
         let guard_base_rises = guard_base_rises.clone();
         let superseded = superseded.clone();
@@ -8607,6 +8613,24 @@ fn sweep_config() {
                         .unwrap()
                         .extend(report.failover_ms.iter().copied());
                     guard_rises.fetch_add(report.guard_rises, ord);
+                    {
+                        let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+                            report.stats.values().map(f).sum()
+                        };
+                        let readoptions = sum(|s| s.kept_readoptions);
+                        let beyond = sum(|s| s.tail_beyond_gap_dropped);
+                        kept_totals[0].fetch_add(sum(|s| s.kept_fetches_completed), ord);
+                        kept_totals[1].fetch_add(readoptions, ord);
+                        kept_totals[2].fetch_add((readoptions > 0) as u64, ord);
+                        kept_totals[3].fetch_add(beyond, ord);
+                        kept_totals[4].fetch_add(sum(|s| s.kept_past_gap), ord);
+                        if readoptions > 0 || beyond > 0 {
+                            eprintln!(
+                                "SWEEP-KEPT-SEED {label} seed {seed}: kept_readoptions {readoptions} \
+                                 tail_beyond_gap_dropped {beyond}"
+                            );
+                        }
+                    }
                     probe_races[0].fetch_add(report.probe_races, ord);
                     probe_races[1].fetch_add((report.probe_races > 0) as u64, ord);
                     for (t, n) in held_totals.iter().zip([
@@ -8961,6 +8985,16 @@ fn sweep_config() {
         held_totals[6].load(ord),
         held_totals[7].load(ord),
         held_totals[8].load(ord),
+    );
+    eprintln!(
+        "SWEEP-KEPT {label} seeds {}/{seeds}: unions installed {}, gates rebuilt at a re-adoption {} \
+         (in {} seeds), tail rows dropped beyond a gap {}, kept rows past a gap {}",
+        seeds - f.len() as u64,
+        kept_totals[0].load(ord),
+        kept_totals[1].load(ord),
+        kept_totals[2].load(ord),
+        kept_totals[3].load(ord),
+        kept_totals[4].load(ord),
     );
     eprintln!(
         "SWEEP-PROBE-RACES {label} seeds {}/{seeds}: {} lane answers rested on the root's own proof \

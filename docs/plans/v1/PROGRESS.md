@@ -70680,3 +70680,15 @@ causes false gaps), ending the attempt on `Gap` before any role or seal (`kept_i
 rebuilds the kept tails of a re-adopted own lease from the store; an unreadable store now ends the acquisition (before the CAS, else as
 a re-adoption not adopted; `kept_readopt_unreadable`) instead of falling back to the lease's `through`, with fault-injection tests.
 Three fail-before tests in `mod kept_fetch`. See ADR-51's amendment.
+
+### Kept-union fix, round 3 (2026-11-18)
+
+Review follow-ups. (M1) `acquire_won` rebuilds a re-adopted own lease's tails from the plan's own predecessor (the node's own lease names
+the union), not from the lease an in-doubt takeover CAS replaced; `gate_names_tail` is read from the own lease too (an in-doubt CAS
+answered `Failed`, its re-read failing, then re-adopted: fail-before `an_in_doubt_kept_claim_is_rebuilt_from_its_own_lease`). (M2) The
+rebuild covers every epoch from `t.epoch` below the lease's own (a union spans up to four generations: fail-before
+`a_readopted_union_over_a_second_generation_reships_every_epoch`). (S1/S2) `fill_log_carried` fills only the carried seqs between copies
+and leaves stored spans alone; a seq neither carried nor stored cuts the union there under `--force`/an abandon (`kept_past_gap`) instead
+of retrying the store's refusal for ever. (S4) the fault test tells the pre-CAS from the post-CAS branch and pins the post-CAS state. (S5)
+`kept_readoptions` counts the rebuilt gates; `SWEEP-KEPT` reports it per label. (S6) the merge's debug assert knows `carried_through`.
+(N2) the sim fails a seed with an unreadable kept union. ADR-51's amendment documents the residual (S3).
