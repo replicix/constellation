@@ -706,7 +706,7 @@ impl Meta {
         // namespace key, ADR-60).
         if let Some(d) = journal::PendingDelegate::peek() {
             if d.idx.is_none()
-                && !d.release_only
+                && !d.is_release_only()
                 && kv_get_tx(tx, &self.local, &deleg_ended_at_gate_key(d.gen))?.is_some()
             {
                 return Err(MetaError::NotAdmitted);
@@ -1486,21 +1486,9 @@ impl Meta {
         deps: crate::session::Position,
     ) -> Result<u64, MetaError> {
         // The one write the gate fence of `begin_local` lets through on a
-        // generation the takeover gate ended: only release records, which
-        // execute no op, so anything else is refused here, before a row.
-        if records.is_empty()
-            || !records.iter().all(|r| {
-                matches!(
-                    r,
-                    LogRecord::StreamReleased { .. } | LogRecord::SubtreeReleased { .. }
-                )
-            })
-        {
-            return Err(MetaError::Invalid(
-                "a delegate's release row carries release records only".into(),
-            ));
-        }
-        let _d = journal::PendingDelegate::set_release(gen, deps);
+        // generation the takeover gate ended: `set_release` refuses anything
+        // but release records, before a row.
+        let _d = journal::PendingDelegate::set_release(gen, deps, records)?;
         self.apply_records_journaled_inner(records, None, Journaled::Plain)?;
         self.delegate_idx(gen)
     }

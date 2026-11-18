@@ -4021,6 +4021,119 @@ mod tests {
         assert_eq!(meta.log_stream_idx(gen).unwrap(), 5);
     }
 
+    /// ADR-60 (claim = release): a stream's release row ships after every
+    /// lower row of its stream. Row 2 seeds a poisoned chunk, so rows 2 and 3
+    /// are held; the release row (4) is held behind them though it touches
+    /// no namespace key, and ships only after the drop frees row 3.
+    #[test]
+    fn a_release_row_stays_behind_a_held_row_of_its_stream() {
+        use crate::mutate::MutateOp;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        let files: Vec<Ino> = (1..=3)
+            .map(|i| {
+                meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                    .unwrap()
+                    .ino
+            })
+            .collect();
+        let gen = (1u64 << 32) | 1;
+        let order = std::cell::RefCell::new(Vec::<u64>::new());
+        let ship = || {
+            let rows = meta.take_shippable(usize::MAX).unwrap();
+            if rows.is_empty() {
+                return;
+            }
+            let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+            let origins = meta.journal_origins(&seqs).unwrap();
+            order
+                .borrow_mut()
+                .extend(origins.iter().filter(|(g, _)| *g == gen).map(|(_, i)| *i));
+            meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        };
+        ship();
+        let setattr = |ino: Ino| MutateOp::Setattr {
+            ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, &setattr(files[0]), None).unwrap();
+        }
+        let hash = ChunkHash::of(b"lost");
+        let manifest = Manifest {
+            layout: replicix_chunkfmt::ChunkLayout::new(4096),
+            file_len: 7,
+            chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+        }
+        .encode();
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            meta.set_manifest_dirty(files[1], None, &manifest, 7, None, None, &[hash])
+                .unwrap();
+        }
+        {
+            let _g = journal::PendingDelegate::set(gen, None, crate::session::Position::ZERO);
+            crate::mutate::execute(&meta, &setattr(files[2]), None).unwrap();
+        }
+        let released = meta
+            .delegate_release(
+                &[LogRecord::StreamReleased {
+                    node: 1,
+                    gen,
+                    through: 3,
+                }],
+                gen,
+                crate::session::Position::ZERO,
+            )
+            .unwrap();
+        assert_eq!(released, 4);
+        meta.note_unrecoverable_chunks(&[(hash, files[1])], false)
+            .unwrap();
+        ship();
+        assert_eq!(
+            *order.borrow(),
+            vec![1],
+            "only row 1 ships ahead of the seed"
+        );
+        let held: Vec<u64> = meta.journal_held_back().unwrap().into_iter().collect();
+        let held_idx: Vec<u64> = meta
+            .journal_origins(&held)
+            .unwrap()
+            .into_iter()
+            .filter(|(g, _)| *g == gen)
+            .map(|(_, i)| i)
+            .collect();
+        assert!(
+            held_idx.contains(&4),
+            "the release row is held: {held_idx:?}"
+        );
+        let none = |_: crate::rid::Rid| false;
+        let no_ops = |_: &ChunkHash| Vec::new();
+        let sessions = LiveSessions::default();
+        let decided = meta
+            .drop_held_knowing(files[1], 0, false, &none, &no_ops, &sessions, true)
+            .unwrap();
+        assert!(decided.pending.is_some(), "{decided:?}");
+        ship();
+        meta.drop_held_apply(files[1], 0, &none, &no_ops, &sessions, true)
+            .unwrap();
+        ship();
+        let order = order.borrow();
+        let at = |i: u64| order.iter().position(|x| *x == i);
+        assert!(
+            at(3).unwrap() < at(4).expect("the release row shipped"),
+            "{order:?}"
+        );
+    }
+
     /// ADR-59 part B (drop contiguity), review SHOULD-3: a fill is the retire
     /// key of a delegate's own outstanding row. The root's drop rolled back
     /// its append of the delegate's row 2 (a dependent that needs the lost

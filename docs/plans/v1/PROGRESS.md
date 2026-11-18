@@ -70010,8 +70010,8 @@ seeds of `far-root-writes+lost-chunk-late` go [226, 996, 1810] -> [996, 1810], `
 [996] both; every other label clean on both sides (`far-root-writes{,-paused,-shared,-cross}+lost-chunk`,
 `far-placement+lost-chunk`, `sticky-claim`, `sticky-holder-restarts-placed`, `far-placement-release`, `far-root-writes`,
 `far-root-writes-paused`, `delegated-designated`, `drop-held-chain-backed`, `flex-crash+durability`). Seeds 996 and 1810
-are independent failures of the `+lost-chunk-late` variant, left. The variant and its seed 226 pin come with the
-drop-held fix.
+are independent failures of the `+lost-chunk-late` variant, left. The variant came with the drop-held fix; its seed 226
+pin (`a_reappended_seed_is_dropped_under_its_own_rid`) is tightened here to a full `.unwrap()`.
 
 
 ### M1.3 step 14: Leave ends grants first (2026-11-14)

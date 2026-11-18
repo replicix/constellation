@@ -21985,34 +21985,23 @@ fn a_drop_fills_the_stream_indices_it_rolls_back() {
 /// Drop-held apply names a re-appended seed (a stream row the root appended
 /// again after re-taking its own lease) by its own rid, not by the synthetic
 /// replay rid (`far-root-writes+lost-chunk-late` 226,
-/// `drop_acked_loss_unrecorded`). The seed still fails, on an independent
-/// finding: `sticky_ends_only_by_holder_or_operator` (a self re-claimed own
-/// stream ended with no release row), and in a debug build the apply's own
-/// stream-index `debug_assert` (a pre-existing finding) trips first, so the
-/// two profiles take different paths. Each is asserted to have reached the
-/// drop, so the pin cannot pass by a run that never dropped; the meta tests
+/// `drop_acked_loss_unrecorded`). The seed's second finding, a self re-claimed
+/// own stream ended with no release row
+/// (`sticky_ends_only_by_holder_or_operator`: the claim's release row met the
+/// append cap and the gate fence, ADR-60), closed with the claim-through-a-gate
+/// fix, so the seed passes whole in both profiles. The run must have dropped,
+/// so the pin cannot pass by a run that never did; the meta tests
 /// (`a_drop_names_a_reappended_seed_by_its_own_rid`) are the precise guard.
-/// Tighten to `.unwrap()` when the findings close.
+/// (Seeds 996 and 1810 of this label fail for other reasons and are not
+/// pinned.)
 #[test]
 fn a_reappended_seed_is_dropped_under_its_own_rid() {
-    match run_seed(
+    let report = run_seed(
         226,
         config_variant(far_root_writes_config(), "lost-chunk-late"),
-    ) {
-        // A pass must have dropped (the report's drop counters).
-        Ok(report) => assert!(report.drop_counts.drops > 0, "no drop was applied"),
-        Err(e) => {
-            assert!(!e.contains("drop_acked_loss"), "{e}");
-            let rid = "Rid { node: 1, incarnation: 1, seq: 23 }";
-            // Debug: the apply ran and tripped its stream-index assert.
-            // Release: the fault log carries the drop's `DroppedHeld`, which
-            // lists the seed's real rid as refused and as acknowledged-lost.
-            let applied = e.contains("took the log index of stream")
-                || (e.contains(&format!("refused: [{rid}]"))
-                    && e.contains(&format!("acked_lost: [({rid}, ")));
-            assert!(applied, "the run never reached the drop: {e}");
-        }
-    }
+    )
+    .unwrap();
+    assert!(report.drop_counts.drops > 0, "no drop was applied");
 }
 
 /// ADR-59 part B, D1 widened (`far-placement+lost-chunk` 326): node 1 lost a

@@ -473,10 +473,11 @@ pub(crate) struct PendingDelegate {
     /// ADR-59 part B (a stream holder's drop): `idx` is this node's own
     /// position for the row, not a root's append of another node's row.
     pub own: bool,
-    /// The row is a release record only (`Meta::delegate_release` checked
-    /// that every record is a `StreamReleased` / `SubtreeReleased`): it
-    /// executes no op, so the gate fence of `Meta::begin_local` lets it by.
-    pub release_only: bool,
+    /// The row is a release record only: it executes no op, so the gate
+    /// fence of `Meta::begin_local` lets it by. Private: only
+    /// [`PendingDelegate::set_release`] sets it, and only after checking
+    /// the records, so no caller can mark a row that carries an op.
+    release_only: bool,
 }
 
 impl PendingDelegate {
@@ -497,10 +498,36 @@ impl PendingDelegate {
         PendingDelegateGuard
     }
 
+    /// Whether the row carries release records only (see
+    /// [`Self::set_release`]).
+    pub(crate) fn is_release_only(&self) -> bool {
+        self.release_only
+    }
+
     /// Like [`Self::set`] for a row of release records only, the one write
-    /// the gate fence lets through on an ended generation. Only
-    /// `Meta::delegate_release` calls it, after checking the records.
-    pub(crate) fn set_release(gen: u64, deps: crate::session::Position) -> PendingDelegateGuard {
+    /// the gate fence lets through on an ended generation.
+    ///
+    /// # Errors
+    /// `MetaError::Invalid` when `records` is empty or holds anything but
+    /// `StreamReleased` / `SubtreeReleased`; nothing is set then.
+    pub(crate) fn set_release(
+        gen: u64,
+        deps: crate::session::Position,
+        records: &[crate::record::LogRecord],
+    ) -> Result<PendingDelegateGuard, MetaError> {
+        use crate::record::LogRecord;
+        if records.is_empty()
+            || !records.iter().all(|r| {
+                matches!(
+                    r,
+                    LogRecord::StreamReleased { .. } | LogRecord::SubtreeReleased { .. }
+                )
+            })
+        {
+            return Err(MetaError::Invalid(
+                "a delegate's release row carries release records only".into(),
+            ));
+        }
         PENDING_DELEGATE.with(|c| {
             c.set(Some(PendingDelegate {
                 gen,
@@ -510,7 +537,7 @@ impl PendingDelegate {
                 release_only: true,
             }))
         });
-        PendingDelegateGuard
+        Ok(PendingDelegateGuard)
     }
 
     /// ADR-59 part B: the holder of stream `gen` journals its own row at
