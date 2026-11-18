@@ -71035,6 +71035,14 @@ mod kept_fetch {
     /// The claimant's log carries `tx` of `epoch` (a row the owner shipped
     /// ahead of a held one).
     fn log_carries(h: &Harness, epoch: Epoch, tx: &BackupTx) {
+        log_carries_unchecked(h, epoch, tx);
+        assert!(Replica::row_in_log(&h.meta, epoch, tx.first));
+        assert!(!Replica::row_in_log(&h.meta, epoch, tx.first - 1));
+    }
+
+    /// [`log_carries`] without the check that the row below is not carried
+    /// (for a log that carries a run of copies).
+    fn log_carries_unchecked(h: &Harness, epoch: Epoch, tx: &BackupTx) {
         let rows: Vec<u64> = (tx.first..=tx.last).collect();
         h.meta
             .apply_segment_rows(
@@ -71054,8 +71062,6 @@ mod kept_fetch {
             Some(constellation_meta::JournalPos { epoch, jseq: 0 }),
             &rows,
         );
-        assert!(Replica::row_in_log(&h.meta, epoch, tx.first));
-        assert!(!Replica::row_in_log(&h.meta, epoch, tx.first - 1));
     }
 
     /// Answers every S3 request from the bucket holding `body` until the
@@ -71397,6 +71403,54 @@ mod kept_fetch {
         }
     }
 
+    /// The re-adopting gate keeps the no-tail record out of its marker, whatever
+    /// of the union the log already carries: the union's epoch is named with a
+    /// seq when a row is rebuilt, and nothing says "no tail" when every row is
+    /// carried (the lease still names it), which would make every replica drop
+    /// the copies of that epoch as never committed.
+    /// Fails without `own_names_tail` (the marker then says no tail).
+    #[test]
+    fn a_re_adopting_gate_never_carries_the_no_tail_record_for_its_union() {
+        let failed = || crate::event::CasFailure::Failed("reset".into());
+        for carry_all in [false, true] {
+            let (mut h, sent, _txs) = in_doubt_kept_claim_with(None, failed());
+            assert!(sent.inherited_tail.is_some(), "the lease names the union");
+            if carry_all {
+                // Nothing is left to rebuild (every row is in the log, the
+                // stored tail is gone) while the lease still names the tail.
+                h.meta.backup_clear().unwrap();
+            }
+            let out = acquire(&mut h, &sent);
+            let all = win(&mut h, out, &sent);
+            let (puts, marker) = put_records(&all);
+            assert!(
+                puts > 0,
+                "carry_all={carry_all}: the gate shipped no segment"
+            );
+            let tails: Vec<&LogRecord> = marker
+                .iter()
+                .filter(|r| matches!(r, LogRecord::TailFollowsThrough { .. }))
+                .collect();
+            if carry_all {
+                // Every row of the union is in the log: nothing is rebuilt, and
+                // the lease still names the tail, so the marker must not say
+                // there is none (`TailFollowsThrough { through: 0 }` would
+                // make every replica drop the union's copies).
+                assert!(tails.is_empty(), "the marker names no tail: {marker:?}");
+            } else {
+                // A row the log lacks: the union's epoch is named with the seq
+                // it is held through.
+                assert!(
+                    tails.iter().any(|r| matches!(
+                        r,
+                        LogRecord::TailFollowsThrough { prev_epoch: 1, through } if *through > 0
+                    )),
+                    "{marker:?}"
+                );
+            }
+        }
+    }
+
     /// The same for the three-generation union of
     /// [`a_readopted_union_over_a_second_generation_reships_every_epoch`].
     #[test]
@@ -71418,7 +71472,7 @@ mod kept_fetch {
         at_one: Vec<BackupTx>,
         carried: &BackupTx,
         force: bool,
-    ) -> (Harness, Option<Lease>) {
+    ) -> (Harness, Option<Lease>, Vec<Action>) {
         let mut h = Harness::new(3);
         h.core.cfg.kept_fetch_skipped = false;
         h.core.cfg.takeover_promise_check = false;
@@ -71440,29 +71494,64 @@ mod kept_fetch {
         }
         let all = win(&mut h, last, &fenced());
         let written = cas(&all);
-        (h, written)
+        (h, written, all)
+    }
+
+    /// The records of the segments the claim's gate put in `out` (its marker
+    /// among them), and how many segments there were: a test that sees none
+    /// proves nothing.
+    fn put_records(out: &[Action]) -> (usize, Vec<LogRecord>) {
+        let mut n = 0;
+        let mut records = Vec::new();
+        for (_, op) in s3_ops(out) {
+            if let S3Op::SegmentPut { payload, .. } = op {
+                n += 1;
+                records.extend(crate::segment::decode(payload).expect("a segment").records);
+            }
+        }
+        (n, records)
     }
 
     /// A copy whose first-1 is carried but whose run before it (from the copy
     /// ahead of it) is not: the merge takes it, the store would refuse the
     /// union. Under `--force` (or an abandon) the union is cut at the first
     /// uncarried seq and the claim goes on with what is contiguous; without,
-    /// the attempt ends once (`kept_install_gaps`) and writes nothing. Before:
+    /// the attempt ends (`kept_install_gaps`, every attempt) and writes nothing. Before:
     /// the forced claim retried the same refusal for ever.
     #[test]
     fn an_uncarried_run_under_a_forced_claim_cuts_the_union_there() {
         let txs = rows(5);
         let answers = vec![txs[0].clone(), txs[4].clone()];
-        let (h, written) = forced_claim(answers.clone(), &txs[3], true);
+        let (h, written, all) = forced_claim(answers.clone(), &txs[3], true);
         let sent = written.expect("the forced claim goes on");
         assert_eq!(h.core.stats.kept_install_gaps, 0);
         assert_eq!(h.core.stats.kept_past_gap, 1, "the copy past the gap");
+        // Every source answered, yet the union was cut under the operator's
+        // override: that is an abandon, recorded in the marker, or the
+        // keepers drop the copies past the cut as never committed.
+        assert_eq!(h.core.stats.kept_abandoned, 1);
+        let (puts, marker) = put_records(&all);
+        assert!(puts > 0, "the claim shipped no segment");
+        assert!(
+            marker.contains(&LogRecord::GroupAbandoned {
+                epoch: 1,
+                gen: 0,
+                through_known: txs[0].last
+            }),
+            "{marker:?}"
+        );
         let got = reshipped(&h);
         assert_eq!(got, vec![(1, txs[0].first)], "only what is contiguous");
         assert!(sent.inherited_tail.is_some_and(|t| t.kept && t.epoch == 1));
-        let (h, written) = forced_claim(answers, &txs[3], false);
+        let (h, written, _) = forced_claim(answers, &txs[3], false);
         assert!(written.is_none(), "the plain claim writes nothing");
         assert_eq!(h.core.stats.kept_install_gaps, 1);
+        assert_eq!(h.core.stats.kept_abandoned, 0);
+        assert_eq!(
+            h.core.bk.kept_force_wanted,
+            Some(1),
+            "status names the lever"
+        );
         assert!(h.meta.backup_tail(1).unwrap().is_empty());
     }
 

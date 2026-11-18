@@ -7174,6 +7174,29 @@ fn regression_a_successors_member_copy_keeps_the_tails_holes_seed_1238() {
     }
 }
 
+/// `drop-held-chain-backed` seed 1822 (ADR-51 keptfix): a claim re-adopted its
+/// own kept lease and the gate, rebuilding nothing, cut the union at a seq the
+/// log carries: a committed row (not answered here, but one could have been)
+/// was dropped as beyond a gap. The gate now rebuilds the union's tails from
+/// the store. Fails on main on `tail_beyond_gap_dropped`.
+#[test]
+fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
+    let seed = 1822;
+    let report = run_seed(seed, drop_held_chain_backed_config()).unwrap_or_else(|e| {
+        panic!(
+            "drop-held-chain-backed seed {seed}: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=drop-held-chain-backed AUTHORITY_SIM_SEED={seed}"
+        )
+    });
+    assert!(
+        report.stats.values().any(|s| s.kept_readoptions > 0),
+        "the seed no longer re-adopts a kept union: the pin would pass vacuously"
+    );
+    for (id, stats) in &report.stats {
+        assert_eq!(stats.tail_beyond_gap_dropped, 0, "node {id}");
+    }
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and

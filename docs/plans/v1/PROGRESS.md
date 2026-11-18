@@ -70692,3 +70692,16 @@ and leaves stored spans alone; a seq neither carried nor stored cuts the union t
 of retrying the store's refusal for ever. (S4) the fault test tells the pre-CAS from the post-CAS branch and pins the post-CAS state. (S5)
 `kept_readoptions` counts the rebuilt gates; `SWEEP-KEPT` reports it per label. (S6) the merge's debug assert knows `carried_through`.
 (N2) the sim fails a seed with an unreadable kept union. ADR-51's amendment documents the residual (S3).
+
+### Kept-union fix, round 4 (2026-11-18)
+
+Review follow-ups. (M1) An operator override that gives rows up is an abandon: `kept_install` records `GroupAbandoned { through_known }`
+(and `kept_abandoned`) also when `--force` cut a union every source answered (`u.force && past_gap > 0`, the forced cut and the merge's
+own gap arm), so the keepers queue the copies past the cut to replay by rid instead of dropping them as never committed (fail-before
+`an_uncarried_run_under_a_forced_claim_cuts_the_union_there`, now asserting the marker's record). (S1) The plain claim's `Gap` arm sets
+`kept_force_wanted` like the divergence arm; wording corrected: it ends at every attempt and retries until the operator acts. (S2)
+`a_re_adopting_gate_never_carries_the_no_tail_record_for_its_union` pins `own_names_tail`, with the log carrying one row and every row.
+(S3) every change of the round-2 and round-3 fixes was reverted in turn on a copy of the tree and its test failed (`logs4/fb-*.log`,
+`revert-*.diff`). (S4) `regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822` pins the rebuilt gate and 0 dropped rows. The
+`tail_beyond_gap_dropped` residual (17 rows over the sweeps) was replayed with throwaway instrumentation, not fixed here: see the
+round-4 report.
