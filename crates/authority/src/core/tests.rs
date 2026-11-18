@@ -16677,16 +16677,6 @@ mod backup_crash {
         h
     }
 
-    /// A peer's configuration: no singleton bump stands in the way of
-    /// backup selection.
-    fn no_bump_in_the_way(h: &mut Harness) {
-        h.core.lease.held.as_mut().unwrap().0.singleton = false;
-        h.core.ack.reconfig = None;
-        h.core.ack.reconfig_wanted = None;
-        h.core.ack.cfg_seen = None;
-        h.core.sync_cfg_spans(&h.meta);
-    }
-
     fn housekeeping_step(h: &mut Harness) -> Vec<Action> {
         h.step(Event::Activity {
             last_write: WaitMs(0),
@@ -16706,8 +16696,15 @@ mod backup_crash {
         let mut h = holder_with_a_roster_of_itself();
         h.advance(10);
         link_2(&mut h, true, Some(1), 0);
-        no_bump_in_the_way(&mut h);
-        // Housekeeping runs: the ask goes out.
+        // The link flips the singleton test: the lease's bump goes out, and
+        // backup selection waits for it (no ask while it is out).
+        h.advance(100);
+        let out = housekeeping_step(&mut h);
+        assert!(h.core.ack.reconfig.is_some(), "premise: the bump is out");
+        assert_eq!(refreshes(&out), 0, "asked with the bump out: {out:?}");
+        // The bump lands; the next housekeeping step asks.
+        land_reconfig(&mut h);
+        assert!(h.core.ack.reconfig.is_none(), "premise: the bump landed");
         h.advance(100);
         let out = housekeeping_step(&mut h);
         assert_eq!(refreshes(&out), 1, "{out:?}");
@@ -16742,10 +16739,10 @@ mod backup_crash {
         h.step(roster_ro_ev(vec![1], vec![2], w(h.now)));
         h.advance(10);
         link_2(&mut h, true, Some(1), 0);
-        no_bump_in_the_way(&mut h);
         h.advance(100);
         let out = housekeeping_step(&mut h);
         assert_eq!(refreshes(&out), 0, "{out:?}");
+        land_reconfig(&mut h);
         h.advance(2_000);
         let out = housekeeping_step(&mut h);
         assert_eq!(refreshes(&out), 0, "{out:?}");
@@ -16753,8 +16750,11 @@ mod backup_crash {
         // A link older than a read that does not list it: the node left.
         let mut h = holder_with_a_roster_of_itself();
         link_2(&mut h, true, Some(1), 10_000);
-        no_bump_in_the_way(&mut h);
         h.advance(100);
+        let out = housekeeping_step(&mut h);
+        assert_eq!(refreshes(&out), 0, "{out:?}");
+        land_reconfig(&mut h);
+        h.advance(2_000);
         let out = housekeeping_step(&mut h);
         assert_eq!(refreshes(&out), 0, "{out:?}");
     }
