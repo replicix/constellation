@@ -66713,7 +66713,7 @@ mod await_retry {
         let journal_before = h.meta.journal_txs_from(0, usize::MAX).unwrap().len();
         let uploads_before = h.meta.pending_uploads().unwrap();
         assert!(!uploads_before.is_empty());
-        let out = drop_held_decide_via_core(&mut h, broken);
+        let out = crate::core::tests::await_retry::drop_held_decide_via_core(&mut h, broken);
         let refused = out.iter().find_map(|a| match a {
             Action::ControlDone { result: Err(e), .. } => Some(e.clone()),
             _ => None,
@@ -77343,6 +77343,31 @@ mod step5_sticky_release {
         );
     }
 
+    /// Plan 46 M1.3 step 5 (996 B round 3, S1): the state of a holder that
+    /// released every subtree stays for the root's append of the row, and the
+    /// sync does not hand its parked op back or abort an acknowledgement that
+    /// waits for a row of the stream: no end has voided a row of it. Fails
+    /// without the restriction of the sync's hand-back to kept states: the
+    /// wait is answered `Busy` and the op goes back early.
+    #[test]
+    fn a_step_5_keep_keeps_its_parks_and_durability_waits() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        park_op(&mut h, _dirs[0], 0, 1);
+        let id =
+            h.core
+                .park_stream_need(h.clk(), 7, 1, crate::core::readindex::ParkedWhat::Release);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = h.core.dl.mine.get(&7).expect("the state was dropped");
+        assert!(!d.parked.is_empty(), "the parked op was handed back");
+        assert!(
+            h.core.stream_parks_of(7).contains(&id),
+            "the durability wait was aborted: {out:?}"
+        );
+    }
+
     /// A restart between the release row and the root's append leaves the row
     /// in the journal of a stream the table lists no subtree of: it is
     /// installed again, stopped, holding the release, and ships the row.
@@ -86908,6 +86933,153 @@ mod root_own_sticky {
                 }
             )),
             "a lock was granted under the kept state: {out:?}"
+        );
+    }
+
+    /// A claimed own stream with a row held on a lost chunk (the seed row of
+    /// 996), the claim and its end run, the root deposed. With `gate`, the
+    /// takeover gate marked the generation ended before the claim. Returns
+    /// the held inode.
+    fn claimed_over_a_held_row_then_deposed(gate: bool) -> (Harness, Ino, u64) {
+        use constellation_fs_core::{ChunkInfo, Manifest};
+        use replicix_chunkfmt::{ChunkHash, ChunkLayout};
+        let (mut h, _dirs, gen, _record) = restarted_root_with_own_stream();
+        let broken = h.meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
+        let seqs: Vec<u64> = MetaStore::take_journal(&h.meta, usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        let lost = ChunkHash::of(b"bytes that are gone");
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: 19,
+            chunks: ChunkInfo::Inline([(0u64, lost)].into_iter().collect()),
+        }
+        .encode();
+        let seed = MutateOp::SetManifest {
+            ino: broken,
+            base_manifest: None,
+            manifest,
+            size: 19,
+            mtime_ns: None,
+            ctime_ns: None,
+        };
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 900,
+        };
+        let tag = constellation_meta::locks::LockTag::NONE;
+        h.meta
+            .delegate_execute(
+                &seed,
+                Some(rid),
+                gen,
+                Default::default(),
+                &tag,
+                Now::same(0),
+            )
+            .unwrap();
+        h.meta.add_pending_upload(&lost, broken).unwrap();
+        h.meta
+            .note_unrecoverable_chunks(&[(lost, broken)], false)
+            .unwrap();
+        if gate {
+            h.meta.strand_for_takeover(2, &[gen], None).unwrap();
+            assert!(h.meta.deleg_ended_at_gate(gen).unwrap());
+        }
+        claim(&mut h);
+        activity(&mut h);
+        assert!(
+            h.core.dl.mine.contains_key(&gen),
+            "no state kept at the claim: the test proves nothing"
+        );
+        depose_to_node_2(&mut h);
+        (h, broken, gen)
+    }
+
+    /// 996 B1 (spec: the deposition test ends with the drop decided
+    /// in-stream): `repair drop-held` on the held row of a claimed stream
+    /// whose state is kept for its release row is decided in the stream, not
+    /// refused.
+    #[test]
+    fn a_claimed_streams_held_row_is_dropped_in_stream_after_a_deposition() {
+        let (mut h, broken, _gen) = claimed_over_a_held_row_then_deposed(false);
+        let out = crate::core::tests::await_retry::drop_held_decide_via_core(&mut h, broken);
+        let refused = out.iter().find_map(|a| match a {
+            Action::ControlDone { result: Err(e), .. } => Some(e.clone()),
+            _ => None,
+        });
+        assert!(refused.is_none(), "the drop was refused: {refused:?}");
+        assert_eq!(h.core.stats.drops_decided, 1, "{out:?}");
+    }
+
+    /// The same claim through a takeover gate that ended the generation: its
+    /// rows are stranded and replayed by rid, no longer rows of the stream
+    /// (`remnant_decides_held_drop` is not enough, the gate-ended stream does
+    /// not hold them), so the drop is the sequencer's and the holder's is
+    /// refused with the takeover's message, as before the claim's state.
+    #[test]
+    fn a_gate_ended_claimed_streams_held_row_is_not_dropped_in_stream() {
+        let (mut h, broken, _gen) = claimed_over_a_held_row_then_deposed(true);
+        let out = crate::core::tests::await_retry::drop_held_decide_via_core(&mut h, broken);
+        let err = out
+            .iter()
+            .find_map(|a| match a {
+                Action::ControlDone { result: Err(e), .. } => Some(e.clone()),
+                _ => None,
+            })
+            .expect("the gate-ended stream's drop was not refused");
+        assert!(err.contains("not all rows of a stream it holds"), "{err}");
+        assert_eq!(h.core.stats.drops_decided, 0);
+    }
+
+    /// 996 B1 (review S4): the root's client renews a lock grant the claimed
+    /// stream tagged with its generation, while the end has passed and the
+    /// state waits for its release row: the root answers it, not `Lost` (its
+    /// grants stay in the one table; the renewal is routed to the root now).
+    #[test]
+    fn a_renewal_of_a_kept_streams_grant_at_the_root_is_not_lost() {
+        use crate::event::{LockRenewEntry, LockRenewResult};
+        use constellation_meta::locks::{Grant, GrantId, LockMode};
+        let (mut h, dirs, gen, _record, _row) = claimed_and_ended();
+        assert!(h.core.dl.mine.contains_key(&gen), "the state was dropped");
+        let f = h.meta.lookup(dirs[0], "f0").unwrap().expect("f0").ino;
+        let id = GrantId { node: 1, seq: 4242 };
+        let g = Grant {
+            id,
+            node: 2,
+            ino: f,
+            mode: LockMode::Exclusive,
+            until: WaitMs(h.now.0 + 5_000),
+            recalled: false,
+            gen,
+            confirmed: Grant::MINTED,
+            settled: false,
+        };
+        assert!(h.meta.locks().install_if_consistent(g, h.clk().wait));
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(41),
+                entries: vec![LockRenewEntry {
+                    ino: f,
+                    grant: id,
+                    mode: LockMode::Exclusive,
+                    late: false,
+                }],
+                sent: HonourMs(h.now.0),
+                clock: 1,
+            },
+        });
+        let [(2, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
+            panic!("expected an answer: {out:?}")
+        };
+        assert!(
+            !matches!(results.as_slice(), [(_, _, LockRenewResult::Lost)]),
+            "the renewal was answered Lost: {results:?}"
         );
     }
 

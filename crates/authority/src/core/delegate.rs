@@ -2435,9 +2435,9 @@ impl Core {
     /// [`Self::claim_releases`], or one a restart installed again): a
     /// stealable stream's recall is outwaited by the root's expiry whatever
     /// its row did, and its ended state is the table's to drop, as before.
-    /// Kept for a stealable stream too, the state outlived its end and moved
-    /// the `long-delegated` schedules (no settle held for an outwait in seeds
-    /// 0 to 2,000, where main holds three; half the outwait extensions).
+    /// Kept for a stealable stream too, the state would outlive its end and
+    /// move the `long-delegated` schedules (the sweep numbers are in
+    /// PROGRESS).
     pub(crate) fn release_row_unshipped(&self, gen: u64, replica: &dyn Replica) -> Option<u64> {
         let d = self.dl.mine.get(&gen)?;
         if !(d.non_stealable
@@ -2476,6 +2476,9 @@ impl Core {
             .journal_own_gens()
             .into_iter()
             .filter(|g| !listed.contains(g) && !self.dl.mine.contains_key(g))
+            // The cheap test first: only a stream with rows the log lacks
+            // can have a row to ship.
+            .filter(|g| replica.delegate_idx(*g) > replica.log_stream_idx(*g))
             .collect();
         if cands.is_empty() {
             return Vec::new();
@@ -3014,7 +3017,11 @@ impl Core {
             .dl
             .mine
             .iter()
-            .filter(|(g, d)| !live_mine.contains(g) && !d.parked.is_empty())
+            .filter(|(g, d)| {
+                !live_mine.contains(g)
+                    && !d.parked.is_empty()
+                    && (d.kept_for_row || (d.remnant && d.stopped))
+            })
             .map(|(g, _)| *g)
             .collect();
         for gen in kept_parked {
@@ -13009,8 +13016,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let through = replica.void_cut(gen).unwrap_or(0);
-        self.deleg_abort_stream_parks_past(now, gen, through, replica, out);
+        // Only rows past a void cut are never acknowledged. Without one the
+        // rows still ship (plan 46 step 5 keeps a state whose generation has
+        // not ended): their waits stay for the row's durability.
+        if let Some(through) = replica.void_cut(gen) {
+            self.deleg_abort_stream_parks_past(now, gen, through, replica, out);
+        }
         let parked = self
             .dl
             .mine

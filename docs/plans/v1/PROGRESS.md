@@ -70825,3 +70825,11 @@ Round 2 (2026-11-18). Four release sim-suite tests failed with the commit above 
   `Core::strand_unshipped_appends` at a newer epoch, before `start` and after it, rolls back none of the node's own stream rows or its
   own end (0 rows), and the sync still re-creates the remnant with its release row. The 996 and 1810 sim pins and
   `a_node_that_leaves_ends_its_grants_first` pass on the merge.
+
+Finding 996 part B, round 3 (review S1, S2, S4, N1, N4):
+
+- S1: the sync's hand-back of a kept state's parks is limited to states kept for their row (`kept_for_row`) and stopped remnants. The plan 46 step 5 keep (a far sticky holder that released everything, the generation not ended) keeps its held ops and its durability waits until the root's append. `hand_back_kept_parks` aborts stream parks only past a void cut. Pin: `a_step_5_keep_keeps_its_parks_and_durability_waits`.
+- S2: `repair drop-held` on a held row of a claimed stream, after the end and a deposition, is decided in-stream (`a_claimed_streams_held_row_is_dropped_in_stream_after_a_deposition`). With a takeover gate that ended the generation it is refused as before (`a_gate_ended_claimed_streams_held_row_is_not_dropped_in_stream`): the gate strands the stream's rows and replays them by rid, so they are no longer the stream's, and the store's fence would refuse a record written into the stream. Not changed; the drop there is the sequencer's.
+- S4: a renewal at the claimant root of a grant tagged with the kept stream's generation is answered, not `Lost` (`a_renewal_of_a_kept_streams_grant_at_the_root_is_not_lost`). No code change.
+- N1: `own_end_remnants` filters candidates by `delegate_idx > log_stream_idx` before it reads the journal. N4: the sweep numbers left the `release_row_unshipped` doc.
+- N2, N3, N5, N6: not done (N2/N3 change behaviour or need a decision; N5 and N6 are test and docs polish).
