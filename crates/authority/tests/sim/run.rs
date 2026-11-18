@@ -5639,6 +5639,19 @@ pub fn last_run_sim_ms() -> u64 {
 }
 
 /// Run one seed. `Err` carries the failure and the replay command.
+///
+/// Determinism contract: `seed -> fingerprint` is a pure function, whatever
+/// the host's load or the sweep's thread count. So the run reads no host
+/// clock (durations come from the node's wait clock, the paused virtual one
+/// here), iterates no `HashMap`/`HashSet` where the order wakes a task,
+/// sends a message or draws from a shared RNG (sort, or use a `BTreeMap`: a
+/// crash drops its waiters' senders in key order, placement breaks ties by
+/// inode), and has no unbiased `select!` (tokio's own RNG is randomly
+/// seeded). Held-write OS threads run in lock-step rendezvous only: every
+/// `go`/`committed`/`phase` hand-off blocks the driver thread, so the paused
+/// clock cannot auto-advance while they run. The determinism gate
+/// (TESTING.md) sweeps labels at two thread counts and compares fingerprint
+/// files; `seed_runs_are_repeatable` pins it in the lib gate.
 pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
     constellation_store_s3::adapters::install();
     // ADR-42: every ownership check on this thread also reads every name and
@@ -5736,7 +5749,11 @@ pub fn run_seed(seed: u64, mut cfg: SimConfig) -> Result<Report, String> {
         .build()
         .expect("runtime");
     let result = rt.block_on(async {
+        // Biased: the unbiased form draws its branch order from tokio's
+        // per-runtime RNG, which is randomly seeded, and reorders the panic
+        // watch's timer registration against `run_inner`'s.
         let result = tokio::select! {
+            biased;
             r = run_inner(seed, cfg) => r,
             msg = panic_watch() => Err(format!("a task panicked: {msg}")),
         };

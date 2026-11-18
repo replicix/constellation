@@ -223,7 +223,7 @@ pub fn check_sessions(
         ));
     }
     let mut invoke: HashMap<Rid, (u64, NsOp)> = HashMap::new();
-    let mut ret: HashMap<Rid, (u64, NsRet)> = HashMap::new();
+    let mut ret: BTreeMap<Rid, (u64, NsRet)> = BTreeMap::new();
     for (e, t) in events.iter().zip(ticks) {
         match e {
             HistEvt::Invoke { rid, op, .. } => {
@@ -637,7 +637,9 @@ pub fn check_sessions(
                 .iter()
                 .chain(own_by_node.get(&session.0).into_iter().flatten())
                 .filter(|(t, n, ..)| *t < r.inv && *n == r.name)
-                .max_by_key(|(_, _, k, ..)| *k)
+                // A total order, so equal states bind the same observation
+                // (and so the same failure text) whatever the list's order.
+                .max_by(|a, b| (a.2, a.0, &a.1).cmp(&(b.2, b.0, &b.1)))
                 .cloned();
             let floor = binding.as_ref().map(|b| b.2).unwrap_or(0);
             match first_at_or_after(&r.name, floor, r.present) {

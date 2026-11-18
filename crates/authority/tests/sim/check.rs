@@ -297,10 +297,15 @@ pub fn check_exactly_once(
     oracle: &Oracle,
     converged: bool,
 ) -> Result<(), String> {
-    for (rid, n) in &oracle.completed {
-        if *n > 1 {
-            return Err(format!("rid {rid:?} completed {n} times in the log"));
-        }
+    // The lowest such rid, so the text does not depend on the map's hash
+    // order.
+    if let Some((rid, n)) = oracle
+        .completed
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .min_by_key(|(rid, _)| **rid)
+    {
+        return Err(format!("rid {rid:?} completed {n} times in the log"));
     }
     if !converged {
         return Ok(());
