@@ -70848,17 +70848,27 @@ Now `Core::strand_unshipped_appends` (called by `Core::apply_incoming` on a fore
 with the persisted applied epoch) at a node that holds no lease, hold or lost mark calls `Meta::strand_appended_below(epoch)` (the appended-row
 clause of `strand_deposed`, one shared `strand_journal_with`): the delegates' rows this node appended under an older tenure and never shipped are
 rolled back from their before-images, kept as member copies of their generation, and the generation's log index and the session's stream index go
-back below them. It is a transaction after the segment's own, not in it: its error propagates (`max_epoch` does not advance, the next segment
-tries again) and a crash between the two is repaired at the next start. The segment's own strand still handles every other entry. The window
-before any newer segment is closed by the dependency rule: `Core::stream_deps_reached` of a node without a root tenure counts a generation it does
-not hold only below its own unshipped appends of it (`Core::unshipped_append_cap`, `Replica::reaches_capped`; ADR-39 amended). Tests: `a_restarted_root_strands_its_unshipped_appends_when_a_newer_tenure_begins`
+back below them. It is a transaction after the segment's own, not in it. A failure never holds the fencing floor down (review round 2, M1): `max_epoch`,
+`last_error`, `retry_stream_ahead` and `stream_passed` run as for any applied segment, the strand is owed (`ShipState::strand_owed`) and retried from the
+persisted applied epoch at every applied foreign segment until it succeeds (idempotent), and a crash between the two is repaired at the next start. The
+strand takes every appended row below the applied epoch, epoch 0 included (a root appends only under a holder epoch of 1 or more). The segment's own
+strand still handles every other entry. The window before any newer segment is closed by the dependency rule: `Core::stream_deps_reached` of a node
+without a root tenure counts a generation it does not hold only below its own unshipped appends of it (`Core::unshipped_append_cap`,
+`Replica::reaches_capped`, void generations included; ADR-39 amended); `Stats::deps_capped` counts the checks the cap bound. After a strand the
+appends' tip is lowered to the journal's (`Meta::lower_holder_append_tip`), so a node without appends is on the one-load path again. Tests:
+`a_restarted_root_strands_its_unshipped_appends_when_a_newer_tenure_begins`
 (core; fails on the parent: after the marker `reaches((4,7))` still holds and the log index stays 7), its guard
-`a_segment_of_the_same_epoch_strands_no_unshipped_append`, and the sim pin `a_restarted_root_does_not_depend_on_its_own_unshipped_appends`
-(`far-root-writes+lost-chunk-late` seed 1810, fails on the parent with the causal cut). Not covered: an op the restarted holder executes before it has
-applied any segment of the newer tenure: closed by the log-only dependency rule, test
-`a_restarted_holder_does_not_count_its_own_unshipped_append_of_another_stream` (fails before it), and the crash between apply and strand by
+`a_segment_of_the_same_epoch_strands_no_unshipped_append`, `a_failed_strand_keeps_the_fence_and_is_retried_at_the_next_segment` (an injected strand
+error, then an epoch-2 straggler after the epoch-3 marker: fenced, the deposed node not named; fails on 407fd3e6), and the sim pin
+`a_restarted_root_does_not_depend_on_its_own_unshipped_appends` (`far-root-writes+lost-chunk-late` seed 1810, fails on the parent with the causal cut).
+The op a restarted holder executes before it has applied any segment of the newer tenure is closed by the log-only dependency rule, test
+`a_restarted_holder_does_not_count_its_own_unshipped_append_of_another_stream` (fails before it); the crash between apply and strand by
 `a_crash_between_the_segment_apply_and_the_strand_is_repaired_at_start`.
-Sweeps, release, 2,000 seeds, parent / fix: failing seeds equal except 1810 gone: `far-root-writes+lost-chunk-late` [226, 996, 1810] / [226, 996],
-`far-root-writes-paused+lost-chunk-late` [996] / [996]; none on `far-root-writes{,-paused,-shared,-cross}+lost-chunk`,
-`sticky-holder-restarts{,-cut,-placed}`, `long-delegated-late-answers`, `backup-crash`. The oracle control
-`the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait` passes.
+Review round 3 (2026-11-18, on origin/main with fix996a and m12tail): sweeps, release, 2,000 seeds, origin/main / fix, 20 labels: failing seeds equal
+except 1810 gone (`far-root-writes+lost-chunk-late` [1810] / none; `far-root-writes-paused+lost-chunk-late` [996] / [996], a different cause, spec-996
+part B); no I-class or lock failure on either side. `Stats::deps_capped` (dependency checks the cap bound, summed over the nodes of a label's 2,000 seeds):
+`far-root-writes` 550, `-cross` 678, `-cross+lost-chunk` 652, `+lost-chunk` 607, `+lost-chunk-late` 2,240, `-paused+lost-chunk` 595,
+`-paused+lost-chunk-late` 5,357, `-paused` 637; 0 on `-shared{,+lost-chunk}`, `sticky-holder-restarts{,-cut,-placed}`, `long-delegated-*`, `backup-crash`,
+`flex-crash`, `delegated-holder-cut`, `drop-held-chain-backed`, `placement-hot`. Fail-before (old behaviour stubbed, logs kept): the floor test fails with
+`max_epoch` 0 instead of 3; the crash repair with the start's strand removed (journal still holds 2 rows); the holder/lost guard with the guard
+removed. The oracle control `the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait` passes.

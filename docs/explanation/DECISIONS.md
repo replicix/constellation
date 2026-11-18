@@ -2520,12 +2520,16 @@ node's own unshipped appends of it (`Core::unshipped_append_cap`, the cap the
 root's commit rule uses), not as far as its session's index, which those
 appends raised: a restarted old root's appended rows may never reach the newer
 tenure's log. A dependency on such a row is not reached whether or not a
-segment of the newer tenure has been applied yet. The deposition's strand has a second trigger for the same reason
-(plan 46 M1.2 step 7, `Meta::strand_appended_below`): a node that holds no
-lease, hold or lost mark and has applied an epoch above its appended rows'
-strands them (member copies, index retracted), at `Core::start` from the
-persisted applied epoch and at each newer tenure's first segment, so a crash
-between the segment's apply and the strand is repaired.
+segment of the newer tenure has been applied yet. A void generation is capped
+too: the cap, not the void mark, decides until the strand has run. The
+deposition's strand has a second trigger for the same reason (plan 46 M1.2 step
+7, `Meta::strand_appended_below`): a node that holds no lease, hold or lost
+mark and has applied an epoch above its appended rows' strands them (member
+copies, index retracted), at `Core::start` from the persisted applied epoch and
+at every applied foreign segment while the strand is owed, so a crash between
+the segment's apply, or a failed strand, is repaired. A root appends only under
+a holder epoch of 1 or more, so no appended row is exempt (epoch 0 included).
+A failed strand never holds the fencing floor down.
 
 See: [Delegations](../reference/features/delegations.md#a-row-whose-cause-was-lost-with-its-generation);
 `crates/authority/src/core/delegate.rs` (`deleg_caps`, `deleg_note_xdeps`,
