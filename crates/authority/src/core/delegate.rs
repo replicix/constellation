@@ -3238,14 +3238,30 @@ impl Core {
             // Only after a restart: a stream this process installed and
             // dropped is not one whose state was lost (a recall's answer is
             // outwaited by the root whatever its row did).
-            let remnant = st.subtrees.is_empty();
+            // ADR-63: a stream this node cut and has not released (the view
+            // forgot the cut subtrees) is no remnant even when the cut left
+            // it none: the cut row is no release row, and the release row
+            // is still to journal.
+            let own_cut = replica.own_cut_dirs(st.gen);
+            let remnant = st.subtrees.is_empty() && own_cut.is_empty();
             if remnant
                 && (self.dl.installed_gens.contains(&st.gen)
                     || replica.delegate_idx(st.gen) <= replica.log_stream_idx(st.gen))
             {
                 continue;
             }
+            if !own_cut.is_empty() && self.dl.installed_gens.contains(&st.gen) {
+                continue;
+            }
             let d = StreamView::of(&st);
+            // The kind of a stream the cut left no subtree to tell it by is
+            // the raw fold's.
+            let cut_kind_ns = !own_cut.is_empty()
+                && replica
+                    .delegation_table_folded()
+                    .stream(me, st.gen)
+                    .is_some_and(|raw| StreamView::of(&raw).non_stealable());
+            let ns = d.non_stealable() || cut_kind_ns;
             // (A leaving node installs nothing: a grant that reached it
             // before the root heard it leaves is released unheld.)
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active || self.dl.leave_self {
@@ -3328,8 +3344,7 @@ impl Core {
             // the journal as it was and goes on (`delegate-handoff-renewal`);
             // a designee is exempt: it renews nothing, and its stream
             // sends only rows a sync put on its disk (`deleg_stream`).
-            let rebooted =
-                !d.non_stealable() && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
+            let rebooted = !ns && replica.deleg_held_on_another_boot(d.gen, now.boot.id);
             if rebooted {
                 self.stats.deleg_rebooted_holder += 1;
                 tracing::warn!(
@@ -3399,7 +3414,7 @@ impl Core {
                     cuts: Vec::new(),
                     release_acked: false,
                     release_pending: (BTreeSet::new(), 0),
-                    released_dirs: BTreeSet::new(),
+                    released_dirs: own_cut.clone(),
                     root_answer: None,
                     core_answer_sent: None,
                     gen: d.gen,
@@ -3407,7 +3422,10 @@ impl Core {
                     // This node's takeover gate ended the generation
                     // (`Meta::strand_for_takeover`): it ends at what the
                     // log holds of it; nothing more executes here.
-                    stopped: replica.deleg_ended_at_gate(d.gen) || rebooted || remnant,
+                    stopped: replica.deleg_ended_at_gate(d.gen)
+                        || rebooted
+                        || remnant
+                        || (!own_cut.is_empty() && st.subtrees.is_empty()),
                     rebooted,
                     restart_q,
                     stream_after: None,
@@ -3435,7 +3453,7 @@ impl Core {
                     parked: Vec::new(),
                     executed: 0,
                     last_own_op: BTreeMap::new(),
-                    non_stealable: d.non_stealable(),
+                    non_stealable: ns,
                     designated: !d.dirs.is_empty()
                         && d.dirs.iter().all(|(_, k)| *k == SubtreeKind::Designated),
                     remnant,
@@ -3467,6 +3485,9 @@ impl Core {
                     lost_from: None,
                 },
             );
+            if !own_cut.is_empty() {
+                self.rebuild_cut(now, d.gen, own_cut, st.subtrees.is_empty(), replica, out);
+            }
             if d.node == me {
                 self.recover_own_grant_row(d.gen, replica);
             }
@@ -3474,7 +3495,7 @@ impl Core {
                 self.arm_stream_tick(now, out);
                 continue;
             }
-            if d.non_stealable() {
+            if ns {
                 // Honoured whatever the root says or the clock does
                 // (DESIGN.md §5.2: the designee writes while isolated).
                 // Its locks wait for the first granting answer, which carries
@@ -9981,6 +10002,80 @@ impl Core {
             need.quarantine_until = Some(need.quarantine_until.map_or(q.until, |u| u.max(q.until)));
         }
         need
+    }
+
+    /// ADR-63 (restart): this node cut subtrees of its stream `gen` and its
+    /// process ended before it journaled the release row. The cut row, the
+    /// table's mark and the own-cut key are durable; the pending cut is not,
+    /// so it is rebuilt here: its release row waits for the ADR-46
+    /// quarantine of the previous process's read delegations (the park of
+    /// [`Self::release_read_need`]), or is due at once when there is none.
+    /// The subtrees stay out of this node's view meanwhile, so nothing
+    /// executes under them. The note carries no locks: the previous
+    /// process's lock table did not survive (a remnant's note is the same).
+    fn rebuild_cut(
+        &mut self,
+        now: Now,
+        gen: u64,
+        dirs: BTreeSet<Ino>,
+        whole: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        // The stream's last cut row in this journal (a merged release has
+        // several; one pending cut covers them all). The index only names
+        // the cut: a row the log carries already is gone from the journal.
+        let from = replica.journal_acked_seq().unwrap_or(0) + 1;
+        let cut_row = replica
+            .journal_txs_from(from, usize::MAX)
+            .iter()
+            .filter(|t| {
+                t.origin.0 == gen
+                    && t.records
+                        .iter()
+                        .any(|r| matches!(r, LogRecord::ReleaseCut { gen: g, .. } if *g == gen))
+            })
+            .map(|t| t.origin.1)
+            .max()
+            .unwrap_or_else(|| replica.delegate_idx(gen));
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs: dirs.iter().copied().collect(),
+            leaving: self.dl.leave_self,
+            ..Default::default()
+        };
+        let to = self.holder_root().unwrap_or(0);
+        let wait = if self.cfg.read_delegations {
+            let need = self.release_read_need(now, gen, whole, &dirs, replica);
+            self.start_recalls(now, need, out)
+        } else {
+            None
+        };
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        d.cuts.push(PendingCut {
+            dirs,
+            whole,
+            cut_row,
+            note,
+            left_at: now.wait,
+            to,
+            due: wait.is_none(),
+        });
+        match wait {
+            Some(wait) => {
+                self.park(
+                    now,
+                    wait,
+                    None,
+                    super::readindex::ParkedWhat::ReleaseCutHeld { gen, cut_row },
+                );
+            }
+            None => {
+                // (The stream tick journals the release row.)
+            }
+        }
+        self.arm_stream_tick(now, out);
     }
 
     /// ADR-63: the read delegations under the cut `cut_row` of `gen` are

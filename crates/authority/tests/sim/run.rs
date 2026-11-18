@@ -616,6 +616,11 @@ pub struct SimConfig {
     /// the lease ends its stream with no release row.
     /// `AUTHORITY_SIM_CLAIM_ENDS_SILENTLY=1` sets it on every configuration.
     pub claim_ends_silently: bool,
+    /// Control (plan 46 M1.3 step 15b, ADR-63; `Config::release_cut` off): a
+    /// holder's release that must wait for read delegations is the held
+    /// release, its row and everything after it held back, not a cut first.
+    /// `AUTHORITY_SIM_NO_RELEASE_CUT=1` sets it on every configuration.
+    pub no_release_cut: bool,
     /// Negative control (plan 46 M1.3 step 14): the operator's leave retires
     /// the node without ending its grants first (the driver skips
     /// `ReleaseGrants` / `EndGrantsOf`), so a live grant stays off the
@@ -1368,6 +1373,8 @@ impl Default for SimConfig {
                 .and_then(|v| v.parse::<f64>().ok())
                 .map_or(0, |p| (p.clamp(0.0, 1.0) * 1_000_000.0) as u32),
             claim_ends_silently: std::env::var_os("AUTHORITY_SIM_CLAIM_ENDS_SILENTLY")
+                .is_some_and(|v| v == "1"),
+            no_release_cut: std::env::var_os("AUTHORITY_SIM_NO_RELEASE_CUT")
                 .is_some_and(|v| v == "1"),
             leave_keeps_grants: std::env::var_os("AUTHORITY_SIM_LEAVE_KEEPS_GRANTS")
                 .is_some_and(|v| v == "1"),
@@ -5934,6 +5941,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         journal_read_fault_ppm: cfg.journal_read_fault_ppm,
         sticky_idle_release_ms: cfg.sticky_idle_ms.unwrap_or(0),
         claim_ends_silently: cfg.claim_ends_silently,
+        release_cut: !cfg.no_release_cut,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
         holder_runs_inbox_ever: cfg.holder_runs_inbox_ever,
         root_ignores_touched: cfg.root_ignores_touched,

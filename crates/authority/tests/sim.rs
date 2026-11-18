@@ -23720,6 +23720,14 @@ fn the_s4_hazard_configurations_reach_a_held_release_and_the_sweep_line_says_so(
         ("sticky-s4-idle", sticky_s4_idle_config as fn() -> SimConfig),
         ("sticky-s4-leave", sticky_s4_leave_config),
     ] {
+        let config = move || SimConfig {
+            // The instrument measures the held release; with the cut (ADR-63,
+            // the default) a row release holds nothing back. The control arm
+            // is what it measures until the strict tag and the cut spans
+            // replace it.
+            no_release_cut: true,
+            ..config()
+        };
         let mut totals = OracleTotals::default();
         // The scan from seed 0 has both conditions by seed 78 in both labels
         // (measured), well inside the bound. A seed that fails some other

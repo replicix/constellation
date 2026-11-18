@@ -82813,6 +82813,69 @@ mod step5_sticky_release {
         );
     }
 
+    /// ADR-63 (test 5): a holder that cut and restarted before it journaled
+    /// the release row installs its stream again, not as a remnant (the cut
+    /// row is no release row: its acknowledgement does not release the
+    /// stream), executes nothing under the cut subtree, and journals the
+    /// release row once the previous process's read grants have expired.
+    /// Fails on the parent: the install took the stream for a remnant whose
+    /// pending release is the cut row, and the cut's acknowledgement set
+    /// `release_acked`.
+    #[test]
+    fn a_restarted_holder_with_a_cut_journals_its_release_after_its_quarantine() {
+        let (mut h, dirs) = holder_with_a_grant(SubtreeKind::Sticky);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(
+            matches!(
+                rows(&h).last().unwrap().records.as_slice(),
+                [LogRecord::ReleaseCut { gen: 7, .. }]
+            ),
+            "{:?}",
+            rows(&h)
+        );
+        assert!(!has_release_row(&h));
+        // The process ends; the next one starts over the same disk. (Its
+        // read-delegation table is empty: the grants of the old one are
+        // known only by the persisted horizon.)
+        let live = h.meta.read_delegations().all_live(h.clk().wait);
+        for g in live.grants {
+            h.meta.read_delegations().forget(g.id);
+        }
+        h.advance(2_000);
+        let cfg = h.core.cfg.clone();
+        h.core = Core::new(cfg);
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.core.lease.cached_holder = Some(1);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(!d.remnant, "the cut-only stream was installed as a remnant");
+        assert!(d.stopped && d.dirs.is_empty());
+        assert!(d.release.is_none(), "a synthetic release for the cut row");
+        assert_eq!(d.cuts.len(), 1);
+        assert!(d.restart_q.is_some());
+        // Nothing executes under the cut, and the cut row's acknowledgement
+        // is not a release's.
+        let before = rows(&h).len();
+        create_in(&mut h, dirs[0], 1);
+        assert_eq!(h.core.dl.mine[&7].executed, 0);
+        assert_eq!(rows(&h).len(), before);
+        assert_eq!(h.core.stats.deleg_exec_in_cut, 0);
+        let all = drain_stream(&mut h, out);
+        let _ = all;
+        assert!(!h.core.dl.mine[&7].release_acked);
+        assert!(!has_release_row(&h), "released inside the quarantine");
+        // The quarantine ends: the release row is journaled, and acknowledged.
+        let id = restart_timer(&h);
+        let until = h.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        h.advance(until.since(h.clk().wait) as u64);
+        let out = h.step(Event::Timer { id });
+        assert!(has_release_row(&h), "no release row after the quarantine");
+        assert!(h.core.dl.mine[&7].cuts.is_empty());
+        let _ = drain_stream(&mut h, out);
+        assert!(h.core.dl.mine[&7].release_acked || !h.core.dl.mine.contains_key(&7));
+    }
+
     /// Expectation (fail-before: executed at once): a placed delegate
     /// restarted on the same boot waits its predecessor's grants out too,
     /// once its renewal makes it honoured.
