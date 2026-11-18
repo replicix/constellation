@@ -71052,11 +71052,8 @@ all pass, with `a_release_abandoned_in_the_gap_sends_no_cas`, `release_record_wr
 `releases_wait_for_their_record_in_the_simulation`. Gates: fmt, workspace clippy, lib tests debug and release (authority, meta, engine), release sim
 suite. Sweeps 0..2000 (`flex-crash`, `flex`, `long-backup`, `backup-crash`, `long-delegated`, `placement-hot`, `delegated-holder-cut`) and 0..1000
 (`locks`, `locks-blips-tight`, `locks-blips-tight-in-doubt`, `sticky-ttl`): 0 failing on both origin/main and the change (18,000 seeds each).
-`bounded_mode_reads_stale` pinned seeds 800..900; the schedule shift moved its first stale read, its scan is 800..5000 now. On origin/main the sim suite
-already fails `m03_a_reachable_sequencers_requester_is_not_isolated` (seed 2), `m03_the_configurations_at_zero_violations_stay_there`
-(`locks-unlinked-delegated-blips+unsettled` 3 allowed against the ceiling 2), `regression_a_readoption_landing_after_a_seal_is_not_served` (1115),
-`regression_every_inbox_batch_of_a_rid_is_withdrawn` (16329) and `regression_no_generation_number_is_minted_twice` (1659), with the same messages
-before and after: not touched here. Harness `chaos-ci --seed 42` passes.
+`bounded_mode_reads_stale` pinned seeds 800..900; the schedule shift moved its first stale read, its scan is 800..5000 now. (Corrected in the next entry: the five sim-suite failures named here
+are this change's, not origin/main's; the check that said so ran the change's `tests/sim.rs` in main's tree, with a shared target dir.) Harness `chaos-ci --seed 42` passes.
 
 Step histogram (heavy 8x16 hardlink, backend on tmpfs, `SLOW_STEP_US` 50 ms, shared loaded box, so counts, not timing; 6 runs each, base then fix):
 steps of 187 ms and over per run, ext4 base [0,0,1,1,1,1], fix [0,0,0,1,0,1]; btrfs base [0,0,1,0,0,0], fix [0,0,1,0,0,0]. Every base step
@@ -71066,3 +71063,26 @@ was `PublishDone`/`LeaseSwap` with `store_syncs=1` (sync 21, 78, 96, 78 ms on ex
 is `Replica::has_dirty()` in `flush_continue` (187-202 ms, measured with a temporary timer, not kept). Follow-up, not done here. Release
 latency S1 to the CAS (record wait): ext4 5-270 ms (median about 150), btrfs 79-538 ms (median about 270). Not done: the four-file-system quiet A/B
 (waits for a quiet box), the Timer -> mint-generation sync, the harness scenario `release-record-abort`.
+
+### The release record off the core, round 2: re-pins, and the I4 count the wait adds (2026-11-18)
+
+Correction of the entry above: origin/main (4cc8a021, and f7dc2b44 after the rebase), built from a fresh archive with its own tests in its own
+target dir, passes all five; the change fails them. Four are coverage pins whose seeds the release's extra event and its 0-25 ms simulated
+sync moved; each path is still reached, re-pinned on the rebased tree: `regression_a_readoption_landing_after_a_seal_is_not_served` 1115 -> 8
+(14 seeds of 0..2499 reach it), `m03_a_reachable_sequencers_requester_is_not_isolated` flex-tight 2 -> 53 (the first of 0..299 with a violation;
+`+unsettled` fails as the test asks), `regression_every_inbox_batch_of_a_rid_is_withdrawn` 16329 -> 14435 (the only seed of 14000-18999 that
+reaches it twice; 25521 still does), `regression_no_generation_number_is_minted_twice` 1659 -> 1660. `bounded_mode_reads_stale`: the first stale
+read of 800..5000 is seed 1039.
+
+The fifth, `m03_the_configurations_at_zero_violations_stay_there`, is a real count increase, not a re-pin: `locks-unlinked-delegated-blips+unsettled`
+seeds 0..99 tell 3 allowed unsettled EIOs (ceiling 2; main 1: seed 50). Over 0..1999: main 8 allowed (seeds 50, 290, 1109 x4, 1146, 1866) and
+6 seeds failing `+unsettled` (427, 934, 1062, 1481, 1589, 1738); the change 13 allowed, a superset (new: 64 x2 isolated, 391 isolated, 1045 none in
+time/claim, 1477 none in time/lease of a holder with nothing) and 4 failing (1062 and 1589 no longer). The change with the simulated sync's delay
+set to 0 (the record still answered by an event) gives main's numbers exactly: the increase is the sync's duration, not the off-core path. In all
+four new seeds a takeover of a continuation epoch ships its journal and the flush release follows; its CAS goes out 10-25 ms after the decision
+(the record's sync), meets an S3 cut that began in that gap, ends in doubt, the re-read fails and the node gives the lease up while it still names
+it (claimable at expiry), so the cut peers' settles find no sequencer. On main the same CAS went out in the decision's step and landed before the
+cut. The daemon had the same gap before (the sync ran inline, ahead of the CAS); the simulation now models it. Shortening it means writing the
+record before the release is decided (while the lease still serves), which touches 670e57d3's crash rule: left open for a decision, the ceiling
+is not raised.
+

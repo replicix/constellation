@@ -1069,7 +1069,8 @@ fn bounded_mode_reads_stale() {
     };
     let mut found = None;
     // (800..900 until the release record's off-core write moved the schedules: no
-    // seed of it reads stale on this tree; the checker finds one a little later.)
+    // seed of it reads stale on this tree; the first that does is 1039, so the
+    // scan stops there. The bound is slack for the next schedule move.)
     for seed in 800..5_000 {
         let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         if let Some(v) = report.cto.violations.first() {
@@ -1285,7 +1286,11 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // The stall fixes (`DelegateState::known_root`, `InboxStore::drain_below`)
     // moved them: over 14000-29999 the finder gives 16329 and 25521 (twice
     // each) and four more once.
-    for seed in [16329, 25521] {
+    // The release record's off-core write, answered 0-25 ms later in the
+    // simulation, moved 16329: it reaches the withdraw no more. Over
+    // 14000-18999 the finder gives 14435 twice and 14369, 15369 and 16674
+    // once; 14435 takes 16329's place (25521 still reaches it twice).
+    for seed in [14435, 25521] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -6321,7 +6326,12 @@ fn regression_placement_hot_rollback_order_and_rebuilt_member_copies() {
 /// on the claimant at convergence.
 #[test]
 fn regression_a_readoption_landing_after_a_seal_is_not_served() {
-    for seed in [204, 1115] {
+    // (The release record's off-core write, answered 0-25 ms later in the
+    // simulation, moved 1115's schedule: its seal no longer reaches the
+    // re-adoption in flight. Over seeds 0..2499 the finder gives 8, 61, 204,
+    // 411 and ten more; 8 takes 1115's place. 8 reaches the path, it is not
+    // a fail-before witness: the guard is the drop itself.)
+    for seed in [204, 8] {
         let cfg = strict(
             SimConfig {
                 s3_latency: (60, 200),
@@ -6497,10 +6507,12 @@ fn l2_a_deposed_roots_rebuild_queues_no_gated_copy_of_a_delegates_row() {
 /// view) fails all three with the oracle ("generation N minted twice"); a
 /// number carries the epoch of the tenure that minted it now. (ADR-51's kept
 /// phase moved 16871's schedule: it mints no number any more. 16855 and
-/// 16869 take its place.)
+/// 16869 take its place. The release record's off-core write, answered 0-25
+/// ms later in the simulation, moved 1659's: it mints none either; 1660,
+/// five numbers minted, takes its place.)
 #[test]
 fn regression_no_generation_number_is_minted_twice() {
-    for seed in [16_855u64, 16_869, 1_659, 2_958] {
+    for seed in [16_855u64, 16_869, 1_660, 2_958] {
         let report = run_seed(seed, placement_hot_slow_lease_reads_config()).unwrap_or_else(|e| {
             panic!(
                 "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=placement-hot \
@@ -20965,8 +20977,11 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     // 190 ms of its window, is under the classifier floor of 2026-11-13 (no
     // room for a lease-read retry after the claim: none in time). Seed 2,
     // root 3 reachable for the last 1.2 s of the window, is the pin.)
+    // (The release record's off-core write, answered 0-25 ms later in the
+    // simulation, settled seed 2's EIO. Seed 53, two such EIOs with root
+    // idle, is the first of seeds 0..299 that tells one, and the pin.)
     let cfg = flex_tight_config;
-    let seed = 2;
+    let seed = 53;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
