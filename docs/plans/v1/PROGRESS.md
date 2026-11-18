@@ -70278,3 +70278,20 @@ base `origin/main` against the fix, 2000 seeds each (nine labels: delegated-hold
 long-delegated-late-answers (also with slow lease reads), delegated-two-dirs-one-backed, delegated-backup, delegated-epoch, tloss-two-node):
 zero `SWEEP-FAIL` seeds on both sides; the fix re-appended own rows in the labels that delegate (`SWEEP-REAPPENDED` totals 602, 22, 586,
 1084, 1372, 409, 285, 0, 10).
+
+### ADR-59 part B follow-up: the drop's apply names a re-appended seed by its own rid (2026-11-18)
+
+`far-root-writes+lost-chunk-late` seed 226 failed `drop_acked_loss_unrecorded`: a seed that is the root's own re-append of a stream row of its
+generation (`gen != 0`, `appended`) is never queued by the strand (`strand_local_tx`), so the seed loop of `drop_held_apply` found no queued replay
+and named it by the synthetic `replay_rid_for` rid, while the `DropHeld` names its real rid. The apply listed the synthetic rid in `acked_lost`,
+journaled `Refused` for it and queued the conflict copy under it. Now `WalkedRow` carries the row's class beside its rid (read before the strand
+deletes the `journal_tx` row); the loop resolves the rid from the queued replay, else the walked row's own rid, and only a transaction with no rid
+at all takes `replay_rid_for`. A seed without a queued replay is listed iff `may_have_left(rid, class)` with the pre-strand class (no class: listed).
+A `debug_assert!` checks that every rid the apply lists is in `plan.rids`, `plan.queued`, or is the synthetic rid of a rolled-back row that has none.
+Tests: `a_drop_names_a_reappended_seed_by_its_own_rid` (meta, fails on the parent with the synthetic rid listed and refused) and the sim pin
+`a_reappended_seed_is_dropped_under_its_own_rid` (new variant `lost-chunk-late`; the pin fails on the parent in release only, the debug trajectory of
+seed 226 differs; it asserts the drop oracle only). Seed 226 still fails after the fix, on an independent finding:
+`sticky_ends_only_by_holder_or_operator` (a self re-claimed own stream ended with no release row), so the pin is to be tightened to `.unwrap()` when
+that closes. Sweeps, release, 2,000 seeds, parent / fix: failing seeds are equal on every label (`far-root-writes+lost-chunk-late` [226, 996, 1810]
+on both, 226 now the sticky finding; the other nine labels none); `acked_lost` totals over the drop counters are equal on the first five labels
+(80, 50, 48, 1445, 41) and within a few of each other on the backed chains (4817/4812, 4813/4817).
