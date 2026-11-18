@@ -292,6 +292,7 @@ fn held_release_span_of(read_ttl: u64, margin: u64, kernel_drain: u64) -> u64 {
 /// The settle cap span does not depend on R, and both spans grow with it,
 /// so the longest fitting TTL is found by bisection. The cap is computed
 /// with R = 1, so an unbounded configured TTL cannot overflow a bound.
+#[must_use]
 pub fn read_ttl_fitting_settle_cap(cfg: &Config) -> Option<u64> {
     let mut probe = cfg.clone();
     probe.read_delegation_ttl_ms = 1;
@@ -1542,10 +1543,10 @@ mod tests {
             c.read_delegation_ttl_ms = r;
             assert_eq!(Deadlines::new(&c).settle_cap_span, 84_500, "R {r}");
         }
-        // A strict daemon at the defaults: cap 84500, m 1000, Kd 1500:
+        // A strict daemon at the defaults: cap 84500, m 1000, Kd 1000:
         // 2R + 4000 <= 84500.
         let mut c = engine();
-        c.kernel_cache_ttl_ms = 1_500;
+        c.kernel_cache_ttl_ms = 1_000;
         assert_eq!(read_ttl_fitting_settle_cap(&c), Some(5_000));
         c.read_delegation_ttl_ms = 40_250;
         assert_eq!(read_ttl_fitting_settle_cap(&c), Some(40_250));

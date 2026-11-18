@@ -2009,22 +2009,67 @@ pub fn sticky_release_cmd(_seed: u64) -> Result<()> {
 
 /// ADR-46: the sticky holder `b` of `d1` is killed with `kill -9` while `c`
 /// holds read delegations it granted, and remounted with its journal inside
-/// their lifetime (the read TTL is 30 s here, so the delegations outlive the
+/// their lifetime (the read TTL is 30 s here, kept by a 39.5 s grant TTL, so the delegations outlive the
 /// remount). `a`'s write of `d1/x` goes to the returned holder: it must not
 /// be acknowledged while `c` can still serve the old content, so `c`'s next
 /// strict open of `d1/x` shows the new content. A holder that forgets its
 /// grants executes at once and `c` serves the old content.
 pub fn sticky_holder_restart(_seed: u64) -> Result<()> {
     const SCENARIO: &str = "sticky-holder-restart";
-    let (_env, _root, mut clients, _) = cluster(
+    // The daemon cuts a read-delegation TTL that would outlast a settle's cap
+    // (ADR-48 D11b), so a 30 s TTL is only run with a grant TTL long enough
+    // to keep it: the cap is `2w + (D + m) + T + max(2F, seal) + drt`, and
+    // with L = 20 s and a strict mount (Kd 1 s) D = 39.5 s lets R = 30 s fit.
+    // At the cluster's usual D = 3 s the daemon would run R = 11.75 s and the
+    // guards below would prove nothing.
+    const READ_TTL_MS: u64 = 30_000;
+    const FITTING_DELEG_TTL_MS: u64 = 39_500;
+    let timings = crate::timings::Timings::from_pairs(&[
+        ("REPLICIX_LEASE_TTL_MS", TTL_MS.to_string()),
+        (
+            "CONSTELLATION_DELEGATION_TTL_MS",
+            FITTING_DELEG_TTL_MS.to_string(),
+        ),
+        ("CONSTELLATION_CTO", "strict".to_string()),
+        (
+            "CONSTELLATION_READ_DELEGATION_TTL_MS",
+            READ_TTL_MS.to_string(),
+        ),
+    ]);
+    anyhow::ensure!(
+        timings.read_delegation_ttl == Duration::from_millis(READ_TTL_MS),
+        "the scenario's configuration cuts the read TTL to {:?}",
+        timings.read_delegation_ttl
+    );
+    let read_ttl = timings.read_delegation_ttl;
+    let (_env, _root, mut clients, _) = cluster_with_deleg_ttl(
         SCENARIO,
         &["a", "b", "c"],
         &[
             ("CONSTELLATION_CTO", "strict"),
-            ("CONSTELLATION_READ_DELEGATION_TTL_MS", "30000"),
+            (
+                "CONSTELLATION_READ_DELEGATION_TTL_MS",
+                &READ_TTL_MS.to_string(),
+            ),
         ],
         0,
+        Some(FITTING_DELEG_TTL_MS),
     )?;
+    // The daemons ran with R as configured: not cut to fit.
+    for c in &clients {
+        let log = c.log_text();
+        anyhow::ensure!(
+            log.contains("protocol deadlines checked")
+                && log.contains(&format!("read_delegation_ttl_ms={READ_TTL_MS}"))
+                && !log.contains("cut to fit"),
+            "{}: the daemon did not run with a {READ_TTL_MS} ms read TTL:\n{}",
+            c.name,
+            c.tail_log_n(40)
+        );
+    }
+    // The guards below are the TTL less what the scenario spends before the
+    // write: 5 s of slack for the remount and the sleep.
+    let alive_bound = read_ttl - Duration::from_secs(5);
     let result = (|| -> Result<()> {
         let a = &clients[0];
         let b = &clients[1];
@@ -2064,7 +2109,7 @@ pub fn sticky_holder_restart(_seed: u64) -> Result<()> {
             killed.elapsed()
         );
         anyhow::ensure!(
-            killed.elapsed() < Duration::from_secs(25),
+            killed.elapsed() < alive_bound,
             "b came back after {:?}: the old read delegations may have lapsed, the scenario proves nothing",
             killed.elapsed()
         );
@@ -2079,7 +2124,7 @@ pub fn sticky_holder_restart(_seed: u64) -> Result<()> {
         // (30 s) are still live meanwhile.
         std::thread::sleep(Duration::from_millis(3_500));
         anyhow::ensure!(
-            killed.elapsed() < Duration::from_secs(25),
+            killed.elapsed() < alive_bound,
             "the old read delegations may have lapsed ({:?} after the kill)",
             killed.elapsed()
         );

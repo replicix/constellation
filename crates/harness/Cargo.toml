@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
+constellation-authority.workspace = true
 constellation-chaos.workspace = true
 constellation-types.workspace = true
 # `caps`: the harness's `Cap` is the vfs crate's, derived from `FrontendCaps`;

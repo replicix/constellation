@@ -582,7 +582,7 @@ means the default; for `_MIN_OPS`, `_DOMINANCE` and `_LEAVE`,
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_DELEGATION` | on | boolean | this node delegates subtrees (as the root) and accepts delegations (as a delegate). Off, or P2P off: no `Delegate` record is ever written |
-| `CONSTELLATION_DELEGATION_TTL_MS` | the lock TTL (`CONSTELLATION_LOCK_TTL_MS`, 20 s), at least `5000` | milliseconds | a delegation grant's lifetime, renewed at half of it (a quarter while it has lock grants out). Lock grants under a delegation never outlive it, so it bounds them; it is also how long a dead delegate's subtree waits to be reclaimed |
+| `CONSTELLATION_DELEGATION_TTL_MS` | the lock TTL (`CONSTELLATION_LOCK_TTL_MS`, 20 s), at least `5000` | milliseconds, above twice the expiry margin (D1: the daemon refuses to start at or below it) | a delegation grant's lifetime, renewed at half of it (a quarter while it has lock grants out). Lock grants under a delegation never outlive it, so it bounds them; it is also how long a dead delegate's subtree waits to be reclaimed |
 | `CONSTELLATION_DELEG_LANE` | on | `off`, `0` or `false` turns it off | the off-core delegation renewal lane: while this node's authority driver is stuck in a step (from a quarter of the renewal period, at most 500 ms, to `CONSTELLATION_HOLDER_STALL_MS`), its heartbeat thread sends the delegation renewals that are due, so a core blocked behind a slow store or log write does not lose the grant; for A/B runs only (see [Delegations](features/delegations.md#grants-renewal-and-expiry)) |
 | `CONSTELLATION_DELEG_ROOT_LANE` | on | `off`, `0` or `false` turns it off | the root's side of the same: while this node's authority driver is stuck in a step (as long as the delegate's lane waits, to `CONSTELLATION_HOLDER_STALL_MS`), its P2P service answers a delegation renewal itself, as the RPC reply of the request, by extending the generation's window in the shared window table, under the lease certificate the core published (the cap by the lease, the freshness rule, no recall or seal begun, nothing for the lock side to hand over); the core still answers the request in full; for A/B runs only (see [Delegations](features/delegations.md#grants-renewal-and-expiry)) |
 | `CONSTELLATION_DELEGATION_PLACEMENT` | on | boolean | the root delegates dominated subtrees by itself. Off keeps manual `delegate` only. Needs `CONSTELLATION_DELEGATION` |
@@ -1367,9 +1367,10 @@ the only time they change):
   cuts the lock TTL, a shorter grant only costs renewals.
 - **A `Refuse`-class invariant** (D1, D5, D6, D7, D9, D16) that fails stops
   the start with an error naming it, for example a read-delegation TTL not
-  above the expiry margin (D1). D2 is the exception: it fails at a lease TTL
+  above the expiry margin, or a write-delegation TTL (`CONSTELLATION_DELEGATION_TTL_MS`)
+  not above twice it (D1). D2 is the exception: it fails at a lease TTL
   of 1 s or less with the default forward timeout, where the harness's
-  short-lease scenarios run, and is logged as an error.
+  short-lease scenarios (leases of 1 s or less, such as `gc-lifecycle`, `gc-dedup-race`, `snapacct`) run, and is logged as an error.
 - **A `Warn`-class invariant** that fails is logged.
 
 The table is generated from the module at the defaults (`UPDATE_DOCS=1

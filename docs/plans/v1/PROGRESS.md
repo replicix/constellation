@@ -70943,7 +70943,8 @@ Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tes
 - **D11b** (s4bound D11′): `held_release_span = read_span + max(R + m, Kd)`, the hold of two merged releases, and
   `settle_cap_span >= held_release_span` (`Warn`). `Kd` is `kernel_cache_ttl_ms`. Pinned in every `pinned_*` table
   (14,000 at the defaults, 13,000 in the sim). `strict-isolated-reader-long` and `strict-reader-rate-fast` (R = 30 s, no
-  delegate streams) waive it.
+  delegate streams) waive it; `every_sim_configuration_passes_deadline_check` now asserts they have no delegations,
+  sticky delegations or placement.
 - **The daemon** runs `authority_driver::enforce_deadlines` once the mount has set every knob the check reads (there is
   no reload; env vars and `--cto`/`--locks` are the only inputs). It cuts R to the longest TTL that keeps D11 and D11b
   (`read_ttl_fitting_settle_cap`; 40,250 ms at the defaults, 3,625 ms at a 1 s lease, 3,325 ms at 200 ms) with a
@@ -70952,12 +70953,28 @@ Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tes
 - **Why a cut:** refusing D11b would stop `snapacct` (lease 1 s) and the snapshot churn (200 ms), which fail it at the
   default R. D2 fails in the same two configurations (a 500 ms forward timeout against a settle window of half the
   lease), so it is logged, not refused: open item.
-- **Newly refused:** `CONSTELLATION_READ_DELEGATION_TTL_MS` at or below the expiry margin (D1). No harness or documented
-  configuration sets it so low (the lowest is 3,000).
+- **Newly refused (D1):** `CONSTELLATION_READ_DELEGATION_TTL_MS` at or below the expiry margin, and
+  `CONSTELLATION_DELEGATION_TTL_MS` at or below twice it (<= 2 s at a 1 s margin). No harness or documented
+  configuration sets either so low (the lowest are 3,000).
 - Tests: `read_ttl_fitting_settle_cap_is_the_longest_that_keeps_d11b`, D11b cases in
   `each_invariant_has_a_failing_configuration`; engine `the_daemon_defaults_pass_the_deadline_check`,
-  `a_read_delegation_ttl_past_d11b_is_cut_to_fit` (fails on the parent: no check), `a_refused_deadline_stops_the_start`,
+  `a_read_delegation_ttl_past_d11b_is_cut_to_fit` (does not compile on the parent; the behavioural fail-before is the
+  harness scenario's R = 100 s case), `a_refused_deadline_stops_the_start`,
   `a_short_lease_starts_with_d2_logged`; harness scenario `deadline-check-at-start` (defaults start; R = 100 s starts
   cut to 40,250; R = 1 s is refused naming D1).
 - Not done here: ReleaseCut; the `GrantQuarantine` wakeup gap; the s4bound part-B core test
   `a_release_merged_into_a_held_one_extends_the_hold_by_its_own_grants`.
+
+**Round 2 (review of the above).**
+- **M1, `sticky-holder-restart`:** at the m11 cluster (L = 20 s, D = 3 s, strict, Kd 1 s) the cap is 27,500 ms and the
+  daemon cut its R = 30 s to 11,750 ms, so the scenario's "delegations still live" guards passed vacuously. The scenario
+  now runs a write-delegation TTL of 39.5 s (cap 64,000, R = 30 s fits), asserts from every mount log that "protocol
+  deadlines checked" names `read_delegation_ttl_ms=30000` with no "cut to fit", and derives its guards from the
+  harness `Timings` R. Sweep: no other scenario sets R above what its cap allows (the other four set 3,000 at
+  L = 20 s or 60 s); short-lease scenarios (leases 200 ms to 1 s, 5 s and 6 s) run the default R, cut, but none guards on R.
+- **S4:** harness `Timings::read_delegation_ttl` applies the same cut (via `read_ttl_fitting_settle_cap`), pinned at
+  40,250, 3,625 and 11,750.
+- **Open item, D2 in the harness:** D2 (settle window above the forward timeout) fails, logged at ERROR, in every harness
+  configuration with a lease of 1 s or less: `gc-lifecycle` (200 ms), `gc-dedup-race`, `gc-open-orphan-hold`,
+  `log-retention-gap`, `fsck-repair`, `mtree-gc-plateau` (200 ms), `snapacct`, and the snapshot churn.
+- Harness/fixture Kd corrected to 1,000 (a strict mount at a 1 s margin; at most 1,500 at the largest margin).

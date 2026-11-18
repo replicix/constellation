@@ -1314,7 +1314,8 @@ forward timeout, the takeover window and the stream tick. The core, the
 simulation driver and the simulation's classifier all read it, and it states
 the invariants between the bounds once (`Deadlines::check`, asserted for every
 simulated configuration and checked by the daemon as it starts, which cuts the
-read-delegation TTL to fit D11/D11b and refuses a `Refuse`-class violation). A new bound is added there,
+read-delegation TTL to fit D11/D11b and refuses a `Refuse`-class violation
+other than D2, [ADR-48](DECISIONS.md)). A new bound is added there,
 with an invariant if it relates to another; a formula that is written again at
 a call site is a defect. The table of the bounds at the defaults is generated
 into the [configuration reference](../reference/configuration.md#derived-timings)

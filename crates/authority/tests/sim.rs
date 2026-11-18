@@ -23353,6 +23353,20 @@ fn every_sim_configuration_passes_deadline_check() {
         let cfg = base_config(label);
         for node in 1..=4 {
             let core = sim::node::driver_config((cfg.core)(node, 1));
+            // A D11b waiver rests on the configuration holding no release
+            // note: it runs no delegate stream. Check it, not only say it.
+            if cfg.deadline_waivers.contains(&"D11b") {
+                assert!(
+                    cfg.delegations.is_empty()
+                        && cfg.sticky_delegations.is_empty()
+                        && !core.placement,
+                    "{label} waives D11b but can run delegate streams (delegations {:?}, sticky \
+                     {:?}, placement {})",
+                    cfg.delegations,
+                    cfg.sticky_delegations,
+                    core.placement
+                );
+            }
             for v in Deadlines::new(&core).check() {
                 let waived = v.class == Class::Warn && cfg.deadline_waivers.contains(&v.id);
                 if !waived {

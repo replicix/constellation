@@ -878,8 +878,9 @@ pub fn load_config(
 /// The deadline invariants the daemon does not refuse, though their class is
 /// `Refuse`: D2 (a settle window above the forward timeout) fails at a lease
 /// TTL of 1 s or less with the default 500 ms forward timeout, and the
-/// harness's short-lease scenarios (`snapacct` at 1 s, the snapshot churn at
-/// 200 ms) run there. They are logged as errors.
+/// harness's short-lease scenarios (`snapacct` and `gc-dedup-race` at 1 s,
+/// `gc-lifecycle` and the snapshot churn at 200 ms, among others) run there.
+/// They are logged as errors.
 const DEADLINES_NOT_REFUSED: &[&str] = &["D2"];
 
 /// The protocol deadlines (`constellation_authority::deadlines`) of the
@@ -912,6 +913,14 @@ pub fn enforce_deadlines(c: &mut Config) -> Result<()> {
             c.expiry_margin_ms
         );
     };
+    if fitted != configured && fitted <= c.expiry_margin_ms {
+        anyhow::bail!(
+            "deadline D11b: the read-delegation TTL that fits the settle cap span is {fitted} ms, \
+             not above the expiry margin ({} ms): the configuration leaves no room for a read \
+             delegation (configured {configured} ms)",
+            c.expiry_margin_ms
+        );
+    }
     if fitted != configured {
         tracing::warn!(
             configured_read_delegation_ttl_ms = configured,
@@ -929,12 +938,11 @@ pub fn enforce_deadlines(c: &mut Config) -> Result<()> {
             }
             Class::Refuse => tracing::error!(
                 deadline = v.id,
-                "deadline {} fails, not refused (short-lease configurations run there): {}",
-                v.id,
+                "deadline fails, not refused (short-lease configurations run there): {}",
                 v.msg
             ),
             Class::Warn => {
-                tracing::warn!(deadline = v.id, "deadline {} fails: {}", v.id, v.msg);
+                tracing::warn!(deadline = v.id, "deadline fails: {}", v.msg);
             }
         }
     }
@@ -10843,13 +10851,13 @@ mod tests {
 
     /// The daemon's configuration at its defaults, as `load_config` and the
     /// mount build it, without reading the environment: L 60 s, m 1 s, the
-    /// delegation TTL the lock TTL's, and a strict mount's kernel drain.
+    /// delegation TTL the lock TTL's, and a strict mount's kernel drain (1 s at a 1 s margin).
     fn daemon_defaults() -> Config {
         let mut c = Config::defaults(1, 1);
         c.ttl_ms = 60_000;
         c.expiry_margin_ms = 1_000;
         c.forward_timeout_ms = 500;
-        c.kernel_cache_ttl_ms = 1_500;
+        c.kernel_cache_ttl_ms = 1_000;
         c.delegation_ttl_ms = 0;
         constellation_authority::deadlines::normalize(&mut c);
         c
@@ -10867,9 +10875,9 @@ mod tests {
     }
 
     /// An unbounded read-delegation TTL is cut to the longest D11b allows
-    /// (cap 84500, 2R + 4000), and D11b then holds. Fails on the parent: the
-    /// daemon never ran the check, and R = 100 s ran with a settle cap below
-    /// the hold of a release.
+    /// (cap 84500, 2R + 4000), and D11b then holds. The behavioural
+    /// fail-before is the harness scenario `deadline-check-at-start` (R = 100 s
+    /// ran uncut on the parent); this test does not compile there.
     #[test]
     fn a_read_delegation_ttl_past_d11b_is_cut_to_fit() {
         for r in [40_251, 100_000, u64::MAX] {

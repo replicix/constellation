@@ -46,11 +46,33 @@ impl Timings {
             .min(lease_ttl.saturating_sub(2 * margin))
             .max(1);
         let delegation_ttl = knob("CONSTELLATION_DELEGATION_TTL_MS", lock_ttl.max(5_000));
-        let read_delegation_ttl = get("CONSTELLATION_READ_DELEGATION_TTL_MS")
+        let backup_takeover = knob("CONSTELLATION_BACKUP_TAKEOVER_MS", 1_500);
+        let configured_read_ttl = get("CONSTELLATION_READ_DELEGATION_TTL_MS")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(5_000)
             .max(1);
-        let backup_takeover = knob("CONSTELLATION_BACKUP_TAKEOVER_MS", 1_500);
+        // Cut to what D11/D11b allow (`enforce_deadlines`, ADR-48): the TTL
+        // the daemon runs with, which the scenario's guards must use.
+        let strict =
+            get("CONSTELLATION_CTO").is_some_and(|v| v.trim().eq_ignore_ascii_case("strict"));
+        let mut cfg = constellation_authority::core::Config::defaults(1, 1);
+        cfg.ttl_ms = lease_ttl;
+        cfg.expiry_margin_ms = margin;
+        cfg.lock_ttl_ms = lock_ttl;
+        cfg.delegation_ttl_ms = delegation_ttl;
+        cfg.forward_timeout_ms = knob("CONSTELLATION_FORWARD_TIMEOUT_MS", 500);
+        cfg.backup_takeover_ms = backup_takeover;
+        // The kernel drain of a strict mount (`cto::lone_kernel_drain_ms`).
+        cfg.kernel_cache_ttl_ms = if strict {
+            (margin / 2).clamp(1, 1_000) + 500
+        } else {
+            0
+        };
+        cfg.read_delegation_ttl_ms = configured_read_ttl;
+        constellation_authority::deadlines::normalize(&mut cfg);
+        let read_delegation_ttl =
+            constellation_authority::deadlines::read_ttl_fitting_settle_cap(&cfg)
+                .unwrap_or(configured_read_ttl);
         let holder_stall = knob("CONSTELLATION_HOLDER_STALL_MS", 15_000);
         Timings {
             lease_ttl: ms(lease_ttl),
@@ -190,6 +212,31 @@ mod tests {
         assert_eq!(t.reclaim_horizon(), ms(6_000));
         assert_eq!(t.ack_floor_wait(true), ms(14_500));
         assert_eq!(t.ack_floor_wait(false), ms(8_500));
+    }
+
+    /// The read-delegation TTL is cut as the daemon cuts it
+    /// (`enforce_deadlines`): the defaults pass, a long one is cut to 40.25 s,
+    /// the 1 s lease cuts the default, and the m11 strict cluster (lease 20 s,
+    /// write-delegation TTL 3 s) cuts 30 s to 11.75 s.
+    #[test]
+    fn the_read_ttl_is_cut_to_fit_the_settle_cap() {
+        let t = Timings::from_pairs::<&str, &str>(&[]);
+        assert_eq!(t.read_delegation_ttl, ms(5_000));
+        let t = Timings::from_pairs(&[("CONSTELLATION_READ_DELEGATION_TTL_MS", "100000")]);
+        assert_eq!(t.read_delegation_ttl, ms(40_250));
+        let t = Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", "1000")]);
+        assert_eq!(t.read_delegation_ttl, ms(3_625));
+        let m11 = [
+            ("REPLICIX_LEASE_TTL_MS", "20000"),
+            ("CONSTELLATION_DELEGATION_TTL_MS", "3000"),
+            ("CONSTELLATION_CTO", "strict"),
+            ("CONSTELLATION_READ_DELEGATION_TTL_MS", "30000"),
+        ];
+        assert_eq!(Timings::from_pairs(&m11).read_delegation_ttl, ms(11_750));
+        // Write-delegation TTL 39.5 s: 30 s fits.
+        let mut fits = m11.to_vec();
+        fits[1].1 = "39500";
+        assert_eq!(Timings::from_pairs(&fits).read_delegation_ttl, ms(30_000));
     }
 
     #[test]

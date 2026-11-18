@@ -3978,28 +3978,34 @@ file (the formulas are the point, not the numbers).
   R of about 40 s at the daemon defaults, and at the default R below a lease
   TTL of about 4.5 s, silently.
 - *Decision.* D11b (`settle_cap_span >= held_release_span`, `Warn`) joins the
-  check; the simulation waives it only for its two R = 30 s configurations,
-  which run no delegate streams. The daemon runs the check once, as it starts
+  check; the simulation waives it only for its R = 30 s configurations,
+  which run no delegate streams (the deadline test asserts it). The daemon runs the check once, as it starts
   (`authority_driver::enforce_deadlines`; there is no reload):
   - it **cuts R** to the longest TTL that keeps D11 and D11b
     (`read_ttl_fitting_settle_cap`), with a warning naming both values, and
     refuses to start if none fits;
   - it **refuses to start** on any other `Refuse`-class violation, naming the
-    invariant, except D2;
+    invariant, except D2. D1 newly refuses a read-delegation TTL at or below
+    the expiry margin and a write-delegation TTL
+    (`CONSTELLATION_DELEGATION_TTL_MS`) at or below twice it, which the daemon
+    ran before; no harness or deployed configuration sets either that low;
   - it logs `Warn`-class violations, and D2 as an error.
 - *Why a cut and not a refusal for D11/D11b.* Refusing is the integrity-first
   default, but it would stop configurations the harness runs and tests:
-  `snapacct` (lease 1 s) and the snapshot churn (lease 200 ms) at the default
-  R fail D11b. A cut keeps the invariant, so it gives up nothing the refusal
+  the harness's short-lease scenarios (`snapacct`, lease 1 s, the snapshot
+  churn and the `gc-*` ones at 200 ms to 1 s) at the default R fail D11b. A cut keeps the invariant, so it gives up nothing the refusal
   would keep. R is a lifetime renewed while in use, and a shorter grant only
   costs renewals. D8 already cuts the lock TTL the same way. Warning only was
   rejected: it keeps the hazard.
 - *Why D2 is not refused.* It fails at a lease TTL of 1 s or less with the
-  default 500 ms forward timeout, which is where those same two harness
+  default 500 ms forward timeout, which is where those same harness
   configurations run. Refusing it would stop them, and cutting the forward
   timeout below the settle window is not a narrow change. It stays an open
   item.
-- *Scope.* D11b covers one merged release. Three or more, a settle that began
+- *Scope.* A store whose previous process ran with a larger, uncut R records
+  that larger span, so its first restart on this build can quarantine longer
+  than the current `read_span`; transitional only. D11b covers one merged
+  release. Three or more, a settle that began
   before the hold, and a redirected settle rest on the simulation's S4 tag.
 
 See: `crates/authority/src/deadlines.rs`,
