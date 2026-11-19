@@ -71000,3 +71000,28 @@ Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tes
   - The epoch closes only after a complete dirty-upload pass (65-95 s in the run), and the driver's `biased` select drains the internal channel
     before `sync_rx`, so the client lane starves while core steps are slow. A fairness budget for `sync_rx` and a shorter epoch need a design.
   - A separate `close` EIO appears in dnotify (inotify) under heavy CPU load in `stress-ng-fs-faults`, with this fix in. It needs its own diagnosis.
+## A journal read error is no longer "drained" (2026-11-19)
+
+- **Bug.** Seven sites took a transient journal read error (EIO, a checksum, `Poisoned` after a failed flush) for an empty journal and so could
+  release the lease, hand it off, forward an op or publish a snapshot over acknowledged rows that never shipped (I1/I5; the loss `flex-tight` seed 485
+  recorded). They were the release CAS's guard (`authority_driver::release_guard`), `round_release` (the epoch flush release and the idle release),
+  `release_after_recalls`, the handoff decline, three forwards in `core/client.rs`, and `TreePublisher::publish_now`. A persistent error already failed
+  closed through `take_journal`.
+- **Fix.** Each site fails closed (ADR-64): the guard fails the CAS, a round meeting the error ends as failed with no release, `EpochFlushed`, handoff
+  pause or nudge, the handoff is declined, forwards take the lease path, `publish_now` fails ("reading the journal"), and
+  `check_own_release_shipped` counts its read error. `Stats::journal_read_errors` counts the first four. `Replica::journal_own_gens` returns the `Result`.
+- **Hook and sim knob.** `Meta::fail_journal_emptiness_reads_for_tests(n)` (per store; `test-util`) and
+  `AUTHORITY_SIM_JOURNAL_READ_FAULT=<p>` (a chance per handled event that a node's next emptiness read fails once).
+- **Tests (each fails before its fix, logs kept):** the release guard, the idle release, the epoch flush release, the handoff decline, the forward
+  at `client.rs:1453`, `release_after_recalls` (flush job) and `publish_now`. Not covered by a test of its own: the two other `client.rs` sites
+  (s3-less P2P forward, lost-lease lease path), which are the same one-line change, and a `Round`-kind `release_after_recalls`.
+- **Sweeps (500 seeds, 1000 for `drop-held-chain-backed`), pre-fix tree against fix, knob off:** `flex`, `flex-crash`, `flex-tight`,
+  `locks-blips-tight-faults`, `delegated-holder-cut`, `long-backup`, `locks-failover-backup`, `sticky-root-designee-inbox-skew`,
+  `drop-held-chain-backed`: 0 failing on both. With the knob at 0.01 on `flex`: the pre-fix tree fails 11 of 100 and 35 of seeds 100..500 (I2c, an
+  acknowledged op's completion lost); the fix fails none. On `long-backup` the knob found nothing on the pre-fix tree (p 0.01 to 1.0, up to 500
+  seeds), so that configuration does not reach the sites.
+- **Open item (architecture).** A persistent journal fault now keeps a holder renewing a lease it can neither release nor hand off. The end state
+  (surface the fault, stop renewing after a bound so the successor's TTL gate strands the rows and replays them) needs an architecture decision.
+- **Gates:** fmt, clippy `-D warnings` (workspace, all targets), lib tests debug 4563 and release 4561 passed, the release sim suite
+  (578 passed, 0 failed, `--test-threads=6`), harness smoke at seed 42 (backup-failover, backup-departs, deposed-reintegration-backup,
+  ack-s3-failover, lease-handover, p2p-handover, snapshot-lifecycle, snapshot-busy-latency, snapshot-mount) all passed.

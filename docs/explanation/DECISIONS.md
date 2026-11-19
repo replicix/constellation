@@ -6128,3 +6128,35 @@ See: `crates/net/src/message.rs` (`write_payload`, `read_payload`),
 `crates/net/src/peers.rs` (`handle_conn`, `handle_stream`),
 [p2p-relays](../reference/features/p2p-relays.md), "Trust model", and
 [security-audit-2026-09](../security-audit-2026-09.md).
+
+## ADR-64: A journal read error is never "drained"
+
+**Status**: decided on 2026-11-19, from a review of every emptiness test of the journal.
+
+**Context**: the question "is the journal empty?" gates the release of the
+lease, a handoff, a forward and a publish. Seven sites answered a read error
+(EIO, a checksum, `Poisoned` after a failed flush) as "empty" (`unwrap_or(true)`,
+`unwrap_or(0)`): the release CAS's guard, `round_release` (the epoch flush
+release and the idle release), `release_after_recalls`, the handoff decline,
+three client forwards and `publish_now`. A transient error on rows
+`take_journal` had skipped (deferred or held) or that landed after the ship
+released the lease over acknowledged, unshipped rows: the loss `flex-tight`
+seed 485 recorded (I1/I5). A persistent error already failed closed, because
+`take_journal` fails.
+
+**Decision**: a read error is the answer that blocks. At a decision that gives
+the lease away or lets an op or a snapshot pass, `Err` takes the path of
+"rows remain": the release guard and the handoff decline fail, a round that
+meets it ends as failed (no release, no `EpochFlushed`, no handoff pause, no
+nudge), a forward takes the lease path, `publish_now` fails ("reading the
+journal"). Every such error is counted (`Stats::journal_read_errors`) and
+warned. Callers that only report a count keep their meaning.
+
+**Consequence**: a persistent fault keeps the holder renewing a lease it can
+no longer release or hand off. The end state (surface the fault, stop renewing
+after a bound so the successor's TTL gate strands the rows and replays them)
+needs its own decision and is an open item in PROGRESS.
+
+See: `Core::journal_drained` (`crates/authority/src/core/jobs.rs`),
+`release_guard` (`crates/engine/src/authority_driver.rs`),
+`Meta::fail_journal_emptiness_reads_for_tests`.
