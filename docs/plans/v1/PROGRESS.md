@@ -71128,3 +71128,47 @@ Gates, on the final tree (origin/main 7319f0da plus four commits), the lib tests
   `locks-writer-hold-delegated-unsettled-own-clock` (13) are the same on both.
 - Harness smoke at seed 42: lease-handover, lease-cold-claim, lease-fencing, lease-claimant-ahead, backup-failover, ack-s3-failover,
   p2p-partition-tolerance, backup-partition: all passed.
+
+
+### The release in doubt: a safe fence, the late-applied S3 fault, Fable's SHOULDs (2026-11-19, round 5)
+
+The review of the round before found that a peer's read showing the lease standing is not the evidence the node's own re-read is: the failed
+release PUT can still be in flight on the node's own path (a request orphaned by a closed connection, delivered when the path heals) and release
+the lease under a node that went on as holder or adopted an epoch hold. The maintainer decided (2026-11-19) for a safe fence. This supersedes the
+paragraph above that says a peer's read resolves the doubt as "kept".
+
+- The fence. A peer's read that shows the lease standing now decides nothing (`release_unresolved_kept_by_peer` counts it, the node stays
+  `releasing`, answers `Held`, adopts no hold). Peer reads still end the wait when they show the release landed or another holder (final: the
+  tag differs from the failed PUT's). The node's own re-read that shows the lease standing, once the wait began, is followed by a renewal CAS on
+  the tag it returned (`Phase::ReleaseRenew`, `release_unresolved_renewals`); the fence lifts when that lands (its new version kills the late
+  PUT). Conflict: read again. No answer: stay. The renewal moves the lease object, so an epoch that carried the old one adopts no hold; it
+  closes on the move and the node goes on as the S3 holder. `LeaseProbe` stays: it shortens waits when a peer sees the release landed or a
+  deposition, and costs one GET per probe. Without the renewal the own-read path alone still shows two authorities (11 of 1,500 seeds of
+  `flex-tight-late-applied`, measured on a tree with only the peer-read change).
+- The fault. `Fault::TimeoutThenApplied { after_ms }` (error now, applied later if the precondition holds) and `TimeoutThenAppliedCut` (the
+  node's path cut meanwhile), `Rule::releases_only`. In `s3_rules()` (`regression_scripted_s3_error_codes`) and in four labels:
+  `flex-tight-late-applied`, `locks-late-applied`, `locks-blips-tight-late-applied`, `locks-unlinked-delegated-blips-late-applied` (half the
+  release PUTs: timeout, applied 3 s later, node cut 5 s). It is not in the unsuffixed configurations: it would move their pinned seeds and
+  ceilings. Fail-before: on 248abc82 (peer-read path) `flex-tight-late-applied` fails "two authorities at once" in 264 of 1,500 seeds (3, 4, 5,
+  7, 16 are pinned in `regression_a_late_applied_release_makes_no_second_authority`); with the safe fence 0 of 1,500 and of 2,000. On
+  origin/main with the same fault 0 (it gives up at once); `locks-blips-tight-late-applied` fails 677 and 1654 on main, 0 here.
+- I4 ceiling of `locks-unlinked-delegated-blips+unsettled`: not raised. The decision was to raise it from 2 to 3 for the in-doubt `EIO` seeds
+  64, 391, 1477; with the renewal those seeds resolve (wait reached, one renewal each, no unsettled `EIO`: `regression_a_release_in_doubt_waits_and_asks_the_peers`) and
+  seeds 0..99 measure 1 (main 1). The ceiling stays 2; raising it is one line in the m03 table if the maintainer still wants it.
+- Fable's SHOULDs. S1: a shutdown queued before the wait gives up at once (`stop_flush_queued`). S2: the journal-rows `debug_assert` in the
+  release gap is gone (legal with the daemon's fast path); the stat stays, logged at debug. S3: the oracle's Breach branch checks published
+  flags against each other, which the real core makes unreachable; the knob test is renamed
+  (`flex_a_fenced_release_is_not_an_authority_and_the_breach_branch_is_wired`) and the docs say so. S4: a read handled after the honour end
+  gives up. S6: ADR-22 lists the cost (job slot, backup reconfiguration, root lease reads, lock renewals, shutdown; all latency, at most one TTL).
+- S5, flex-tight+unsettled: 62 on main, 59 here, all I4 "told EIO unsettled although a sequencer was reachable", 18 seeds new (the 17 of last
+  round and 1730, 1895) and 21 gone. Run with `SWEEP-RELEASE-WAIT` (new sweep line) on the final tree: 12 of the 18 never enter the wait
+  (`release_unresolved` 0; all have `release_record_waits` 2..8: the record's simulated sync, as for the earlier rounds). 6 enter it (358,
+  462, 1002, 1046, 1730, 1895, one renewal each, none gave up); 4 of those answered `Held` (462: 4, 1002: 17, 1730: 9, 1895: 4), so the wait
+  may contribute to the EIO there. Not proven either way. The `flex-tight` ceilings are unchanged and the m03 test passes.
+
+Gates, on the rebased tree (origin/main b6861176 plus six commits), box2: fmt, clippy `--workspace --all-targets -D warnings` clean; lib
+tests debug and release: authority 1765, meta 485/484, engine 1001, net 166, 0 failed; full release sim suite: 583 passed, 0 failed, 16
+ignored (includes m03 with the unchanged ceilings). Sweeps of 0..1999, origin/main (with the same sim) against the final tree, 138 labels
+(every `locks*`, flex-tight and +unsettled, the m03 configurations, the four late-applied labels): identical failing sets except
+`flex-tight+unsettled` (above), `locks-unlinked-delegated-blips+unsettled` (6 on main, 4 here, none new) and `locks-blips-tight-late-applied`
+(2 on main, 0 here). No new I-class, lock or liveness failure.
