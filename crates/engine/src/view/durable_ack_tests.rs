@@ -1503,7 +1503,7 @@ fn hinted_and_lost(
             1,
         )
         .unwrap();
-    assert!(hinted);
+    assert!(hinted.installed());
     let (mut fs, dir, core) = holder_fs(meta.clone(), false);
     // Not the holder: the close forwards.
     fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());

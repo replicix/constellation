@@ -1773,9 +1773,10 @@ pub struct Report {
     /// withheld, quarantines ended early by the void round.
     pub quarantine_core: [u64; 6],
     /// The shadows and the hints refused because their records skipped on
-    /// the requester's replica, summed over the nodes (`SWEEP-UNAPPLIED`):
-    /// only the stale-base knob may have any.
-    pub unapplied_core: [u64; 2],
+    /// the requester's replica, and the shadows and hints installed on a
+    /// base the requester had not applied (uncovered), summed over the
+    /// nodes (`SWEEP-UNAPPLIED`): only the stale-base knob may have any.
+    pub unapplied_core: [u64; 3],
     /// The release in doubt's wait (`release_doubt.rs`), summed over the nodes:
     /// entered, peer reads that showed the lease standing, given up, inconclusive
     /// peer reads, forwards answered `Held`, renewal CASes, probes answered,
@@ -7566,6 +7567,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.shadows_unapplied, stats.hints_unapplied, report.stats
             ));
         }
+        // Installed on a base the requester had not applied is the knob's
+        // doing alone: `base_ok` is `base_held` without it.
+        if stats.stale_base_uncovered > 0 && !stale_base {
+            return Err(format!(
+                "node {id}: {} shadow(s) or hint(s) installed on a base the requester had not applied, without the stale-base knob\n  stats: {:#?}",
+                stats.stale_base_uncovered, report.stats
+            ));
+        }
     }
     // Plan 46 M1.2 step 14: a root's append of a delegate's row is dropped or
     // kept as a member copy by every stranding pass, never queued for replay
@@ -8190,6 +8199,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.sticky_core[15] += s.deleg_abandon_superseded;
         report.unapplied_core[0] += s.shadows_unapplied;
         report.unapplied_core[1] += s.hints_unapplied;
+        report.unapplied_core[2] += s.stale_base_uncovered;
         report.quarantine_core[0] += s.deleg_restart_quarantines;
         report.quarantine_core[1] += s.deleg_restart_q_parks;
         report.quarantine_core[2] += s.deleg_restart_q_held;

@@ -17,9 +17,9 @@ use constellation_fs_core::Ino;
 use constellation_meta::delegation::{DelegationTable, Ownership};
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
-    execute_tagged, BackupRole, BackupTx, CompletedOutcome, DelegateTx, InboxAck, JournalBatch,
-    JournalPos, KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position, ReadDelegations,
-    Rid, ShadowInstall, Stranded, StrandedOp, TouchSet,
+    execute_tagged, BackupRole, BackupTx, CompletedOutcome, DelegateTx, HintInstall, InboxAck,
+    JournalBatch, JournalPos, KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position,
+    ReadDelegations, Rid, ShadowInstall, Stranded, StrandedOp, TouchSet,
 };
 use constellation_types::Code;
 
@@ -192,9 +192,10 @@ pub trait Replica {
     fn adopt_streamed(&self, rid: Rid, op: &MutateOp, tag: &LockTag) -> Result<bool, MetaError>;
     /// Install the entry behind `rid`'s `Exists` refusal ahead of the
     /// log; it retires once the applied log reaches `at`, the reply's
-    /// position. `false` when not installed: this replica already has the
+    /// position. [`HintInstall::Redundant`]: this replica already has the
     /// refusal (applied, or streamed ahead of the log with whatever the
-    /// holder streamed after it).
+    /// holder streamed after it); [`HintInstall::Unapplied`]: the entry's
+    /// records skip here.
     fn install_hint(
         &self,
         rid: Rid,
@@ -203,7 +204,7 @@ pub trait Replica {
         epoch: Epoch,
         gen: u64,
         committed: bool,
-    ) -> Result<bool, MetaError>;
+    ) -> Result<HintInstall, MetaError>;
     fn has_outstanding_speculation(&self) -> bool;
     /// Roll back every speculative entry accepted below `epoch` and
     /// queue its op for replay.
@@ -453,9 +454,6 @@ pub trait Replica {
     /// since the last call (a tolerant apply; counted, and the sim fails a
     /// seed that has one).
     fn take_deleg_append_skipped(&self) -> u64;
-    /// Hints refused since the last call because their records skipped
-    /// here (`Meta::take_hints_unapplied`).
-    fn take_hints_unapplied(&self) -> u64;
     /// Appended delegate rows with a rid and no completion for it (must stay 0).
     fn take_deleg_append_uncompleted(&self) -> u64;
     /// This node's unretired transactions of stream `gen` from `from_idx`.
@@ -1221,7 +1219,7 @@ impl Replica for Meta {
         epoch: Epoch,
         gen: u64,
         committed: bool,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<HintInstall, MetaError> {
         Meta::install_hint_committed(self, Some(rid), records, at, epoch, gen, committed)
     }
 
@@ -1606,10 +1604,6 @@ impl Replica for Meta {
 
     fn take_deleg_append_skipped(&self) -> u64 {
         Meta::take_deleg_append_skipped(self)
-    }
-
-    fn take_hints_unapplied(&self) -> u64 {
-        Meta::take_hints_unapplied(self)
     }
 
     fn take_deleg_append_uncompleted(&self) -> u64 {

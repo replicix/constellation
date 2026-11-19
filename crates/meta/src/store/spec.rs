@@ -156,6 +156,7 @@ const ABANDON_REPLAY_NODE: u64 = 1 << 63;
 // ---------------------------------------------------------------- types
 
 /// What [`Meta::install_shadow`] did with a forward reply's records.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShadowInstall {
     /// A shadow stands for the op's effect (or the holder's stream carried
@@ -175,9 +176,44 @@ pub enum ShadowInstall {
 
 impl ShadowInstall {
     /// Whether a shadow (or an adopted stream entry) stands for the op.
-    pub fn installed(self) -> bool {
-        self == Self::Installed
+    #[must_use]
+    pub const fn installed(self) -> bool {
+        matches!(self, Self::Installed)
     }
+}
+
+/// What [`Meta::install_hint_committed`] did with an `Exists` refusal's entry.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintInstall {
+    /// A hint stands for the entry.
+    Installed,
+    /// Not installed: this replica is already at or past the state the
+    /// entry was read from (the log or the holder's stream carries the
+    /// refusal), or its keys are held by live speculation or a held inode.
+    Redundant,
+    /// The replay skipped some of the entry's records: this replica is not
+    /// at the state the holder read it from. Nothing was installed and
+    /// nothing may claim coverage.
+    Unapplied,
+}
+
+impl HintInstall {
+    /// Whether a hint stands for the entry.
+    #[must_use]
+    pub const fn installed(self) -> bool {
+        matches!(self, Self::Installed)
+    }
+}
+
+/// What [`Meta::install_speculative_tx`] does when the replay skips a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnSkip {
+    /// Abort: nothing is installed.
+    Refuse,
+    /// Install what applied (a streamed transaction: the stream's order
+    /// is the holder's, and a skip is its own retirement rule).
+    Keep,
 }
 
 /// What one `spec` row is. See the module doc.
@@ -5114,7 +5150,13 @@ impl Meta {
             gated: committed,
             non_stealable,
         };
-        if self.install_speculative_tx(tx, UsageTracker::staging(), kind, records, true)? {
+        if self.install_speculative_tx(
+            tx,
+            UsageTracker::staging(),
+            kind,
+            records,
+            OnSkip::Refuse,
+        )? {
             Ok(ShadowInstall::Installed)
         } else {
             tracing::warn!(
@@ -5130,21 +5172,21 @@ impl Meta {
     /// `Hint` entry: it retires once the applied log holds everything the
     /// answering holder had (`at`, the reply's position; see
     /// `hint_reached`), and is rolled back if a segment from a later epoch
-    /// than the answering holder's arrives first. `false`: not installed
-    /// (see [`Self::install_hint_from`]).
+    /// than the answering holder's arrives first. Not installed: see
+    /// [`Self::install_hint_from`].
     pub fn install_hint(
         &self,
         records: &[LogRecord],
         at: Position,
         epoch: u64,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<HintInstall, MetaError> {
         self.install_hint_from(None, records, at, epoch, 0)
     }
 
     /// [`Self::install_hint`] for the refusal of `rid` (when known),
     /// answered by a delegate of generation `gen` (plan 30 §M11; 0: the
-    /// root). Returns `false`, and installs nothing, when this replica is
-    /// already at or past the state the entry was read from:
+    /// root). Returns [`HintInstall::Redundant`], and installs nothing, when
+    /// this replica is already at or past the state the entry was read from:
     /// - the applied log carries `rid`'s refusal;
     /// - plan 30 §M9: the holder's pre-S3 stream carried the refusal here
     ///   before the reply (which waits for the backup's acknowledgement
@@ -5173,7 +5215,7 @@ impl Meta {
     ///   arrived (plan 45 review).
     ///
     /// - the replay skips any of the entry's records
-    ///   ([`Self::take_hints_unapplied`]): this replica is not at the state
+    ///   ([`HintInstall::Unapplied`]): this replica is not at the state
     ///   the holder read it from, and a hint that lacks part of the entry
     ///   would cover keys it does not show.
     ///
@@ -5186,7 +5228,7 @@ impl Meta {
         at: Position,
         epoch: u64,
         gen: u64,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<HintInstall, MetaError> {
         self.install_hint_committed(rid, records, at, epoch, gen, false)
     }
 
@@ -5200,20 +5242,20 @@ impl Meta {
         epoch: u64,
         gen: u64,
         committed: bool,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<HintInstall, MetaError> {
         let tx = self.db.write_tx();
         if let Some(rid) = rid {
             if tx.get(&self.completed, rid.to_key())?.is_some()
                 || streamed_entry_refusing(&tx, self, rid)?.is_some()
             {
-                return Ok(false);
+                return Ok(HintInstall::Redundant);
             }
         }
         if live_speculation_touches(&tx, self, &TouchSet::from_records(records.iter()))? {
-            return Ok(false);
+            return Ok(HintInstall::Redundant);
         }
         if hint_names_a_held_inode(&tx, self, records)? {
-            return Ok(false);
+            return Ok(HintInstall::Redundant);
         }
         let installed = self.install_speculative_tx(
             tx,
@@ -5225,20 +5267,13 @@ impl Meta {
                 gated: committed,
             },
             records,
-            true,
+            OnSkip::Refuse,
         )?;
-        if !installed {
-            self.hints_unapplied
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(installed)
-    }
-
-    /// How many hints [`Self::install_hint_committed`] refused since the
-    /// last call because their records skipped on this replica.
-    pub fn take_hints_unapplied(&self) -> u64 {
-        self.hints_unapplied
-            .swap(0, std::sync::atomic::Ordering::Relaxed)
+        Ok(if installed {
+            HintInstall::Installed
+        } else {
+            HintInstall::Unapplied
+        })
     }
 
     /// The highest journal seq of `epoch` installed here as a `Streamed`
@@ -5641,7 +5676,7 @@ impl Meta {
                 own: None,
             },
             records,
-            false,
+            OnSkip::Keep,
         )
         .map(|_| ())
     }
@@ -5680,20 +5715,25 @@ impl Meta {
     /// `staged` may carry usage the caller's transaction already moved
     /// (a retraction); it is persisted with this install's.
     ///
-    /// `refuse_on_skip`: when the replay skips any record (the local state
+    /// `on_skip`: with [`OnSkip::Refuse`], when the replay skips any record (the local state
     /// is not the one the sequencer evaluated the records against), install
     /// nothing: the transaction is dropped unfinished, which aborts it (the
     /// namespace writes, the `dirty` rows the capture wrote in it and the
     /// usage delta staged in `staged`, which is not drained), and `false` is
     /// returned. An entry that applied only part of its records would stand
     /// for an effect it lacks. `true`: installed.
+    ///
+    /// An aborted pass leaves two effects outside the transaction, both
+    /// harmless: `note_snapshot_change` has bumped `snapshot_gen` (a
+    /// spurious invalidation) and the hybrid clock has observed the
+    /// records' timestamps.
     fn install_speculative_tx(
         &self,
         mut tx: SingleWriterWriteTx,
         staged: UsageTracker,
         kind: SpecKind,
         records: &[LogRecord],
-        refuse_on_skip: bool,
+        on_skip: OnSkip,
     ) -> Result<bool, MetaError> {
         let capture = Capture::new();
         let (skipped, applied) = {
@@ -5711,7 +5751,7 @@ impl Meta {
                 true,
             )?
         };
-        if refuse_on_skip && skipped > 0 {
+        if on_skip == OnSkip::Refuse && skipped > 0 {
             drop(tx);
             // Holds the aborted pass staged are harmless (the flush checks
             // the committed hold key); clear them with this thread's.

@@ -10596,7 +10596,7 @@ struct OracleTotals {
     root_own_core: [u64; 15],
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
-    unapplied_core: [u64; 2],
+    unapplied_core: [u64; 3],
     release_wait: [u64; 8],
     sticky_driver: [u64; 4],
     /// Plan 46 M1.3 step 14 (`Report::leave_driver`).
@@ -11241,7 +11241,7 @@ impl OracleTotals {
             constellation_authority::core::ACK_COUNTERS.iter().zip(self.claimed).collect::<Vec<_>>()
         );
         eprintln!(
-            "SWEEP-UNAPPLIED {label} seeds {}/{seeds}: [shadows, hints] whose records skipped on the requester's replica (refused, never covering; must be 0 without the stale-base knob) {:?}",
+            "SWEEP-UNAPPLIED {label} seeds {}/{seeds}: [shadows refused, hints refused, stale-base installs left uncovered]: records that skipped on the requester's replica, or a base it had not applied (never covering; must be 0 without the stale-base knob) {:?}",
             self.seeds, self.unapplied_core
         );
         eprintln!(
@@ -22437,6 +22437,45 @@ fn regression_delegated_backup_links_stalebase_ryw_seeds_464_1911() {
                  AUTHORITY_SIM_CONFIG=delegated-backup+{variants}"
             )
         });
+    }
+}
+
+/// `delegated-backup+links+stalebase` seeds 1489 and 1537 and
+/// `long-delegated+links-local+stalebase` seeds 131 and 579
+/// (`read_your_writes`): a stale-base reply whose records apply here with no
+/// skip (a rename of a source this replica lacks is a silent no-op; a `Same`
+/// rename has no records to replay) still stood for an effect it did not
+/// show and covered its keys, so the next read of the name saw it absent. A
+/// shadow or hint covers only on a base this replica has applied; on a stale
+/// base it stays installed and raises `observed` instead
+/// (`a_stale_base_shadow_raises_observed_instead_of_covering`).
+#[test]
+fn regression_stalebase_ryw_noop_shadow_seeds() {
+    type Base = fn() -> SimConfig;
+    let cases: [(&str, Base, &str, [u64; 2]); 2] = [
+        (
+            "delegated-backup",
+            delegated_backup_config,
+            "links+stalebase",
+            [1489, 1537],
+        ),
+        (
+            "long-delegated",
+            long_delegated_config,
+            "links-local+stalebase",
+            [131, 579],
+        ),
+    ];
+    for (base, config, variants, seeds) in cases {
+        for seed in seeds {
+            let cfg = variants.split('+').fold(config(), config_variant);
+            run_seed(seed, cfg).unwrap_or_else(|e| {
+                panic!(
+                    "{base}+{variants} seed {seed}: {e}\n  replay with \
+                     AUTHORITY_SIM_CONFIG={base}+{variants}"
+                )
+            });
+        }
     }
 }
 

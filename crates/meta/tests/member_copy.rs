@@ -789,16 +789,18 @@ fn a_tail_origin_retires_a_streamed_entry() {
 fn an_abandon_strands_a_committed_entry() {
     let meta = Meta::open_in_memory().unwrap();
     let recs = vec![create("a", ino(1), 10), completed(rid(1))];
-    meta.install_shadow_committed(
-        rid(1),
-        1,
-        0,
-        &create_op("a", ino(1)),
-        &Default::default(),
-        &recs,
-        true,
-    )
-    .unwrap();
+    assert!(meta
+        .install_shadow_committed(
+            rid(1),
+            1,
+            0,
+            &create_op("a", ino(1)),
+            &Default::default(),
+            &recs,
+            true,
+        )
+        .unwrap()
+        .installed());
     let marker = vec![LogRecord::GroupAbandoned {
         epoch: 1,
         gen: 0,
@@ -823,16 +825,18 @@ fn the_takeover_gate_supersedes_a_committed_entry_without_queueing() {
         let meta = Meta::open_in_memory().unwrap();
         let before = raw_ns(&meta);
         let recs = vec![create("a", ino(1), 10), completed(rid(1))];
-        meta.install_shadow_committed(
-            rid(1),
-            1,
-            0,
-            &create_op("a", ino(1)),
-            &Default::default(),
-            &recs,
-            true,
-        )
-        .unwrap();
+        assert!(meta
+            .install_shadow_committed(
+                rid(1),
+                1,
+                0,
+                &create_op("a", ino(1)),
+                &Default::default(),
+                &recs,
+                true,
+            )
+            .unwrap()
+            .installed());
         meta.install_streamed_committed(
             1,
             HOLDER,
@@ -929,16 +933,18 @@ fn a_deposition_still_copies_an_own_archive_row() {
 fn a_rebuild_keeps_a_committed_shadow() {
     let meta = Meta::open_in_memory().unwrap();
     let recs = vec![create("a", ino(1), 10), completed(rid(1))];
-    meta.install_shadow_committed(
-        rid(1),
-        1,
-        0,
-        &create_op("a", ino(1)),
-        &Default::default(),
-        &recs,
-        true,
-    )
-    .unwrap();
+    assert!(meta
+        .install_shadow_committed(
+            rid(1),
+            1,
+            0,
+            &create_op("a", ino(1)),
+            &Default::default(),
+            &recs,
+            true,
+        )
+        .unwrap()
+        .installed());
     // A gated row of this node's own journal: member copy; a lone one: queue.
     meta.set_holder_epoch(1);
     holder_create(&meta, RowCommit::ROOT_GROUP, "g", 4, 4);
@@ -965,16 +971,18 @@ fn a_rebuild_keeps_a_committed_shadow() {
     assert!(meta.member_copy_carries(rid(4)).unwrap());
     // The log the rebuild came from completes the shadow's rid: retired.
     let meta = Meta::open_in_memory().unwrap();
-    meta.install_shadow_committed(
-        rid(1),
-        1,
-        0,
-        &create_op("a", ino(1)),
-        &Default::default(),
-        &recs,
-        true,
-    )
-    .unwrap();
+    assert!(meta
+        .install_shadow_committed(
+            rid(1),
+            1,
+            0,
+            &create_op("a", ino(1)),
+            &Default::default(),
+            &recs,
+            true,
+        )
+        .unwrap()
+        .installed());
     let side = Meta::open_in_memory().unwrap();
     apply_rows(&side, 1, 2, 2, &[1, 2], &recs);
     meta.replace_ns_from_rebuilt(&side, &Default::default())
@@ -1133,16 +1141,18 @@ fn the_takeover_gate_keeps_a_delegates_committed_shadow_its_tail_lacks() {
     for carried in [false, true] {
         let meta = Meta::open_in_memory().unwrap();
         let recs = vec![create("a", ino(1), 10), completed(rid(1))];
-        meta.install_shadow_committed(
-            rid(1),
-            1,
-            7,
-            &create_op("a", ino(1)),
-            &Default::default(),
-            &recs,
-            true,
-        )
-        .unwrap();
+        assert!(meta
+            .install_shadow_committed(
+                rid(1),
+                1,
+                7,
+                &create_op("a", ino(1)),
+                &Default::default(),
+                &recs,
+                true,
+            )
+            .unwrap()
+            .installed());
         let tail: std::collections::HashSet<Rid> = if carried {
             [rid(1)].into()
         } else {
@@ -2005,16 +2015,18 @@ fn a_streamed_rolled_back_record_retracts_committed_and_own_entries() {
         .unwrap();
     // Node 2's own op (a shadow its reply installed), adopted by the stream.
     let c = vec![create("c", ino(3), 12), completed(rid(3))];
-    meta.install_shadow_committed(
-        rid(3),
-        1,
-        0,
-        &create_op("c", ino(3)),
-        &Default::default(),
-        &c,
-        true,
-    )
-    .unwrap();
+    assert!(meta
+        .install_shadow_committed(
+            rid(3),
+            1,
+            0,
+            &create_op("c", ino(3)),
+            &Default::default(),
+            &c,
+            true,
+        )
+        .unwrap()
+        .installed());
     meta.install_streamed_committed(1, HOLDER, 5, 6, &c, true, (0, 0))
         .unwrap();
     assert!(meta.has_outstanding_speculation());

@@ -13,7 +13,7 @@ use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::InodeKind;
 use constellation_meta::{
     execute_mutate, CloneSpec, LogRecord, Meta, MetaStore, MutateOp, PublishBasis, Rid,
-    SetXattrMode, SnapshotRow, SubtreeKind, TouchSet,
+    SetXattrMode, ShadowInstall, SnapshotRow, SubtreeKind, TouchSet,
 };
 use constellation_types::clock::Now;
 use std::collections::BTreeMap;
@@ -1140,23 +1140,25 @@ fn a_holder_publishes_the_log_prefix_by_before_image_substitution() {
     assert!(inode.xattrs.iter().any(|(n, _)| n == "user.k2"));
 
     // Requester speculation still defers the publish.
-    meta.install_hint(
-        &[LogRecord::Create {
-            parent: ROOT_INO,
-            name: "hinted".into(),
-            ino: (5 << 40) | 1,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            time_ns: 1,
-        }],
-        constellation_meta::Position {
-            seq: 10,
-            ..constellation_meta::Position::ZERO
-        },
-        1,
-    )
-    .unwrap();
+    let hint = meta
+        .install_hint(
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: "hinted".into(),
+                ino: (5 << 40) | 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+            constellation_meta::Position {
+                seq: 10,
+                ..constellation_meta::Position::ZERO
+            },
+            1,
+        )
+        .unwrap();
+    assert!(hint.installed());
     assert_eq!(basis(&meta), PublishBasis::Defer);
 }
 
@@ -1186,10 +1188,10 @@ fn a_forward_reply_older_than_the_held_epoch_is_queued_not_installed() {
         },
         LogRecord::Completed { rid: rid(9) },
     ];
-    assert!(!meta
-        .install_shadow(rid(9), 2, &op, &recs)
-        .unwrap()
-        .installed());
+    assert_eq!(
+        meta.install_shadow(rid(9), 2, &op, &recs).unwrap(),
+        ShadowInstall::QueuedBehindTakeover
+    );
     assert!(!meta.has_outstanding_speculation());
     assert!(meta.lookup(ROOT_INO, "late-reply").unwrap().is_none());
     let queued = meta.pending_replays().unwrap();

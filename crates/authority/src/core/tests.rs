@@ -6225,6 +6225,291 @@ fn a_stale_base_reply_whose_records_do_not_apply_waits_for_the_log() {
     );
 }
 
+/// What `stale_base_*` tests share: a requester that forwards a rename to a
+/// sequencer, `speculate_on_stale_base` on. The sequencer's namespace is
+/// `f1` (shipped, and applied here) and `f2` (its own create; shipped and
+/// applied here when `ship_f2`, otherwise unshipped, so the reply to an
+/// op on it has no base). Returns the requester, the op's rid, the records
+/// the sequencer's `rename f2 f4` produced, the unshipped records (the
+/// create of `f2`, when not shipped) and the reply's position.
+struct StaleBase {
+    requester: Harness,
+    rid: Rid,
+    req: OpId,
+    rename: Vec<LogRecord>,
+    unshipped: Vec<LogRecord>,
+}
+
+fn stale_base_rename(ship_f2: bool) -> StaleBase {
+    let (_, mut requester) = pair();
+    requester.core.cfg.speculate_on_stale_base = true;
+    let sequencer = Meta::open_in_memory().unwrap();
+    sequencer.set_node_prefix(1).unwrap();
+    let make = |name: &str, seq: u64| {
+        let op = requester.create(name);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        };
+        constellation_meta::execute_mutate(&sequencer, &op, Some(rid)).unwrap()
+    };
+    let mut shipped = make("f1", 1);
+    let f2 = make("f2", 2);
+    let mut unshipped = Vec::new();
+    if ship_f2 {
+        shipped.extend(f2);
+    } else {
+        unshipped = f2;
+    }
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, 0, &[], &[], &shipped).unwrap();
+    let rid = requester.rid(1);
+    let op = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "f2".into(),
+        new_parent: ROOT_INO,
+        new_name: "f4".into(),
+        noreplace: false,
+    };
+    let out = requester.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: op.clone(),
+        tag: Default::default(),
+    });
+    let sent = sends(&out);
+    let [(1, PeerMsg::MutateRequest { req, .. })] = sent.as_slice() else {
+        panic!("expected one forward to node 1: {sent:?}")
+    };
+    let req = *req;
+    let rename = constellation_meta::execute_mutate(&sequencer, &op, Some(rid)).unwrap();
+    StaleBase {
+        requester,
+        rid,
+        req,
+        rename,
+        unshipped,
+    }
+}
+
+/// A reply of the sequencer's at `seq` with its journal pending to `jseq`.
+fn stale_base_reply(
+    t: &mut StaleBase,
+    outcome: MutateOutcome,
+    base: Option<u64>,
+    position: constellation_meta::Position,
+) -> Vec<Action> {
+    t.requester.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::MutateReply {
+            req: t.req,
+            outcome,
+            base,
+            position,
+            gen: 0,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+            committed: false,
+            non_stealable: false,
+        },
+    })
+}
+
+fn unshipped_position() -> constellation_meta::Position {
+    constellation_meta::Position {
+        seq: 1,
+        pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 9 }),
+        streams: Default::default(),
+    }
+}
+
+/// Read-your-writes, `delegated-backup+links+stalebase` seeds 1489 and 1537,
+/// `long-delegated+links-local+stalebase` seed 131: a stale-base reply (the
+/// holder renamed a name it created itself, unshipped; the reply has no base)
+/// whose records apply here with no skip, because a rename of a missing
+/// source is a silent no-op. The shadow stands for nothing, and covering its
+/// keys let the next read of the new name see it absent right after the
+/// acknowledged rename. The shadow stays installed and the op is answered,
+/// but it covers nothing: `observed` rises and the read waits for the log.
+#[test]
+fn a_stale_base_shadow_raises_observed_instead_of_covering() {
+    use constellation_meta::ReadKey;
+    let mut t = stale_base_rename(false);
+    let records = t.rename.clone();
+    let out = stale_base_reply(
+        &mut t,
+        MutateOutcome::Accepted { epoch: 1, records },
+        None,
+        unshipped_position(),
+    );
+    assert_eq!(replies(&out).len(), 1, "answered at once: {out:?}");
+    let stats = &t.requester.core.stats;
+    assert_eq!(stats.shadows_installed, 1);
+    assert_eq!(stats.stale_base_uncovered, 1);
+    let keys = [ReadKey::Dentry(ROOT_INO, "f4".into())];
+    assert!(
+        !t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO),
+        "a shadow on a base this replica lacks does not cover its keys"
+    );
+    // The log delivers the create and the rename.
+    let mut delivered = t.unshipped.clone();
+    delivered.extend(t.rename.clone());
+    crate::replica::Replica::apply_segment(&t.requester.meta, 2, 1, 9, &[], &[], &delivered)
+        .unwrap();
+    assert!(t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+    assert!(MetaStore::lookup(&t.requester.meta, ROOT_INO, "f4")
+        .unwrap()
+        .is_some());
+}
+
+/// The control of the above: the same reply with a base this replica has
+/// applied (the production case: the holder's premise is here) covers its
+/// keys, so the read of the new name is ready at once and shows the rename.
+#[test]
+fn a_base_held_shadow_still_covers_its_keys() {
+    use constellation_meta::ReadKey;
+    let mut t = stale_base_rename(true);
+    let applied = t.requester.meta.applied_seq().unwrap();
+    assert_eq!(applied, 1);
+    let position = constellation_meta::Position {
+        seq: 1,
+        ..constellation_meta::Position::ZERO
+    };
+    let records = t.rename.clone();
+    let out = stale_base_reply(
+        &mut t,
+        MutateOutcome::Accepted { epoch: 1, records },
+        Some(applied),
+        position,
+    );
+    assert_eq!(replies(&out).len(), 1, "answered at once: {out:?}");
+    let stats = &t.requester.core.stats;
+    assert_eq!(
+        (stats.shadows_installed, stats.stale_base_uncovered),
+        (1, 0)
+    );
+    let keys = [ReadKey::Dentry(ROOT_INO, "f4".into())];
+    assert!(t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+    assert!(MetaStore::lookup(&t.requester.meta, ROOT_INO, "f4")
+        .unwrap()
+        .is_some());
+}
+
+/// `long-delegated+links-local+stalebase` seed 579: the holder accepted a
+/// rename of one name of an inode onto another name of the same inode (POSIX
+/// no-op, `Same`; the holder's records are `[Completed]`), on a link this
+/// replica does not have yet. The records have nothing to replay, so no skip
+/// can refuse the install, and the covered key set is empty: the next read of
+/// the source name saw it absent, though the acknowledged op had observed it.
+/// `observed` rises instead, and the read waits for the log.
+#[test]
+fn a_stale_base_records_less_accept_raises_observed() {
+    use constellation_meta::ReadKey;
+    let mut t = stale_base_rename(false);
+    let rid = t.rid;
+    let records = vec![LogRecord::Completed { rid }];
+    let out = stale_base_reply(
+        &mut t,
+        MutateOutcome::Accepted {
+            epoch: 1,
+            records: records.clone(),
+        },
+        None,
+        unshipped_position(),
+    );
+    assert_eq!(replies(&out).len(), 1, "answered at once: {out:?}");
+    assert_eq!(t.requester.core.stats.stale_base_uncovered, 1);
+    let keys = [ReadKey::Dentry(ROOT_INO, "f2".into())];
+    assert!(
+        !t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO),
+        "the read of the source waits for the log"
+    );
+    let mut delivered = t.unshipped.clone();
+    delivered.extend(records);
+    crate::replica::Replica::apply_segment(&t.requester.meta, 2, 1, 9, &[], &[], &delivered)
+        .unwrap();
+    assert!(t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+}
+
+/// An `Exists` hint on a stale base (the floor is above this replica's
+/// applied position and the knob lets the reply install) stays installed but
+/// covers nothing: the refusal's read waits for the log.
+#[test]
+fn a_stale_base_hint_raises_observed() {
+    use constellation_meta::ReadKey;
+    let mut t = stale_base_rename(true);
+    let entry = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "g".into(),
+        ino: (9 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 1,
+    };
+    let applied = t.requester.meta.applied_seq().unwrap();
+    let position = constellation_meta::Position {
+        seq: applied + 1,
+        ..constellation_meta::Position::ZERO
+    };
+    let out = stale_base_reply(
+        &mut t,
+        MutateOutcome::Exists {
+            epoch: 1,
+            records: vec![entry],
+        },
+        Some(applied + 1),
+        position,
+    );
+    assert_eq!(replies(&out).len(), 1, "answered at once: {out:?}");
+    let stats = &t.requester.core.stats;
+    assert_eq!(stats.hints_installed, 1);
+    assert_eq!(stats.stale_base_uncovered, 1);
+    let keys = [ReadKey::Dentry(ROOT_INO, "g".into())];
+    assert!(
+        !t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO),
+        "a hint on a base this replica lacks does not cover its keys"
+    );
+}
+
+/// An `Exists` hint whose records skip here is refused (`Unapplied`): the
+/// refusal is uncovered and `observed` rises, as for a hint not installed.
+#[test]
+fn a_hint_whose_records_do_not_apply_is_refused_and_uncovered() {
+    use constellation_meta::ReadKey;
+    let mut t = stale_base_rename(true);
+    // The entry's exchange skips: this replica has no `f9`.
+    let entry = LogRecord::Exchange {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        new_parent: ROOT_INO,
+        new_name: "f9".into(),
+        time_ns: 12,
+        ino: (9 << 40) | 1,
+        new_ino: (9 << 40) | 2,
+    };
+    let applied = t.requester.meta.applied_seq().unwrap();
+    let position = constellation_meta::Position {
+        seq: applied + 1,
+        ..constellation_meta::Position::ZERO
+    };
+    let out = stale_base_reply(
+        &mut t,
+        MutateOutcome::Exists {
+            epoch: 1,
+            records: vec![entry],
+        },
+        Some(applied),
+        position,
+    );
+    assert_eq!(replies(&out).len(), 1, "answered at once: {out:?}");
+    let stats = &t.requester.core.stats;
+    assert_eq!((stats.hints_installed, stats.hints_unapplied), (0, 1));
+    assert!(!t.requester.meta.has_outstanding_speculation());
+    let keys = [ReadKey::Dentry(ROOT_INO, "f9".into())];
+    assert!(!t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+}
+
 /// A refusal observes the holder's unshipped state: later reads wait for
 /// it (here they time out at the 20 ms test budget, degraded), except a
 /// key a newer shadow covers — the parent's attributes included — until

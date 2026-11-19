@@ -21,8 +21,8 @@ use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
-    CompletedOutcome, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position,
-    Rid, ShadowInstall, Streams, TouchSet,
+    CompletedOutcome, HintInstall, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome,
+    OwnChunks, Position, Rid, ShadowInstall, Streams, TouchSet,
 };
 use constellation_types::Code;
 use std::collections::BTreeSet;
@@ -1976,7 +1976,13 @@ impl Core {
             self.lease.name_holder(from);
         }
         let applied = replica.applied_seq().unwrap_or(0);
-        let base_ok = self.cfg.speculate_on_stale_base || base.is_some_and(|b| applied >= b);
+        // The base this replica has applied: the premise the holder
+        // evaluated the op on is here, so a shadow or hint of its records
+        // stands for the effect. Under the test-only knob a reply on a
+        // base this replica lacks is installed and answered all the same
+        // (`base_ok`), but its premise is not here, so it never covers.
+        let base_held = base.is_some_and(|b| applied >= b);
+        let base_ok = self.cfg.speculate_on_stale_base || base_held;
         tracing::debug!(
             node = self.cfg.node_id,
             ?rid,
@@ -1986,6 +1992,7 @@ impl Core {
             ?position,
             applied,
             base_ok,
+            base_held,
             ?outcome,
             "forward reply"
         );
@@ -2056,10 +2063,22 @@ impl Core {
                             replica,
                         );
                         // Plan 30 §M6 (coordinator decision 2): installed
-                        // effects do not raise `observed`; the shadow
+                        // effects do not raise `observed` when the shadow
                         // covers its keys (the parent directory's
                         // attributes included) up to the reply's position.
-                        replica.note_covering(KeySet::from_records(&records), position);
+                        // It covers only on a base this replica has
+                        // applied: that is when the holder's premise is
+                        // here, so the records stand for the effect (a
+                        // stale-base reply's records may apply as a no-op
+                        // on a missing source, or have none to apply).
+                        // Otherwise reads wait for the log (read-your-writes
+                        // ryw464, `speculate_on_stale_base` only).
+                        if base_held {
+                            replica.note_covering(KeySet::from_records(&records), position);
+                        } else {
+                            self.stats.stale_base_uncovered += 1;
+                            self.observe_reply(now, rid, position, &own_chunks, replica, out);
+                        }
                         self.finish_as(
                             now,
                             rid,
@@ -2358,7 +2377,7 @@ impl Core {
                     // holder did after it — so the hint is stale (backup
                     // sim seed 600396); the refusal is uncovered, as below.
                     match replica.install_hint(rid, records, position, epoch, gen, committed) {
-                        Ok(true) => {
+                        Ok(HintInstall::Installed) => {
                             self.stats.hints_installed += 1;
                             self.note_ungated_shadow(
                                 from,
@@ -2367,13 +2386,20 @@ impl Core {
                                 gen,
                                 replica,
                             );
-                            replica.note_covering(KeySet::from_records(records), position);
-                            hinted = true;
+                            // As a shadow: covers only on a base applied
+                            // here; a stale-base hint stays installed and
+                            // `observed` is raised below.
+                            if base_held {
+                                replica.note_covering(KeySet::from_records(records), position);
+                                hinted = true;
+                            } else {
+                                self.stats.stale_base_uncovered += 1;
+                            }
                         }
-                        Ok(false) => {}
+                        Ok(HintInstall::Redundant) => {}
+                        Ok(HintInstall::Unapplied) => self.stats.hints_unapplied += 1,
                         Err(error) => tracing::warn!(%error, "failed to install hint"),
                     }
-                    self.stats.hints_unapplied += replica.take_hints_unapplied();
                 }
                 if !hinted {
                     self.observe_reply(now, rid, position, &own_chunks, replica, out);

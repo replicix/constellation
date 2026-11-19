@@ -3674,12 +3674,18 @@ core as a lapse and keeps its backup (`a_holder_stuck_in_a_step_keeps_its_backup
 driver before, for a pin whose scenario is such a removal). The sweep prints
 `SWEEP-FAIL <config> seed`, and also `SWEEP-FAILOVER` on every run: count the
 former with the label (`grep -c "^SWEEP-FAIL <config> seed"`).
-`SWEEP-UNAPPLIED <config>` prints `[shadows, hints]`: the forward replies and `Exists`
+`SWEEP-UNAPPLIED <config>` prints `[shadows, hints, stale-base]`: the forward replies and `Exists`
 hints whose records skipped on the requester's replica (`Stats::shadows_unapplied`,
-`hints_unapplied`). Such a shadow or hint is not installed (`ShadowInstall::Unapplied`; the op waits
-for the log, the refusal raises `observed`), so it never covers keys it does not show. Only the
-`+stalebase` knob (`speculate_on_stale_base`: replies installed on a base the requester lacks) may
-have any; the run fails a seed that has one without the knob, as a base bug.
+`hints_unapplied`), and the shadows and hints installed on a base the requester had not applied
+(`Stats::stale_base_uncovered`). A shadow or hint whose records skip is not installed
+(`ShadowInstall::Unapplied`, `HintInstall::Unapplied`; the op waits for the log, the refusal raises
+`observed`). A shadow or hint covers its keys only on a base this replica has applied (`base_held`),
+the one case where the holder's premise is here and its records stand for the effect; a records-less
+accept or a rename of a source this replica lacks applies "cleanly" with no skip yet shows nothing.
+On a stale base (`+stalebase` knob only: `speculate_on_stale_base`) it stays installed and answers
+at once, but raises `observed` instead of covering, so the next read waits for the log. Only the
+knob may have any of the three counters; the run fails a seed that has one without it, as a base
+bug. With the knob off `base_ok == base_held`, so the rule changes nothing there.
 `locks-core-stall*` (plan 41 L2/L4, `locks_survive_core_stalls`,
 `locks_survive_core_stalls_in_every_topology`): the core of a lock holder
 that is not the lease holder is stuck in one step for 2 s (over a grant's

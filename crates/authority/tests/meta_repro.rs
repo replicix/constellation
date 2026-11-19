@@ -215,19 +215,22 @@ fn a_hint_installed_on_a_stale_base_converges() {
         }
         Replica::entry_as_record(&m, ROOT_INO, "f1").unwrap()
     };
-    assert!(!Replica::install_hint(
-        &requester,
-        rid(2, 99),
-        &[f1_after_15],
-        constellation_meta::Position {
-            seq: 16,
-            ..constellation_meta::Position::ZERO
-        },
-        1,
-        0,
-        false
-    )
-    .unwrap());
+    assert_eq!(
+        Replica::install_hint(
+            &requester,
+            rid(2, 99),
+            &[f1_after_15],
+            constellation_meta::Position {
+                seq: 16,
+                ..constellation_meta::Position::ZERO
+            },
+            1,
+            0,
+            false
+        )
+        .unwrap(),
+        constellation_meta::HintInstall::Redundant
+    );
     for seq in 14..=19 {
         apply(&requester, &segments, seq);
     }

@@ -89,9 +89,9 @@ pub use store::member::{
 };
 pub use store::remote::RemoteBlockers;
 pub use store::spec::{
-    created_ino_of, AwaitRetry, OrphanProof, QueueSnapshot, Refusal, ReshipReport, SegmentApplied,
-    ShadowInstall, SpecKind, SpeculationCounts, StrandArgs, Stranded, StrandedOp, TailArgs,
-    LOCAL_REPLAY_INCARNATION,
+    created_ino_of, AwaitRetry, HintInstall, OrphanProof, QueueSnapshot, Refusal, ReshipReport,
+    SegmentApplied, ShadowInstall, SpecKind, SpeculationCounts, StrandArgs, Stranded, StrandedOp,
+    TailArgs, LOCAL_REPLAY_INCARNATION,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use store::spec::{

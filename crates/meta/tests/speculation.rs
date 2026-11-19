@@ -14,8 +14,8 @@
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
-    execute_mutate, JournalPos, LogRecord, Meta, MetaStore, MutateOp, Position, PublishBasis, Rid,
-    ShadowInstall, TouchSet,
+    execute_mutate, HintInstall, JournalPos, LogRecord, Meta, MetaStore, MutateOp, Position,
+    PublishBasis, Rid, ShadowInstall, TouchSet,
 };
 use constellation_types::Code;
 
@@ -158,10 +158,11 @@ fn a_shadow_for_an_already_completed_rid_is_not_installed() {
     let recs = vec![create("a", ino(1), 10), completed(rid(1))];
     apply(&meta, 1, 1, &recs);
     // The reply arrives after this replica already tailed the segment.
-    assert!(!meta
-        .install_shadow(rid(1), 1, &create_op("a", ino(1)), &recs)
-        .unwrap()
-        .installed());
+    assert_eq!(
+        meta.install_shadow(rid(1), 1, &create_op("a", ino(1)), &recs)
+            .unwrap(),
+        ShadowInstall::InLog
+    );
     assert!(!meta.has_outstanding_speculation());
 }
 
@@ -183,8 +184,10 @@ fn stranding_rolls_back_a_shadow_under_a_foreign_segment_touching_the_same_paren
     let seg2 = vec![chmod(ino(2), 0o600, t0 + 30)];
 
     let phantom = vec![create("phantom", ino(1), t0 + 10), completed(rid(1))];
-    meta.install_shadow(rid(1), 1, &create_op("phantom", ino(1)), &phantom)
-        .unwrap();
+    assert!(meta
+        .install_shadow(rid(1), 1, &create_op("phantom", ino(1)), &phantom)
+        .unwrap()
+        .installed());
     // Tailed while the shadow is outstanding: captured for redo.
     let applied = meta
         .apply_segment(1, 1, &seg1, &TouchSet::default())
@@ -223,10 +226,14 @@ fn a_retired_shadow_behind_a_stranded_one_survives_through_its_segment() {
     let reference = Meta::open_in_memory().unwrap();
     let s1 = vec![create("s1", ino(1), 10), completed(rid(1))];
     let s2 = vec![create("s2", ino(2), 11), completed(rid(2))];
-    meta.install_shadow(rid(1), 2, &create_op("s1", ino(1)), &s1)
-        .unwrap();
-    meta.install_shadow(rid(2), 2, &create_op("s2", ino(2)), &s2)
-        .unwrap();
+    assert!(meta
+        .install_shadow(rid(1), 2, &create_op("s1", ino(1)), &s1)
+        .unwrap()
+        .installed());
+    assert!(meta
+        .install_shadow(rid(2), 2, &create_op("s2", ino(2)), &s2)
+        .unwrap()
+        .installed());
     // Epoch 2's holder ships only s2 (s1 stays in its journal).
     let applied = meta.apply_segment(1, 2, &s2, &TouchSet::default()).unwrap();
     assert_eq!(applied.retired, 1);
@@ -255,8 +262,10 @@ fn a_retired_shadow_behind_a_stranded_one_survives_through_its_segment() {
 fn a_segment_that_completes_a_lower_epoch_shadow_retires_it() {
     let meta = Meta::open_in_memory().unwrap();
     let recs = vec![create("a", ino(1), 10), completed(rid(1))];
-    meta.install_shadow(rid(1), 1, &create_op("a", ino(1)), &recs)
-        .unwrap();
+    assert!(meta
+        .install_shadow(rid(1), 1, &create_op("a", ino(1)), &recs)
+        .unwrap()
+        .installed());
     let applied = meta
         .apply_segment(1, 2, &recs, &TouchSet::default())
         .unwrap();
@@ -270,8 +279,10 @@ fn a_segment_that_completes_a_lower_epoch_shadow_retires_it() {
 fn a_hint_retires_at_its_floor_and_strands_on_a_later_epoch() {
     let meta = Meta::open_in_memory().unwrap();
     // Retired: the floor segment carries the entry.
-    meta.install_hint(&[create("h", ino(1), 10)], shipped(1), 1)
-        .unwrap();
+    assert!(meta
+        .install_hint(&[create("h", ino(1), 10)], shipped(1), 1)
+        .unwrap()
+        .installed());
     assert!(meta.has_outstanding_speculation());
     let applied = meta
         .apply_segment(1, 1, &[create("h", ino(1), 10)], &TouchSet::default())
@@ -282,8 +293,10 @@ fn a_hint_retires_at_its_floor_and_strands_on_a_later_epoch() {
 
     // Stranded: the answering holder's unshipped entry never lands, and a
     // later epoch's segment arrives before the floor.
-    meta.install_hint(&[create("ghost", ino(2), 20)], shipped(3), 1)
-        .unwrap();
+    assert!(meta
+        .install_hint(&[create("ghost", ino(2), 20)], shipped(3), 1)
+        .unwrap()
+        .installed());
     assert!(meta.lookup(ROOT_INO, "ghost").unwrap().is_some());
     let applied = meta
         .apply_segment(2, 2, &[create("real", ino(3), 30)], &TouchSet::default())
@@ -354,8 +367,9 @@ fn a_hint_whose_refusal_was_streamed_first_is_not_installed() {
             0,
         )
         .unwrap();
-    assert!(
-        !installed,
+    assert_eq!(
+        installed,
+        HintInstall::Redundant,
         "the hint was read before state this replica streamed already"
     );
     assert_eq!(
@@ -378,13 +392,15 @@ fn strand_below_epoch_queues_stranded_shadows_in_order() {
     let base = raw_ns(&meta);
     for (i, name) in ["x", "y", "z"].iter().enumerate() {
         let n = i as u64 + 1;
-        meta.install_shadow(
-            rid(n),
-            1,
-            &create_op(name, ino(n)),
-            &[create(name, ino(n), 10 + n as i64), completed(rid(n))],
-        )
-        .unwrap();
+        assert!(meta
+            .install_shadow(
+                rid(n),
+                1,
+                &create_op(name, ino(n)),
+                &[create(name, ino(n), 10 + n as i64), completed(rid(n))],
+            )
+            .unwrap()
+            .installed());
     }
     assert_eq!(meta.usage_bytes_files().1, 3);
     let stranded = meta.strand_below_epoch(2).unwrap();
@@ -414,8 +430,10 @@ fn a_stranded_unlink_restores_the_file() {
         parent: ROOT_INO,
         name: "f".into(),
     };
-    meta.install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
-        .unwrap();
+    assert!(meta
+        .install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
+        .unwrap()
+        .installed());
     assert!(meta.lookup(ROOT_INO, "f").unwrap().is_none());
     assert!(!meta.orphans().unwrap().is_empty() || meta.getattr(ino(1)).unwrap().is_none());
     meta.strand_below_epoch(2).unwrap();
@@ -558,8 +576,10 @@ fn a_stranded_unlink_leaves_no_orphan_xattrs() {
         parent: ROOT_INO,
         name: "f".into(),
     };
-    meta.install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
-        .unwrap();
+    assert!(meta
+        .install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
+        .unwrap()
+        .installed());
     assert_eq!(
         meta.list_xattrs(ino(1)).unwrap(),
         ["user.a"],
@@ -623,8 +643,10 @@ fn a_pending_unlink_keeps_exactly_its_orphan_xattrs_through_many_rewinds() {
         parent: ROOT_INO,
         name: "f".into(),
     };
-    meta.install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
-        .unwrap();
+    assert!(meta
+        .install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
+        .unwrap()
+        .installed());
     let sorted = |ino: u64| {
         let mut names = meta.list_xattrs(ino).unwrap();
         names.sort();
@@ -1088,7 +1110,7 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                         }),
                         ..Position::ZERO
                     };
-                    if !meta.install_hint(&recs, at, epoch).unwrap() {
+                    if !meta.install_hint(&recs, at, epoch).unwrap().installed() {
                         // Live speculation touches the name: not installed.
                         trace.push(format!("hint {name} refused"));
                         continue;
@@ -1495,7 +1517,11 @@ fn a_hint_is_not_installed_over_live_speculation_on_its_keys() {
     let installed = meta
         .install_hint_from(Some(rid(52)), &[create("f0", a, 10)], shipped(3), 1, 0)
         .unwrap();
-    assert!(!installed, "the stale hint went in over the shadow");
+    assert_eq!(
+        installed,
+        HintInstall::Redundant,
+        "the stale hint went in over the shadow"
+    );
     assert!(meta.lookup(ROOT_INO, "f0").unwrap().is_none());
     assert_eq!(meta.lookup(ROOT_INO, "f1").unwrap().map(|e| e.ino), Some(a));
 }
@@ -2021,7 +2047,8 @@ fn a_hint_outlives_a_segment_that_does_not_carry_its_entry() {
     let entry = create("p19", p19, t0 + 2);
     assert!(meta
         .install_hint_from(Some(rid(2)), std::slice::from_ref(&entry), refused_at, 1, 0)
-        .unwrap());
+        .unwrap()
+        .installed());
     let present = |m: &Meta| {
         m.lookup(ROOT_INO, "p19").unwrap().map(|e| e.ino) == Some(p19)
             && m.getattr(p19).unwrap().is_some()
@@ -2089,7 +2116,8 @@ fn a_later_change_of_a_hinted_name_ends_the_hint(later: LogRecord, renamed_to: O
     let entry = create("p19", p19, t0 + 2);
     assert!(meta
         .install_hint_from(Some(rid(2)), std::slice::from_ref(&entry), refused_at, 1, 0)
-        .unwrap());
+        .unwrap()
+        .installed());
     assert_eq!(
         meta.lookup(ROOT_INO, "p19").unwrap().map(|e| e.ino),
         Some(p19)
@@ -2165,11 +2193,12 @@ fn a_hint_naming_a_held_inode_keeps_it(segment: LogRecord, names: &[&str], nlink
     assert_eq!(
         (now.size, now.nlink),
         (100, 1),
-        "the hint reset the inode this replica holds (installed: {installed})"
+        "the hint reset the inode this replica holds (installed: {installed:?})"
     );
     assert!(meta.manifest(x).unwrap().is_some(), "the manifest is gone");
-    assert!(
-        !installed,
+    assert_eq!(
+        installed,
+        HintInstall::Redundant,
         "a hint that cannot apply cleanly covers its keys"
     );
     assert!(meta.lookup(ROOT_INO, "b").unwrap().is_none());
@@ -2387,8 +2416,9 @@ fn a_hint_for_the_other_name_of_an_inode_a_shadow_unlinked_is_not_installed() {
         .unwrap()
         .and_then(|e| meta.getattr(e.ino).unwrap())
         .map(|a| a.size);
-    assert!(
-        !installed,
+    assert_eq!(
+        installed,
+        HintInstall::Redundant,
         "the hint went in over the shadowed unlink: `b` reads size {size:?}"
     );
     assert_eq!(size, None);
@@ -2810,6 +2840,34 @@ fn a_shadow_whose_records_do_not_apply_is_not_installed() {
     );
     assert!(meta.lookup(ROOT_INO, "f3").unwrap().is_none());
     assert!(meta.completed_position(rid(1)).unwrap().is_none());
+}
+
+/// The hint of an `Exists` refusal whose records skip on this replica is
+/// not installed either, and says so: [`HintInstall::Unapplied`], not the
+/// `Redundant` of a refusal the replica has already. Nothing stays behind.
+#[test]
+fn a_hint_whose_records_do_not_apply_is_not_installed() {
+    let meta = Meta::open_in_memory().unwrap();
+    let (f1, f3) = (ino(1), ino(3));
+    apply(&meta, 1, 1, &[create("f1", f1, 10)]);
+    let before = raw_ns(&meta);
+    let exchange = LogRecord::Exchange {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        new_parent: ROOT_INO,
+        new_name: "f3".into(),
+        time_ns: 12,
+        ino: f1,
+        new_ino: f3,
+    };
+    let outcome = meta
+        .install_hint_from(Some(rid(1)), &[exchange], shipped(3), 1, 0)
+        .unwrap();
+    assert_eq!(outcome, HintInstall::Unapplied);
+    assert_eq!(meta.speculation_counts().unwrap().outstanding, 0);
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(raw_ns(&meta), before, "the namespace is unchanged");
+    assert!(meta.lookup(ROOT_INO, "f3").unwrap().is_none());
 }
 
 /// ADR-59 part B (drop contiguity), review MUST-1: a deposed root's strand of

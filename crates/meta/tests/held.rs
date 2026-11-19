@@ -11,7 +11,9 @@
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::{ChunkInfo, Ino, Manifest};
-use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, PublishBasis, TouchSet};
+use constellation_meta::{
+    LogRecord, Meta, MetaStore, MutateOp, PublishBasis, ShadowInstall, TouchSet,
+};
 use constellation_types::Code;
 use replicix_chunkfmt::{ChunkHash, ChunkLayout};
 use std::collections::BTreeMap;
@@ -1981,10 +1983,11 @@ fn a_drop_leaves_a_queued_replay_of_a_delegates_shadow_alone() {
     // A delegate's acceptance of the write that arrived after a takeover:
     // queued under the delegate's generation.
     let gen = (1u64 << 32) | 1;
-    assert!(!meta
-        .install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
-        .unwrap()
-        .installed());
+    assert_eq!(
+        meta.install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
+            .unwrap(),
+        ShadowInstall::QueuedBehindTakeover
+    );
     let dropped = meta.drop_held(broken, 1).unwrap();
     assert_eq!(dropped.queued_dropped, 1, "{dropped:?}");
     let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
@@ -2229,10 +2232,11 @@ fn a_queued_shadow_the_drop_leaves_alone_keeps_the_chunks_marks() {
     };
     let tag = constellation_meta::locks::LockTag::default();
     let gen = (1u64 << 32) | 1;
-    assert!(!meta
-        .install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
-        .unwrap()
-        .installed());
+    assert_eq!(
+        meta.install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
+            .unwrap(),
+        ShadowInstall::QueuedBehindTakeover
+    );
     let dropped = meta.drop_held(broken, 1).unwrap();
     assert_eq!(dropped.dropped, 1, "{dropped:?}");
     assert_eq!(dropped.queued_kept, 1, "{dropped:?}");

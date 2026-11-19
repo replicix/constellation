@@ -957,6 +957,11 @@ pub struct Stats {
     /// `Exists` hints refused for the same reason (uncovered, `observed`
     /// raised).
     pub hints_unapplied: u64,
+    /// Shadows and hints installed on a reply whose base this replica had
+    /// not applied (`speculate_on_stale_base` only): installed and
+    /// answered, but never covering; `observed` is raised instead. Zero
+    /// with the knob off, which the sim enforces.
+    pub stale_base_uncovered: u64,
     pub speculation_rolled_back: u64,
     pub local_rolled_back: u64,
     pub stranded_replayed: u64,
