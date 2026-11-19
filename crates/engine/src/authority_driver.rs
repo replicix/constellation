@@ -1009,6 +1009,18 @@ fn cas_failure(e: impl Into<StoreError>) -> CasFailure {
     }
 }
 
+/// The release CAS's last guard, after the fast path has gone quiet: a write
+/// that landed after the flush leaves rows in the journal, and a release
+/// over them would strand rows already acknowledged.
+fn release_guard(meta: &Meta) -> Result<(), CasFailure> {
+    if !constellation_meta::MetaStore::journal_is_empty(meta).unwrap_or(true) {
+        return Err(CasFailure::Failed(
+            "a write landed before the release; retrying next round".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn s3_failure(e: impl Into<StoreError>) -> S3Failure {
     let e = e.into();
     S3Failure(e.to_string())
@@ -6666,13 +6678,10 @@ impl Driver {
                         // and one that landed after the flush fails the
                         // release rather than being stranded behind it.
                         view.wait_quiescent().await;
-                        if !constellation_meta::MetaStore::journal_is_empty(&*meta).unwrap_or(true)
-                        {
+                        if let Err(failure) = release_guard(&*meta) {
                             let _ = tx.send(Internal::Event(Event::S3 {
                                 op,
-                                result: S3Result::LeasePut(Err(CasFailure::Failed(
-                                    "a write landed before the release; retrying next round".into(),
-                                ))),
+                                result: S3Result::LeasePut(Err(failure)),
                             }));
                             return;
                         }
@@ -8420,6 +8429,28 @@ impl Standalone {
 
 #[cfg(test)]
 mod tests {
+    /// A transient read error on the release guard is not "drained": the
+    /// guard must not let the release CAS through over rows it could not
+    /// see (I1/I5).
+    #[test]
+    fn the_release_guard_does_not_pass_on_a_journal_read_error() {
+        use constellation_meta::MetaStore;
+        let meta = super::Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        assert!(super::release_guard(&meta).is_ok(), "an empty journal passes");
+        meta.create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
+            .unwrap();
+        assert!(
+            super::release_guard(&meta).is_err(),
+            "an unshipped row blocks"
+        );
+        meta.fail_journal_emptiness_reads_for_tests(1);
+        assert!(
+            super::release_guard(&meta).is_err(),
+            "a read error is not a drained journal"
+        );
+    }
+
     use super::parse_u64_zero_ok;
     use super::{enforce_deadlines, Config};
     use super::{LeaseMode, LeaseStore, PARTITION};
