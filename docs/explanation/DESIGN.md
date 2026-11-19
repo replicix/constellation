@@ -1194,7 +1194,13 @@ a grant goes to a *node* and covers a set of subtrees under one stream:
   after it has appended through `at`; the stream's other subtrees stay
   delegated. A request for some subtrees that stays unanswered becomes a
   recall of the whole stream, and a holder that cannot release by a row
-  answers with the cut it ends at. A placed grant whose holder is
+  answers with the cut it ends at. A holder that must first recall read
+  delegations under the subtrees releases in two rows: it journals
+  `ReleaseCut` at once and stops executing there, and the release row once
+  the reads are gone; the root answers a settle on those keys at the cut row,
+  not the release row. A release that cannot write a cut row keeps the held
+  release, counted
+  ([ADR-64](DECISIONS.md#adr-64-a-release-cuts-first-the-holders-stop-is-a-stream-row-and-settles-are-answered-there)). A placed grant whose holder is
   unreachable is outwaited and ended by TTL (`DelegateNodeEnded`, after its
   recorded backup's seal when it has one). A cross-subtree op on a sticky
   grant or a designation is refused whatever the holder's reachability

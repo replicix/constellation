@@ -4682,6 +4682,22 @@ lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.
 
+Plan 46 M1.3 step 15b (ADR-64, S4): `AUTHORITY_SIM_NO_RELEASE_CUT=1` is the
+control knob (`SimConfig::no_release_cut`, `Config::release_cut` off): a release
+that must wait for read delegations is the held release again, and the strict S4
+tag (the first unsettled `EIO` resting on a stream whose release waited on read
+recalls) fails the run in every configuration; with the cut it fires nowhere.
+The hazard configurations that reach it are `sticky-s4-idle`, `sticky-s4-leave`,
+`sticky-s4-suspend` (the holder suspended once its release has cut or is held) and
+`sticky-s4-merge` (four sticky subtrees of one stream released in turn while the
+reader is cut off), each also with `+unsettled`. With the control, `sticky-s4-suspend`
+fails 51 and `sticky-s4-merge` 33 of 2,000 seeds; with the cut, none. The two pins
+`s4_suspend_settle_answered_at_the_cut` and
+`s4_merge_first_release_settle_answered_at_the_cut` fail with the control and pass
+without it, and a run also fails if the store fence refused an execution under a cut
+(`deleg_exec_in_cut`). The sweep line counts the cut spans, the settles answered at a
+cut and the rowless held releases (RC-1).
+
 A failing seed prints its replay command. The regression tests
 (`regression_bug_a_slow_holder_replies`,
 `regression_bug_b_holder_dies_with_unshipped_forwards`,

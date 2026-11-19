@@ -71323,3 +71323,50 @@ Harness `lock-grace-wait` failed intermittently (also on the tree before the O2 
   (+ `meta_repro`), engine, model and harness in debug and release, 0 failed; release sim suite 589 passed, 0 failed, 16
   ignored; m03 passes with the 38 CEILING lines identical to main's; `tools/sim-determinism-gate.sh` defaults: 8 labels x
   300 seeds identical at 2 and 16 threads.
+
+## Plan 46 M1.3 step 15b: ReleaseCut (S4) (2026-11-19)
+
+[ADR-64](../../explanation/DECISIONS.md#adr-64-a-release-cuts-first-the-holders-stop-is-a-stream-row-and-settles-are-answered-there).
+S4 (a settle that waits past its cap for a holder's release, which waits for read recalls) is closed by
+construction for the releases that write a row; the rest are counted under a strict tag.
+
+**What landed (C1 to C8).**
+- The model takes a cut before the read recall and answers settles at it; negative controls
+  `refuse_at_holder_cut`, `execute_at_cut`, `exec_past_cut`, `cut_counts_as_release`.
+- The `ReleaseCut` record and the delegation table's cut mark; `Meta::delegate_cut` and the holder's view that
+  forgets its own cut subtrees; the store fence (`deleg_exec_in_cut`).
+- A holder that must wait for read delegations journals its cut first and its release row after; the claim, the
+  release progress and the gate's re-append count a pending cut; a restarted holder with a cut and no release row
+  re-drives its release (ADR-46 quarantine).
+- The root answers a settle on cut keys at the cut row (R1 to R5), a shippable takeover gate too (RC-2, amends
+  ADR-42/44).
+- Sim: the control (`AUTHORITY_SIM_NO_RELEASE_CUT=1`), the hazard configurations `sticky-s4-suspend` and
+  `sticky-s4-merge`, the strict S4 tag, counters in the sweep line.
+- Docs: ADR-64, DESIGN.md, plan 46, TESTING.md, delegations.md. ADR number 63 went to O2; the ReleaseCut comments
+  were renumbered.
+
+**Fail-before.** The two pins (`s4_suspend_settle_answered_at_the_cut`, seed 3;
+`s4_merge_first_release_settle_answered_at_the_cut`, seed 8) fail with the control on the S4 tag and pass on the fix.
+
+**Control table (2,000 seeds each).**
+
+| Config | Control knob on | Fix |
+|---|---|---|
+| `sticky-s4-suspend` | 51 S4 | 0 |
+| `sticky-s4-merge` | 33 S4 | 0 |
+| `sticky-s4-idle`, `sticky-s4-leave` | 0 | 0 |
+
+**Sweep summary.** 211 configurations compared base against the fix: no fix-only failure class. The one differing
+label is `sticky-s4-idle+unsettled`, 3 base seeds against 2 fix seeds with different seeds, inside the known I4
+"itself" class. Cut spans and settles answered at a cut are measured (the hazard configs: for example `sticky-s4-merge`
+2,434 spans, 76 settles answered at a cut). `deleg_release_rowless_held`: 17 rowless held releases seen (RC-1 (a):
+a stream already stopped, a lost dependency or a capped cut keeps the held release), the strict S4 tag 0.
+`deleg_exec_in_cut` 0.
+
+**Kept.** Daemon D11 enforcement and the `GrantQuarantine` wake-up gap (named items, unchanged). A durable rowless
+cut is built only if a sweep shows the tag.
+
+**Open items.**
+- `sticky-s4-suspend+unsettled` fails about 53 of 2,000 on `unacked_fails_never_lands_late`. It does so on main
+  too (the config was added to a main archive), so it is not from this change.
+- `sticky-s4-idle+unsettled` swaps seeds within the known I4 "itself" class (base 326, 393, 1106; fix 428, 1294).

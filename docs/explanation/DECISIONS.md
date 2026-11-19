@@ -6306,3 +6306,97 @@ needs its own decision and is an open item in PROGRESS.
 See: `Core::journal_drained` (`crates/authority/src/core/jobs.rs`),
 `release_guard` (`crates/engine/src/authority_driver.rs`),
 `Meta::fail_journal_emptiness_reads_for_tests`.
+
+## ADR-64: A release cuts first: the holder's stop is a stream row, and settles are answered there
+
+**Status**: built as plan 46 M1.3 step 15b (S4). Amends ADR-60 (the re-append
+takes the cut row), ADR-42 and ADR-44 (a shippable takeover gate answers a
+settle on cut keys) and ADR-46 (a restarted holder's cut is re-driven, and its
+release waits for the quarantine). The maintainer's decisions of 2026-11-18:
+RC-1 (a), the rowless remainder stays held, and RC-2, the gate answers.
+
+**Context**: S4 is a settle that the root cannot answer because the delegate
+that held its keys has not yet said where its stream stops. A holder that must
+recall read delegations before it releases (the root granted reads under its
+subtrees) held its release note back until the recalls were done. The hold was
+unbounded when releases merged into one, stretched by a suspend of the holder,
+and D11 (the settle cap against the hold) is a check of the configuration, not
+a bound the daemon enforces. A settle on the subtree meanwhile waited past its
+cap and the client saw an unsettled `EIO`: the plan's D-3. The plan's first
+design was a `DelegCut` message ahead of the note; a message is not ordered
+with the stream's rows, which is how the root learns what the holder
+executed, so the cut is a row.
+
+**Decision**:
+
+- **The record.** `ReleaseCut { node, gen, dirs, at }` is a row of the
+  delegate's own stream. The delegation table marks the subtrees cut (a
+  replicated mark, persisted with the table row; it changes no other view and
+  is cleared by the release row, the stream's release or end, or a regrant).
+- **The holder's view.** `Meta::delegate_cut` journals the row as the stream's
+  next transaction and writes a node-local key in the same transaction. The
+  holder's `delegation_table` is the fold less its own cut subtrees: it stops
+  resolving, granting and executing there from the commit. The raw fold has a
+  distinct name and two callers. The store fence refuses an execution that
+  touches a cut subtree (counted `deleg_exec_in_cut`, which the sim fails).
+- **Who answers what.** A holder whose release must wait for read delegations
+  journals the cut at once, hands its lock grants back into a pending cut and
+  parks on the recalls. The cut ships under the ordinary stream rule: nothing
+  in the stream is held for the reads. The root answers a settle on keys under
+  a cut as soon as the cut row is appended (from what it holds, the dedup else
+  `Refused ABANDONED`), not when the release row is. It sends no settle to the
+  stopped holder, and its own client's settle is answered the same way. A
+  settle parked on the generation's recall is woken by the cut row, from a
+  stream batch or from a segment a successor root applies.
+- **The release row after the reads.** When the recalls are clear the holder
+  journals the release row (`SubtreeReleased` or `StreamReleased`), which
+  carries the note. Executions on the cut subtrees wait for it, as before.
+  `constellation release --wait` waits for the release row, not the cut. A
+  cut that covers every subtree left in the stream releases the stream.
+- **RC-2, a shippable gate answers (amends ADR-42/44).** ADR-42 redirected a
+  settle on a delegate's keys to the delegate. For cut keys the takeover gate,
+  when it is shippable, answers it under its own epoch instead: the delegate
+  appends nothing more there, so the answer is final whatever sequences it.
+- **ADR-46.** A holder that journaled a cut and restarted before its release
+  row installs its stream (not as a remnant: that would make the cut row the
+  release), rebuilds one pending cut from the node-local key, and parks the
+  release on the quarantine of the previous process's read delegations. Nothing
+  executes under the cut subtrees meanwhile.
+- **ADR-60.** The claim of the lease releases the whole stream by its own row
+  and drops the pending cuts, counted. A stranding takeover gate re-appends a
+  cut row it lacks verbatim: the release-only predicate takes every
+  release-class record, and the fence exemption is unchanged.
+- **Exclusions.** The root's own stream (ADR-55) is never cut: its release is
+  the release row. No cut is taken while a drop is pending (ADR-59), and a
+  generation the takeover gate ended is left to the claim. ADR-56's `Grow`
+  guard still waits for the release row.
+- **RC-1 (a), rowless releases keep the held note.** A release that cannot
+  write a cut row (a stream already stopped, a lost dependency, a capped cut)
+  keeps today's held release. It is counted (`deleg_release_rowless_held`) and
+  the S4 tag stays strict for it: an unsettled `EIO` that rests on a stream
+  whose release waited on read recalls fails the run. A durable rowless cut is
+  built only if a sweep shows one. So S4 is closed by construction for the
+  releases that write a row, and open, counted and under a strict tag for the
+  rest.
+- **The knob.** `Config::release_cut` (default on; the sim's control
+  `AUTHORITY_SIM_NO_RELEASE_CUT=1`) false restores the held release.
+- **ADR-48 / D11.** D11 no longer carries S4. It stays for the parked settle's
+  `Held` outwait.
+
+**Evidence**: the hazard configurations `sticky-s4-suspend` (a suspend of the
+holder once its release has cut or is held) and `sticky-s4-merge` (four sticky
+subtrees of one stream released in turn while the reader is cut off) fail the
+strict S4 tag with the control, 51 and 33 of 2,000 seeds, and 0 of 2,000 with
+the cut. 211 configurations compared against the base ran 2,000 seeds each
+with no new failure class. 17 rowless held releases were seen, with the tag at
+0.
+
+**Rejected**: the message form (`DelegCut`, unordered with the rows); bounding
+the hold (D11', releases merge without bound); un-merging held notes (the
+s4bound study); closing S4 on evidence (the maintainer, 2026-11-18).
+
+See: `crates/meta/src/delegation.rs`, `crates/meta/src/store/local.rs`
+(`delegate_cut`), `crates/authority/src/core/delegate.rs` (`release_subtrees`,
+`release_after_cut`), `crates/authority/src/core/client.rs`, `holder.rs`
+(`gate_settle`), `crates/model/src/node_stream.rs`, and
+[delegations](../reference/features/delegations.md).
