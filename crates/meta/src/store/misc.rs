@@ -254,6 +254,32 @@ pub(crate) fn track_manifest_transition_tx(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-util"))]
+impl Meta {
+    /// Tests only (`test-util`): fail this store's next `n` reads of
+    /// [`crate::MetaStore::journal_is_empty`] and [`crate::MetaStore::journal_len`] with an
+    /// I/O error, whichever thread makes them.
+    pub fn fail_journal_emptiness_reads_for_tests(&self, n: u32) {
+        self.journal_read_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The hook's check: consume one injected fault, if any is left.
+    pub(crate) fn take_journal_read_fault(&self) -> Result<(), MetaError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let took = self
+            .journal_read_faults
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if took {
+            return Err(MetaError::Io(std::io::Error::other(
+                "injected journal read fault (testing only)",
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Meta {
     pub fn chunk_ref_exists(&self, hash: &ChunkHash) -> Result<bool, MetaError> {
         let r = self.db.read_tx();
@@ -1173,5 +1199,28 @@ mod pending_claim_tests {
                  one inode's rows scan {list_scan:?} -> mirror {list_seek:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod journal_read_fault_tests {
+    use crate::store::Meta;
+    use crate::MetaStore;
+
+    /// The test hook fails exactly the next `n` emptiness reads, whichever
+    /// thread makes them, and then lets reads through again.
+    #[test]
+    fn the_journal_read_fault_hook_fails_n_reads_on_any_thread() {
+        let meta = std::sync::Arc::new(Meta::open_in_memory().unwrap());
+        meta.fail_journal_emptiness_reads_for_tests(2);
+        assert!(meta.journal_is_empty().is_err());
+        let other = meta.clone();
+        let err = std::thread::spawn(move || other.journal_len())
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("injected journal read fault"));
+        assert!(meta.journal_is_empty().unwrap());
+        assert_eq!(meta.journal_len().unwrap(), 0);
     }
 }

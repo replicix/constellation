@@ -648,6 +648,12 @@ pub struct Meta {
     pub(crate) drop_plan_written: AtomicBool,
     /// Whether a failed read of the drop plans has been warned of (once).
     pub(crate) drop_plan_read_warned: AtomicBool,
+    /// Tests only (`test-util`): how many of this store's next
+    /// `journal_is_empty` / `journal_len` reads fail with an I/O error
+    /// ([`Meta::fail_journal_emptiness_reads_for_tests`]). Per store, not per
+    /// thread: the release guard reads the journal on a spawned task.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) journal_read_faults: std::sync::atomic::AtomicU32,
     /// Unit tests of the tree publisher only: publish `ns` as it stands
     /// though this node's unshipped journal holds uncaptured writes
     /// (`Meta::publish_basis_at`). Never set by the daemon.
@@ -1402,6 +1408,8 @@ impl Meta {
             drop_plans_state: AtomicU64::new(1),
             drop_plan_written: AtomicBool::new(false),
             drop_plan_read_warned: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            journal_read_faults: std::sync::atomic::AtomicU32::new(0),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             deleg_gate: std::sync::RwLock::new(()),

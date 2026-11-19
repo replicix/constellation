@@ -2305,11 +2305,15 @@ impl MetaStore for Meta {
     }
 
     fn journal_len(&self) -> Result<u64, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        self.take_journal_read_fault()?;
         let r = self.db.read_tx();
         journal::len(&r, &self.journal_ks, &self.local)
     }
 
     fn journal_is_empty(&self) -> Result<bool, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        self.take_journal_read_fault()?;
         let r = self.db.read_tx();
         journal::is_empty(&r, &self.journal_ks, &self.local)
     }
