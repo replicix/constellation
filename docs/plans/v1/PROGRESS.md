@@ -71232,3 +71232,30 @@ change: placement was hash-ordered on ties, and the status list is tie-broken to
 `reship_hold_ms_reads_the_wait_clock`, `fp_file_lines_are_written_whole`; gated by `tools/sim-determinism-gate.sh` (TESTING.md, "The determinism gate").
 Not in scope: HLC stamps from the host clock in record payloads, and the 10 s / 300 s host-clock thresholds (session watermark TTL, `atime_stale`).
 Open item (placement): a node's covered top subtree masks its other dominated subtrees. While an exact tie between two subtrees of one node lasts, the lowest-`Ino` sibling wins every round: its total stays equal and the node's stream already covers it, so `table.covering` (`placement.rs`, the `chosen` walk) skips it and the higher-`Ino` sibling is never placed or grown. On main the hash order let a later round pick the other sibling ("grew a delegation's stream by a subtree", placement-hot seed 235); that outcome is now 0% per round, and the sim's placement-hot coverage of the grow-by-second-subtree path drops with it. Same masking every strictly smaller dominated subtree of a node already had; no safety effect, the hot directory still wins. Candidate fix: skip candidates the node's own stream already covers when filling `chosen`.
+
+### A shadow or hint whose records skip is not installed: read-your-writes under `+stalebase` (ryw464, 2026-11-19)
+
+- **Defect.** Under the test knob `speculate_on_stale_base` a reply installs on a base the requester lacks. `install_speculative_tx` dropped the
+  replay's skip count, so a shadow whose records skipped ("exchange entry missing") was reported installed, `note_covering` let the next read skip its
+  wait, and the read saw the name absent: `delegated-backup+links-local+stalebase` seeds 464 and 1911 failed `read_your_writes` on 46f91659. Production
+  never reaches it (without the knob a reply base that is not applied waits for the log); the defect is general: an installed shadow may claim keys it
+  skipped.
+- **Fix.** `install_speculative_tx(.., refuse_on_skip)`: a skipping install drops its transaction (nothing stays: namespace, `dirty` rows, usage
+  staging) and reports not installed. `install_shadow*` returns `ShadowInstall { Installed, InLog, QueuedBehindTakeover, Unapplied }`; on `Unapplied`
+  the client takes the log-wait path (`accepted_awaits_log`, the body of the stale-base arm, now shared) and never calls `note_covering`. A hint that
+  skips returns `Ok(false)` (uncovered, `observed` raised). The streamed install is unchanged. Counters `shadows_unapplied`, `hints_unapplied`
+  (`SWEEP-UNAPPLIED`); the sim fails a seed with either without the knob.
+- **Tests (fail on 46f91659 plus the test hunks, pass here):** `a_shadow_whose_records_do_not_apply_is_not_installed` (meta),
+  `a_stale_base_reply_whose_records_do_not_apply_waits_for_the_log` (core), `regression_delegated_backup_links_stalebase_ryw_seeds_464_1911` (sim).
+- **Sweeps** (release, fresh per-tree builds of 46f91659 and this tree, same seeds): `delegated-backup+links-local+stalebase` 2,000: 0 failing (main
+  [464, 1911]). Other `+stalebase` labels at 2,000: `long-delegated+links` 0 (main [1016, 1477]), `placement-hot+links-local` 0 (main [1543]),
+  `placement-hot+links` 0 (main [323, 541, 1088]); `delegated-backup+links` [1489, 1537] and `long-delegated+links-local` [131, 579] fail identically
+  on both (the same read-your-writes class, a `Rename` whose shadow installed without a skip and the name still read absent: not this defect, open);
+  `flex-crash+links` and `flex-crash+links-local` 0 on both. Knob off, 600 seeds each (`delegated-backup`, `long-delegated`, `delegated-backup+links`,
+  `+links-local`): 0 failing, `shadows_unapplied == hints_unapplied == 0`. All 290 `base_config` labels at 300 seeds: failing sets identical to main
+  (11 labels fail on both, same seeds).
+- **O1 pin.** With O1's shadow-takes-place hunk reverted (`Journaled::Appended` -> `Plain` in `apply_delegate_tx`), the pin's old seeds (333, 416, 430,
+  447, 472, 13) pass on 46f91659 too: they stopped reaching the bug before this change. `delegated-backup+links-local+stalebase` seed 438 fails "not
+  the log prefix" without O1's fix on both trees and passes with it; added to the pin.
+- **Gates.** fmt, clippy `--workspace --all-targets -D warnings` clean; lib tests meta, engine, authority, model in debug and release, 0 failed; release
+  sim suite 585 passed, 0 failed, 16 ignored.

@@ -22336,6 +22336,11 @@ fn hard_links_and_exchanges_converge_under_faults() {
 /// it lacks, which is what lets the root shadow a second op on names
 /// whose first op the delegate has not streamed yet (its reply base
 /// otherwise sends the root to wait for the log).
+///
+/// Seed 438 of `delegated-backup` joined the list (ryw464): the other seeds
+/// no longer reach the append over a shadow (later schedule changes: they pass
+/// with the O1 fix reverted, on 46f91659 as well); 438 fails "not the log
+/// prefix" without the fix and passes with it.
 #[test]
 fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
     type Config = fn() -> SimConfig;
@@ -22350,7 +22355,7 @@ fn regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix() {
             "delegated-backup",
             delegated_backup_config,
             "links-local+stalebase",
-            &[13],
+            &[13, 438],
         ),
     ];
     for (label, config, variants, seeds) in cases {
