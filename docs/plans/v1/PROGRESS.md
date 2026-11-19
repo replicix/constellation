@@ -71425,3 +71425,15 @@ node 3 is the sequencer, its core idle, t >= 60 s), tagged by neither the held n
 - **Open (recorded):** the model's cut topologies have one directory and no faults (S-7): a takeover with a cut in the tail, a
   holder restart, two cuts of one stream and the rowless fallback are not modelled.
 
+**Gates and sweeps of round 5 (final tree).** fmt and clippy `-D warnings` clean; meta (493 debug, 492 release, also with
+`test-util`) and authority (1,763, debug and release) lib tests green; the model suite green in release (the model crate is
+unchanged since its C7 debug run); the release sim suite 582 passed, 0 failed. The four `sticky-s4-*` labels, plain and
+`+unsettled`, at 2,000 seeds with the corrected tag: control knob 0, 0, 51, 33 S4-tagged fails (`+unsettled`: 0, 0, 53, 35),
+fix 0 strict-S4 in every label; the fix's other failures are the known I4 "itself" seeds (`idle+unsettled` 428, 1294;
+`suspend+unsettled` 304), the 53 `unacked_fails_never_lands_late` and `merge+unsettled` 287 and 1537, all classified above. Base
+against fix: the 29 other `sticky*`, `far*` and `placement*` labels at 2,000 seeds and the other 177 labels of the 203 list at 300
+seeds (the 2,000-seed pass of all 203 was not repeated in this round): no fix-only and no base-only failing seed; the three
+`delegated-core-stall-*` labels fail every seed on both. The control arm was measured on the tree before the last one-line change to the
+due cut's stopped test (a whole cut pending is no reason to end the stream rowless; it affects no sim label: `cut_rowless_after`
+is 0 everywhere); the fix arm was re-run on the final tree with identical results.
+
