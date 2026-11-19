@@ -71572,3 +71572,78 @@ sets (916 failing seeds on each side, 0 label differs).
 **Gates** (tree of the code commit): fmt and clippy `-D warnings` clean; lib tests meta (494 debug, 493 release, also with
 `test-util`) and authority (1,802, debug and release) green; the model suite green (debug and release); the release sim suite 592
 passed, 2 failed (the two above).
+
+## Plan 46 M1.3 step 15b: ReleaseCut round 8, the root-restart residual (2026-11-20)
+
+Rebased onto origin/main first (2469d9fc, the simfix determinism fixes; the first commit of the branch was already upstream and
+dropped; the only conflict was PROGRESS, both sides kept). Spec: `spec-rootrestart.md` (an Opus diagnosis of the seven seeds
+the round-7 sweep left on `sticky-s4-root-restart`: 60, 375, 403, 646, 772, 980, 1321). Four separate delays, not one chain; each is
+cleared by an event, none by a timer. No oracle, tag, ceiling, window or excuse changed.
+
+**F1, the root tells its delegate to stream** (`PeerMsg::DelegateStreamResume { gen }`, `Core::on_delegate_stream_resume`). A root that
+takes a generation on from a predecessor sends it once to the delegate (`gated_takes_stream || root_ends_recall`); the delegate, if the
+sender is its root and the generation is its own, sets the round-7 flag (`root_back`) and the link evidence, and starts a new stream
+round at once. A plain wire addition (`Payload::DelegateStreamResume`, appended; no compatibility shim, no version bump).
+
+**F2, R5b completed** (`Core::settles_cut_seen`, `settles_waiting_cut`, `settle_route_to`). (a) The settles waiting for the cut are noted
+before the segment applies, so a segment that carries the cut row and the release row of one subtree still wakes them (the release row
+clears the cut mark in the apply; seed 60). (b) `AcquireRetry` and `WaitingLease` are woken too (seed 403 slept the acquire back-off
+past its deadline). (c) The root whose segment carried the cut is reachable for that one forward when the lease names it (seeds 375,
+980: the requester's outage record stands until its next peers tick); every earlier branch of the route is unchanged.
+
+**Evidence of fail-before.** Core tests (fail on a tree with F1 and F2 off and the rule reverted, `neither` variant): `a_settle_in_the_acquire_backoff_is_routed_again_when_its_cut_row_is_applied`,
+`a_settle_is_routed_again_when_its_cut_and_release_rows_arrive_together`, `a_settle_woken_at_the_cut_asks_the_root_whose_segment_carried_it`
+and `a_root_keeps_a_settle_from_an_inherited_delegate_it_has_not_heard` (fails with the rule reverted): four of four fail on that variant. The
+resume tests `a_resume_from_the_root_streams_the_rows_at_once_through_a_refusal_backoff` (delegate side, passes on it: new API) and
+`a_gate_taking_a_generation_on_tells_its_delegate_to_stream` (root side) are new API, not the fail-before of F1; that is the pin of seed 375. Sim pin `s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle` (375, 403, 980, fix arm clean, control arm
+fires the strict tag, counters show the paths). Replays of the fix arm on variants of the final tree: without F2, 375, 403 and 980 fail
+(strict tag, "no sequencer in time ... cut span"); without F1, 375 fails (and its control arm no longer fires, so the pin fails there
+on the control first). Variants and fresh per-tree builds (`touch` of every source, `md5sum` of the binaries compared).
+
+**The silent-inherited-delegate test, re-pinned.** `long_delegated_settle_is_not_bounced_to_a_silent_inherited_delegate` no longer "fails on
+the parent": 4863 was the original seed and no longer reaches the path, and with the rule reverted (`let redirects = redirects_before;`)
+no seed of 0 to 9,999 fails on this tree. It is now a regression pin of the path (seeds 181, 757, 925, each clean with
+`settles_not_redirected_unheard > 0`); the fail-before is the core test, which exercises the rule on an open root with an inherited,
+unheard generation (a gate answers by a different rule, `gate_settle`, and cannot reach it). The finder is committed
+(`find_settle_not_redirected_unheard_seeds`, ignored).
+
+**Sweeps, 2,000 seeds each, fix arm unless marked** (logs in `logs8/`):
+
+| label | fix arm | control (`NO_RELEASE_CUT`) | `CUT_ROW_WITHHELD` | `ROOT_IGNORES_CUT` |
+|---|---|---|---|---|
+| `sticky-s4-root-restart` | **0 failing** (round 7: 7 tagged) | 265 (all tagged) | | |
+| `sticky-s4-root-restart+unsettled` | 287 only, 0 tagged | 265 (all tagged) | | |
+| `sticky-s4-merge` | 0 | 24 | 13 | 14 |
+| `sticky-s4-merge+unsettled` | 5: 287, 1537 (round 6), 73, 1191, 1234; 0 tagged | 27 (24 tagged) | 17 (13) | 17 (14) |
+| `sticky-s4-suspend` | 0 | 51 | 51 | 51 |
+| `sticky-s4-suspend+unsettled` | 55 (same classes), 0 tagged | 109 (51 tagged) | 109 (51) | 105 (51) |
+| `delegated-strict`, `sticky-leave`, `sticky-holder-restarts-placed` | 0, 0, 0 | | | |
+
+Counters (fix arm, `SWEEP-R8` line): `sticky-s4-root-restart`: resumes sent 1,814 of 1,814 generations taken on (the bound), taken 1,902
+(probably the delegates' counts survive a root's reboot, the root's do not; not checked), ignored 0; settles woken at a cut 1,126, of them from the acquire waits
+913, by the pre-apply snapshot only 594, forwarded to a root alive 16 (at most the woken). `delegated-strict`: sent 535 of 536, ignored 8.
+The negative controls still fire on their pins (`the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_*`).
+
+**`sticky-s4-merge+unsettled`: three untagged I4 seeds in, by schedule.** 73 and 1234 fail on the fix arm only (the control passes), 1191
+on both arms. By variant: 1191 is F1's schedule (passes without F1), 73 and 1234 F2's (pass without F2). All three are the round-6 class
+of an unsettled `EIO` with a sequencer reachable for a short span of the window (224, 1,567, 243 ms of 3 s: the root's idle release
+fence, `Busy`, then `NotHolder { 0 }` after the successor takes the lease, as seed 841 of round 6), liveness and retryable by rid, no tag.
+Not fixed here; not excused.
+
+**`locks-writer-hold-delegated-unsettled-own-clock` seed 234, found by the equivalence run.** At 300 seeds seed 234 fails on this tree and nothing fails on
+the base; at 3,000 seeds the base fails 27 and this tree 23 with the same message ("node 3's held write ... landed after
+node 1's turn ... acknowledged", a lock-plane mutual exclusion violation of the writer-hold hazard); the sets differ both ways (this
+tree only: 234, 385, 847, 2272, 2856; base only: 504, 939, 966, 1197, ...). F1's schedule moves seed 234 into it (without F1 it passes).
+So it is a pre-existing class on main that a schedule shift exposes, not a new class; recorded as an open item for the lock jobs
+(`lockre`), not touched here.
+
+**Equivalence.** All 203 labels of the 300-seed set, origin/main and this tree (fresh per-tree builds, every source touched, binaries
+compared): identical failing-seed sets except the one above (`locks-writer-hold-delegated-unsettled-own-clock` 234).
+
+**`regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix` (seed 13).** Untouched (the ryw bug is fixed under its own job;
+`ryw` had not landed on origin/main at the end of this round). It passes on this tree by schedule (it did
+in the prototype of the spec too), as the full sim suite shows: not claimed fixed.
+
+**Gates** (code commit, box1, fresh gate tree): fmt, clippy `--workspace --all-targets -D warnings`, lib tests meta (495 debug, 494
+release), authority (1,809, debug and release), net (167), engine (1,003), the model suite (debug and release), the release sim suite
+598 passed, 0 failed (17 ignored).

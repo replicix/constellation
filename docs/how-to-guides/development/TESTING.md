@@ -4715,6 +4715,29 @@ again when its cut row is applied) clears it; the pin is seed 8
 (`s4_root_restart_the_cut_row_reaches_the_returned_root_in_time`). Its core tests are
 `the_roots_link_coming_back_sends_the_unacknowledged_rows_at_once` and
 `a_settle_waiting_out_a_retry_is_routed_again_when_its_cut_row_is_applied`.
+Round 8 closed its residual seeds (60, 375, 403, 646, 772, 980, 1321): four separate
+delays, each cleared by an event, none by a timer. The root tells its delegate to stream
+when it takes a generation on (`PeerMsg::DelegateStreamResume`; core tests
+`a_gate_taking_a_generation_on_tells_its_delegate_to_stream` and
+`a_resume_from_the_root_streams_the_rows_at_once_through_a_refusal_backoff`), and a
+requester's settle waiting for the cut is woken from the acquire waits, by a snapshot taken
+before the segment applies (the cut and the release in one segment), and sent to the root
+whose segment carried the cut (core tests
+`a_settle_in_the_acquire_backoff_is_routed_again_when_its_cut_row_is_applied`,
+`a_settle_is_routed_again_when_its_cut_and_release_rows_arrive_together`,
+`a_settle_woken_at_the_cut_asks_the_root_whose_segment_carried_it`). The pin
+`s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle` runs seeds 375, 403
+and 980 (fix arm clean, control arm tagged) and asserts the counters that show the paths
+(`deleg_stream_resumes`, `settles_woken_at_cut_phase`, `settles_cut_forwarded_alive`):
+375 is the fail-before of the resume (it fails with that half off), 403 and 980 of the
+requester's half. A sweep prints a `SWEEP-R8` line with `deleg_stream_resumes_sent` (at most
+`deleg_inherited`), `deleg_stream_resumes`, the ignored ones, and the `settles_woken_at_cut*`
+and `settles_cut_forwarded_alive` counters (at most the settles woken).
+`long_delegated_settle_is_not_bounced_to_a_silent_inherited_delegate` is a path-reached
+regression pin (seeds 181, 757, 925), no longer a fail-before: no seed of 0 to 9,999 fails
+with the rule reverted; the fail-before is the core test
+`a_root_keeps_a_settle_from_an_inherited_delegate_it_has_not_heard`, and the ignored
+`find_settle_not_redirected_unheard_seeds` lists the seeds that reach the path.
 `AUTHORITY_SIM_S4_EIO=1` prints every unsettled `EIO` of a sweep with its rid, verdict and
 span (to be kept with the failing-seed logs). The two pins
 `s4_suspend_settle_answered_at_the_cut` and

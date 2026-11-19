@@ -6369,6 +6369,43 @@ executed, so the cut is a row.
   for "seen back": the lease epoch of a takeover of its own lease is not
   distinct, and the takeover marker arrives only after the root is serving.
   Rows are deduplicated by cursor and rid at the root, as after a failover.
+- **The root tells its delegate to stream (round 8).** A root that takes a
+  generation on from a predecessor (its sync inherits it, and the gate or the
+  usable root takes the delegate's stream) sends the delegate one
+  `PeerMsg::DelegateStreamResume { gen }` (one way; `Core::on_delegate_stream_resume`).
+  The delegate, if the sender is its root and the generation is its own, starts
+  a new stream round at once (the round 7 path: the batch in flight dropped,
+  the back-off and the refusal back-off cleared, streaming from the log
+  cursor), and takes the message as the evidence of the root's link. Before,
+  a restarted root refused the delegate's batches (the cut row among them)
+  until it held its lease and the generation, and the delegate then waited out
+  the refusal back-off (four stream ticks) or, with its peers view still
+  showing the root down, sent nothing until its next peers tick. It is a new
+  wire variant (`Payload::DelegateStreamResume`, appended); a plain addition,
+  with no compatibility shim (the project needs none). Not
+  `DelegateStreamAck`: the restarted root does not know the delegate's stream
+  round, and an acknowledgement outside its round is stale. Counted
+  `deleg_stream_resumes_sent` (at most one per generation taken on,
+  `deleg_inherited`), `deleg_stream_resumes`, `deleg_stream_resumes_stale`.
+- **R5b completed (round 8).** Three gaps of the requester's wake at the cut
+  (`sticky-s4-root-restart`): (a) the settle's phase: it also wakes a settle in
+  `AcquireRetry` (its forwards ran out on the restarted root's `Busy`, the
+  acquisition was refused, and the acquire back-off, up to a second, ran past
+  its deadline) and one in `WaitingLease`; (b) the cut row and the release row
+  of the subtree arrive in one segment, the release clears the cut mark in the
+  apply, and a check made after it found nothing at the cut: the waiting
+  settles whose keys are at the cut, or delegated to a generation among the
+  segment's `ReleaseCut` rows, are noted before the apply
+  (`Core::settles_waiting_cut`); (c) the route: the requester's peers view
+  still called the returned root's link down (its outage record stands until
+  the next peers tick), so the woken settle went to a lease read and a
+  back-off. The root whose segment carried the cut is reachable for that one
+  forward when the lease names it (`settle_route_to`'s `alive`); every earlier
+  branch of the route is unchanged, and a forward to a node that is in fact
+  cut off fails or times out into the retry as any forward does. Counted
+  `settles_woken_at_cut_phase`, `settles_woken_at_cut_released`,
+  `settles_cut_forwarded_alive`. No timer, window, ceiling, tag or oracle
+  moved.
 - **The release row after the reads.** When the recalls are clear the holder
   journals the release row (`SubtreeReleased` or `StreamReleased`), which
   carries the note. Executions on the cut subtrees wait for it, as before.
@@ -6454,6 +6491,13 @@ the base in round 5 ran 2,000 seeds each with no new failure class (the other la
 the control, 27 of 300 on the tree without the stream round, and 7 of 2,000 on the fix: the root is back at about 20 s and the
 requesters' 3 s windows end at 20.3 to 20.7 s, so a refused stream (the root's gate has not the table yet) and the refusal's
 back-off use the rest. Not excused; it is the root's boot against a fixed window.
+
+**Evidence, round 8.** The seven seeds round 7 left on `sticky-s4-root-restart` (60, 375, 403, 646, 772, 980, 1321) had four separate
+delays: a refused or silent re-send of the cut row to the returned root, the requester's settle in `AcquireRetry`, the cut and release rows in
+one segment, and the requester's view of the root's link. `sticky-s4-root-restart` is now 0 of 2,000 on the fix (the control 265, all
+tagged), and `sticky-s4-merge`, `sticky-s4-suspend`, `delegated-strict`, `sticky-leave` and `sticky-holder-restarts-placed` stay at 0 (the
+negative controls still fire: merge 13 and 14, suspend 51 and 51). The `+unsettled` lanes keep their untagged I4 seeds of earlier rounds
+(merge now also 73, 1191, 1234, by schedule: the same class, a short reachable span, no tag).
 
 **Rejected**: the message form (`DelegCut`, unordered with the rows); bounding
 the hold (D11', releases merge without bound); un-merging held notes (the
