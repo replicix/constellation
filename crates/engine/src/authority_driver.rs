@@ -4656,6 +4656,12 @@ impl Driver {
                     position,
                 },
             })),
+            SyncRequest::PeerDelegateStreamResume { from, gen } => {
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::DelegateStreamResume { gen },
+                }))
+            }
             SyncRequest::PeerLockCancel {
                 from,
                 ino,
@@ -5359,6 +5365,13 @@ impl Driver {
                     ino,
                     sent: sent.0,
                     outcome: crate::locks::outcome_wire(&outcome),
+                };
+                self.one_way(to, payload);
+            }
+            PeerMsg::DelegateStreamResume { gen } => {
+                let payload = Payload::DelegateStreamResume {
+                    from: self.node_id,
+                    gen,
                 };
                 self.one_way(to, payload);
             }

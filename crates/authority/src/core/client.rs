@@ -5334,6 +5334,8 @@ impl Core {
         &mut self,
         now: Now,
         nodes: &BTreeSet<NodeId>,
+        waiting: &BTreeSet<Rid>,
+        shipper: NodeId,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -5343,14 +5345,10 @@ impl Core {
         let due: Vec<Rid> = self
             .clients
             .iter()
-            .filter(|(_, c)| {
-                c.settle
-                    && match c.phase {
-                        Phase::Backoff => !c.gate_recall_wait,
-                        Phase::Forwarded { holder, .. } => nodes.contains(&holder),
-                        _ => false,
-                    }
-                    && replica.settle_at_cut(&super::holder::keys_of_op_in(&c.op, replica))
+            .filter(|(rid, c)| {
+                self.settle_waits_for_cut(c, nodes)
+                    && (waiting.contains(rid)
+                        || replica.settle_at_cut(&super::holder::keys_of_op_in(&c.op, replica)))
             })
             .map(|(rid, _)| *rid)
             .collect();
@@ -5358,6 +5356,7 @@ impl Core {
             let Some(c) = self.clients.get_mut(&rid) else {
                 continue;
             };
+            let from_acquire = matches!(c.phase, Phase::AcquireRetry | Phase::WaitingLease);
             if let Phase::Forwarded { req, .. } = c.phase {
                 self.by_req.remove(&req);
             }
@@ -5366,8 +5365,68 @@ impl Core {
                 self.cancel_timer(t, out);
             }
             self.stats.settles_woken_at_cut += 1;
-            self.settle_route(now, rid, replica, out);
+            if from_acquire {
+                self.stats.settles_woken_at_cut_phase += 1;
+            }
+            if waiting.contains(&rid) {
+                let at_cut = self.clients.get(&rid).is_some_and(|c| {
+                    replica.settle_at_cut(&super::holder::keys_of_op_in(&c.op, replica))
+                });
+                if !at_cut {
+                    self.stats.settles_woken_at_cut_released += 1;
+                }
+            }
+            let alive = (shipper != self.cfg.node_id).then_some(shipper);
+            self.settle_route_to(now, rid, alive, replica, out);
         }
+    }
+
+    /// ADR-64 (R5b): whether `c` is a settle of this node's own in a phase
+    /// the cut row's arrival wakes: a backoff (not a gate's recall wait), a
+    /// forward to one of the stopped holders `nodes`, or either wait of the
+    /// lease path (round 8: `sticky-s4-root-restart` seed 403's settle slept
+    /// the acquire back-off past its deadline). A lease read in flight
+    /// routes on its own answer, and an inbox settle's route is the
+    /// withdraw's.
+    fn settle_waits_for_cut(&self, c: &ClientOp, nodes: &BTreeSet<NodeId>) -> bool {
+        c.settle
+            && match c.phase {
+                Phase::Backoff => !c.gate_recall_wait,
+                Phase::Forwarded { holder, .. } => nodes.contains(&holder),
+                Phase::AcquireRetry | Phase::WaitingLease => true,
+                _ => false,
+            }
+    }
+
+    /// ADR-64 (R5b, round 8): the settles of this node's own, waiting for the
+    /// cut, whose keys the segment about to be applied will take to the cut
+    /// *and* release in one step: already at the cut, or delegated to a
+    /// generation among the segment's `ReleaseCut` rows `gens`. Taken before
+    /// the apply, because the release row of the same segment ends the
+    /// generation and clears the cut mark, and the keys then resolve to the
+    /// root with `settle_at_cut` false (`sticky-s4-root-restart` seed 60).
+    pub(crate) fn settles_waiting_cut(
+        &self,
+        nodes: &BTreeSet<NodeId>,
+        gens: &BTreeSet<u64>,
+        replica: &dyn Replica,
+    ) -> BTreeSet<Rid> {
+        if self.cfg.root_ignores_cut || !self.cfg.delegation {
+            return BTreeSet::new();
+        }
+        self.clients
+            .iter()
+            .filter(|(_, c)| self.settle_waits_for_cut(c, nodes))
+            .filter(|(_, c)| {
+                let keys = super::holder::keys_of_op_in(&c.op, replica);
+                replica.settle_at_cut(&keys)
+                    || matches!(
+                        replica.resolve_ownership(&keys),
+                        Ownership::Delegated(d) if gens.contains(&d.gen)
+                    )
+            })
+            .map(|(rid, _)| *rid)
+            .collect()
     }
 
     /// Plan 43 C2 (§5.3 item 5): send a settle of `rid` the way the op itself
@@ -5378,6 +5437,24 @@ impl Core {
     /// lease path). Retries (`Busy`, a timeout, `NotHolder`) go on as the
     /// op's did until the second deadline.
     fn settle_route(&mut self, now: Now, rid: Rid, replica: &dyn Replica, out: &mut Vec<Action>) {
+        self.settle_route_to(now, rid, None, replica, out);
+    }
+
+    /// [`Self::settle_route`], where `alive` is a node whose segment this
+    /// node has just applied (R5b, round 8): it is the lease's holder and
+    /// reachable for this one forward although the peers view still calls
+    /// its link down (the outage record stands until the next peers tick).
+    /// Only the last test, "is the holder reachable", takes it; every
+    /// earlier branch is unchanged. A forward to a node that is in fact cut
+    /// off fails or times out into the retry as any forward does.
+    fn settle_route_to(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        alive: Option<NodeId>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         // (In `submit`'s order: this node as the op's delegate, a live
         // delegate of its keys, this node as the root, the route.)
         let Some((op, deps, tag)) = self
@@ -5478,7 +5555,12 @@ impl Core {
         }
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {
-            Some(holder) if self.reaches(now, holder) && self.cfg.forwarding => {
+            Some(holder)
+                if (self.reaches(now, holder) || alive == Some(holder)) && self.cfg.forwarding =>
+            {
+                if !self.reaches(now, holder) {
+                    self.stats.settles_cut_forwarded_alive += 1;
+                }
                 self.send_forward(now, rid, holder, 0, replica, out)
             }
             _ => self.route(now, rid, replica, out),

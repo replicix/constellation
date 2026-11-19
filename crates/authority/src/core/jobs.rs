@@ -958,6 +958,31 @@ impl Core {
                     replica.backup_clear();
                 }
             }
+            // ADR-64 (R5b, round 8): a segment that carries the cut row and
+            // the release row of one subtree takes the settle's keys past
+            // the cut in its one apply: the waiting settles it concerns are
+            // noted before.
+            let cut_gens: BTreeSet<u64> = seg
+                .records
+                .iter()
+                .filter_map(|r| match r {
+                    LogRecord::ReleaseCut { gen, .. } => Some(*gen),
+                    _ => None,
+                })
+                .collect();
+            let cut_nodes: BTreeSet<NodeId> = seg
+                .records
+                .iter()
+                .filter_map(|r| match r {
+                    LogRecord::ReleaseCut { node, .. } => Some(*node),
+                    _ => None,
+                })
+                .collect();
+            let waiting_cut = if cut_gens.is_empty() {
+                BTreeSet::new()
+            } else {
+                self.settles_waiting_cut(&cut_nodes, &cut_gens, replica)
+            };
             let applied = replica.apply_segment(
                 seq,
                 seg.epoch,
@@ -1033,26 +1058,11 @@ impl Core {
             }
             // ADR-64 (R4): a successor root learns a delegate's cut from the
             // log; the settles it parked on that generation are answered.
-            let cut_gens: BTreeSet<u64> = seg
-                .records
-                .iter()
-                .filter_map(|r| match r {
-                    LogRecord::ReleaseCut { gen, .. } => Some(*gen),
-                    _ => None,
-                })
-                .collect();
             if !cut_gens.is_empty() {
                 self.root_cut_seen(now, &cut_gens, replica, out);
-                // (R5b: and a requester's own settle, waiting out a retry.)
-                let cut_nodes: BTreeSet<NodeId> = seg
-                    .records
-                    .iter()
-                    .filter_map(|r| match r {
-                        LogRecord::ReleaseCut { node, .. } => Some(*node),
-                        _ => None,
-                    })
-                    .collect();
-                self.settles_cut_seen(now, &cut_nodes, replica, out);
+                // (R5b: and a requester's own settle, waiting out a retry,
+                // sent to the root whose segment carried the cut.)
+                self.settles_cut_seen(now, &cut_nodes, &waiting_cut, seg.node, replica, out);
             }
             if seg.records.iter().any(|r| {
                 matches!(

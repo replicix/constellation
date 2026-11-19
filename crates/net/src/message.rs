@@ -957,6 +957,14 @@ pub enum Payload {
         req_id: u64,
         read: LeaseReadWire,
     },
+    /// ReleaseCut round 8, one way: the root took generation `gen` on
+    /// (it inherited it from a predecessor tenure) and now takes the
+    /// delegate's stream: the delegate starts a new stream round at once
+    /// instead of waiting out a refusal back-off.
+    DelegateStreamResume {
+        from: u64,
+        gen: u64,
+    },
 }
 
 /// A peer's read of the lease object on the wire
@@ -2066,6 +2074,21 @@ mod tests {
         };
         let frame = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(&frame[4..]).unwrap(), payload);
+    }
+
+    /// ReleaseCut round 8: the root's resume of a delegate's stream round
+    /// is one-way and appended after every other variant.
+    #[test]
+    fn a_delegate_stream_resume_round_trips_and_is_appended_last() {
+        let payload = Payload::DelegateStreamResume { from: 1, gen: 7 };
+        let frame = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(&frame[4..]).unwrap(), payload);
+        let tag = |payload: &Payload| postcard::to_allocvec(payload).unwrap()[0];
+        let last_before = tag(&Payload::LeaseProbeReply {
+            req_id: 1,
+            read: LeaseReadWire::Absent,
+        });
+        assert_eq!(tag(&payload), last_before + 1);
     }
 
     #[test]

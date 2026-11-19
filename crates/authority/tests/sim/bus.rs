@@ -345,7 +345,9 @@ impl Bus {
         }
         if matches!(
             msg,
-            PeerMsg::DelegateStreamAck { .. } | PeerMsg::DelegRenewed { .. }
+            PeerMsg::DelegateStreamAck { .. }
+                | PeerMsg::DelegateStreamResume { .. }
+                | PeerMsg::DelegRenewed { .. }
         ) {
             let (lo, hi) = *self.deleg_answer_delay.lock().unwrap();
             if hi > 0 {

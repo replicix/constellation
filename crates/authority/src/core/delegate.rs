@@ -3870,6 +3870,17 @@ impl Core {
                     continue;
                 }
                 self.arm_gen_expiry(now, d.gen, out);
+                // ReleaseCut round 8: the delegate's batches (the cut row
+                // among them) were refused, or never reached this node,
+                // while it was not ready; it backs off, or waits for its
+                // peers tick. Say it may stream now.
+                if self.gated_takes_stream(now, d.gen) || self.root_ends_recall(now, d.gen) {
+                    self.stats.deleg_stream_resumes_sent += 1;
+                    out.push(Action::Send {
+                        to: d.node,
+                        msg: PeerMsg::DelegateStreamResume { gen: d.gen },
+                    });
+                }
             }
             let gone: Vec<u64> = self
                 .dl
@@ -7011,6 +7022,23 @@ impl Core {
             self.dl.root_back = true;
         }
         self.dl.root_link = root.map(|r| (r, up));
+    }
+
+    /// ReleaseCut round 8: the root `from` took generation `gen` on and now
+    /// takes this delegate's stream. A new stream round starts at the next
+    /// sync (as for a returned root): the batch in flight is dropped, the
+    /// back-offs cleared, the rows sent again from the log cursor. A message
+    /// from the root is also the evidence of its link that a delegate lacks
+    /// until its next peers tick. Ignored unless it is from this node's root
+    /// and about a generation this node holds.
+    pub(crate) fn on_delegate_stream_resume(&mut self, from: NodeId, gen: u64) {
+        if self.dl.mine.contains_key(&gen) && self.holder_root() == Some(from) {
+            self.stats.deleg_stream_resumes += 1;
+            self.dl.root_back = true;
+            self.dl.root_link = Some((from, true));
+        } else {
+            self.stats.deleg_stream_resumes_stale += 1;
+        }
     }
 
     fn deleg_new_round(&mut self) -> u64 {

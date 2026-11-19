@@ -1316,6 +1316,15 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
+    fn delegate_stream_resume(&self, from: u64, gen: u64) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self
+            .nudge
+            .send(sync::SyncRequest::PeerDelegateStreamResume { from, gen });
+    }
+
     fn lock_cancel(&self, from: u64, ino: u64, exclusive: bool, shared: bool, upto: i64) {
         if crate::fault::p2p_denied(from) {
             return;

@@ -1734,6 +1734,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         ChunksDurable { from, .. }
         | DelegateStream { from, .. }
         | DelegateStreamAck { from, .. }
+        | DelegateStreamResume { from, .. }
         | DelegRenew { from, .. }
         | DelegRenewOffCore { from, .. }
         | DelegRenewed { from, .. }
@@ -1960,6 +1961,10 @@ async fn handle_stream<S: PeerService>(
                     archive_bound,
                 );
                 Some(Payload::Ok { req_id })
+            }
+            Payload::DelegateStreamResume { from, gen } => {
+                service.delegate_stream_resume(from, gen);
+                Some(Payload::Ok { req_id: 0 })
             }
             Payload::DelegRenew {
                 from,

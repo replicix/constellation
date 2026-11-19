@@ -39984,6 +39984,47 @@ mod s3_no_loops {
         assert_eq!(recalls_sent(&out, 3), 0, "a second recall: {out:?}");
     }
 
+    /// Round 8 (re-seeding `long-delegated+unsettled` 4863): a root that
+    /// inherited a generation and has not heard its delegate does not
+    /// redirect another node's settle on its keys to that delegate (it may
+    /// have disowned the generation and would send the settle straight back,
+    /// one bounced round trip per retry until the settle's cap): the settle
+    /// parks behind the generation's recall. Once the delegate has been heard
+    /// the settle is redirected as before. Fails with the rule reverted
+    /// (`let redirects = redirects_before;` at the `unheard_inherited` test
+    /// of `holder.rs`): `NotHolder { 3 }` at the first settle.
+    #[test]
+    fn a_root_keeps_a_settle_from_an_inherited_delegate_it_has_not_heard() {
+        let (mut h, dir, gen) = delegated_root();
+        {
+            let g = h.core.dl.gens.get_mut(&gen).unwrap();
+            g.inherited = true;
+            g.delegate_heard = None;
+        }
+        let out = forward(&mut h, 4, 20, dir, true);
+        let reply = reply_to(&out, 4, 20);
+        assert_ne!(
+            reply,
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.settles_not_redirected_unheard, 1);
+        // The delegate is heard: the settle is redirected to it.
+        let (mut h, dir, gen) = delegated_root();
+        {
+            let g = h.core.dl.gens.get_mut(&gen).unwrap();
+            g.inherited = true;
+            g.delegate_heard = Some(w(h.now));
+        }
+        let out = forward(&mut h, 4, 21, dir, true);
+        assert_eq!(
+            reply_to(&out, 4, 21),
+            Some(MutateOutcome::NotHolder { holder: 3 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.settles_not_redirected_unheard, 0);
+    }
+
     fn timer_of(out: &[Action], kind: TimerKind) -> TimerId {
         let t = timers(out, kind);
         assert_eq!(t.len(), 1, "expected one {kind:?} timer: {out:?}");
@@ -45101,6 +45142,223 @@ fn the_roots_link_coming_back_sends_the_unacknowledged_rows_at_once() {
         "the rows waited out the back-off after the root's return: {out:?}"
     );
     assert_eq!(h.core.dl.mine[&7].stream_backoff_ms, 0);
+}
+
+/// Round 8: node 2 (a requester), root node 1, `/d` delegated to node 3 as
+/// generation 7, the links up, and a settle of its own waiting on a create
+/// in `/d`: `(harness, dir, rid)`.
+fn waiting_settle_at_a_delegate() -> (Harness, constellation_fs_core::Ino, Rid) {
+    let mut h = Harness::new(2);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    h.step(Event::Peers {
+        registry_complete: true,
+        links: [1, 3]
+            .into_iter()
+            .map(|node| crate::event::PeerLink {
+                node,
+                connected: true,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            })
+            .collect(),
+        lapses: 0,
+    });
+    let rid = h.rid(1);
+    h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        tag: Default::default(),
+    });
+    h.core.clients.get_mut(&rid).unwrap().settle = true;
+    (h, dir, rid)
+}
+
+/// Whether `out` carries a settle `MutateRequest` of `rid` to `to`.
+fn settle_sent_to(out: &[Action], rid: Rid, to: NodeId) -> bool {
+    sends(out).into_iter().any(|(t, m)| {
+        t == to && matches!(m, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid)
+    })
+}
+
+/// Applies segment 2 shipped by `node` carrying `records`, as the foreign
+/// segment the cut row arrives in.
+fn apply_cut_segment(h: &mut Harness, node: NodeId, records: &[LogRecord]) -> Vec<Action> {
+    let payload = crate::segment::encode(node, 1, 0, &[], &[], records).unwrap();
+    h.core.ship.next_seq = 2;
+    let mut out = Vec::new();
+    h.core
+        .apply_incoming(h.clk(), 2, &payload, &h.meta, &mut out)
+        .unwrap();
+    out
+}
+
+/// ADR-64 (R5b, round 8, `sticky-s4-root-restart` seed 403): a settle in the
+/// lease path's acquire back-off (its forward retries ran out on the
+/// restarted root's `Busy`, and the acquisition was refused) slept past its
+/// deadline while the cut row, applied meanwhile, would have let the root
+/// answer it. The cut row's arrival routes it again at once. Fails on the
+/// parent: nothing is sent.
+#[test]
+fn a_settle_in_the_acquire_backoff_is_routed_again_when_its_cut_row_is_applied() {
+    let (mut h, dir, rid) = waiting_settle_at_a_delegate();
+    let mut out = Vec::new();
+    h.core.lease_path(h.clk(), rid, &h.meta, &mut out);
+    h.core
+        .on_acquire_finished(h.clk(), false, &h.meta, &mut out);
+    assert_eq!(
+        h.core.clients[&rid].phase,
+        crate::core::client::Phase::AcquireRetry,
+        "{out:?}"
+    );
+    let cut = LogRecord::ReleaseCut {
+        node: 3,
+        gen: 7,
+        dirs: vec![dir],
+        at: 0,
+    };
+    let out = apply_cut_segment(&mut h, 1, &[cut]);
+    assert!(settle_sent_to(&out, rid, 1), "no settle sent to 1: {out:?}");
+    assert!(!settle_sent_to(&out, rid, 3), "sent to node 3: {out:?}");
+    assert_eq!(h.core.stats.settles_woken_at_cut_phase, 1);
+}
+
+/// ADR-64 (R5b, round 8, seed 60): the cut row and the release row of the
+/// subtree arrive in one segment. After the apply the release row has
+/// cleared the cut mark, the keys resolve to the root and are not at the
+/// cut, and a check made after the apply wakes nothing: the settle waited for
+/// its next retry. Taken before the apply, the settle is routed again at
+/// once. Fails on the parent: nothing is sent.
+#[test]
+fn a_settle_is_routed_again_when_its_cut_and_release_rows_arrive_together() {
+    let (mut h, dir, rid) = waiting_settle_at_a_delegate();
+    let mut out = Vec::new();
+    h.core.on_forward_failed(h.clk(), rid, &h.meta, &mut out);
+    assert_eq!(
+        h.core.clients[&rid].phase,
+        crate::core::client::Phase::Backoff,
+        "{out:?}"
+    );
+    let cut = LogRecord::ReleaseCut {
+        node: 3,
+        gen: 7,
+        dirs: vec![dir],
+        at: 0,
+    };
+    let release = LogRecord::StreamReleased {
+        node: 3,
+        gen: 7,
+        through: 0,
+    };
+    let out = apply_cut_segment(&mut h, 1, &[cut, release]);
+    let mut keys = constellation_meta::TouchSet::default();
+    keys.dentries.insert((dir, "f".into()));
+    assert!(
+        !h.meta.delegation_table().settle_at_cut(&h.meta, &keys),
+        "the release row did not clear the cut"
+    );
+    assert!(matches!(
+        h.meta.resolve_ownership(&keys),
+        constellation_meta::delegation::Ownership::Root
+    ));
+    assert!(settle_sent_to(&out, rid, 1), "no settle sent to 1: {out:?}");
+    assert_eq!(h.core.stats.settles_woken_at_cut_released, 1);
+}
+
+/// ADR-64 (R5b, round 8, seeds 375 and 980): the requester's peers view still
+/// calls the returned root's link down (its outage record stands until the
+/// next peers tick), so the woken settle went to a lease read and a back-off,
+/// never to the root whose segment had just been applied. It asks the root
+/// that shipped the cut row. Fails on the parent: no forward.
+#[test]
+fn a_settle_woken_at_the_cut_asks_the_root_whose_segment_carried_it() {
+    let (mut h, dir, rid) = waiting_settle_at_a_delegate();
+    let mut out = Vec::new();
+    h.core.on_forward_failed(h.clk(), rid, &h.meta, &mut out);
+    // Node 1's link is down and its outage is old.
+    h.core.cfg.inbox_p2p_grace_ms = 1;
+    h.step(Event::Peers {
+        registry_complete: true,
+        links: [1, 3]
+            .into_iter()
+            .map(|node| crate::event::PeerLink {
+                node,
+                connected: node == 3,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            })
+            .collect(),
+        lapses: 0,
+    });
+    h.core.note_p2p_result(h.clk(), 1, false);
+    h.advance(100);
+    let now = h.clk();
+    assert!(!h.core.reaches(now, 1), "node 1 is reachable");
+    let cut = LogRecord::ReleaseCut {
+        node: 3,
+        gen: 7,
+        dirs: vec![dir],
+        at: 0,
+    };
+    let out = apply_cut_segment(&mut h, 1, &[cut]);
+    assert!(settle_sent_to(&out, rid, 1), "no settle sent to 1: {out:?}");
+    assert_eq!(h.core.stats.settles_cut_forwarded_alive, 1);
+}
+
+/// Round 8 (F1, delegate): the root's resume starts a new stream round at
+/// once, through a refusal back-off; a resume from a node that is not the
+/// root sends nothing.
+#[test]
+fn a_resume_from_the_root_streams_the_rows_at_once_through_a_refusal_backoff() {
+    let (mut h, dir) = streaming_delegate();
+    let out = create_in(&mut h, dir, 1);
+    let (req, round, _, _) = stream_batch(&out, 1).expect("no batch streamed");
+    // The root refuses (it is not ready): the delegate backs off.
+    h.advance(10);
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamAck {
+            req,
+            gen: 7,
+            round,
+            through: 0,
+            committed: 0,
+            refused: true,
+            archive_bound: false,
+        },
+    });
+    assert!(h.core.dl.mine[&7].refusal_backoff_ms > 0);
+    h.advance(100);
+    let out = poke(&mut h);
+    assert!(stream_batch(&out, 1).is_none(), "sent inside the back-off");
+    // A resume from a node that is not the root is ignored.
+    let out = h.step(Event::Peer {
+        from: 5,
+        msg: PeerMsg::DelegateStreamResume { gen: 7 },
+    });
+    assert!(stream_batch(&out, 1).is_none(), "{out:?}");
+    assert_eq!(h.core.stats.deleg_stream_resumes_stale, 1);
+    // The root's resume: a batch to it, in a new round, back-off cleared.
+    let out = h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamResume { gen: 7 },
+    });
+    let (_, new_round, _, _) = stream_batch(&out, 1).expect("no batch after the resume");
+    assert_ne!(new_round, round);
+    assert_eq!(h.core.dl.mine[&7].refusal_backoff_ms, 0);
+    assert_eq!(h.core.stats.deleg_stream_resumes, 1);
 }
 
 /// delegate-stream-acks: a delegate of `/d` (generation 7, root node 1)
@@ -65640,6 +65898,38 @@ mod c2g_settle {
             Some(MutateOutcome::NotHolder { holder: 4 }),
             "{out:?}"
         );
+    }
+
+    /// Round 8 (F1, root): a root that takes a generation on from a
+    /// predecessor tells its delegate to stream now, once. A gate whose
+    /// journal work is not done takes nothing on and sends nothing. (New
+    /// API: the fail-before evidence is the pin of seed 375 of
+    /// `sticky-s4-root-restart`.)
+    #[test]
+    fn a_gate_taking_a_generation_on_tells_its_delegate_to_stream() {
+        let resume_to_4 = |out: &[Action]| {
+            sends(out)
+                .into_iter()
+                .filter(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegateStreamResume { gen: 7 }))
+                .count()
+        };
+        for shippable in [true, false] {
+            let mut h = gated_root(shippable);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            let _dir = delegated_to_me(&h.meta, 4);
+            let out = connect_4(&mut h);
+            let again = poke(&mut h);
+            if shippable {
+                assert_eq!(resume_to_4(&out), 1, "{out:?}");
+                assert_eq!(h.core.stats.deleg_stream_resumes_sent, 1);
+            } else {
+                assert_eq!(h.core.stats.deleg_inherited, 0);
+                assert_eq!(resume_to_4(&out), 0, "{out:?}");
+                assert_eq!(h.core.stats.deleg_stream_resumes_sent, 0);
+            }
+            assert_eq!(resume_to_4(&again), 0, "sent again: {again:?}");
+        }
     }
 
     /// S5: what the gate counts of what it takes on.

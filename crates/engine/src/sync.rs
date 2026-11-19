@@ -858,6 +858,12 @@ pub enum SyncRequest {
         sent: i64,
         outcome: constellation_authority::LockOutcome,
     },
+    /// ReleaseCut round 8, one way: the root took `gen` on and now takes
+    /// this delegate's stream.
+    PeerDelegateStreamResume {
+        from: u64,
+        gen: u64,
+    },
     /// One way: a peer no longer waits for `ino` in the modes named.
     PeerLockCancel {
         from: u64,

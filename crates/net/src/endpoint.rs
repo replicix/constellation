@@ -1540,6 +1540,10 @@ pub trait PeerService: Send + Sync + 'static {
         _archive_bound: bool,
     ) {
     }
+    /// ReleaseCut round 8, one way: the root took generation `gen` on and
+    /// now takes this delegate's stream ([`Payload::DelegateStreamResume`]).
+    /// Default: ignored.
+    fn delegate_stream_resume(&self, _from: u64, _gen: u64) {}
     /// Plan 30 §M11 phase 2b: a delegate's append to this backup.
     /// Default: sealed (nothing held).
     fn deleg_backup_append_requested(

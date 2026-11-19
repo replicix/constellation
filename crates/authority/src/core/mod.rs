@@ -2218,6 +2218,21 @@ pub struct Stats {
     /// ADR-64 (R5b): this node's own settles, waiting out a retry, that were
     /// routed again at once when the segment carrying a cut row was applied.
     pub settles_woken_at_cut: u64,
+    /// ADR-64 (R5b, round 8): of those, woken from the lease path's waits
+    /// (`AcquireRetry`, `WaitingLease`).
+    pub settles_woken_at_cut_phase: u64,
+    /// Of those, woken only by the snapshot taken before the segment's
+    /// apply: the segment's release row had cleared the cut mark.
+    pub settles_woken_at_cut_released: u64,
+    /// Of those, sent to the root whose segment carried the cut although
+    /// this node's peers view still called its link down.
+    pub settles_cut_forwarded_alive: u64,
+    /// ReleaseCut round 8: `DelegateStreamResume`s a root sent on taking a
+    /// generation on; a delegate's resumes that started a new stream round,
+    /// and those ignored (not its root, not its generation).
+    pub deleg_stream_resumes_sent: u64,
+    pub deleg_stream_resumes: u64,
+    pub deleg_stream_resumes_stale: u64,
     /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it
     /// owns (a refusal journaled, or a dedup'd outcome), settles it left
     /// `Held` because its journal work was not done yet, and settles of a
@@ -4110,6 +4125,7 @@ impl Core {
                 replica,
                 out,
             ),
+            PeerMsg::DelegateStreamResume { gen } => self.on_delegate_stream_resume(from, gen),
             PeerMsg::DelegRenew {
                 req,
                 gen,

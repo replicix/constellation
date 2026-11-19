@@ -963,6 +963,17 @@ pub enum PeerMsg {
         refused: bool,
         archive_bound: bool,
     },
+    /// ReleaseCut round 8, one way, root to delegate: the root took
+    /// generation `gen` on (it inherited it from a predecessor tenure) and
+    /// now takes the delegate's stream. The delegate, whose batches the
+    /// root refused or never saw while it was not yet ready, starts a new
+    /// stream round from its log cursor at once instead of waiting out a
+    /// refusal back-off or its next peers tick. Sent once per generation
+    /// taken on; a delegate that does not hold `gen` from this root
+    /// ignores it.
+    DelegateStreamResume {
+        gen: u64,
+    },
     /// Plan 30 §M11: a delegate renews its grant on `gen`; the root
     /// answers with the ttl (0: refused — the generation is ending or is
     /// not this delegate's). The delegate measures from its send. One
@@ -1352,6 +1363,7 @@ impl PeerMsg {
             PeerMsg::LeaseProbeReply { .. } => "LeaseProbeReply",
             PeerMsg::DelegateStream { .. } => "DelegateStream",
             PeerMsg::DelegateStreamAck { .. } => "DelegateStreamAck",
+            PeerMsg::DelegateStreamResume { .. } => "DelegateStreamResume",
             PeerMsg::DelegRenew { .. } => "DelegRenew",
             PeerMsg::DelegRenewOffCore { .. } => "DelegRenewOffCore",
             PeerMsg::DelegRenewedOffCore { .. } => "DelegRenewedOffCore",
@@ -1415,6 +1427,7 @@ impl PeerMsg {
             self,
             PeerMsg::DelegateStream { .. }
                 | PeerMsg::DelegateStreamAck { .. }
+                | PeerMsg::DelegateStreamResume { .. }
                 | PeerMsg::DelegRenew { .. }
                 | PeerMsg::DelegRenewed { .. }
                 | PeerMsg::ReleaseRequest { .. }

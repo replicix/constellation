@@ -10814,6 +10814,11 @@ struct OracleTotals {
     s4_cut_spans: (u64, u64),
     s4_cut_settles: u64,
     s4_answered_at_cut: u64,
+    /// Round 8: `deleg_stream_resumes_sent`, `deleg_stream_resumes`,
+    /// `deleg_stream_resumes_stale`, `deleg_inherited`, `settles_woken_at_cut`,
+    /// `settles_woken_at_cut_phase`, `settles_woken_at_cut_released` and
+    /// `settles_cut_forwarded_alive`, summed over nodes and seeds.
+    r8: [u64; 8],
     s4_rowless_held: u64,
     s4_exec_in_cut: u64,
     /// Due cuts that went rowless, were left to a claim, were asked for
@@ -11079,6 +11084,20 @@ impl OracleTotals {
         self.s4_cut_spans.1 += u64::from(r.cut_release_spans > 0);
         self.s4_cut_settles += r.settles_sent_in_cut;
         self.s4_answered_at_cut += r.settles_answered_at_cut;
+        for s in r.stats.values() {
+            for (n, v) in self.r8.iter_mut().zip([
+                s.deleg_stream_resumes_sent,
+                s.deleg_stream_resumes,
+                s.deleg_stream_resumes_stale,
+                s.deleg_inherited,
+                s.settles_woken_at_cut,
+                s.settles_woken_at_cut_phase,
+                s.settles_woken_at_cut_released,
+                s.settles_cut_forwarded_alive,
+            ]) {
+                *n += v;
+            }
+        }
         self.s4_rowless_held += r.rowless_held_releases;
         self.s4_exec_in_cut += r.exec_in_cut;
         for (n, v) in self.s4_pred.iter_mut().zip(r.s4_pred) {
@@ -11395,6 +11414,10 @@ impl OracleTotals {
             self.seeds, self.held_lost_chunk.0, self.held_lost_chunk.1
         );
         eprintln!("{}", self.s4_line(label, seeds));
+        eprintln!(
+            "SWEEP-R8 {label}: resumes sent {} (generations taken on {}), resumes taken {}, resumes ignored {}; settles woken at a cut {} (from the acquire waits {}, by the pre-apply snapshot only {}), forwarded to a root alive {}",
+            self.r8[0], self.r8[3], self.r8[1], self.r8[2], self.r8[4], self.r8[5], self.r8[6], self.r8[7]
+        );
         eprintln!(
             "SWEEP-I4-CAUSES {label} seeds {}/{seeds}: violations by cause {:?}",
             self.seeds, self.violation_causes
@@ -21404,25 +21427,69 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
 // test of the extension (`settles_extended_for_durability`: one window, once,
 // never past the cap).
 
-/// `long-delegated+unsettled` 4863: the root restarted and inherited a
+/// `long-delegated+unsettled`: the root restarted and inherited a
 /// generation whose delegate had disowned it; a settle of the generation's
 /// keys was redirected to the delegate (`NotHolder`), which sent it back, for
 /// the 4.4 s until the settle's cap, then an unsettled `EIO` with the root
 /// reachable. The settle of a generation inherited and not heard on parks
-/// behind its recall instead. Fails on the parent: one unsettled `EIO`.
+/// behind its recall instead.
+///
+/// A regression pin of the path, not a fail-before. 4863 was the original
+/// seed; it no longer reaches the path, and no seed of 0 to 9,999 fails on
+/// this tree with the rule reverted (`let redirects = redirects_before;`
+/// at the `unheard_inherited` test of `holder.rs`), although the path is
+/// still reached. The fail-before evidence is the core test
+/// `a_root_keeps_a_settle_from_an_inherited_delegate_it_has_not_heard`.
+/// (`find_settle_not_redirected_unheard_seeds` lists the seeds that reach it.)
 #[test]
 fn long_delegated_settle_is_not_bounced_to_a_silent_inherited_delegate() {
-    let seed = 4863;
-    let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
-        .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
-    assert!(
-        r.stats
-            .values()
-            .map(|s| s.settles_not_redirected_unheard)
-            .sum::<u64>()
-            > 0,
-        "seed {seed}: no settle was kept from the delegate; the seed no longer exercises the path"
-    );
+    for seed in [181, 757, 925] {
+        let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
+            .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
+        assert!(
+            r.stats
+                .values()
+                .map(|s| s.settles_not_redirected_unheard)
+                .sum::<u64>()
+                > 0,
+            "seed {seed}: no settle was kept from the delegate; the seed no longer exercises the path"
+        );
+    }
+}
+
+/// Finder for [`long_delegated_settle_is_not_bounced_to_a_silent_inherited_delegate`]:
+/// the seeds of `long-delegated+unsettled` that reach
+/// `settles_not_redirected_unheard`. `AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS`
+/// as for `long_random`.
+#[test]
+#[ignore]
+fn find_settle_not_redirected_unheard_seeds() {
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    for seed in start..start + seeds {
+        match run_seed(seed, strict(long_delegated_config(), "unsettled")) {
+            Ok(report) => {
+                let n: u64 = report
+                    .stats
+                    .values()
+                    .map(|s| s.settles_not_redirected_unheard)
+                    .sum();
+                if n > 0 {
+                    eprintln!("settle not redirected (unheard): seed {seed} ({n})");
+                }
+            }
+            Err(e) => eprintln!(
+                "failing seed {seed}: {}",
+                e.lines().next().unwrap_or_default()
+            ),
+        }
+    }
 }
 
 /// Plan 46 M1.2 step 13 (`long-delegated` seeds 29 and 47): a client's settle
@@ -23918,7 +23985,7 @@ fn s4_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
 /// [`s4_pin`]; `answered_at_cut`: the fix arm must also have answered a
 /// settle at a cut (not so where the cut row's timely arrival only lets the
 /// root answer as it would have: the root-restart pins).
-fn s4_pin_with(label: &str, config: fn() -> SimConfig, seed: u64, answered_at_cut: bool) {
+fn s4_pin_with(label: &str, config: fn() -> SimConfig, seed: u64, answered_at_cut: bool) -> Report {
     let control = run_seed(
         seed,
         SimConfig {
@@ -23947,6 +24014,7 @@ fn s4_pin_with(label: &str, config: fn() -> SimConfig, seed: u64, answered_at_cu
     );
     assert_eq!((fix.unsettled_s4, fix.s4_strict.len()), (0, 0));
     assert_eq!(fix.exec_in_cut, 0);
+    fix
 }
 
 /// Round 7: `seed` of `config` passes on the fix arm with nothing tagged and
@@ -24003,6 +24071,63 @@ fn s4_root_restart_the_cut_row_reaches_the_returned_root_in_time() {
         8,
         false,
     );
+}
+
+/// Round 8: the seven residual seeds of `sticky-s4-root-restart` (60, 375,
+/// 403, 646, 772, 980, 1321) had four separate delays (the spec's A to D).
+/// Each pin needs both halves, or the half it names:
+/// - 375: the delegate never sent the cut row while its peers view showed the
+///   returned root down, and the requester's `reaches` was false until its
+///   peers tick. Fails with either half alone, so it is the fail-before of F1
+///   (the root's `DelegateStreamResume` on taking the generation on) and shows
+///   F2c (the settle is forwarded to the root whose segment carried the cut).
+/// - 403: the settle sat in `AcquireRetry` when the cut row arrived. Fails
+///   with F1 alone: the fail-before of F2b (the phases R5b wakes).
+/// - 980: `reaches(root)` false for the requester until 20.47 s. Fails with F1
+///   alone: the fail-before of F2c.
+///
+/// The control arm (the held release) fires the strict tag on each. Each pin
+/// fails on the tree of round 7.
+#[test]
+fn s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle() {
+    let sum = |r: &Report, f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+        r.stats.values().map(f).sum()
+    };
+    for seed in [375u64, 403, 980] {
+        let fix = s4_pin_with(
+            "sticky-s4-root-restart",
+            sticky_s4_root_restart_config,
+            seed,
+            false,
+        );
+        let resumes = sum(&fix, |s| s.deleg_stream_resumes);
+        let phase = sum(&fix, |s| s.settles_woken_at_cut_phase);
+        let alive = sum(&fix, |s| s.settles_cut_forwarded_alive);
+        match seed {
+            375 => assert!(
+                resumes > 0 && alive > 0,
+                "seed 375: resumes {resumes}, forwarded alive {alive}: the seed no longer exercises the path"
+            ),
+            403 => assert!(
+                phase > 0,
+                "seed 403: no settle woken from the acquire waits: the seed no longer exercises the path"
+            ),
+            _ => assert!(
+                alive > 0,
+                "seed {seed}: no settle forwarded to the root alive: the seed no longer exercises the path"
+            ),
+        }
+        // (The bounds of the review: a resume is sent once per generation
+        // taken on, and a settle is forwarded alive only after being woken.)
+        assert!(
+            sum(&fix, |s| s.deleg_stream_resumes_sent) <= sum(&fix, |s| s.deleg_inherited),
+            "seed {seed}: more resumes sent than generations taken on"
+        );
+        assert!(
+            alive <= sum(&fix, |s| s.settles_woken_at_cut),
+            "seed {seed}: more forwards alive than settles woken"
+        );
+    }
 }
 
 /// ADR-64: a holder suspended after its release cut leaves the settles on its
