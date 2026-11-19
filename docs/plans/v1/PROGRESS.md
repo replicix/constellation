@@ -71086,3 +71086,45 @@ cut. The daemon had the same gap before (the sync ran inline, ahead of the CAS);
 record before the release is decided (while the lease still serves), which touches 670e57d3's crash rule: left open for a decision, the ceiling
 is not raised.
 
+
+### The release in doubt waits for a read, and the single-authority oracle's definition (2026-11-19)
+
+The release CAS of a node that lost its answer, whose own re-read fails too, no longer gives the lease up at once (ADR-22, amendment of
+2026-11-18). The node stays the named holder and `releasing` (every fence of a release in flight holds), asks every reachable peer for a fresh
+read of the lease (`LeaseProbe`/`LeaseProbeReply`), answers forwards `Held`, and ends at the first conclusive read (landed, kept, deposed)
+or at its honour end, where the old give-up runs unchanged. Code: `core/release_doubt.rs`, the probe in `net` and the engine's driver. On
+the rebase onto O2 the probe takes its framing: a bare payload on the unsigned stream, with `requester` in `claimed_node_id`, so a probe
+naming another node than the connection's is dropped before the service (`a_lease_probe_naming_another_node_is_dropped`). Pins:
+`regression_a_release_in_doubt_is_resolved_by_a_peer_read` (`locks-unlinked-delegated-blips+unsettled` seeds 64, 391, 1477), the core tests
+named in TESTING.md.
+
+The same round refines the oracle that the change made reachable. `sample_authority` counted a node's usable S3 lease as an authority
+whenever the node held it; flex-tight seed 366 then failed "two authorities at once" on a node that was paused while its release CAS
+landed and a peer claimed and formed an epoch (a paused process handles nothing, so it answered, granted and renewed nothing in the
+window; its published view was stale). The model's definition (`crates/model/src/flex.rs`, plan 30 §M10) is that at most one live node could
+acknowledge a write now. The refinement, approved 2026-11-19:
+- `Core::release_cas_out()`: `releasing` and the job in `Release` or `ReleaseReread`. Only from there can S3 let go without a TTL wait.
+- The sim view publishes `release_cas_out` and `admits` (`open_for_new_mutation`, read without moving the node's clock).
+- `epochs::s3_authority(usable, release_cas_out, admits)` classifies each S3 holder: `Counted`, `NotAuthority`, `FencedRelease` (left
+  out, counted in `Report::fenced_release_samples`) and `Breach` (CAS out yet still admitting: a split brain on its own, whatever else
+  exists). The exclusion therefore rests on the fence, checked on every sample. Paused nodes still count; a flush or `PersistRelease`
+  (CAS not yet sent) still counts.
+- Tests: the classifier's cases (`s3_authority_classifies_the_release_states`); non-vacuity
+  `flex_a_fenced_release_is_not_an_authority_but_an_open_one_is` (flex-tight 366 passes with `fenced_release_samples > 0`; with
+  `SimConfig::plant_release_admits`, which publishes `admits` without the release fence, it fails "two authorities at once");
+  `flex_without_the_promise_check_is_found` unchanged and passing.
+- Documented next to the oracle, in TESTING.md and in the ADR-22 amendment.
+
+Gates, on the final tree (origin/main 7319f0da plus four commits), the lib tests and sweeps on a loaded shared box:
+- fmt, `clippy --workspace --all-targets -D warnings`: clean.
+- Lib tests, debug and release: authority 1761, meta 485/484, engine 997, net 166 passed, 0 failed.
+- Full release sim suite (598 tests): 0 failed, 16 ignored. The first 198 ran with a disk TMPDIR before the job's own 2 h timeout (the disk
+  TMPDIR made the suite fsync-bound, about 25 tests an hour); the remaining 400 ran with a tmpfs TMPDIR in 192 s. The binary is the same.
+- Sweeps of 0..1999, origin/main against the final tree, 134 labels each (every `locks*` label, flex-tight and flex-tight+unsettled, the 36
+  m03 configurations and the round-1 set): identical sets of failing seeds in all but two. `locks-unlinked-delegated-blips+unsettled`: 6 on main,
+  4 here (1062 and 1589 no longer fail, none new). `flex-tight+unsettled`: 62 on main, 57 here, all in the known I4 "told EIO unsettled although a
+  sequencer was reachable" class, as before (no other class; the seeds moved with the schedule: new 53, 163, 288, 337, 358, 369, 462 and more,
+  gone the ones the change moved). No new I-class, lock or liveness failure class. `locks-late-stale-mirror-naive` (43) and
+  `locks-writer-hold-delegated-unsettled-own-clock` (13) are the same on both.
+- Harness smoke at seed 42: lease-handover, lease-cold-claim, lease-fencing, lease-claimant-ahead, backup-failover, ack-s3-failover,
+  p2p-partition-tolerance, backup-partition: all passed.
