@@ -27,6 +27,20 @@ pub use mutate::{
 #[cfg(any(test, feature = "test-util"))]
 pub use mutate::{set_after_write_hook_for_tests, set_before_write_hook_for_tests};
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
+
+/// Tests: the journal rows the emptiness and length questions have stepped
+/// over on this thread since the last reset (what a question about the
+/// journal costs).
+#[cfg(any(test, feature = "test-util"))]
+pub fn journal_rows_walked_for_tests() -> u64 {
+    store::journal::ROWS_COUNTED.with(std::cell::Cell::get)
+}
+
+/// Tests: zero the count [`journal_rows_walked_for_tests`] reads.
+#[cfg(any(test, feature = "test-util"))]
+pub fn reset_journal_rows_walked_for_tests() {
+    store::journal::ROWS_COUNTED.with(|c| c.set(0));
+}
 #[cfg(any(test, feature = "test-util"))]
 pub use readdeleg::fail_horizon_writes_on_this_thread_for_tests;
 pub use readdeleg::{
@@ -347,7 +361,14 @@ pub trait MetaStore: Send + Sync {
     // --- journal ---
     fn take_journal(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError>;
     fn ack_journal(&self, upto_seq: u64) -> Result<(), MetaError>;
+    /// How many journal rows are unshipped. It walks the whole backlog,
+    /// so it costs time proportional to it: ask [`MetaStore::journal_is_empty`]
+    /// when only "any left?" matters.
     fn journal_len(&self) -> Result<u64, MetaError>;
+    /// Whether no journal row is unshipped. It costs one seek, where
+    /// [`MetaStore::journal_len`] walks the backlog: use it on any
+    /// per-event path.
+    fn journal_is_empty(&self) -> Result<bool, MetaError>;
 
     // --- read-time atime (plan 20) ---
     /// The one atime merge path: clamp to `now + skew`, guard on

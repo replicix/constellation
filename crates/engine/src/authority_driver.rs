@@ -6666,7 +6666,8 @@ impl Driver {
                         // and one that landed after the flush fails the
                         // release rather than being stranded behind it.
                         view.wait_quiescent().await;
-                        if constellation_meta::MetaStore::journal_len(&*meta).unwrap_or(0) > 0 {
+                        if !constellation_meta::MetaStore::journal_is_empty(&*meta).unwrap_or(true)
+                        {
                             let _ = tx.send(Internal::Event(Event::S3 {
                                 op,
                                 result: S3Result::LeasePut(Err(CasFailure::Failed(

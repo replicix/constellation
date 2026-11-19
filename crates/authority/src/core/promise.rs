@@ -463,7 +463,7 @@ impl Core {
                 self.pr.persisted_hold = hold;
             }
         }
-        if self.pr.flush_pending && replica.journal_len().unwrap_or(1) == 0 {
+        if self.pr.flush_pending && replica.journal_is_empty().unwrap_or(false) {
             self.pr.flush_pending = false;
         }
         if self.cfg.epoch_slack == 0 || self.pr.retired || self.epoch.open || self.pr.flush_pending

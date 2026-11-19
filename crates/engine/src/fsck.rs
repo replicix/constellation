@@ -388,7 +388,7 @@ async fn check_metadata_tree_in(
         let vector = meta.applied_seq()?;
         let Some(matching) = candidates
             .iter()
-            .find(|commit| commit.applied == vector && meta.journal_len().unwrap_or(1) == 0)
+            .find(|commit| commit.applied == vector && meta.journal_is_empty().unwrap_or(false))
         else {
             tracing::info!("no commit claims this replica's exact state; skipping the rebuild comparison");
             return Ok(found);
@@ -736,7 +736,7 @@ mod tests {
 
         // Drift: the replica changes, and the change is drained from
         // the local journal (as shipping would do) without ever being
-        // published — the `journal_len() == 0` half of the rebuild
+        // published — the empty-journal half of the rebuild
         // comparison's "this commit claims the replica's exact state"
         // check needs this, or it correctly (if less interestingly)
         // skips the comparison as "more local work than the commit

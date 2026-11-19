@@ -357,6 +357,8 @@ pub trait Replica {
     /// another epoch).
     fn applied_jseq_of(&self, epoch: Epoch) -> u64;
     fn journal_len(&self) -> Result<u64, MetaError>;
+    /// One seek, where `journal_len` walks the backlog (`MetaStore::journal_is_empty`).
+    fn journal_is_empty(&self) -> Result<bool, MetaError>;
     /// What the last ship plan held back or deferred (`Meta::held_summary`).
     fn held_summary(&self) -> constellation_meta::HeldSummary;
     /// The next unshipped journal rows, whole transactions only, at most
@@ -1405,6 +1407,10 @@ impl Replica for Meta {
 
     fn journal_len(&self) -> Result<u64, MetaError> {
         MetaStore::journal_len(self)
+    }
+
+    fn journal_is_empty(&self) -> Result<bool, MetaError> {
+        MetaStore::journal_is_empty(self)
     }
 
     fn take_journal(&self, max: usize) -> Result<JournalBatch, MetaError> {

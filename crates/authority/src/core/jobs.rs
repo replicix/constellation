@@ -2851,7 +2851,7 @@ impl Core {
     }
 
     pub(crate) fn round_release(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        let backlog = replica.journal_len().unwrap_or(0);
+        let drained = replica.journal_is_empty().unwrap_or(true);
         // The continuation epoch's flush: its journal is in S3 and the
         // lease taken for it can go — unless lock grants are live under
         // it: then the flush is over and the lease stays, as an idle
@@ -2862,7 +2862,7 @@ impl Core {
             && self.lease.held.is_some()
             && !self.lease.lost
             && !self.lease.epoch_held()
-            && backlog == 0;
+            && drained;
         // The takeover floor holds an epoch's flush release too, and so does
         // a *fast takeover's* gate before its marker landed (no floor yet,
         // no adopted delegation table). Not the epoch's own re-claim's
@@ -2991,7 +2991,7 @@ impl Core {
         }
         if self
             .lease
-            .idle_release_due(now, &self.cfg, backlog, self.held_back)
+            .idle_release_due(now, &self.cfg, drained, self.held_back)
         {
             tracing::info!(node = self.cfg.node_id, "idle-releasing the lease");
             self.lease.releasing = true;
@@ -2999,7 +2999,7 @@ impl Core {
             self.release_after_atime(now, replica, out);
             return;
         }
-        if backlog > 0 {
+        if !drained {
             // Force the backlog to zero: close the fast path for a while
             // so the next round can drain and release — but follow up
             // at once only if this round moved the log. A backlog that
@@ -3158,7 +3158,7 @@ impl Core {
                     // (with the lock grants the recalls handed back, it
                     // keeps the lease, as with any grant); a flush or a
                     // handoff ships on and releases.
-                    if replica.journal_len().unwrap_or(0) > 0 {
+                    if !replica.journal_is_empty().unwrap_or(true) {
                         match kind {
                             JobKind::Round => {
                                 self.lease.releasing = false;
@@ -3212,10 +3212,10 @@ impl Core {
             tracing::warn!(node = self.cfg.node_id, %error, "sync round failed; will retry");
             self.ship.last_error = Some(error.clone());
         }
-        let backlog = replica.journal_len().unwrap_or(0);
+        let backlog_left = !replica.journal_is_empty().unwrap_or(true);
         let productive = self.nudged
             || self.ship.head_seq != head_before
-            || backlog > 0
+            || backlog_left
             || !poll_triggered
             || failed.is_some()
             || !self.inbox.pending.is_empty();

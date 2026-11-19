@@ -2309,6 +2309,11 @@ impl MetaStore for Meta {
         journal::len(&r, &self.journal_ks, &self.local)
     }
 
+    fn journal_is_empty(&self) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        journal::is_empty(&r, &self.journal_ks, &self.local)
+    }
+
     fn apply_atime(&self, bumps: &[(Ino, i64, i64)]) -> Result<(u64, u64), MetaError> {
         let mut tx = self.db.write_tx();
         let skew = atime::atime_skew_tolerance_ns();

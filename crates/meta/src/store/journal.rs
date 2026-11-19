@@ -912,7 +912,7 @@ pub(crate) fn len(
     let mut n = 0u64;
     for guard in r.range(journal, seq_key(from)..) {
         guard.key()?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         ROWS_COUNTED.with(|c| c.set(c.get() + 1));
         n += 1;
     }
@@ -934,7 +934,7 @@ pub(crate) fn is_empty(
     match r.range(journal, seq_key(from)..).next() {
         Some(guard) => {
             guard.key()?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             ROWS_COUNTED.with(|c| c.set(c.get() + 1));
             Ok(false)
         }
@@ -944,7 +944,7 @@ pub(crate) fn is_empty(
 
 // Tests: the journal rows `len` and `is_empty` stepped over on this thread
 // (what a question about the journal costs).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 thread_local! {
     pub(crate) static ROWS_COUNTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }

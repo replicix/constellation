@@ -1675,7 +1675,7 @@ impl Core {
             if behind {
                 self.stats.epoch_handoffs_behind += 1;
             }
-            if behind || replica.journal_len().unwrap_or(1) > 0 {
+            if behind || !replica.journal_is_empty().unwrap_or(false) {
                 decline(self, out);
                 return;
             }

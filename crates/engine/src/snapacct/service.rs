@@ -1391,7 +1391,7 @@ impl SnapAcctService {
         use constellation_meta::MetaStore;
         Ok((
             self.deps.meta.applied_seq()?,
-            self.deps.meta.journal_len()? == 0,
+            self.deps.meta.journal_is_empty()?,
         ))
     }
 

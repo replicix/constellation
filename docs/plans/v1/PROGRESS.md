@@ -70978,3 +70978,25 @@ Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tes
   configuration with a lease of 1 s or less: `gc-lifecycle` (200 ms), `gc-dedup-race`, `gc-open-orphan-hold`,
   `log-retention-gap`, `fsck-repair`, `mtree-gc-plateau` (200 ms), `snapacct`, and the snapshot churn.
 - Harness/fixture Kd corrected to 1,000 (a strict mount at a 1 s margin; at most 1,500 at the largest margin).
+## The epoch flush wait no longer walks the journal on every core step (2026-11-19)
+
+- **Bug.** `Core::promise_after_event` asked `journal_len() == 0` after every core event while `flush_pending` stood (set at an epoch close, kept
+  until the journal is empty). `journal_len` walks every unshipped row, so with about 640 K rows queued after a long S3 cut each step cost 70 ms to
+  1.5 s, the core thread saturated, client submits queued by the thousands and the FUSE mount froze for 30 s and more (`stress-ng-fs-faults`:
+  "stalled past 30s", or the 240 s hang). The cost had been there since plan 30 M10.
+- **Fix.** `MetaStore::journal_is_empty` (and the `Replica` forward): one seek via `journal::is_empty`, as the ship ack already does. It replaces
+  every emptiness test written with `journal_len`: `promise.rs` (the flush wait), `holder.rs` (the epoch handoff's decline), `snapacct`'s
+  `settle_mark` and `fsck`'s rebuild comparison. Each keeps its meaning on error. Counts that are reported keep `journal_len`.
+- **Test.** `an_epoch_flush_wait_does_not_walk_the_journal_on_every_step` (core tests): 5,000 unshipped rows, the epoch closed with the flush
+  pending, 20 steps that ship nothing walk at most 2 rows each, and an emptied journal ends the wait. Before the fix it failed in debug and release
+  with 100,040 rows walked in 20 steps. The row counter (`journal_rows_walked_for_tests`) is now available to other crates under `test-util`.
+- **The other "any left?" callers take it too** (each keeps its meaning on error): `core/client.rs` (three sites: `journal_len() > 0 &&
+  journal_has_undelegated()` per client op, the hot path), `core/jobs.rs` (`round_release`, the ship-ready check, and the productive-round test
+  after each round) and `engine/authority_driver.rs` (the FUSE fast path before a release CAS). Callers that report or compare a count keep
+  `journal_len`: `core/jobs.rs` 642 and 2190 (logged counts) and the handoff decline (the undrained count in its log), `engine/node.rs` (the
+  handoff, unshipped-summary and drain logs, and the drain watchdog's progress tuple), `engine/snapshot.rs`, `engine/lifecycle.rs`, `control/service.rs`
+  and `cli/handoff_socket.rs` (status displays).
+- **Open items (not fixed here).**
+  - The epoch closes only after a complete dirty-upload pass (65-95 s in the run), and the driver's `biased` select drains the internal channel
+    before `sync_rx`, so the client lane starves while core steps are slow. A fairness budget for `sync_rx` and a shorter epoch need a design.
+  - A separate `close` EIO appears in dnotify (inotify) under heavy CPU load in `stress-ng-fs-faults`, with this fix in. It needs its own diagnosis.

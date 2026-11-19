@@ -426,10 +426,8 @@ impl LeaseState {
     }
 
     /// `LeaseKeeper::idle_release_due`.
-    pub fn idle_release_due(&self, now: Now, cfg: &Config, backlog: u64, held_back: u64) -> bool {
-        backlog == 0
-            && !(cfg.keep_lease_while_held && held_back > 0)
-            && self.wants_handoff(now, cfg)
+    pub fn idle_release_due(&self, now: Now, cfg: &Config, drained: bool, held_back: u64) -> bool {
+        drained && !(cfg.keep_lease_while_held && held_back > 0) && self.wants_handoff(now, cfg)
     }
 
     /// Plan 30 §M9: whether the permit lets this node claim `prev` now.
@@ -1996,8 +1994,11 @@ mod tests {
         st.touch(t0.plus(800));
         assert!(!st.wants_handoff(t0.plus(1_500), &cfg), "written just now");
         assert!(st.wants_handoff(t0.plus(1_900), &cfg), "idle for the dwell");
-        assert!(!st.idle_release_due(t0.plus(1_900), &cfg, 1, 0), "backlog");
-        assert!(st.idle_release_due(t0.plus(1_900), &cfg, 0, 0));
+        assert!(
+            !st.idle_release_due(t0.plus(1_900), &cfg, false, 0),
+            "backlog"
+        );
+        assert!(st.idle_release_due(t0.plus(1_900), &cfg, true, 0));
         st.release_when_idle = false;
         assert!(
             !st.wants_handoff(t0.plus(9_000), &cfg),
@@ -2066,10 +2067,13 @@ mod tests {
             st.wants_handoff(t0.plus(2_700), &cfg),
             "grace still elapsed"
         );
-        assert!(!st.idle_release_due(t0.plus(2_700), &cfg, 3, 0), "backlog");
-        assert!(st.idle_release_due(t0.plus(2_700), &cfg, 0, 0));
         assert!(
-            !st.idle_release_due(t0.plus(2_700), &cfg, 0, 1),
+            !st.idle_release_due(t0.plus(2_700), &cfg, false, 0),
+            "backlog"
+        );
+        assert!(st.idle_release_due(t0.plus(2_700), &cfg, true, 0));
+        assert!(
+            !st.idle_release_due(t0.plus(2_700), &cfg, true, 1),
             "M4 held records keep it"
         );
     }

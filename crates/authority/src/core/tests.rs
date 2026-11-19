@@ -31513,6 +31513,111 @@ mod locks {
         );
     }
 
+    /// `stress-ng-fs-faults`: after a long S3 cut the journal held hundreds
+    /// of thousands of unshipped rows, and every core step, whatever the
+    /// event, counted them all to learn whether the epoch's flush was done
+    /// (`promise_after_event`): 70 ms to 1.5 s a step, the core saturated,
+    /// the client lane starved and the FUSE mount frozen for 30 s and more.
+    /// While the flush waits, a step asks one seek, not the backlog; and the
+    /// wait still ends once the journal is empty.
+    #[test]
+    fn an_epoch_flush_wait_does_not_walk_the_journal_on_every_step() {
+        let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
+        for n in 0..5000 {
+            let op = h.create(&format!("bulk{n}"));
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        }
+        assert!(MetaStore::journal_len(&h.meta).unwrap() >= 5000);
+        h.advance(500);
+        // S3 is back: the epoch's round closes it. Everything but the
+        // journal's own uploads is answered, so nothing ships.
+        let mut out = Vec::new();
+        if let Some(id) = h.core.poll_timer {
+            out.extend(h.step(Event::Timer { id }));
+        }
+        for _ in 0..200 {
+            if h.core.pr.flush_pending || out.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for action in std::mem::take(&mut out) {
+                match action {
+                    Action::UploadDirtyChunks { op, .. } => {
+                        next.extend(h.step(Event::UploadsDone {
+                            op,
+                            result: UploadResult::Done { held: 0 },
+                        }));
+                    }
+                    Action::S3 { op, req } => {
+                        let result = match req {
+                            S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((object.clone(), tag())))),
+                            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                            _ => continue,
+                        };
+                        next.extend(h.step(Event::S3 { op, result }));
+                    }
+                    Action::SetTimer {
+                        id,
+                        kind: TimerKind::Poll,
+                        ..
+                    } => next.extend(h.step(Event::Timer { id })),
+                    _ => {}
+                }
+            }
+            h.advance(20);
+            out = next;
+        }
+        assert!(
+            h.core.pr.flush_pending,
+            "the epoch closed and waits for its journal to ship"
+        );
+        assert!(MetaStore::journal_len(&h.meta).unwrap() >= 5000);
+
+        // Steps that ship nothing.
+        const STEPS: u64 = 20;
+        constellation_meta::reset_journal_rows_walked_for_tests();
+        for n in 0..STEPS {
+            h.advance(1);
+            h.step(Event::Control {
+                op: OpId(900 + n),
+                req: Control::Lock {
+                    ino: 1,
+                    mode: X,
+                    blocking: false,
+                    waited_ms: 0,
+                },
+            });
+        }
+        let walked = constellation_meta::journal_rows_walked_for_tests();
+        assert!(
+            h.core.pr.flush_pending,
+            "nothing shipped, so the flush still waits"
+        );
+        assert!(
+            walked <= 2 * STEPS,
+            "{walked} journal rows walked in {STEPS} steps: the flush check counts the backlog"
+        );
+
+        // The journal ships (here: is acknowledged whole): the next step
+        // sees it empty and ends the wait.
+        let head = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+        let upto = head.last().map(|(seq, _)| *seq).unwrap();
+        MetaStore::ack_journal(&h.meta, upto).unwrap();
+        assert_eq!(MetaStore::journal_len(&h.meta).unwrap(), 0);
+        h.advance(1);
+        h.step(Event::Control {
+            op: OpId(999),
+            req: Control::Lock {
+                ino: 1,
+                mode: X,
+                blocking: false,
+                waited_ms: 0,
+            },
+        });
+        assert!(!h.core.pr.flush_pending, "an empty journal ends the wait");
+    }
+
     /// `locks-blips-tight` seed 99102 (three nodes): the hold owner
     /// closed its epoch in a short S3 window and was cut again before its
     /// re-claim. No next epoch could form (the other members were still
