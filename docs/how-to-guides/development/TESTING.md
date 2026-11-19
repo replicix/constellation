@@ -4690,12 +4690,24 @@ recalls) fails the run in every configuration; with the cut it fires nowhere.
 The hazard configurations that reach it are `sticky-s4-idle`, `sticky-s4-leave`,
 `sticky-s4-suspend` (the holder suspended once its release has cut or is held) and
 `sticky-s4-merge` (four sticky subtrees of one stream released in turn while the
-reader is cut off), each also with `+unsettled`. With the control, `sticky-s4-suspend`
-fails 51 and `sticky-s4-merge` 33 of 2,000 seeds; with the cut, none under the strict
-tag, which counts held-release spans (the control) and cut spans per subtree (the fix).
-On the merge configuration the cut leaves no unsettled `EIO` at all on 19 of the 33
-control seeds (0.95 %, under the spec's 1 % bar): the others are the requester's own
-isolation, as on the control arm. The two pins
+reader is cut off), each also with `+unsettled`. The strict tag is one predicate on both arms (round 6): a held-release span (the control)
+or a cut span per subtree (the fix) overlapped the `EIO`'s window and the requester,
+judged against the root alone from the span's start (`Question::new`), was not `allowed`;
+the one named excuse, a cut row the holder could not ship, is counted apart on the
+`SWEEP-S4` line. With the control, `sticky-s4-suspend` fails 51 of 2,000 seeds (2.55 %,
+50 of the 51 clean on the fix) and `sticky-s4-merge` 25 (33 by the older count of any
+`EIO` under a held span; about 0.55 % by like class, under the 1 % bar; 14 of the 25 have
+no unsettled `EIO` at all on the fix). On the fix the suspend label is 0 and the merge
+label fires on 2 seeds (841 and 1725, the latter the same `EIO` as the control's): the
+`EIO`s left are of the classes listed in ADR-64's evidence (a requester with no usable
+root, a lease claim, a generation outwait, a root reboot), not all "the requester's
+isolation". Two negative controls on the fix arm must make the tag fire:
+`AUTHORITY_SIM_CUT_ROW_WITHHELD=1` (the cut row kept off the stream until the reads
+clear) and `AUTHORITY_SIM_ROOT_IGNORES_CUT=1` (the root ignores the cut mark); they fail
+`sticky-s4-suspend` 51 and `sticky-s4-merge` 16 and 15 of 2,000 seeds, and are pinned on
+seeds 3 and 8 (`the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_*`).
+`AUTHORITY_SIM_S4_EIO=1` prints every unsettled `EIO` of a sweep with its rid, verdict and
+span (to be kept with the failing-seed logs). The two pins
 `s4_suspend_settle_answered_at_the_cut` and
 `s4_merge_first_release_settle_answered_at_the_cut` fail with the control and pass
 without it, and a run also fails if the store fence refused an execution under a cut

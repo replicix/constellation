@@ -6391,23 +6391,41 @@ executed, so the cut is a row.
   the S4 tag stays strict for it: an unsettled `EIO` that rests on a stream
   whose release waited on read recalls fails the run. A durable rowless cut is
   built only if a sweep shows one. So S4 is closed by construction for the
-  releases that write a row, and open, counted and under a strict tag for the
-  rest.
+  releases that write a row (the evidence of round 6 below: the suspend control
+  carries it, the merge control fires on 2 of 2,000 seeds), and open, counted
+  and under a strict tag for the rest.
 - **The knob.** `Config::release_cut` (default on; the sim's control
   `AUTHORITY_SIM_NO_RELEASE_CUT=1`) false restores the held release.
 - **ADR-48 / D11.** D11 no longer carries S4. It stays for the parked settle's
   `Held` outwait.
 
-**Evidence**: the hazard configurations `sticky-s4-suspend` (a suspend of the
-holder once its release has cut or is held) and `sticky-s4-merge` (four sticky
-subtrees of one stream released in turn while the reader is cut off) fail the
-strict S4 tag with the control, 51 and 33 of 2,000 seeds, and 0 of 2,000 with
-the cut (the tag counts held spans on the control and cut spans per subtree on
-the fix, and the oracle hands a cut subtree to the root from the cut row). The
-merge cure by the stricter count of seeds left with no unsettled `EIO` at all is
-19 of 2,000 (0.95 %, under the 1 % bar): the rest are the requester's isolation. 211 configurations compared against the base ran 2,000 seeds each
-with no new failure class. 17 rowless held releases were seen, with the tag at
-0.
+**Evidence** (round 6, the tag rebuilt; 2,000 seeds per label on the final tree). The strict S4 tag is one predicate on both
+arms: a held-release span (the control) or a cut span per subtree (the fix) overlapped the `EIO`'s window, and the requester,
+judged against the root alone from the span's start (`Question::new`: the keys are the root's all along), was not `allowed`.
+It does not use the oracle's owner timeline, so a cut row that never reached the root cannot hide behind a delegate owner. The
+one excuse is named and counted (`cut row unshippable`: the holder itself had no usable root from the span's start to the
+`EIO`); it excused nothing that would have fired. The control carries it: `sticky-s4-suspend` fails 51 of 2,000 seeds (2.55 %),
+all 51 scored by the predicate, and 50 of the 51 are clean on the fix (the 51st, seed 304, is the known "itself" class);
+`sticky-s4-merge` fails 25 seeds by the predicate (33 by the round-5 count of any `EIO` under a held span; the 8 others, seeds
+78, 540, 571, 849, 1043, 1230, 1525 and 1898, are `EIO`s of a requester with no usable root) and is about 0.55 % by like class
+(11 of the 16 delegate-owner or reachable seeds are clean on the fix), under the spec's 1 % bar; it was not re-shaped. By the
+stricter count of seeds left with no unsettled `EIO` at all, 14 of the 25 are clean (0.70 %). The tag fires on the fix arm with
+either negative control (`Config::cut_row_withheld`, the cut row kept off the stream until the reads clear; and
+`Config::root_ignores_cut`): `sticky-s4-suspend` 51 of 2,000 seeds each, `sticky-s4-merge` 16 and 15. **S4 is closed for the
+suspend control and open for the merge control**: on the fix, `sticky-s4-suspend` is 0 of 2,000, `sticky-s4-merge` fires on 2
+of 2,000 seeds (841 and 1725, plain and `+unsettled`). Seed 1725 is the same `EIO` on both arms (rid node 3 seq 58, 20,720 ms:
+the root rebooted over 17.2 to 19.5 s and the holder's `d5` cut was journaled at 17.7 s, so the cut row could not reach the root
+before it returned); the cut changes nothing there. Seed 841 is a lease-claim-class `EIO` (the claim finishes at 18,139 ms, the
+`EIO` is told at 19,236 ms) that only the fix has. What the other `EIO`s left on the fix under a cut span or on a control seed
+are, by class (not "the requester's isolation" as a whole): requester with no usable root, claim of the lease or a root run
+under one ask cycle (108, 246, 748, 891, 956, 1186, 1198, 1429, 1970); generation outwait (807, 1977; not under a cut span in
+1977); designation-held `EIO`s with the requester isolated or the root down, identical on both arms and under no cut span on
+the fix (23, 633, 774, 842, 1438, 1810, and 1043, 1230, 1898 under a span with no usable root); isolated (197, 432, 475);
+and the control's own I4 (287, 1537), which are not S4. Seeds 1044, 1183 and 1612 of `sticky-s4-suspend` are generation
+outwaits of the takeover generation near 27 to 31 s, under no cut span, and the control has none in them (a schedule shift).
+`delegated-strict` (2,777 cut spans in 1,465 seeds, 17 rowless held releases, `cut_rowless_after` 0), `sticky-leave` and
+`sticky-holder-restarts-placed` ran 2,000 seeds each on the final tree with no failure. The 211 configurations compared against
+the base in round 5 ran 2,000 seeds each with no new failure class (the other labels of the 300-seed set stay at 300).
 
 **Rejected**: the message form (`DelegCut`, unordered with the rows); bounding
 the hold (D11', releases merge without bound); un-merging held notes (the
