@@ -6348,6 +6348,27 @@ executed, so the cut is a row.
   stopped holder, and its own client's settle is answered the same way. A
   settle parked on the generation's recall is woken by the cut row, from a
   stream batch or from a segment a successor root applies.
+- **R5b, the requester wakes at the cut (round 7).** A requester's own settle
+  that waits out a retry (a backoff, or a forward to the stopped holder) is
+  routed again at once when it applies a segment carrying a `ReleaseCut` row
+  over its keys (`Core::settles_cut_seen`, from the foreign-segment apply,
+  beside the successor root's `root_cut_seen`). R5 changed only where the next
+  retry went, not when: the retry came a backoff later, after the root's idle
+  release and the successor's takeover had closed the window the cut opened.
+  A settle is the rid's own question, answered by dedup, so asking early is
+  what its retries do anyway. Counted `settles_woken_at_cut`.
+- **The stream's round follows the root's link (round 7).** A delegate starts
+  a new stream round (clearing the batch in flight, the back-off its failed
+  batches raised, and the root's old acknowledgements, and streaming from the
+  log cursor) when the root's node changes, as before, and now also when the
+  link to the same root comes back up after a spell down
+  (`Core::deleg_on_peers`, from `Event::Peers`). A root that reboots as the
+  same node, with the same lease holder, was no new root to the sync, and the
+  back-off the outage raised (up to 2 s) carried past its return: a cut row
+  sent while it was away waited it out. The link is the signal the code has
+  for "seen back": the lease epoch of a takeover of its own lease is not
+  distinct, and the takeover marker arrives only after the root is serving.
+  Rows are deduplicated by cursor and rid at the root, as after a failover.
 - **The release row after the reads.** When the recalls are clear the holder
   journals the release row (`SubtreeReleased` or `StreamReleased`), which
   carries the note. Executions on the cut subtrees wait for it, as before.
@@ -6426,6 +6447,13 @@ outwaits of the takeover generation near 27 to 31 s, under no cut span, and the 
 `delegated-strict` (2,777 cut spans in 1,465 seeds, 17 rowless held releases, `cut_rowless_after` 0), `sticky-leave` and
 `sticky-holder-restarts-placed` ran 2,000 seeds each on the final tree with no failure. The 211 configurations compared against
 the base in round 5 ran 2,000 seeds each with no new failure class (the other labels of the 300-seed set stay at 300).
+
+**Evidence, round 7.** The two firing seeds of round 6 are closed by R5b and the stream round above: `sticky-s4-merge` is 0 of
+2,000 on the fix (the control 24, the two negative controls 16 and 14), `sticky-s4-suspend` 0 (control and controls 51). A new label,
+`sticky-s4-root-restart` (the merge configuration with the root rebooted for 2.3 s over `d5`'s release), fails 259 of 2,000 seeds on
+the control, 27 of 300 on the tree without the stream round, and 7 of 2,000 on the fix: the root is back at about 20 s and the
+requesters' 3 s windows end at 20.3 to 20.7 s, so a refused stream (the root's gate has not the table yet) and the refusal's
+back-off use the rest. Not excused; it is the root's boot against a fixed window.
 
 **Rejected**: the message form (`DelegCut`, unordered with the rows); bounding
 the hold (D11', releases merge without bound); un-merging held notes (the

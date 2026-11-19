@@ -4706,6 +4706,15 @@ isolation". Two negative controls on the fix arm must make the tag fire:
 clear) and `AUTHORITY_SIM_ROOT_IGNORES_CUT=1` (the root ignores the cut mark); they fail
 `sticky-s4-suspend` 51 and `sticky-s4-merge` 16 and 15 of 2,000 seeds, and are pinned on
 seeds 3 and 8 (`the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_*`).
+Round 7 added `sticky-s4-root-restart` (`sticky-s4-merge` with the root, node 1, rebooted
+for 2.3 s from 17.2 s, just before the release of `d5`): the delegate's cut row is sent
+while the root is away and its stream backs off, and the root returns as the same node.
+Its control (`AUTHORITY_SIM_NO_RELEASE_CUT=1`) shows the hazard, and the fix arm (the stream
+starts a new round when the root's link comes back, and a settle waiting out a retry is routed
+again when its cut row is applied) clears it; the pin is seed 8
+(`s4_root_restart_the_cut_row_reaches_the_returned_root_in_time`). Its core tests are
+`the_roots_link_coming_back_sends_the_unacknowledged_rows_at_once` and
+`a_settle_waiting_out_a_retry_is_routed_again_when_its_cut_row_is_applied`.
 `AUTHORITY_SIM_S4_EIO=1` prints every unsettled `EIO` of a sweep with its rid, verdict and
 span (to be kept with the failing-seed logs). The two pins
 `s4_suspend_settle_answered_at_the_cut` and

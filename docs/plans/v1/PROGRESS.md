@@ -71500,3 +71500,75 @@ against a 230 ms ask cycle, and the takeover-gate `EIO`), red on both arms.
 (1,774, debug and release) lib tests green; the model suite green (debug and release); the release sim suite 585 passed, 0
 failed. The sweeps ran on the tree one commit before the last (which only extends the `AUTHORITY_SIM_S4_EIO` print to EIOs
 without a span); the per-seed dumps ran on the final tree.
+
+## Plan 46 M1.3 step 15b: ReleaseCut round 7, two liveness fixes (2026-11-19)
+
+Rebased onto origin/main first (18 commits; the first one, the model's cut before the read recall, was already upstream and
+dropped; the only conflict was PROGRESS, both sides kept). Diagnosis: `diag841-1725.md` (an Opus review of round 6's two
+firing seeds). Both are liveness, in-doubt `EIO`s, no integrity involved; no oracle, tag, ceiling or excuse changed.
+
+**Fix 1725, the stream's round follows the root's link** (`Core::deleg_on_peers`, `DelegationState::root_link`/`root_back`). A
+delegate started a new stream round only when the root's node changed; a root that reboots as the same node, with the same
+lease holder, was no new root, so the back-off its outage raised on every failed batch (doubling to 2 s) carried past its
+return and the cut row waited it out. The signal chosen is the link to the root coming back up after a spell down
+(`Event::Peers`), which feeds the existing round change of the delegate's sync (batch in flight, back-off, old acknowledgements
+cleared, streaming from the log cursor, as for a failover). The lease holder and epoch of a root taking its own lease again do
+not change, and the takeover marker arrives only after the root already serves. Fail-before core test
+`the_roots_link_coming_back_sends_the_unacknowledged_rows_at_once` (fails on the parent: nothing sent when the link returns).
+New label `sticky-s4-root-restart` (`sticky-s4-merge` plus node 1 rebooted for 2.3 s from 17.2 s, just before `d5`'s
+release); pin seed 8 (`s4_root_restart_the_cut_row_reaches_the_returned_root_in_time`: the control arm fires the strict tag, the
+fix arm passes; fails on the tree without the fix) and seed 1725 of `sticky-s4-merge` (fix arm clean, control arm still
+fires; fails on the tree without the fix).
+
+**Fix 841, R5b** (`Core::settles_cut_seen`, from the foreign-segment apply beside `root_cut_seen`; `settles_woken_at_cut`). A
+settle of the requester's own waiting in a backoff, or on a forward to the stopped holder, whose keys are now at the cut is
+routed again at once when the segment with the cut row is applied. Fail-before core test
+`a_settle_waiting_out_a_retry_is_routed_again_when_its_cut_row_is_applied`. **Seed 841 no longer reproduces on the rebased
+tree even without the fix** (main's changes moved the schedule): its pin (`s4_merge_seed_841_...`) is a regression pin, not a
+fail-before; the fail-before evidence of R5b is the core test. Seed 1915 of the control arm still fires the tag (the
+lease-claim class, unchanged); the allowed seeds 540, 571, 849, 1043, 1230 and 1525 on the fix arm: 571 and 1230 keep their
+`allowed` claim-of-the-lease `EIO`, the others have no `EIO`; none tags.
+
+**Sweeps, 2,000 seeds each, fix arm unless marked** (logs in `logs7/`):
+
+| label | fix arm | control (`NO_RELEASE_CUT`) | `CUT_ROW_WITHHELD` | `ROOT_IGNORES_CUT` |
+|---|---|---|---|---|
+| `sticky-s4-merge` | 0 failing (tree without the fixes: 1725) | 24 | 16 | 14 |
+| `sticky-s4-merge+unsettled` | 287, 1537, 0 tagged | 26 (24 tagged) | 18 (16) | 16 (14) |
+| `sticky-s4-suspend` | 0 | 51 | 51 | 51 |
+| `sticky-s4-suspend+unsettled` | 55 known I4, 0 tagged | 109 (51 tagged) | 109 (51) | 105 (51) |
+| `sticky-s4-root-restart` | **7 tagged: 60, 375, 403, 646, 772, 980, 1321** | 259 (all tagged) | | |
+| `sticky-s4-root-restart+unsettled` | 7 tagged + 287 | 259 | | |
+| `delegated-strict`, `sticky-leave`, `sticky-holder-restarts-placed` | 0, 0, 0 | | | |
+
+On a 300-seed run of `sticky-s4-root-restart` the tree without the round-7 fixes fails 27 seeds (all tagged), the fix 1 (60); at
+2,000 the fix leaves 7 (0.35 %), the control 259 (13 %). `sticky-s4-merge+unsettled` 287 and 1537 are the round-6 open item (3),
+red on both arms, not tagged. `sticky-s4-suspend+unsettled`: the same classes as round 6 (the "itself" class and
+`unacked_fails_never_lands_late`; 54 then, 55 now: 304, 325, 583, 608 out, 615, 816, 956, 1227, 1936 in), 0 tagged.
+
+**Open: the 7 root-restart seeds.** The root is back at about 19.95 s and answers nothing before its restart quarantine and its
+takeover gate are done; the settles that began at the restart end their 3 s window at 20.3 to 20.7 s. In 403 the fix re-sends the
+cut row at 20,000 ms (the link back), the root refuses it at 20,025 (gate not yet holding the table), inherits the generation at
+20,135, and the delegate's refusal back-off (four stream ticks, plan 41 seed 1390) sends the next batch at 20,243; the cut row is
+committed at 20,322 and the requester's `Held` retry (200 ms) lands past its window at 20,449. 60 and 772 are the same chain.
+That is the root's boot against a fixed window, not a delay of the cut row; the oracle's root run (the requester reaches a root
+for at least the 230 ms floor) is not excused and the tag was not touched. A shorter first refusal back-off, or the root pushing
+an acknowledgement to a delegate when it inherits the generation, would shorten it; neither is in this round (the first changes
+every refusal's timing, the second is a protocol addition).
+
+**Open, a latent session-guarantee failure that the round's schedule change exposes.** `regression_a_root_appending_over_its_own_shadow_keeps_the_log_prefix`
+(seed 13 of `delegated-backup+links-local+stalebase`) now fails with `read_your_writes` (a node reads `d1/f3` absent after its
+own `Exchange("d1/f1","d1/f3")`), and `long_delegated_settle_is_not_bounced_to_a_silent_inherited_delegate` (4863) no longer
+reaches its path (`settles_not_redirected_unheard` is 0). Both come from the link-round change alone (a build with only R5b
+passes both; one with only the link round fails both). The `read_your_writes` shape is not new: `delegated-backup+links-local+stalebase`
+seed 464 fails with the same message on origin/main (fresh build, 600 seeds) and on the rebased tree without the round-7
+fixes, and seed 13 passes on both only by schedule. Not fixed here (stop rule: a session-guarantee failure of a variant that
+deliberately installs replies on a base the requester lacks); the pin of 4863 needs a new seed. Both tests are red in the release
+sim suite (592 passed, 2 failed).
+
+**Equivalence.** All 203 labels of the 300-seed set: origin/main and this tree (fresh per-tree builds) have identical failing-seed
+sets (916 failing seeds on each side, 0 label differs).
+
+**Gates** (tree of the code commit): fmt and clippy `-D warnings` clean; lib tests meta (494 debug, 493 release, also with
+`test-util`) and authority (1,802, debug and release) green; the model suite green (debug and release); the release sim suite 592
+passed, 2 failed (the two above).
