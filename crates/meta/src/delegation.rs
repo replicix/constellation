@@ -989,14 +989,13 @@ impl Meta {
     /// the tombstones that unlinked names left below it are not stepped
     /// over. The scan stops at the `limit`th name, and a `String` is made
     /// only for the names returned.
-    pub fn names_of_ino(&self, ino: Ino, limit: usize) -> Vec<(Ino, String)> {
-        self.names_prefix(ino, limit).names
-    }
-
-    /// [`Self::names_of_ino`] with its `complete` flag: set when the names
-    /// are all of them (the row's `ONE` flag, or the range ended before the
-    /// `limit`th name).
-    pub(crate) fn names_prefix(&self, ino: Ino, limit: usize) -> crate::replay::NamePrefix {
+    ///
+    /// `complete` says the names are all of them: the row's `ONE` flag, or
+    /// the range ended before the `limit`th name (an inode whose row is not
+    /// `ONE` with exactly `limit` names left reads incomplete: the names
+    /// that remain after a removed one are only known to be all by one more
+    /// read).
+    pub fn names_of_ino(&self, ino: Ino, limit: usize) -> crate::replay::NamePrefix {
         use crate::replay::NamePrefix;
         if limit == 0 || ino == ROOT_INO || !self.delegations_any() {
             return NamePrefix {

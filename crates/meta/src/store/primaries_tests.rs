@@ -98,7 +98,7 @@ fn verify(meta: &Meta, files: &[u64]) -> Result<(), TestCaseError> {
     for &f in files {
         let want = scan(meta, f);
         for k in [1usize, 2, 3, usize::MAX] {
-            let got = meta.names_prefix(f, k);
+            let got = meta.names_of_ino(f, k);
             prop_assert_eq!(
                 &got.names[..],
                 &want[..k.min(want.len())],
@@ -460,8 +460,8 @@ fn a_primary_row_follows_the_stress_ng_unlink_order() {
     let row = row_of(&meta);
     assert!(!row.is_one(), "the row never sets ONE again");
     assert_eq!(row.name(), b"sng-1-0-18446744073709551615");
-    assert!(!meta.names_prefix(f, 1).complete);
-    assert!(meta.names_prefix(f, 2).complete);
+    assert!(!meta.names_of_ino(f, 1).complete);
+    assert!(meta.names_of_ino(f, 2).complete);
     meta.check_primary_index().unwrap();
 }
 
@@ -522,7 +522,7 @@ fn a_rolled_back_unlink_of_the_primary_restores_its_row() {
     meta.strand_recalled_speculation(GEN).unwrap();
     assert_eq!(dump(&meta.primaries, &meta), before);
     meta.check_primary_index().unwrap();
-    assert_eq!(meta.names_prefix(f, 1).names, vec![(dir, "a".to_string())]);
+    assert_eq!(meta.names_of_ino(f, 1).names, vec![(dir, "a".to_string())]);
 }
 
 #[test]
@@ -609,7 +609,7 @@ fn a_single_name_inode_has_a_one_row_and_a_complete_read() {
         .unwrap()
         .unwrap();
     assert!(row.is_one());
-    let got = meta.names_prefix(f, 1);
+    let got = meta.names_of_ino(f, 1);
     assert_eq!(got.names, vec![(dir, "x".to_string())]);
     assert!(got.complete);
 }

@@ -337,24 +337,25 @@ impl TouchSet {
     /// delegation first.
     ///
     /// `names(ino, limit)` lists the first `limit` names of `ino` in key
-    /// order (fewer than `limit` means all of them), or nothing when there
-    /// is no table to consult (`Meta::names_of_ino`). A name the op adds to
-    /// the inode needs no hold here: its dentry is held already.
+    /// order, or nothing when there is no table to consult
+    /// (`Meta::names_of_ino`): a [`NamePrefix`], whose `complete` says the
+    /// names are all of them (the contract is on the type). A name the op
+    /// adds to the inode needs no hold here: its dentry is held already.
     ///
-    /// Only a prefix of the names is read: one name when the name that
-    /// leaves is not the primary one, two reads when it is (an unlink of a
-    /// name of an inode with 8,192 names does not read 8,192). Per inode,
-    /// the moves are replayed against `limit` = 1 names, and again against
-    /// twice as many (from a fresh `names` call, so every attempt sees one
-    /// snapshot) until the outcome is decided. One, not two: a first limit
-    /// of two reads the second live name, and in a link order like the
-    /// stress tools' (the primary stays, the others go in key order) the
-    /// second live name is the one leaving, behind a tombstone for every
-    /// name unlinked before it, so every op steps over all of them and the
-    /// unlinks of n names cost O(n^2) (measured: 25 to 48 s against 0.7 to
-    /// 1.9 s for 8,192 names). The price of one: an inode with a single
-    /// name is not seen complete by its one name, so its unlink or rename
-    /// reads twice (one name, then two), both reads short.
+    /// Only a prefix of the names is read: one name for an inode that has
+    /// one name and for a name that leaves without being the primary one,
+    /// two names when the primary leaves (an unlink of a name of an inode
+    /// with 8,192 names does not read 8,192). Per inode, the moves are
+    /// replayed against `limit` = 1 names, and again against twice as many
+    /// (from a fresh `names` call, so every attempt sees one snapshot)
+    /// until the outcome is decided. The store answers each read from the
+    /// inode's primary row (`store::primaries`): a point get, then one seek
+    /// at the primary name, whatever tombstones the names unlinked before
+    /// left; its `complete` for a single-name inode comes from the row's
+    /// `ONE` flag, so that inode's unlink or rename reads one name, not two.
+    /// The first limit is one and not two because a limit of two reads the
+    /// second live name, which in a link order like the stress tools' (the
+    /// primary stays, the others go in key order) is the name leaving.
     ///
     /// Why that is exact. The fetched names are a prefix of the snapshot's
     /// names in key order, which is `(u64, String)`'s `Ord` (the `RDentry`
@@ -371,7 +372,7 @@ impl TouchSet {
     pub fn from_op_in_names(
         op: &crate::mutate::MutateOp,
         lookup: &dyn Fn(u64, &str) -> Option<u64>,
-        names: &dyn Fn(u64, usize) -> Vec<(u64, String)>,
+        names: &dyn Fn(u64, usize) -> NamePrefix,
     ) -> Self {
         let (mut set, moves) = Self::name_moves(op, lookup);
         // The moves of one inode, in the op's order. The inodes are
@@ -545,7 +546,7 @@ impl TouchSet {
     fn from_op_in_names_reference(
         op: &crate::mutate::MutateOp,
         lookup: &dyn Fn(u64, &str) -> Option<u64>,
-        names: &dyn Fn(u64, usize) -> Vec<(u64, String)>,
+        names: &dyn Fn(u64, usize) -> NamePrefix,
     ) -> Self {
         let (mut set, moves) = Self::name_moves(op, lookup);
         // One after another, as the op applies them: a `Records` op that
@@ -558,7 +559,7 @@ impl TouchSet {
             std::collections::HashMap::new();
         for (ino, gone, arrives) in moves {
             let (orig, now) = seen.entry(ino).or_insert_with(|| {
-                let before = names(ino, usize::MAX);
+                let before = names(ino, usize::MAX).names;
                 (before.clone(), before)
             });
             let primary = now.first().cloned();
@@ -591,9 +592,10 @@ type NameMove = ((u64, String), Option<(u64, String)>);
 /// An inode, with one [`NameMove`].
 type Move = (u64, (u64, String), Option<(u64, String)>);
 
-/// The first `limit` of the names asked for: one, so that the scan ends at
-/// the primary name and never reaches the tombstones that unlinked names
-/// leave after it (`TouchSet::from_op_in_names`; the meta test
+/// The first `limit` of the names asked for: one, so that the read ends at
+/// the primary name and never reaches the second live name, behind the
+/// tombstones that the names unlinked before it left
+/// (`TouchSet::from_op_in_names`; the meta test
 /// `the_unlinks_of_a_link_order_do_not_scan_more_tombstones_each` pins it).
 const FIRST_NAMES_LIMIT: usize = 1;
 
@@ -627,10 +629,15 @@ impl Drop for NamesCrossCheck {
 fn replay_name_moves(
     moves: &[NameMove],
     limit: usize,
-    fetched: Vec<(u64, String)>,
+    fetched: NamePrefix,
 ) -> Option<Vec<(u64, String)>> {
-    debug_assert!(fetched.is_sorted(), "names come in key order");
-    let complete = fetched.len() < limit;
+    debug_assert!(fetched.names.is_sorted(), "names come in key order");
+    debug_assert!(
+        fetched.complete || fetched.names.len() == limit,
+        "a prefix that is not complete has `limit` names"
+    );
+    let complete = fetched.complete;
+    let fetched = fetched.names;
     // A name the moves so far removed (`false`) or added (`true`).
     let mut overlay: BTreeMap<(u64, String), bool> = BTreeMap::new();
     let survivor = |overlay: &BTreeMap<(u64, String), bool>| {
@@ -2179,7 +2186,7 @@ mod tests {
     #[test]
     fn removing_the_primary_name_of_a_linked_inode_holds_the_next_name() {
         use crate::mutate::MutateOp;
-        use crate::replay::TouchSet;
+        use crate::replay::{NamePrefix, TouchSet};
         // Inode 10 is named (2, "a") (primary), (5, "b") and (9, "c");
         // inode 11 has one name, (2, "s"). Directory 3 holds 12 at (3, "t").
         let lookup = |p: u64, n: &str| match (p, n) {
@@ -2198,7 +2205,7 @@ mod tests {
             12 => vec![(3, "t".to_string())],
             _ => Vec::new(),
         };
-        let names = |i: u64, limit: usize| full(i).into_iter().take(limit).collect::<Vec<_>>();
+        let names = |i: u64, limit: usize| NamePrefix::prefix_of(full(i), limit);
         let keys = |op: &MutateOp| TouchSet::from_op_in_names(op, &lookup, &names);
         let holds = |k: &TouchSet, p: u64, n: &str| {
             k.dentries.contains(&(p, n.to_string())) && k.shared.contains(&p)
@@ -2277,7 +2284,7 @@ mod tests {
     #[test]
     fn records_that_remove_two_names_of_an_inode_hold_the_third() {
         use crate::mutate::MutateOp;
-        use crate::replay::TouchSet;
+        use crate::replay::{NamePrefix, TouchSet};
         let lookup = |p: u64, n: &str| match (p, n) {
             (2, "a") | (5, "b") | (9, "c") => Some(10),
             _ => None,
@@ -2290,7 +2297,7 @@ mod tests {
             ],
             _ => Vec::new(),
         };
-        let names = |i: u64, limit: usize| full(i).into_iter().take(limit).collect::<Vec<_>>();
+        let names = |i: u64, limit: usize| NamePrefix::prefix_of(full(i), limit);
         let keys = |records: Vec<LogRecord>| {
             TouchSet::from_op_in_names(&MutateOp::Records { records }, &lookup, &names)
         };
@@ -2323,7 +2330,7 @@ mod tests {
     #[test]
     fn a_record_that_removes_a_name_an_earlier_one_moved_resolves_the_moved_inode() {
         use crate::mutate::MutateOp;
-        use crate::replay::TouchSet;
+        use crate::replay::{NamePrefix, TouchSet};
         let lookup = |p: u64, n: &str| match (p, n) {
             (2, "a") | (9, "c") => Some(10),
             (4, "b") => Some(20),
@@ -2334,7 +2341,7 @@ mod tests {
             20 => vec![(4, "b".to_string())],
             _ => Vec::new(),
         };
-        let names = |i: u64, limit: usize| full(i).into_iter().take(limit).collect::<Vec<_>>();
+        let names = |i: u64, limit: usize| NamePrefix::prefix_of(full(i), limit);
         let holds = |k: &TouchSet, p: u64, n: &str| {
             k.dentries.contains(&(p, n.to_string())) && k.shared.contains(&p)
         };
@@ -2364,12 +2371,13 @@ mod tests {
     /// ADR-42's cost: the names of an inode are read in key order only
     /// until the outcome is decided, whatever the inode's name count. A name
     /// that is not the primary one leaves after one read of one name; the
-    /// primary one after two reads (one name, then two). (Fails before: the
-    /// one-argument `names` listed all 8,192 at every call.)
+    /// primary one after at most two reads (one name, then two: 1 + 2 names).
+    /// (Fails before: the one-argument `names` listed all 8,192 at every
+    /// call.)
     #[test]
     fn an_unlink_of_a_name_that_is_not_the_primary_reads_one_name() {
         use crate::mutate::MutateOp;
-        use crate::replay::TouchSet;
+        use crate::replay::{NamePrefix, TouchSet};
         use std::cell::Cell;
         let all: Vec<(u64, String)> = (0..8_192).map(|i| (2, format!("n{i:05}"))).collect();
         let lookup = |p: u64, n: &str| (p == 2 && n.starts_with('n')).then_some(10);
@@ -2377,9 +2385,9 @@ mod tests {
         let names = |i: u64, limit: usize| {
             assert_eq!(i, 10);
             assert!(limit <= 2, "a read of {limit} names");
-            let got: Vec<_> = all.iter().take(limit).cloned().collect();
+            let got = NamePrefix::prefix_of(all.clone(), limit);
             reads.set(reads.get() + 1);
-            read.set(read.get() + got.len());
+            read.set(read.get() + got.names.len());
             got
         };
         let unlink = |name: &str| MutateOp::Unlink {
@@ -2392,29 +2400,29 @@ mod tests {
         reads.set(0);
         read.set(0);
         let k = TouchSet::from_op_in_names(&unlink("n00000"), &lookup, &names);
+        assert!(reads.get() <= 2 && read.get() <= 3, "(1 + 2) names at most");
         assert_eq!((reads.get(), read.get()), (2, 3), "reads of one, then two");
         assert!(k.dentries.contains(&(2, "n00001".to_string())), "{k:?}");
         assert!(k.shared.contains(&2));
     }
 
-    /// An unlink or a rename of a file that has one name reads twice, both
-    /// reads short: one name (which could be a prefix of more), then the
-    /// two asked for, of which one exists. The first limit is one and not
-    /// two for the sake of the tombstones, not of this case
-    /// (`the_unlinks_of_a_link_order_do_not_scan_more_tombstones_each`).
+    /// An unlink or a rename of a file that has one name reads one name: the
+    /// store's `complete` for a single-name inode comes from the row's `ONE`
+    /// flag, so that one name is all of them. (Fails with a first read that
+    /// cannot tell: the unlink then reads a second time.)
     #[test]
-    fn an_unlink_or_a_rename_of_a_single_name_file_reads_twice_both_short() {
+    fn an_unlink_or_a_rename_of_a_single_name_file_reads_one_name() {
         use crate::mutate::MutateOp;
-        use crate::replay::TouchSet;
+        use crate::replay::{NamePrefix, TouchSet};
         use std::cell::Cell;
         let lookup = |p: u64, n: &str| (p == 2 && n == "f").then_some(10);
         let (reads, read) = (Cell::new(0usize), Cell::new(0usize));
         let names = |i: u64, limit: usize| {
             assert_eq!(i, 10);
             assert!(limit <= 2, "a read of {limit} names");
-            let got: Vec<_> = [(2u64, "f".to_string())].into_iter().take(limit).collect();
+            let got = NamePrefix::prefix_of(vec![(2u64, "f".to_string())], limit);
             reads.set(reads.get() + 1);
-            read.set(read.get() + got.len());
+            read.set(read.get() + got.names.len());
             got
         };
         let unlink = MutateOp::Unlink {
@@ -2422,7 +2430,7 @@ mod tests {
             name: "f".into(),
         };
         let k = TouchSet::from_op_in_names(&unlink, &lookup, &names);
-        assert_eq!((reads.get(), read.get()), (2, 2), "unlink: {k:?}");
+        assert_eq!((reads.get(), read.get()), (1, 1), "unlink: {k:?}");
         reads.set(0);
         read.set(0);
         let rename = MutateOp::Rename {
@@ -2433,13 +2441,13 @@ mod tests {
             noreplace: false,
         };
         let k = TouchSet::from_op_in_names(&rename, &lookup, &names);
-        assert_eq!((reads.get(), read.get()), (2, 2), "rename: {k:?}");
+        assert_eq!((reads.get(), read.get()), (1, 1), "rename: {k:?}");
     }
 
     mod bounded_names {
         use crate::mutate::MutateOp;
         use crate::record::LogRecord;
-        use crate::replay::TouchSet;
+        use crate::replay::{NamePrefix, TouchSet};
         use proptest::prelude::*;
 
         const SLOTS: usize = 16;
@@ -2592,24 +2600,31 @@ mod tests {
             fn bounded_name_reads_give_the_keys_of_reading_every_name(
                 table in prop::collection::vec(prop::option::weighted(0.7, 0u64..3), SLOTS),
                 served in names_table(),
+                loose in prop::collection::vec(any::<bool>(), 1..16),
                 spec in spec(),
             ) {
                 let lookup = |p: u64, n: &str| {
                     (0..SLOTS).find(|s| slot(*s) == (p, n.to_string())).and_then(|s| table[s]).map(|i| 10 + i)
                 };
+                // How `complete` is reported, per call: tight (`n <= limit`) or
+                // loose (`n < limit`), the two ends of the contract.
+                let calls = std::cell::Cell::new(0usize);
                 let names = |i: u64, limit: usize| {
                     let from = match &served {
                         Names::Same => &table,
                         Names::Own(own) => own,
-                        Names::Empty => return Vec::new(),
+                        Names::Empty => return NamePrefix { names: Vec::new(), complete: true },
                     };
                     let mut all: Vec<(u64, String)> = (0..SLOTS)
                         .filter(|s| from[*s].map(|t| 10 + t) == Some(i))
                         .map(slot)
                         .collect();
                     all.sort();
+                    let n = all.len();
+                    let tight = loose[calls.get() % loose.len()];
+                    calls.set(calls.get() + 1);
                     all.truncate(limit);
-                    all
+                    NamePrefix { names: all, complete: if tight { n <= limit } else { n < limit } }
                 };
                 let op = op_of(&spec);
                 let bounded = TouchSet::from_op_in_names(&op, &lookup, &names);
@@ -2714,11 +2729,11 @@ mod tests {
                 )
                 .unwrap();
                 let expected: Vec<(u64, String)> = wanted.into_iter().collect();
-                let full = meta.names_of_ino(f, usize::MAX);
+                let full = meta.names_of_ino(f, usize::MAX).names;
                 prop_assert_eq!(&full, &expected);
                 prop_assert!(full.is_sorted());
                 for k in 0..=expected.len() + 1 {
-                    let got = meta.names_of_ino(f, k);
+                    let got = meta.names_of_ino(f, k).names;
                     prop_assert_eq!(&got[..], &expected[..k.min(expected.len())]);
                 }
             }
@@ -2782,13 +2797,13 @@ mod tests {
         .unwrap();
         assert!(meta.delegations_any());
         assert_eq!(
-            meta.names_of_ino(f, 1),
+            meta.names_of_ino(f, 1).names,
             vec![(p1, "a".to_string())],
             "the primary name alone"
         );
-        assert_eq!(meta.names_of_ino(f, 3).len(), 3);
-        assert_eq!(meta.names_of_ino(f, 0).len(), 0);
-        assert_eq!(meta.names_of_ino(f, usize::MAX).len(), 2_000);
+        assert_eq!(meta.names_of_ino(f, 3).names.len(), 3);
+        assert_eq!(meta.names_of_ino(f, 0).names.len(), 0);
+        assert_eq!(meta.names_of_ino(f, usize::MAX).names.len(), 2_000);
         let unlink = |parent: u64, name: &str| MutateOp::Unlink {
             parent,
             name: name.into(),
@@ -2880,8 +2895,8 @@ mod tests {
         let crossed = Cell::new(0usize);
         let names = |i: u64, limit: usize| {
             let got = meta.names_of_ino(i, limit);
-            if let Some((_, last)) = got.last() {
-                crossed.set(crossed.get() + rank[last] - (got.len() - 1));
+            if let Some((_, last)) = got.names.last() {
+                crossed.set(crossed.get() + rank[last] - (got.names.len() - 1));
             }
             got
         };

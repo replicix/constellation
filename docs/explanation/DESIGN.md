@@ -696,6 +696,13 @@ matter here:
   the same bytes and a `link`, `unlink` or attribute change costs the same
   at any number of names
   ([ADR-36](DECISIONS.md#adr-36-a-dentry-copies-its-inodes-attributes-only-while-the-inode-has-one-name)).
+- `primaries`: each inode's primary name (the lowest `0x04` key of `ns`),
+  with a flag for an inode that has exactly one name, so the first name of an
+  inode is a point get and a seek at that name, not a scan over the
+  tombstones that unlinked names left. Local derived state like
+  `xattr_by_name`, not published or journaled: it is maintained in the `ns`
+  funnel, in the transaction of the name write
+  ([ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)).
 - `journal` and `journal_tx`: the local operations not yet in the log,
   with one row per transaction (where it ends, its op and rid, its epoch).
 - `spec`, `spec_live`, `pending_replay`: the speculation log (below).

@@ -3101,17 +3101,19 @@ or is releasing is unchanged. A settle of the gated root's own plans no recall
   (`delegate_dir`'s read recalls then cover the file). It closes the same race
   for a usable root. Cost: only while a delegation exists, in `keys_of_op_in`
   and the FUSE fast paths, the inode's names are read in key order only until
-  the outcome is decided: one range seek and one live name when the name
-  leaving is not the primary one, two short reads when it is, and two short
-  reads for an inode that has only one name (the first review's text claimed
-  one `RDentry` range seek, which did not hold: the check listed every name of
-  the inode, O(links) per op). The first read is of one name, not two,
-  because of the tombstones: a delete leaves one at the name's key, a forward
-  scan steps over every one before the first live key, and in a link order
-  where the primary stays and the others go in key order (M1, stress-ng) the
-  second live name is the one leaving, behind a tombstone for every earlier
-  unlink, so a first limit of two makes the unlinks of n names O(n^2)
-  (8,192 links with a grant: 25 to 48 s against 0.7 to 1.9 s). The keys are
+  the outcome is decided. The first names of an inode are read through its
+  per-inode primary row (the `primaries` keyspace: the lowest `RDentry` key of
+  the inode, kept in the same transaction as every write of a name, with a
+  flag that says the inode has exactly that one name): one point get, then one
+  seek at the primary. One name is read unless the primary leaves (then two),
+  and a single-name inode is answered by the row alone. The cost does not
+  depend on how many names were unlinked before, which a scan from the start
+  of the inode's range did, because a delete leaves a tombstone at the name's
+  key that a forward scan steps over before the first live key (in a link
+  order where the primary stays and the others go in key order, M1 and
+  stress-ng, 8,192 links with a grant took 25 to 48 s against 0.7 to 1.9 s,
+  and the unlinks of the names that sort below the primary made every later
+  one pay for them too). The keys are
   unchanged (an implementation note, no decision change: `from_op_in_names`
   asks `names(ino, limit)` for a prefix, starting at one and doubling it
   until some fetched name survives the op's moves, and the
