@@ -14,19 +14,36 @@
 //! - its own re-read, issued again on a backoff
 //!   ([`crate::deadlines::release_reread_retry_ms`]);
 //! - a reachable peer's, asked for with [`PeerMsg::LeaseProbe`]. The peer
-//!   issues a new `LeaseGet` after the probe arrived, so the read is causally
-//!   after the failed CAS, as the node's own re-read is: no assumption
-//!   beyond the one 56085d00 already rests on.
+//!   issues a new `LeaseGet` after the probe arrived.
+//!
+//! A peer's read ends the wait only when it shows the node's own release
+//! landed, or another holder (or nothing): both are final, no late request of
+//! this node's can undo them (a landed release is landed; the tag a deposing
+//! read shows differs from the one the failed PUT carries). A peer's read that
+//! shows the lease standing decides nothing. It says nothing about this node's
+//! path to S3, and the failed PUT may still be in flight on it: it would still
+//! match the held tag and release the lease under a node that went on as its
+//! holder (or adopted an epoch hold on it). The node therefore stays fenced
+//! (`releasing`, no admits, no hold adopted) until a CAS of its own lands or
+//! the wait ends. The peer's answer informs only the waiting: forwards are
+//! answered `Held` and the node keeps looking.
+//!
+//! The node's own re-read does not end the wait by itself either, once the
+//! wait began: it succeeded after a backoff, and the failed PUT may still be on
+//! its way (a request orphaned in flight can land seconds after a later
+//! request of the same node was served). Seeing the lease standing, the node
+//! renews it with a CAS on the tag the read returned (`Phase::ReleaseRenew`).
+//! That write changes the object's version, so the failed PUT can never apply
+//! after it, and the fence is lifted only when it lands. A conflict reads
+//! again, no answer leaves the wait as it was.
 //!
 //! The decision table is the re-read's ([`Core::resolve_release_doubt`]).
-//! A peer cannot send a `LeaseTag`, so a lease a peer read shows standing
-//! keeps the (lease, tag) the node holds: a stale tag only makes the next
-//! CAS conflict and re-read.
 //!
 //! The wait is bounded by the held lease's honour end: past it the old
-//! give-up runs unchanged ([`Core::give_up_release_in_doubt`]). A shutdown
-//! flush gives up at once, as does a release that runs under an epoch hold.
-//! Forwards are answered `Held` meanwhile (`holder.rs`), never executed.
+//! give-up runs unchanged ([`Core::give_up_release_in_doubt`]), also when a
+//! read arrives late, after that end. A shutdown flush gives up at once, queued
+//! before the wait or after it, as does a release that runs under an epoch
+//! hold. Forwards are answered `Held` meanwhile (`holder.rs`), never executed.
 
 use super::jobs::JobKind;
 use super::{Core, S3For, Timer};
@@ -60,18 +77,14 @@ pub(crate) struct ReleaseUnresolved {
 pub(crate) enum DoubtRead {
     /// This node's own re-read, with the tag it returned.
     Own(Option<(Lease, LeaseTag)>),
-    /// A peer's read, requested at `sent` (this node's honour clock).
-    Peer {
-        object: Option<Lease>,
-        sent: HonourMs,
-    },
+    /// A peer's read.
+    Peer { object: Option<Lease> },
 }
 
 /// What the table decided.
 enum Decision {
     Landed,
-    KeptOwn(Lease, LeaseTag),
-    KeptByPeer(Lease, HonourMs),
+    KeptOwn(Box<Lease>, LeaseTag),
     Deposed(NodeId, Epoch),
     Inconclusive,
 }
@@ -149,11 +162,12 @@ impl Core {
     }
 
     /// Whether a release in doubt whose re-read failed may wait for a read:
-    /// not a shutdown (the process ends; the record on disk keeps a restart
-    /// conservative), not under an epoch hold, and with honour left on the
-    /// held lease.
+    /// not a shutdown, in the slot or queued behind it (the process ends; the
+    /// record on disk keeps a restart conservative), not under an epoch hold,
+    /// and with honour left on the held lease.
     fn may_wait_unresolved(&self, now: Now) -> bool {
         !self.job_is_stop_flush()
+            && !self.stop_flush_queued()
             && !self.lease.epoch_held()
             && self
                 .lease
@@ -321,9 +335,9 @@ impl Core {
             Some((node, _)) if *node == from => {}
             _ => return,
         }
-        let Some((_, sent)) = st.probes.remove(&req) else {
+        if st.probes.remove(&req).is_none() {
             return;
-        };
+        }
         let object = match read {
             ProbedLease::Failed => return,
             ProbedLease::Absent => None,
@@ -333,7 +347,7 @@ impl Core {
             self.end_release_unresolved(out);
             return;
         };
-        self.resolve_release_doubt(now, kind, DoubtRead::Peer { object, sent }, replica, out);
+        self.resolve_release_doubt(now, kind, DoubtRead::Peer { object }, replica, out);
     }
 
     /// A probe that could not be sent (or whose answer never came): the next
@@ -350,9 +364,9 @@ impl Core {
     /// | read | decision |
     /// |---|---|
     /// | this node, the held epoch, released | the release landed |
-    /// | this node, the held epoch, standing, own read | kept (`renewed`) |
-    /// | the same, a peer's read with the held expiry fields | kept; the held (lease, tag) stays |
-    /// | the same, a peer's read with other expiry fields | inconclusive |
+    /// | this node, the held epoch, standing, own read, no wait began | kept (`renewed`) |
+    /// | the same, after the wait began | a renewal CAS; kept when it lands ([`Core::on_release_renew`]) |
+    /// | the same, a peer's read | inconclusive: still fenced (`release_unresolved_kept_by_peer`) |
     /// | this node, an older epoch, a peer's read | inconclusive |
     /// | another holder, a later epoch, or no object | deposed |
     pub(crate) fn resolve_release_doubt(
@@ -386,23 +400,24 @@ impl Core {
                 Decision::Landed
             }
             DoubtRead::Own(Some((cur, tag))) if cur.holder == me && cur.epoch == mine.epoch => {
-                Decision::KeptOwn(cur, tag)
+                Decision::KeptOwn(Box::new(cur), tag)
             }
             DoubtRead::Own(Some((cur, _))) => Decision::Deposed(cur.holder, cur.epoch),
             DoubtRead::Own(None) => Decision::Deposed(0, 0),
             DoubtRead::Peer {
                 object: Some(cur), ..
             } if cur.holder == me && cur.epoch == mine.epoch && cur.released => Decision::Landed,
-            DoubtRead::Peer {
-                object: Some(cur),
-                sent,
-            } if cur.holder == me && cur.epoch == mine.epoch => {
+            // Standing, as a peer sees it: it says nothing of the failed PUT
+            // on this node's own path. Never lifts the fence.
+            DoubtRead::Peer { object: Some(cur) }
+                if cur.holder == me && cur.epoch == mine.epoch =>
+            {
                 if (cur.epoch, cur.expires_unix_ms, cur.holder_expires_ms) == held_key {
-                    Decision::KeptByPeer(cur, sent)
+                    self.stats.release_unresolved_kept_by_peer += 1;
                 } else {
                     self.stats.release_unresolved_inconclusive += 1;
-                    Decision::Inconclusive
                 }
+                Decision::Inconclusive
             }
             // An older read proves nothing (`root_probe::judge`).
             DoubtRead::Peer {
@@ -421,34 +436,113 @@ impl Core {
         }
         // Conclusive: whatever follows acts on a node that is no longer
         // waiting.
+        let was_waiting = self.release_unresolved.is_some();
+        // A read handled after the held lease's honour end proves nothing
+        // that is still usable: the wait's own give-up, as the timer's.
+        let honour_over = self
+            .lease
+            .honour_left_ms(now, &self.cfg)
+            .is_none_or(|left| left <= self.cfg.expiry_margin_ms as i64);
+        if was_waiting && honour_over && matches!(decision, Decision::KeptOwn(..)) {
+            tracing::warn!(
+                node = self.cfg.node_id,
+                ?waited_ms,
+                "a re-read showed the lease standing only after its honour ended; giving the lease up"
+            );
+            self.end_release_unresolved(out);
+            self.stats.release_unresolved_gave_up += 1;
+            self.give_up_release_in_doubt(now, &mine, replica, out);
+            self.release_job_tail(now, kind, replica, out);
+            return;
+        }
+        // The failed release PUT may still be in flight on this node's own
+        // path and would match the tag this read returned: a read that saw
+        // the lease standing does not end it. Only a CAS of this node's own
+        // that lands does (its new version kills the late PUT): the fence
+        // stays up until it does.
+        if was_waiting {
+            if let Decision::KeptOwn(cur, tag) = decision {
+                self.renew_in_doubt(now, *cur, tag, out);
+                return;
+            }
+        }
         self.end_release_unresolved(out);
         match decision {
             Decision::Landed => {
                 self.release_landed(now, kind, replica, out);
                 return;
             }
-            Decision::KeptOwn(cur, tag) => self.lease.renewed(now, cur, tag),
-            Decision::KeptByPeer(cur, sent) => {
-                self.stats.release_unresolved_kept_by_peer += 1;
-                tracing::info!(
-                    node = self.cfg.node_id,
-                    epoch = cur.epoch,
-                    ?waited_ms,
-                    "a peer's read shows the lease standing: the release did not happen"
-                );
-                // The held (lease, tag) is unchanged. The read proves the
-                // tenure live as of the probe's send, never its arrival.
-                self.lease.note_object(&cur);
-                if sent > self.ack.last_s3_fresh {
-                    self.ack.last_s3_fresh = sent;
-                }
-            }
+            Decision::KeptOwn(cur, tag) => self.lease.renewed(now, *cur, tag),
             Decision::Deposed(holder, epoch) => {
                 self.deposed(now, holder, epoch, mine.epoch, replica, out)
             }
             Decision::Inconclusive => return,
         }
         self.release_job_tail(now, kind, replica, out);
+    }
+
+    /// The node's own re-read shows the lease standing after the wait began:
+    /// renew it with a CAS on the returned tag. The fence stays up
+    /// (`Phase::ReleaseRenew`, `releasing`, the unresolved state) until the
+    /// renewal lands ([`Core::on_release_renew`]).
+    fn renew_in_doubt(&mut self, now: Now, cur: Lease, tag: LeaseTag, out: &mut Vec<Action>) {
+        let mut renewed = self.lease.renewed_lease(now, &self.cfg, &cur);
+        self.clear_covered_tail(&mut renewed);
+        self.stats.release_unresolved_renewals += 1;
+        let op = self.issue_s3(
+            S3Op::LeaseSwap {
+                lease: renewed.clone(),
+                tag,
+            },
+            S3For::Job,
+            out,
+        );
+        self.set_phase_release_renew(renewed, op);
+    }
+
+    /// The result of the renewal CAS of [`Core::renew_in_doubt`].
+    pub(super) fn on_release_renew(
+        &mut self,
+        now: Now,
+        kind: JobKind,
+        sent: Lease,
+        result: Result<LeaseTag, crate::event::CasFailure>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        use crate::event::CasFailure;
+        if self.lease.held.is_none() {
+            self.end_release_unresolved(out);
+            self.lease.releasing = false;
+            self.lease_gone_mid_job(now, kind, replica, out);
+            return;
+        }
+        match result {
+            Ok(tag) => {
+                // The object moved on by this node's own write: the release
+                // PUT that failed can never apply. The lease is kept.
+                self.end_release_unresolved(out);
+                self.lease.renewed(now, sent, tag);
+                self.release_job_tail(now, kind, replica, out);
+            }
+            Err(CasFailure::Conflict) => {
+                // The object is not what the re-read showed (the late PUT
+                // landed, or another write): read it again.
+                let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
+                self.set_release_reread_phase(Some(op));
+            }
+            Err(CasFailure::Failed(e)) => {
+                // No answer: the renewal may land too, and the fence stays.
+                // The timer looks again (a landed renewal shows as a lease
+                // standing with other expiry fields and is renewed again).
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    error = %e,
+                    "the renewal of a release in doubt failed without an answer"
+                );
+                self.set_release_reread_phase(None);
+            }
+        }
     }
 
     /// The release in doubt is given up: it may or may not have landed and

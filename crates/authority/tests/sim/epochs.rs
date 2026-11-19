@@ -497,8 +497,10 @@ pub enum S3Auth {
     /// nothing. Left out of the count, and counted in
     /// `Report::fenced_release_samples`.
     FencedRelease,
-    /// The release CAS is out yet the node still admits new mutations: the
-    /// fence the exclusion rests on is broken. A split brain on its own.
+    /// The release CAS is out yet the published view says the node admits new
+    /// mutations: a split brain on its own. A consistency check of the
+    /// published flags (on the real core the fence makes it unreachable), not
+    /// a judgement of what the node does.
     Breach,
 }
 

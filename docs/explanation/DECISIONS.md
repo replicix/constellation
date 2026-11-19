@@ -735,43 +735,70 @@ The rule: a re-read that fails too does not give the lease up. The node
 stays the named holder, `releasing` (every fence of a release in flight
 holds unchanged: nothing new is admitted, no grant or delegation is
 renewed, no epoch hold is adopted, an activation carrying the lease owes
-the move), and looks for the lease's state until a read resolves it. It
-re-reads its own on a backoff and asks every reachable peer to read the
-lease (`LeaseProbe`/`LeaseProbeReply`), and answers the forwards it is
-asked `Held`, never `Busy` or `NotHolder`, executing nothing. The first
-conclusive read decides, by the re-read's own table: the release landed
-(complete it), the lease stands with the expiry fields the release
-replaced (the release did not happen: `releasing` drops, the held lease
-and tag stay, and a lease an epoch carried is held through
-`epoch_hold_after_kept_release`), another holder, a later epoch or no
-object (deposed). Anything else (an older epoch, other expiry fields, a
-failed read) decides nothing.
+the move), and looks for the lease's state until it is known. It re-reads
+its own on a backoff and asks every reachable peer to read the lease
+(`LeaseProbe`/`LeaseProbeReply`), and answers the forwards it is asked
+`Held`, never `Busy` or `NotHolder`, executing nothing.
 
-The peer's standing: the probed peer issues a *new* lease read after the
-probe arrived, never answers from a body it has or a read in flight. That
-read is causally after the failed CAS, exactly as the node's own re-read
-is, so it resolves the doubt under the assumption 56085d00 already rests
-on (a CAS that failed without an answer does not land after a read that
-saw it had not): no new assumption. A peer cannot send a `LeaseTag`
-(objcas's field is private and the core is shared), so a kept lease keeps
-the tag the node holds; a stale tag only makes the next CAS conflict and
-re-read. The S3 liveness a peer's read proves is dated at the probe's
-send, never at the reply's arrival.
+What ends the wait (amended 2026-11-19, the maintainer's decision: the fence
+is safe):
+- The release landed (an own or a peer's read shows the lease released by
+  this node): complete it.
+- Another holder, a later epoch or no object (an own or a peer's read):
+  deposed. Final either way: the tag such a read shows differs from the one
+  the failed PUT carries, so nothing of this node's can undo it.
+- The node's own re-read shows the lease standing: the node renews the lease
+  with a CAS on the tag that read returned (`Phase::ReleaseRenew`) and the
+  fence is lifted, the held lease and its renewed tag kept, when that CAS
+  lands. The renewal moves the lease object, so a lease a continuation epoch
+  carried is no longer the one the node holds: no hold is adopted on it
+  (`epoch_hold_after_kept_release` matches the carried lease), the epoch closes
+  on the lease's move and the node goes on as the S3 holder. A conflict reads again; no answer leaves the wait as it was.
+- A peer's read that shows the lease standing decides nothing. It informs the
+  wait (the node keeps answering `Held` and looking) and never lifts the
+  fence or adopts the epoch hold.
+
+Why a read that shows the lease standing is not enough: the failed PUT is
+still a request in flight, not a request that was dropped. A send error can
+follow written bytes; a request orphaned by a closed connection can be
+delivered when the path heals, seconds after a later request of the same node
+was served, and S3 applies it if its precondition (the held tag) still holds.
+A peer's read says nothing about this node's path, and it is used exactly when
+the node's path is cut while the peers' is not. The simulation's
+`Fault::TimeoutThenApplied` (error now, applied later) shows it: with the
+peer's read lifting the fence (248abc82) seeds of `flex-tight-late-applied`
+end with an epoch hold on one node and a usable S3 lease on another (I1);
+with a lifted fence on the node's own read alone, 11 of 1,500 do. A CAS of the
+node's own changes the object's version, so the failed PUT can never apply
+after it. (The first re-read of a release in doubt, made at once after the
+failed CAS, keeps its older rule: its success resolves the doubt as ever. The
+renewal applies to the reads of the wait.)
 
 The bound: the wait ends at the first conclusive read, or when the held
 lease's honour runs out (`honour_left <= expiry_margin`), where the old
 give-up runs unchanged (the `given_up` mark, the owed move, `EROFS` if the
-epoch now refuses writes). A shutdown flush gives up at once, as does a
-release that runs under an epoch hold. The record is durable before the
-CAS and nothing is written during the wait, so a crash restarts on the
-conservative side. The retry interval is `deadlines::release_reread_retry_ms`.
+epoch now refuses writes). A read handled after that end (a late core, a late
+reply) does not count: it gives up too. A shutdown flush gives up at once,
+queued before the wait or after it, as does a release that runs under an epoch
+hold. The record is durable before the CAS and nothing is written during the
+wait, so a crash restarts on the conservative side. The retry interval is
+`deadlines::release_reread_retry_ms`.
 
-The cost: at most one lease TTL more latency (the node's slot, its
-handoff's answer and the `Held` answers last to the honour end instead of
-one failed read) in a whole-bucket outage that begins during a release.
-The seeds: 64, 391 and 1477 of `locks-unlinked-delegated-blips+unsettled`
-(`regression_a_release_in_doubt_is_resolved_by_a_peer_read`); seed 1045 is
-not on this path (its re-read succeeded and found the release landed).
+The cost, all of it latency, none of it bounded by more than one lease TTL
+(the honour end), and none of it a different kind of cost: a node whose
+release CAS is in doubt and whose own S3 path stays cut while a peer's does
+not (or whose peers all fail their reads, or which has no reachable peer, or
+whose CAS the driver refused locally because a write landed before it) waits
+up to the honour end instead of one failed read. While it waits the job slot
+is taken (operator flushes and the handoff's answer queue behind it), no
+backup reconfiguration starts (`lease_cas_in_flight`), the root's lease reads
+are not open (`releasing`), no lock grant is renewed under an unmarked
+release, and the forwards are answered `Held`. A peer's read that shows the
+lease standing no longer shortens the wait: the three seeds this amendment
+was made for (`locks-unlinked-delegated-blips+unsettled` 64, 391 and 1477, in
+the pin `regression_a_release_in_doubt_waits_and_asks_the_peers`) end through
+the node's own re-read and renewal. Seed 1045 is not on this path (its
+re-read succeeded and found the release landed).
 
 The probe's framing: `LeaseProbe` carries a bare payload on an
 unsigned stream, and its `requester` is bound to the connection's
@@ -790,9 +817,13 @@ may claim at once (this ADR, 670e57d3), and the releaser is fenced
 (`open_for_new_mutation` is false, the fast path refuses, forwards get
 `Busy`/`Held`, no delegation is renewed). Such a node is not counted
 (`Report::fenced_release_samples` counts the samples left out), and the
-exclusion rests on the fence being checked on every sample: a node with
-its CAS out whose view still admits new mutations is a split brain on its
-own. Paused nodes are not excluded. Flush and `PersistRelease`, before
+exclusion rests on the fence, and the sampler checks the published flags on
+every sample: a node with its CAS out whose published view still admits new
+mutations is called a split brain on its own. That check compares the node's
+published flags with each other (on the real core the release implies the
+fence, so it cannot fire; `plant_release_admits` only changes the published
+bit): it pins the plumbing, not the behaviour. That the fence holds is argued
+from the core (`fenced()`) and covered by the core tests. Paused nodes are not excluded. Flush and `PersistRelease`, before
 the CAS, still count. The false positive it removes: flex-tight seed 366,
 a paused releaser whose CAS had landed while a peer claimed and formed an
 epoch. No protocol rule changes. Testing: `docs/how-to-guides/development/TESTING.md`.

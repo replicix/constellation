@@ -175,8 +175,24 @@ fn s3_rules() -> Vec<(OpKind, &'static str, When, Fault)> {
             When::Nth(1),
             Fault::AppliedThenTimeout,
         ),
+        // The caller sees a timeout and the request lands 1.5 s later: a
+        // release CAS that failed without an answer and is applied after a
+        // later read saw it had not been (`LATE_APPLY_MS`).
+        (
+            OpKind::Put,
+            "leases/",
+            When::Random(0.15),
+            Fault::TimeoutThenApplied {
+                after_ms: LATE_APPLY_MS,
+            },
+        ),
     ]
 }
+
+/// How long after its caller's timeout a `Fault::TimeoutThenApplied` request
+/// reaches S3: long enough for a failed re-read, a probe round and a peer's
+/// read to come between.
+const LATE_APPLY_MS: u64 = 1_500;
 
 fn s3_rule_config(i: usize) -> SimConfig {
     let (op, pattern, when, fault) = s3_rules()[i];
@@ -515,6 +531,12 @@ fn replay_seed() {
         Ok("locks-unlinked-delegated-random") => locks_unlinked_random_config(false),
         Ok("locks-unlinked-delegated-dbackup-random") => locks_unlinked_random_config(true),
         Ok("locks-unlinked-delegated-blips") => locks_unlinked_blips_config(),
+        Ok("locks-unlinked-delegated-blips-late-applied") => {
+            late_release(locks_unlinked_blips_config())
+        }
+        Ok("locks-late-applied") => late_release(locks_config()),
+        Ok("flex-tight-late-applied") => late_release(flex_tight_config()),
+        Ok("locks-blips-tight-late-applied") => late_release(locks_blips_tight_config()),
         Ok("locks-unlinked-delegated-partition") => locks_unlinked_partition_config(),
         Ok("locks-root-own-unlinked-partition") => locks_root_own_unlinked_partition_config(true),
         Ok("locks-root-own-unlinked-partition-nocrash") => {
@@ -7235,19 +7257,22 @@ fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
 }
 
 /// `locks-unlinked-delegated-blips+unsettled` seeds 64, 391 and 1477: a
-/// release CAS went in doubt, its re-read failed in the same cut, and the node
-/// gave the lease up while the lease object still named it. The continuation
-/// epoch that formed in the cut carried a lease no node claimed, so it refused
-/// writes, and the peers' settles found no sequencer: 2, 1 and 1 unsettled
-/// `EIO` (the I4 count's isolated and no-sequencer classes). The node now stays
-/// the named holder, fenced, and a peer's fresh read of the lease resolves the
-/// doubt (`release_doubt.rs`); no `EIO` is left. Fails on the tree without it
-/// on the `EIO` count of each seed. (Seed 1045 is not on this path: its re-read
-/// succeeded and found the release landed.)
+/// release CAS in doubt whose re-read failed too. The node used to give the
+/// lease up at once while the object still named it: an epoch that formed in
+/// the cut carried a lease nobody claimed, and the peers' settles found no
+/// sequencer (2, 1 and 1 unsettled `EIO`). It now stays the named holder,
+/// fenced, asks the peers (their reads end the wait only when they show the
+/// release landed or another holder) and looks again itself; its own re-read
+/// that finds the lease standing is followed by a renewal CAS, and the fence is
+/// lifted when that lands (`release_doubt.rs`): no `EIO` is left. A peer's read
+/// that shows the lease standing lifts nothing
+/// (`regression_a_late_applied_release_makes_no_second_authority`). Fails on
+/// the tree without the wait on the `EIO` count of each seed. (Seed 1045 is
+/// not on this path: its re-read succeeded and found the release landed.)
 #[test]
-fn regression_a_release_in_doubt_is_resolved_by_a_peer_read() {
+fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
     let mut reached = 0;
-    let mut kept_by_peer = 0;
+    let mut renewals = 0;
     for seed in [64, 391, 1477] {
         let cfg = SimConfig {
             strict_unsettled: true,
@@ -7272,25 +7297,59 @@ fn regression_a_release_in_doubt_is_resolved_by_a_peer_read() {
         let sum =
             |f: fn(&constellation_authority::Stats) -> u64| r.stats.values().map(f).sum::<u64>();
         eprintln!(
-            "seed {seed}: unresolved {}, kept by peer {}, gave up {}, inconclusive {}, held answers {}, probes answered {}",
+            "seed {seed}: unresolved {}, peer reads kept {}, gave up {}, inconclusive {}, held answers {}, probes answered {}, renewals {}",
             sum(|s| s.release_unresolved),
             sum(|s| s.release_unresolved_kept_by_peer),
             sum(|s| s.release_unresolved_gave_up),
             sum(|s| s.release_unresolved_inconclusive),
             sum(|s| s.release_unresolved_held),
             sum(|s| s.lease_probes_answered),
+            sum(|s| s.release_unresolved_renewals),
         );
         reached += sum(|s| s.release_unresolved);
-        kept_by_peer += sum(|s| s.release_unresolved_kept_by_peer);
+        renewals += sum(|s| s.release_unresolved_renewals);
     }
     assert!(
         reached >= 3,
         "the seeds no longer reach an unresolved release: the pin would pass vacuously"
     );
     assert!(
-        kept_by_peer >= 1,
-        "no peer read kept a lease: the path of the fix is not exercised"
+        renewals >= 1,
+        "no renewal lifted a fence: the path of the fix is not exercised"
     );
+}
+
+/// The release CAS a node timed out on is applied by S3 later
+/// (`Fault::TimeoutThenAppliedCut`: the node's path is cut meanwhile). A peer
+/// that reads the lease in between sees it standing; a node that took that as
+/// "the release did not happen" lifted its fence, went on as holder or adopted
+/// the continuation epoch's hold, and when the late PUT landed the lease was
+/// anyone's: two authorities (I1). On 248abc82, the peer-read path, seeds 3, 4,
+/// 5, 7 and 16 of `flex-tight-late-applied` fail "two authorities at once"
+/// (264 of 1,500). The node now stays fenced on a peer's read, and on its own
+/// re-read until a renewal CAS of its own lands (the new version kills the late
+/// PUT): none of 1,500 seeds fails.
+#[test]
+fn regression_a_late_applied_release_makes_no_second_authority() {
+    let mut waited = 0;
+    let mut renewed = 0;
+    for seed in [3, 4, 5, 7, 16] {
+        let r = run_seed(seed, late_release(flex_tight_config())).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=flex-tight-late-applied AUTHORITY_SIM_SEED={seed}"
+            )
+        });
+        let sum =
+            |f: fn(&constellation_authority::Stats) -> u64| r.stats.values().map(f).sum::<u64>();
+        waited += sum(|s| s.release_unresolved);
+        renewed += sum(|s| s.release_unresolved_renewals);
+    }
+    assert!(
+        waited >= 1,
+        "no release in doubt waited: the pin would pass vacuously"
+    );
+    eprintln!("releases in doubt that waited: {waited}, renewals: {renewed}");
 }
 
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
@@ -7443,10 +7502,15 @@ fn flex_without_the_promise_check_is_found() {
 /// process while a peer claimed and formed an epoch; the node's published
 /// view still showed its lease. Without the exclusion the sampler called
 /// that two authorities, though the node could acknowledge nothing.
-/// The fence is judged, not assumed: the node planted to admit new
-/// mutations with its release CAS out is a split brain on its own.
+/// The sampler's Breach branch is wired: a published view that admits new
+/// mutations with the release CAS out is called a split brain. This pins the
+/// plumbing only. On the real core `release_cas_out` implies `releasing`,
+/// which implies the fence, so the branch compares the published flag with
+/// itself; `plant_release_admits` changes the published bit, not the core. That
+/// the fence holds is argued from the core (`fenced()`) and covered by the
+/// core tests, not judged by the sampler.
 #[test]
-fn flex_a_fenced_release_is_not_an_authority_but_an_open_one_is() {
+fn flex_a_fenced_release_is_not_an_authority_and_the_breach_branch_is_wired() {
     let report = run_seed(366, flex_tight_config()).expect("seed 366 passes");
     assert!(
         report.fenced_release_samples > 0,
@@ -8146,6 +8210,12 @@ fn base_config(label: &str) -> SimConfig {
         "locks-unlinked-delegated-random" => locks_unlinked_random_config(false),
         "locks-unlinked-delegated-dbackup-random" => locks_unlinked_random_config(true),
         "locks-unlinked-delegated-blips" => locks_unlinked_blips_config(),
+        "locks-unlinked-delegated-blips-late-applied" => {
+            late_release(locks_unlinked_blips_config())
+        }
+        "locks-late-applied" => late_release(locks_config()),
+        "flex-tight-late-applied" => late_release(flex_tight_config()),
+        "locks-blips-tight-late-applied" => late_release(locks_blips_tight_config()),
         "locks-unlinked-delegated-partition" => locks_unlinked_partition_config(),
         "locks-root-own-unlinked-partition" => locks_root_own_unlinked_partition_config(true),
         "locks-root-own-unlinked-partition-nocrash" => {
@@ -10380,6 +10450,7 @@ struct OracleTotals {
     root_own_core: [u64; 15],
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
+    release_wait: [u64; 8],
     sticky_driver: [u64; 4],
     /// Plan 46 M1.3 step 14 (`Report::leave_driver`).
     leave_driver: sim::run::LeaveDriver,
@@ -10834,6 +10905,9 @@ impl OracleTotals {
         for (t, c) in self.quarantine_core.iter_mut().zip(r.quarantine_core) {
             *t += c;
         }
+        for (t, c) in self.release_wait.iter_mut().zip(r.release_wait_core) {
+            *t += c;
+        }
         self.sticky_release_rows_judged += r.sticky_release_rows_judged;
         for (t, c) in self.sticky_driver.iter_mut().zip(r.sticky_driver) {
             *t += c;
@@ -11143,6 +11217,20 @@ impl OracleTotals {
             self.quarantine_core[3],
             self.quarantine_core[4],
             self.quarantine_core[5]
+        );
+        eprintln!(
+            "SWEEP-RELEASE-WAIT {label} seeds {}/{seeds}: release_unresolved {}, release_unresolved_kept_by_peer {}, \
+             release_unresolved_gave_up {}, release_unresolved_inconclusive {}, release_unresolved_held {}, \
+             release_unresolved_renewals {}, lease_probes_answered {}, release_record_waits {}",
+            self.seeds,
+            self.release_wait[0],
+            self.release_wait[1],
+            self.release_wait[2],
+            self.release_wait[3],
+            self.release_wait[4],
+            self.release_wait[5],
+            self.release_wait[6],
+            self.release_wait[7]
         );
         eprintln!(
             "SWEEP-UNSETTLED-CAUSES {label} seeds {}/{seeds}: {:?}",
@@ -18547,6 +18635,39 @@ fn locks_unlinked_blips_config() -> SimConfig {
         faults: c.faults,
         ..locks_unlinked_delegated_config()
     }
+}
+
+/// A release CAS that its caller gave up on and S3 applies later: half the
+/// release PUTs time out at once, are applied 3 s later, and cut the node's
+/// path to S3 from the timeout for 5 s (the request orphaned in flight, the
+/// node cut from S3 while the peers are not). The node's own re-read fails
+/// during the cut, a peer's read shows the lease standing, then the PUT lands
+/// and releases it, and any node may claim it at once. A node that went on as
+/// holder on the peer's read, or adopted the continuation epoch's hold, is a
+/// second authority (I1); a node that stays fenced until a CAS of its own
+/// lands is not. These are variants of the lease and lock configurations
+/// (`flex-tight`, `locks`, `locks-blips-tight`, `locks-unlinked-delegated-blips`
+/// `-late-applied`): not added to the unsuffixed ones, whose pinned seeds and
+/// ceilings the fault would move. `regression_scripted_s3_error_codes` runs
+/// the plain `TimeoutThenApplied` rule on lease PUTs.
+fn late_release(mut c: SimConfig) -> SimConfig {
+    c.faults.push(ScheduledFault {
+        at_ms: 0,
+        kind: FaultKind::S3Rule(
+            Rule::new(
+                None,
+                OpKind::Put,
+                "leases/",
+                When::Random(0.5),
+                Fault::TimeoutThenAppliedCut {
+                    after_ms: 3_000,
+                    cut_ms: 5_000,
+                },
+            )
+            .releases_only(),
+        ),
+    });
+    c
 }
 
 /// `locks-partition`'s cut lockers (plus its random fault).

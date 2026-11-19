@@ -1772,6 +1772,11 @@ pub struct Report {
     /// forwards answered `Held`, quarantines waited out, read grants
     /// withheld, quarantines ended early by the void round.
     pub quarantine_core: [u64; 6],
+    /// The release in doubt's wait (`release_doubt.rs`), summed over the nodes:
+    /// entered, peer reads that showed the lease standing, given up, inconclusive
+    /// peer reads, forwards answered `Held`, renewal CASes, probes answered,
+    /// releases that waited for their record.
+    pub release_wait_core: [u64; 8],
     /// Plan 46 M1.3 step 5, the idle tracker's releases: requested, answered
     /// (`wait`), unanswered or refused (`wait`), granted again.
     pub sticky_driver: [u64; 4],
@@ -8158,6 +8163,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.quarantine_core[3] += s.deleg_restart_q_waited_out;
         report.quarantine_core[4] += s.deleg_read_grants_quarantined;
         report.quarantine_core[5] += s.deleg_restart_q_voided;
+        report.release_wait_core[0] += s.release_unresolved;
+        report.release_wait_core[1] += s.release_unresolved_kept_by_peer;
+        report.release_wait_core[2] += s.release_unresolved_gave_up;
+        report.release_wait_core[3] += s.release_unresolved_inconclusive;
+        report.release_wait_core[4] += s.release_unresolved_held;
+        report.release_wait_core[5] += s.release_unresolved_renewals;
+        report.release_wait_core[6] += s.lease_probes_answered;
+        report.release_wait_core[7] += s.release_record_waits;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
         report.claim_core[0] += s.claim_released;
         report.claim_core[1] += s.claim_release_rowless;

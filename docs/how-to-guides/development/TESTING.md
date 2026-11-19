@@ -1951,19 +1951,34 @@ sleeps before the sync to widen the gap between the decision to release and
 the CAS. Unset, it is one cached lookup. The core's crash-point test is
 `release_record_crash_at_every_point`.
 
-A release in doubt whose own re-read fails too stays fenced until a read
-resolves it (ADR-22, `core/release_doubt.rs`). Its counters, per node in
-`Stats`: `release_unresolved` (entered), `release_unresolved_kept_by_peer`
-(a probed peer's fresh read showed the lease standing),
-`release_unresolved_gave_up` (the honour end, or a shutdown, ended the wait),
-`release_unresolved_inconclusive` (a peer read that decided nothing),
-`release_unresolved_held` (forwards answered `Held` meanwhile) and, on the
-probed side, `lease_probes_answered`. The sim pin is
-`regression_a_release_in_doubt_is_resolved_by_a_peer_read`
-(`locks-unlinked-delegated-blips+unsettled` seeds 64, 391, 1477: no
-unsettled `EIO`, the path reached, a peer read kept a lease). The core tests
-are in `core/tests.rs` (`a_release_in_doubt_whose_reread_fails_stays_named_and_fenced`
-and its neighbours, and the lock lane's
+A release in doubt whose own re-read fails too stays fenced until it is
+resolved (ADR-22, `core/release_doubt.rs`): by a read that shows the release
+landed or another holder, or by its own re-read and a renewal CAS of its own
+that lands; never by a peer's read that shows the lease standing. Its counters,
+per node in `Stats`: `release_unresolved` (entered),
+`release_unresolved_kept_by_peer` (a peer's fresh read showed the lease
+standing: the node stayed fenced), `release_unresolved_gave_up` (the honour
+end, or a shutdown, ended the wait), `release_unresolved_inconclusive` (a peer
+read that decided nothing), `release_unresolved_held` (forwards answered `Held`
+meanwhile), `release_unresolved_renewals` (renewal CASes before a fence was
+lifted) and, on the probed side, `lease_probes_answered`; `SWEEP-RELEASE-WAIT`
+prints them summed over a sweep. The sim has the store fault
+`Fault::TimeoutThenApplied { after_ms }` (the caller sees a timeout now, the
+request is applied later if its precondition holds) and
+`TimeoutThenAppliedCut` (the node's path is cut meanwhile), with
+`Rule::releases_only`. They are in `s3_rules()` (`regression_scripted_s3_error_codes`)
+and in the labels `flex-tight-late-applied`, `locks-late-applied`,
+`locks-blips-tight-late-applied` and `locks-unlinked-delegated-blips-late-applied`
+(half the release PUTs: timeout, applied 3 s later, the node cut for 5 s). The
+sim pins are `regression_a_late_applied_release_makes_no_second_authority`
+(`flex-tight-late-applied` seeds 3, 4, 5, 7 and 16 fail "two authorities at
+once" on the peer-read path, 248abc82) and
+`regression_a_release_in_doubt_waits_and_asks_the_peers`
+(`locks-unlinked-delegated-blips+unsettled` seeds 64, 391, 1477: no unsettled
+`EIO`, the wait reached, a renewal lifted the fence). The core tests are in
+`core/tests.rs` (`a_release_in_doubt_whose_reread_fails_stays_named_and_fenced`
+and its neighbours, `a_peer_read_showing_the_lease_standing_does_not_lift_the_fence`,
+`a_shutdown_queued_before_the_wait_gives_up_at_once`, and the lock lane's
 `no_lock_grant_is_made_while_an_unresolved_release_waits_for_a_read`).
 
 Bug B scenarios (plan 30 M3a and M3b regression tests, in `SCENARIOS`;

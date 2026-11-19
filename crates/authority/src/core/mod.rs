@@ -1937,12 +1937,15 @@ pub struct Stats {
     pub release_record_wait_ms_total: u64,
     pub release_record_wait_ms_max: u64,
     /// A release in doubt whose re-read failed too and stayed fenced
-    /// (`release_doubt.rs`), how each ended: kept by a peer's read, given
-    /// up at the lease's honour end, inconclusive peer reads, and the
-    /// forwards answered `Held` meanwhile.
+    /// (`release_doubt.rs`), how each ended: peer reads that showed the lease
+    /// standing (the node stays fenced), given up at the lease's honour
+    /// end, inconclusive peer reads, and the forwards answered `Held`
+    /// meanwhile.
     pub release_unresolved: u64,
     pub release_unresolved_kept_by_peer: u64,
     pub release_unresolved_gave_up: u64,
+    /// Renewal CASes a kept re-read made before lifting the fence.
+    pub release_unresolved_renewals: u64,
     pub release_unresolved_inconclusive: u64,
     pub release_unresolved_held: u64,
     /// Peer side: lease probes answered with a fresh read.

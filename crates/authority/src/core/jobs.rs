@@ -218,6 +218,12 @@ enum Phase {
     /// `LeaseGet` after a release CAS conflict, or after a release CAS
     /// that failed without an answer (`in_doubt`: it may have landed).
     ReleaseReread { in_doubt: bool },
+    /// A release in doubt that waited for a read: the node's own re-read
+    /// showed the lease standing, and a renewal CAS on the tag it returned is
+    /// outstanding (`release_doubt.rs`). It changes the object's version, so
+    /// the failed release PUT can never apply after it; the fence is lifted
+    /// only when it lands. `sent`: the object it writes.
+    ReleaseRenew { sent: Box<Lease> },
     /// A deposition recovery's `RebuildReplica` outstanding.
     Recover { op: OpId },
     /// Acquire: `LeaseGet` outstanding.
@@ -519,12 +525,29 @@ impl Core {
         self.set_phase(Phase::ReleaseReread { in_doubt: true }, op);
     }
 
+    /// The in-doubt release's renewal CAS is out.
+    pub(super) fn set_phase_release_renew(&mut self, sent: Lease, op: OpId) {
+        self.set_phase(
+            Phase::ReleaseRenew {
+                sent: Box::new(sent),
+            },
+            Some(op),
+        );
+    }
+
     /// The job in the slot is a shutdown flush (`Control::Shutdown`).
     pub(super) fn job_is_stop_flush(&self) -> bool {
         matches!(
             self.job.as_ref().map(|j| &j.what),
             Some(What::Flush { stop: true, .. })
         )
+    }
+
+    /// A shutdown flush waits in the queue.
+    pub(super) fn stop_flush_queued(&self) -> bool {
+        self.queued_jobs
+            .iter()
+            .any(|q| matches!(q, JobReq::Flush { stop: true, .. }))
     }
 
     /// The job in the slot waits for no S3 request of its own.
@@ -2106,7 +2129,10 @@ impl Core {
         self.lk.release_unmarked
             && self.lease.releasing
             && self.job.as_ref().is_some_and(|job| {
-                matches!(job.phase, Phase::Release | Phase::ReleaseReread { .. })
+                matches!(
+                    job.phase,
+                    Phase::Release | Phase::ReleaseReread { .. } | Phase::ReleaseRenew { .. }
+                )
             })
     }
 
@@ -2120,7 +2146,10 @@ impl Core {
     pub fn release_cas_out(&self) -> bool {
         self.lease.releasing
             && self.job.as_ref().is_some_and(|job| {
-                matches!(job.phase, Phase::Release | Phase::ReleaseReread { .. })
+                matches!(
+                    job.phase,
+                    Phase::Release | Phase::ReleaseReread { .. } | Phase::ReleaseRenew { .. }
+                )
             })
     }
 
@@ -2134,6 +2163,7 @@ impl Core {
                     | Phase::PersistRelease { .. }
                     | Phase::Release
                     | Phase::ReleaseReread { .. }
+                    | Phase::ReleaseRenew { .. }
                     | Phase::Cas { .. }
                     | Phase::CasReread { .. }
             ),
@@ -3338,14 +3368,16 @@ impl Core {
                             if matches!(kind, JobKind::Handoff | JobKind::Flush)
                                 && replica.journal_len().ok() != Some(0)
                             {
+                                // Legal in the daemon: the FUSE fast path admits on
+                                // a published view, concurrently with the core, and
+                                // a write admitted just before `releasing` rose may
+                                // journal in this gap. The driver's quiesce and
+                                // journal check fail the CAS then. The invariant
+                                // that holds is "no row at the CAS", enforced there.
                                 self.stats.release_rows_in_gap += 1;
-                                tracing::error!(
+                                tracing::debug!(
                                     node = self.cfg.node_id,
                                     "journal rows appeared while the release record was written"
-                                );
-                                debug_assert!(
-                                    false,
-                                    "the journal is not empty at the release CAS of a handoff or flush"
                                 );
                             }
                             self.issue_release(now, replica, out);
@@ -5675,6 +5707,9 @@ impl Core {
             }
             (Phase::ReleaseReread { in_doubt }, S3Result::LeaseGet(result)) => {
                 self.on_release_reread(now, kind, in_doubt, result, replica, out)
+            }
+            (Phase::ReleaseRenew { sent }, S3Result::LeasePut(result)) => {
+                self.on_release_renew(now, kind, *sent, result, replica, out)
             }
             // ---- acquire ----
             (Phase::Get, S3Result::LeaseGet(Ok(object))) => {

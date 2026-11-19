@@ -42,6 +42,16 @@ pub enum Fault {
     AppliedThen(u16),
     /// The operation takes effect, then the caller sees a timeout.
     AppliedThenTimeout,
+    /// The caller sees a timeout now and the request is applied `after_ms`
+    /// later, if its precondition still holds then: the request left the
+    /// node, the node gave up on it, and it reached S3 late (a send error
+    /// after written bytes, the orphaned retransmission of a closed
+    /// connection). A read behaves as for `Timeout`.
+    TimeoutThenApplied { after_ms: u64 },
+    /// As `TimeoutThenApplied`, and the node's path to the bucket is cut
+    /// from the timeout on for `cut_ms`: the request is orphaned in flight
+    /// while the node is cut, and lands when the path heals.
+    TimeoutThenAppliedCut { after_ms: u64, cut_ms: u64 },
 }
 
 /// A scripted rule: `op` calls on paths containing `pattern`, from `node`
@@ -54,6 +64,8 @@ pub struct Rule {
     pub pattern: String,
     pub when: When,
     pub fault: Fault,
+    /// Only PUTs whose body is a released lease (`"released":true`) match.
+    pub releases_only: bool,
     seen: usize,
 }
 
@@ -73,8 +85,15 @@ impl Rule {
             pattern: pattern.to_string(),
             when,
             fault,
+            releases_only: false,
             seen: 0,
         }
+    }
+
+    /// The rule matches only the PUTs that release the lease.
+    pub fn releases_only(mut self) -> Self {
+        self.releases_only = true;
+        self
     }
 }
 
@@ -444,7 +463,7 @@ impl Bucket {
         Duration::from_millis(ms)
     }
 
-    fn fault_for(&self, node: u64, op: OpKind, path: &Path) -> Option<Fault> {
+    fn fault_for(&self, node: u64, op: OpKind, path: &Path, body: Option<&[u8]>) -> Option<Fault> {
         {
             let mut counts = self.counts.lock().unwrap();
             match op {
@@ -460,6 +479,10 @@ impl Bucket {
             if rule.op != op
                 || !path.contains(&rule.pattern)
                 || rule.node.is_some_and(|n| n != node)
+                || (rule.releases_only
+                    && !body.is_some_and(|b| {
+                        std::str::from_utf8(b).is_ok_and(|b| b.contains("\"released\":true"))
+                    }))
             {
                 continue;
             }
@@ -511,12 +534,57 @@ impl std::fmt::Display for NodeStore {
 }
 
 impl NodeStore {
-    async fn admit(&self, op: OpKind, path: &Path) -> object_store::Result<Option<Fault>> {
+    /// The request leaves for S3 and its caller gives up: it is applied
+    /// `after_ms` later if its precondition still holds then, and the node's
+    /// path is cut meanwhile for `cut_ms` when asked.
+    fn apply_later(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+        after_ms: u64,
+        cut_ms: Option<u64>,
+    ) {
+        let bucket = self.bucket.clone();
+        let node = self.node;
+        let location = location.clone();
+        if let Some(cut_ms) = cut_ms {
+            bucket.set_cut(node, true);
+            let bucket = bucket.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(cut_ms)).await;
+                bucket.set_cut(node, false);
+            });
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(after_ms)).await;
+            // Late delivery: the node's path may be cut by now, the request
+            // is already in S3's hands. It applies only if its precondition
+            // (the tag it was built on) still holds.
+            let landed = payload.clone();
+            let before = bucket.lease_before(&location);
+            if bucket
+                .inner
+                .put_opts(&location, payload, opts)
+                .await
+                .is_ok()
+            {
+                bucket.put_landed(node, before, &location, &landed);
+            }
+        });
+    }
+
+    async fn admit(
+        &self,
+        op: OpKind,
+        path: &Path,
+        body: Option<&[u8]>,
+    ) -> object_store::Result<Option<Fault>> {
         tokio::time::sleep(self.bucket.latency()).await;
         if self.bucket.cut.lock().unwrap().contains(&self.node) {
             return Err(unreachable_error());
         }
-        Ok(self.bucket.fault_for(self.node, op, path))
+        Ok(self.bucket.fault_for(self.node, op, path, body))
     }
 }
 
@@ -529,7 +597,8 @@ impl ObjectStore for NodeStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         let mode = opts.mode.clone();
-        match self.admit(OpKind::Put, location).await? {
+        let body: bytes::Bytes = payload.clone().into();
+        match self.admit(OpKind::Put, location, Some(&body)).await? {
             None => {
                 let landed = payload.clone();
                 let before = self.bucket.lease_before(location);
@@ -551,6 +620,14 @@ impl ObjectStore for NodeStore {
                 let before = self.bucket.lease_before(location);
                 self.bucket.inner.put_opts(location, payload, opts).await?;
                 self.bucket.put_landed(self.node, before, location, &landed);
+                Err(timeout_error())
+            }
+            Some(Fault::TimeoutThenApplied { after_ms }) => {
+                self.apply_later(location, payload, opts, after_ms, None);
+                Err(timeout_error())
+            }
+            Some(Fault::TimeoutThenAppliedCut { after_ms, cut_ms }) => {
+                self.apply_later(location, payload, opts, after_ms, Some(cut_ms));
                 Err(timeout_error())
             }
         }
@@ -582,7 +659,7 @@ impl ObjectStore for NodeStore {
         if let Some(d) = self.bucket.draw(reads.before) {
             tokio::time::sleep(d).await;
         }
-        match self.admit(OpKind::Get, location).await? {
+        match self.admit(OpKind::Get, location, None).await? {
             None | Some(Fault::AppliedThen(_)) | Some(Fault::AppliedThenTimeout) => {
                 // Served now; the response is on its way back for a while
                 // (the object may change meanwhile, the caller sees the
@@ -610,7 +687,9 @@ impl ObjectStore for NodeStore {
             Some(Fault::Status(status)) => {
                 Err(s3_error(location.as_ref(), status, &PutMode::Overwrite))
             }
-            Some(Fault::Timeout) => Err(timeout_error()),
+            Some(Fault::Timeout)
+            | Some(Fault::TimeoutThenApplied { .. })
+            | Some(Fault::TimeoutThenAppliedCut { .. }) => Err(timeout_error()),
         }
     }
 
@@ -631,14 +710,16 @@ impl ObjectStore for NodeStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let path = prefix.cloned().unwrap_or_else(|| Path::from(""));
-        match self.admit(OpKind::List, &path).await? {
+        match self.admit(OpKind::List, &path, None).await? {
             None | Some(Fault::AppliedThen(_)) | Some(Fault::AppliedThenTimeout) => {
                 self.bucket.inner.list_with_delimiter(prefix).await
             }
             Some(Fault::Status(status)) => {
                 Err(s3_error(path.as_ref(), status, &PutMode::Overwrite))
             }
-            Some(Fault::Timeout) => Err(timeout_error()),
+            Some(Fault::Timeout)
+            | Some(Fault::TimeoutThenApplied { .. })
+            | Some(Fault::TimeoutThenAppliedCut { .. }) => Err(timeout_error()),
         }
     }
 
@@ -666,11 +747,13 @@ fn async_stream_list(
         if bucket.cut.lock().unwrap().contains(&node) {
             return vec![Err(unreachable_error())];
         }
-        match bucket.fault_for(node, OpKind::List, &prefix) {
+        match bucket.fault_for(node, OpKind::List, &prefix, None) {
             Some(Fault::Status(status)) => {
                 return vec![Err(s3_error(prefix.as_ref(), status, &PutMode::Overwrite))]
             }
-            Some(Fault::Timeout) => return vec![Err(timeout_error())],
+            Some(Fault::Timeout)
+            | Some(Fault::TimeoutThenApplied { .. })
+            | Some(Fault::TimeoutThenAppliedCut { .. }) => return vec![Err(timeout_error())],
             _ => {}
         }
         inner.list(Some(&prefix)).collect::<Vec<_>>().await

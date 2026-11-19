@@ -1383,14 +1383,18 @@ Operational rules:
   epoch's close instead, and that obligation is persisted. Once S3 is
   back it closes the epoch, and re-claims the lease if the release did
   not land. If the release ends with the lease kept (a failed handoff
-  flush, a re-read that finds the lease standing, or a peer's read that
-  shows it standing), it holds the epoch after all and the obligation is
-  dropped. A release in doubt whose own re-read fails too does not give
+  flush that kept it), it holds the epoch after all and the obligation is
+  dropped. A release in doubt that ends with the node's own re-read and a
+  renewal CAS of its own keeps the lease but moves it, so no hold is adopted:
+  the epoch closes on the lease's move. A release in doubt whose own re-read fails too does not give
   the lease up: the node stays its named holder, fenced as for any release
   in flight, re-reads on a backoff, asks the reachable peers to read the
   lease (a fresh read each, after the probe arrived), and answers forwards
-  `Held`; the first conclusive read decides, and the lease is given up only
-  at its honour end ([ADR-22](../../explanation/DECISIONS.md#adr-22-flexible-quorum-continuation-epochs-with-promises)).
+  `Held`; a read that shows the release landed or another holder decides,
+  the node's own re-read that shows the lease standing is followed by a
+  renewal CAS and decides when that lands, a peer's read that shows the lease
+  standing decides nothing (the failed PUT may still land), and the lease is
+  given up only at its honour end ([ADR-22](../../explanation/DECISIONS.md#adr-22-flexible-quorum-continuation-epochs-with-promises)).
   Given up in doubt while holding the epoch (a release that ran under the
   hold), the hold goes, the move is owed, and writes are refused (`EROFS`)
   until the epoch closes: nobody holds it.
