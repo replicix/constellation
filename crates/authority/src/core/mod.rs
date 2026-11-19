@@ -186,6 +186,18 @@ pub struct Config {
     /// release (the simulation's control, `AUTHORITY_SIM_NO_RELEASE_CUT`).
     pub release_cut: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine), round 6 (ADR-64): the holder journals its `ReleaseCut`
+    /// row but keeps it, and what follows it, off its stream until the read
+    /// delegations are gone (the cut row held with the stream). The sim's
+    /// strict S4 tag must then fire on the fix arm.
+    pub cut_row_withheld: bool,
+    /// Fault injection for the simulation's negative control (never set by
+    /// the engine), round 6 (ADR-64): the root ignores a delegate's cut mark
+    /// when it answers a settle (no answer at the cut: the redirect, the
+    /// recall and the wait for the release row, as without the cut). The
+    /// sim's strict S4 tag must then fire on the fix arm.
+    pub root_ignores_cut: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): a holder's release of sticky subtrees journals its row
     /// at once, without draining its in-flight ops there and waiting for
     /// the root to append through its last row (plan 46 M1.3 step 5,
@@ -767,6 +779,8 @@ impl Config {
             ttl_reclaims_sticky: false,
             restart_skips_write_quarantine: false,
             release_cut: true,
+            cut_row_withheld: false,
+            root_ignores_cut: false,
             holder_releases_before_drain: false,
             claim_ends_silently: false,
             partial_release_ends_stream: false,

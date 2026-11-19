@@ -10795,6 +10795,10 @@ struct OracleTotals {
     /// Due cuts that went rowless, were left to a claim, were asked for
     /// again, or were taken into a whole release (ADR-64's other paths).
     s4_cut_paths: [u64; 4],
+    /// Round 6, one predicate on both arms (`Report::s4_pred`): EIOs under a
+    /// held-release span, of them root-blocked; under a cut span, of them
+    /// root-blocked, of them with the cut row unshippable, of them both.
+    s4_pred: [u64; 6],
     s4_span_max_ms: u64,
     violation_causes: std::collections::BTreeMap<String, u64>,
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
@@ -11053,6 +11057,9 @@ impl OracleTotals {
         self.s4_answered_at_cut += r.settles_answered_at_cut;
         self.s4_rowless_held += r.rowless_held_releases;
         self.s4_exec_in_cut += r.exec_in_cut;
+        for (n, v) in self.s4_pred.iter_mut().zip(r.s4_pred) {
+            *n += v as u64;
+        }
         for (n, v) in self.s4_cut_paths.iter_mut().zip([
             r.cut_rowless_after,
             r.cut_left_to_claim,
@@ -11267,7 +11274,7 @@ impl OracleTotals {
     /// apart, over the excused ones (a sticky stream's are `designation_held`).
     fn s4_line(&self, label: &str, seeds: u64) -> String {
         format!(
-            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms; cut spans {} in {} seeds; settles sent while a cut waited {}; settles answered at a cut {}; rowless held releases {}; executions refused under a cut {}; cut_rowless_after {}; cut_left_to_claim {}; cut_repeated {}; cut_absorbed {}",
+            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms; cut spans {} in {} seeds; settles sent while a cut waited {}; settles answered at a cut {}; rowless held releases {}; executions refused under a cut {}; cut_rowless_after {}; cut_left_to_claim {}; cut_repeated {}; cut_absorbed {}; under the one predicate (the requester judged against the root over the span, `Question::new`): EIOs under a held-release span {}, root-blocked {}; under a cut span {}, root-blocked {}, cut row unshippable {} (named excuse), blocked and unshippable {}",
             self.seeds,
             self.s4.0,
             self.s4.1,
@@ -11289,7 +11296,13 @@ impl OracleTotals {
             self.s4_cut_paths[0],
             self.s4_cut_paths[1],
             self.s4_cut_paths[2],
-            self.s4_cut_paths[3]
+            self.s4_cut_paths[3],
+            self.s4_pred[0],
+            self.s4_pred[1],
+            self.s4_pred[2],
+            self.s4_pred[3],
+            self.s4_pred[4],
+            self.s4_pred[5]
         )
     }
 
@@ -23919,6 +23932,46 @@ fn s4_suspend_settle_answered_at_the_cut() {
 #[test]
 fn s4_merge_first_release_settle_answered_at_the_cut() {
     s4_pin("sticky-s4-merge", sticky_s4_merge_config, 8);
+}
+
+/// Round 6 (review MUST-2): the final tag has fired on the fix arm. Each
+/// fix-arm negative control, run on the pin seed of its label, fails by the
+/// strict S4 tag with a cut span in its text: (a) the cut row kept off the
+/// stream until the reads clear, (b) the root ignoring the cut mark.
+fn s4_knob_fires(label: &str, config: fn() -> SimConfig, seed: u64) {
+    for (name, knob) in [
+        (
+            "cut_row_withheld",
+            (|c| SimConfig {
+                cut_row_withheld: true,
+                ..c
+            }) as fn(SimConfig) -> SimConfig,
+        ),
+        ("root_ignores_cut", |c| SimConfig {
+            root_ignores_cut: true,
+            ..c
+        }),
+    ] {
+        let e = run_seed(seed, knob(config())).expect_err(&format!(
+            "{label} seed {seed} +{name}: the tag did not fire"
+        ));
+        assert!(
+            e.contains("s4_release_read_recall")
+                && e.contains(sim::oracle::S4_MARK)
+                && e.contains("cut span"),
+            "{label} seed {seed} +{name}: failed, but not on the tag over a cut span: {e}"
+        );
+    }
+}
+
+#[test]
+fn the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_suspend() {
+    s4_knob_fires("sticky-s4-suspend", sticky_s4_suspend_config, 3);
+}
+
+#[test]
+fn the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_merge() {
+    s4_knob_fires("sticky-s4-merge", sticky_s4_merge_config, 8);
 }
 
 /// Plan 46 M1.3 step 15a, S4 (review MUST-2), now the control arm

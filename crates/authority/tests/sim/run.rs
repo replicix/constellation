@@ -642,6 +642,14 @@ pub struct SimConfig {
     /// release, its row and everything after it held back, not a cut first.
     /// `AUTHORITY_SIM_NO_RELEASE_CUT=1` sets it on every configuration.
     pub no_release_cut: bool,
+    /// Negative control (round 6, ADR-64; `Config::cut_row_withheld`): the
+    /// holder's cut row stays off its stream until the reads clear.
+    /// `AUTHORITY_SIM_CUT_ROW_WITHHELD=1` sets it on every configuration.
+    pub cut_row_withheld: bool,
+    /// Negative control (round 6, ADR-64; `Config::root_ignores_cut`): the
+    /// root ignores the cut mark when it answers a settle.
+    /// `AUTHORITY_SIM_ROOT_IGNORES_CUT=1` sets it on every configuration.
+    pub root_ignores_cut: bool,
     /// Negative control (plan 46 M1.3 step 14): the operator's leave retires
     /// the node without ending its grants first (the driver skips
     /// `ReleaseGrants` / `EndGrantsOf`), so a live grant stays off the
@@ -1397,6 +1405,10 @@ impl Default for SimConfig {
                 .is_some_and(|v| v == "1"),
             no_release_cut: std::env::var_os("AUTHORITY_SIM_NO_RELEASE_CUT")
                 .is_some_and(|v| v == "1"),
+            cut_row_withheld: std::env::var_os("AUTHORITY_SIM_CUT_ROW_WITHHELD")
+                .is_some_and(|v| v == "1"),
+            root_ignores_cut: std::env::var_os("AUTHORITY_SIM_ROOT_IGNORES_CUT")
+                .is_some_and(|v| v == "1"),
             leave_keeps_grants: std::env::var_os("AUTHORITY_SIM_LEAVE_KEEPS_GRANTS")
                 .is_some_and(|v| v == "1"),
             leave_asks_any: std::env::var_os("AUTHORITY_SIM_LEAVE_ASKS_ANY")
@@ -1890,6 +1902,12 @@ pub struct Report {
     /// their window: the strict class `s4_release_read_recall` (a violation
     /// in every configuration), described.
     pub s4_strict: Vec<String>,
+    /// Round 6 (review MUST-1), the one predicate on both arms over every
+    /// unsettled `EIO` (excused ones included) that overlapped a span:
+    /// `[held-release spans, of them the root judged for the requester over
+    /// the span was blocked, cut spans, of them root-blocked, of them with
+    /// the cut row unshippable, root-blocked and unshippable]`.
+    pub s4_pred: [usize; 6],
     /// The cut spans the run saw (`Oracles::cut_releases`), the settles the
     /// roots answered at a cut, the releases that held their note without a
     /// row (RC-1) and the executions a store fence refused under a cut
@@ -5689,8 +5707,34 @@ fn count_unsettled(
     report: &mut Report,
     world: &super::chunks::ChunkWorld,
     archive: &super::oracle::ArchiveIndex,
+    seed: u64,
 ) -> Vec<String> {
     let everything = oracles.unsettled.lock().unwrap();
+    for u in everything.iter() {
+        let Some(span) = &u.s4_span else { continue };
+        let slot = if span.cut { 2 } else { 0 };
+        report.s4_pred[slot] += 1;
+        report.s4_pred[slot + 1] += usize::from(span.root_blocked);
+        if span.cut {
+            report.s4_pred[4] += usize::from(span.unshippable);
+            report.s4_pred[5] += usize::from(span.unshippable && span.root_blocked);
+        }
+        // (`AUTHORITY_SIM_S4_EIO=1`: every `EIO` under a span, excused and
+        // tagged or not, with its rid, verdict and the span.)
+        if std::env::var_os("AUTHORITY_SIM_S4_EIO").is_some() {
+            eprintln!(
+                "SWEEP-S4-EIO seed {seed}: {}{}; tagged {}; {}",
+                u.describe_verdict_text(),
+                if u.designation_held {
+                    " (designation held)"
+                } else {
+                    ""
+                },
+                u.release_read_recall,
+                span.describe()
+            );
+        }
+    }
     let lost_chunk = |u: &&super::oracle::Unsettled| u.held_lost_chunk(world, archive);
     report.unsettled_nonstealable_holder = everything.iter().filter(|u| u.designation_held).count();
     report.unsettled_isolated_from_s3 = everything
@@ -6078,6 +6122,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         sticky_idle_release_ms: cfg.sticky_idle_ms.unwrap_or(0),
         claim_ends_silently: cfg.claim_ends_silently,
         release_cut: !cfg.no_release_cut,
+        cut_row_withheld: cfg.cut_row_withheld,
+        root_ignores_cut: cfg.root_ignores_cut,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
         holder_runs_inbox_ever: cfg.holder_runs_inbox_ever,
         root_ignores_touched: cfg.root_ignores_touched,
@@ -7338,8 +7384,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
         // Plan 46 M0.3: the unsettled `EIO`s this run told are counted (and
         // judged under `strict_unsettled`) like any other run's.
-        let unsettled_violations =
-            count_unsettled(&oracles, &mut report, &cluster.env.world, &bucket.archive);
+        let unsettled_violations = count_unsettled(
+            &oracles,
+            &mut report,
+            &cluster.env.world,
+            &bucket.archive,
+            seed,
+        );
         if let Some(first) = report.s4_strict.first() {
             return Err(format!(
                 "{first}\n  ({} s4_release_read_recall violation(s); the run ended with a claim \
@@ -8481,8 +8532,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.late_landings = found.i4.len();
     report.settled_landings = found.i4.iter().filter(|m| m.starts_with("I4: rid")).count();
     report.landings_isolated_from_s3 = found.i4_isolated_from_s3;
-    let unsettled_violations =
-        count_unsettled(&oracles, &mut report, &cluster.env.world, &bucket.archive);
+    let unsettled_violations = count_unsettled(
+        &oracles,
+        &mut report,
+        &cluster.env.world,
+        &bucket.archive,
+        seed,
+    );
     report.non_lone_rollbacks = found.i5.len();
     report.i5_operator = found.i5_operator.len();
     report.i5_after_end = found.i5_after_end.len();
@@ -9504,6 +9560,7 @@ mod s4_count_tests {
             &mut report,
             &ChunkWorld::default(),
             &ArchiveIndex::default(),
+            0,
         );
         assert_eq!(report.unsettled_s4, 1);
         assert_eq!(report.unsettled_s4_excused, 1);

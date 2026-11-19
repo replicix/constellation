@@ -7474,6 +7474,19 @@ impl Core {
                 let row = *row;
                 txs.retain(|t| t.idx < row);
             }
+            // (Round 6, the negative control `cut_row_withheld`: the cut row
+            // and what follows it stay off the stream until the reads are
+            // gone and its release row is journaled.)
+            if self.cfg.cut_row_withheld {
+                if let Some(cut) = self
+                    .dl
+                    .mine
+                    .get(&gen)
+                    .and_then(|d| d.cuts.iter().map(|c| c.cut_row).min())
+                {
+                    txs.retain(|t| t.idx < cut);
+                }
+            }
             let d = self.dl.mine.get(&gen).expect("present");
             if txs.is_empty() {
                 if let Some(since) = awaited.get(&gen) {

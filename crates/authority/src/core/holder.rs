@@ -511,7 +511,8 @@ impl Core {
                 // final whatever the read recalls that hold its release row
                 // back. No redirect (the stopped holder sends it back), no
                 // recall, no wait on the generation.
-                let cut_settle = settle && replica.settle_at_cut(&keys);
+                let cut_settle =
+                    settle && !self.cfg.root_ignores_cut && replica.settle_at_cut(&keys);
                 if cut_settle {
                     self.stats.settles_answered_at_cut += 1;
                 }

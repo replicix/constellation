@@ -40346,6 +40346,59 @@ mod s3_no_loops {
         assert_eq!(h.core.stats.settles_refused, 1);
     }
 
+    /// Round 6 (review SHOULD), the root's side of a rowless end after a
+    /// cut: the delegate's `ReleaseCut` row is appended (the mark), then the
+    /// release ends rowless at the cut (`end_at`, no row). The settles the
+    /// mark answered were answered; the end clears the mark with the stream
+    /// (the subtree is the root's again), a settle after it takes the
+    /// ordinary path (no answer "at a cut"), and a write in the subtree runs
+    /// at the root, no live grant under it.
+    #[test]
+    fn a_rowless_end_after_a_cut_clears_the_root_mark_and_serves_the_subtree() {
+        let (mut h, dir, gen) = delegated_root();
+        h.core.dl.gens.get_mut(&gen).unwrap().delegate_heard = Some(w(h.now));
+        deliver_stream(&mut h, 3, gen, vec![cut_row(gen, dir, 0)], None);
+        h.archive_lands();
+        // The mark answers a settle.
+        let mut out = forward(&mut h, 2, 7, dir, true);
+        out.extend(h.archive_lands());
+        assert_eq!(
+            settled_to_2(&out, 7),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.settles_answered_at_cut, 1);
+        assert!(!h.core.dl.gens[&gen].ended);
+        // The release ends rowless at the cut row (index 1).
+        let dirs = h.core.dl.gens[&gen].dirs.keys().copied().collect();
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs,
+            end_at: Some(1),
+            locks: Default::default(),
+            leaving: false,
+            seal: false,
+            no_stream: false,
+        };
+        deliver_stream(&mut h, 3, gen, Vec::new(), Some(note));
+        h.archive_lands();
+        assert!(h.core.dl.gens[&gen].ended, "the stream did not end");
+        assert!(
+            h.meta.delegation_table().get(dir).is_none(),
+            "the subtree is still delegated"
+        );
+        // A settle now is no settle at a cut; a write runs at the root.
+        let before = h.core.stats.settles_answered_at_cut;
+        forward(&mut h, 2, 8, dir, true);
+        assert_eq!(h.core.stats.settles_answered_at_cut, before);
+        let mut out = forward(&mut h, 2, 9, dir, false);
+        out.extend(h.archive_lands());
+        assert!(
+            matches!(reply_to(&out, 2, 9), Some(MutateOutcome::Accepted { .. })),
+            "the write did not run at the root: {out:?}"
+        );
+        assert!(h.meta.lookup(dir, "n9").unwrap().is_some());
+    }
+
     /// A designation under recall (`online` released it) is never skipped:
     /// `deleg_recall_plan` would refuse every op on it (`EROFS`), the
     /// designee's own included. The designee's op is held, a third node's op

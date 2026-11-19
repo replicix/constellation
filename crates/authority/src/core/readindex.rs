@@ -1789,6 +1789,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if self.cfg.root_ignores_cut {
+            return;
+        }
         let ids: BTreeSet<u64> = gens.iter().map(|g| super::delegate::wait_id(*g)).collect();
         let mut woken = 0u64;
         for p in self.rd.parked.values_mut() {

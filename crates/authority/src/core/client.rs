@@ -3494,7 +3494,7 @@ impl Core {
             // ADR-64 (R2): nor does a settle at a delegate's cut wait for the
             // release row; it is answered from the dedup or refused, as the
             // release row's append would leave it.
-            let at_cut = settle && replica.settle_at_cut(&keys);
+            let at_cut = settle && !self.cfg.root_ignores_cut && replica.settle_at_cut(&keys);
             if at_cut {
                 self.stats.settles_answered_at_cut += 1;
             }

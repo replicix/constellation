@@ -400,12 +400,8 @@ impl HeldReleases {
     /// Whether a span of any of `gens` (on any node) overlaps
     /// `[from_ms, to_ms]`.
     pub fn overlaps(&self, gens: &BTreeSet<u64>, from_ms: u64, to_ms: u64) -> bool {
-        self.spans.iter().any(|((_, gen, _), spans)| {
-            gens.contains(gen)
-                && spans
-                    .iter()
-                    .any(|&(s, e)| s <= to_ms && e.is_none_or(|e| e > from_ms))
-        })
+        self.first_overlap(from_ms, to_ms, |gen, _| gens.contains(&gen))
+            .is_some()
     }
 
     /// Whether a cut span of one of the `(gen, subtree)` pairs the op's keys
@@ -417,12 +413,48 @@ impl HeldReleases {
         from_ms: u64,
         to_ms: u64,
     ) -> bool {
-        self.spans.iter().any(|((_, gen, dir), spans)| {
-            subtrees.contains(&(*gen, *dir))
-                && spans
+        self.first_subtree_overlap(subtrees, from_ms, to_ms)
+            .is_some()
+    }
+
+    /// The earliest overlapping span of one of `subtrees`, as `(its start,
+    /// the node that holds it)`.
+    pub fn first_subtree_overlap(
+        &self,
+        subtrees: &BTreeSet<(u64, u64)>,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Option<(u64, NodeId)> {
+        self.first_overlap(from_ms, to_ms, |gen, dir| subtrees.contains(&(gen, dir)))
+    }
+
+    /// The earliest overlapping span of any of `gens`, as `(its start, the
+    /// node that holds it)`.
+    pub fn first_gens_overlap(
+        &self,
+        gens: &BTreeSet<u64>,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Option<(u64, NodeId)> {
+        self.first_overlap(from_ms, to_ms, |gen, _| gens.contains(&gen))
+    }
+
+    fn first_overlap(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        want: impl Fn(u64, u64) -> bool,
+    ) -> Option<(u64, NodeId)> {
+        self.spans
+            .iter()
+            .filter(|((_, gen, dir), _)| want(*gen, *dir))
+            .flat_map(|((node, _, _), spans)| {
+                spans
                     .iter()
-                    .any(|&(s, e)| s <= to_ms && e.is_none_or(|e| e > from_ms))
-        })
+                    .filter(move |&&(s, e)| s <= to_ms && e.is_none_or(|e| e > from_ms))
+                    .map(move |&(s, _)| (s, *node))
+            })
+            .min()
     }
 }
 
@@ -451,6 +483,49 @@ pub struct ReleaseDrain {
     pub checked: BTreeMap<(NodeId, u64), u64>,
     pub rows: u64,
     pub violations: Vec<String>,
+}
+
+/// Round 6 (review MUST-1): the strict S4 tag, one predicate on both arms. A
+/// span of a release held on read recalls (the control) or of a cut waiting
+/// for them (the fix) overlapped the `EIO`'s window, and the tag fires when
+///  - `root_blocked`: the requester, asked of the root alone over
+///    `[max(from, span start), at]`, was not `allowed` (a sequencer
+///    reachable: the root that answers at the cut, or the control's own
+///    failing to), and
+///  - not `unshippable` (the named excuse, cut spans only): the holder
+///    itself had no usable root from the span's start to the `EIO`, so the
+///    cut row could not leave it.
+#[derive(Debug, Clone)]
+pub struct S4Span {
+    pub start: u64,
+    pub holder: NodeId,
+    /// A cut span (the fix arm); else a held-release span (the control).
+    pub cut: bool,
+    pub root_blocked: bool,
+    pub unshippable: bool,
+}
+
+impl S4Span {
+    pub fn fires(&self) -> bool {
+        self.root_blocked && !self.unshippable
+    }
+
+    /// The text of the per-EIO print.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} span of node {} from {} ms: the root judged for the requester over the span: {}; \
+             cut row unshippable: {}",
+            if self.cut { "cut" } else { "held-release" },
+            self.holder,
+            self.start,
+            if self.root_blocked {
+                "blocked"
+            } else {
+                "allowed"
+            },
+            self.unshippable
+        )
+    }
 }
 
 /// An unsettled `EIO` (the client was told in doubt after its settle went
@@ -492,6 +567,10 @@ pub struct Unsettled {
     /// holder's release of a generation the question rests on waited on
     /// read-delegation recalls during `[from_ms, at]`.
     pub release_read_recall: bool,
+    /// The earliest held or cut span of the owning stream (or of a subtree
+    /// under the op's keys) overlapping the `EIO`'s window, and how the one
+    /// predicate judged it (the same on both arms, `S4Span`).
+    pub s4_span: Option<S4Span>,
     /// When the `EIO` was told (`tokio` time, as the drops' and the log's).
     pub at: tokio::time::Instant,
 }
@@ -595,10 +674,16 @@ impl Unsettled {
     pub fn describe(&self) -> String {
         let text = self.describe_verdict();
         if self.release_read_recall {
-            format!("{text} [{S4_MARK}]")
+            let span = self.s4_span.as_ref().map(S4Span::describe);
+            format!("{text} [{S4_MARK}; {}]", span.unwrap_or_default())
         } else {
             text
         }
+    }
+
+    /// The verdict's text with no S4 note (the per-`EIO` print's).
+    pub fn describe_verdict_text(&self) -> String {
+        self.describe_verdict()
     }
 
     fn describe_verdict(&self) -> String {
@@ -1061,20 +1146,46 @@ impl Oracles {
             born,
             awaiting,
         };
-        // The strict S4 tag: a held span of the owning stream (the knob-on
-        // arm, whose release waits held), or, on the fix arm, whose releases
-        // are never held, a cut span over a subtree the op's keys lie under
-        // while the verdict says the requester could have reached the root
-        // that answers at the cut (an `EIO` the requester's own isolation
-        // explains is no cut's to prevent, `reach::Verdict::allowed`).
-        let held_tag = self.held_releases.lock().unwrap().tags(&question);
-        let cut_tag = self.cut_releases.lock().unwrap().overlaps_subtrees(
-            &self.op_subtrees(node, rid, from_ms, at),
-            from_ms,
-            at,
-        );
+        // The strict S4 tag (round 6, review MUST-1): a held span of the
+        // owning stream (the control arm, whose release waits held) or a cut
+        // span over a subtree the op's keys lie under (the fix arm) that
+        // overlaps the window, and the requester judged against the root over
+        // the span: `Question::new` has the keys the root's all along, so it is
+        // `allowed` exactly when the requester had no usable root (no cut's to
+        // prevent), whatever the oracle's owner timeline says. The one named
+        // excuse, a cut row the holder could not ship, is counted apart.
+        let held_span = self
+            .held_releases
+            .lock()
+            .unwrap()
+            .first_gens_overlap(&question_gens(&question), from_ms, at)
+            .map(|(start, holder)| (start, holder, false));
+        let cut_span = self
+            .cut_releases
+            .lock()
+            .unwrap()
+            .first_subtree_overlap(&self.op_subtrees(node, rid, from_ms, at), from_ms, at)
+            .map(|(start, holder)| (start, holder, true));
+        let s4_span = held_span
+            .into_iter()
+            .chain(cut_span)
+            .min_by_key(|&(start, _, _)| start)
+            .map(|(start, holder, cut)| S4Span {
+                start,
+                holder,
+                cut,
+                root_blocked: !self
+                    .reach
+                    .classify(super::reach::Question::new(node, from_ms.max(start), at))
+                    .allowed(),
+                unshippable: cut
+                    && self
+                        .reach
+                        .classify(super::reach::Question::new(holder, start, at))
+                        .allowed(),
+            });
+        let release_read_recall = s4_span.as_ref().is_some_and(S4Span::fires);
         let verdict = self.reach.classify(question.clone());
-        let release_read_recall = held_tag || (cut_tag && !verdict.allowed());
         let silence = self.reach.silence_class(&question, &verdict);
         // Late-landing U1(a): a settle that could not write its tombstones
         // for a whole window (`w` before it went on without the inbox) was
@@ -1113,6 +1224,7 @@ impl Oracles {
             chunk_lost,
             plan_held,
             release_read_recall,
+            s4_span,
             at: tokio::time::Instant::now(),
         });
     }
@@ -4301,6 +4413,26 @@ mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
 
+    /// Round 6: the predicate, one for both arms. An `S4Span` fires when the
+    /// requester asked of the root alone was not allowed, and not when the
+    /// holder could not ship the cut row (the named excuse).
+    #[test]
+    fn the_s4_predicate_fires_on_a_blocked_requester_unless_the_cut_row_was_unshippable() {
+        let span = |root_blocked, unshippable| S4Span {
+            start: 1_000,
+            holder: 2,
+            cut: true,
+            root_blocked,
+            unshippable,
+        };
+        assert!(span(true, false).fires());
+        assert!(
+            !span(false, false).fires(),
+            "no usable root: no cut's to prevent"
+        );
+        assert!(!span(true, true).fires(), "the cut row could not ship");
+    }
+
     /// MUST-2: a cut span tags an EIO per subtree. The held spans of the
     /// knob-on arm are gone on the fix arm, which waits in a cut.
     #[test]
@@ -4314,6 +4446,14 @@ mod tests {
         // of 41 (until 4_000).
         assert!(c.overlaps_subtrees(&under(5, 40), 2_500, 3_500));
         assert!(c.overlaps_subtrees(&under(5, 41), 2_500, 3_500));
+        // The earliest overlapping span says where it started and whose it is
+        // (round 6: the predicate judges the requester from there).
+        let both = BTreeSet::from([(5, 40), (5, 41)]);
+        assert_eq!(
+            c.first_subtree_overlap(&both, 2_500, 3_500),
+            Some((1_000, 2))
+        );
+        assert_eq!(c.first_subtree_overlap(&both, 4_000, 5_000), None);
         // After the cut of 40 ended only 41's counts.
         assert!(!c.overlaps_subtrees(&under(5, 40), 3_100, 3_500));
         assert!(c.overlaps_subtrees(&under(5, 41), 3_100, 3_500));

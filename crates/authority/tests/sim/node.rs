@@ -580,6 +580,10 @@ pub struct NodeEnv {
     pub claim_ends_silently: bool,
     /// See `SimConfig::no_release_cut` (inverted: `Config::release_cut`).
     pub release_cut: bool,
+    /// See `SimConfig::cut_row_withheld`.
+    pub cut_row_withheld: bool,
+    /// See `SimConfig::root_ignores_cut`.
+    pub root_ignores_cut: bool,
     /// See `SimConfig::fence_accepts_unrouted`.
     pub fence_accepts_unrouted: bool,
     /// See `SimConfig::holder_runs_inbox_ever`.
@@ -944,6 +948,8 @@ impl NodeHandle {
         cfg.sticky_idle_release_ms = env.sticky_idle_release_ms;
         cfg.claim_ends_silently = env.claim_ends_silently;
         cfg.release_cut = env.release_cut;
+        cfg.cut_row_withheld = env.cut_row_withheld;
+        cfg.root_ignores_cut = env.root_ignores_cut;
         cfg.fence_accepts_unrouted = env.fence_accepts_unrouted;
         cfg.holder_runs_inbox_ever = env.holder_runs_inbox_ever;
         cfg.root_ignores_touched = env.root_ignores_touched;
