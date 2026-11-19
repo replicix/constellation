@@ -664,9 +664,16 @@ pub struct Meta {
     /// table at all, so a cluster without delegations pays nothing.
     pub(crate) deleg_any: AtomicBool,
     /// Plan 46 M1.3 step 15b (ADR-64): a node-local `deleg_own_cut` key was
-    /// written here (or found at open). Raised only: while it is clear,
+    /// written here (or found at open). Lowered when the last key is cleared
+    /// (`own_cut_gens` empty): while it is clear,
     /// [`Meta::delegation_table`] is the raw fold with no look at the keys.
     pub(crate) own_cut_any: AtomicBool,
+    /// The generations a `deleg_own_cut` key is held for (kept beside the
+    /// keys: raised before the commit that writes one, lowered with the
+    /// transaction that clears the last subtree of a generation). Read only
+    /// when the key scan itself fails, to fail closed: every subtree of
+    /// these streams is taken as cut.
+    pub(crate) own_cut_gens: std::sync::Mutex<std::collections::BTreeSet<u64>>,
     /// Executions the store refused because they touch a subtree this node's
     /// stream cut (ADR-64's fence, `deleg_exec_in_cut`); read by
     /// [`Meta::take_deleg_exec_in_cut`].
@@ -1428,6 +1435,7 @@ impl Meta {
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             own_cut_any: AtomicBool::new(false),
+            own_cut_gens: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             deleg_exec_in_cut: AtomicU64::new(0),
             deleg_gate: std::sync::RwLock::new(()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),

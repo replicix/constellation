@@ -1343,6 +1343,9 @@ pub struct Stats {
     /// ADR-64: pending cuts dropped because the claim of the lease released
     /// the whole stream by its own row.
     pub deleg_cut_left_to_claim: u64,
+    /// ADR-64: pending cuts taken into a release of the whole stream (a row
+    /// or a rowless end) that came before their release rows.
+    pub deleg_cut_absorbed: u64,
     /// ADR-64: a cut whose release row could not be journaled once the reads
     /// were clear (a lost dependency, rows its tenure has not committed): the
     /// release went rowless.

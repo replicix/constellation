@@ -892,6 +892,13 @@ pub(crate) struct DelegateState {
     /// which is what lets [`DelegateState::remnant_decides_held_drop`] decide
     /// the drop of its held rows (996 B).
     pub remnant: bool,
+    /// ADR-64: installed again after a restart for a stream this node cut
+    /// whole and has not released (its release row, or the cut that waits for
+    /// one, is still to ship): the restarted counterpart of a remnant, which
+    /// the cut's own view of the table keeps from being one (the cut row is
+    /// no release row). It decides a drop of the stream's held rows as a
+    /// remnant does ([`Self::remnant_decides_held_drop`]).
+    pub cut_remnant: bool,
     /// ADR-55: the state outlived the end of its generation, or the table's
     /// forgetting it, only for its release row
     /// ([`Core::release_row_unshipped`]): [`Core::kept_row_progress`] lets it
@@ -1138,11 +1145,26 @@ impl DelegateState {
     /// release, a lapsed or backup-sealed stream and a gate-ended one do not
     /// qualify.
     pub(crate) fn remnant_decides_held_drop(&self) -> bool {
-        self.remnant
+        (self.remnant
             && self.lost_from.is_none()
             && self.dirs.is_empty()
             && !self.release_acked
-            && self.release.as_ref().is_some_and(|r| r.row.is_some())
+            && self.release.as_ref().is_some_and(|r| r.row.is_some()))
+            || self.cut_remnant_decides_held_drop()
+    }
+
+    /// ADR-64: [`Self::remnant_decides_held_drop`] for a restarted whole-cut
+    /// holder, on the same conditions: the cut row or the release row after
+    /// it is still to ship, no subtree is left, and nothing was lost. The
+    /// argument is the remnant's: the held rows and every row after them
+    /// never left this journal.
+    fn cut_remnant_decides_held_drop(&self) -> bool {
+        self.cut_remnant
+            && self.lost_from.is_none()
+            && self.dirs.is_empty()
+            && !self.release_acked
+            && (self.cuts.iter().any(|c| c.whole)
+                || self.release.as_ref().is_some_and(|r| r.row.is_some()))
     }
 }
 
@@ -1869,6 +1891,26 @@ impl Core {
             .filter(|(_, d)| !d.cuts.is_empty())
             .map(|(gen, _)| *gen)
             .collect()
+    }
+
+    /// ADR-64: the `(generation, subtree)` pairs of this node's pending cuts,
+    /// for the simulation's per-subtree S4 tag of the cut spans. Read-only;
+    /// ascending.
+    #[must_use]
+    pub fn deleg_cut_subtrees(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = self
+            .dl
+            .mine
+            .iter()
+            .flat_map(|(gen, d)| {
+                d.cuts
+                    .iter()
+                    .flat_map(|c| c.dirs.iter().map(|dir| (*gen, *dir)))
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     pub fn deleg_view(&self) -> DelegView {
@@ -3427,6 +3469,7 @@ impl Core {
                         ends: true,
                     }),
                     cuts: Vec::new(),
+                    cut_remnant: !own_cut.is_empty() && st.subtrees.is_empty(),
                     release_acked: false,
                     release_pending: (BTreeSet::new(), 0),
                     released_dirs: own_cut.clone(),
@@ -9751,7 +9794,14 @@ impl Core {
         // ADR-64: a release that must wait for read delegations journals a
         // `ReleaseCut` first, and its release row once they are gone. The
         // root's own stream (ADR-55) keeps today's path.
-        let cut_mode = self.cfg.release_cut && self.cfg.read_delegations && !rowless && from != me;
+        // (A generation this node's takeover gate ended is released by the
+        // row, as on main: `stopped` trails the store's mark, so the gate is
+        // asked, not the flag.)
+        let cut_mode = self.cfg.release_cut
+            && self.cfg.read_delegations
+            && !rowless
+            && from != me
+            && !replica.deleg_ended_at_gate(gen);
         let early_wait = if cut_mode {
             let need = self.release_read_need(now, gen, whole, &asked, replica);
             self.start_recalls(now, need, out)
@@ -9761,12 +9811,6 @@ impl Core {
         let mut row = None;
         let mut cut_row = None;
         if early_wait.is_some() {
-            // (A generation the takeover gate ended is stopped, so it is
-            // rowless: it never gets here.)
-            debug_assert!(
-                !replica.deleg_ended_at_gate(gen),
-                "a cut on a generation the takeover gate ended"
-            );
             if let Some(d) = self.dl.mine.get_mut(&gen) {
                 Self::deleg_group_refresh_one(d, replica);
             }
@@ -9886,7 +9930,7 @@ impl Core {
                     due: false,
                 });
             } else {
-                let release = PendingRelease {
+                let mut release = PendingRelease {
                     note,
                     row,
                     first_row: row,
@@ -9896,6 +9940,14 @@ impl Core {
                     to: from,
                     ends: whole || rowless,
                 };
+                if whole {
+                    // The release covers every subtree: a cut of the stream
+                    // still waiting for its row is inside it, and journals
+                    // none after the stream's (ADR-64).
+                    let absorbed;
+                    (release, absorbed) = Self::absorb_cuts(d, release, now.wait);
+                    self.stats.deleg_cut_absorbed += absorbed;
+                }
                 // A note the root has not acknowledged is never dropped for
                 // this one: the two are one.
                 d.release = Some(match d.release.take() {
@@ -10117,6 +10169,42 @@ impl Core {
         self.deleg_stream(now, replica, out);
     }
 
+    /// ADR-64: a release that covers the whole stream (a `StreamReleased` row
+    /// or a rowless end) takes the stream's pending cuts into its note: their
+    /// subtrees and lock grants join it, and their release rows are never
+    /// journaled (a row after the stream's release or end would be past it).
+    /// Returns the release and how many cuts it took.
+    fn absorb_cuts(
+        d: &mut DelegateState,
+        mut release: PendingRelease,
+        now: WaitMs,
+    ) -> (PendingRelease, u64) {
+        let cuts = std::mem::take(&mut d.cuts);
+        let n = cuts.len() as u64;
+        for c in cuts {
+            let mut note = c.note;
+            if let Some(end) = release.note.end_at {
+                note.end_at = Some(end);
+                note.locks
+                    .rows
+                    .iter_mut()
+                    .for_each(|(_, at)| *at = (*at).min(end));
+            }
+            let absorbed = PendingRelease {
+                note,
+                row: release.row,
+                first_row: release.first_row,
+                held: false,
+                holds: 0,
+                left_at: c.left_at,
+                to: c.to,
+                ends: c.whole,
+            };
+            release = release.merge(absorbed, now);
+        }
+        (release, n)
+    }
+
     /// ADR-64: journals the release row of a cut whose reads are clear
     /// (`PendingCut::due`), and turns the cut into the generation's
     /// `PendingRelease` as a release journaled at that moment would be. The
@@ -10170,10 +10258,27 @@ impl Core {
             self.stats.deleg_cut_left_to_claim += 1;
             return;
         }
+        // The stream was released or ended meanwhile (a whole release, a
+        // claim, a stop that ended it rowless): the cut's subtrees are inside
+        // that, and a row of this cut would sit past the stream's end.
+        if self.release_row_journaled(gen, replica) {
+            drop_cut(self);
+            self.stats.deleg_cut_left_to_claim += 1;
+            return;
+        }
         let idx = replica.delegate_idx(gen);
         let append_cap = self.holder_append_cap(gen, replica);
         let lost = self.deleg_find_lost(gen, replica);
-        if lost.is_some() || append_cap < idx {
+        // A stopped stream cannot take a row of a part of it (its release is
+        // rowless, as `release_subtrees`' is). A whole cut stopped the stream
+        // itself: while one is pending that is no reason.
+        let stopped = !c.whole
+            && self
+                .dl
+                .mine
+                .get(&gen)
+                .is_some_and(|d| d.stopped && !d.cuts.iter().any(|x| x.whole));
+        if lost.is_some() || append_cap < idx || stopped {
             self.release_cut_rowless(now, gen, c, idx, append_cap, lost, replica, out);
             return;
         }
@@ -10243,9 +10348,10 @@ impl Core {
     }
 
     /// ADR-64: the release of a cut whose stream cannot take a row now (a
-    /// dependency was lost, rows its tenure has not committed): today's
-    /// rowless release, the stream ended at its cut with every subtree. The
-    /// reads are clear, so the note is not held.
+    /// dependency was lost, rows its tenure has not committed, a stopped
+    /// stream): today's rowless release, the stream ended at its cut with
+    /// every subtree and every other pending cut. Only the reads under this
+    /// cut's subtrees are known clear: the note is held for the others'.
     #[allow(clippy::too_many_arguments)]
     fn release_cut_rowless(
         &mut self,
@@ -10321,10 +10427,29 @@ impl Core {
             to: c.to,
             ends: true,
         };
+        // Only this cut's subtrees are known clear of reads. The stream ends
+        // with every other subtree and pending cut, so the reads under all of
+        // them are recalled first, and the note is held until they are gone
+        // (ADR-64, as `release_subtrees`' rowless branch holds it).
+        let wait = if self.cfg.read_delegations {
+            let need = self.release_read_need(now, gen, true, &BTreeSet::new(), replica);
+            self.start_recalls(now, need, out)
+        } else {
+            None
+        };
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
         };
         d.cuts.retain(|x| x.cut_row != c.cut_row);
+        // The other pending cuts end with the stream: their notes join this
+        // one, and their release rows are never journaled.
+        let (mut release, absorbed) = Self::absorb_cuts(d, release, now.wait);
+        self.stats.deleg_cut_absorbed += absorbed;
+        if wait.is_some() {
+            release.held = true;
+            release.holds += 1;
+            self.stats.deleg_release_rowless_held += 1;
+        }
         d.dirs.clear();
         d.grown.clear();
         d.stopped = true;
@@ -10339,9 +10464,20 @@ impl Core {
             }
             None => release,
         };
+        let held = merged.held;
         let note = merged.note_at(now.wait);
         d.release = Some(merged);
-        self.send_release_cut(gen, c.to, note, out);
+        if let Some(wait) = wait {
+            self.park(
+                now,
+                wait,
+                None,
+                super::readindex::ParkedWhat::ReleaseHeld { gen },
+            );
+        }
+        if !held {
+            self.send_release_cut(gen, c.to, note, out);
+        }
     }
 
     /// A release that journaled no row (`ReleaseNote::end_at`) says so to the

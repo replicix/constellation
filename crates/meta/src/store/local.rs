@@ -1333,34 +1333,47 @@ impl Meta {
 
     /// Plan 46 M1.3 step 15b (ADR-64): the subtrees this node's stream `gen`
     /// cut and has not released (empty: none). Node-local; the holder's own
-    /// view of what it stopped executing in.
+    /// view of what it stopped executing in. Fails closed: a key that cannot
+    /// be read or parsed counts every subtree of the stream as cut.
     pub fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino> {
         if !self.own_cut_any.load(Ordering::Acquire) {
             return Default::default();
         }
         let r = self.db.read_tx();
-        own_cut_dirs_tx(&r, &self.local, gen).unwrap_or_default()
+        match own_cut_dirs_tx(&r, &self.local, gen) {
+            Ok(dirs) => dirs,
+            Err(error) => {
+                tracing::error!(%error, gen, "the own-cut key cannot be read: every subtree of the stream is taken as cut");
+                let table = crate::delegation::read_table_tx(&r, self).unwrap_or_default();
+                table
+                    .node_of_gen(gen)
+                    .and_then(|node| table.stream(node, gen))
+                    .map(|s| s.subtrees.iter().map(|(d, _)| *d).collect())
+                    .unwrap_or_default()
+            }
+        }
     }
 
     /// The generations this node holds an own-cut key for, with their
-    /// subtrees (the raw read behind [`Self::delegation_table`]'s view).
+    /// subtrees (the raw read behind [`Self::delegation_table`]'s view);
+    /// `None`: a key whose value cannot be parsed, so every subtree of the
+    /// stream (fail closed). An error: the scan or a key name failed.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn own_cuts_tx(
         &self,
         r: &impl Readable,
-    ) -> Result<Vec<(u64, std::collections::BTreeSet<Ino>)>, MetaError> {
+    ) -> Result<Vec<(u64, Option<std::collections::BTreeSet<Ino>>)>, MetaError> {
         let mut out = Vec::new();
         for guard in r.prefix(&self.local, DELEG_OWN_CUT_PREFIX.as_bytes()) {
             let (k, v) = guard.into_inner()?;
-            let Some(gen) = std::str::from_utf8(&k)
+            let gen = std::str::from_utf8(&k)
                 .ok()
                 .and_then(|k| k.strip_prefix(DELEG_OWN_CUT_PREFIX))
                 .and_then(|g| g.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            let dirs = parse_own_cut(&String::from_utf8_lossy(&v));
-            if !dirs.is_empty() {
-                out.push((gen, dirs));
+                .ok_or_else(|| MetaError::Invalid("an own-cut key with no generation".into()))?;
+            match parse_own_cut(&String::from_utf8_lossy(&v)) {
+                Some(dirs) if dirs.is_empty() => {}
+                dirs => out.push((gen, dirs)),
             }
         }
         Ok(out)
@@ -1370,10 +1383,22 @@ impl Meta {
     /// left by a previous process.
     pub(crate) fn load_own_cut_flag(&self) -> Result<(), MetaError> {
         let r = self.db.read_tx();
-        if r.prefix(&self.local, DELEG_OWN_CUT_PREFIX.as_bytes())
-            .next()
-            .is_some()
-        {
+        let mut gens = std::collections::BTreeSet::new();
+        for guard in r.prefix(&self.local, DELEG_OWN_CUT_PREFIX.as_bytes()) {
+            let (k, _) = guard.into_inner()?;
+            if let Some(gen) = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|k| k.strip_prefix(DELEG_OWN_CUT_PREFIX))
+                .and_then(|g| g.parse::<u64>().ok())
+            {
+                gens.insert(gen);
+            }
+        }
+        if !gens.is_empty() {
+            self.own_cut_gens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(gens);
             self.own_cut_any.store(true, Ordering::Release);
         }
         Ok(())
@@ -3734,6 +3759,49 @@ mod root_substitution_tests {
         assert_eq!(meta.delegation_table(), meta.delegation_table_folded());
     }
 
+    /// ADR-64 (review S-4, S-5): a key whose value cannot be parsed counts
+    /// every subtree of its stream as cut, in the view and in the fence's
+    /// input; and the flag comes down with the last key, so a node that cut
+    /// once reads the keys no more.
+    #[test]
+    fn an_unreadable_own_cut_key_fails_closed_and_the_flag_comes_down() {
+        use std::sync::atomic::Ordering;
+        let (meta, d, e) = cut_fixture();
+        assert!(!meta.own_cut_any.load(Ordering::Acquire));
+        meta.delegate_cut(1, 5, &[d], 0, Default::default())
+            .unwrap();
+        assert!(meta.own_cut_any.load(Ordering::Acquire));
+        // A damaged value: the whole stream is taken as cut.
+        meta.kv_set("deleg_own_cut:5", "garbage").unwrap();
+        assert_eq!(meta.own_cut_dirs(5), BTreeSet::from([d, e]));
+        let view = meta.delegation_table();
+        assert!(view.get(d).is_none() && view.get(e).is_none());
+        assert!(meta.delegation_table_folded().get(e).is_some());
+        // The key as written: only `/d`.
+        meta.kv_set("deleg_own_cut:5", &d.to_string()).unwrap();
+        assert_eq!(meta.own_cut_dirs(5), BTreeSet::from([d]));
+        meta.delegate_release(
+            &[LogRecord::SubtreeReleased {
+                node: 1,
+                gen: 5,
+                dir: d,
+                at: 0,
+            }],
+            5,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(
+            !meta.own_cut_any.load(Ordering::Acquire),
+            "the flag stays up after the last cut ended"
+        );
+        // A later cut raises it again.
+        meta.delegate_cut(1, 5, &[e], 1, Default::default())
+            .unwrap();
+        assert!(meta.own_cut_any.load(Ordering::Acquire));
+        assert_eq!(meta.own_cut_dirs(5), BTreeSet::from([e]));
+    }
+
     /// ADR-64's store fence: after the cut an execution touching the cut
     /// subtree is refused `NotAdmitted` with nothing written and counted;
     /// one in the stream's other subtree, or the root's, goes through.
@@ -3982,8 +4050,13 @@ fn deleg_own_cut_key(gen: u64) -> String {
     format!("{DELEG_OWN_CUT_PREFIX}{gen}")
 }
 
-fn parse_own_cut(v: &str) -> std::collections::BTreeSet<Ino> {
-    v.split(',').filter_map(|d| d.parse().ok()).collect()
+/// The subtrees of an own-cut key; `None` when any of them cannot be parsed
+/// (the key is then no evidence of what was cut: callers fail closed).
+fn parse_own_cut(v: &str) -> Option<std::collections::BTreeSet<Ino>> {
+    v.split(',')
+        .filter(|d| !d.is_empty())
+        .map(|d| d.parse().ok())
+        .collect()
 }
 
 pub(crate) fn own_cut_dirs_tx(
@@ -3991,9 +4064,12 @@ pub(crate) fn own_cut_dirs_tx(
     local: &SingleWriterTxKeyspace,
     gen: u64,
 ) -> Result<std::collections::BTreeSet<Ino>, MetaError> {
-    Ok(kv_get_tx(r, local, &deleg_own_cut_key(gen))?
-        .map(|v| parse_own_cut(&v))
-        .unwrap_or_default())
+    match kv_get_tx(r, local, &deleg_own_cut_key(gen))? {
+        Some(v) => parse_own_cut(&v).ok_or_else(|| {
+            MetaError::Invalid(format!("the own-cut key of {gen} cannot be parsed"))
+        }),
+        None => Ok(Default::default()),
+    }
 }
 
 fn put_own_cut_tx(
@@ -4023,6 +4099,10 @@ pub(crate) fn mark_own_cut_tx(
 ) -> Result<(), MetaError> {
     let mut set = own_cut_dirs_tx(&*tx, &meta.local, gen)?;
     set.extend(dirs.iter().copied());
+    meta.own_cut_gens
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(gen);
     meta.own_cut_any.store(true, Ordering::Release);
     put_own_cut_tx(tx, &meta.local, gen, &set);
     Ok(())
@@ -4051,6 +4131,20 @@ pub(crate) fn clear_own_cut_tx(
         None => set.clear(),
     }
     put_own_cut_tx(tx, &meta.local, gen, &set);
+    if set.is_empty() {
+        // The last subtree of the generation: the flag goes down with the
+        // last key (a cut node would else scan the keys on every table read
+        // for the life of the process). Lowered before the commit as
+        // `deleg_any` is; the writer is single and a mark raises it again.
+        let mut gens = meta
+            .own_cut_gens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gens.remove(&gen);
+        if gens.is_empty() {
+            meta.own_cut_any.store(false, Ordering::Release);
+        }
+    }
     Ok(())
 }
 

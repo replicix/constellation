@@ -76975,6 +76975,199 @@ mod step9_one_stream_per_node {
         let _ = (f1, f2, r2);
     }
 
+    /// ADR-64 (review MUST-1): a due cut whose row cannot be journaled (a lost
+    /// dependency) ends the stream rowless with every other subtree, so the
+    /// reads under them are recalled first and the note is held until they
+    /// are gone. Fails on the parent: the note left at once and the root
+    /// executed in `d3` under node 3's live read grant.
+    #[test]
+    fn a_rowless_end_after_a_cut_waits_for_the_other_subtrees_reads() {
+        let (mut h, d1, d2, d3, _f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d2, until);
+        h.meta.read_delegations().grant(4, d3, until);
+        let recall_of = |out: &[Action], ino| {
+            sends(out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegationRecall { req, ino: i, .. } if *i == ino => Some((to, *req)),
+                _ => None,
+            })
+        };
+        let out = release_request(&mut h, 5, vec![d2]);
+        let (_, r2) = recall_of(&out, d2).expect("recall of d2");
+        assert!(recall_of(&out, d3).is_none(), "d3 is not asked for");
+        assert_eq!(h.core.dl.mine[&7].cuts.len(), 1);
+        // A dependency of a later row is lost; d2's grant is answered.
+        h.core.dl.mine.get_mut(&7).unwrap().lost_from = Some(2);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: r2 },
+        });
+        assert_eq!(h.core.stats.deleg_cut_rowless_after, 1);
+        let (_, r3) =
+            recall_of(&out, d3).unwrap_or_else(|| panic!("d3's grant not recalled: {out:?}"));
+        assert!(
+            release_note_to(&out, 1).is_none(),
+            "the stream ended with a live read grant under d3: {out:?}"
+        );
+        let r = h.core.dl.mine[&7].release.clone().expect("the release");
+        assert!(r.held && r.row.is_none());
+        assert_eq!(h.core.stats.deleg_release_rowless_held, 1);
+        // Node 3's grant is gone: the note goes, ended at the cut, with d1
+        // and d3 and the cut's subtree.
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::DelegationRecalled { req: r3 },
+        });
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no note: {out:?}"));
+        assert!(note.end_at.is_some());
+        for d in [d1, d2, d3] {
+            assert!(note.dirs.contains(&d), "{d}: {:?}", note.dirs);
+        }
+    }
+
+    /// ADR-64 (review S-1): the other pending cuts end with a rowless end,
+    /// their reads recalled and their notes in it: no row of theirs follows.
+    #[test]
+    fn a_rowless_end_takes_the_other_pending_cuts_with_it() {
+        let (mut h, d1, d2, d3, _f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        h.meta.read_delegations().grant(2, d2, until);
+        let recall_of = |out: &[Action], ino| {
+            sends(out).into_iter().find_map(|(_, m)| match m {
+                PeerMsg::DelegationRecall { req, ino: i, .. } if *i == ino => Some(*req),
+                _ => None,
+            })
+        };
+        let out = release_request(&mut h, 5, vec![d1]);
+        let r1 = recall_of(&out, d1).expect("recall of d1");
+        let out = release_request(&mut h, 6, vec![d2]);
+        let r2 = recall_of(&out, d2).expect("recall of d2");
+        assert_eq!(h.core.dl.mine[&7].cuts.len(), 2);
+        h.core.dl.mine.get_mut(&7).unwrap().lost_from = Some(3);
+        // d2's reads clear first: its row cannot be journaled; d1's reads
+        // are still out, so the end waits for them.
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: r2 },
+        });
+        assert!(release_note_to(&out, 1).is_none(), "{out:?}");
+        assert!(h.core.dl.mine[&7].cuts.is_empty(), "d1's cut stays pending");
+        assert_eq!(h.core.stats.deleg_cut_absorbed, 1);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: r1 },
+        });
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no note: {out:?}"));
+        for d in [d1, d2, d3] {
+            assert!(note.dirs.contains(&d), "{d}: {:?}", note.dirs);
+        }
+        let recs: Vec<LogRecord> =
+            crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
+                .into_iter()
+                .flat_map(|t| t.records)
+                .collect();
+        assert!(
+            !recs.iter().any(|r| matches!(
+                r,
+                LogRecord::SubtreeReleased { .. } | LogRecord::StreamReleased { .. }
+            )),
+            "{recs:?}"
+        );
+    }
+
+    /// ADR-64 (review S-3): a generation this node's takeover gate ended
+    /// takes today's path when asked to release with a read grant live (the
+    /// row, held), not a cut: `stopped` trails the gate's mark, and the
+    /// parent's `debug_assert!` fired there.
+    #[test]
+    fn a_gate_ended_generation_releases_by_the_held_row_not_a_cut() {
+        let (mut h, d1, _d2, _d3, _f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        h.meta.strand_for_takeover(2, &[7], None).unwrap();
+        assert!(h.meta.deleg_ended_at_gate(7).unwrap());
+        assert!(!h.core.dl.mine[&7].stopped, "stopped trails the mark");
+        release_request(&mut h, 5, vec![d1]);
+        assert_eq!(h.core.stats.deleg_cuts, 0);
+        assert!(h.core.dl.mine[&7].cuts.is_empty());
+    }
+
+    /// ADR-64 (review S-1): a stopped stream takes no row of a part of it: a
+    /// due cut ends it rowless. Fails on the parent: `SubtreeReleased` was
+    /// journaled after the stop.
+    #[test]
+    fn a_due_cut_on_a_stopped_stream_journals_no_row() {
+        let (mut h, d1, _d2, _d3, _f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        let out = release_request(&mut h, 5, vec![d1]);
+        let r1 = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::DelegationRecall { req, .. } => Some(*req),
+                _ => None,
+            })
+            .expect("recall");
+        h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: r1 },
+        });
+        assert_eq!(h.core.stats.deleg_cut_rowless_after, 1);
+        assert!(
+            release_note_to(&out, 1).is_some_and(|n| n.end_at.is_some()),
+            "{out:?}"
+        );
+        let recs: Vec<LogRecord> =
+            crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
+                .into_iter()
+                .flat_map(|t| t.records)
+                .collect();
+        assert!(
+            !recs
+                .iter()
+                .any(|r| matches!(r, LogRecord::SubtreeReleased { .. })),
+            "{recs:?}"
+        );
+    }
+
+    /// ADR-64 (review S-1): a whole release journaled while a cut waits for
+    /// its row (the cut's grant expired by the clock before its timer) takes
+    /// the cut into its note: no row of the cut follows the stream's.
+    #[test]
+    fn a_whole_release_takes_a_pending_cut_with_it() {
+        let (mut h, d1, d2, d3, _f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        let out = release_request(&mut h, 5, vec![d1]);
+        assert!(sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::DelegationRecall { .. })));
+        assert_eq!(h.core.dl.mine[&7].cuts.len(), 1);
+        // The grant lapses by the clock; the request for the rest arrives
+        // before the park's timer.
+        h.advance(6_000);
+        release_request(&mut h, 6, vec![d2, d3]);
+        assert_eq!(h.core.stats.deleg_cut_absorbed, 1);
+        assert!(h.core.dl.mine.get(&7).is_none_or(|d| d.cuts.is_empty()));
+        let recs: Vec<LogRecord> =
+            crate::replica::Replica::delegate_txs_from(&h.meta, 7, 1, usize::MAX)
+                .into_iter()
+                .flat_map(|t| t.records)
+                .collect();
+        let last = recs
+            .iter()
+            .rposition(|r| matches!(r, LogRecord::StreamReleased { .. }))
+            .expect("the stream's release row");
+        assert!(
+            !recs[last..]
+                .iter()
+                .any(|r| matches!(r, LogRecord::SubtreeReleased { .. })),
+            "{recs:?}"
+        );
+    }
+
     /// ADR-64: a cut of every subtree left in the stream releases the whole
     /// stream, subtrees of earlier cuts included, so its release row goes
     /// after theirs: the root must not see `d1` free while the read
@@ -83097,6 +83290,9 @@ mod step5_sticky_release {
         assert!(d.release.is_none(), "a synthetic release for the cut row");
         assert_eq!(d.cuts.len(), 1);
         assert!(d.restart_q.is_some());
+        // The restarted whole-cut holder decides a drop of its held rows, as
+        // a remnant does.
+        assert!(d.remnant_decides_held_drop());
         // Nothing executes under the cut, and the cut row's acknowledgement
         // is not a release's.
         let before = rows(&h).len();

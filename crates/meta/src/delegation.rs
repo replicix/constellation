@@ -670,9 +670,32 @@ impl Meta {
         let r = self.db.read_tx();
         let mut table = read_table_tx(&r, self).unwrap_or_default();
         if self.own_cut_any.load(std::sync::atomic::Ordering::Acquire) {
-            for (gen, dirs) in self.own_cuts_tx(&r).unwrap_or_default() {
+            let cuts = match self.own_cuts_tx(&r) {
+                Ok(cuts) => cuts,
+                Err(error) => {
+                    // Fail closed: the keys cannot be read, so every subtree
+                    // of the streams this node holds a key for is taken as
+                    // cut (the holder executes nothing in them).
+                    tracing::error!(%error, "the own-cut keys cannot be read: every subtree of the streams cut here is taken as cut");
+                    self.own_cut_gens
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .map(|g| (*g, None))
+                        .collect()
+                }
+            };
+            for (gen, dirs) in cuts {
                 let Some(node) = table.node_of_gen(gen) else {
                     continue;
+                };
+                // `None`: every subtree of the stream.
+                let dirs: Vec<Ino> = match dirs {
+                    Some(dirs) => dirs.into_iter().collect(),
+                    None => table
+                        .stream(node, gen)
+                        .map(|s| s.subtrees.iter().map(|(d, _)| *d).collect())
+                        .unwrap_or_default(),
                 };
                 for dir in dirs {
                     table.apply(DelegationRecord::SubtreeReleased { node, gen, dir });
