@@ -71172,3 +71172,51 @@ ignored (includes m03 with the unchanged ceilings). Sweeps of 0..1999, origin/ma
 (every `locks*`, flex-tight and +unsettled, the m03 configurations, the four late-applied labels): identical failing sets except
 `flex-tight+unsettled` (above), `locks-unlinked-delegated-blips+unsettled` (6 on main, 4 here, none new) and `locks-blips-tight-late-applied`
 (2 on main, 0 here). No new I-class, lock or liveness failure.
+
+### The release in doubt: only the node's own CAS lifts the fence, every own re-read included (2026-11-19, round 6)
+
+Round 5's review (Fable) found one door left in the safe fence: the **first** re-read of a release in doubt, made at once after the failed CAS,
+still lifted the fence on a read alone (`was_waiting` gated the renewal). A slow PUT overtaken by a fast GET is the ordinary timeout case, and the
+PUT can land after the read and release the lease under a node that went on as holder. Main has had the same gap since 56085d00.
+
+- **Rule.** An own re-read of a release in doubt (`in_doubt: true`) that shows the lease standing always goes through the renewal CAS. The node
+  enters the wait first (the renewal's conflict and no-answer arms need its timer, its probes still inform the wait) and `renew_in_doubt` sends the
+  CAS; the fence lifts when it lands. Where `may_wait_unresolved` is false (a shutdown flush, an epoch hold, no honour left) the node gives the
+  lease up instead of keeping it. A release that failed with a conflict (`in_doubt: false`: the PUT was answered) keeps the old rule. ADR-22's
+  exception for the first re-read is gone; it states the rule plainly.
+- **Fail-before (M1).** New label `flex-tight-late-applied-nocut`: `TimeoutThenApplied { after_ms: 3000 }` on half the release PUTs, no cut, so the
+  first re-read succeeds. On 675c46e0, seeds 0..199: 4 fail "two authorities at once" (14, 20, 66, 126). On the final tree, 2,000 seeds: 0; on
+  origin/main 15 (20, 126, 177, ...). Pinned: `regression_the_first_reread_of_a_release_in_doubt_does_not_lift_the_fence`; core tests
+  `the_first_reread_of_a_release_in_doubt_renews_before_it_lifts_the_fence` and
+  `a_first_reread_that_shows_the_lease_standing_gives_up_where_the_node_may_not_wait`.
+- **S1.** `Fault::TimeoutThenAppliedRand { max_ms, cut_ms }`: the delay is drawn per request over `0..=max_ms` from the seed's rng. Label
+  `*-late-applied-shortcut`: half the release PUTs, delay `0..=6 s` (one TTL), cut 1 s, so the renewal races a live PUT and some PUTs land after
+  the give-up or a successor's claim. `flex-tight-late-applied-shortcut`, 2,000 seeds: 4,432 renewals, 0 failing (main 0 as well: with the cut
+  this short the first re-read mostly fails or sees the release landed; the label exercises the renewal against a live PUT, `-nocut` is the
+  fail-before).
+- **S2.** `*-late-applied-all`: the late apply (delay `0..=6 s`, 10 %) on every lease PUT (claim, renewal, reconfiguration, release and the
+  release's renewal), plus the shortcut rule on releases. `flex-tight-late-applied-all`: 6,375 renewals, 0 failing in 2,000 seeds (main 13, I2c
+  and two authorities from the first-re-read door); a late-applied renewal costs availability only. On 675c46e0, seed 28 of the label failed I2c
+  (200 seeds).
+- **S3.** `ReleaseUnresolved::renewals` remembers the expiry of every renewal sent. A give-up (`give_up_release_in_doubt(.., renewed, ..)`) covers
+  them: `PromiseState::given_up_renewed` makes an epoch carrying a renewed lease of this node a given-up one (`epoch_refuses_writes`,
+  `epoch_carries_let_go`), and the move is owed when the open epoch carries one at the give-up. Test:
+  `a_give_up_after_a_lost_renewal_covers_the_renewed_lease`. Cleared with `released`/`given_up` on an acquisition.
+- **Rebase onto origin/main 52f421c2 (drainerr).** No textual conflict in the release guard or `round_release` (only PROGRESS, both entries kept).
+  The semantic resolution: drainerr's guard fails a journal read error as `CasFailure::Conflict` (the CAS was never sent, `in_doubt: false`, a
+  failed re-read keeps the lease); that path is untouched and stays fail-closed. The guard's other failure, rows still in the journal, returned
+  `Failed`, which this branch treats as a release in doubt (a wait, a renewal CAS, a give-up if nothing resolves it) for a CAS that was never
+  sent; it now fails as `Conflict` too (`release_guard`, test updated). The decision of a release read error keeps not failing the round.
+- **Stale build trap.** Files shipped by `tar` keep old mtimes, so cargo reused a stale `constellation-meta` and the sim build failed with a
+  bogus E0782; the ship script touches every `.rs` now.
+- **Sweeps** (2,000 seeds, 143 labels: every `locks*`, `flex-tight` and `+unsettled`, the m03 configurations, every `*-late-applied`), origin/main
+  (plus the harness: the sim files and zero stats fields) against the final tree: failing sets identical (with no seed new on this side) on 135 of the 143, except
+  `flex-tight-late-applied-nocut` (15 on main, 0 here), `flex-tight-late-applied-all` (13, 0), `locks-blips-tight-late-applied` (2, 0),
+  `locks-unlinked-delegated-blips+unsettled` (6, 4, none new) and `flex-tight+unsettled` (62, 59; 18 new and 21 gone, the same counts as round 5,
+  still open as S5 in TRIAGE: latency, `Held` answers while the renewal runs). Three labels of the list (`locks-nofence`, `locks-partition-writes`,
+  `locks-pause-writes`) are not sweepable names on either side. No new I-class, lock or liveness failure.
+- **Not done:** N1 (cut as a counter), N2, N3, N5 and S4 (the fault in the `*-blips` and `*-faults` families, a round of its own: it moves pinned
+  seeds and ceilings).
+- **Gates** (final tree, box2, fresh build, 6 threads): fmt, `clippy --workspace --all-targets -D warnings` clean; lib tests debug and release:
+  authority 1778, engine 1003, meta 486/485, 0 failed; the release sim suite 584 passed, 0 failed, 16 ignored, with
+  `m03_the_configurations_at_zero_violations_stay_there` and the ceilings unchanged (none raised).
