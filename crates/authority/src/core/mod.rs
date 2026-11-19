@@ -179,7 +179,7 @@ pub struct Config {
     /// previous process granted (ADR-46, `Core::deleg_restart_quarantined`).
     /// The sim's close-to-open oracle must then fail the run.
     pub restart_skips_write_quarantine: bool,
-    /// Plan 46 M1.3 step 15b (ADR-63): a holder asked to release subtrees
+    /// Plan 46 M1.3 step 15b (ADR-64): a holder asked to release subtrees
     /// whose read delegations it must still recall journals a `ReleaseCut`
     /// row at once and its release row once they are gone, instead of the
     /// release row held back with everything after it. `false` is the held
@@ -1335,23 +1335,23 @@ pub struct Stats {
     /// ADR-59 part B: release requests deferred because this node's drop as
     /// the stream's holder had not reached the log yet.
     pub deleg_release_drop_pending: u64,
-    /// ADR-63: `ReleaseCut` rows this node journaled as a delegate.
+    /// ADR-64: `ReleaseCut` rows this node journaled as a delegate.
     pub deleg_cuts: u64,
-    /// ADR-63: the root's repeated release request for subtrees a pending
+    /// ADR-64: the root's repeated release request for subtrees a pending
     /// cut covers (the cut and its batch are sent again).
     pub deleg_cut_repeated: u64,
-    /// ADR-63: pending cuts dropped because the claim of the lease released
+    /// ADR-64: pending cuts dropped because the claim of the lease released
     /// the whole stream by its own row.
     pub deleg_cut_left_to_claim: u64,
-    /// ADR-63: a cut whose release row could not be journaled once the reads
+    /// ADR-64: a cut whose release row could not be journaled once the reads
     /// were clear (a lost dependency, rows its tenure has not committed): the
     /// release went rowless.
     pub deleg_cut_rowless_after: u64,
-    /// ADR-63: a release that held its note back from the stream for the read
+    /// ADR-64: a release that held its note back from the stream for the read
     /// recalls although it journaled no row (RC-1: rowless releases keep the
     /// held note).
     pub deleg_release_rowless_held: u64,
-    /// ADR-63's store fence: executions refused because they touch a
+    /// ADR-64's store fence: executions refused because they touch a
     /// subtree this node's stream cut (must stay 0).
     pub deleg_exec_in_cut: u64,
     pub deleg_release_rowless_partial: u64,
@@ -2190,12 +2190,12 @@ pub struct Stats {
     /// has not heard its delegate on (`on_forward`): they park behind the
     /// recall.
     pub settles_not_redirected_unheard: u64,
-    /// ADR-63: settles the root answered from what it holds (the dedup, else
+    /// ADR-64: settles the root answered from what it holds (the dedup, else
     /// a refusal) because their keys lie under subtrees a delegate's
     /// `ReleaseCut` row stopped: no redirect, no recall, no wait for the
     /// release row.
     pub settles_answered_at_cut: u64,
-    /// ADR-63 (R5): this node's own settles whose keys were at a cut, which
+    /// ADR-64 (R5): this node's own settles whose keys were at a cut, which
     /// it did not send to the stopped holder.
     pub settles_routed_around_cut: u64,
     /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it

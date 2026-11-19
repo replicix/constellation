@@ -7634,7 +7634,7 @@ impl Meta {
                     }
                 }
             }
-            // A claim's release row (ADR-60) or a holder's cut row (ADR-63)
+            // A claim's release row (ADR-60) or a holder's cut row (ADR-64)
             // has no rid and no op: nothing replays it, and it goes back
             // verbatim like the rows below it.
             let release_only = outcome.is_none()

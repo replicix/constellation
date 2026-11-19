@@ -504,7 +504,7 @@ impl Core {
             if self.cfg.delegation && self.deleg_known() {
                 let keys = keys_of_op_in(&op, replica);
                 let mut answered_from_outcome = false;
-                // ADR-63 (R1): a settle whose keys lie under subtrees a
+                // ADR-64 (R1): a settle whose keys lie under subtrees a
                 // delegate's cut row stopped (and the root's own) is
                 // answered from what this node holds, at once: the delegate
                 // appends nothing more there, so the dedup or the refusal is
@@ -1830,7 +1830,7 @@ impl Core {
         }
         let me = self.cfg.node_id;
         let keys = keys_of_op_in(op, replica);
-        // ADR-63 (R3, amends ADR-42/44): a settle on keys a delegate's cut
+        // ADR-64 (R3, amends ADR-42/44): a settle on keys a delegate's cut
         // row stopped (the predecessor's tail, applied, carries the row) is
         // answered here like a root key's, not redirected to the stopped
         // holder: under `g.epoch` once the gate's journal work is done.

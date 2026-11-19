@@ -1611,7 +1611,7 @@ fn c9_knob_server_replay_queue_is_found() {
     );
 }
 
-// ---------------------------------- plan 46 M1.3 step 15b: `ReleaseCut` (ADR-63)
+// ---------------------------------- plan 46 M1.3 step 15b: `ReleaseCut` (ADR-64)
 
 /// The model before the cut: a release waits for the read recall (the old
 /// behaviour, the control of the sim's `AUTHORITY_SIM_NO_RELEASE_CUT`).

@@ -68,7 +68,7 @@ pub enum DelegationRecord {
     /// Generation `gen` ended: every record of its stream that is not
     /// before this one in the log is void.
     DelegateNodeEnded { node: NodeId, gen: Gen },
-    /// Plan 46 M1.3 step 15b (ADR-63): the holder stopped executing in
+    /// Plan 46 M1.3 step 15b (ADR-64): the holder stopped executing in
     /// `dirs` (the stream's `ReleaseCut` row). Marks them; changes nothing
     /// else: a cut subtree is still the stream's in every view, until its
     /// release row.
@@ -133,7 +133,7 @@ pub struct DelegationTable {
     /// anyway; it floors the next mint (`Meta::next_delegation_gen`) and
     /// seeds the restart's session (`SessionState::seed_generations`).
     max_gen: Gen,
-    /// Plan 46 M1.3 step 15b (ADR-63): the subtrees whose holder journaled a
+    /// Plan 46 M1.3 step 15b (ADR-64): the subtrees whose holder journaled a
     /// `ReleaseCut` and has not released them yet, with the stream that cut
     /// them. Only [`Self::settle_at_cut`] and its accessors read it: `by_dir`,
     /// `streams`, `resolve` and `covering` still list a cut subtree as the
@@ -305,7 +305,7 @@ impl DelegationTable {
     }
 
     /// Whether any key of `keys` lies in a subtree of stream `gen` that its
-    /// holder cut and has not released (ADR-63's store fence).
+    /// holder cut and has not released (ADR-64's store fence).
     pub fn touches_cut(&self, ns: &dyn Namespace, keys: &TouchSet, gen: Gen) -> bool {
         if self.cut.is_empty() {
             return false;
@@ -318,7 +318,7 @@ impl DelegationTable {
             || keys.inos.iter().chain(keys.shared.iter()).any(|i| hit(*i))
     }
 
-    /// Whether a settle on `keys` is answered at a cut (ADR-63): at least one
+    /// Whether a settle on `keys` is answered at a cut (ADR-64): at least one
     /// key's covering delegation is a subtree its holder cut, and every key's
     /// is either the root's (`None`) or such a cut one. A key under a live,
     /// uncut delegation makes it false.
@@ -661,7 +661,7 @@ impl Meta {
     /// every `DelegateNode`/`SubtreeReleased`/`StreamReleased`/
     /// `DelegateNodeEnded` record it applied (its journal
     /// included, on the root), **less the subtrees this node's own stream
-    /// cut** (plan 46 M1.3 step 15b, ADR-63): from the `ReleaseCut` row the
+    /// cut** (plan 46 M1.3 step 15b, ADR-64): from the `ReleaseCut` row the
     /// holder stopped executing there, so its own view forgets them as its
     /// release row would, while every other replica's table still lists them
     /// as the stream's until the release row. One point read of a small key,
@@ -690,7 +690,7 @@ impl Meta {
         read_table_tx(&r, self).unwrap_or_default()
     }
 
-    /// ADR-63: whether a settle on `keys` is answered at a cut, on this
+    /// ADR-64: whether a settle on `keys` is answered at a cut, on this
     /// replica's view of the table.
     pub fn settle_at_cut(&self, keys: &TouchSet) -> bool {
         self.delegation_table().settle_at_cut(self, keys)
@@ -1325,7 +1325,7 @@ mod tests {
         }
     }
 
-    /// ADR-63: a cut marks the subtrees the stream holds and changes no other
+    /// ADR-64: a cut marks the subtrees the stream holds and changes no other
     /// view; its release, the stream's whole release, the stream's end and a
     /// re-grant to another stream each clear the mark; a directory the stream
     /// does not hold is not marked.
@@ -1409,7 +1409,7 @@ mod tests {
         assert_eq!(DelegationTable::decode(&plain.encode()).unwrap(), plain);
     }
 
-    /// ADR-63: a settle is answered at the cut when at least one key is under
+    /// ADR-64: a settle is answered at the cut when at least one key is under
     /// a cut subtree and every key is the root's or under a cut one.
     #[test]
     fn settle_at_cut_needs_every_key_cut_or_root() {

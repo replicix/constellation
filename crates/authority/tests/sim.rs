@@ -2608,7 +2608,7 @@ fn sticky_s4_leave_config() -> SimConfig {
     }
 }
 
-/// Plan 46 M1.3 step 15b (ADR-63): `sticky-s4-idle` plus a forced suspend of
+/// Plan 46 M1.3 step 15b (ADR-64): `sticky-s4-idle` plus a forced suspend of
 /// the holder after its release has cut (or, with the control
 /// `AUTHORITY_SIM_NO_RELEASE_CUT=1`, after the release was held on read
 /// recalls): the suspend outlasts the sim's settle cap (14.9 s). The held
@@ -2629,7 +2629,7 @@ fn sticky_s4_suspend_config() -> SimConfig {
     config
 }
 
-/// Plan 46 M1.3 step 15b (ADR-63): node 2 holds sticky `d2` to `d5` (one
+/// Plan 46 M1.3 step 15b (ADR-64): node 2 holds sticky `d2` to `d5` (one
 /// stream), node 3 reads all four, and the 2-3 partition runs for 25 s from
 /// 2 s. The operator releases `d2` at 2.3 s, `d3` at 6.3 s, `d4` at 10.3 s and
 /// `d5` at 14.3 s; each waits for node 3's grants and merges into the held
@@ -10784,7 +10784,7 @@ struct OracleTotals {
     s4_excused: (u64, u64),
     s4_spans: (u64, u64),
     s4_settles: (u64, u64),
-    /// ADR-63: the cut spans seen (and the seeds with one), the settles sent
+    /// ADR-64: the cut spans seen (and the seeds with one), the settles sent
     /// while a cut waited, the settles the roots answered at a cut, the
     /// rowless held releases (RC-1) and the executions refused under a cut.
     s4_cut_spans: (u64, u64),
@@ -23800,7 +23800,7 @@ fn a_restarted_sticky_holder_serves_no_stale_read() {
     assert!(quarantined > 0, "no restarted holder was quarantined");
 }
 
-/// Plan 46 M1.3 step 15b (ADR-63): the S4 hazard configurations reach the
+/// Plan 46 M1.3 step 15b (ADR-64): the S4 hazard configurations reach the
 /// cut, so a zero in `SWEEP-S4` is a measurement and not an absence. Core ->
 /// Report -> `OracleTotals` -> the sweep line, end to end: cut spans exist
 /// (the holder's cut waited for read recalls), settles are sent while one
@@ -23856,7 +23856,7 @@ fn the_s4_hazard_configurations_reach_a_cut_and_the_sweep_line_says_so() {
     }
 }
 
-/// ADR-63 pin: `seed` of `config` fails with the strict S4 tag with the
+/// ADR-64 pin: `seed` of `config` fails with the strict S4 tag with the
 /// control (`no_release_cut`: the held release), and passes on the fix with
 /// settles answered at a cut and nothing tagged.
 fn s4_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
@@ -23890,7 +23890,7 @@ fn s4_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
     assert_eq!(fix.exec_in_cut, 0);
 }
 
-/// ADR-63: a holder suspended after its release cut leaves the settles on its
+/// ADR-64: a holder suspended after its release cut leaves the settles on its
 /// subtree to the root, which answers them at the cut row. Fails with the
 /// control (the held release outlasts the settle cap, tagged EIO).
 #[test]
@@ -23898,7 +23898,7 @@ fn s4_suspend_settle_answered_at_the_cut() {
     s4_pin("sticky-s4-suspend", sticky_s4_suspend_config, 3);
 }
 
-/// ADR-63: the first release of a merged series (`d2`) is answered at its own
+/// ADR-64: the first release of a merged series (`d2`) is answered at its own
 /// cut row, not when the last release (`d5`) clears the held note. Fails with
 /// the control (a `d2` settle outlives its cap).
 #[test]

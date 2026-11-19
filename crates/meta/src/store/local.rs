@@ -1331,7 +1331,7 @@ impl Meta {
         Ok(out)
     }
 
-    /// Plan 46 M1.3 step 15b (ADR-63): the subtrees this node's stream `gen`
+    /// Plan 46 M1.3 step 15b (ADR-64): the subtrees this node's stream `gen`
     /// cut and has not released (empty: none). Node-local; the holder's own
     /// view of what it stopped executing in.
     pub fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino> {
@@ -1379,7 +1379,7 @@ impl Meta {
         Ok(())
     }
 
-    /// ADR-63's store fence: an execution as the delegate of `gen` touching a
+    /// ADR-64's store fence: an execution as the delegate of `gen` touching a
     /// subtree this node's stream cut is refused (`NotAdmitted`, nothing
     /// written) and counted ([`Self::take_deleg_exec_in_cut`]). The core
     /// never admits one (its view forgets the subtree at the cut); this is
@@ -1573,7 +1573,7 @@ impl Meta {
         self.delegate_idx(gen)
     }
 
-    /// Plan 46 M1.3 step 15b (ADR-63): the delegate of `gen` journals its
+    /// Plan 46 M1.3 step 15b (ADR-64): the delegate of `gen` journals its
     /// `ReleaseCut` for `dirs` as the next transaction of its stream, with
     /// no rid and no op: it stopped executing under them after index `at`.
     /// The table of every replica that applies the row marks the subtrees
@@ -3606,7 +3606,7 @@ mod root_substitution_tests {
         assert!(meta.lookup(ROOT_INO, "f4").unwrap().is_none());
     }
 
-    /// ADR-63 fixture: a store holding `/d` and `/e` as one placed stream
+    /// ADR-64 fixture: a store holding `/d` and `/e` as one placed stream
     /// `(1, 5)`.
     fn cut_fixture() -> (Meta, Ino, Ino) {
         let meta = Meta::open_in_memory().unwrap();
@@ -3648,7 +3648,7 @@ mod root_substitution_tests {
         k
     }
 
-    /// ADR-63: the holder's own view forgets the subtrees its `ReleaseCut`
+    /// ADR-64: the holder's own view forgets the subtrees its `ReleaseCut`
     /// row cut, from the commit of that row, while the raw fold (and every
     /// other replica) still lists them as the stream's with the cut mark; its
     /// release row clears the mark and the node-local key; a replica that
@@ -3734,7 +3734,7 @@ mod root_substitution_tests {
         assert_eq!(meta.delegation_table(), meta.delegation_table_folded());
     }
 
-    /// ADR-63's store fence: after the cut an execution touching the cut
+    /// ADR-64's store fence: after the cut an execution touching the cut
     /// subtree is refused `NotAdmitted` with nothing written and counted;
     /// one in the stream's other subtree, or the root's, goes through.
     #[test]
@@ -3795,7 +3795,7 @@ mod root_substitution_tests {
         assert_eq!(meta.take_deleg_exec_in_cut(), 0);
     }
 
-    /// ADR-63: no cut is journaled on a generation the takeover gate ended
+    /// ADR-64: no cut is journaled on a generation the takeover gate ended
     /// (such a stream releases rowless): the store fence refuses it with
     /// nothing written, and the node-local key is not set.
     #[test]
@@ -3971,7 +3971,7 @@ pub(crate) fn deleg_idx_assigned_tx(
 /// copied by the in-process rebuild ([`Meta::replace_ns_from_rebuilt`]).
 pub(crate) const DELEG_LOG_IDX_PREFIX: &str = "deleg_log_idx:";
 pub(crate) const DELEG_VOID_CUT_PREFIX: &str = "deleg_void_cut:";
-/// `local` kv (plan 46 M1.3 step 15b, ADR-63): the subtrees this node's own
+/// `local` kv (plan 46 M1.3 step 15b, ADR-64): the subtrees this node's own
 /// stream `gen` cut and has not released, sorted, comma-separated. Written in
 /// the transaction of the `ReleaseCut` row ([`Meta::delegate_cut`]); cleared
 /// by the apply of the stream's release row for that subtree, its
@@ -5332,7 +5332,7 @@ mod verbatim_append_tests {
         assert!(meta.pending_replays().unwrap().is_empty());
     }
 
-    /// ADR-63: a holder's cut row that the log does not carry yet is an own
+    /// ADR-64: a holder's cut row that the log does not carry yet is an own
     /// row of this node's stranding gate, like a claim's release row: it has
     /// no rid and nothing replays it, so the strand puts it back verbatim
     /// behind the rows below it. Fails when only the release rows are let

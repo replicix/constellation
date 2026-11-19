@@ -1385,7 +1385,7 @@ struct Driver {
     /// `Stats::deleg_sticky_releases` as last seen.
     releases_seen: u64,
     /// `Stats::{settles_answered_at_cut, deleg_release_rowless_held,
-    /// deleg_exec_in_cut}` as last seen (ADR-63's counters, summed over the
+    /// deleg_exec_in_cut}` as last seen (ADR-64's counters, summed over the
     /// run's incarnations in `Oracles`).
     cut_counters_seen: [u64; 3],
     /// `Stats::deleg_deps_refused` already judged (the causal-cut oracle).
@@ -2658,7 +2658,7 @@ impl Driver {
                     &held,
                     self.oracles.reach.now_ms(),
                 );
-                // ADR-63: the cut spans and the counters.
+                // ADR-64: the cut spans and the counters.
                 let cut = self.core.deleg_releases_cut();
                 self.oracles.cut_releases.lock().unwrap().note(
                     self.id,

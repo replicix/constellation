@@ -226,7 +226,7 @@ pub enum FaultKind {
         within_ms: u64,
         restart_ms: Option<u64>,
     },
-    /// Plan 46 M1.3 step 15b (ADR-63, S4): once a release of `node` is held
+    /// Plan 46 M1.3 step 15b (ADR-64, S4): once a release of `node` is held
     /// on read recalls or cut and waiting for them (`NodeShared::release_open`),
     /// `after_ms` later (the cut row has left: at least twice the peers'
     /// round trip), suspend the node for `ms` (above the sim's settle cap).
@@ -637,7 +637,7 @@ pub struct SimConfig {
     /// the lease ends its stream with no release row.
     /// `AUTHORITY_SIM_CLAIM_ENDS_SILENTLY=1` sets it on every configuration.
     pub claim_ends_silently: bool,
-    /// Control (plan 46 M1.3 step 15b, ADR-63; `Config::release_cut` off): a
+    /// Control (plan 46 M1.3 step 15b, ADR-64; `Config::release_cut` off): a
     /// holder's release that must wait for read delegations is the held
     /// release, its row and everything after it held back, not a cut first.
     /// `AUTHORITY_SIM_NO_RELEASE_CUT=1` sets it on every configuration.
@@ -1885,7 +1885,7 @@ pub struct Report {
     pub settles_sent_in_hold: u64,
     /// The longest closed held-release span (ms).
     pub held_span_max_ms: u64,
-    /// Plan 46 M1.3 step 15b (ADR-63): the unsettled `EIO`s, excused ones
+    /// Plan 46 M1.3 step 15b (ADR-64): the unsettled `EIO`s, excused ones
     /// included, whose owning stream's release waited on read recalls during
     /// their window: the strict class `s4_release_read_recall` (a violation
     /// in every configuration), described.
@@ -8588,7 +8588,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         (true, "nonholder_refused_a_designee_ran", &found.fence),
         (cfg.strict_settle, "I4", &found.i4),
         (cfg.strict_settle, "I4", &found.unjournaled_landed),
-        // ADR-63 (RC-3): an unsettled EIO that rests on a stream whose release
+        // ADR-64 (RC-3): an unsettled EIO that rests on a stream whose release
         // waited on read recalls is a violation in every configuration: row
         // releases hold nothing back with the cut, and the rowless ones
         // (RC-1) are what the tripwire is for.
@@ -8671,7 +8671,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 + h.meta.unjustified_ships()
         })
         .sum();
-    // ADR-63: the store fence refused no execution under a cut subtree.
+    // ADR-64: the store fence refused no execution under a cut subtree.
     if report.exec_in_cut > 0 {
         return Err(format!(
             "I2 deleg_exec_in_cut: {} execution(s) under subtrees a holder's cut stopped reached \

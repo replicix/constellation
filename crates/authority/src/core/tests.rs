@@ -40218,7 +40218,7 @@ mod s3_no_loops {
         })
     }
 
-    /// ADR-63 (R4), spec test 2: a settle the root parked for the recall of
+    /// ADR-64 (R4), spec test 2: a settle the root parked for the recall of
     /// a generation is answered when the generation's cut row is appended,
     /// whatever the read recalls that hold its release row back: the
     /// refusal is journaled and answered once it commits, the stream does
@@ -40265,7 +40265,7 @@ mod s3_no_loops {
         assert!(h.meta.lookup(dir, "n8").unwrap().is_none(), "it ran");
     }
 
-    /// ADR-63 (R1), spec test 3: the delegate executed X in `D` (its row is
+    /// ADR-64 (R1), spec test 3: the delegate executed X in `D` (its row is
     /// appended at the root, unshipped to the log), then cut. A settle of X
     /// is answered from the outcome, never refused; a settle of a rid the
     /// delegate never ran is refused. Fails on the parent: the settle is
@@ -65387,7 +65387,7 @@ mod c2g_settle {
         assert!(h.core.lease.gate.is_some(), "the gate is still pending");
     }
 
-    /// ADR-63 (R3, amends ADR-42/44), spec test 12: a settle on keys a
+    /// ADR-64 (R3, amends ADR-42/44), spec test 12: a settle on keys a
     /// delegate's cut row stopped is answered by the shippable gate that
     /// inherited the row, `Refused { ABANDONED }` under the gate's epoch,
     /// not redirected to the stopped holder; a gate whose journal work is not
@@ -76907,7 +76907,7 @@ mod step9_one_stream_per_node {
         assert_eq!(note.locks.grants.len(), 2);
     }
 
-    /// ADR-63 (test 4): two releases with live read grants, the second after
+    /// ADR-64 (test 4): two releases with live read grants, the second after
     /// the first's cut: each journals its own cut row at once, and the first
     /// release row follows its own reads, not the second's.
     #[test]
@@ -76975,7 +76975,7 @@ mod step9_one_stream_per_node {
         let _ = (f1, f2, r2);
     }
 
-    /// ADR-63: a cut of every subtree left in the stream releases the whole
+    /// ADR-64: a cut of every subtree left in the stream releases the whole
     /// stream, subtrees of earlier cuts included, so its release row goes
     /// after theirs: the root must not see `d1` free while the read
     /// delegations under it are out.
@@ -77041,7 +77041,7 @@ mod step9_one_stream_per_node {
         assert!(h.core.dl.mine[&7].cuts.is_empty());
     }
 
-    /// ADR-63 (test 7): the lock grants a cut hands back ride the release
+    /// ADR-64 (test 7): the lock grants a cut hands back ride the release
     /// row's batch only: the batches between the cut and the release carry
     /// no note and no `leaving` grant of the cut subtree, and the note's rows
     /// name the release row.
@@ -80340,7 +80340,7 @@ mod step5_sticky_release {
         })
     }
 
-    /// ADR-63 (the settle spec's `a_delegate_sends_its_cut_before_its_read_recalls`):
+    /// ADR-64 (the settle spec's `a_delegate_sends_its_cut_before_its_read_recalls`):
     /// asked to release a subtree a read delegation lies under, the holder
     /// journals a `ReleaseCut` at once and ships it; the rows of its other
     /// subtree ship behind it, not held; the release row is journaled once
@@ -80406,7 +80406,7 @@ mod step5_sticky_release {
         assert_eq!(note.dirs, vec![dirs[0]]);
     }
 
-    /// ADR-63 (test 15): `constellation release --wait` waits for the
+    /// ADR-64 (test 15): `constellation release --wait` waits for the
     /// release row's acknowledgement, not the cut's.
     #[test]
     fn sticky_release_wait_waits_for_the_release_row_not_the_cut() {
@@ -80451,7 +80451,7 @@ mod step5_sticky_release {
             .any(|r| matches!(r, LogRecord::ReleaseCut { .. })));
     }
 
-    /// ADR-63 (test 6): nothing executes under a cut: an op in the cut
+    /// ADR-64 (test 6): nothing executes under a cut: an op in the cut
     /// subtree gets no row, and the store fence never fired.
     #[test]
     fn nothing_executes_or_refuses_in_stream_under_a_cut() {
@@ -80474,7 +80474,7 @@ mod step5_sticky_release {
         assert_eq!(h.core.dl.mine[&7].executed, 1);
     }
 
-    /// ADR-63 (test 8): a cut subtree gets no read delegation from the
+    /// ADR-64 (test 8): a cut subtree gets no read delegation from the
     /// holder (its view does not list it), the other subtree still does.
     #[test]
     fn a_holder_grants_no_read_delegation_under_a_cut() {
@@ -80499,7 +80499,7 @@ mod step5_sticky_release {
         }
     }
 
-    /// ADR-63 (test 10): no cut while the holder's drop is pending (the
+    /// ADR-64 (test 10): no cut while the holder's drop is pending (the
     /// release is deferred as before), and a due cut waits for it too: the
     /// release row is journaled once the drop is applied.
     #[test]
@@ -83024,7 +83024,7 @@ mod step5_sticky_release {
     /// Expectation (fail-before: the row streamed at once): a restarted
     /// holder told to release journals its cut at once and ships it, and its
     /// release row only once the previous process's read grants have expired
-    /// (ADR-46, ADR-63).
+    /// (ADR-46, ADR-64).
     #[test]
     fn a_restarted_holders_release_row_waits_for_the_quarantine() {
         let (h, _) = holder_with_a_grant(SubtreeKind::Sticky);
@@ -83056,7 +83056,7 @@ mod step5_sticky_release {
         );
     }
 
-    /// ADR-63 (test 5): a holder that cut and restarted before it journaled
+    /// ADR-64 (test 5): a holder that cut and restarted before it journaled
     /// the release row installs its stream again, not as a remnant (the cut
     /// row is no release row: its acknowledgement does not release the
     /// stream), executes nothing under the cut subtree, and journals the
@@ -90869,7 +90869,7 @@ mod root_own_sticky {
         assert!(release_row_idx(&h, gen, record).is_some());
     }
 
-    /// ADR-63 (test 9): a claim while a cut waits for its reads releases the
+    /// ADR-64 (test 9): a claim while a cut waits for its reads releases the
     /// whole stream by its own row (ADR-60): the pending cut is dropped and
     /// counted, and exactly one release row is journaled. Fails on the
     /// parent: the cut stays pending, and its release row would follow the
@@ -91169,7 +91169,7 @@ mod root_own_sticky {
         );
     }
 
-    /// ADR-63 (test 11): the root's own stream is never cut: its release is
+    /// ADR-64 (test 11): the root's own stream is never cut: its release is
     /// the root's own row (ADR-55), whatever read delegations lie under it.
     #[test]
     fn the_root_own_stream_never_cuts() {

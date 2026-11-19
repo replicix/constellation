@@ -429,7 +429,7 @@ pub enum LogRecord {
     /// acknowledged. Every replica reads the cut from the record. Touches
     /// no inode or dentry.
     DelegateNodeEnded { node: u64, gen: u64, through: u64 },
-    /// Plan 46 M1.3 step 15b (S4, ADR-63): a row of the delegate's own
+    /// Plan 46 M1.3 step 15b (S4, ADR-64): a row of the delegate's own
     /// stream. The holder of `(node, gen)` stopped executing under the
     /// subtrees `dirs` after index `at` of its stream (this row is `at + 1`
     /// or later): every row of the stream that touched `dirs` is at or below
@@ -517,7 +517,7 @@ impl LogRecord {
 
     /// The records a delegate journals as a row of its own stream with no rid
     /// and no op to replay, which a stranding gate puts back verbatim (ADR-60,
-    /// ADR-63): a release (`StreamReleased`, `SubtreeReleased`) or a cut
+    /// ADR-64): a release (`StreamReleased`, `SubtreeReleased`) or a cut
     /// (`ReleaseCut`). A cut is not a release: it ends and releases nothing.
     pub fn is_release_class(&self) -> bool {
         matches!(

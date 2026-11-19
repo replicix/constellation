@@ -824,7 +824,7 @@ impl PendingRelease {
 }
 
 /// Plan 46 M1.3 step 15b: a cut this holder journaled whose release row
-/// waits for the read delegations under its subtrees (ADR-63).
+/// waits for the read delegations under its subtrees (ADR-64).
 #[derive(Debug, Clone)]
 pub(crate) struct PendingCut {
     /// The subtrees the cut covers (the ones the root asked for).
@@ -875,7 +875,7 @@ pub(crate) struct DelegateState {
     /// Plan 46 M1.2 step 10: this node released subtrees on the root's
     /// request and the root has not acknowledged the release row yet.
     pub release: Option<PendingRelease>,
-    /// Plan 46 M1.3 step 15b (ADR-63): the cuts this node journaled whose
+    /// Plan 46 M1.3 step 15b (ADR-64): the cuts this node journaled whose
     /// release rows wait for read delegations. In memory only: the cut row,
     /// the table's mark and the node-local own-cut key are the durable facts.
     pub cuts: Vec<PendingCut>,
@@ -1856,7 +1856,7 @@ impl Core {
             .collect()
     }
 
-    /// Plan 46 M1.3 step 15b (ADR-63): the generations this node holds that
+    /// Plan 46 M1.3 step 15b (ADR-64): the generations this node holds that
     /// journaled a `ReleaseCut` whose release row waits for the read
     /// delegations under its subtrees. For the simulation's measurement of
     /// the cut spans (the counterpart of [`Self::deleg_releases_held`]).
@@ -3142,7 +3142,7 @@ impl Core {
                     .release
                     .as_ref()
                     .is_some_and(|r| r.row.is_none_or(|row| replica.log_stream_idx(**g) < row))
-                    // ADR-63: a cut whose release row is still to journal.
+                    // ADR-64: a cut whose release row is still to journal.
                     || !d.cuts.is_empty();
                 // ADR-55: the root's own stream ended at its inline append
                 // (the table forgot it) but its release row has not shipped:
@@ -3253,7 +3253,7 @@ impl Core {
             // Only after a restart: a stream this process installed and
             // dropped is not one whose state was lost (a recall's answer is
             // outwaited by the root whatever its row did).
-            // ADR-63: a stream this node cut and has not released (the view
+            // ADR-64: a stream this node cut and has not released (the view
             // forgot the cut subtrees) is no remnant even when the cut left
             // it none: the cut row is no release row, and the release row
             // is still to journal.
@@ -7348,7 +7348,7 @@ impl Core {
         if self.dl.mine.is_empty() {
             return;
         }
-        // ADR-63: a cut whose reads are clear journals its release row.
+        // ADR-64: a cut whose reads are clear journals its release row.
         let due: Vec<(u64, u64)> = self
             .dl
             .mine
@@ -9667,7 +9667,7 @@ impl Core {
             }
         }
         if asked.is_empty() {
-            // ADR-63: the subtrees were cut already (the view forgot them):
+            // ADR-64: the subtrees were cut already (the view forgot them):
             // the root asks again because it has not seen the release row,
             // and the cut row may have been lost with a batch.
             let d = self.dl.mine.get(&gen).expect("present");
@@ -9748,7 +9748,7 @@ impl Core {
             (asked, whole)
         };
         let asked_list: Vec<Ino> = asked.iter().copied().collect();
-        // ADR-63: a release that must wait for read delegations journals a
+        // ADR-64: a release that must wait for read delegations journals a
         // `ReleaseCut` first, and its release row once they are gone. The
         // root's own stream (ADR-55) keeps today's path.
         let cut_mode = self.cfg.release_cut && self.cfg.read_delegations && !rowless && from != me;
@@ -9944,7 +9944,7 @@ impl Core {
         // The release row and what follows it are held back from the
         // stream until then.
         if let (Some(wait), Some(cut_row)) = (early_wait, cut_row) {
-            // ADR-63: the cut is journaled and ships at once; the release
+            // ADR-64: the cut is journaled and ships at once; the release
             // row is journaled when the park ends.
             self.park(
                 now,
@@ -10019,7 +10019,7 @@ impl Core {
         need
     }
 
-    /// ADR-63 (restart): this node cut subtrees of its stream `gen` and its
+    /// ADR-64 (restart): this node cut subtrees of its stream `gen` and its
     /// process ended before it journaled the release row. The cut row, the
     /// table's mark and the own-cut key are durable; the pending cut is not,
     /// so it is rebuilt here: its release row waits for the ADR-46
@@ -10093,7 +10093,7 @@ impl Core {
         self.arm_stream_tick(now, out);
     }
 
-    /// ADR-63: the read delegations under the cut `cut_row` of `gen` are
+    /// ADR-64: the read delegations under the cut `cut_row` of `gen` are
     /// recalled or expired: its release row is due. It journals here (and
     /// again on every stream event while something defers it).
     pub(crate) fn deleg_cut_reads_clear(
@@ -10117,7 +10117,7 @@ impl Core {
         self.deleg_stream(now, replica, out);
     }
 
-    /// ADR-63: journals the release row of a cut whose reads are clear
+    /// ADR-64: journals the release row of a cut whose reads are clear
     /// (`PendingCut::due`), and turns the cut into the generation's
     /// `PendingRelease` as a release journaled at that moment would be. The
     /// cut stays due while the stream cannot take a row now (a drop pending,
@@ -10242,7 +10242,7 @@ impl Core {
         d.refused = false;
     }
 
-    /// ADR-63: the release of a cut whose stream cannot take a row now (a
+    /// ADR-64: the release of a cut whose stream cannot take a row now (a
     /// dependency was lost, rows its tenure has not committed): today's
     /// rowless release, the stream ended at its cut with every subtree. The
     /// reads are clear, so the note is not held.
@@ -14739,7 +14739,7 @@ impl Core {
         }
     }
 
-    /// ADR-63: the claim released the whole stream by its own row (ADR-60):
+    /// ADR-64: the claim released the whole stream by its own row (ADR-60):
     /// the subtrees of the cuts this node journaled as its holder are inside
     /// it, and their release rows are never journaled. (A park that waits for
     /// their reads finds no cut when it ends.)
@@ -15787,7 +15787,7 @@ impl Core {
             // ships in the segment that follows, a flush at an unmount), so the
             // command does not wait for it. A delegate's is done once the
             // root has the row (the release note is not pending any more).
-            // (ADR-63: a cut whose release row is still to journal is a
+            // (ADR-64: a cut whose release row is still to journal is a
             // release in progress: the command waits for the row, not the cut.)
             return (d.release.is_none() && d.cuts.is_empty()) || self.dl.own_minted.contains(&gen);
         }

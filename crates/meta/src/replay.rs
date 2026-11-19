@@ -1253,7 +1253,7 @@ fn apply_one(
             crate::store::local::clear_own_cut_tx(tx, meta, *gen, Some(*dir))?;
             Ok(Applied::Done)
         }
-        // Step 15b (ADR-63): the holder's cut. The table marks the subtrees;
+        // Step 15b (ADR-64): the holder's cut. The table marks the subtrees;
         // nothing else changes until the release row.
         LogRecord::ReleaseCut {
             node, gen, dirs, ..

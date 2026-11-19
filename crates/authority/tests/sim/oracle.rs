@@ -268,7 +268,7 @@ pub struct Oracles {
     /// waited on read-delegation recalls, per `(node, gen)`. Diagnostic only
     /// (`Unsettled::release_read_recall`).
     pub held_releases: Mutex<HeldReleases>,
-    /// Plan 46 M1.3 step 15b (ADR-63): the spans in which a holder's cut
+    /// Plan 46 M1.3 step 15b (ADR-64): the spans in which a holder's cut
     /// waited for the read delegations under its subtrees
     /// (`Core::deleg_releases_cut`), the settles the roots answered at a cut
     /// (`Stats::settles_answered_at_cut`), the releases that held their note

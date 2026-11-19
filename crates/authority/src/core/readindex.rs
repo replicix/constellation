@@ -210,7 +210,7 @@ pub(crate) enum ParkedWhat {
     /// Phase 2b: a delegate's release of subtrees (plan 46 M1.2 step 10)
     /// streams once the read delegations it granted under them are recalled.
     ReleaseHeld { gen: u64 },
-    /// ADR-63: a delegate's cut row went out; its release row journals once
+    /// ADR-64: a delegate's cut row went out; its release row journals once
     /// the read delegations under the cut subtrees are recalled.
     ReleaseCutHeld { gen: u64, cut_row: u64 },
 }
@@ -1777,7 +1777,7 @@ impl Core {
         }
     }
 
-    /// ADR-63 (R4): the delegate's `ReleaseCut` row of `gen` is in this
+    /// ADR-64 (R4): the delegate's `ReleaseCut` row of `gen` is in this
     /// node's log. A settle parked on the generation's recall
     /// (`ExecuteReply { settle: true }`, `ExecuteLocal` of an own settle)
     /// whose keys are now at the cut no longer waits for it: it is woken and

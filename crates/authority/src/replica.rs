@@ -440,7 +440,7 @@ pub trait Replica {
         gen: u64,
         deps: Position,
     ) -> Result<u64, MetaError>;
-    /// Plan 46 M1.3 step 15b (ADR-63): the delegate of `gen` journals its
+    /// Plan 46 M1.3 step 15b (ADR-64): the delegate of `gen` journals its
     /// `ReleaseCut` for `dirs` (after stream index `at`) as the next
     /// transaction of its stream and, in the same transaction, drops them
     /// from its own view of the table. `node` is the holder's id. Returns
@@ -454,16 +454,16 @@ pub trait Replica {
         at: u64,
         deps: Position,
     ) -> Result<u64, MetaError>;
-    /// ADR-63: whether a settle on `keys` is answered at a cut, on this
+    /// ADR-64: whether a settle on `keys` is answered at a cut, on this
     /// replica's view of the table.
     fn settle_at_cut(&self, keys: &TouchSet) -> bool;
-    /// ADR-63: the subtrees this node's own stream `gen` cut and has not
+    /// ADR-64: the subtrees this node's own stream `gen` cut and has not
     /// released (node-local; empty for none).
     fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino>;
-    /// ADR-63: the raw fold of the table, this node's own cut subtrees
+    /// ADR-64: the raw fold of the table, this node's own cut subtrees
     /// still listed as its stream's (the holder's re-drive reads it).
     fn delegation_table_folded(&self) -> DelegationTable;
-    /// ADR-63's store fence: executions refused since the last call because
+    /// ADR-64's store fence: executions refused since the last call because
     /// they touch a subtree this node's stream cut (must stay 0).
     fn take_deleg_exec_in_cut(&self) -> u64;
     /// The root appends a delegate's transaction with its origin

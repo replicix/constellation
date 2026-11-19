@@ -1031,7 +1031,7 @@ impl Core {
             if !self.dl.mine.is_empty() {
                 self.note_shipped_touches(seq, payload);
             }
-            // ADR-63 (R4): a successor root learns a delegate's cut from the
+            // ADR-64 (R4): a successor root learns a delegate's cut from the
             // log; the settles it parked on that generation are answered.
             let cut_gens: BTreeSet<u64> = seg
                 .records

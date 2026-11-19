@@ -3491,7 +3491,7 @@ impl Core {
             // would wait on a generation `start_recall` does not know until
             // the gate opens. A gated root's settle is answered by
             // `gate_settle` on keys no generation of another node owns.
-            // ADR-63 (R2): nor does a settle at a delegate's cut wait for the
+            // ADR-64 (R2): nor does a settle at a delegate's cut wait for the
             // release row; it is answered from the dedup or refused, as the
             // release row's append would leave it.
             let at_cut = settle && replica.settle_at_cut(&keys);
@@ -5355,7 +5355,7 @@ impl Core {
             ) {
                 return;
             }
-            // ADR-63 (R2, R5): a settle whose keys lie under subtrees a delegate
+            // ADR-64 (R2, R5): a settle whose keys lie under subtrees a delegate
             // cut is not sent to that stopped holder: the root answers it
             // below (this node, when it sequences), else it goes to the
             // lease holder by the ordinary route.

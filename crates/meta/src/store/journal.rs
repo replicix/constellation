@@ -581,7 +581,7 @@ thread_local! {
     static PENDING_OWN_CUT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// Plan 46 M1.3 step 15b (ADR-63): the generation whose `ReleaseCut` row the
+/// Plan 46 M1.3 step 15b (ADR-64): the generation whose `ReleaseCut` row the
 /// transaction being journaled is this node's own, as the stream's holder
 /// ([`crate::Meta::delegate_cut`]). The apply of the record then writes the
 /// node-local `deleg_own_cut` key in the same transaction. Set only there:

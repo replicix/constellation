@@ -663,12 +663,12 @@ pub struct Meta {
     /// root's FUSE fast path reads this atomic before it looks at the
     /// table at all, so a cluster without delegations pays nothing.
     pub(crate) deleg_any: AtomicBool,
-    /// Plan 46 M1.3 step 15b (ADR-63): a node-local `deleg_own_cut` key was
+    /// Plan 46 M1.3 step 15b (ADR-64): a node-local `deleg_own_cut` key was
     /// written here (or found at open). Raised only: while it is clear,
     /// [`Meta::delegation_table`] is the raw fold with no look at the keys.
     pub(crate) own_cut_any: AtomicBool,
     /// Executions the store refused because they touch a subtree this node's
-    /// stream cut (ADR-63's fence, `deleg_exec_in_cut`); read by
+    /// stream cut (ADR-64's fence, `deleg_exec_in_cut`); read by
     /// [`Meta::take_deleg_exec_in_cut`].
     deleg_exec_in_cut: AtomicU64,
     /// Plan 30 §M12: the root's FUSE fast path holds this *shared*

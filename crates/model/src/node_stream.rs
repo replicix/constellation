@@ -321,7 +321,7 @@
 //! - **No server queue**: a deposed root's parked ops die with its tenure;
 //!   the requester's retry is the only source of another copy.
 //!
-//! ## Step 15b: `ReleaseCut` (ADR-63)
+//! ## Step 15b: `ReleaseCut` (ADR-64)
 //!
 //! - **The cut row** ([`RowKind::Cut`], [`Action::Cut`], [`Action::CutAll`],
 //!   [`NodeStreamModel::release_cut`]): a holder asked to release a subtree
@@ -537,7 +537,7 @@
 //!   refuses keys a node stream holds at once (no release).
 //! - `cut_before_read_recall` (chunk 9, S4): a holder releases with its
 //!   read delegation outstanding.
-//! - `refuse_at_holder_cut` (step 15b, ADR-63): the root refuses a settle at
+//! - `refuse_at_holder_cut` (step 15b, ADR-64): the root refuses a settle at
 //!   the holder's cut before it appended the stream to the cut row.
 //! - `execute_at_cut` (step 15b): an appended cut flips the table, so the
 //!   root executes in the subtree before the release row and the recall.
@@ -647,7 +647,7 @@ pub enum RowKind {
     /// `StreamReleased` (every subtree it held): `at` is one past the last
     /// index of the stream that touched `dirs`.
     Released { dirs: u8, at: u8 },
-    /// Step 15b (ADR-63): a node stream's `ReleaseCut { dirs, at }`. The
+    /// Step 15b (ADR-64): a node stream's `ReleaseCut { dirs, at }`. The
     /// holder stopped executing in `dirs` after index `at` (one past the
     /// last index of the stream that touched them); the release row follows
     /// once the stream's read delegation is recalled. It ends and releases
@@ -936,9 +936,9 @@ pub const SAW_GRANT_BLOCKS_SINGLETON: u64 = 1 << 51;
 /// Chunk 14: the new root appended a row of the deposed root's own stream
 /// that was journaled after the deposition.
 pub const SAW_DEPOSED_ROOT_STREAMS: u64 = 1 << 52;
-/// Step 15b (ADR-63): a holder journaled a `ReleaseCut` row.
+/// Step 15b (ADR-64): a holder journaled a `ReleaseCut` row.
 pub const SAW_CUT: u64 = 1 << 53;
-/// Step 15b (ADR-63): the root refused a settle at a holder's appended cut
+/// Step 15b (ADR-64): the root refused a settle at a holder's appended cut
 /// while that stream's read delegation was still outstanding.
 pub const SAW_CUT_SETTLE: u64 = 1 << 54;
 
@@ -1087,7 +1087,7 @@ pub enum Action {
     /// The holder of `stream` answers the root's request with
     /// `SubtreeReleased` for `dirs`.
     Release { stream: u8, dirs: u8 },
-    /// Step 15b (ADR-63): the holder of `stream` journals `ReleaseCut` for
+    /// Step 15b (ADR-64): the holder of `stream` journals `ReleaseCut` for
     /// `dirs` while its read delegation is outstanding (`release_subtrees`).
     Cut { stream: u8, dirs: u8 },
     /// The holder of stream `g` releases every subtree (`StreamReleased`).
@@ -1290,7 +1290,7 @@ pub struct NodeStreamModel {
     /// Chunk 14, the knob: a deposition discards the deposed root's own
     /// stream rows past the adopted prefix with the root's rows.
     pub deposed_root_drops_own_stream: bool,
-    /// Step 15b (ADR-63): a holder whose read delegation is outstanding
+    /// Step 15b (ADR-64): a holder whose read delegation is outstanding
     /// journals `ReleaseCut` first and the release row after the recall,
     /// and the root answers a settle at the appended cut. `false` is the
     /// model before (the release waits for the recall).
@@ -1853,7 +1853,7 @@ fn deleg_cut(s: &State, g: u8, dir: usize) -> bool {
 }
 
 /// [`deleg_owns_at`]; `cut_stops`: the holder stopped executing in a
-/// directory it cut (its view forgets it from the cut row on, ADR-63).
+/// directory it cut (its view forgets it from the cut row on, ADR-64).
 fn deleg_view(
     m: &NodeStreamModel,
     s: &State,
@@ -2106,7 +2106,7 @@ fn has_peer(s: &State, mask: u8) -> bool {
 /// `exec`: the root executes an op in `dirs`; a holder's appended cut counts
 /// as gone then (nothing may execute at a cut). A settle's refusal (`exec`
 /// false) at a cut needs no recall: it changes nothing a reader can see
-/// (ADR-63); after a release it still does.
+/// (ADR-64); after a release it still does.
 fn check_reads(m: &NodeStreamModel, s: &mut State, dirs: u8, rid: Rid, idx: u8, exec: bool) {
     if s.reads == 0 {
         return;
@@ -2591,7 +2591,7 @@ pub fn journal_valid(m: &NodeStreamModel, s: &State) -> bool {
     true
 }
 
-/// Step 15b (ADR-63): no `Op` or `Refused` row of a node stream touching a
+/// Step 15b (ADR-64): no `Op` or `Refused` row of a node stream touching a
 /// directory comes after the stream's `ReleaseCut` of it. The holder
 /// stopped executing there at the cut row.
 pub fn no_row_past_cut(s: &State) -> bool {
@@ -3206,7 +3206,7 @@ fn receive_settle(m: &NodeStreamModel, s: &mut State, at: u8, rid: Rid, op: Writ
     match status(m, s, at, op, &[0; MAXS]) {
         Status::Run(g) => refuse(m, s, at, g, rid, op),
         _ if m.settle_unowned && at == s.root => refuse(m, s, at, ROOT, rid, op),
-        // Step 15b (ADR-63): the root has the holder's cut row in order, so
+        // Step 15b (ADR-64): the root has the holder's cut row in order, so
         // it has every row of the stream that touched the keys, and the
         // holder executes nothing more there: the settle is answered here,
         // before the release row (and the read recall).
@@ -3241,7 +3241,7 @@ fn cut_appended(m: &NodeStreamModel, s: &State, g: u8, dir: usize) -> bool {
     })
 }
 
-/// `settle_at_cut` (ADR-63): at least one of `op`'s directories is a node
+/// `settle_at_cut` (ADR-64): at least one of `op`'s directories is a node
 /// stream's whose appended cut the table still lists, and every other one is
 /// the root's or such a cut one. A directory under a live, uncut grant makes
 /// it false.
@@ -3631,7 +3631,7 @@ impl Model for NodeStreamModel {
                     }
                 }
                 // S4 (chunk 9): the release row is journaled only after the
-                // read recall; before it, step 15b's `ReleaseCut` (ADR-63).
+                // read recall; before it, step 15b's `ReleaseCut` (ADR-64).
                 let reads_clear = s.reads & (1 << stream) == 0 || self.cut_before_read_recall;
                 if reads_clear {
                     // The directories already cut wait for this row.
