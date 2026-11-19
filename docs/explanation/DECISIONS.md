@@ -6370,6 +6370,21 @@ executed, so the cut is a row.
   the release row. No cut is taken while a drop is pending (ADR-59), and a
   generation the takeover gate ended is left to the claim. ADR-56's `Grow`
   guard still waits for the release row.
+- **Review of 2026-11-19 (round 5).** A due cut whose row cannot be journaled
+  (a lost dependency, a capped append, a stopped stream) ends the stream rowless
+  with every other subtree and pending cut, so the reads under all of them are
+  recalled first and the note is held, as `release_subtrees`' rowless branch
+  holds it; the other pending cuts join its note. A release of the whole stream
+  (a row or a rowless end) takes the pending cuts into its note, and a due cut
+  finds the stream released already: none journals a row after the stream's
+  release. A generation the takeover gate ended takes today's path (the held
+  row), not a cut. A restarted holder that cut whole decides a drop of its held
+  rows as a remnant does (`DelegateState::cut_remnant`). The own-cut keys fail
+  closed: a key that cannot be read or parsed counts every subtree of its stream
+  as cut, and the flag that makes the table read them is lowered with the last
+  key. A stealable holder's whole cut never journals its release row when its
+  state is dropped first (as a stealable held release on main): the subtree
+  stays cut until the root's reclaim, and the settles were answered at the cut.
 - **RC-1 (a), rowless releases keep the held note.** A release that cannot
   write a cut row (a stream already stopped, a lost dependency, a capped cut)
   keeps today's held release. It is counted (`deleg_release_rowless_held`) and
@@ -6387,7 +6402,10 @@ executed, so the cut is a row.
 holder once its release has cut or is held) and `sticky-s4-merge` (four sticky
 subtrees of one stream released in turn while the reader is cut off) fail the
 strict S4 tag with the control, 51 and 33 of 2,000 seeds, and 0 of 2,000 with
-the cut. 211 configurations compared against the base ran 2,000 seeds each
+the cut (the tag counts held spans on the control and cut spans per subtree on
+the fix, and the oracle hands a cut subtree to the root from the cut row). The
+merge cure by the stricter count of seeds left with no unsettled `EIO` at all is
+19 of 2,000 (0.95 %, under the 1 % bar): the rest are the requester's isolation. 211 configurations compared against the base ran 2,000 seeds each
 with no new failure class. 17 rowless held releases were seen, with the tag at
 0.
 

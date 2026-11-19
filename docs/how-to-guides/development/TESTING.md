@@ -4691,7 +4691,11 @@ The hazard configurations that reach it are `sticky-s4-idle`, `sticky-s4-leave`,
 `sticky-s4-suspend` (the holder suspended once its release has cut or is held) and
 `sticky-s4-merge` (four sticky subtrees of one stream released in turn while the
 reader is cut off), each also with `+unsettled`. With the control, `sticky-s4-suspend`
-fails 51 and `sticky-s4-merge` 33 of 2,000 seeds; with the cut, none. The two pins
+fails 51 and `sticky-s4-merge` 33 of 2,000 seeds; with the cut, none under the strict
+tag, which counts held-release spans (the control) and cut spans per subtree (the fix).
+On the merge configuration the cut leaves no unsettled `EIO` at all on 19 of the 33
+control seeds (0.95 %, under the spec's 1 % bar): the others are the requester's own
+isolation, as on the control arm. The two pins
 `s4_suspend_settle_answered_at_the_cut` and
 `s4_merge_first_release_settle_answered_at_the_cut` fail with the control and pass
 without it, and a run also fails if the store fence refused an execution under a cut

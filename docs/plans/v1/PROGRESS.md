@@ -71348,12 +71348,13 @@ construction for the releases that write a row; the rest are counted under a str
 **Fail-before.** The two pins (`s4_suspend_settle_answered_at_the_cut`, seed 3;
 `s4_merge_first_release_settle_answered_at_the_cut`, seed 8) fail with the control on the S4 tag and pass on the fix.
 
-**Control table (2,000 seeds each).**
+**Control table (2,000 seeds each; corrected in round 5, see "Review round 5" below).** The control arm is
+`AUTHORITY_SIM_NO_RELEASE_CUT=1` (the knob, not the fix: the sweep directories `on`/`off` name the knob).
 
-| Config | Control knob on | Fix |
+| Config | Control knob on (S4-tagged fails) | Fix (strict S4 tag, per subtree, cut spans included) |
 |---|---|---|
-| `sticky-s4-suspend` | 51 S4 | 0 |
-| `sticky-s4-merge` | 33 S4 | 0 |
+| `sticky-s4-suspend` | 51 | 0 |
+| `sticky-s4-merge` | 33 | 0 |
 | `sticky-s4-idle`, `sticky-s4-leave` | 0 | 0 |
 
 **Sweep summary.** 211 configurations compared base against the fix: no fix-only failure class. The one differing
@@ -71370,3 +71371,57 @@ cut is built only if a sweep shows the tag.
 - `sticky-s4-suspend+unsettled` fails about 53 of 2,000 on `unacked_fails_never_lands_late`. It does so on main
   too (the config was added to a main archive), so it is not from this change.
 - `sticky-s4-idle+unsettled` swaps seeds within the known I4 "itself" class (base 326, 393, 1106; fix 428, 1294).
+
+### Review round 5 (2026-11-19): the S4 evidence and the rowless fallback
+
+The Fable review of C1 to C7 found two blockers and a set of SHOULDs; all are fixed on top of C8.
+
+**MUST-1, the rowless end after a cut.** `release_cut_rowless` ended the whole stream with an unheld note and never
+recalled the reads under the other subtrees or the other pending cuts, so the root could write under node 3's live read
+grant after d2's cut. It now computes the read need of the whole stream, recalls, holds the note (`deleg_release_rowless_held`)
+and takes the other pending cuts into it (`deleg_cut_absorbed`). Fail-before:
+`a_rowless_end_after_a_cut_waits_for_the_other_subtrees_reads` (cut d2, lose a dependency, d2's grant clears, a live grant
+under d3: no note leaves until it is gone) and `a_rowless_end_takes_the_other_pending_cuts_with_it`. The sweep line now
+carries `cut_rowless_after`, `cut_left_to_claim`, `cut_repeated` and `cut_absorbed`. **No simulation label reaches
+`cut_rowless_after`** (0 in the four `sticky-s4-*` labels, `sticky-holder-restarts-placed`, `sticky-leave` and
+`delegated-strict` at 300 to 2,000 seeds). A merge configuration with a continuation epoch (the delegates stop while the cuts
+wait) was tried and dropped: the root's recall ends the stream before its cut is due, and the label fails on epoch
+artifacts of both arms. The path is covered by the unit tests only; reaching it in a sim stays open.
+
+**MUST-2, the S4 tag.** The strict tag read only held-release spans, which the cut removes, so the fix arm's 0 was true by
+construction. The tag now also covers cut spans per `(generation, subtree)` (`HeldReleases::overlaps_subtrees`, from
+`Core::deleg_cut_subtrees`), and the oracle's owner timeline hands a cut subtree to the root from the root's append of the cut row
+(ADR-64 R1), so an unsettled `EIO` in a cut span while the root was reachable is now an I4 violation and tagged. A cut span alone
+does not tag an `EIO` the requester's isolation explains (the first version did: 12 of 2,000 fix seeds on `sticky-s4-merge`,
+4 identical on both arms and 8 with node 3 cut off, unavoidable by any cut). The tag fires on the knob arm (51 and 33 seeds) and
+has a unit test on the cut spans; on the fix arm it is 0 in all four labels, plain and with `+unsettled`.
+
+**Merge control, per seed (honest numbers).** Of the 33 knob-arm S4 seeds of `sticky-s4-merge`, the fix has no unsettled `EIO`
+at all on 19 (0.95 % of 2,000, under the spec's 1 % bar), only isolated-class `EIO`s on 3 (1.10 % with them), other allowed
+`EIO`s (no sequencer in time) on 10, and an I4 on 1 (seed 287). The merge control is therefore weaker than the 1 % bar by the
+strict count: the cut answers the settles it can, and the `EIO`s left are the requester's isolation, the same ones the knob arm has.
+The configuration was not re-shaped to pass. (`sticky-s4-suspend` is clean: 50 of 51 seeds have no `EIO` on the fix, 1, seed 304, is
+the known "itself" class.)
+
+**Seed 287** (`sticky-s4-merge+unsettled`): the same `EIO` on both arms (rid node 3 seq 54, t=14579 ms, window [11575, 14579]).
+The knob arm reports it as S4 (the held span). On the fix the root is reachable only over [12771, 13074] ms, 303 ms against an
+ask cycle of 230 ms, so the oracle (which now sees the root as the owner) calls it a reachable-root I4. It does not depend on the
+cut: classified as the short-reachability boundary of the oracle, a residual of the label (with seed 1537, a takeover-gate
+`EIO` the knob arm has too), not a ReleaseCut defect. It stays an open I4 on `sticky-s4-merge+unsettled` (2 of 2,000).
+
+**Seeds 428 and 1294** (`sticky-s4-idle+unsettled`): replayed on the fix: both are the known I4 "itself" class (the requester
+node 3 is the sequencer, its core idle, t >= 60 s), tagged by neither the held nor the cut tag; the base has 3 such seeds
+(326, 393, 1106), the fix 2: a schedule shift (the fix cuts in 1,450 of 2,000 seeds), same class and rate.
+
+**SHOULDs.**
+- A due cut journaled a release row on a stream released or stopped meanwhile: a whole release now takes the pending cuts into
+  its note, a due cut finds the stream released already (`release_row_journaled`) and a stopped stream ends rowless
+  (`a_whole_release_takes_a_pending_cut_with_it`, `a_due_cut_on_a_stopped_stream_journals_no_row`).
+- A restarted whole-cut holder decides a drop of its held rows as a remnant does (`DelegateState::cut_remnant`).
+- The `debug_assert!` at the cut is gone: a generation the takeover gate ended takes the held-row path (the gate is asked, not
+  `stopped`).
+- The own-cut keys fail closed (an unreadable or unparsable key counts every subtree of its stream as cut) and
+  `own_cut_any` is lowered with the last key (`an_unreadable_own_cut_key_fails_closed_and_the_flag_comes_down`).
+- **Open (recorded):** the model's cut topologies have one directory and no faults (S-7): a takeover with a cut in the tail, a
+  holder restart, two cuts of one stream and the rowless fallback are not modelled.
+
