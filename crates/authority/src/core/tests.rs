@@ -6348,7 +6348,9 @@ fn a_stale_base_shadow_raises_observed_instead_of_covering() {
     assert_eq!(stats.stale_base_uncovered, 1);
     let keys = [ReadKey::Dentry(ROOT_INO, "f4".into())];
     assert!(
-        !t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO),
+        !t.requester
+            .meta
+            .session_ready_at(&keys, &constellation_meta::Position::ZERO),
         "a shadow on a base this replica lacks does not cover its keys"
     );
     // The log delivers the create and the rename.
@@ -6356,7 +6358,10 @@ fn a_stale_base_shadow_raises_observed_instead_of_covering() {
     delivered.extend(t.rename.clone());
     crate::replica::Replica::apply_segment(&t.requester.meta, 2, 1, 9, &[], &[], &delivered)
         .unwrap();
-    assert!(t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+    assert!(t
+        .requester
+        .meta
+        .session_ready_at(&keys, &constellation_meta::Position::ZERO));
     assert!(MetaStore::lookup(&t.requester.meta, ROOT_INO, "f4")
         .unwrap()
         .is_some());
@@ -6389,7 +6394,10 @@ fn a_base_held_shadow_still_covers_its_keys() {
         (1, 0)
     );
     let keys = [ReadKey::Dentry(ROOT_INO, "f4".into())];
-    assert!(t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+    assert!(t
+        .requester
+        .meta
+        .session_ready_at(&keys, &constellation_meta::Position::ZERO));
     assert!(MetaStore::lookup(&t.requester.meta, ROOT_INO, "f4")
         .unwrap()
         .is_some());
@@ -6421,14 +6429,19 @@ fn a_stale_base_records_less_accept_raises_observed() {
     assert_eq!(t.requester.core.stats.stale_base_uncovered, 1);
     let keys = [ReadKey::Dentry(ROOT_INO, "f2".into())];
     assert!(
-        !t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO),
+        !t.requester
+            .meta
+            .session_ready_at(&keys, &constellation_meta::Position::ZERO),
         "the read of the source waits for the log"
     );
     let mut delivered = t.unshipped.clone();
     delivered.extend(records);
     crate::replica::Replica::apply_segment(&t.requester.meta, 2, 1, 9, &[], &[], &delivered)
         .unwrap();
-    assert!(t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+    assert!(t
+        .requester
+        .meta
+        .session_ready_at(&keys, &constellation_meta::Position::ZERO));
 }
 
 /// An `Exists` hint on a stale base (the floor is above this replica's
@@ -6467,7 +6480,9 @@ fn a_stale_base_hint_raises_observed() {
     assert_eq!(stats.stale_base_uncovered, 1);
     let keys = [ReadKey::Dentry(ROOT_INO, "g".into())];
     assert!(
-        !t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO),
+        !t.requester
+            .meta
+            .session_ready_at(&keys, &constellation_meta::Position::ZERO),
         "a hint on a base this replica lacks does not cover its keys"
     );
 }
@@ -6507,7 +6522,10 @@ fn a_hint_whose_records_do_not_apply_is_refused_and_uncovered() {
     assert_eq!((stats.hints_installed, stats.hints_unapplied), (0, 1));
     assert!(!t.requester.meta.has_outstanding_speculation());
     let keys = [ReadKey::Dentry(ROOT_INO, "f9".into())];
-    assert!(!t.requester.meta.session_ready_at(&keys, &constellation_meta::Position::ZERO));
+    assert!(!t
+        .requester
+        .meta
+        .session_ready_at(&keys, &constellation_meta::Position::ZERO));
 }
 
 /// A refusal observes the holder's unshipped state: later reads wait for
