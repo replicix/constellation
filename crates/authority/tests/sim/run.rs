@@ -5710,8 +5710,24 @@ fn count_unsettled(
     seed: u64,
 ) -> Vec<String> {
     let everything = oracles.unsettled.lock().unwrap();
+    // (`AUTHORITY_SIM_S4_EIO=1`: every unsettled `EIO`, excused and tagged or
+    // not, with its rid, verdict and the span it lies under, if any.)
+    let print_all = std::env::var_os("AUTHORITY_SIM_S4_EIO").is_some();
     for u in everything.iter() {
-        let Some(span) = &u.s4_span else { continue };
+        let Some(span) = &u.s4_span else {
+            if print_all {
+                eprintln!(
+                    "SWEEP-S4-EIO seed {seed}: {}{}; tagged false; no span",
+                    u.describe_verdict_text(),
+                    if u.designation_held {
+                        " (designation held)"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            continue;
+        };
         let slot = if span.cut { 2 } else { 0 };
         report.s4_pred[slot] += 1;
         report.s4_pred[slot + 1] += usize::from(span.root_blocked);
@@ -5719,9 +5735,7 @@ fn count_unsettled(
             report.s4_pred[4] += usize::from(span.unshippable);
             report.s4_pred[5] += usize::from(span.unshippable && span.root_blocked);
         }
-        // (`AUTHORITY_SIM_S4_EIO=1`: every `EIO` under a span, excused and
-        // tagged or not, with its rid, verdict and the span.)
-        if std::env::var_os("AUTHORITY_SIM_S4_EIO").is_some() {
+        if print_all {
             eprintln!(
                 "SWEEP-S4-EIO seed {seed}: {}{}; tagged {}; {}",
                 u.describe_verdict_text(),
