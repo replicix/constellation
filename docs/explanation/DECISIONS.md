@@ -6129,7 +6129,7 @@ See: `crates/net/src/message.rs` (`write_payload`, `read_payload`),
 [p2p-relays](../reference/features/p2p-relays.md), "Trust model", and
 [security-audit-2026-09](../security-audit-2026-09.md).
 
-## ADR-64: A journal read error is never "drained"
+## ADR-65: A journal read error is never "drained"
 
 **Status**: decided on 2026-11-19, from a review of every emptiness test of the journal.
 
@@ -6146,11 +6146,21 @@ seed 485 recorded (I1/I5). A persistent error already failed closed, because
 
 **Decision**: a read error is the answer that blocks. At a decision that gives
 the lease away or lets an op or a snapshot pass, `Err` takes the path of
-"rows remain": the release guard and the handoff decline fail, a round that
-meets it ends as failed (no release, no `EpochFlushed`, no handoff pause, no
-nudge), a forward takes the lease path, `publish_now` fails ("reading the
-journal"). Every such error is counted (`Stats::journal_read_errors`) and
-warned. Callers that only report a count keep their meaning.
+"rows remain": the release guard fails the CAS without sending it (reported as
+a conflict, never as a release in doubt, so a failed re-read keeps the lease),
+the handoff decline fails, a round that meets it releases nothing (no release,
+no `EpochFlushed`, no handoff pause, no nudge) and ends as any round that had
+nothing to release, so its waiters and barriers are not failed by it, a forward
+takes the lease path, `publish_now` fails ("reading the journal"). The reads
+of the node's own generations (`journal_own_gens`) fail closed too: the
+takeover gate stays closed and retries, the ADR-55 keep of the holder state
+stays, the restart's own-end remnants are retried. Counted
+(`Stats::journal_read_errors`) and warned: the core's reads (`journal_drained`,
+the takeover gate's strand, `check_own_release_shipped`, the delegation sync's
+remnants). Warned only: the driver's guard (it has no `Stats`). Neither
+counted nor warned: the forwards in `core/client.rs` and `publish_now`, which
+only return or act on the error. Callers that only report a count keep their
+meaning.
 
 **Consequence**: a persistent fault keeps the holder renewing a lease it can
 no longer release or hand off. The end state (surface the fault, stop renewing

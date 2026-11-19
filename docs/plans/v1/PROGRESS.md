@@ -71000,6 +71000,7 @@ Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tes
   - The epoch closes only after a complete dirty-upload pass (65-95 s in the run), and the driver's `biased` select drains the internal channel
     before `sync_rx`, so the client lane starves while core steps are slow. A fairness budget for `sync_rx` and a shorter epoch need a design.
   - A separate `close` EIO appears in dnotify (inotify) under heavy CPU load in `stress-ng-fs-faults`, with this fix in. It needs its own diagnosis.
+
 ## A journal read error is no longer "drained" (2026-11-19)
 
 - **Bug.** Seven sites took a transient journal read error (EIO, a checksum, `Poisoned` after a failed flush) for an empty journal and so could
@@ -71007,14 +71008,15 @@ Review C2 of the S4 closure: `Deadlines::check` ran only in the simulation's tes
   recorded). They were the release CAS's guard (`authority_driver::release_guard`), `round_release` (the epoch flush release and the idle release),
   `release_after_recalls`, the handoff decline, three forwards in `core/client.rs`, and `TreePublisher::publish_now`. A persistent error already failed
   closed through `take_journal`.
-- **Fix.** Each site fails closed (ADR-64): the guard fails the CAS, a round meeting the error ends as failed with no release, `EpochFlushed`, handoff
-  pause or nudge, the handoff is declined, forwards take the lease path, `publish_now` fails ("reading the journal"), and
-  `check_own_release_shipped` counts its read error. `Stats::journal_read_errors` counts the first four. `Replica::journal_own_gens` returns the `Result`.
+- **Fix.** Each site fails closed (ADR-65): the guard fails the CAS without sending it (a conflict, not a release in doubt), a round meeting the error releases nothing (no release, `EpochFlushed`, handoff
+  pause or nudge) and ends unfailed, so its waiters and barriers are not failed by it, the handoff is declined, forwards take the lease path, `publish_now` fails ("reading the journal"), and
+  `check_own_release_shipped` counts its read error. `Stats::journal_read_errors` counts the core's reads: `round_release`, `release_after_recalls`, the handoff decline, `check_own_release_shipped`, the takeover gate's own-generations read and the delegation sync's remnants (not the driver's guard, which warns only, nor the `client.rs` forwards and `publish_now`). `Replica::journal_own_gens` returns the `Result`; its callers fail closed (the takeover gate stays closed, `release_row_unshipped` keeps the holder state, `own_end_remnants` retries). The test hook covers `journal_own_gens` too.
 - **Hook and sim knob.** `Meta::fail_journal_emptiness_reads_for_tests(n)` (per store; `test-util`) and
   `AUTHORITY_SIM_JOURNAL_READ_FAULT=<p>` (a chance per handled event that a node's next emptiness read fails once).
 - **Tests (each fails before its fix, logs kept):** the release guard, the idle release, the epoch flush release, the handoff decline, the forward
-  at `client.rs:1453`, `release_after_recalls` (flush job) and `publish_now`. Not covered by a test of its own: the two other `client.rs` sites
-  (s3-less P2P forward, lost-lease lease path), which are the same one-line change, and a `Round`-kind `release_after_recalls`.
+  at `client.rs:1453`, `release_after_recalls` (flush job and Round), the takeover gate's own-generations read, the guard's conflict outcome, the unfailed round and `publish_now`. Not covered by a test of its own: the two other `client.rs` sites
+  (s3-less P2P forward, lost-lease lease path), which are the same one-line change.
+- **Review round 2.** `own_journaled_gens` (the takeover gate's strand) and `release_row_unshipped`/`own_end_remnants` (ADR-55) fail closed on a `journal_own_gens` error; the test hook covers `journal_own_gens`. The guard's read error is reported as `CasFailure::Conflict` (the CAS was never sent), so a failed re-read keeps the lease. A release decision's read error ends the round unfailed (waiters and barriers are not failed by it). The ADR is ADR-65 (`releasecut` keeps ADR-64). Gates on the fix: clippy, lib debug and release, release sim suite (0 failed), the nine sweeps above and the knob at 0.01 on `flex` over 500 seeds (0 failing), harness smoke of 9 scenarios.
 - **Sweeps (500 seeds, 1000 for `drop-held-chain-backed`), pre-fix tree against fix, knob off:** `flex`, `flex-crash`, `flex-tight`,
   `locks-blips-tight-faults`, `delegated-holder-cut`, `long-backup`, `locks-failover-backup`, `sticky-root-designee-inbox-skew`,
   `drop-held-chain-backed`: 0 failing on both. With the knob at 0.01 on `flex`: the pre-fix tree fails 11 of 100 and 35 of seeds 100..500 (I2c, an
