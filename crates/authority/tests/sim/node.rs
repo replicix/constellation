@@ -553,6 +553,8 @@ pub struct NodeEnv {
     pub first_start_unsettled: bool,
     /// See `SimConfig::holder_releases_before_drain`.
     pub holder_releases_before_drain: bool,
+    /// See `SimConfig::journal_read_fault_ppm`.
+    pub journal_read_fault_ppm: u32,
     /// See `SimConfig::sticky_idle_ms`: the core's `sticky_idle_release_ms`.
     pub sticky_idle_release_ms: u64,
     /// See `SimConfig::claim_ends_silently`.
@@ -970,6 +972,8 @@ impl NodeHandle {
             world: env.world.clone(),
             bus: env.bus.clone(),
             step_now: clock.now(),
+            fault_tick: 0,
+            journal_read_fault_ppm: env.journal_read_fault_ppm,
             clock: clock.clone(),
             tx: tx.clone(),
             rx,
@@ -1269,6 +1273,9 @@ struct Driver {
     /// its clock read and its actions, `StallStep`, still fires its timers
     /// when the reading says).
     step_now: constellation_authority::Now,
+    /// Events handled so far: the roll of an injected journal read fault.
+    fault_tick: u64,
+    journal_read_fault_ppm: u32,
     tx: mpsc::UnboundedSender<Event>,
     rx: mpsc::UnboundedReceiver<Event>,
     /// The daemon's urgent lane, as far as the delegation renewal lane
@@ -2268,6 +2275,19 @@ impl Driver {
             let Some(mut event) = self.next_event().await else {
                 break;
             };
+            // `AUTHORITY_SIM_JOURNAL_READ_FAULT`: before this event, the next
+            // emptiness read of this node's journal may fail once (a
+            // transient EIO), rolled from the seed, the node and the count.
+            if self.journal_read_fault_ppm > 0 {
+                self.fault_tick += 1;
+                let mut x = self.seed ^ (self.id << 40) ^ self.fault_tick.rotate_left(17);
+                x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                if (x ^ (x >> 31)) % 1_000_000 < self.journal_read_fault_ppm as u64 {
+                    self.meta.fail_journal_emptiness_reads_for_tests(1);
+                }
+            }
             if self.bootstrap.is_some() && matches!(event, Event::Submit { .. }) {
                 self.deferred.push(event);
                 continue;

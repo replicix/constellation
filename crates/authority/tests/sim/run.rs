@@ -606,6 +606,12 @@ pub struct SimConfig {
     /// `AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN=1` sets it on every
     /// configuration; a run that released before the drain fails.
     pub holder_releases_before_drain: bool,
+    /// Fault injection: the chance, in parts per million per event a node
+    /// handles, that its next journal emptiness read fails once (a transient
+    /// read error; the core must fail closed, ADR-64).
+    /// `AUTHORITY_SIM_JOURNAL_READ_FAULT=<p>` (a probability, `0.001`) sets it
+    /// on every configuration.
+    pub journal_read_fault_ppm: u32,
     /// Negative control (`Config::claim_ends_silently`): a holder's claim of
     /// the lease ends its stream with no release row.
     /// `AUTHORITY_SIM_CLAIM_ENDS_SILENTLY=1` sets it on every configuration.
@@ -1354,6 +1360,10 @@ impl Default for SimConfig {
                 "AUTHORITY_SIM_HOLDER_RELEASES_BEFORE_DRAIN",
             )
             .is_some_and(|v| v == "1"),
+            journal_read_fault_ppm: std::env::var("AUTHORITY_SIM_JOURNAL_READ_FAULT")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map_or(0, |p| (p.clamp(0.0, 1.0) * 1_000_000.0) as u32),
             claim_ends_silently: std::env::var_os("AUTHORITY_SIM_CLAIM_ENDS_SILENTLY")
                 .is_some_and(|v| v == "1"),
             leave_keeps_grants: std::env::var_os("AUTHORITY_SIM_LEAVE_KEEPS_GRANTS")
@@ -5885,6 +5895,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         restart_skips_write_quarantine: cfg.restart_skips_write_quarantine,
         first_start_unsettled: cfg.first_start_unsettled,
         holder_releases_before_drain: cfg.holder_releases_before_drain,
+        journal_read_fault_ppm: cfg.journal_read_fault_ppm,
         sticky_idle_release_ms: cfg.sticky_idle_ms.unwrap_or(0),
         claim_ends_silently: cfg.claim_ends_silently,
         fence_accepts_unrouted: cfg.fence_accepts_unrouted,
