@@ -257,8 +257,8 @@ pub(crate) fn track_manifest_transition_tx(
 #[cfg(any(test, feature = "test-util"))]
 impl Meta {
     /// Tests only (`test-util`): fail this store's next `n` reads of
-    /// [`crate::MetaStore::journal_is_empty`] and [`crate::MetaStore::journal_len`] with an
-    /// I/O error, whichever thread makes them.
+    /// [`crate::MetaStore::journal_is_empty`], [`crate::MetaStore::journal_len`] and
+    /// [`Meta::journal_own_gens`] with an I/O error, whichever thread makes them.
     pub fn fail_journal_emptiness_reads_for_tests(&self, n: u32) {
         self.journal_read_faults
             .store(n, std::sync::atomic::Ordering::SeqCst);

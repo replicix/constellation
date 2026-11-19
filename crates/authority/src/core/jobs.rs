@@ -1638,10 +1638,22 @@ impl Core {
     /// its table, and shipped them ahead of the tail's rename they depended
     /// on). A root's append of another delegate's row records that
     /// delegate's index and assigns none here.
-    fn own_journaled_gens(&self, replica: &dyn Replica) -> Vec<u64> {
+    ///
+    /// A read error is not "none": the strand would leave this node's own
+    /// rows ahead of the tail they depend on. The caller keeps the gate
+    /// closed and retries (counted and warned here).
+    fn own_journaled_gens(&mut self, replica: &dyn Replica) -> Result<Vec<u64>, String> {
         let mut gens: std::collections::BTreeSet<u64> = self.dl.mine.keys().copied().collect();
-        gens.extend(replica.journal_own_gens().unwrap_or_default());
-        gens.into_iter().collect()
+        match replica.journal_own_gens() {
+            Ok(own) => gens.extend(own),
+            Err(e) => {
+                self.stats.journal_read_errors += 1;
+                let error = format!("reading the journal's own generations for the strand: {e}");
+                tracing::warn!(node = self.cfg.node_id, %error, "journal read failed; the takeover gate stays closed");
+                return Err(error);
+            }
+        }
+        Ok(gens.into_iter().collect())
     }
 
     /// The re-ship of a takeover failed (`Meta::reship_at_takeover`):
@@ -1751,7 +1763,10 @@ impl Core {
             // a generation the table does not list (plan 46 M0.4 MUST-1,
             // `Meta::strand_for_takeover_carrying`): they replay by rid.
             let own_gens: Vec<u64> = if gate.backup_tail_epoch.is_some() {
-                self.own_journaled_gens(replica)
+                match self.own_journaled_gens(replica) {
+                    Ok(gens) => gens,
+                    Err(error) => return GateStep::Failed(error),
+                }
             } else {
                 Vec::new()
             };
@@ -2868,9 +2883,11 @@ impl Core {
         let drained = match self.journal_drained(replica, "a release decision") {
             Ok(drained) => drained,
             // No release, no `EpochFlushed`, no handoff pause and no nudge:
-            // the next round decides again.
-            Err(error) => {
-                self.finish_round(now, Some(error), replica, out);
+            // the next round decides again. The round itself did not fail
+            // (a read error here is counted and warned): its waiters and
+            // barriers are answered as for any round that released nothing.
+            Err(_) => {
+                self.finish_round(now, None, replica, out);
                 return;
             }
         };
@@ -3196,11 +3213,11 @@ impl Core {
                     // handoff ships on and releases.
                     let drained = match self.journal_drained(replica, "the release") {
                         Ok(drained) => drained,
-                        Err(error) => {
+                        Err(_) => {
                             match kind {
                                 JobKind::Round => {
                                     self.lease.releasing = false;
-                                    self.finish_round(now, Some(error), replica, out);
+                                    self.finish_round(now, None, replica, out);
                                 }
                                 _ => self.finish_flush_job(now, false, replica, out),
                             }

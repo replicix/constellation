@@ -2557,11 +2557,12 @@ impl Core {
             return None;
         }
         let r = d.release.as_ref().filter(|r| r.ends)?.row?;
+        // A read error is not "shipped": the state stays until a read says
+        // so, and the keep still ends when the row ships.
         (replica.log_stream_idx(gen) < r
             && replica
                 .journal_own_gens()
-                .unwrap_or_default()
-                .contains(&gen))
+                .map_or(true, |gens| gens.contains(&gen)))
         .then_some(r)
     }
 
@@ -2577,18 +2578,23 @@ impl Core {
     /// strands the journal's superseded rows), so the log's end installs
     /// nothing. A node that holds a root tenure installs nothing: the claim
     /// ([`Self::claim_releases`]) keeps the state itself.
+    ///
+    /// A journal that cannot be read is not one without such a stream: the
+    /// error is returned, and the caller installs none now and syncs again
+    /// (the install retry), so the row is streamed to the next root once the
+    /// read works.
     fn own_end_remnants(
         &self,
         listed: &BTreeSet<u64>,
         replica: &dyn Replica,
-    ) -> Vec<constellation_meta::delegation::NodeStream> {
+    ) -> Result<Vec<constellation_meta::delegation::NodeStream>, constellation_meta::MetaError>
+    {
         if self.root_tenure() || !replica.journal_has_undelegated() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let me = self.me();
         let cands: Vec<u64> = replica
-            .journal_own_gens()
-            .unwrap_or_default()
+            .journal_own_gens()?
             .into_iter()
             .filter(|g| !listed.contains(g) && !self.dl.mine.contains_key(g))
             // The cheap test first: only a stream with rows the log lacks
@@ -2596,11 +2602,11 @@ impl Core {
             .filter(|g| replica.delegate_idx(*g) > replica.log_stream_idx(*g))
             .collect();
         if cands.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let from = replica.journal_acked_seq().unwrap_or(0) + 1;
         let txs = replica.journal_txs_from(from, usize::MAX);
-        cands
+        Ok(cands
             .into_iter()
             .filter(|g| {
                 let released = txs.iter().filter(|t| t.origin.0 == *g).any(|t| {
@@ -2621,7 +2627,7 @@ impl Core {
                 gen,
                 subtrees: Vec::new(),
             })
-            .collect()
+            .collect())
     }
 
     /// This node holds a root tenure: the lease, or the hold of a
@@ -3178,7 +3184,19 @@ impl Core {
         // installed as a remnant like the one below, and exempt from the
         // fence for ended generations for itself (its own rows are what must
         // ship).
-        let remnants_own_end = self.own_end_remnants(&streams_mine, replica);
+        let remnants_own_end = match self.own_end_remnants(&streams_mine, replica) {
+            Ok(remnants) => remnants,
+            Err(e) => {
+                self.stats.journal_read_errors += 1;
+                tracing::warn!(
+                    node = me,
+                    error = %e,
+                    "journal read failed; the delegation sync installs no own-end remnant now and retries"
+                );
+                retry = true;
+                Vec::new()
+            }
+        };
         let own_end_gens: BTreeSet<u64> = remnants_own_end.iter().map(|s| s.gen).collect();
         for st in table
             .streams()

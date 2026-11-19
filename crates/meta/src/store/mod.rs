@@ -649,7 +649,7 @@ pub struct Meta {
     /// Whether a failed read of the drop plans has been warned of (once).
     pub(crate) drop_plan_read_warned: AtomicBool,
     /// Tests only (`test-util`): how many of this store's next
-    /// `journal_is_empty` / `journal_len` reads fail with an I/O error
+    /// `journal_is_empty` / `journal_len` / `journal_own_gens` reads fail with an I/O error
     /// ([`Meta::fail_journal_emptiness_reads_for_tests`]). Per store, not per
     /// thread: the release guard reads the journal on a spawned task.
     #[cfg(any(test, feature = "test-util"))]

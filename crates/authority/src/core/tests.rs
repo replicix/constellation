@@ -3441,6 +3441,125 @@ fn a_journal_read_error_does_not_release_a_flushing_epoch() {
     assert_eq!(h.core.stats.journal_read_errors, 1);
 }
 
+/// A release decision's read error is counted and warned, not a failure of
+/// the round: the round's waiters and barriers are answered as for a round
+/// that released nothing. A follower's fsync barrier or a `PublishNow` did not
+/// fail because of one transient read in a decision that would not have
+/// released anything. Fails on the parent: the round ended with the read
+/// error as its failure, so the waiter was answered with it, the barrier
+/// failed at once and `ship.last_error` was set.
+#[test]
+fn a_release_decision_read_error_does_not_fail_the_rounds_waiters() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.meta.create(ROOT_INO, "acked", 0o644, 0, 0).unwrap();
+    let mut out = Vec::new();
+    h.core.start(h.clk(), &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    h.step(Event::Timer { id: poll });
+    assert_eq!(h.core.job(), Some(JobKind::Round));
+    let barrier = OpId(1 << 50);
+    let waiter = OpId(1 << 51);
+    let out = h.step(Event::Control {
+        op: barrier,
+        req: Control::Barrier { ino: None },
+    });
+    assert!(
+        !out.iter()
+            .any(|a| matches!(a, Action::ControlDone { op, .. } if *op == barrier)),
+        "the barrier answered before the round: {out:?}"
+    );
+    h.core.round_waiters.push((waiter, Control::PublishNow));
+    h.meta.fail_journal_emptiness_reads_for_tests(1);
+    let mut out = Vec::new();
+    h.core.round_release(h.clk(), &h.meta, &mut out);
+    assert_eq!(h.core.stats.journal_read_errors, 1);
+    assert!(h.core.ship.last_error.is_none(), "the round was failed");
+    assert!(
+        out.iter()
+            .any(|a| matches!(a, Action::RoundDone { failed: None })),
+        "the round ended failed: {out:?}"
+    );
+    for a in &out {
+        if let Action::ControlDone { op, result } = a {
+            assert_ne!(*op, barrier, "the barrier was answered: {result:?}");
+            if *op == waiter {
+                let error = result.clone().unwrap_err();
+                assert!(
+                    !error.contains("reading the journal"),
+                    "the waiter got the read error: {error}"
+                );
+            }
+        }
+    }
+    assert_eq!(h.core.barriers.len(), 1, "the barrier waits its rounds");
+    assert!(!h.core.lease.releasing);
+}
+
+/// The release CAS's journal guard failing to read (the driver reports it as
+/// a conflict: the CAS was never sent, so it cannot have landed) is not a
+/// release in doubt: when the re-read of the lease fails as well, the node
+/// keeps the lease. Given up, it would have left rows it acknowledged and has
+/// not shipped to the takeover's strand.
+#[test]
+fn a_guard_that_blocked_the_release_cas_keeps_the_lease_when_the_reread_fails() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    submit_create(&mut h, 1, "f");
+    let flush = OpId(9);
+    let mut out = h.step(Event::Control {
+        op: flush,
+        req: Control::Flush,
+    });
+    let mut blocked = false;
+    for _ in 0..40 {
+        if let Some(upload) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+            continue;
+        }
+        if let Some(op) = out.iter().find_map(|a| match a {
+            Action::Publish { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::PublishDone { op, ok: true });
+            continue;
+        }
+        let Some((op, req)) = s3_ops(&out).first().map(|(o, r)| (*o, (*r).clone())) else {
+            break;
+        };
+        let result = match req {
+            S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+            S3Op::LeaseSwap { lease, .. } if lease.released => {
+                // The driver's guard could not read the journal.
+                blocked = true;
+                S3Result::LeasePut(Err(CasFailure::Conflict))
+            }
+            S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+            S3Op::LeaseGet => {
+                assert!(blocked, "a lease read before the release was blocked");
+                S3Result::LeaseGet(Err(crate::event::S3Failure("away".into())))
+            }
+            S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+            other => panic!("unexpected S3 op: {other:?}"),
+        };
+        out = h.step(Event::S3 { op, result });
+    }
+    assert!(blocked, "the release CAS was never issued");
+    assert!(
+        h.core.lease().held.is_some(),
+        "the lease was given up over unshipped rows"
+    );
+    assert!(!h.core.lease.releasing);
+}
+
 /// The handoff pause closes acquisitions too: a node that gave its lease up
 /// does not claim it back inside the pause, journal or not (that is what the
 /// pause is for: the successor needs its S3 round trips to claim it, and a
@@ -19688,6 +19807,99 @@ mod locks {
         assert_eq!(h.meta.delegate_idx(7).unwrap(), 2);
     }
 
+    /// The takeover gate with a backup tail reads which generations the node's
+    /// own journal rows belong to (`Meta::journal_own_gens`); a read error is
+    /// not "none". Taken for none, the strand left the node's own delegate
+    /// rows ahead of the tail they depend on, and they shipped before it
+    /// (`delegated-holder-cut` seed 1240). The gate stays closed and changes
+    /// nothing; the next pass, with the read working, strands them behind the
+    /// tail. Fails on the parent: the error read as an empty list and the gate
+    /// ran its strand without the node's own generation.
+    #[test]
+    fn the_takeover_gate_does_not_strand_without_the_own_rows_on_a_journal_read_error() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        two_delegate_rows(&h, dir);
+        let tail = vec![
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "t".into(),
+                ino: h.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 5,
+            },
+            LogRecord::Completed {
+                rid: Rid {
+                    node: 1,
+                    incarnation: 1,
+                    seq: 9,
+                },
+            },
+        ];
+        h.meta
+            .backup_append(
+                1,
+                &[constellation_meta::BackupTx {
+                    first: 1,
+                    last: 2,
+                    records: tail.clone(),
+                    origin: (0, 0),
+                }],
+            )
+            .unwrap();
+        h.core = Core::new(h.core.cfg.clone());
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        h.core.bk.tail_through = 2;
+        let journal_before = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX);
+        h.meta.fail_journal_emptiness_reads_for_tests(1);
+        let mut out = Vec::new();
+        let step = h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert!(
+            matches!(step, crate::core::jobs::GateStep::Failed(_)),
+            "the gate went on over a journal it could not read"
+        );
+        assert_eq!(h.core.stats.journal_read_errors, 1);
+        assert_eq!(
+            crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX),
+            journal_before,
+            "a failed gate pass changed the journal"
+        );
+        // The next pass reads: the tail first, then the own rows.
+        let step = h.core.complete_gate(h.clk(), &h.meta, &mut out);
+        assert!(
+            !matches!(step, crate::core::jobs::GateStep::Failed(_)),
+            "the retry failed"
+        );
+        let journal = crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX);
+        let at_tail = journal
+            .iter()
+            .position(|tx| tx.records.ends_with(&tail))
+            .expect("the tail is in the journal");
+        assert!(
+            journal
+                .iter()
+                .enumerate()
+                .filter(|(_, tx)| tx.origin.0 == 7)
+                .all(|(i, _)| i > at_tail),
+            "the tail first, then the delegate's own rows: {journal:?}"
+        );
+    }
+
     /// Review M1.2 S3 (pin): C3 item 3 across a crash. The gate's re-ship
     /// (the strand, the tail, and the re-append of the delegate's own rows of
     /// generation 7) is one store transaction, so a process that dies right
@@ -21570,6 +21782,86 @@ mod locks {
         assert!(d.done.contains(&(flush, false)), "{:?}", d.done);
         assert!(h.core.stats.journal_read_errors >= 1);
         assert!(!h.core.lease.releasing);
+    }
+
+    /// The same read error with a Round doing the release (a continuation
+    /// epoch's flush): the round ends unfailed, the
+    /// release flag it raised is down, and the next round decides again
+    /// rather than waiting in the release fence. Fails on the parent: the
+    /// round ended failed (its waiters answered with the read error).
+    #[test]
+    fn a_round_release_after_recalls_fails_closed_on_a_journal_read_error() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        h.core.dw.set_until_for_tests(7, w(h.now.plus(5_000)));
+        // What the delegation's setup journaled is shipped (for the test),
+        // so the flush release sees a drained journal.
+        constellation_meta::MetaStore::ack_journal(&h.meta, Replica::journal_tip(&h.meta)).unwrap();
+        // A continuation epoch's flush: the round releases for it.
+        h.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: false,
+                active: false,
+                frozen: false,
+                flushing: true,
+                base: 0,
+                members: vec![1, 2],
+                carrier: None,
+                stale_below: 1,
+            },
+        });
+        // A round runs to its release decision, which waits for the recall.
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        let poll = timers(&out, TimerKind::Poll)[0];
+        let out = h.step(Event::Timer { id: poll });
+        let d = drive_job(&mut h, out);
+        assert!(!d.released, "released with a recall in flight");
+        assert_eq!(h.core.job(), Some(JobKind::Round), "the round is parked");
+        assert!(h.core.lease.releasing);
+        let waiter = OpId(1 << 51);
+        h.core.round_waiters.push((waiter, Control::PublishNow));
+        h.meta.fail_journal_emptiness_reads_for_tests(1_000);
+        h.advance(10);
+        let grant = constellation_meta::locks::GrantWire {
+            id: GrantId { node: 3, seq: 5 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until_ms: h.now.0 + 10_000,
+            recalled: false,
+            gen: 7,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+            lapsed: false,
+        };
+        let out = release_answer(
+            &mut h,
+            3,
+            7,
+            constellation_meta::locks::LockHandback {
+                carry: Vec::new(),
+                grants: vec![grant],
+                floor: Position::ZERO,
+                barrier: 0,
+                rows: Vec::new(),
+            },
+        );
+        let d = drive_job(&mut h, out);
+        assert!(!d.released, "released over a journal it could not read");
+        assert!(h.core.stats.journal_read_errors >= 1);
+        assert!(!h.core.lease.releasing, "the release fence stays up");
+        assert!(h.core.ship.last_error.is_none(), "the round was failed");
     }
 
     /// The same release with a silent delegate: the recall's own outwait

@@ -1104,6 +1104,8 @@ impl Meta {
     /// append of another delegate's row assigns none), read from the
     /// transaction heads alone.
     pub fn journal_own_gens(&self) -> Result<Vec<u64>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        self.take_journal_read_fault()?;
         let r = self.db.read_tx();
         let mut gens: Vec<u64> = read_journal_txs(&r, self)?
             .into_iter()

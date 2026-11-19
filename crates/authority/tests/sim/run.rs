@@ -608,7 +608,7 @@ pub struct SimConfig {
     pub holder_releases_before_drain: bool,
     /// Fault injection: the chance, in parts per million per event a node
     /// handles, that its next journal emptiness read fails once (a transient
-    /// read error; the core must fail closed, ADR-64).
+    /// read error; the core must fail closed, ADR-65).
     /// `AUTHORITY_SIM_JOURNAL_READ_FAULT=<p>` (a probability, `0.001`) sets it
     /// on every configuration.
     pub journal_read_fault_ppm: u32,
