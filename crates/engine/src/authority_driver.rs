@@ -1012,13 +1012,21 @@ fn cas_failure(e: impl Into<StoreError>) -> CasFailure {
 /// The release CAS's last guard, after the fast path has gone quiet: a write
 /// that landed after the flush leaves rows in the journal, and a release
 /// over them would strand rows already acknowledged.
+///
+/// A journal that cannot be read is not an empty one: one transient read
+/// error would release over an acknowledged row that never shipped (I1/I5).
+/// It fails the CAS too, which the core retries as any other failed release
+/// (the in-doubt path re-reads the lease); the CAS is never sent on an error.
 fn release_guard(meta: &Meta) -> Result<(), CasFailure> {
-    if !constellation_meta::MetaStore::journal_is_empty(meta).unwrap_or(true) {
-        return Err(CasFailure::Failed(
+    match constellation_meta::MetaStore::journal_is_empty(meta) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(CasFailure::Failed(
             "a write landed before the release; retrying next round".into(),
-        ));
+        )),
+        Err(e) => Err(CasFailure::Failed(format!(
+            "reading the journal before the release: {e}"
+        ))),
     }
-    Ok(())
 }
 
 fn s3_failure(e: impl Into<StoreError>) -> S3Failure {
@@ -6678,7 +6686,7 @@ impl Driver {
                         // and one that landed after the flush fails the
                         // release rather than being stranded behind it.
                         view.wait_quiescent().await;
-                        if let Err(failure) = release_guard(&*meta) {
+                        if let Err(failure) = release_guard(&meta) {
                             let _ = tx.send(Internal::Event(Event::S3 {
                                 op,
                                 result: S3Result::LeasePut(Err(failure)),
@@ -8437,7 +8445,10 @@ mod tests {
         use constellation_meta::MetaStore;
         let meta = super::Meta::open_in_memory().unwrap();
         meta.set_node_prefix(1).unwrap();
-        assert!(super::release_guard(&meta).is_ok(), "an empty journal passes");
+        assert!(
+            super::release_guard(&meta).is_ok(),
+            "an empty journal passes"
+        );
         meta.create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
             .unwrap();
         assert!(
