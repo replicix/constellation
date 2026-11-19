@@ -492,8 +492,15 @@ impl TreePublisher {
         // the replica as it stands (a snapshot), unshipped work is as
         // transient a blocker as requester speculation: the caller ships
         // first and retries.
-        let unshipped = constellation_meta::MetaStore::journal_len(&*self.meta).unwrap_or(0) > 0;
-        if self.meta.has_dirty() && (self.meta.has_outstanding_speculation() || unshipped) {
+        // A journal that cannot be read is not an empty one: rows acked
+        // before the caller's barrier may be unshipped behind the error, and
+        // a commit that misses them would be stale (I1), so it fails the
+        // publish. The journal is read only when there is something dirty.
+        if self.meta.has_dirty()
+            && (self.meta.has_outstanding_speculation()
+                || !constellation_meta::MetaStore::journal_is_empty(&*self.meta)
+                    .context("reading the journal")?)
+        {
             anyhow::bail!("{SPECULATION_OUTSTANDING}");
         }
         // A deferral that the next attempt resolves by itself — most
@@ -1517,6 +1524,26 @@ mod tests {
         assert!(
             format!("{error:#}").contains(PUBLISH_DEFERRED),
             "publish_now: {error:#}"
+        );
+    }
+
+    /// A journal that cannot be read is not an empty one: `publish_now`
+    /// would otherwise take unshipped rows (acknowledged before the
+    /// snapshot's barrier) for none and publish a commit that misses them.
+    /// Fails on the parent: the read error counted as zero rows and the
+    /// publish went ahead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publish_now_fails_when_the_journal_cannot_be_read() {
+        let mut f = Fixture::new();
+        seed(&f.meta, 3);
+        f.meta.set_applied_seq(5).unwrap();
+        assert!(f.meta.has_dirty());
+        let mut publisher = f.publisher(1);
+        f.meta.fail_journal_emptiness_reads_for_tests(1);
+        let error = publisher.publish_now(1).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reading the journal"),
+            "{error:#}"
         );
     }
 

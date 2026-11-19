@@ -2557,7 +2557,12 @@ impl Core {
             return None;
         }
         let r = d.release.as_ref().filter(|r| r.ends)?.row?;
-        (replica.log_stream_idx(gen) < r && replica.journal_own_gens().contains(&gen)).then_some(r)
+        (replica.log_stream_idx(gen) < r
+            && replica
+                .journal_own_gens()
+                .unwrap_or_default()
+                .contains(&gen))
+        .then_some(r)
     }
 
     /// ADR-55 (restart and claim): the streams this node held as the root
@@ -2583,6 +2588,7 @@ impl Core {
         let me = self.me();
         let cands: Vec<u64> = replica
             .journal_own_gens()
+            .unwrap_or_default()
             .into_iter()
             .filter(|g| !listed.contains(g) && !self.dl.mine.contains_key(g))
             // The cheap test first: only a stream with rows the log lacks
@@ -14332,7 +14338,11 @@ impl Core {
     /// Whether this node's journal holds a `StreamReleased` of its own stream
     /// `gen` already.
     fn release_row_journaled(&self, gen: u64, replica: &dyn Replica) -> bool {
-        if !replica.journal_own_gens().contains(&gen) {
+        if !replica
+            .journal_own_gens()
+            .unwrap_or_default()
+            .contains(&gen)
+        {
             return false;
         }
         let from = replica.journal_acked_seq().unwrap_or(0) + 1;

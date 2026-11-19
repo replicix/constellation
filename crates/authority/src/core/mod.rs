@@ -966,6 +966,10 @@ pub struct Stats {
     pub client_deadlines_extended: u64,
     pub handoffs_served: u64,
     pub handoffs_declined: u64,
+    /// Reads of the journal that failed where a decision to release the lease
+    /// or hand it off needed them; each failed that decision closed
+    /// (`Core::journal_drained`). Expected 0.
+    pub journal_read_errors: u64,
     pub releases: u64,
     pub publishes: u64,
     pub in_doubt: u64,

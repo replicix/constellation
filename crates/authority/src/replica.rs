@@ -495,8 +495,8 @@ pub trait Replica {
     fn delegate_idx(&self, gen: u64) -> u64;
     /// The generations of this node's unshipped journal rows that it
     /// assigned the stream indices of, as their delegate
-    /// (`Meta::journal_own_gens`); empty when it cannot be read.
-    fn journal_own_gens(&self) -> Vec<u64>;
+    /// (`Meta::journal_own_gens`).
+    fn journal_own_gens(&self) -> Result<Vec<u64>, MetaError>;
     /// This node assigned stream indices under `gen`: it is, or was, one of
     /// its generations as their delegate (`Meta::delegate_idx` above 0).
     /// `None`: unreadable.
@@ -1769,8 +1769,8 @@ impl Replica for Meta {
         Meta::delegate_idx(self, gen).ok().map(|i| i > 0)
     }
 
-    fn journal_own_gens(&self) -> Vec<u64> {
-        Meta::journal_own_gens(self).unwrap_or_default()
+    fn journal_own_gens(&self) -> Result<Vec<u64>, MetaError> {
+        Meta::journal_own_gens(self)
     }
 
     fn settle_tagged_writes(&self) -> bool {

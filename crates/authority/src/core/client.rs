@@ -1450,7 +1450,7 @@ impl Core {
         // already on. A non-holder with nothing journaled never pays this.
         // Plan 30 §M11: a delegate's own stream rows are not such work
         // (the root ships them); only undelegated rows count.
-        if !replica.journal_is_empty().unwrap_or(true) && replica.journal_has_undelegated() {
+        if !replica.journal_is_empty().unwrap_or(false) && replica.journal_has_undelegated() {
             tracing::debug!(
                 node = self.cfg.node_id,
                 ?rid,
@@ -2697,7 +2697,7 @@ impl Core {
         }
         // `route`'s rule: an op of a node with unshipped journal of its
         // own may depend on records no holder has.
-        if !replica.journal_is_empty().unwrap_or(true) && replica.journal_has_undelegated() {
+        if !replica.journal_is_empty().unwrap_or(false) && replica.journal_has_undelegated() {
             return;
         }
         let mut waiting: Vec<(u64, Rid)> = self
@@ -3107,7 +3107,7 @@ impl Core {
             return;
         }
         if self.lease.lost
-            && !replica.journal_is_empty().unwrap_or(true)
+            && !replica.journal_is_empty().unwrap_or(false)
             && replica.journal_has_undelegated()
         {
             self.lease_path(now, rid, replica, out);

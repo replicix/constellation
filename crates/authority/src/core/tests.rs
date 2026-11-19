@@ -3361,6 +3361,86 @@ fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
     }
 }
 
+/// A journal that cannot be read is not a drained one: the idle release and
+/// (next test) the continuation epoch's flush release both decide on "the journal is
+/// empty", and a transient read error taken for "empty" released the lease
+/// over rows acknowledged and not shipped (I1/I5; `flex-tight` seed 485's
+/// loss came from such a release). The round fails closed: no release, no
+/// `EpochFlushed`, no handoff pause. Fails on the parent: the error counted
+/// as drained and both released.
+#[test]
+fn a_journal_read_error_does_not_release_an_idle_holder() {
+    let idle = |h: &mut Harness| {
+        let long_ago = WaitMs(h.now.0 - 1_000_000);
+        h.core.lease.wanted = vec![2];
+        if let Some((held, _)) = h.core.lease.held.as_mut() {
+            held.wanted_by = vec![2];
+        }
+        h.core.lease.wanted_since = Some(long_ago);
+        h.core.lease.held_since = Some(long_ago);
+        h.core.lease.last_write = long_ago;
+        assert!(h.core.lease.wants_handoff(h.clk(), h.core.config()));
+    };
+    // Idle: a row acknowledged and unshipped, one injected read fault.
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    idle(&mut h);
+    h.meta.create(ROOT_INO, "acked", 0o644, 0, 0).unwrap();
+    h.meta.fail_journal_emptiness_reads_for_tests(1);
+    let paused_before = h.core.lease.pause_until;
+    let mut out = Vec::new();
+    h.core.round_release(h.clk(), &h.meta, &mut out);
+    assert!(
+        !h.core.lease.releasing,
+        "idle-released over a journal it could not read"
+    );
+    assert_eq!(h.core.stats.journal_read_errors, 1);
+    assert_eq!(
+        h.core.lease.pause_until, paused_before,
+        "a handoff pause began over a journal it could not read"
+    );
+    // The fault was one read: the next round reads the row and holds too
+    // (the backlog is not drained), without counting another error.
+    h.core.round_release(h.clk(), &h.meta, &mut out);
+    assert!(!h.core.lease.releasing);
+    assert_eq!(h.core.stats.journal_read_errors, 1);
+}
+
+/// The continuation epoch's flush release, on a read error
+/// (see `a_journal_read_error_does_not_release_an_idle_holder`).
+/// Fails on the parent: the error counted as drained and the flush released.
+#[test]
+fn a_journal_read_error_does_not_release_a_flushing_epoch() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.step(Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Epoch {
+            open: false,
+            active: false,
+            frozen: false,
+            flushing: true,
+            base: 0,
+            members: vec![1, 2],
+            carrier: None,
+            stale_below: 1,
+        },
+    });
+    h.meta.create(ROOT_INO, "acked", 0o644, 0, 0).unwrap();
+    h.meta.fail_journal_emptiness_reads_for_tests(1);
+    let mut out = Vec::new();
+    h.core.round_release(h.clk(), &h.meta, &mut out);
+    assert!(
+        !h.core.lease.releasing,
+        "the epoch's flush released over a journal it could not read"
+    );
+    assert!(
+        !out.iter().any(|a| matches!(a, Action::EpochFlushed)),
+        "the flush was reported done: {out:?}"
+    );
+    assert_eq!(h.core.stats.journal_read_errors, 1);
+}
+
 /// The handoff pause closes acquisitions too: a node that gave its lease up
 /// does not claim it back inside the pause, journal or not (that is what the
 /// pause is for: the successor needs its S3 round trips to claim it, and a
@@ -3567,6 +3647,98 @@ fn a_handoff_is_declined_while_the_journal_cannot_drain() {
     assert_eq!(h.core.stats.handoffs_declined, 1);
     assert_eq!(h.meta.held_summary().deferred, 1);
     assert!(h.core.job().is_none());
+}
+
+/// A handoff whose flush ends on a journal it cannot read is declined like
+/// one that cannot drain: released, the lease would move over rows the
+/// holder could not see (I1/I5). Fails on the parent: the read error counted
+/// as zero undrained rows and the lease was released.
+#[test]
+fn a_handoff_is_declined_when_the_journal_cannot_be_read() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    submit_create(&mut h, 1, "f");
+    let mut out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::LeaseRequest {
+            req: OpId(5),
+            epoch_applied: None,
+        },
+    });
+    assert_eq!(h.core.job(), Some(JobKind::Handoff));
+    // Every emptiness read fails from here: the flush ships the row, and
+    // the decision after it cannot tell that it did.
+    h.meta.fail_journal_emptiness_reads_for_tests(1_000);
+    let mut answered = None;
+    for _ in 0..12 {
+        if let Some(a) = sends(&out).iter().find_map(|(to, m)| match m {
+            PeerMsg::LeaseHandoff { released, .. } if *to == 2 => Some(*released),
+            _ => None,
+        }) {
+            answered = Some(a);
+            break;
+        }
+        if let Some(upload) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+            continue;
+        }
+        if let Some((op, req)) = s3_ops(&out).first().map(|(o, r)| (*o, (*r).clone())) {
+            let result = match req {
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::LeaseSwap { lease, .. } => {
+                    assert!(
+                        !lease.released,
+                        "released the lease over a journal it could not read"
+                    );
+                    S3Result::LeasePut(Ok(tag()))
+                }
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected S3 op in the handoff: {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+            continue;
+        }
+        break;
+    }
+    assert_eq!(
+        answered,
+        Some(false),
+        "the handoff was not declined: {out:?}"
+    );
+    assert!(h.core.lease().held.is_some(), "the lease stays");
+    assert_eq!(h.core.stats.handoffs_declined, 1);
+    assert!(h.core.stats.journal_read_errors >= 1);
+}
+
+/// Plan 30 M5 round 3, on a read error: an op from a node whose journal
+/// cannot be read is not known to have none unshipped, so it takes the lease
+/// path rather than a forward the holder would refuse `ENOENT`. Fails on the
+/// parent: the error counted as an empty journal and the op was forwarded.
+#[test]
+fn an_op_from_a_node_whose_journal_cannot_be_read_takes_the_lease_path() {
+    let mut h = Harness::new(1);
+    h.meta.mkdir(ROOT_INO, "clone", 0o755, 0, 0).unwrap();
+    h.core.lease.cached_holder = Some(2);
+    h.meta.fail_journal_emptiness_reads_for_tests(1);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(1),
+        op: h.create("in-clone"),
+        tag: Default::default(),
+    });
+    assert!(
+        sends(&out).is_empty(),
+        "forwarded over a journal it could not read: {out:?}"
+    );
+    assert_eq!(h.core.job(), Some(JobKind::Acquire), "the lease path");
 }
 
 /// A claim of the holder's placement offer asks the holder over P2P
@@ -21357,6 +21529,47 @@ mod locks {
         assert!(d.done.contains(&(flush, true)), "{:?}", d.done);
         assert_eq!(h.core.stats.deleg_release_wait_bound, 0);
         assert!(h.core.dl.release_wait.is_none());
+    }
+
+    /// The release after the recalls reads the journal for the cuts it must
+    /// ship first; a read error is not "shipped". Fails on the parent: the
+    /// error counted as drained and the lease was released with the
+    /// generation's `DelegateNodeEnded` unshipped.
+    #[test]
+    fn a_release_after_recalls_fails_closed_on_a_journal_read_error() {
+        let (mut h, _recall, flush, f, d) = release_during_recall();
+        assert!(!d.released, "released with a recall in flight");
+        h.meta.fail_journal_emptiness_reads_for_tests(1_000);
+        h.advance(10);
+        let grant = constellation_meta::locks::GrantWire {
+            id: GrantId { node: 3, seq: 5 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until_ms: h.now.0 + 10_000,
+            recalled: false,
+            gen: 7,
+            confirmed: constellation_meta::locks::Grant::UNCONFIRMED,
+            settled: false,
+            lapsed: false,
+        };
+        let out = release_answer(
+            &mut h,
+            3,
+            7,
+            constellation_meta::locks::LockHandback {
+                carry: Vec::new(),
+                grants: vec![grant],
+                floor: Position::ZERO,
+                barrier: 0,
+                rows: Vec::new(),
+            },
+        );
+        let d = drive_job(&mut h, out);
+        assert!(!d.released, "released over a journal it could not read");
+        assert!(d.done.contains(&(flush, false)), "{:?}", d.done);
+        assert!(h.core.stats.journal_read_errors >= 1);
+        assert!(!h.core.lease.releasing);
     }
 
     /// The same release with a silent delegate: the recall's own outwait
@@ -88064,7 +88277,7 @@ mod root_own_sticky {
             acked_seqs: Vec::new(),
         });
         assert!(h.core.dl.mine[&d.gen].release.is_some());
-        assert!(Replica::journal_own_gens(&h.meta).contains(&d.gen));
+        assert!(Replica::journal_own_gens(&h.meta).unwrap().contains(&d.gen));
         // Nothing has shipped it: the guard sees the row.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             h.core.check_own_release_shipped(&h.meta);

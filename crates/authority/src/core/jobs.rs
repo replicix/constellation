@@ -1640,7 +1640,7 @@ impl Core {
     /// delegate's index and assigns none here.
     fn own_journaled_gens(&self, replica: &dyn Replica) -> Vec<u64> {
         let mut gens: std::collections::BTreeSet<u64> = self.dl.mine.keys().copied().collect();
-        gens.extend(replica.journal_own_gens());
+        gens.extend(replica.journal_own_gens().unwrap_or_default());
         gens.into_iter().collect()
     }
 
@@ -2850,8 +2850,30 @@ impl Core {
         self.round_release(now, replica, out);
     }
 
+    /// Whether this node's journal is empty, for a decision that releases the
+    /// lease or hands it off. A read error is not "drained": rows already
+    /// acknowledged to clients may be unshipped behind it (`flex-tight` seed
+    /// 485 lost operations from a release over such rows), so the caller must
+    /// fail closed: keep the lease and try again. Counted and warned here.
+    fn journal_drained(&mut self, replica: &dyn Replica, site: &str) -> Result<bool, String> {
+        replica.journal_is_empty().map_err(|e| {
+            self.stats.journal_read_errors += 1;
+            let error = format!("reading the journal before {site}: {e}");
+            tracing::warn!(node = self.cfg.node_id, %error, "journal read failed; failing closed");
+            error
+        })
+    }
+
     pub(crate) fn round_release(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        let drained = replica.journal_is_empty().unwrap_or(true);
+        let drained = match self.journal_drained(replica, "a release decision") {
+            Ok(drained) => drained,
+            // No release, no `EpochFlushed`, no handoff pause and no nudge:
+            // the next round decides again.
+            Err(error) => {
+                self.finish_round(now, Some(error), replica, out);
+                return;
+            }
+        };
         // The continuation epoch's flush: its journal is in S3 and the
         // lease taken for it can go — unless lock grants are live under
         // it: then the flush is over and the lease stays, as an idle
@@ -3052,7 +3074,21 @@ impl Core {
     /// the release never gets here, so the subtree stays blocked at the
     /// successor until the row ships (the cost of D3, `delegations.md`).
     pub(super) fn check_own_release_shipped(&mut self, replica: &dyn Replica) {
-        let in_journal = replica.journal_own_gens();
+        // A journal that cannot be read is counted, not taken as empty: this
+        // check only reports, but a silent skip would hide the very row it
+        // looks for.
+        let in_journal = match replica.journal_own_gens() {
+            Ok(gens) => gens,
+            Err(e) => {
+                self.stats.journal_read_errors += 1;
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    error = %e,
+                    "reading the journal's own generations before the release failed"
+                );
+                Vec::new()
+            }
+        };
         let pending = self
             .dl
             .mine
@@ -3158,7 +3194,20 @@ impl Core {
                     // (with the lock grants the recalls handed back, it
                     // keeps the lease, as with any grant); a flush or a
                     // handoff ships on and releases.
-                    if !replica.journal_is_empty().unwrap_or(true) {
+                    let drained = match self.journal_drained(replica, "the release") {
+                        Ok(drained) => drained,
+                        Err(error) => {
+                            match kind {
+                                JobKind::Round => {
+                                    self.lease.releasing = false;
+                                    self.finish_round(now, Some(error), replica, out);
+                                }
+                                _ => self.finish_flush_job(now, false, replica, out),
+                            }
+                            return;
+                        }
+                    };
+                    if !drained {
                         match kind {
                             JobKind::Round => {
                                 self.lease.releasing = false;
@@ -4895,19 +4944,29 @@ impl Core {
                 // same acknowledged writes. The requester forwards to
                 // this node meanwhile, as an idle holder with a backlog
                 // already makes it (`idle_release_due`).
-                let undrained = replica.journal_len().unwrap_or(0);
                 let handoff = matches!(
                     self.job.as_ref().map(|j| &j.what),
                     Some(What::Handoff { .. })
                 );
-                if handoff && undrained > 0 {
-                    tracing::info!(
-                        node = self.cfg.node_id,
-                        undrained,
-                        "handoff declined: the journal cannot drain (deferred or held rows)"
-                    );
-                    self.finish_flush_job(now, false, replica, out);
-                    return;
+                if handoff {
+                    // A journal that cannot be read is declined like one
+                    // that cannot drain: the handoff must not move the lease
+                    // over rows it could not see.
+                    match self.journal_drained(replica, "the handoff") {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(
+                                node = self.cfg.node_id,
+                                "handoff declined: the journal cannot drain (deferred or held rows)"
+                            );
+                            self.finish_flush_job(now, false, replica, out);
+                            return;
+                        }
+                        Err(_) => {
+                            self.finish_flush_job(now, false, replica, out);
+                            return;
+                        }
+                    }
                 }
                 // The handoff was admitted with no lock grant out
                 // (`on_lease_request`), but grants go on being made while
