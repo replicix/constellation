@@ -141,7 +141,8 @@ fn shadows_installed_on_the_holders_base_converge() {
                 records,
                 (false, None)
             )
-            .unwrap());
+            .unwrap()
+            .installed());
         }
         apply(&requester, &segments, seq);
         assert_eq!(
@@ -176,7 +177,8 @@ fn a_shadow_survives_an_unrelated_rename_tailed_under_it() {
         records18,
         (false, None)
     )
-    .unwrap());
+    .unwrap()
+    .installed());
     apply(&requester, &segments, 17);
     let mut expected = listing_at(&segments, 17);
     expected.retain(|e| !e.starts_with("f0="));
@@ -286,7 +288,8 @@ fn forwarded_rename_flags_are_decided_by_the_holder_and_converge() {
         records3,
         (false, None)
     )
-    .unwrap());
+    .unwrap()
+    .installed());
     apply(&requester, &segments, 3);
     assert!(!requester.has_outstanding_speculation());
     assert_eq!(listing(&requester), listing_at(&segments, 3));

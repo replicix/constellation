@@ -1983,7 +1983,8 @@ fn a_drop_leaves_a_queued_replay_of_a_delegates_shadow_alone() {
     let gen = (1u64 << 32) | 1;
     assert!(!meta
         .install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
-        .unwrap());
+        .unwrap()
+        .installed());
     let dropped = meta.drop_held(broken, 1).unwrap();
     assert_eq!(dropped.queued_dropped, 1, "{dropped:?}");
     let lost: Vec<_> = dropped.acked_lost.iter().map(|(r, _)| *r).collect();
@@ -2230,7 +2231,8 @@ fn a_queued_shadow_the_drop_leaves_alone_keeps_the_chunks_marks() {
     let gen = (1u64 << 32) | 1;
     assert!(!meta
         .install_shadow_answered(rid_of(1, 8), 0, gen, &write, &tag, &[], (true, None))
-        .unwrap());
+        .unwrap()
+        .installed());
     let dropped = meta.drop_held(broken, 1).unwrap();
     assert_eq!(dropped.dropped, 1, "{dropped:?}");
     assert_eq!(dropped.queued_kept, 1, "{dropped:?}");

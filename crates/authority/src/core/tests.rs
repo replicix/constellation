@@ -6117,6 +6117,114 @@ fn a_dedup_answer_without_records_is_not_installed_as_a_shadow() {
     );
 }
 
+/// `delegated-backup+links-local+stalebase` seeds 464 and 1911 (read your
+/// writes): with `speculate_on_stale_base` a reply installs on a base the
+/// requester lacks. The holder accepted `exchange f1 f3` where `f3` exists
+/// (its own create, unshipped, so the reply carries no base); the requester
+/// has no `f3`, the replay skips the exchange ("exchange entry missing"),
+/// and the shadow that stood for it covered `f3` with an effect it lacked:
+/// the op was answered at once and the next read of `f3` saw it absent. A
+/// shadow whose records skip is not installed; the op waits for the log
+/// like any reply on a stale base, and answers when the log delivers it.
+#[test]
+fn a_stale_base_reply_whose_records_do_not_apply_waits_for_the_log() {
+    let (_, mut requester) = pair();
+    requester.core.cfg.speculate_on_stale_base = true;
+    // The sequencer's own state: `f1` shipped, `f3` created and not shipped.
+    let sequencer = Meta::open_in_memory().unwrap();
+    sequencer.set_node_prefix(1).unwrap();
+    let make = |name: &str, seq: u64| {
+        let op = requester.create(name);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        };
+        constellation_meta::execute_mutate(&sequencer, &op, Some(rid)).unwrap()
+    };
+    let shipped = make("f1", 1);
+    let unshipped = make("f3", 2);
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, 0, &[], &[], &shipped).unwrap();
+    assert!(MetaStore::lookup(&requester.meta, ROOT_INO, "f1")
+        .unwrap()
+        .is_some());
+    let rid = requester.rid(1);
+    let op = MutateOp::Exchange {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        new_parent: ROOT_INO,
+        new_name: "f3".into(),
+    };
+    let out = requester.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: op.clone(),
+        tag: Default::default(),
+    });
+    let sent = sends(&out);
+    let [(1, PeerMsg::MutateRequest { req, .. })] = sent.as_slice() else {
+        panic!("expected one forward to node 1: {sent:?}")
+    };
+    let req = *req;
+    let exchange = constellation_meta::execute_mutate(&sequencer, &op, Some(rid)).unwrap();
+    let out = requester.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Accepted {
+                epoch: 1,
+                records: exchange.clone(),
+            },
+            // The sequencer's unshipped create of `f3` overlaps the
+            // exchange's keys: no base.
+            base: None,
+            position: constellation_meta::Position {
+                seq: 1,
+                pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 9 }),
+                streams: Default::default(),
+            },
+            gen: 0,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+            committed: false,
+            non_stealable: false,
+        },
+    });
+    assert!(
+        replies(&out).is_empty(),
+        "not answered before the effect is here"
+    );
+    assert_eq!(
+        requester.core.clients().collect::<Vec<_>>(),
+        vec![(rid, ClientPhase::AwaitingLog)]
+    );
+    assert!(
+        !requester.meta.has_outstanding_speculation(),
+        "no shadow stands for the skipped exchange"
+    );
+    // The log delivers the create and the exchange.
+    let mut delivered = unshipped;
+    delivered.extend(exchange);
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 2, 0, &[], &[], &delivered).unwrap();
+    let mut out = Vec::new();
+    let now = requester.clk();
+    requester
+        .core
+        .answer_awaiting_log(now, &requester.meta, &mut out);
+    let r = replies(&out);
+    assert_eq!(r.len(), 1, "answered once the log has it: {out:?}");
+    assert!(matches!(
+        r[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+    assert!(
+        MetaStore::lookup(&requester.meta, ROOT_INO, "f3")
+            .unwrap()
+            .is_some(),
+        "the acknowledged exchange is visible to the next read"
+    );
+}
+
 /// A refusal observes the holder's unshipped state: later reads wait for
 /// it (here they time out at the 20 ms test budget, degraded), except a
 /// key a newer shadow covers — the parent's attributes included — until

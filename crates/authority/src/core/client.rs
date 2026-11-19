@@ -22,7 +22,7 @@ use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
     CompletedOutcome, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position,
-    Rid, Streams, TouchSet,
+    Rid, ShadowInstall, Streams, TouchSet,
 };
 use constellation_types::Code;
 use std::collections::BTreeSet;
@@ -1814,6 +1814,83 @@ impl Core {
         }
     }
 
+    /// An accepted reply whose records are not installed as a shadow: the
+    /// log (or the holder's stream) delivers the transaction, and the op is
+    /// answered when it has. Whether the op's effect is in this replica's
+    /// log prefix already, the stream carried it here ahead of the reply, or
+    /// this node waits (`Phase::AwaitingLog`).
+    ///
+    /// Nothing here claims coverage for the records' keys unless the
+    /// transaction is in place already (the log's or the stream's): a skipped
+    /// shadow lacks the effect it would stand for.
+    fn accepted_awaits_log(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        (from, epoch, records, position): (NodeId, Epoch, Vec<LogRecord>, Position),
+        own_chunks: OwnChunks,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if replica.completed_position(rid).ok().flatten().is_some() {
+            // Delivered by the log already; the rest of what the
+            // holder evaluated against normally came with it.
+            self.observe_reply(now, rid, position, &own_chunks, replica, out);
+            self.finish_as(
+                now,
+                rid,
+                MutateOutcome::Accepted { epoch, records },
+                AnswerSource::Relayed { from },
+                replica,
+                out,
+            );
+            return;
+        }
+        self.stats.awaited_log += 1;
+        // Plan 30 §M9 (the OVH run's finding 4): the holder's
+        // pre-S3 stream carried the transaction here ahead of
+        // this reply — installed already, in the holder's order.
+        if self.adopt_streamed(rid, &position, replica) {
+            replica.note_covering(KeySet::from_records(&records), position);
+            self.finish_as(
+                now,
+                rid,
+                MutateOutcome::Accepted { epoch, records },
+                AnswerSource::Relayed { from },
+                replica,
+                out,
+            );
+            return;
+        }
+        let c = self.clients.get_mut(&rid).expect("present");
+        c.phase = Phase::AwaitingLog { epoch, position };
+        // What the pre-S3 stream brings (`answer_awaiting_streamed`)
+        // is this sequencer's own transaction, its answer passed on;
+        // an outcome read from the log is the log's
+        // (`answer_awaiting_log`).
+        c.answered_by = Some(AnswerSource::Relayed { from });
+        // Chunk metered-own-rows (OVH run 31): a replay of a
+        // stranded op waits for a transaction the sequencer's
+        // stream may have carried here already — before this
+        // node's deposition was recovered (a deposed holder drops
+        // the new holder's stream, and its recovery rolls back
+        // what it installed), so it is gone here and the stream
+        // does not resend it. Answered `Streamed`, each replay
+        // waited out the safety timer (10 s) before its upload,
+        // one after another (the queue replays one op at a time),
+        // and a close queued behind seven of them hit its 120 s
+        // deadline. Replays are rare (a takeover's stranded ops):
+        // upload at once.
+        let own_chunks = match own_chunks {
+            OwnChunks::Streamed(inos) if matches!(c.origin, Origin::Replay { .. }) => {
+                OwnChunks::Upload(inos)
+            }
+            own => own,
+        };
+        self.await_own_records(now, rid, own_chunks, out);
+        self.nudge(now, out);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_mutate_reply(
         &mut self,
@@ -1945,63 +2022,14 @@ impl Core {
                 // deposed root's replay of a delegate's create was
                 // answered from dedup, and the create was lost on that
                 // replica). Wait for the log, or the stream, instead.
-                if replica.completed_position(rid).ok().flatten().is_some() {
-                    // Delivered by the log already; the rest of what the
-                    // holder evaluated against normally came with it.
-                    self.observe_reply(now, rid, position, &own_chunks, replica, out);
-                    self.finish_as(
-                        now,
-                        rid,
-                        MutateOutcome::Accepted { epoch, records },
-                        AnswerSource::Relayed { from },
-                        replica,
-                        out,
-                    );
-                    return;
-                }
-                self.stats.awaited_log += 1;
-                // Plan 30 §M9 (the OVH run's finding 4): the holder's
-                // pre-S3 stream carried the transaction here ahead of
-                // this reply — installed already, in the holder's order.
-                if self.adopt_streamed(rid, &position, replica) {
-                    replica.note_covering(KeySet::from_records(&records), position);
-                    self.finish_as(
-                        now,
-                        rid,
-                        MutateOutcome::Accepted { epoch, records },
-                        AnswerSource::Relayed { from },
-                        replica,
-                        out,
-                    );
-                    return;
-                }
-                let c = self.clients.get_mut(&rid).expect("present");
-                c.phase = Phase::AwaitingLog { epoch, position };
-                // What the pre-S3 stream brings (`answer_awaiting_streamed`)
-                // is this sequencer's own transaction, its answer passed on;
-                // an outcome read from the log is the log's
-                // (`answer_awaiting_log`).
-                c.answered_by = Some(AnswerSource::Relayed { from });
-                // Chunk metered-own-rows (OVH run 31): a replay of a
-                // stranded op waits for a transaction the sequencer's
-                // stream may have carried here already — before this
-                // node's deposition was recovered (a deposed holder drops
-                // the new holder's stream, and its recovery rolls back
-                // what it installed), so it is gone here and the stream
-                // does not resend it. Answered `Streamed`, each replay
-                // waited out the safety timer (10 s) before its upload,
-                // one after another (the queue replays one op at a time),
-                // and a close queued behind seven of them hit its 120 s
-                // deadline. Replays are rare (a takeover's stranded ops):
-                // upload at once.
-                let own_chunks = match own_chunks {
-                    OwnChunks::Streamed(inos) if matches!(c.origin, Origin::Replay { .. }) => {
-                        OwnChunks::Upload(inos)
-                    }
-                    own => own,
-                };
-                self.await_own_records(now, rid, own_chunks, out);
-                self.nudge(now, out);
+                self.accepted_awaits_log(
+                    now,
+                    rid,
+                    (from, epoch, records, position),
+                    own_chunks,
+                    replica,
+                    out,
+                );
             }
             MutateOutcome::Accepted { epoch, records } => {
                 let Some((op, tag)) = self
@@ -2017,7 +2045,7 @@ impl Core {
                         .then_some(now.wall.0),
                 );
                 match replica.install_shadow(rid, epoch, gen, &op, &tag, &records, answer) {
-                    Ok(true) => {
+                    Ok(ShadowInstall::Installed) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
                         self.note_ungated_shadow(
@@ -2041,27 +2069,40 @@ impl Core {
                             out,
                         );
                     }
-                    Ok(false) => {
+                    Ok(ShadowInstall::InLog) => {
                         // Not installed: the completion is already in the
-                        // log prefix (fine), or this node took the lease
-                        // at a higher epoch and queued the op for replay
-                        // (plan 30 §M3b) — then the lease path executes it
-                        // here at once by the same rid.
-                        let queued = replica.completed_position(rid).ok().flatten().is_none();
-                        if queued {
-                            self.stats.queued_behind_takeover += 1;
-                            self.lease_path(now, rid, replica, out);
-                        } else {
-                            self.observe_reply(now, rid, position, &own_chunks, replica, out);
-                            self.finish_as(
-                                now,
-                                rid,
-                                MutateOutcome::Accepted { epoch, records },
-                                AnswerSource::Relayed { from },
-                                replica,
-                                out,
-                            );
-                        }
+                        // log prefix, which is fine.
+                        self.observe_reply(now, rid, position, &own_chunks, replica, out);
+                        self.finish_as(
+                            now,
+                            rid,
+                            MutateOutcome::Accepted { epoch, records },
+                            AnswerSource::Relayed { from },
+                            replica,
+                            out,
+                        );
+                    }
+                    Ok(ShadowInstall::QueuedBehindTakeover) => {
+                        // This node took the lease at a higher epoch and
+                        // queued the op for replay (plan 30 §M3b): the lease
+                        // path executes it here at once by the same rid.
+                        self.stats.queued_behind_takeover += 1;
+                        self.lease_path(now, rid, replica, out);
+                    }
+                    Ok(ShadowInstall::Unapplied) => {
+                        // The records skipped on this replica's state (a
+                        // stale-base reply): nothing was installed, and
+                        // nothing covers their keys. Wait for the log, as a
+                        // reply whose base is not applied does.
+                        self.stats.shadows_unapplied += 1;
+                        self.accepted_awaits_log(
+                            now,
+                            rid,
+                            (from, epoch, records, position),
+                            own_chunks,
+                            replica,
+                            out,
+                        );
                     }
                     Err(error) => {
                         tracing::warn!(%error, node = self.cfg.node_id, ?rid, "failed to install shadow");
@@ -2311,7 +2352,8 @@ impl Core {
                 let floor = position.hint_floor();
                 let mut hinted = false;
                 if base_ok && applied < floor {
-                    // Not installed (`Ok(false)`): the refusal is here
+                    // Not installed (`Ok(false)`; a hint whose records skip
+                    // here counts in `hints_unapplied`): the refusal is here
                     // already — streamed ahead of the log, with what the
                     // holder did after it — so the hint is stale (backup
                     // sim seed 600396); the refusal is uncovered, as below.
@@ -2331,6 +2373,7 @@ impl Core {
                         Ok(false) => {}
                         Err(error) => tracing::warn!(%error, "failed to install hint"),
                     }
+                    self.stats.hints_unapplied += replica.take_hints_unapplied();
                 }
                 if !hinted {
                     self.observe_reply(now, rid, position, &own_chunks, replica, out);

@@ -709,7 +709,8 @@ fn a_committed_shadow_survives_a_takeover_and_retires_by_the_re_ship() {
             &recs,
             true
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     // Another node's row of epoch 2 arrives (the marker and an unrelated
     // transaction): the shadow stays.
     let other = vec![create("b", ino(2), 11), completed(rid(2))];
@@ -736,7 +737,8 @@ fn an_uncommitted_shadow_still_strands_at_a_later_epoch() {
     let recs = vec![create("a", ino(1), 10), completed(rid(1))];
     assert!(meta
         .install_shadow(rid(1), 1, &create_op("a", ino(1)), &recs)
-        .unwrap());
+        .unwrap()
+        .installed());
     let other = vec![create("b", ino(2), 11), completed(rid(2))];
     apply_rows(&meta, 1, 2, 2, &[1, 2], &other);
     assert_eq!(meta.pending_replays().unwrap().len(), 1);
@@ -1099,7 +1101,8 @@ fn a_delegates_committed_shadow_survives_a_root_takeover() {
             &recs,
             true
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     let other = vec![create("b", ino(2), 11), completed(rid(2))];
     apply_rows(&meta, 1, 2, 2, &[1, 2], &other);
     assert!(meta.has_outstanding_speculation(), "not stranded");

@@ -1772,6 +1772,10 @@ pub struct Report {
     /// forwards answered `Held`, quarantines waited out, read grants
     /// withheld, quarantines ended early by the void round.
     pub quarantine_core: [u64; 6],
+    /// The shadows and the hints refused because their records skipped on
+    /// the requester's replica, summed over the nodes (`SWEEP-UNAPPLIED`):
+    /// only the stale-base knob may have any.
+    pub unapplied_core: [u64; 2],
     /// The release in doubt's wait (`release_doubt.rs`), summed over the nodes:
     /// entered, peer reads that showed the lease standing, given up, inconclusive
     /// peer reads, forwards answered `Held`, renewal CASes, probes answered,
@@ -7552,6 +7556,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 stats.deleg_append_skipped, report.stats
             ));
         }
+        // A reply's records that skip on the requester's replica mean the
+        // reply's base did not cover what they need: with production rules a
+        // base bug (the knob installs on a base the requester lacks, and the
+        // skipping shadow or hint is refused, never trusted).
+        if (stats.shadows_unapplied > 0 || stats.hints_unapplied > 0) && !stale_base {
+            return Err(format!(
+                "node {id}: {} shadow(s) and {} hint(s) whose records skipped on the requester's replica\n  stats: {:#?}",
+                stats.shadows_unapplied, stats.hints_unapplied, report.stats
+            ));
+        }
     }
     // Plan 46 M1.2 step 14: a root's append of a delegate's row is dropped or
     // kept as a member copy by every stranding pass, never queued for replay
@@ -8174,6 +8188,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.sticky_core[13] += s.deleg_abandon_reads_recalled;
         report.sticky_core[14] += s.deleg_abandon_reads_expired;
         report.sticky_core[15] += s.deleg_abandon_superseded;
+        report.unapplied_core[0] += s.shadows_unapplied;
+        report.unapplied_core[1] += s.hints_unapplied;
         report.quarantine_core[0] += s.deleg_restart_quarantines;
         report.quarantine_core[1] += s.deleg_restart_q_parks;
         report.quarantine_core[2] += s.deleg_restart_q_held;

@@ -1186,7 +1186,10 @@ fn a_forward_reply_older_than_the_held_epoch_is_queued_not_installed() {
         },
         LogRecord::Completed { rid: rid(9) },
     ];
-    assert!(!meta.install_shadow(rid(9), 2, &op, &recs).unwrap());
+    assert!(!meta
+        .install_shadow(rid(9), 2, &op, &recs)
+        .unwrap()
+        .installed());
     assert!(!meta.has_outstanding_speculation());
     assert!(meta.lookup(ROOT_INO, "late-reply").unwrap().is_none());
     let queued = meta.pending_replays().unwrap();
@@ -1194,7 +1197,10 @@ fn a_forward_reply_older_than_the_held_epoch_is_queued_not_installed() {
     assert_eq!(queued[0].rid, rid(9));
     // A reply from the held epoch itself installs normally.
     meta.set_holder_epoch(2);
-    assert!(meta.install_shadow(rid(10), 2, &op, &recs).unwrap());
+    assert!(meta
+        .install_shadow(rid(10), 2, &op, &recs)
+        .unwrap()
+        .installed());
 }
 
 /// An op's records and its `Completed { rid }` never land in different

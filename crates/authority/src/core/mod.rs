@@ -948,6 +948,15 @@ pub struct Stats {
     pub lease_path_taken: u64,
     pub shadows_installed: u64,
     pub hints_installed: u64,
+    /// Accepted replies whose records skipped on this replica's state
+    /// (`ShadowInstall::Unapplied`): no shadow, the op waited for the log.
+    /// A stale-base reply under `speculate_on_stale_base`; with production
+    /// rules the reply's base covers what the records need, so the sim
+    /// fails a seed that has any.
+    pub shadows_unapplied: u64,
+    /// `Exists` hints refused for the same reason (uncovered, `observed`
+    /// raised).
+    pub hints_unapplied: u64,
     pub speculation_rolled_back: u64,
     pub local_rolled_back: u64,
     pub stranded_replayed: u64,

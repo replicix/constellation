@@ -19,7 +19,7 @@ use constellation_meta::locks::LockTag;
 use constellation_meta::{
     execute_tagged, BackupRole, BackupTx, CompletedOutcome, DelegateTx, InboxAck, JournalBatch,
     JournalPos, KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position, ReadDelegations,
-    Rid, Stranded, StrandedOp, TouchSet,
+    Rid, ShadowInstall, Stranded, StrandedOp, TouchSet,
 };
 use constellation_types::Code;
 
@@ -186,7 +186,7 @@ pub trait Replica {
         tag: &LockTag,
         records: &[LogRecord],
         answer: (bool, Option<i64>),
-    ) -> Result<bool, MetaError>;
+    ) -> Result<ShadowInstall, MetaError>;
     /// The pre-S3 stream installed `rid`'s transaction here already:
     /// adopt it as this node's own op (`Meta::adopt_streamed`).
     fn adopt_streamed(&self, rid: Rid, op: &MutateOp, tag: &LockTag) -> Result<bool, MetaError>;
@@ -453,6 +453,9 @@ pub trait Replica {
     /// since the last call (a tolerant apply; counted, and the sim fails a
     /// seed that has one).
     fn take_deleg_append_skipped(&self) -> u64;
+    /// Hints refused since the last call because their records skipped
+    /// here (`Meta::take_hints_unapplied`).
+    fn take_hints_unapplied(&self) -> u64;
     /// Appended delegate rows with a rid and no completion for it (must stay 0).
     fn take_deleg_append_uncompleted(&self) -> u64;
     /// This node's unretired transactions of stream `gen` from `from_idx`.
@@ -1206,7 +1209,7 @@ impl Replica for Meta {
         tag: &LockTag,
         records: &[LogRecord],
         answer: (bool, Option<i64>),
-    ) -> Result<bool, MetaError> {
+    ) -> Result<ShadowInstall, MetaError> {
         Meta::install_shadow_answered(self, rid, epoch, gen, op, tag, records, answer)
     }
 
@@ -1603,6 +1606,10 @@ impl Replica for Meta {
 
     fn take_deleg_append_skipped(&self) -> u64 {
         Meta::take_deleg_append_skipped(self)
+    }
+
+    fn take_hints_unapplied(&self) -> u64 {
+        Meta::take_hints_unapplied(self)
     }
 
     fn take_deleg_append_uncompleted(&self) -> u64 {

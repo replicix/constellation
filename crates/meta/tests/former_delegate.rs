@@ -88,7 +88,10 @@ impl Fx {
             },
             LogRecord::Completed { rid: s_rid },
         ];
-        assert!(meta.install_shadow(s_rid, 1, &s_op, &s_recs).unwrap());
+        assert!(meta
+            .install_shadow(s_rid, 1, &s_op, &s_recs)
+            .unwrap()
+            .installed());
         // This node, the delegate of `d` (generation 1), executes
         // `create d/x`.
         let x_ino = (2 << 40) | 20;

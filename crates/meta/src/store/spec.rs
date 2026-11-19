@@ -155,6 +155,31 @@ const ABANDON_REPLAY_NODE: u64 = 1 << 63;
 
 // ---------------------------------------------------------------- types
 
+/// What [`Meta::install_shadow`] did with a forward reply's records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShadowInstall {
+    /// A shadow stands for the op's effect (or the holder's stream carried
+    /// the transaction here already and this node adopted it).
+    Installed,
+    /// This replica's applied log carries the op's completion: the effect
+    /// is part of the log prefix, nothing to install.
+    InLog,
+    /// This node took the lease at a higher epoch: the op is queued for
+    /// replay here instead.
+    QueuedBehindTakeover,
+    /// The replay skipped some of the records: this replica is not at the
+    /// state the sequencer evaluated the op against. Nothing was installed
+    /// and nothing may claim coverage; the log carries the effect.
+    Unapplied,
+}
+
+impl ShadowInstall {
+    /// Whether a shadow (or an adopted stream entry) stands for the op.
+    pub fn installed(self) -> bool {
+        self == Self::Installed
+    }
+}
+
 /// What one `spec` row is. See the module doc.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpecKind {
@@ -4866,8 +4891,8 @@ fn op_keys_depend_on_lookup(op: &MutateOp) -> bool {
 
 impl Meta {
     /// Install a forwarded op's accepted records ahead of the log, as a
-    /// `Shadow` entry (`forward::apply_accepted`). Returns `false`, and
-    /// installs nothing, when:
+    /// `Shadow` entry (`forward::apply_accepted`). Installs nothing, and
+    /// says why in the [`ShadowInstall`] it returns, when:
     /// - this replica's applied log already carries `rid`'s completion:
     ///   the reply lost a race with this node's own tail, so the effect is
     ///   already part of the log prefix, and re-applying it on top of
@@ -4878,14 +4903,19 @@ impl Meta {
     ///   takeover). That epoch can no longer reach the log, so a shadow
     ///   would only let this holder validate against phantom state until
     ///   something stranded it; the op is queued for replay by rid
-    ///   instead, in the same transaction, and the replay runs it here.
+    ///   instead, in the same transaction, and the replay runs it here;
+    /// - the replay skips any of the records ([`ShadowInstall::Unapplied`]):
+    ///   this replica is not at the state the sequencer evaluated the op
+    ///   against (a stale-base reply), so a shadow of it would claim an
+    ///   effect it lacks and a read would trust that coverage. Nothing
+    ///   stays behind; the caller waits for the log.
     pub fn install_shadow(
         &self,
         rid: Rid,
         epoch: u64,
         op: &MutateOp,
         records: &[LogRecord],
-    ) -> Result<bool, MetaError> {
+    ) -> Result<ShadowInstall, MetaError> {
         self.install_shadow_from(rid, epoch, 0, op, &LockTag::NONE, records)
     }
 
@@ -4979,7 +5009,7 @@ impl Meta {
         op: &MutateOp,
         tag: &LockTag,
         records: &[LogRecord],
-    ) -> Result<bool, MetaError> {
+    ) -> Result<ShadowInstall, MetaError> {
         self.install_shadow_committed(rid, epoch, gen, op, tag, records, false)
     }
 
@@ -4996,7 +5026,7 @@ impl Meta {
         tag: &LockTag,
         records: &[LogRecord],
         (committed, non_stealable): (bool, Option<i64>),
-    ) -> Result<bool, MetaError> {
+    ) -> Result<ShadowInstall, MetaError> {
         self.install_shadow_inner(
             rid,
             epoch,
@@ -5021,7 +5051,7 @@ impl Meta {
         tag: &LockTag,
         records: &[LogRecord],
         committed: bool,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<ShadowInstall, MetaError> {
         self.install_shadow_inner(rid, epoch, gen, op, tag, records, (committed, None))
     }
 
@@ -5035,10 +5065,10 @@ impl Meta {
         tag: &LockTag,
         records: &[LogRecord],
         (committed, non_stealable): (bool, Option<i64>),
-    ) -> Result<bool, MetaError> {
+    ) -> Result<ShadowInstall, MetaError> {
         let mut tx = self.db.write_tx();
         if tx.get(&self.completed, rid.to_key())?.is_some() {
-            return Ok(false);
+            return Ok(ShadowInstall::InLog);
         }
         // Plan 30 §M9: the holder's pre-S3 stream may have carried this
         // very op here before its reply (the requester is a subscriber
@@ -5054,7 +5084,7 @@ impl Meta {
         // the op down the lease path a second time).
         if adopt_streamed_tx(&mut tx, self, rid, op, tag)? {
             tx.commit()?;
-            return Ok(true);
+            return Ok(ShadowInstall::Installed);
         }
         if self.holder_epoch() > epoch {
             let key = next_spec_seq_tx(&mut tx, &self.local)?;
@@ -5073,7 +5103,7 @@ impl Meta {
                 "a forward reply from an older epoch arrived after this node's takeover; \
                  queued for replay instead of installed"
             );
-            return Ok(false);
+            return Ok(ShadowInstall::QueuedBehindTakeover);
         }
         let kind = SpecKind::Shadow {
             rid,
@@ -5084,8 +5114,16 @@ impl Meta {
             gated: committed,
             non_stealable,
         };
-        self.install_speculative_tx(tx, UsageTracker::staging(), kind, records)?;
-        Ok(true)
+        if self.install_speculative_tx(tx, UsageTracker::staging(), kind, records, true)? {
+            Ok(ShadowInstall::Installed)
+        } else {
+            tracing::warn!(
+                ?rid,
+                epoch,
+                "a forward reply's records do not apply on this replica; no shadow installed"
+            );
+            Ok(ShadowInstall::Unapplied)
+        }
     }
 
     /// Install the entry behind an `Exists` refusal ahead of the log, as a
@@ -5134,6 +5172,11 @@ impl Meta {
     ///   name see it at once, until the segment carrying the link
     ///   arrived (plan 45 review).
     ///
+    /// - the replay skips any of the entry's records
+    ///   ([`Self::take_hints_unapplied`]): this replica is not at the state
+    ///   the holder read it from, and a hint that lacks part of the entry
+    ///   would cover keys it does not show.
+    ///
     /// The caller then treats the refusal as uncovered (raises
     /// `observed`), which is always correct.
     pub fn install_hint_from(
@@ -5172,7 +5215,7 @@ impl Meta {
         if hint_names_a_held_inode(&tx, self, records)? {
             return Ok(false);
         }
-        self.install_speculative_tx(
+        let installed = self.install_speculative_tx(
             tx,
             UsageTracker::staging(),
             SpecKind::Hint {
@@ -5182,8 +5225,20 @@ impl Meta {
                 gated: committed,
             },
             records,
+            true,
         )?;
-        Ok(true)
+        if !installed {
+            self.hints_unapplied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(installed)
+    }
+
+    /// How many hints [`Self::install_hint_committed`] refused since the
+    /// last call because their records skipped on this replica.
+    pub fn take_hints_unapplied(&self) -> u64 {
+        self.hints_unapplied
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The highest journal seq of `epoch` installed here as a `Streamed`
@@ -5586,7 +5641,9 @@ impl Meta {
                 own: None,
             },
             records,
+            false,
         )
+        .map(|_| ())
     }
 
     /// Plan 46 M0.2 follow-up (defect B): the holder's `repair drop-held`
@@ -5622,15 +5679,24 @@ impl Meta {
 
     /// `staged` may carry usage the caller's transaction already moved
     /// (a retraction); it is persisted with this install's.
+    ///
+    /// `refuse_on_skip`: when the replay skips any record (the local state
+    /// is not the one the sequencer evaluated the records against), install
+    /// nothing: the transaction is dropped unfinished, which aborts it (the
+    /// namespace writes, the `dirty` rows the capture wrote in it and the
+    /// usage delta staged in `staged`, which is not drained), and `false` is
+    /// returned. An entry that applied only part of its records would stand
+    /// for an effect it lacks. `true`: installed.
     fn install_speculative_tx(
         &self,
         mut tx: SingleWriterWriteTx,
         staged: UsageTracker,
         kind: SpecKind,
         records: &[LogRecord],
-    ) -> Result<(), MetaError> {
+        refuse_on_skip: bool,
+    ) -> Result<bool, MetaError> {
         let capture = Capture::new();
-        let (_, applied) = {
+        let (skipped, applied) = {
             let cx = ApplyCx {
                 dirty: self.dirty_capturing(&capture),
                 durable: false,
@@ -5645,13 +5711,20 @@ impl Meta {
                 true,
             )?
         };
+        if refuse_on_skip && skipped > 0 {
+            drop(tx);
+            // Holds the aborted pass staged are harmless (the flush checks
+            // the committed hold key); clear them with this thread's.
+            self.flush_held_releases();
+            return Ok(false);
+        }
         let usage = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, usage.0, usage.1)?;
         record_tx(&mut tx, self, kind, applied, capture.finish(), usage)?;
         tx.commit()?;
         self.flush_held_releases();
         staged.drain_into(self.usage_tracker());
-        Ok(())
+        Ok(true)
     }
 
     /// Apply one tailed, non-fenced log segment at `seq` (from a holder at

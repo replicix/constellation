@@ -15,7 +15,7 @@
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
     execute_mutate, JournalPos, LogRecord, Meta, MetaStore, MutateOp, Position, PublishBasis, Rid,
-    TouchSet,
+    ShadowInstall, TouchSet,
 };
 use constellation_types::Code;
 
@@ -119,7 +119,8 @@ fn a_shadow_retires_by_rid_and_its_row_is_compacted() {
     let recs = vec![create("a", ino(1), 10), completed(rid(1))];
     assert!(meta
         .install_shadow(rid(1), 1, &create_op("a", ino(1)), &recs)
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(meta.has_outstanding_speculation());
     assert_eq!(
         meta.completed_position(rid(1)).unwrap(),
@@ -159,7 +160,8 @@ fn a_shadow_for_an_already_completed_rid_is_not_installed() {
     // The reply arrives after this replica already tailed the segment.
     assert!(!meta
         .install_shadow(rid(1), 1, &create_op("a", ino(1)), &recs)
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(!meta.has_outstanding_speculation());
 }
 
@@ -495,7 +497,8 @@ fn a_stranded_run_of_links_and_unlinks_restores_each_dentrys_form() {
         let r = rid(i as u64 + 1);
         assert!(meta
             .install_shadow(r, 1, op, &[record.clone(), completed(r)])
-            .unwrap());
+            .unwrap()
+            .installed());
     }
     // f is down to f3 (2 -> 3 -> 2 -> 1: its copy is back), g is at two.
     assert_eq!(meta.getattr(f).unwrap().unwrap().nlink, 1);
@@ -1045,7 +1048,10 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                     let recs = vec![rec, completed(r)];
                     journal.extend(recs.iter().cloned());
                     let installed = meta.install_shadow(r, epoch, &op, &recs).unwrap();
-                    assert!(installed, "a fresh rid is never already completed");
+                    assert!(
+                        installed.installed(),
+                        "a fresh rid is never already completed"
+                    );
                     events.push(Event::Speculation(specs.len(), recs));
                     specs.push(Spec {
                         epoch,
@@ -1484,7 +1490,8 @@ fn a_hint_is_not_installed_over_live_speculation_on_its_keys() {
     };
     assert!(meta
         .install_shadow(rid(51), 1, &op, &[rename, completed(rid(51))])
-        .unwrap());
+        .unwrap()
+        .installed());
     let installed = meta
         .install_hint_from(Some(rid(52)), &[create("f0", a, 10)], shipped(3), 1, 0)
         .unwrap();
@@ -1538,7 +1545,10 @@ fn a_streamed_transaction_goes_under_a_shadow_whose_reply_overtook_it() {
 
     let meta = Meta::open_in_memory().unwrap();
     apply(&meta, 1, 1, &seg1);
-    assert!(meta.install_shadow(mine, 1, &op, &ours).unwrap());
+    assert!(meta
+        .install_shadow(mine, 1, &op, &ours)
+        .unwrap()
+        .installed());
     assert_eq!(mode(&meta), 0o640, "read-your-writes");
     meta.install_streamed(1, HOLDER, 2, 3, &theirs).unwrap();
     assert_eq!(
@@ -1583,7 +1593,8 @@ fn a_segment_under_a_git_objects_shadows_keeps_the_object() {
         let u = vec![unlink("tmp", 12), completed(rid(3))];
         assert!(meta
             .install_shadow(rid(1), 1, &create_op("tmp", x), &c)
-            .unwrap());
+            .unwrap()
+            .installed());
         assert!(meta
             .install_shadow(
                 rid(2),
@@ -1595,7 +1606,8 @@ fn a_segment_under_a_git_objects_shadows_keeps_the_object() {
                 },
                 &l
             )
-            .unwrap());
+            .unwrap()
+            .installed());
         assert!(meta
             .install_shadow(
                 rid(3),
@@ -1606,7 +1618,8 @@ fn a_segment_under_a_git_objects_shadows_keeps_the_object() {
                 },
                 &u
             )
-            .unwrap());
+            .unwrap()
+            .installed());
         let a = meta.getattr(x).unwrap().expect("inode after shadows");
         assert_eq!(a.nlink, 1);
         if split {
@@ -1675,7 +1688,8 @@ fn a_root_appending_a_delegates_git_object_keeps_the_object() {
     for (r, op, recs) in &ops {
         assert!(meta
             .install_shadow_from(*r, 1, gen, op, &Default::default(), recs)
-            .unwrap());
+            .unwrap()
+            .installed());
     }
     for (idx, (r, _, recs)) in ops.iter().enumerate() {
         // The delegate's row carries its own `Completed`.
@@ -1941,7 +1955,8 @@ fn a_refused_rid_in_the_log_rolls_its_shadow_back_without_a_replay() {
     let records = [create("b", ino(91), t0 + 1), completed(r)];
     assert!(meta
         .install_shadow(r, 1, &create_op("b", ino(91)), &records)
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(MetaStore::lookup(&meta, ROOT_INO, "b").unwrap().is_some());
     apply(
         &meta,
@@ -1994,7 +2009,10 @@ fn a_hint_outlives_a_segment_that_does_not_carry_its_entry() {
         mtime_ns: None,
     };
     let written = vec![chmod(p18, 0o600, t0 + 1), completed(rid(1))];
-    assert!(meta.install_shadow(rid(1), 1, &write, &written).unwrap());
+    assert!(meta
+        .install_shadow(rid(1), 1, &write, &written)
+        .unwrap()
+        .installed());
     let refused_at = Position {
         seq: 1,
         pending: Some(JournalPos { epoch: 1, jseq: 5 }),
@@ -2058,7 +2076,10 @@ fn a_later_change_of_a_hinted_name_ends_the_hint(later: LogRecord, renamed_to: O
         mtime_ns: None,
     };
     let written = vec![chmod(p18, 0o600, t0 + 1), completed(rid(1))];
-    assert!(meta.install_shadow(rid(1), 1, &write, &written).unwrap());
+    assert!(meta
+        .install_shadow(rid(1), 1, &write, &written)
+        .unwrap()
+        .installed());
     // Refused with the winner's create at journal row 5 of 6.
     let refused_at = Position {
         seq: 1,
@@ -2245,7 +2266,10 @@ fn a_streamed_link_goes_under_a_shadowed_unlink_of_the_inodes_other_name() {
 
     let meta = Meta::open_in_memory().unwrap();
     apply(&meta, 1, 1, &seg1);
-    assert!(meta.install_shadow(mine, 1, &op, &ours).unwrap());
+    assert!(meta
+        .install_shadow(mine, 1, &op, &ours)
+        .unwrap()
+        .installed());
     assert_eq!(names(&meta), (None, None), "read-your-writes");
     meta.install_streamed(1, HOLDER, 2, 3, &theirs).unwrap();
     assert_eq!(
@@ -2306,7 +2330,8 @@ fn a_root_appending_a_delegates_exchange_over_its_shadow_swaps_once() {
             &Default::default(),
             &[exchange.clone(), completed(rid(1))]
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     assert_eq!(names(&meta), (Some(b), Some(a)), "read-your-writes");
     assert!(meta
         .apply_delegate_tx(
@@ -2352,7 +2377,8 @@ fn a_hint_for_the_other_name_of_an_inode_a_shadow_unlinked_is_not_installed() {
             &Default::default(),
             &[unlink("a", t0 + 3), completed(rid(1))]
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     let installed = meta
         .install_hint_from(Some(rid(61)), &[create("b", x, t0)], shipped(3), 1, 0)
         .unwrap();
@@ -2421,7 +2447,8 @@ fn o1_a_root_appending_an_exchange_under_a_later_shadow_keeps_their_order() {
                 &Default::default(),
                 &[e.clone(), completed(rid(r))]
             )
-            .unwrap());
+            .unwrap()
+            .installed());
     }
     meta.apply_delegate_tx(
         &[e1.clone(), completed(rid(1))],
@@ -2470,7 +2497,8 @@ fn o1_a_root_appending_a_rename_under_a_later_shadow_keeps_their_order() {
             &Default::default(),
             &[rename.clone(), completed(rid(1))]
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(meta
         .install_shadow_from(
             rid(2),
@@ -2480,7 +2508,8 @@ fn o1_a_root_appending_a_rename_under_a_later_shadow_keeps_their_order() {
             &Default::default(),
             &[create("a", y, 13), completed(rid(2))]
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     meta.apply_delegate_tx(
         &[rename.clone(), completed(rid(1))],
         Some(rid(1)),
@@ -2516,7 +2545,8 @@ fn o1_a_root_appending_over_its_own_shadow_takes_the_shadows_place() {
                 &Default::default(),
                 &[create(name, i, t), completed(rid(r))]
             )
-            .unwrap());
+            .unwrap()
+            .installed());
     }
     assert!(meta
         .apply_delegate_tx(
@@ -2586,7 +2616,8 @@ fn o1_a_root_appending_under_its_own_rows_keeps_the_journal_order() {
             &Default::default(),
             &[rename.clone(), completed(rid(1))]
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     execute_mutate(&meta, &create_op("z", z), Some(rid(10))).unwrap();
     assert!(meta
         .install_shadow_from(
@@ -2597,7 +2628,8 @@ fn o1_a_root_appending_under_its_own_rows_keeps_the_journal_order() {
             &Default::default(),
             &[create("a", y, 13), completed(rid(2))]
         )
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(meta
         .apply_delegate_tx(
             &[rename.clone(), completed(rid(1))],
@@ -2654,7 +2686,8 @@ fn m2_a_root_appending_a_refusal_strands_its_own_shadow_of_the_rid() {
                 &Default::default(),
                 &[create(name, i, t), completed(rid(r))]
             )
-            .unwrap());
+            .unwrap()
+            .installed());
     }
     assert!(meta
         .apply_delegate_tx(
@@ -2715,7 +2748,8 @@ fn a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect() {
     // The dedup reply: accepted, nothing to apply.
     assert!(meta
         .install_shadow(rid(1), 1, &create_op("a", x), &[])
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(meta.lookup(ROOT_INO, "a").unwrap().is_none());
     meta.install_streamed(1, HOLDER, 1, 2, &tx).unwrap();
     assert_eq!(
@@ -2733,6 +2767,49 @@ fn a_streamed_transaction_does_not_adopt_a_shadow_that_lacks_its_effect() {
     let reference = Meta::open_in_memory().unwrap();
     apply(&reference, 1, 1, &tx);
     assert_eq!(raw_ns(&meta), raw_ns(&reference));
+}
+
+/// A shadow whose records skip on this replica (a stale-base reply: the
+/// sequencer evaluated the exchange where `f3` existed, this replica lacks
+/// it) is not installed. Installed, the entry would stand for an effect the
+/// replica does not show, and the client would cover the keys with it (a
+/// read of `f3` right after its own acknowledged exchange saw it absent:
+/// `delegated-backup+links-local+stalebase` seeds 464 and 1911). Nothing
+/// stays behind: no entry, no namespace change.
+#[test]
+fn a_shadow_whose_records_do_not_apply_is_not_installed() {
+    let meta = Meta::open_in_memory().unwrap();
+    let (f1, f3) = (ino(1), ino(3));
+    apply(&meta, 1, 1, &[create("f1", f1, 10)]);
+    let before = raw_ns(&meta);
+    let op = MutateOp::Exchange {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        new_parent: ROOT_INO,
+        new_name: "f3".into(),
+    };
+    let exchange = LogRecord::Exchange {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        new_parent: ROOT_INO,
+        new_name: "f3".into(),
+        time_ns: 12,
+        ino: f1,
+        new_ino: f3,
+    };
+    let outcome = meta
+        .install_shadow(rid(1), 1, &op, &[exchange, completed(rid(1))])
+        .unwrap();
+    assert_eq!(outcome, ShadowInstall::Unapplied);
+    assert_eq!(meta.speculation_counts().unwrap().outstanding, 0);
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(raw_ns(&meta), before, "the namespace is unchanged");
+    assert_eq!(
+        meta.lookup(ROOT_INO, "f1").unwrap().map(|e| e.ino),
+        Some(f1)
+    );
+    assert!(meta.lookup(ROOT_INO, "f3").unwrap().is_none());
+    assert!(meta.completed_position(rid(1)).unwrap().is_none());
 }
 
 /// ADR-59 part B (drop contiguity), review MUST-1: a deposed root's strand of

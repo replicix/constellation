@@ -1570,7 +1570,10 @@ mod tests {
         // The requester installs the outcome as `rid_r`'s shadow and
         // covers its keys at the reply's position; one of its clients has
         // already observed that position (an earlier answer).
-        assert!(requester.install_shadow(rid_r, 1, &op, &records).unwrap());
+        assert!(requester
+            .install_shadow(rid_r, 1, &op, &records)
+            .unwrap()
+            .installed());
         let reply = Position {
             seq: 1,
             pending: None,

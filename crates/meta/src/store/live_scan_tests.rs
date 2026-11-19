@@ -51,7 +51,8 @@ fn decoded_per_install(n: u64) -> Vec<u64> {
     };
     assert!(meta
         .install_shadow(rid(1_000_000), EPOCH, &op, &shadow)
-        .unwrap());
+        .unwrap()
+        .installed());
     let mut out = Vec::new();
     for i in 1..=n {
         let recs = vec![

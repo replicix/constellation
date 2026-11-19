@@ -417,7 +417,8 @@ fn a_rebuild_does_not_void_an_end_a_kept_streamed_entry_carries() {
     };
     assert!(meta
         .install_shadow_committed(rid, 1, 0, &op, &Default::default(), &records, true)
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(!meta.session().is_voided(h), "streamed-ahead: no void");
     assert!(
         meta.delegation_table().iter().next().is_none(),
@@ -870,7 +871,8 @@ fn a_requester_s_shadow_alone_names(committed: bool) {
     }];
     assert!(meta
         .install_shadow_committed(rid, 1, g, &op, &Default::default(), &records, committed)
-        .unwrap());
+        .unwrap()
+        .installed());
     assert!(meta.delegation_table().iter().all(|d| d.gen != g));
     assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
     meta.apply_segment_rows(

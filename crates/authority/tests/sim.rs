@@ -10596,6 +10596,7 @@ struct OracleTotals {
     root_own_core: [u64; 15],
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
+    unapplied_core: [u64; 2],
     release_wait: [u64; 8],
     sticky_driver: [u64; 4],
     /// Plan 46 M1.3 step 14 (`Report::leave_driver`).
@@ -11051,6 +11052,9 @@ impl OracleTotals {
         for (t, c) in self.quarantine_core.iter_mut().zip(r.quarantine_core) {
             *t += c;
         }
+        for (t, c) in self.unapplied_core.iter_mut().zip(r.unapplied_core) {
+            *t += c;
+        }
         for (t, c) in self.release_wait.iter_mut().zip(r.release_wait_core) {
             *t += c;
         }
@@ -11235,6 +11239,10 @@ impl OracleTotals {
             self.unsettled_class[3],
             self.isolated_s3,
             constellation_authority::core::ACK_COUNTERS.iter().zip(self.claimed).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "SWEEP-UNAPPLIED {label} seeds {}/{seeds}: [shadows, hints] whose records skipped on the requester's replica (refused, never covering; must be 0 without the stale-base knob) {:?}",
+            self.seeds, self.unapplied_core
         );
         eprintln!(
             "SWEEP-LL-STATS {label} seeds {}/{seeds}: [withdrawn-first, resubmitted-ops, stale-reads, stale-relists, stale-parks, unacked-settles, foreign-deferred, withdraw-failed, bg-dropped, multi-batch, withdrawn-ops] {:?}",
@@ -22401,6 +22409,30 @@ fn regression_delegated_backup_links_stalebase_seed_138() {
              AUTHORITY_SIM_CONFIG=delegated-backup+{variants}"
         )
     });
+}
+
+/// `delegated-backup+links-local+stalebase` seeds 464 and 1911
+/// (`read_your_writes`: an own `Exchange` acknowledged, then the next read
+/// of the swapped name absent). The knob installs a reply on a base the
+/// requester lacks; the exchange's records skipped on its replica
+/// ("exchange entry missing") and the shadow that stood for them covered
+/// the name, so the read did not wait for the log. A shadow whose records
+/// skip is not installed
+/// (`a_stale_base_reply_whose_records_do_not_apply_waits_for_the_log`).
+#[test]
+fn regression_delegated_backup_links_stalebase_ryw_seeds_464_1911() {
+    let variants = "links-local+stalebase";
+    for seed in [464, 1911] {
+        let cfg = variants
+            .split('+')
+            .fold(delegated_backup_config(), config_variant);
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!(
+                "delegated-backup+{variants} seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-backup+{variants}"
+            )
+        });
+    }
 }
 
 /// Plan 46 M1.1 step 3: a delegate that stamps its rows from the mutable

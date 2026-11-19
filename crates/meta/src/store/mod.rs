@@ -908,6 +908,9 @@ pub struct Meta {
     /// fails a seed that has any), not yet taken by the core
     /// ([`Meta::take_deleg_append_skipped`]).
     deleg_append_skipped: AtomicU64,
+    /// Hints refused because their records skipped
+    /// ([`Meta::take_hints_unapplied`]).
+    hints_unapplied: AtomicU64,
     /// Appended rows with a rid whose records carry no `Completed` or
     /// `Refused` for it ([`Meta::take_deleg_append_uncompleted`]).
     deleg_append_uncompleted: AtomicU64,
@@ -1474,6 +1477,7 @@ impl Meta {
             holder_scans: AtomicU64::new(0),
             deleg_append_replay: std::sync::atomic::AtomicBool::new(false),
             deleg_append_skipped: AtomicU64::new(0),
+            hints_unapplied: AtomicU64::new(0),
             deleg_append_uncompleted: AtomicU64::new(0),
             dentries_read: AtomicU64::new(0),
             snapshot_gen: AtomicU64::new(0),
