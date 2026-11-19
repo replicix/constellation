@@ -1900,6 +1900,13 @@ pub struct Report {
     pub settles_answered_at_cut: u64,
     pub rowless_held_releases: u64,
     pub exec_in_cut: u64,
+    /// The cut's other paths: a due cut that went rowless, one left to a
+    /// claim, a repeated request for a pending cut, cuts taken into a whole
+    /// release.
+    pub cut_rowless_after: u64,
+    pub cut_left_to_claim: u64,
+    pub cut_repeated: u64,
+    pub cut_absorbed: u64,
     /// The I4 violations by `Unsettled::cause`.
     pub unsettled_violation_causes: BTreeMap<String, usize>,
     pub unsettled_examples: Vec<String>,
@@ -5735,6 +5742,10 @@ fn count_unsettled(
         report.settles_answered_at_cut = oracles.answered_at_cut.load(ord);
         report.rowless_held_releases = oracles.rowless_held.load(ord);
         report.exec_in_cut = oracles.exec_in_cut.load(ord);
+        report.cut_rowless_after = oracles.cut_rowless_after.load(ord);
+        report.cut_left_to_claim = oracles.cut_left_to_claim.load(ord);
+        report.cut_repeated = oracles.cut_repeated.load(ord);
+        report.cut_absorbed = oracles.cut_absorbed.load(ord);
     }
     // MUST-1: the tag over the excused ones too (non-stealable holder,
     // isolated from S3, held behind a lost chunk): a sticky stream's

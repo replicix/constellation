@@ -279,6 +279,12 @@ pub struct Oracles {
     pub answered_at_cut: std::sync::atomic::AtomicU64,
     pub rowless_held: std::sync::atomic::AtomicU64,
     pub exec_in_cut: std::sync::atomic::AtomicU64,
+    /// The rest of ADR-64's counters (`deleg_cut_rowless_after`,
+    /// `deleg_cut_left_to_claim`, `deleg_cut_repeated`, `deleg_cut_absorbed`).
+    pub cut_rowless_after: std::sync::atomic::AtomicU64,
+    pub cut_left_to_claim: std::sync::atomic::AtomicU64,
+    pub cut_repeated: std::sync::atomic::AtomicU64,
+    pub cut_absorbed: std::sync::atomic::AtomicU64,
     /// ADR-56: the root's handover requests and grants, stamped with the
     /// run's clock (`Core::take_hand_events`): `handover_tenure` and
     /// `one_off_no_handover` judge them.
@@ -310,24 +316,36 @@ type Span = (u64, Option<u64>);
 
 #[derive(Default, Debug)]
 pub struct HeldReleases {
-    spans: BTreeMap<(NodeId, u64), Vec<Span>>,
+    /// Per `(node, gen, subtree)`; a held release is one span of the whole
+    /// stream (`WHOLE`), a cut one span per subtree it covers.
+    spans: BTreeMap<(NodeId, u64, u64), Vec<Span>>,
     /// The settles requesters sent: when, and how long they last at least.
     settles: Vec<(u64, u64)>,
 }
+
+/// The subtree key of a span that covers the whole stream.
+const WHOLE: u64 = 0;
 
 impl HeldReleases {
     /// `node` holds the releases of `held` at `now_ms`: spans open for the
     /// new ones and close for those that are no longer held.
     pub fn note(&mut self, node: NodeId, held: &[u64], now_ms: u64) {
-        for (&(n, gen), spans) in self.spans.iter_mut() {
-            if n == node && !held.contains(&gen) {
+        let keys: Vec<(u64, u64)> = held.iter().map(|&g| (g, WHOLE)).collect();
+        self.note_keys(node, &keys, now_ms);
+    }
+
+    /// The same per subtree: `node` holds cuts over the `(gen, dir)` pairs of
+    /// `open` at `now_ms`.
+    pub fn note_keys(&mut self, node: NodeId, open: &[(u64, u64)], now_ms: u64) {
+        for (&(n, gen, dir), spans) in self.spans.iter_mut() {
+            if n == node && !open.contains(&(gen, dir)) {
                 if let Some(last) = spans.last_mut().filter(|s| s.1.is_none()) {
                     last.1 = Some(now_ms);
                 }
             }
         }
-        for &gen in held {
-            let spans = self.spans.entry((node, gen)).or_default();
+        for &(gen, dir) in open {
+            let spans = self.spans.entry((node, gen, dir)).or_default();
             if spans.last().is_none_or(|s| s.1.is_some()) {
                 spans.push((now_ms, None));
             }
@@ -379,11 +397,28 @@ impl HeldReleases {
         self.overlaps(&question_gens(question), question.from_ms, question.to_ms)
     }
 
-    /// Whether a held span of any of `gens` (on any node) overlaps
+    /// Whether a span of any of `gens` (on any node) overlaps
     /// `[from_ms, to_ms]`.
     pub fn overlaps(&self, gens: &BTreeSet<u64>, from_ms: u64, to_ms: u64) -> bool {
-        self.spans.iter().any(|((_, gen), spans)| {
+        self.spans.iter().any(|((_, gen, _), spans)| {
             gens.contains(gen)
+                && spans
+                    .iter()
+                    .any(|&(s, e)| s <= to_ms && e.is_none_or(|e| e > from_ms))
+        })
+    }
+
+    /// Whether a cut span of one of the `(gen, subtree)` pairs the op's keys
+    /// resolved to overlaps `[from_ms, to_ms]` (MUST-2: the strict S4 tag on
+    /// the arm whose releases are never held).
+    pub fn overlaps_subtrees(
+        &self,
+        subtrees: &BTreeSet<(u64, u64)>,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> bool {
+        self.spans.iter().any(|((_, gen, dir), spans)| {
+            subtrees.contains(&(*gen, *dir))
                 && spans
                     .iter()
                     .any(|&(s, e)| s <= to_ms && e.is_none_or(|e| e > from_ms))
@@ -688,6 +723,10 @@ impl Oracles {
             answered_at_cut: Default::default(),
             rowless_held: Default::default(),
             exec_in_cut: Default::default(),
+            cut_rowless_after: Default::default(),
+            cut_left_to_claim: Default::default(),
+            cut_repeated: Default::default(),
+            cut_absorbed: Default::default(),
             hand_events: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
             rolled_back_nodes: Mutex::new(BTreeMap::new()),
@@ -882,13 +921,31 @@ impl Oracles {
                 None => Owner::Root,
                 Some((_, _, tb)) => match tb.resolve(&*meta, &keys) {
                     constellation_meta::delegation::Ownership::Root => Owner::Root,
+                    // ADR-64 (R1): from the root's append of the cut row the
+                    // root answers for a cut subtree, not its stopped holder.
+                    constellation_meta::delegation::Ownership::Delegated(d)
+                        if tb.cut_of(d.dir).is_some() =>
+                    {
+                        Owner::Root
+                    }
                     constellation_meta::delegation::Ownership::Delegated(d) => Owner::Delegate {
                         node: d.node,
                         gen: d.gen,
                     },
                     constellation_meta::delegation::Ownership::CrossSubtree {
                         involved, ..
-                    } => Owner::Blocked(involved.iter().map(|d| (d.node, d.gen)).collect()),
+                    } => {
+                        let live: Vec<_> = involved
+                            .iter()
+                            .filter(|d| tb.cut_of(d.dir).is_none())
+                            .map(|d| (d.node, d.gen))
+                            .collect();
+                        if live.is_empty() {
+                            Owner::Root
+                        } else {
+                            Owner::Blocked(live)
+                        }
+                    }
                 },
             };
             if out.last().map(|(_, o)| o) != Some(&owner) {
@@ -896,6 +953,43 @@ impl Oracles {
             }
         }
         (out, born)
+    }
+
+    /// The `(gen, subtree)` pairs the op's keys resolved to in the holder's
+    /// table at any instant of `[from, to]` (the subtrees a cut span must
+    /// lie under to tag the op's `EIO`, `HeldReleases::overlaps_subtrees`).
+    fn op_subtrees(&self, node: NodeId, rid: Rid, from: u64, to: u64) -> BTreeSet<(u64, u64)> {
+        let mut out = BTreeSet::new();
+        let Some(op) = self.ops.lock().unwrap().get(&rid).cloned() else {
+            return out;
+        };
+        let Some(meta) = self.store(node) else {
+            return out;
+        };
+        let keys = constellation_meta::TouchSet::from_op_in_names(
+            &op,
+            &|p, n| Replica::lookup_ino(&*meta, p, n),
+            &|i, limit| Replica::names_of_ino(&*meta, i, limit),
+        );
+        let tables = self.tables.lock().unwrap().clone();
+        for (at, _, tb) in tables.iter().filter(|t| t.0 <= to) {
+            // (A table that changed before the window still holds in it: the
+            // last one at or before `from` and every later one count.)
+            let later = tables.iter().any(|t| t.0 > *at && t.0 <= from);
+            if later {
+                continue;
+            }
+            match tb.resolve(&*meta, &keys) {
+                constellation_meta::delegation::Ownership::Root => {}
+                constellation_meta::delegation::Ownership::Delegated(d) => {
+                    out.insert((d.gen, d.dir));
+                }
+                constellation_meta::delegation::Ownership::CrossSubtree { involved, .. } => {
+                    out.extend(involved.iter().map(|d| (d.gen, d.dir)));
+                }
+            }
+        }
+        out
     }
 
     /// Plan 46 M0.3: `node`'s core told a client `EIO`, in doubt, at the
@@ -967,8 +1061,20 @@ impl Oracles {
             born,
             awaiting,
         };
-        let release_read_recall = self.held_releases.lock().unwrap().tags(&question);
+        // The strict S4 tag: a held span of the owning stream (the knob-on
+        // arm, whose release waits held), or, on the fix arm, whose releases
+        // are never held, a cut span over a subtree the op's keys lie under
+        // while the verdict says the requester could have reached the root
+        // that answers at the cut (an `EIO` the requester's own isolation
+        // explains is no cut's to prevent, `reach::Verdict::allowed`).
+        let held_tag = self.held_releases.lock().unwrap().tags(&question);
+        let cut_tag = self.cut_releases.lock().unwrap().overlaps_subtrees(
+            &self.op_subtrees(node, rid, from_ms, at),
+            from_ms,
+            at,
+        );
         let verdict = self.reach.classify(question.clone());
+        let release_read_recall = held_tag || (cut_tag && !verdict.allowed());
         let silence = self.reach.silence_class(&question, &verdict);
         // Late-landing U1(a): a settle that could not write its tombstones
         // for a whole window (`w` before it went on without the inbox) was
@@ -4194,6 +4300,29 @@ impl LeaseClaims {
 mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
+
+    /// MUST-2: a cut span tags an EIO per subtree. The held spans of the
+    /// knob-on arm are gone on the fix arm, which waits in a cut.
+    #[test]
+    fn an_unsettled_eio_is_tagged_while_a_cut_covers_its_subtree() {
+        let mut c = HeldReleases::default();
+        c.note_keys(2, &[(5, 40), (5, 41)], 1_000);
+        c.note_keys(2, &[(5, 41)], 3_000);
+        c.note_keys(2, &[], 4_000);
+        let under = |gen: u64, dir: u64| BTreeSet::from([(gen, dir)]);
+        // The window [2_500, 3_500] overlaps the cut of 40 (until 3_000) and
+        // of 41 (until 4_000).
+        assert!(c.overlaps_subtrees(&under(5, 40), 2_500, 3_500));
+        assert!(c.overlaps_subtrees(&under(5, 41), 2_500, 3_500));
+        // After the cut of 40 ended only 41's counts.
+        assert!(!c.overlaps_subtrees(&under(5, 40), 3_100, 3_500));
+        assert!(c.overlaps_subtrees(&under(5, 41), 3_100, 3_500));
+        // Another subtree or generation of the stream is not covered.
+        assert!(!c.overlaps_subtrees(&under(5, 42), 2_500, 3_500));
+        assert!(!c.overlaps_subtrees(&under(6, 40), 2_500, 3_500));
+        // The cut spans never tag by stream alone.
+        assert!(!c.overlaps(&BTreeSet::from([7]), 2_500, 3_500));
+    }
 
     /// Plan 46 M1.3 step 15a (S4): the tag of an unsettled EIO whose owning
     /// stream's release waited on read recalls, on a hand-built history.

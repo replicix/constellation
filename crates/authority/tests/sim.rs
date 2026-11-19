@@ -10792,6 +10792,9 @@ struct OracleTotals {
     s4_answered_at_cut: u64,
     s4_rowless_held: u64,
     s4_exec_in_cut: u64,
+    /// Due cuts that went rowless, were left to a claim, were asked for
+    /// again, or were taken into a whole release (ADR-64's other paths).
+    s4_cut_paths: [u64; 4],
     s4_span_max_ms: u64,
     violation_causes: std::collections::BTreeMap<String, u64>,
     /// Plan 46 M0.3 S5 (ADR-42), `SWEEP-S5-GATE`: generations a shippable
@@ -11050,6 +11053,14 @@ impl OracleTotals {
         self.s4_answered_at_cut += r.settles_answered_at_cut;
         self.s4_rowless_held += r.rowless_held_releases;
         self.s4_exec_in_cut += r.exec_in_cut;
+        for (n, v) in self.s4_cut_paths.iter_mut().zip([
+            r.cut_rowless_after,
+            r.cut_left_to_claim,
+            r.cut_repeated,
+            r.cut_absorbed,
+        ]) {
+            *n += v;
+        }
         for (k, n) in &r.unsettled_violation_causes {
             *self.violation_causes.entry(k.clone()).or_default() += *n as u64;
         }
@@ -11256,7 +11267,7 @@ impl OracleTotals {
     /// apart, over the excused ones (a sticky stream's are `designation_held`).
     fn s4_line(&self, label: &str, seeds: u64) -> String {
         format!(
-            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms; cut spans {} in {} seeds; settles sent while a cut waited {}; settles answered at a cut {}; rowless held releases {}; executions refused under a cut {}",
+            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms; cut spans {} in {} seeds; settles sent while a cut waited {}; settles answered at a cut {}; rowless held releases {}; executions refused under a cut {}; cut_rowless_after {}; cut_left_to_claim {}; cut_repeated {}; cut_absorbed {}",
             self.seeds,
             self.s4.0,
             self.s4.1,
@@ -11274,7 +11285,11 @@ impl OracleTotals {
             self.s4_cut_settles,
             self.s4_answered_at_cut,
             self.s4_rowless_held,
-            self.s4_exec_in_cut
+            self.s4_exec_in_cut,
+            self.s4_cut_paths[0],
+            self.s4_cut_paths[1],
+            self.s4_cut_paths[2],
+            self.s4_cut_paths[3]
         )
     }
 
