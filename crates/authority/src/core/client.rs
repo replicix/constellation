@@ -5321,6 +5321,55 @@ impl Core {
         journal_carries_outcome(replica, rid).then_some(due)
     }
 
+    /// ADR-64 (R5b): a segment this node applied carries the `ReleaseCut` row
+    /// of the delegates `nodes`. A settle of this node's own whose keys are
+    /// now at the cut, and that waits in a backoff or on a forward to one of
+    /// those stopped holders, is routed again at once: R5 changed only where
+    /// the next retry goes, and the retry came after the backoff, a second
+    /// or more later, when the root's idle release and the successor's
+    /// takeover could already have closed the window the cut opened
+    /// (`sticky-s4-merge` seed 841). A settle is the rid's own question:
+    /// asking twice is what its retries do, and the answer is by dedup.
+    pub(crate) fn settles_cut_seen(
+        &mut self,
+        now: Now,
+        nodes: &BTreeSet<NodeId>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.cfg.root_ignores_cut || !self.cfg.delegation {
+            return;
+        }
+        let due: Vec<Rid> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                c.settle
+                    && match c.phase {
+                        Phase::Backoff => !c.gate_recall_wait,
+                        Phase::Forwarded { holder, .. } => nodes.contains(&holder),
+                        _ => false,
+                    }
+                    && replica.settle_at_cut(&super::holder::keys_of_op_in(&c.op, replica))
+            })
+            .map(|(rid, _)| *rid)
+            .collect();
+        for rid in due {
+            let Some(c) = self.clients.get_mut(&rid) else {
+                continue;
+            };
+            if let Phase::Forwarded { req, .. } = c.phase {
+                self.by_req.remove(&req);
+            }
+            c.phase = Phase::Backoff;
+            if let Some(t) = c.timer.take() {
+                self.cancel_timer(t, out);
+            }
+            self.stats.settles_woken_at_cut += 1;
+            self.settle_route(now, rid, replica, out);
+        }
+    }
+
     /// Plan 43 C2 (§5.3 item 5): send a settle of `rid` the way the op itself
     /// would go now, from wherever it stood — executed here if this node is
     /// the sequencer for it (the root with its view open, or its delegate),

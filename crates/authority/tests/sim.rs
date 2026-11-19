@@ -340,6 +340,7 @@ fn replay_seed() {
         Ok("sticky-s4-leave") => sticky_s4_leave_config(),
         Ok("sticky-s4-suspend") => sticky_s4_suspend_config(),
         Ok("sticky-s4-merge") => sticky_s4_merge_config(),
+        Ok("sticky-s4-root-restart") => sticky_s4_root_restart_config(),
         Ok("sticky-holder-restarts-placed") => sticky_holder_restarts_placed_config(),
         Ok("sticky-holder-fresh") => sticky_holder_fresh_config(),
         Ok("sticky-holder-restarts-cut") => sticky_holder_restarts_cut_config(),
@@ -2672,6 +2673,28 @@ fn sticky_s4_merge_config() -> SimConfig {
         faults,
         ..sticky_holder_restarts_config()
     }
+}
+
+/// Round 7 (ReleaseCut, `sticky-s4-merge` seed 1725): `sticky-s4-merge`, and
+/// the root (node 1) reboots for 2.3 s from 17.2 s, the instant before node
+/// 2's release of `d5` at 17.3 s: the delegate's cut row is sent while the
+/// root is away, and its stream backs off. The root returns as the same node
+/// with the same lease holder, which the delegate's sync takes for no new
+/// root; the back-off the outage raised must not outlast the root's return,
+/// or the cut row reaches the root a second late and a settle of node 3's
+/// outlasts its window. Fails the strict S4 tag on the control arm
+/// (`AUTHORITY_SIM_NO_RELEASE_CUT`) as the merge label does.
+fn sticky_s4_root_restart_config() -> SimConfig {
+    let mut config = sticky_s4_merge_config();
+    config.faults.push(ScheduledFault {
+        at_ms: 17_200,
+        kind: FaultKind::CrashNode {
+            node: 1,
+            restart_ms: Some(2_300),
+            keep_journal: true,
+        },
+    });
+    config
 }
 
 /// Plan 46 M1.3 step 7: `sticky-holder-restarts` with the placement on
@@ -8157,6 +8180,7 @@ fn base_config(label: &str) -> SimConfig {
         "sticky-s4-leave" => sticky_s4_leave_config(),
         "sticky-s4-suspend" => sticky_s4_suspend_config(),
         "sticky-s4-merge" => sticky_s4_merge_config(),
+        "sticky-s4-root-restart" => sticky_s4_root_restart_config(),
         "sticky-holder-restarts-placed" => sticky_holder_restarts_placed_config(),
         "sticky-holder-fresh" => sticky_holder_fresh_config(),
         "sticky-holder-restarts-cut" => sticky_holder_restarts_cut_config(),
@@ -23888,6 +23912,13 @@ fn the_s4_hazard_configurations_reach_a_cut_and_the_sweep_line_says_so() {
 /// control (`no_release_cut`: the held release), and passes on the fix with
 /// settles answered at a cut and nothing tagged.
 fn s4_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
+    s4_pin_with(label, config, seed, true);
+}
+
+/// [`s4_pin`]; `answered_at_cut`: the fix arm must also have answered a
+/// settle at a cut (not so where the cut row's timely arrival only lets the
+/// root answer as it would have: the root-restart pins).
+fn s4_pin_with(label: &str, config: fn() -> SimConfig, seed: u64, answered_at_cut: bool) {
     let control = run_seed(
         seed,
         SimConfig {
@@ -23911,11 +23942,67 @@ fn s4_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
     )
     .unwrap_or_else(|e| panic!("{label} seed {seed}: the fix arm failed: {e}"));
     assert!(
-        fix.settles_answered_at_cut > 0,
+        !answered_at_cut || fix.settles_answered_at_cut > 0,
         "{label} seed {seed}: no settle was answered at a cut"
     );
     assert_eq!((fix.unsettled_s4, fix.s4_strict.len()), (0, 0));
     assert_eq!(fix.exec_in_cut, 0);
+}
+
+/// Round 7: `seed` of `config` passes on the fix arm with nothing tagged and
+/// no execution in a cut. (The control arm of such a seed may pass as well:
+/// the fix arm's schedule differs by the cut row it adds to every release.)
+fn s4_fix_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
+    let fix = run_seed(
+        seed,
+        SimConfig {
+            no_release_cut: false,
+            ..config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{label} seed {seed}: the fix arm failed: {e}"));
+    assert_eq!((fix.unsettled_s4, fix.s4_strict.len()), (0, 0));
+    assert_eq!(fix.exec_in_cut, 0);
+}
+
+/// Round 7 (R5b): the requester has the cut row from the log a second before
+/// its next retry, which the root answered `Busy` and then `NotHolder { 0 }`
+/// after its idle release, and the settle ran out one retry cycle after the
+/// successor took the lease (the strict S4 tag on the fix arm of the tree of
+/// ReleaseCut round 6). The cut row's arrival routes the backing-off settle
+/// again at once. A regression pin of the seed, the evidence of the fix being
+/// the core test `a_settle_waiting_out_a_retry_is_routed_again_when_its_cut_row_is_applied`:
+/// on the tree rebased onto main the seed passes without R5b (the schedule
+/// moved with main's changes). The control arm passes this seed.
+#[test]
+fn s4_merge_seed_841_a_settle_is_routed_again_when_the_cut_row_arrives() {
+    s4_fix_pin("sticky-s4-merge", sticky_s4_merge_config, 841);
+}
+
+/// Round 7 (the stream's root round): the root rebooted over the release of
+/// `d5`; the cut row, sent while it was away, waited out the delegate's
+/// doubled back-off after the root returned. The link coming back starts a
+/// new stream round. Fails on the parent on both arms; the control arm still
+/// fails by the tag.
+#[test]
+fn s4_merge_seed_1725_the_cut_row_does_not_wait_out_the_roots_backoff() {
+    s4_pin_with("sticky-s4-merge", sticky_s4_merge_config, 1725, false);
+}
+
+/// Round 7: the root reboots over `d5`'s release (`sticky-s4-root-restart`).
+/// With the control (the held release) the settle of node 3 outlasts its
+/// window; on the fix arm the cut row, re-sent when the root's link is back,
+/// reaches the root in time and the settle is answered at the cut. Fails on
+/// the parent (the cut row waits out the stream's back-off: the strict S4 tag
+/// on the fix arm, 27 of 300 seeds).
+#[test]
+fn s4_root_restart_the_cut_row_reaches_the_returned_root_in_time() {
+    s4_pin_with(
+        "sticky-s4-root-restart",
+        sticky_s4_root_restart_config,
+        8,
+        false,
+    );
 }
 
 /// ADR-64: a holder suspended after its release cut leaves the settles on its

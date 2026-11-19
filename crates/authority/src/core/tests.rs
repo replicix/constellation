@@ -44961,6 +44961,148 @@ fn a_refusal_backs_off_from_a_few_ticks_not_from_what_the_roots_absence_raised()
     assert!(wait <= 4 * tick, "backed off {wait} ms after a refusal");
 }
 
+/// ADR-64 (R5b): a settle of the requester's own that waits out a retry
+/// (here a backoff after its forward failed) is routed again at once when
+/// the segment carrying the cut row of the stopped holder is applied, and the
+/// retry goes to the lease holder, not to the stopped holder
+/// (`sticky-s4-merge` seed 841: the cut row was applied a second before the
+/// retry, and the root had idle-released by then). Fails on the parent:
+/// nothing is sent when the segment is applied.
+#[test]
+fn a_settle_waiting_out_a_retry_is_routed_again_when_its_cut_row_is_applied() {
+    let mut h = Harness::new(2);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    h.step(Event::Peers {
+        registry_complete: true,
+        links: [1, 3]
+            .into_iter()
+            .map(|node| crate::event::PeerLink {
+                node,
+                connected: true,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            })
+            .collect(),
+        lapses: 0,
+    });
+    let rid = h.rid(1);
+    h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        tag: Default::default(),
+    });
+    // The op's attempts ran out and it is settled; the forward to the
+    // stopped holder failed and the settle backs off.
+    h.core.clients.get_mut(&rid).unwrap().settle = true;
+    let mut out = Vec::new();
+    h.core.on_forward_failed(h.clk(), rid, &h.meta, &mut out);
+    assert_eq!(
+        h.core.clients[&rid].phase,
+        crate::core::client::Phase::Backoff,
+        "{out:?}"
+    );
+    let settle_to = |out: &[Action], to: NodeId| {
+        sends(out).into_iter().any(|(t, m)| {
+            t == to && matches!(m, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid)
+        })
+    };
+    // The segment of the log that carries the holder's cut row.
+    let cut = LogRecord::ReleaseCut {
+        node: 3,
+        gen: 7,
+        dirs: vec![dir],
+        at: 0,
+    };
+    let payload = crate::segment::encode(1, 1, 0, &[], &[], &[cut]).unwrap();
+    h.core.ship.next_seq = 2;
+    let mut out = Vec::new();
+    h.core
+        .apply_incoming(h.clk(), 2, &payload, &h.meta, &mut out)
+        .unwrap();
+    assert!(h.meta.delegation_table().settle_at_cut(&h.meta, &{
+        let mut k = constellation_meta::TouchSet::default();
+        k.dentries.insert((dir, "f".into()));
+        k
+    }));
+    assert!(settle_to(&out, 1), "no settle sent to the holder: {out:?}");
+    assert!(!settle_to(&out, 3), "sent to the stopped holder: {out:?}");
+}
+
+/// A root that restarts as the same node is no new root to the delegate's
+/// sync (the lease's holder is unchanged), and the back-off the outage raised
+/// on every failed batch carried past its return: a release's cut row waited
+/// for it (`sticky-s4-merge` seed 1725, ReleaseCut). The root's link coming
+/// back up after a spell down starts a new stream round, which sends the rows
+/// at once. Fails on the parent: nothing went out until the back-off ran out.
+#[test]
+fn the_roots_link_coming_back_sends_the_unacknowledged_rows_at_once() {
+    let (mut h, dir) = streaming_delegate();
+    let peers = |up: bool| Event::Peers {
+        registry_complete: true,
+        links: vec![crate::event::PeerLink {
+            node: 1,
+            connected: up,
+            last_seen: None,
+            rtt_ms: None,
+            since: None,
+        }],
+        lapses: 0,
+    };
+    h.step(peers(true));
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(1),
+        op: MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        tag: Default::default(),
+    });
+    stream_batch(&out, 1).expect("no batch streamed");
+    // The root goes down: the batch in flight times out, again and again,
+    // and the back-off reaches its bound.
+    h.step(peers(false));
+    h.advance(h.core.deleg_request_timeout_ms() + 1);
+    h.step(Event::Activity {
+        last_write: WaitMs(0),
+        acked_seqs: Vec::new(),
+    });
+    assert!(h.core.dl.mine[&7].inflight.is_none(), "still in flight");
+    let now = h.clk().wait;
+    let d = h.core.dl.mine.get_mut(&7).unwrap();
+    d.stream_backoff_ms = 2_000;
+    d.stream_after = Some(now.plus(2_000));
+    h.advance(100);
+    let out = h.step(Event::Activity {
+        last_write: WaitMs(0),
+        acked_seqs: Vec::new(),
+    });
+    assert!(stream_batch(&out, 1).is_none(), "sent inside the back-off");
+    // The root is back: the rows go at once, in a round of their own.
+    let out = h.step(peers(true));
+    assert!(
+        stream_batch(&out, 1).is_some(),
+        "the rows waited out the back-off after the root's return: {out:?}"
+    );
+    assert_eq!(h.core.dl.mine[&7].stream_backoff_ms, 0);
+}
+
 /// delegate-stream-acks: a delegate of `/d` (generation 7, root node 1)
 /// whose first renewal was granted. `stream_one` executes a create under
 /// it and returns the batch that went out (`(req, round, last)`).

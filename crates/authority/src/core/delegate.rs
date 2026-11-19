@@ -1575,6 +1575,13 @@ pub(crate) struct DelegationState {
     cert_set: bool,
     /// The generations this node is the delegate of.
     pub mine: BTreeMap<u64, DelegateState>,
+    /// The root this node streams to and whether its link was up at the last
+    /// `Event::Peers` ([`Core::deleg_on_peers`]).
+    root_link: Option<(NodeId, bool)>,
+    /// The link of the root came back up after a spell down: the next sync
+    /// starts a new stream round for every generation of this node, as a
+    /// new root would ([`Core::deleg_on_peers`]).
+    root_back: bool,
     /// Plan 43 C3: per generation, the highest index below this node's
     /// first holder append its tenure has not committed, with what it was
     /// computed from (`Core::holder_append_cap`): recomputed only when one
@@ -6762,11 +6769,12 @@ impl Core {
         let root = self.holder_root();
         let mut stale_reqs = Vec::new();
         let mut renew_again = Vec::new();
+        let root_back = std::mem::take(&mut self.dl.root_back);
         let rounds: BTreeMap<u64, u64> = self
             .dl
             .mine
             .values()
-            .filter(|d| d.last_root != root)
+            .filter(|d| d.last_root != root || (root_back && d.last_root.is_some()))
             .map(|d| d.gen)
             .collect::<Vec<_>>()
             .into_iter()
@@ -6984,6 +6992,27 @@ impl Core {
     /// within this incarnation (an op id, below 2^40) and across
     /// incarnations (the incarnation in the high 24 bits: two
     /// incarnations share them only 2^24 restarts apart).
+    /// `Event::Peers`: the link of the root this node streams to came back up
+    /// after a spell down. A root restarted as the same node (its lease
+    /// epoch and holder unchanged) is no new root to the sync below, and the
+    /// backoff the outage raised on every failed batch (up to 2 s) would
+    /// carry past its return: a cut row of a release waited it out
+    /// (`sticky-s4-merge` seed 1725). A new round clears the batch in flight,
+    /// the backoff and the root's old acknowledgements, and streams from the
+    /// log cursor again, which a restarted root needs anyway; rows are
+    /// deduplicated by cursor and rid at the root, as after a failover.
+    pub(crate) fn deleg_on_peers(&mut self) {
+        let root = self.root_node();
+        let up = root
+            .and_then(|r| self.roster.links().get(&r))
+            .is_some_and(|l| l.connected);
+        let was_down = matches!(self.dl.root_link, Some((r, false)) if Some(r) == root);
+        if was_down && up && !self.dl.mine.is_empty() {
+            self.dl.root_back = true;
+        }
+        self.dl.root_link = root.map(|r| (r, up));
+    }
+
     fn deleg_new_round(&mut self) -> u64 {
         const OP_BITS: u32 = 40;
         // (An op id carries the incarnation in its high bits already: the low

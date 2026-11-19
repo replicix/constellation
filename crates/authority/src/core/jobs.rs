@@ -1043,6 +1043,16 @@ impl Core {
                 .collect();
             if !cut_gens.is_empty() {
                 self.root_cut_seen(now, &cut_gens, replica, out);
+                // (R5b: and a requester's own settle, waiting out a retry.)
+                let cut_nodes: BTreeSet<NodeId> = seg
+                    .records
+                    .iter()
+                    .filter_map(|r| match r {
+                        LogRecord::ReleaseCut { node, .. } => Some(*node),
+                        _ => None,
+                    })
+                    .collect();
+                self.settles_cut_seen(now, &cut_nodes, replica, out);
             }
             if seg.records.iter().any(|r| {
                 matches!(

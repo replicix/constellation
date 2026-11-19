@@ -2215,6 +2215,9 @@ pub struct Stats {
     /// ADR-64 (R5): this node's own settles whose keys were at a cut, which
     /// it did not send to the stopped holder.
     pub settles_routed_around_cut: u64,
+    /// ADR-64 (R5b): this node's own settles, waiting out a retry, that were
+    /// routed again at once when the segment carrying a cut row was applied.
+    pub settles_woken_at_cut: u64,
     /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it
     /// owns (a refusal journaled, or a dedup'd outcome), settles it left
     /// `Held` because its journal work was not done yet, and settles of a
@@ -3689,6 +3692,7 @@ impl Core {
                 self.note_rtt_samples(now.wait, &links);
                 self.roster.install_links(links, registry_complete, lapses);
                 self.stream_on_peers(now);
+                self.deleg_on_peers();
             }
             Event::OwnS3 {
                 stalled,
