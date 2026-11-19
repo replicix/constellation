@@ -2942,7 +2942,12 @@ impl Core {
         !self.lease.epoch_held()
             && self.lease.held.is_none()
             && self.pr.carried.is_some_and(|c| {
-                c.node == self.cfg.node_id && self.pr.given_up == Some((c.epoch, c.expires_unix_ms))
+                c.node == self.cfg.node_id
+                    && (self.pr.given_up == Some((c.epoch, c.expires_unix_ms))
+                        || self
+                            .pr
+                            .given_up_renewed
+                            .contains(&(c.epoch, c.expires_unix_ms)))
             })
     }
 

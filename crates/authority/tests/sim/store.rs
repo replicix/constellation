@@ -52,6 +52,11 @@ pub enum Fault {
     /// from the timeout on for `cut_ms`: the request is orphaned in flight
     /// while the node is cut, and lands when the path heals.
     TimeoutThenAppliedCut { after_ms: u64, cut_ms: u64 },
+    /// As `TimeoutThenAppliedCut`, with the delay drawn per request from
+    /// `0..=max_ms` (the seed's rng) and a cut of `cut_ms` (none when 0): the
+    /// request lands before the cut ends, after it, after the node gave up
+    /// on it, or after a successor claimed.
+    TimeoutThenAppliedRand { max_ms: u64, cut_ms: u64 },
 }
 
 /// A scripted rule: `op` calls on paths containing `pattern`, from `node`
@@ -630,6 +635,17 @@ impl ObjectStore for NodeStore {
                 self.apply_later(location, payload, opts, after_ms, Some(cut_ms));
                 Err(timeout_error())
             }
+            Some(Fault::TimeoutThenAppliedRand { max_ms, cut_ms }) => {
+                let after_ms = self.bucket.rng.lock().unwrap().random_range(0..=max_ms);
+                self.apply_later(
+                    location,
+                    payload,
+                    opts,
+                    after_ms,
+                    (cut_ms > 0).then_some(cut_ms),
+                );
+                Err(timeout_error())
+            }
         }
     }
 
@@ -689,7 +705,8 @@ impl ObjectStore for NodeStore {
             }
             Some(Fault::Timeout)
             | Some(Fault::TimeoutThenApplied { .. })
-            | Some(Fault::TimeoutThenAppliedCut { .. }) => Err(timeout_error()),
+            | Some(Fault::TimeoutThenAppliedCut { .. })
+            | Some(Fault::TimeoutThenAppliedRand { .. }) => Err(timeout_error()),
         }
     }
 
@@ -719,7 +736,8 @@ impl ObjectStore for NodeStore {
             }
             Some(Fault::Timeout)
             | Some(Fault::TimeoutThenApplied { .. })
-            | Some(Fault::TimeoutThenAppliedCut { .. }) => Err(timeout_error()),
+            | Some(Fault::TimeoutThenAppliedCut { .. })
+            | Some(Fault::TimeoutThenAppliedRand { .. }) => Err(timeout_error()),
         }
     }
 
@@ -753,7 +771,8 @@ fn async_stream_list(
             }
             Some(Fault::Timeout)
             | Some(Fault::TimeoutThenApplied { .. })
-            | Some(Fault::TimeoutThenAppliedCut { .. }) => return vec![Err(timeout_error())],
+            | Some(Fault::TimeoutThenAppliedCut { .. })
+            | Some(Fault::TimeoutThenAppliedRand { .. }) => return vec![Err(timeout_error())],
             _ => {}
         }
         inner.list(Some(&prefix)).collect::<Vec<_>>().await

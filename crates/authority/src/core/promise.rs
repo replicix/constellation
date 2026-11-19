@@ -260,6 +260,13 @@ pub(crate) struct PromiseState {
     /// re-read failed too): while the open epoch carries it and nobody
     /// holds the epoch, writes are refused (`epoch_refuses_writes`).
     pub given_up: Option<(Epoch, i64)>,
+    /// The renewals of a release in doubt (`ReleaseRenew`) sent before it
+    /// was given up: each may have landed without its answer, so the object
+    /// then names this node under that expiry. An epoch carrying such a
+    /// lease is carrying a given-up one: nobody holds it, the move is owed
+    /// (`epoch_carries_let_go`, `epoch_carried_given_up`). Cleared with
+    /// `released` and `given_up` when a lease is acquired.
+    pub given_up_renewed: Vec<(Epoch, i64)>,
     /// This node closed its epoch while owning the hold, and its journal
     /// has not all reached the log yet: it is still the epoch's
     /// authority, and promises nothing.
@@ -1043,7 +1050,11 @@ impl Core {
             && self.pr.carried.is_some_and(|c| {
                 c.node == me
                     && ((self.lease.releasing && self.carries_mine())
-                        || self.pr.released == Some((c.epoch, c.expires_unix_ms)))
+                        || self.pr.released == Some((c.epoch, c.expires_unix_ms))
+                        || self
+                            .pr
+                            .given_up_renewed
+                            .contains(&(c.epoch, c.expires_unix_ms)))
             })
     }
 
@@ -1126,6 +1137,7 @@ impl Core {
         if acquired {
             self.pr.released = None;
             self.pr.given_up = None;
+            self.pr.given_up_renewed.clear();
         } else if self.lease.releasing || self.pr.released == self.pr.release_record {
             return;
         }

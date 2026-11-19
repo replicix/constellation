@@ -747,8 +747,9 @@ is safe):
 - Another holder, a later epoch or no object (an own or a peer's read):
   deposed. Final either way: the tag such a read shows differs from the one
   the failed PUT carries, so nothing of this node's can undo it.
-- The node's own re-read shows the lease standing: the node renews the lease
-  with a CAS on the tag that read returned (`Phase::ReleaseRenew`) and the
+- The node's own re-read shows the lease standing, the first one included
+  (the maintainer's rule: only the node's own CAS lifts the fence): the node
+  enters the wait if it is not in it and renews the lease with a CAS on the tag that read returned (`Phase::ReleaseRenew`) and the
   fence is lifted, the held lease and its renewed tag kept, when that CAS
   lands. The renewal moves the lease object, so a lease a continuation epoch
   carried is no longer the one the node holds: no hold is adopted on it
@@ -770,9 +771,17 @@ peer's read lifting the fence (248abc82) seeds of `flex-tight-late-applied`
 end with an epoch hold on one node and a usable S3 lease on another (I1);
 with a lifted fence on the node's own read alone, 11 of 1,500 do. A CAS of the
 node's own changes the object's version, so the failed PUT can never apply
-after it. (The first re-read of a release in doubt, made at once after the
-failed CAS, keeps its older rule: its success resolves the doubt as ever. The
-renewal applies to the reads of the wait.)
+after it. This holds for every own read of a release in doubt, the first one
+made at once after the failed CAS too: it is served earlier than any other and
+the late PUT is the likelier still to be on its way
+(`flex-tight-late-applied-nocut`, where the first re-read succeeds, fails "two
+authorities at once" without the renewal). Where the node may not wait (a
+shutdown, an epoch hold, no honour left) it gives the lease up instead of
+keeping it. A release that failed with a conflict was answered: no late PUT
+is behind it, and its re-read keeps the lease on the read alone. A renewal
+sent before a give-up may have landed without its answer: the give-up covers
+its expiry (`PromiseState::given_up_renewed`), so an epoch carrying it has a
+given-up lease, refuses writes and is owed its move.
 
 The bound: the wait ends at the first conclusive read, or when the held
 lease's honour runs out (`honour_left <= expiry_margin`), where the old

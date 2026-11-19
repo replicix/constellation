@@ -1738,6 +1738,12 @@ fn unresolved_release(h: &mut Harness) -> (Lease, Vec<Action>) {
 /// `lease`, standing: the node renews it with a CAS (`ReleaseRenew`), the fence
 /// still up. Returns the renewal's op and the actions of the re-read's step.
 fn own_reread_keeps(h: &mut Harness, timer: TimerId, lease: &Lease) -> (OpId, TimerId) {
+    let (renew, next, _) = own_reread_keeps_sent(h, timer, lease);
+    (renew, next)
+}
+
+/// As [`own_reread_keeps`], also returning the renewed lease the CAS carries.
+fn own_reread_keeps_sent(h: &mut Harness, timer: TimerId, lease: &Lease) -> (OpId, TimerId, Lease) {
     h.advance(600);
     let out = h.step(Event::Timer { id: timer });
     let next = timers(&out, TimerKind::ReleaseReread)[0];
@@ -1749,13 +1755,16 @@ fn own_reread_keeps(h: &mut Harness, timer: TimerId, lease: &Lease) -> (OpId, Ti
         op: reread,
         result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
     });
-    let (renew, _) = s3_ops(&out)
+    let (renew, sent) = s3_ops(&out)
         .into_iter()
-        .find(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }))
+        .find_map(|(op, r)| match r {
+            S3Op::LeaseSwap { lease, .. } => Some((op, lease.clone())),
+            _ => None,
+        })
         .expect("a renewal CAS");
     assert!(h.core.lease().releasing, "the fence lifted before the CAS");
     assert!(h.core.release_unresolved.is_some());
-    (renew, next)
+    (renew, next, sent)
 }
 
 /// The probe `to` was sent in `out`.
@@ -2180,6 +2189,107 @@ fn a_renewal_that_fails_keeps_the_fence_and_a_conflict_reads_again() {
     assert!(h.core.lease().held.is_none());
     assert_eq!(h.core.stats.releases, 1);
     assert_eq!(h.core.job(), None);
+}
+
+/// The first re-read of a release in doubt does not lift the fence on a read
+/// alone either: it may have been served before the failed PUT committed, and
+/// that PUT may still be on its way. The node enters the wait and renews the
+/// lease with a CAS of its own; the fence is lifted when that lands.
+#[test]
+fn the_first_reread_of_a_release_in_doubt_renews_before_it_lifts_the_fence() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mine = h.core.lease.held.as_ref().unwrap().0.clone();
+    let release = handoff_release_in_flight(&mut h);
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((mine, tag())))),
+    });
+    let (renew, _) = s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }))
+        .expect("a renewal CAS");
+    assert!(h.core.lease().releasing, "the fence lifted on a read");
+    assert!(h.core.release_unresolved.is_some());
+    assert_eq!(h.core.job(), Some(JobKind::Handoff));
+    assert_eq!(h.core.stats.release_unresolved_renewals, 1);
+    h.step(Event::S3 {
+        op: renew,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    assert!(!h.core.lease().releasing);
+    assert!(h.core.release_unresolved.is_none());
+    assert!(h.core.lease().held.is_some(), "the renewed lease is kept");
+}
+
+/// A node that may not wait (a shutdown flush queued behind the release) gives
+/// the lease up on a first re-read that shows it standing, instead of keeping
+/// it on the read.
+#[test]
+fn a_first_reread_that_shows_the_lease_standing_gives_up_where_the_node_may_not_wait() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mine = h.core.lease.held.as_ref().unwrap().0.clone();
+    let release = handoff_release_in_flight(&mut h);
+    h.step(Event::Control {
+        op: OpId(904),
+        req: Control::Shutdown,
+    });
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((mine, tag())))),
+    });
+    assert!(
+        !s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseSwap { lease, .. } if !lease.released)),
+        "renewed under a shutdown: {out:?}"
+    );
+    assert!(h.core.release_unresolved.is_none());
+    assert!(h.core.lease.held.is_none(), "kept on a read");
+    assert!(h.core.pr.given_up.is_some());
+}
+
+/// A give-up after a renewal went out without an answer covers the renewed
+/// lease: the renewal may have landed, and an epoch that carries it has no
+/// holder. The epoch's writes are refused at once and the move is owed.
+#[test]
+fn a_give_up_after_a_lost_renewal_covers_the_renewed_lease() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let (mine, out) = unresolved_release(&mut h);
+    let timer = timers(&out, TimerKind::ReleaseReread)[0];
+    let (renew, timer, sent) = own_reread_keeps_sent(&mut h, timer, &mine);
+    let renewed = sent.expires_unix_ms;
+    h.step(Event::S3 {
+        op: renew,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+    });
+    assert_ne!(renewed, mine.expires_unix_ms);
+    // The renewal landed unanswered: an epoch forms carrying the renewed lease.
+    let mut carried = mine.clone();
+    carried.expires_unix_ms = renewed;
+    h.step(epoch_report(carrier_of(&carried), true, true, false, false));
+    assert!(!h.core.epoch_refuses_writes(), "nothing is given up yet");
+    // Nothing resolves it by the honour end: the give-up.
+    h.advance(10_000);
+    h.step(Event::Timer { id: timer });
+    assert!(h.core.lease.held.is_none(), "not given up");
+    assert!(
+        h.core.epoch_refuses_writes(),
+        "an epoch carrying the renewed lease has a holder"
+    );
+    assert_eq!(h.core.pr.owes_move, Some((mine.epoch, renewed)));
 }
 
 /// A reply after the state ended (or from a peer not asked, or for a request

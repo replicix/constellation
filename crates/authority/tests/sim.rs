@@ -536,6 +536,12 @@ fn replay_seed() {
         }
         Ok("locks-late-applied") => late_release(locks_config()),
         Ok("flex-tight-late-applied") => late_release(flex_tight_config()),
+        Ok("flex-tight-late-applied-nocut") => late_release_nocut(flex_tight_config()),
+        Ok("flex-tight-late-applied-shortcut") => late_release_shortcut(flex_tight_config()),
+        Ok("flex-tight-late-applied-all") => late_every_lease_put(flex_tight_config()),
+        Ok("locks-late-applied-nocut") => late_release_nocut(locks_config()),
+        Ok("locks-late-applied-shortcut") => late_release_shortcut(locks_config()),
+        Ok("locks-late-applied-all") => late_every_lease_put(locks_config()),
         Ok("locks-blips-tight-late-applied") => late_release(locks_blips_tight_config()),
         Ok("locks-unlinked-delegated-partition") => locks_unlinked_partition_config(),
         Ok("locks-root-own-unlinked-partition") => locks_root_own_unlinked_partition_config(true),
@@ -7352,6 +7358,35 @@ fn regression_a_late_applied_release_makes_no_second_authority() {
     eprintln!("releases in doubt that waited: {waited}, renewals: {renewed}");
 }
 
+/// The first re-read of a release in doubt does not lift the fence on a read
+/// either. With no cut, the first re-read succeeds at once and shows the lease
+/// standing while the late PUT is still in flight; a node that kept the lease
+/// on that read was a second authority once the PUT landed and a successor
+/// claimed. On 675c46e0 seeds 14, 20, 66 and 126 of
+/// `flex-tight-late-applied-nocut` fail "two authorities at once" (4 of 200).
+/// The node now enters the wait and renews with a CAS of its own first.
+#[test]
+fn regression_the_first_reread_of_a_release_in_doubt_does_not_lift_the_fence() {
+    let mut renewed = 0;
+    for seed in [14, 20, 66, 126] {
+        let r = run_seed(seed, late_release_nocut(flex_tight_config())).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=flex-tight-late-applied-nocut AUTHORITY_SIM_SEED={seed}"
+            )
+        });
+        renewed += r
+            .stats
+            .values()
+            .map(|s| s.release_unresolved_renewals)
+            .sum::<u64>();
+    }
+    assert!(
+        renewed >= 1,
+        "no renewal lifted a fence: the pin would pass vacuously"
+    );
+}
+
 /// Re-pin helper for the two step-6a controls above: lists the seeds of
 /// `flex-tight+oracles` and `flex+commit` that pass as they are and, with the
 /// resumed tenure's span dropped, fail with the class claim (`control`); and
@@ -8215,6 +8250,12 @@ fn base_config(label: &str) -> SimConfig {
         }
         "locks-late-applied" => late_release(locks_config()),
         "flex-tight-late-applied" => late_release(flex_tight_config()),
+        "flex-tight-late-applied-nocut" => late_release_nocut(flex_tight_config()),
+        "flex-tight-late-applied-shortcut" => late_release_shortcut(flex_tight_config()),
+        "flex-tight-late-applied-all" => late_every_lease_put(flex_tight_config()),
+        "locks-late-applied-nocut" => late_release_nocut(locks_config()),
+        "locks-late-applied-shortcut" => late_release_shortcut(locks_config()),
+        "locks-late-applied-all" => late_every_lease_put(locks_config()),
         "locks-blips-tight-late-applied" => late_release(locks_blips_tight_config()),
         "locks-unlinked-delegated-partition" => locks_unlinked_partition_config(),
         "locks-root-own-unlinked-partition" => locks_root_own_unlinked_partition_config(true),
@@ -18668,6 +18709,75 @@ fn late_release(mut c: SimConfig) -> SimConfig {
         ),
     });
     c
+}
+
+/// The late-applied release with no cut: the release PUT times out at once,
+/// the node's path stays up, and the PUT lands 3 s later. The first re-read
+/// succeeds and shows the lease standing, with the PUT still in flight. A node
+/// that went on as holder on that read is a second authority once the PUT
+/// lands and a successor claims; one that renews with a CAS of its own first
+/// is not (`regression_the_first_reread_of_a_release_in_doubt_does_not_lift_the_fence`).
+fn late_release_nocut(mut c: SimConfig) -> SimConfig {
+    c.faults.push(ScheduledFault {
+        at_ms: 0,
+        kind: FaultKind::S3Rule(
+            Rule::new(
+                None,
+                OpKind::Put,
+                "leases/",
+                When::Random(0.5),
+                Fault::TimeoutThenApplied { after_ms: 3_000 },
+            )
+            .releases_only(),
+        ),
+    });
+    c
+}
+
+/// A late-applied release whose cut is shorter than the apply delay, the
+/// delay drawn per request over `0..=6 s` (one TTL): the node's own re-read
+/// works from 1 s on, while the PUT is still in flight, so the renewal races a
+/// live PUT; some PUTs also land after the give-up or after a successor's
+/// claim.
+fn late_release_shortcut(mut c: SimConfig) -> SimConfig {
+    c.faults.push(ScheduledFault {
+        at_ms: 0,
+        kind: FaultKind::S3Rule(
+            Rule::new(
+                None,
+                OpKind::Put,
+                "leases/",
+                When::Random(0.5),
+                Fault::TimeoutThenAppliedRand {
+                    max_ms: 6_000,
+                    cut_ms: 1_000,
+                },
+            )
+            .releases_only(),
+        ),
+    });
+    c
+}
+
+/// The late apply on every lease PUT (claim, renewal, reconfiguration,
+/// release, and the release's renewal), the delay drawn over `0..=6 s`, no
+/// cut: the renewal CAS of a release in doubt is itself orphaned and lands
+/// late. Costs availability only: the object then names the node, unreleased.
+fn late_every_lease_put(mut c: SimConfig) -> SimConfig {
+    c.faults.push(ScheduledFault {
+        at_ms: 0,
+        kind: FaultKind::S3Rule(Rule::new(
+            None,
+            OpKind::Put,
+            "leases/",
+            When::Random(0.1),
+            Fault::TimeoutThenAppliedRand {
+                max_ms: 6_000,
+                cut_ms: 0,
+            },
+        )),
+    });
+    late_release_shortcut(c)
 }
 
 /// `locks-partition`'s cut lockers (plus its random fault).

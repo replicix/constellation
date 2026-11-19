@@ -28,14 +28,19 @@
 //! the wait ends. The peer's answer informs only the waiting: forwards are
 //! answered `Held` and the node keeps looking.
 //!
-//! The node's own re-read does not end the wait by itself either, once the
-//! wait began: it succeeded after a backoff, and the failed PUT may still be on
-//! its way (a request orphaned in flight can land seconds after a later
-//! request of the same node was served). Seeing the lease standing, the node
-//! renews it with a CAS on the tag the read returned (`Phase::ReleaseRenew`).
-//! That write changes the object's version, so the failed PUT can never apply
-//! after it, and the fence is lifted only when it lands. A conflict reads
-//! again, no answer leaves the wait as it was.
+//! The node's own re-read never lifts the fence by itself, the first one
+//! included: it may have been served before the failed PUT committed, and
+//! that PUT may still be on its way (a request orphaned in flight can land
+//! seconds after a later request of the same node was served). Seeing the
+//! lease standing, a release in doubt renews it with a CAS on the tag the read
+//! returned (`Phase::ReleaseRenew`), entering the wait first. That write
+//! changes the object's version, so the failed PUT can never apply after it,
+//! and the fence is lifted only when it lands: only the node's own CAS lifts
+//! the fence. Where the node may not wait (a shutdown, an epoch hold, no
+//! honour left) it gives the lease up instead of keeping it. A release that
+//! failed with a conflict (`in_doubt: false`: the PUT was answered) has no
+//! late PUT behind it and keeps the lease on the read alone. A renewal that
+//! conflicts reads again, one that gets no answer leaves the wait as it was.
 //!
 //! The decision table is the re-read's ([`Core::resolve_release_doubt`]).
 //!
@@ -70,13 +75,21 @@ pub(crate) struct ReleaseUnresolved {
     timer: Option<TimerId>,
     /// Outstanding probes: the peer and the honour time the probe was sent.
     probes: BTreeMap<OpId, (NodeId, HonourMs)>,
+    /// The `expires_unix_ms` of every renewal CAS sent: one that landed
+    /// without its answer names this node under that expiry, and a give-up
+    /// must cover it (`PromiseState::given_up_renewed`).
+    renewals: Vec<i64>,
 }
 
 /// A read of the lease object offered to the decision table.
 #[derive(Debug)]
 pub(crate) enum DoubtRead {
-    /// This node's own re-read, with the tag it returned.
-    Own(Option<(Lease, LeaseTag)>),
+    /// This node's own re-read, with the tag it returned. `in_doubt`: the
+    /// release CAS it follows got no answer (a late PUT may be behind it).
+    Own {
+        object: Option<(Lease, LeaseTag)>,
+        in_doubt: bool,
+    },
     /// A peer's read.
     Peer { object: Option<Lease> },
 }
@@ -124,9 +137,13 @@ impl Core {
             return;
         };
         match result {
-            Ok(object) => {
-                self.resolve_release_doubt(now, kind, DoubtRead::Own(object), replica, out)
-            }
+            Ok(object) => self.resolve_release_doubt(
+                now,
+                kind,
+                DoubtRead::Own { object, in_doubt },
+                replica,
+                out,
+            ),
             // Waiting already: the timer looks again, nothing gives up here.
             Err(e) if self.release_unresolved.is_some() => {
                 tracing::debug!(
@@ -151,7 +168,7 @@ impl Core {
                     error = %e.0,
                     "lease re-read failed after a release in doubt; giving the lease up"
                 );
-                self.give_up_release_in_doubt(now, &mine, replica, out);
+                self.give_up_release_in_doubt(now, &mine, &[], replica, out);
                 self.release_job_tail(now, kind, replica, out);
             }
             Err(e) => {
@@ -186,6 +203,7 @@ impl Core {
             tries: 0,
             timer: None,
             probes: BTreeMap::new(),
+            renewals: Vec::new(),
         });
         self.send_release_probes(now, out);
         self.arm_release_reread(now, out);
@@ -194,11 +212,19 @@ impl Core {
     /// Drop the unresolved state: its timer, and its probes (a late reply
     /// is then ignored).
     fn end_release_unresolved(&mut self, out: &mut Vec<Action>) {
-        if let Some(st) = self.release_unresolved.take() {
-            if let Some(id) = st.timer {
-                self.cancel_timer(id, out);
-            }
+        self.end_release_unresolved_taking_renewals(out);
+    }
+
+    /// As [`Core::end_release_unresolved`], returning the expiries of the
+    /// renewals the wait sent (for a give-up that follows).
+    fn end_release_unresolved_taking_renewals(&mut self, out: &mut Vec<Action>) -> Vec<i64> {
+        let Some(st) = self.release_unresolved.take() else {
+            return Vec::new();
+        };
+        if let Some(id) = st.timer {
+            self.cancel_timer(id, out);
         }
+        st.renewals
     }
 
     fn arm_release_reread(&mut self, now: Now, out: &mut Vec<Action>) {
@@ -257,11 +283,11 @@ impl Core {
             self.end_release_unresolved(out);
             return;
         };
-        self.end_release_unresolved(out);
+        let renewed = self.end_release_unresolved_taking_renewals(out);
         self.stats.release_unresolved_gave_up += 1;
         match self.lease.held.clone() {
             Some((mine, _)) => {
-                self.give_up_release_in_doubt(now, &mine, replica, out);
+                self.give_up_release_in_doubt(now, &mine, &renewed, replica, out);
                 self.release_job_tail(now, kind, replica, out);
             }
             None => {
@@ -301,9 +327,9 @@ impl Core {
                 waited_ms = self.release_unresolved.as_ref().map(|st| now.wait.since(st.since)),
                 "no read resolved a release in doubt before the lease's honour ended; giving the lease up"
             );
-            self.end_release_unresolved(out);
+            let renewed = self.end_release_unresolved_taking_renewals(out);
             self.stats.release_unresolved_gave_up += 1;
-            self.give_up_release_in_doubt(now, &mine, replica, out);
+            self.give_up_release_in_doubt(now, &mine, &renewed, replica, out);
             self.release_job_tail(now, kind, replica, out);
             return;
         }
@@ -393,17 +419,23 @@ impl Core {
             .as_ref()
             .map(|st| st.mine)
             .unwrap_or((mine.epoch, mine.expires_unix_ms, mine.holder_expires_ms));
+        let read_in_doubt = matches!(read, DoubtRead::Own { in_doubt: true, .. });
         let decision = match read {
-            DoubtRead::Own(Some((cur, _)))
-                if cur.holder == me && cur.epoch == mine.epoch && cur.released =>
-            {
-                Decision::Landed
-            }
-            DoubtRead::Own(Some((cur, tag))) if cur.holder == me && cur.epoch == mine.epoch => {
+            DoubtRead::Own {
+                object: Some((cur, _)),
+                ..
+            } if cur.holder == me && cur.epoch == mine.epoch && cur.released => Decision::Landed,
+            DoubtRead::Own {
+                object: Some((cur, tag)),
+                ..
+            } if cur.holder == me && cur.epoch == mine.epoch => {
                 Decision::KeptOwn(Box::new(cur), tag)
             }
-            DoubtRead::Own(Some((cur, _))) => Decision::Deposed(cur.holder, cur.epoch),
-            DoubtRead::Own(None) => Decision::Deposed(0, 0),
+            DoubtRead::Own {
+                object: Some((cur, _)),
+                ..
+            } => Decision::Deposed(cur.holder, cur.epoch),
+            DoubtRead::Own { object: None, .. } => Decision::Deposed(0, 0),
             DoubtRead::Peer {
                 object: Some(cur), ..
             } if cur.holder == me && cur.epoch == mine.epoch && cur.released => Decision::Landed,
@@ -434,6 +466,26 @@ impl Core {
         if matches!(decision, Decision::Inconclusive) {
             return;
         }
+        // The node's own re-read of a release in doubt that shows the lease
+        // standing never lifts the fence on the read: it goes through the
+        // renewal CAS, whether or not the wait began. Enter the wait first
+        // (the renewal's outcomes need its timer), or give up where the node
+        // may not wait.
+        let own_in_doubt_kept =
+            matches!((&decision, &read_in_doubt), (Decision::KeptOwn(..), true));
+        if own_in_doubt_kept && self.release_unresolved.is_none() {
+            if !self.may_wait_unresolved(now) {
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    "a re-read showed the lease standing after a release in doubt, and the node may not wait for a renewal; giving the lease up"
+                );
+                self.stats.release_unresolved_gave_up += 1;
+                self.give_up_release_in_doubt(now, &mine, &[], replica, out);
+                self.release_job_tail(now, kind, replica, out);
+                return;
+            }
+            self.enter_release_unresolved(now, &mine, out);
+        }
         // Conclusive: whatever follows acts on a node that is no longer
         // waiting.
         let was_waiting = self.release_unresolved.is_some();
@@ -449,9 +501,9 @@ impl Core {
                 ?waited_ms,
                 "a re-read showed the lease standing only after its honour ended; giving the lease up"
             );
-            self.end_release_unresolved(out);
+            let renewed = self.end_release_unresolved_taking_renewals(out);
             self.stats.release_unresolved_gave_up += 1;
-            self.give_up_release_in_doubt(now, &mine, replica, out);
+            self.give_up_release_in_doubt(now, &mine, &renewed, replica, out);
             self.release_job_tail(now, kind, replica, out);
             return;
         }
@@ -489,6 +541,9 @@ impl Core {
         let mut renewed = self.lease.renewed_lease(now, &self.cfg, &cur);
         self.clear_covered_tail(&mut renewed);
         self.stats.release_unresolved_renewals += 1;
+        if let Some(st) = self.release_unresolved.as_mut() {
+            st.renewals.push(renewed.expires_unix_ms);
+        }
         let op = self.issue_s3(
             S3Op::LeaseSwap {
                 lease: renewed.clone(),
@@ -553,12 +608,25 @@ impl Core {
         &mut self,
         now: Now,
         mine: &Lease,
+        renewed: &[i64],
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let carried_mine = self.epoch_carries(mine);
+        // A renewal CAS that was sent may have landed without its answer:
+        // the object then names this node under the renewed expiry, and an
+        // epoch carrying that lease has no holder either.
+        let carried_mine = self.epoch_carries(mine)
+            || renewed.iter().any(|&x| {
+                self.epoch_carries(&Lease {
+                    expires_unix_ms: x,
+                    ..mine.clone()
+                })
+            });
         self.pr.released = Some((mine.epoch, mine.expires_unix_ms));
         self.pr.given_up = self.pr.released;
+        self.pr
+            .given_up_renewed
+            .extend(renewed.iter().map(|&x| (mine.epoch, x)));
         self.lease.released();
         self.owe_given_up_move(carried_mine, replica);
         self.drop_unexecuted_parks(now, replica, out);

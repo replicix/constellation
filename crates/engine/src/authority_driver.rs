@@ -1056,18 +1056,19 @@ fn cas_failure(e: impl Into<StoreError>) -> CasFailure {
 ///
 /// A journal that cannot be read is not an empty one: one transient read
 /// error would release over an acknowledged row that never shipped (I1/I5).
-/// It fails the CAS too, as `Conflict` and not `Failed`: the CAS was never
-/// sent, so it cannot have landed, and `Failed` would make the core treat the
-/// release as in doubt (and give the lease up if the re-read failed as well,
-/// over rows that never shipped). `Conflict` re-reads the lease with
+/// It fails the CAS too, as `Conflict` and not `Failed`, like a journal with
+/// rows in it: the CAS was never sent, so it cannot have landed, and `Failed`
+/// would make the core treat the release as in doubt (a wait, a renewal CAS,
+/// and a give-up if nothing resolves it, over rows that never shipped). `Conflict` re-reads the lease with
 /// `in_doubt: false`: a failed re-read keeps the lease and the next round
 /// decides again.
 fn release_guard(meta: &Meta) -> Result<(), CasFailure> {
     match constellation_meta::MetaStore::journal_is_empty(meta) {
         Ok(true) => Ok(()),
-        Ok(false) => Err(CasFailure::Failed(
-            "a write landed before the release; retrying next round".into(),
-        )),
+        Ok(false) => {
+            tracing::debug!("a write landed before the release; keeping the lease");
+            Err(CasFailure::Conflict)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "reading the journal before the release failed; keeping the lease");
             Err(CasFailure::Conflict)
@@ -8591,8 +8592,11 @@ mod tests {
         meta.create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
             .unwrap();
         assert!(
-            super::release_guard(&meta).is_err(),
-            "an unshipped row blocks"
+            matches!(
+                super::release_guard(&meta),
+                Err(super::CasFailure::Conflict)
+            ),
+            "an unshipped row blocks, and the CAS it blocks was never sent"
         );
         meta.fail_journal_emptiness_reads_for_tests(1);
         assert!(
