@@ -100,9 +100,26 @@ impl Meta {
         }
         let r = self.db.read_tx();
         let range = keys::names_of(ino);
-        for keyspace in [&self.ns, &self.scratch] {
+        for (keyspace, primaries) in [(&self.ns, Some(&self.primaries)), (&self.scratch, None)] {
             let mut parents = Vec::new();
-            for guard in r.range(keyspace, ns::key_range_bounds(&range)) {
+            let mut span = ns::key_range_bounds(&range);
+            if let Some(primaries) = primaries {
+                // From the primary name: no live name lies below it.
+                let row = crate::store::primaries::primary_of(&r, primaries, ino)?;
+                #[cfg(any(test, feature = "test-util"))]
+                crate::store::primaries::assert_row_is_first_key(
+                    &r,
+                    keyspace,
+                    ino,
+                    row.as_ref(),
+                    "parents_of",
+                );
+                match row {
+                    Some(row) => span.start = row.key(ino),
+                    None => continue,
+                }
+            }
+            for guard in r.range(keyspace, span) {
                 let (k, _) = guard.into_inner()?;
                 if let keys::Key::RDentry { parent_ino, .. } = keys::Key::parse(&k)? {
                     if parents.last() != Some(&parent_ino) {
@@ -122,7 +139,7 @@ impl Meta {
         r: &impl Readable,
         ino: Ino,
     ) -> Result<Option<Ino>, MetaError> {
-        ns::parent_of(r, &self.ns, ino)
+        ns::parent_of(r, &self.ns, Some(&self.primaries), ino)
     }
 
     /// Upward walk to the root via the `0x04` reverse index. Silently
@@ -136,18 +153,20 @@ impl Meta {
         let mut names = Vec::new();
         let mut cur = ino;
         loop {
-            let range = keys::names_of(cur);
-            let Some(guard) = r.range(&self.ns, ns::key_range_bounds(&range)).next() else {
+            let row = crate::store::primaries::primary_of(&r, &self.primaries, cur)?;
+            #[cfg(any(test, feature = "test-util"))]
+            crate::store::primaries::assert_row_is_first_key(
+                &r,
+                &self.ns,
+                cur,
+                row.as_ref(),
+                "path_of",
+            );
+            let Some(row) = row else {
                 break;
             };
-            let (k, _) = guard.into_inner()?;
-            let keys::Key::RDentry {
-                parent_ino, name, ..
-            } = keys::Key::parse(&k)?
-            else {
-                break;
-            };
-            names.push(String::from_utf8_lossy(name).into_owned());
+            let parent_ino = row.parent();
+            names.push(row.name_lossy());
             if parent_ino == ROOT_INO {
                 break;
             }
@@ -167,18 +186,20 @@ impl Meta {
         let mut chain = vec![(ino, String::new())];
         let mut cur = ino;
         while cur != ROOT_INO {
-            let range = keys::names_of(cur);
-            let Some(guard) = r.range(&self.ns, ns::key_range_bounds(&range)).next() else {
+            let row = crate::store::primaries::primary_of(&r, &self.primaries, cur)?;
+            #[cfg(any(test, feature = "test-util"))]
+            crate::store::primaries::assert_row_is_first_key(
+                &r,
+                &self.ns,
+                cur,
+                row.as_ref(),
+                "ancestry",
+            );
+            let Some(row) = row else {
                 return Ok(None);
             };
-            let (k, _) = guard.into_inner()?;
-            let keys::Key::RDentry {
-                parent_ino, name, ..
-            } = keys::Key::parse(&k)?
-            else {
-                return Ok(None);
-            };
-            chain.last_mut().unwrap().1 = String::from_utf8_lossy(name).into_owned();
+            let parent_ino = row.parent();
+            chain.last_mut().unwrap().1 = row.name_lossy();
             // A directory has one parent; a cycle is a corrupt index.
             if chain.iter().any(|(seen, _)| *seen == parent_ino) {
                 return Ok(None);

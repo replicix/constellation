@@ -8,6 +8,7 @@
 //! `ns` and `scratch` share one implementation.
 
 use crate::error::MetaError;
+use crate::store::primaries;
 use crate::store::Meta;
 use constellation_fs_core::{FileAttr, Ino, InodeKind};
 use constellation_mtree::keys::{self, KeyRange};
@@ -94,16 +95,25 @@ pub(crate) fn dentry_attrs(
     }
 }
 
-/// The dentry pointing at `ino` (there's at most one relevant parent for
-/// this purpose: an ancestor walk only needs *a* parent, and a hard
-/// linked non-directory never needs one).
+/// The directory of `ino`'s primary name: a point get of its row
+/// ([`primaries`]), or, for a keyspace that keeps none (`scratch`,
+/// `primaries` is `None`), the first key of its `0x04` range. The first
+/// name is enough: an ancestor walk only needs *a* parent, and a hard
+/// linked non-directory never needs one.
 pub(crate) fn parent_of(
     r: &impl Readable,
     ns_ks: &SingleWriterTxKeyspace,
+    primaries: Option<&SingleWriterTxKeyspace>,
     ino: Ino,
 ) -> Result<Option<Ino>, MetaError> {
     if ino == constellation_fs_core::types::ROOT_INO {
         return Ok(None);
+    }
+    if let Some(primaries) = primaries {
+        let row = primaries::primary_of(r, primaries, ino)?;
+        #[cfg(any(test, feature = "test-util"))]
+        primaries::assert_row_is_first_key(r, ns_ks, ino, row.as_ref(), "parent_of");
+        return Ok(row.map(|row| row.parent()));
     }
     let range = keys::names_of(ino);
     if let Some(guard) = r.range(ns_ks, key_range_bounds(&range)).next() {
@@ -293,14 +303,28 @@ pub(crate) fn child_ino(
 }
 
 /// Every `(parent, name)` pointing at `ino` via the `0x04` reverse index.
+/// With the keyspace's `primaries` the range starts at the primary name's
+/// key: no live name lies below it, and the tombstones there are not
+/// stepped over.
 pub(crate) fn links_of(
     r: &impl Readable,
     ns: &SingleWriterTxKeyspace,
+    primaries: Option<&SingleWriterTxKeyspace>,
     ino: Ino,
 ) -> Result<Vec<(Ino, String)>, MetaError> {
     let range = keys::names_of(ino);
+    let mut start = range.start().to_vec();
+    if let Some(primaries) = primaries {
+        let row = primaries::primary_of(r, primaries, ino)?;
+        #[cfg(any(test, feature = "test-util"))]
+        primaries::assert_row_is_first_key(r, ns, ino, row.as_ref(), "links_of");
+        match row {
+            Some(row) => start = row.key(ino),
+            None => return Ok(Vec::new()),
+        }
+    }
     let mut out = Vec::new();
-    for guard in r.range(ns, range.start().to_vec()..range.end().to_vec()) {
+    for guard in r.range(ns, start..range.end().to_vec()) {
         let (k, _) = guard.into_inner()?;
         if let constellation_mtree::keys::Key::RDentry {
             parent_ino, name, ..
@@ -424,7 +448,7 @@ pub(crate) fn put_inode_record(
         return Ok(());
     }
     let want = DentryRecord::for_inode(ino, &record.attrs).encode();
-    for (parent, name) in links_of(tx, ns, ino)? {
+    for (parent, name) in links_of(tx, ns, dirty.primaries(), ino)? {
         let key = keys::dentry(parent, name.as_bytes());
         let stale = match tx.get(ns, &key)? {
             Some(held) => *held != *want,
@@ -750,13 +774,17 @@ pub(crate) fn key_range_bounds(r: &KeyRange) -> std::ops::Range<Vec<u8>> {
 /// reasoning that makes only `ns` dirty-tracked makes only `ns` worth
 /// undoing; derived indexes (`chunk_ref`, `xattr_by_name`, `orphans`)
 /// are recomputed from the restored records instead
-/// (`spec::restore_key_tx`).
+/// (`spec::restore_key_tx`), and `primaries` follows the restored `0x04` keys
+/// through the funnel.
 #[derive(Clone, Copy)]
 pub(crate) enum Dirty<'a> {
     Untracked,
     Tracked {
         dirty: &'a SingleWriterTxKeyspace,
         local: &'a SingleWriterTxKeyspace,
+        /// The per-inode primary rows the funnel keeps in step with the
+        /// `0x04` keys it writes ([`crate::store::primaries`]).
+        primaries: &'a SingleWriterTxKeyspace,
         capture: Option<&'a crate::store::spec::Capture>,
         /// How the write of this handle changes the key it touches: `None`
         /// an exclusive write (the default), `Some` a commutative merge of
@@ -770,10 +798,12 @@ impl<'a> Dirty<'a> {
     pub(crate) fn tracked(
         dirty: &'a SingleWriterTxKeyspace,
         local: &'a SingleWriterTxKeyspace,
+        primaries: &'a SingleWriterTxKeyspace,
     ) -> Self {
         Dirty::Tracked {
             dirty,
             local,
+            primaries,
             capture: None,
             mode: None,
         }
@@ -784,11 +814,13 @@ impl<'a> Dirty<'a> {
     pub(crate) fn capturing(
         dirty: &'a SingleWriterTxKeyspace,
         local: &'a SingleWriterTxKeyspace,
+        primaries: &'a SingleWriterTxKeyspace,
         capture: &'a crate::store::spec::Capture,
     ) -> Self {
         Dirty::Tracked {
             dirty,
             local,
+            primaries,
             capture: Some(capture),
             mode: None,
         }
@@ -820,15 +852,26 @@ impl<'a> Dirty<'a> {
             Dirty::Tracked {
                 dirty,
                 local,
+                primaries,
                 capture,
                 ..
             } => Dirty::Tracked {
                 dirty,
                 local,
+                primaries,
                 capture,
                 mode,
             },
             Dirty::Untracked => Dirty::Untracked,
+        }
+    }
+
+    /// The primary rows' keyspace, for a write to `ns` (`None`: a
+    /// scratch keyspace, which keeps none).
+    pub(crate) fn primaries(self) -> Option<&'a SingleWriterTxKeyspace> {
+        match self {
+            Dirty::Tracked { primaries, .. } => Some(primaries),
+            Dirty::Untracked => None,
         }
     }
 
@@ -873,6 +916,11 @@ impl<'a> Dirty<'a> {
 /// be forgotten on a new write path (plan 29 M2's `dirty_snapshot`/
 /// `clear_dirty_upto` test exercises every mutating API to check exactly
 /// that).
+///
+/// A tracked write of a `0x04` key also keeps the inode's primary row in step
+/// ([`primaries::note_insert`], in the same transaction): the row is written
+/// only here and in [`ns_remove`], which is invariant I-P's whole proof
+/// (`store::primaries`).
 pub(crate) fn ns_insert(
     tx: &mut SingleWriterWriteTx,
     ks: &SingleWriterTxKeyspace,
@@ -882,11 +930,18 @@ pub(crate) fn ns_insert(
 ) -> Result<(), MetaError> {
     dirty.mark(tx, &key)?;
     dirty.capture(tx, ks, &key)?;
-    tx.insert(ks, key, value);
+    match dirty.primaries() {
+        Some(primaries) if key.first() == Some(&keys::RANGE_RDENTRY) => {
+            tx.insert(ks, key.clone(), value);
+            primaries::note_insert(tx, primaries, &key)?;
+        }
+        _ => tx.insert(ks, key, value),
+    }
     Ok(())
 }
 
-/// The removing twin of [`ns_insert`].
+/// The removing twin of [`ns_insert`]; a `0x04` key's removal moves the
+/// primary row to the inode's next name, or drops it ([`primaries::note_remove`]).
 pub(crate) fn ns_remove(
     tx: &mut SingleWriterWriteTx,
     ks: &SingleWriterTxKeyspace,
@@ -895,7 +950,13 @@ pub(crate) fn ns_remove(
 ) -> Result<(), MetaError> {
     dirty.mark(tx, &key)?;
     dirty.capture(tx, ks, &key)?;
-    tx.remove(ks, key);
+    match dirty.primaries() {
+        Some(primaries) if key.first() == Some(&keys::RANGE_RDENTRY) => {
+            tx.remove(ks, key.clone());
+            primaries::note_remove(tx, ks, primaries, &key)?;
+        }
+        _ => tx.remove(ks, key),
+    }
     Ok(())
 }
 

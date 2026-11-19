@@ -20,6 +20,34 @@ use constellation_types::Rdev;
 use fjall::{Readable, SingleWriterWriteTx};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The first names of an inode, in key order ([`TouchSet::from_op_in_names`]'s
+/// `names` argument).
+///
+/// Contract: `names` is the key-order prefix of `min(limit, n)` of the `n`
+/// names the inode has, and `complete` implies it is all of them. Every
+/// implementation must also set `complete` when `names.len() < limit`; it
+/// may leave it clear when `names.len() == limit` and the inode has no more
+/// (the store does, for an inode whose primary row is not `ONE`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NamePrefix {
+    /// `(parent, name)`, in key order.
+    pub names: Vec<(u64, String)>,
+    /// `names` is every name the inode has.
+    pub complete: bool,
+}
+
+impl NamePrefix {
+    /// The prefix of `limit` names of `full` (sorted), with the tightest
+    /// `complete`: set when `full.len() <= limit`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn prefix_of(full: Vec<(u64, String)>, limit: usize) -> Self {
+        let complete = full.len() <= limit;
+        let mut names = full;
+        names.truncate(limit);
+        Self { names, complete }
+    }
+}
+
 /// Which dentries/inos a batch of records touches, used to suppress a
 /// foreign record that collides with the caller's own not-yet-shipped
 /// work. Atime is deliberately invisible here (see [`LogRecord::Atime`]):

@@ -68,6 +68,11 @@
 //!   redundant-but-simple index for prune-policy root discovery
 //!   (`constellation_meta::prune`) over the *shared* namespace's
 //!   xattrs (`ns`'s xattrs are ino-major, never name-major).
+//! - `primaries` — `ino(8 BE) -> flags | parent(8 BE) | name`, each
+//!   inode's primary name (the lowest `0x04` key of `ns`, ADR-42), kept in
+//!   the `ns` funnel in the transaction of the name write
+//!   (`store::primaries`, ADR-42); the first-name reads are a point get and
+//!   one seek, whatever tombstones the unlinked names left.
 //! - `scratch` — a scratch directory's private content, same
 //!   `constellation_mtree` key/value encoding as `ns` (so scratch → shared
 //!   publish is a record copy), but never journaled or replicated.
@@ -121,6 +126,9 @@ mod lock_bench;
 mod merge_tests;
 pub(crate) mod misc;
 pub(crate) mod ns;
+pub(crate) mod primaries;
+#[cfg(test)]
+mod primaries_tests;
 #[cfg(test)]
 mod prune_tests;
 mod reads;
@@ -256,6 +264,9 @@ pub(crate) const KV_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
 /// The layout version of this store's persisted rows, written when the
 /// store is created and checked by every open ([`Meta::check_format`]).
 pub(crate) const KV_FORMAT: &str = "format";
+/// `local` kv: the store has the `primaries` index (written at genesis; a
+/// store with a root inode and no marker predates it and is refused).
+pub(crate) const KV_PRIMARIES_INDEX: &str = "primaries_index";
 /// The on-disk format this binary reads and writes. There is no migration:
 /// a store of another format is refused at open. 3: `local` counts each
 /// node's remote-pending marks (`store::remote`, `remote_marks/<node>`),
@@ -539,6 +550,9 @@ pub struct Meta {
     pub(crate) chunk_ref: SingleWriterTxKeyspace,
     pub(crate) chunk_ref_by_ino: SingleWriterTxKeyspace,
     pub(crate) xattr_by_name: SingleWriterTxKeyspace,
+    /// `ino BE -> flags | parent BE | name`: each inode's primary name,
+    /// kept by the `ns` funnel ([`primaries`]). Local derived state.
+    pub(crate) primaries: SingleWriterTxKeyspace,
     pub(crate) scratch: SingleWriterTxKeyspace,
     /// Plan 29 M2: `key -> counter: u64 BE`, the set of `ns` keys changed
     /// since the last publish observed them. Every write to `ns` records
@@ -1382,6 +1396,7 @@ impl Meta {
         let chunk_ref = db.keyspace("chunk_ref", KeyspaceCreateOptions::default)?;
         let chunk_ref_by_ino = db.keyspace("chunk_ref_by_ino", KeyspaceCreateOptions::default)?;
         let xattr_by_name = db.keyspace("xattr_by_name", KeyspaceCreateOptions::default)?;
+        let primaries = db.keyspace("primaries", KeyspaceCreateOptions::default)?;
         let scratch = db.keyspace("scratch", ns_options)?;
         let dirty = db.keyspace("dirty", KeyspaceCreateOptions::default)?;
         let pins = db.keyspace("pins", KeyspaceCreateOptions::default)?;
@@ -1410,6 +1425,7 @@ impl Meta {
             chunk_ref,
             chunk_ref_by_ino,
             xattr_by_name,
+            primaries,
             scratch,
             dirty,
             pins,
@@ -1597,12 +1613,20 @@ impl Meta {
             Some(v) => v.parse::<u32>().ok(),
             None if tx.get(&self.ns, keys::inode(ROOT_INO))?.is_none() => {
                 kv_set_tx(&mut tx, &self.local, KV_FORMAT, &META_FORMAT.to_string());
+                kv_set_tx(&mut tx, &self.local, KV_PRIMARIES_INDEX, "1");
                 tx.commit()?;
                 return Ok(());
             }
             None => Some(1),
         };
         if found == Some(META_FORMAT) {
+            if kv_get_tx(&tx, &self.local, KV_PRIMARIES_INDEX)?.is_none()
+                && tx.get(&self.ns, keys::inode(ROOT_INO))?.is_some()
+            {
+                return Err(MetaError::Invalid(
+                    "the store predates the primaries index: re-bootstrap it".into(),
+                ));
+            }
             return Ok(());
         }
         let found = found.map_or_else(|| "unreadable".to_string(), |f| f.to_string());
@@ -1669,11 +1693,12 @@ impl Meta {
             ns::ns_insert(
                 &mut tx,
                 &self.ns,
-                ns::Dirty::tracked(&self.dirty, &self.local),
+                self.dirty_for_ns(),
                 keys::inode(ROOT_INO),
                 InodeRecord::new(attrs).encode(),
             )?;
             tx.insert(&self.atime, ROOT_INO.to_be_bytes(), t.to_le_bytes());
+            kv_set_tx(&mut tx, &self.local, KV_PRIMARIES_INDEX, "1");
         }
         if kv_get_tx(&tx, &self.local, KV_NEXT_INO)?.is_none() {
             kv_set_tx(
@@ -2261,14 +2286,14 @@ impl Meta {
     /// keyspace. The one thing every `ns`-mutating call site constructs
     /// to route its writes through the tracked path.
     pub(crate) fn dirty_for_ns(&self) -> ns::Dirty<'_> {
-        ns::Dirty::tracked(&self.dirty, &self.local)
+        ns::Dirty::tracked(&self.dirty, &self.local, &self.primaries)
     }
 
     /// As [`Self::dirty_for_ns`], additionally recording every touched
     /// key's before-image into `capture` (plan 30 §M3a speculation log,
     /// `store::spec`).
     pub(crate) fn dirty_capturing<'a>(&'a self, capture: &'a spec::Capture) -> ns::Dirty<'a> {
-        ns::Dirty::capturing(&self.dirty, &self.local, capture)
+        ns::Dirty::capturing(&self.dirty, &self.local, &self.primaries, capture)
     }
 
     /// Every `(key, counter)` currently in `dirty`, under the caller's
@@ -2981,7 +3006,9 @@ mod dentry_copy_tests {
             let rec: InodeRecord = ns::get_inode_record(&r, &meta.ns, d.ino)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{label}: dangling dentry {k:?}"));
-            let names = ns::links_of(&r, &meta.ns, d.ino).unwrap().len();
+            let names = ns::links_of(&r, &meta.ns, Some(&meta.primaries), d.ino)
+                .unwrap()
+                .len();
             let copy = rec.attrs.kind == constellation_mtree::record::Kind::Dir || names == 1;
             if copy {
                 assert_eq!(

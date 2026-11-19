@@ -981,33 +981,119 @@ impl Meta {
     /// than `limit` means that is all of them. Nothing while no delegation
     /// exists, when every key is the root's and a name that leaves cannot
     /// move an inode between owners ([`TouchSet::from_op_in_names`], which
-    /// asks for as many names as its outcome needs). The scan stops at the
-    /// `limit`th name, and a `String` is made only for the names returned.
+    /// asks for as many names as its outcome needs).
+    ///
+    /// The inode's primary row ([`crate::store::primaries`]) answers a
+    /// single-name inode in one point get, and otherwise says where the
+    /// scan starts: at the primary name, not at the start of the range, so
+    /// the tombstones that unlinked names left below it are not stepped
+    /// over. The scan stops at the `limit`th name, and a `String` is made
+    /// only for the names returned.
     pub fn names_of_ino(&self, ino: Ino, limit: usize) -> Vec<(Ino, String)> {
+        self.names_prefix(ino, limit).names
+    }
+
+    /// [`Self::names_of_ino`] with its `complete` flag: set when the names
+    /// are all of them (the row's `ONE` flag, or the range ended before the
+    /// `limit`th name).
+    pub(crate) fn names_prefix(&self, ino: Ino, limit: usize) -> crate::replay::NamePrefix {
+        use crate::replay::NamePrefix;
         if limit == 0 || ino == ROOT_INO || !self.delegations_any() {
-            return Vec::new();
+            return NamePrefix {
+                names: Vec::new(),
+                complete: true,
+            };
         }
         let r = self.db.read_tx();
-        let range = keys::names_of(ino);
-        let mut out = Vec::new();
-        for guard in r.range(&self.ns, ns::key_range_bounds(&range)) {
-            let Ok((k, _)) = guard.into_inner() else {
-                break;
-            };
-            if let Ok(keys::Key::RDentry {
+        // A read error fails open, as it did before the row (an empty or
+        // short answer reads as "these are all the names").
+        let got = self.names_prefix_at(&r, ino, limit).unwrap_or(NamePrefix {
+            names: Vec::new(),
+            complete: true,
+        });
+        #[cfg(any(test, feature = "test-util"))]
+        self.assert_names_prefix_is_scan(&r, ino, limit, &got);
+        got
+    }
+
+    fn names_prefix_at(
+        &self,
+        r: &impl Readable,
+        ino: Ino,
+        limit: usize,
+    ) -> Result<crate::replay::NamePrefix, MetaError> {
+        use crate::replay::NamePrefix;
+        use crate::store::primaries;
+        let Some(row) = primaries::primary_of(r, &self.primaries, ino)? else {
+            return Ok(NamePrefix {
+                names: Vec::new(),
+                complete: true,
+            });
+        };
+        if row.is_one() {
+            return Ok(NamePrefix {
+                names: vec![(row.parent(), row.name_lossy())],
+                complete: true,
+            });
+        }
+        let end = keys::names_of(ino).end().to_vec();
+        let mut names = Vec::with_capacity(limit.min(8));
+        for guard in r.range(&self.ns, row.key(ino)..end) {
+            let (k, _) = guard.into_inner()?;
+            if let keys::Key::RDentry {
                 parent_ino, name, ..
-            }) = keys::Key::parse(&k)
+            } = keys::Key::parse(&k)?
             {
                 // (Key order is `(u64, String)` order only while names are valid
                 // UTF-8, as the store's `String` names are: the bounded
                 // computation in `TouchSet::from_op_in_names` relies on it.)
-                out.push((parent_ino, String::from_utf8_lossy(name).into_owned()));
-                if out.len() >= limit {
+                names.push((parent_ino, String::from_utf8_lossy(name).into_owned()));
+                if names.len() >= limit {
                     break;
                 }
             }
         }
-        out
+        let complete = names.len() < limit;
+        Ok(NamePrefix { names, complete })
+    }
+
+    /// Test-util cross-check on the reader's own snapshot: the names are the
+    /// first `min(limit, n)` of the from-start scan, `complete` only when
+    /// the scan has no more, and the row is the scan's first key.
+    #[cfg(any(test, feature = "test-util"))]
+    fn assert_names_prefix_is_scan(
+        &self,
+        r: &impl Readable,
+        ino: Ino,
+        limit: usize,
+        got: &crate::replay::NamePrefix,
+    ) {
+        use crate::store::primaries;
+        let scan = primaries::scan_tails(r, &self.ns, ino, limit.saturating_add(1))
+            .expect("the scan of the cross-check");
+        let names_of = |tails: &[Vec<u8>]| -> Vec<(Ino, String)> {
+            tails
+                .iter()
+                .map(|t| {
+                    let parent = Ino::from_be_bytes(t[..8].try_into().expect("a parent"));
+                    (parent, String::from_utf8_lossy(&t[8..]).into_owned())
+                })
+                .collect()
+        };
+        let scanned = names_of(&scan);
+        let want = &scanned[..scanned.len().min(limit)];
+        assert_eq!(
+            got.names, want,
+            "the primary row of {ino} disagrees with the 0x04 scan (names_of_ino, limit {limit})"
+        );
+        assert!(
+            !got.complete || scanned.len() <= limit,
+            "the primary row of {ino} disagrees with the 0x04 scan (names_of_ino, limit {limit}): \
+             complete with more names after {:?}",
+            got.names
+        );
+        let row = primaries::primary_of(r, &self.primaries, ino).expect("the row");
+        primaries::assert_row_is_first_key(r, &self.ns, ino, row.as_ref(), "names_of_ino");
     }
 }
 
@@ -1024,13 +1110,7 @@ impl Namespace for Meta {
             return None;
         }
         let r = self.db.read_tx();
-        let range = keys::names_of(ino);
-        let guard = r.range(&self.ns, ns::key_range_bounds(&range)).next()?;
-        let (k, _) = guard.into_inner().ok()?;
-        match keys::Key::parse(&k).ok()? {
-            keys::Key::RDentry { parent_ino, .. } => Some(parent_ino),
-            _ => None,
-        }
+        ns::parent_of(&r, &self.ns, Some(&self.primaries), ino).ok()?
     }
 }
 

@@ -22,6 +22,7 @@
 
 use crate::error::MetaError;
 use crate::store::local::{DELEG_LOG_IDX_PREFIX, DELEG_VOID_CUT_PREFIX};
+use crate::store::primaries::PrimaryRow;
 use crate::store::{misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
 use constellation_fs_core::Ino;
 use constellation_mtree::keys;
@@ -60,6 +61,8 @@ pub struct BootstrapIndexBuilder {
     xattr_by_name: Vec<(String, Ino, Vec<u8>)>,
     usage_bytes: u64,
     usage_files: u64,
+    /// The primary rows, in `ino` order ([`Self::observe_name`]).
+    primaries: Vec<(Ino, PrimaryRow)>,
 }
 
 impl BootstrapIndexBuilder {
@@ -91,6 +94,21 @@ impl BootstrapIndexBuilder {
         if attrs.kind == Kind::File {
             self.usage_bytes += attrs.size;
             self.usage_files += 1;
+        }
+    }
+
+    /// Record one `0x04` key. The keys must arrive in key order, as a tree
+    /// cursor yields them: the first of an inode is its primary name, and
+    /// a second one means the row's `ONE` flag is clear. A key that is not
+    /// a `0x04` key of a name is ignored.
+    pub fn observe_name(&mut self, key: &[u8]) {
+        let Ok(keys::Key::RDentry { ino, .. }) = keys::Key::parse(key) else {
+            return;
+        };
+        let tail = key[1 + keys::INO_LEN..].to_vec();
+        match self.primaries.last_mut() {
+            Some((last, row)) if *last == ino => row.clear_one(),
+            _ => self.primaries.push((ino, PrimaryRow::new(true, tail))),
         }
     }
 }
@@ -189,6 +207,9 @@ impl Meta {
     /// override. Neither dirties nor journals: the value *is* the
     /// published tree's.
     pub fn ns_overwrite_after_ingest(&self, key: &[u8], value: &[u8]) -> Result<(), MetaError> {
+        // Not the funnel: the root's `0x01` only, which no primary row
+        // follows (`store::primaries`).
+        debug_assert!(key.first() != Some(&keys::RANGE_RDENTRY));
         let mut tx = self.db.write_tx();
         tx.insert(&self.ns, key.to_vec(), value.to_vec());
         tx.commit()?;
@@ -246,7 +267,7 @@ impl Meta {
     /// incrementally, which bulk ingestion bypassed, applied here with
     /// no re-decoding of what was already decoded once.
     ///
-    /// Clears the three index keyspaces first (idempotent: a bootstrap
+    /// Clears the index keyspaces (and `primaries`) first (idempotent: a bootstrap
     /// that retries lands on the same state either way), then inserts
     /// `builder`'s rows directly.
     pub fn apply_bootstrap_indexes(&self, builder: BootstrapIndexBuilder) -> Result<(), MetaError> {
@@ -254,6 +275,10 @@ impl Meta {
         clear_tx(&mut tx, &self.chunk_ref)?;
         clear_tx(&mut tx, &self.chunk_ref_by_ino)?;
         clear_tx(&mut tx, &self.xattr_by_name)?;
+        clear_tx(&mut tx, &self.primaries)?;
+        for (ino, row) in &builder.primaries {
+            tx.insert(&self.primaries, ino.to_be_bytes(), row.encode());
+        }
         for (hash, ino) in &builder.chunk_hashes {
             tx.insert(&self.chunk_ref, misc::cr_key(hash, *ino), Vec::new());
             tx.insert(

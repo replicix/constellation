@@ -7452,6 +7452,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 ));
             }
         }
+        check_primary_indexes(&cluster)?;
         return Ok(report);
     }
     // Plan 43 C2e: the operator ended a delegation generation whose group
@@ -8835,7 +8836,21 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             report.ungated_shadows, report.faults
         ));
     }
+    check_primary_indexes(&cluster)?;
     Ok(report)
+}
+
+/// ADR-42 (the per-inode primary row): at the end of a seed every live
+/// node's `primaries` keyspace is exactly its first `0x04` keys.
+fn check_primary_indexes(cluster: &Cluster) -> Result<(), String> {
+    for id in cluster.ids() {
+        cluster
+            .get(id)
+            .meta
+            .check_primary_index()
+            .map_err(|e| format!("primary index of node {id}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Plan 30 §M11: create `cfg.dirs` under the root through node 1 (it

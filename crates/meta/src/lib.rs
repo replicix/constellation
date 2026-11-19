@@ -49,7 +49,7 @@ pub use readdeleg::{
 };
 pub use record::{from_bytes_exact, CloneNode, LogRecord, SubtreeGrant, SubtreeKind};
 pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
-pub use replay::TouchSet;
+pub use replay::{NamePrefix, TouchSet};
 pub use rid::Rid;
 pub use session::{
     DelegDurable, DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait,

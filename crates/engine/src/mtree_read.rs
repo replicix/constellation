@@ -685,7 +685,11 @@ pub(crate) fn load_tree(
                 main.push((key.to_vec(), value.to_vec()));
                 n_dentries += 1;
             }
-            Key::RDentry { .. } | Key::Subsystem { .. } => {
+            Key::RDentry { .. } => {
+                derived.observe_name(key);
+                main.push((key.to_vec(), value.to_vec()));
+            }
+            Key::Subsystem { .. } => {
                 main.push((key.to_vec(), value.to_vec()));
             }
             // Handled per-inode above.

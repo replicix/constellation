@@ -922,7 +922,7 @@ fn rename_in_tx(
     };
     ns::require_dir(tx, ns_ks, new_parent)?;
 
-    if src_rec.attrs.kind == Kind::Dir && is_within(tx, ns_ks, new_parent, ino)? {
+    if src_rec.attrs.kind == Kind::Dir && is_within(tx, ns_ks, dirty, new_parent, ino)? {
         return Err(MetaError::Invalid("rename into own subtree".into()));
     }
 
@@ -1053,6 +1053,7 @@ fn rename_in_tx(
 fn is_within(
     tx: &SingleWriterWriteTx,
     ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
     dir: Ino,
     ancestor: Ino,
 ) -> Result<bool, MetaError> {
@@ -1064,7 +1065,7 @@ fn is_within(
         if cursor == ROOT_INO {
             return Ok(false);
         }
-        match ns::parent_of(tx, ns_ks, cursor)? {
+        match ns::parent_of(tx, ns_ks, dirty.primaries(), cursor)? {
             Some(p) => cursor = p,
             None => return Ok(false),
         }
@@ -1145,8 +1146,8 @@ pub(crate) fn exchange_in_tx(
     // Neither directory may land beneath itself (Linux: `EINVAL` when one
     // entry is an ancestor of the other).
     if validate
-        && ((src_dir && is_within(tx, ns_ks, new_parent, src.ino)?)
-            || (dst_dir && is_within(tx, ns_ks, parent, dst.ino)?))
+        && ((src_dir && is_within(tx, ns_ks, dirty, new_parent, src.ino)?)
+            || (dst_dir && is_within(tx, ns_ks, dirty, parent, dst.ino)?))
     {
         return Err(MetaError::Invalid("exchange into own subtree".into()));
     }
