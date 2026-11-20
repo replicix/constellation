@@ -962,14 +962,17 @@ impl Core {
             // the release row of one subtree takes the settle's keys past
             // the cut in its one apply: the waiting settles it concerns are
             // noted before.
-            let cut_gens: BTreeSet<u64> = seg
+            let cut_dirs: BTreeSet<(u64, constellation_fs_core::Ino)> = seg
                 .records
                 .iter()
-                .filter_map(|r| match r {
-                    LogRecord::ReleaseCut { gen, .. } => Some(*gen),
-                    _ => None,
+                .flat_map(|r| match r {
+                    LogRecord::ReleaseCut { gen, dirs, .. } => {
+                        dirs.iter().map(|d| (*gen, *d)).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
                 })
                 .collect();
+            let cut_gens: BTreeSet<u64> = cut_dirs.iter().map(|(g, _)| *g).collect();
             let cut_nodes: BTreeSet<NodeId> = seg
                 .records
                 .iter()
@@ -978,10 +981,14 @@ impl Core {
                     _ => None,
                 })
                 .collect();
+            // (F2c: the shipper of a segment that carried a cut is taken as
+            // alive for either delivery path; ADR-64 round 9 records the cost
+            // of a polled one.)
+            let alive = (seg.node != self.cfg.node_id).then_some(seg.node);
             let waiting_cut = if cut_gens.is_empty() {
                 BTreeSet::new()
             } else {
-                self.settles_waiting_cut(&cut_nodes, &cut_gens, replica)
+                self.settles_waiting_cut(&cut_nodes, &cut_dirs, replica)
             };
             let applied = replica.apply_segment(
                 seq,
@@ -1062,7 +1069,7 @@ impl Core {
                 self.root_cut_seen(now, &cut_gens, replica, out);
                 // (R5b: and a requester's own settle, waiting out a retry,
                 // sent to the root whose segment carried the cut.)
-                self.settles_cut_seen(now, &cut_nodes, &waiting_cut, seg.node, replica, out);
+                self.settles_cut_seen(now, &cut_nodes, &waiting_cut, alive, replica, out);
             }
             if seg.records.iter().any(|r| {
                 matches!(

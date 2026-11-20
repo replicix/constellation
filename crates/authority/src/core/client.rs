@@ -4254,6 +4254,11 @@ impl Core {
     /// would never carry it, up to the client deadline, and the client
     /// heard in doubt (`EIO`) for a write that had landed.
     ///
+    /// Round 9: also this node's own settle backing off between forwards
+    /// (`Backoff`); its timer resolves it the same way
+    /// (`on_forward_backoff`), up to a back-off later, and a deadline can
+    /// fall in between (`sticky-s4-merge` seed 73).
+    ///
     /// Also: an inbox op durable under an older epoch (the gate drained
     /// that epoch's inbox, so the same rule holds; before, it waited for
     /// the next recheck), and an op backing off between acquisitions.
@@ -4277,15 +4282,19 @@ impl Core {
             return;
         }
         let epoch = held;
-        let moot = |phase: &Phase| match *phase {
+        let moot = |c: &ClientOp| match c.phase {
             Phase::AwaitingLog { epoch: e, .. } | Phase::InboxWaiting { epoch: e } => e < epoch,
             Phase::AcquireRetry => true,
+            // Round 9 (review 3, MUST-2): a settle of this node's own backing
+            // off between forwards; its timer would resolve it so
+            // (`on_forward_backoff`), up to a backoff later.
+            Phase::Backoff => c.settle,
             _ => false,
         };
         let mut rids: Vec<(u64, Rid)> = self
             .clients
             .iter()
-            .filter(|(_, c)| moot(&c.phase))
+            .filter(|(_, c)| moot(c))
             .map(|(rid, c)| (c.order, *rid))
             .collect();
         if rids.is_empty() {
@@ -4298,7 +4307,7 @@ impl Core {
             let Some(c) = self.clients.get_mut(&rid) else {
                 continue;
             };
-            if !moot(&c.phase) {
+            if !moot(c) {
                 continue;
             }
             if self.lease.new_mutation_epoch(now, &self.cfg) != Some(epoch) {
@@ -4306,6 +4315,7 @@ impl Core {
             }
             let c = self.clients.get_mut(&rid).expect("present");
             let kind = c.phase_kind();
+            let backing_off = matches!(c.phase, Phase::Backoff);
             if let Some(t) = c.timer.take() {
                 self.cancel_timer(t, out);
             }
@@ -4314,6 +4324,9 @@ impl Core {
                 ClientPhase::AwaitingLog => self.stats.awaiting_log_resolved += 1,
                 ClientPhase::InboxWaiting => self.stats.inbox_waits_resolved += 1,
                 _ => {}
+            }
+            if backing_off {
+                self.stats.settles_backoff_resolved += 1;
             }
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -5335,21 +5348,19 @@ impl Core {
         now: Now,
         nodes: &BTreeSet<NodeId>,
         waiting: &BTreeSet<Rid>,
-        shipper: NodeId,
+        alive: Option<NodeId>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         if self.cfg.root_ignores_cut || !self.cfg.delegation {
             return;
         }
+        // (Round 9: only the settles of the subtrees this segment cuts, as the
+        // snapshot before the apply resolved them.)
         let due: Vec<Rid> = self
             .clients
             .iter()
-            .filter(|(rid, c)| {
-                self.settle_waits_for_cut(c, nodes)
-                    && (waiting.contains(rid)
-                        || replica.settle_at_cut(&super::holder::keys_of_op_in(&c.op, replica)))
-            })
+            .filter(|(rid, c)| self.settle_waits_for_cut(c, nodes) && waiting.contains(rid))
             .map(|(rid, _)| *rid)
             .collect();
         for rid in due {
@@ -5376,7 +5387,6 @@ impl Core {
                     self.stats.settles_woken_at_cut_released += 1;
                 }
             }
-            let alive = (shipper != self.cfg.node_id).then_some(shipper);
             self.settle_route_to(now, rid, alive, replica, out);
         }
     }
@@ -5408,7 +5418,7 @@ impl Core {
     pub(crate) fn settles_waiting_cut(
         &self,
         nodes: &BTreeSet<NodeId>,
-        gens: &BTreeSet<u64>,
+        cuts: &BTreeSet<(u64, constellation_fs_core::Ino)>,
         replica: &dyn Replica,
     ) -> BTreeSet<Rid> {
         if self.cfg.root_ignores_cut || !self.cfg.delegation {
@@ -5419,11 +5429,13 @@ impl Core {
             .filter(|(_, c)| self.settle_waits_for_cut(c, nodes))
             .filter(|(_, c)| {
                 let keys = super::holder::keys_of_op_in(&c.op, replica);
-                replica.settle_at_cut(&keys)
-                    || matches!(
-                        replica.resolve_ownership(&keys),
-                        Ownership::Delegated(d) if gens.contains(&d.gen)
-                    )
+                match replica.resolve_ownership(&keys) {
+                    Ownership::Delegated(d) => cuts.contains(&(d.gen, d.dir)),
+                    Ownership::CrossSubtree { involved, .. } => {
+                        involved.iter().any(|d| cuts.contains(&(d.gen, d.dir)))
+                    }
+                    Ownership::Root => false,
+                }
             })
             .map(|(rid, _)| *rid)
             .collect()

@@ -7032,6 +7032,7 @@ impl Core {
     /// until its next peers tick. Ignored unless it is from this node's root
     /// and about a generation this node holds.
     pub(crate) fn on_delegate_stream_resume(&mut self, from: NodeId, gen: u64) {
+        self.stats.deleg_stream_resumes_received += 1;
         if self.dl.mine.contains_key(&gen) && self.holder_root() == Some(from) {
             self.stats.deleg_stream_resumes += 1;
             self.dl.root_back = true;

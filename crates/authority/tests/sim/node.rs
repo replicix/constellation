@@ -235,6 +235,10 @@ pub struct Shared {
     pub release_open: AtomicBool,
     /// `Stats::settle_frozen_asks` of this node's earlier incarnations.
     pub settle_asks_before: AtomicU64,
+    /// Round 9: the delegate-stream resume counters of this node's earlier
+    /// incarnations (`resume_counts`): a rebooted node starts its `Stats`
+    /// from zero, so a root that sent resumes and then restarted lost them.
+    pub resumes_before: Mutex<[u64; 5]>,
     /// `Meta::unjustified_ships` of this node's earlier incarnations (a meta
     /// that did not survive the restart; plan 46 M0.4).
     pub unjustified_ships_before: AtomicU64,
@@ -764,6 +768,7 @@ impl NodeHandle {
             ungated_shadows_before: AtomicU64::new(0),
             release_open: AtomicBool::new(false),
             settle_asks_before: AtomicU64::new(0),
+            resumes_before: Mutex::new([0; 5]),
             unjustified_ships_before: AtomicU64::new(0),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),

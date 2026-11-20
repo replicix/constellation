@@ -452,6 +452,21 @@ pub struct Reach {
 }
 
 impl Reach {
+    /// ADR-64 round 9 (the factual excuse): whether `node` had a root to ship
+    /// a row to inside `[from, to]`: it was the root itself, or it reached the
+    /// root in force over P2P for at least one round trip (`min_p2p_ms`, not
+    /// the requester's ask-cycle floor). `Some((from, to))` of the first such
+    /// run.
+    pub fn root_run_for_a_row(&self, node: NodeId, from: u64, to: u64) -> Option<(u64, u64)> {
+        let g = self.inner.lock().unwrap();
+        let (runs, _, _) = runs_of(&g, &Question::new(node, from, to));
+        runs.into_iter().find_map(|(via, s, e)| match via {
+            Via::Itself => Some((s, e)),
+            Via::Root(_) if e - s >= g.min_p2p_ms => Some((s, e)),
+            _ => None,
+        })
+    }
+
     /// The run's clock: true ms since the first reading (virtual under a
     /// paused runtime).
     pub fn now_ms(&self) -> u64 {
@@ -1763,7 +1778,17 @@ fn lapsed_holder_in(g: &Inner, q: &Question) -> Option<NodeId> {
     })
 }
 
+/// The reachable runs of `q`'s window (consecutive segments reaching a
+/// sequencer the same way, merged), and the first tail-blocked and not-due
+/// reasons met.
+type Runs = (Vec<(Via, u64, u64)>, Option<String>, Option<String>);
+
 fn judge(g: &Inner, q: &Question) -> Judged {
+    let (runs, tail_blocked, not_due) = runs_of(g, q);
+    judge_runs(g, q, runs, tail_blocked, not_due)
+}
+
+fn runs_of(g: &Inner, q: &Question) -> Runs {
     // Every instant at which any state changes inside the window.
     let mut marks: Vec<u64> = vec![q.from_ms, q.to_ms];
     let inside = |t: u64| t > q.from_ms && t < q.to_ms;
@@ -1849,6 +1874,16 @@ fn judge(g: &Inner, q: &Question) -> Judged {
             Seg::Nothing => {}
         }
     }
+    (runs, tail_blocked, not_due)
+}
+
+fn judge_runs(
+    g: &Inner,
+    q: &Question,
+    runs: Vec<(Via, u64, u64)>,
+    mut tail_blocked: Option<String>,
+    not_due: Option<String>,
+) -> Judged {
     let mut claim_blocked: Option<String> = None;
     let mut under_floor: Option<String> = None;
     for (via, from, to) in runs {
@@ -2075,6 +2110,39 @@ mod tests {
     /// The window [4 000, 7 000] of `requester`, the keys the root's.
     fn q(requester: NodeId) -> Question {
         Question::new(requester, 4_000, 7_000)
+    }
+
+    /// Round 9 (review 3, MUST-3): a holder had a root to ship a row to when
+    /// it was the root, or reached the root in force for a round trip
+    /// (`min_p2p_ms`: 2 x 10 + 100 = 120 ms here), not for less.
+    #[test]
+    fn a_holder_has_a_root_for_a_row_when_it_is_the_root_or_reaches_it_for_a_round_trip() {
+        let r = world();
+        for t in [500, 1_400, 2_300, 3_200] {
+            r.lease_landed_at(t, 1, t + 1_000, false);
+        }
+        // The root itself, at any length.
+        assert!(r.root_run_for_a_row(1, 2_000, 2_001).is_some());
+        // Node 3 reaches it throughout.
+        assert!(r.root_run_for_a_row(3, 1_000, 2_000).is_some());
+        // Node 3 cut from both nodes and from S3 until 3_000, then back: the
+        // runs after the heal are shorter or longer than one round trip.
+        r.partition_at(1_000, 3, 1, true);
+        r.partition_at(1_000, 3, 2, true);
+        r.s3_cut_at(1_000, 3, true);
+        r.partition_at(3_000, 3, 1, false);
+        r.partition_at(3_000, 3, 2, false);
+        r.s3_cut_at(3_000, 3, false);
+        assert_eq!(r.root_run_for_a_row(3, 1_100, 2_900), None);
+        assert!(r.root_run_for_a_row(3, 1_100, 4_000).is_some());
+        let short = r.root_run_for_a_row(3, 1_100, 3_000 + 20);
+        let long = r.root_run_for_a_row(3, 1_100, 3_000 + 400);
+        assert!(
+            short.is_none(),
+            "a run under one round trip counted: {short:?}"
+        );
+        let (s, e) = long.expect("a run over one round trip");
+        assert!(e - s >= 120, "{s}..{e}");
     }
 
     #[test]

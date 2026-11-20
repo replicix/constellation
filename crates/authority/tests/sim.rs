@@ -10819,6 +10819,9 @@ struct OracleTotals {
     /// `settles_woken_at_cut_phase`, `settles_woken_at_cut_released` and
     /// `settles_cut_forwarded_alive`, summed over nodes and seeds.
     r8: [u64; 8],
+    /// Round 9: resumes received (every incarnation), settles resolved out of
+    /// `Backoff` by the node's own acquisition.
+    r9: [u64; 2],
     s4_rowless_held: u64,
     s4_exec_in_cut: u64,
     /// Due cuts that went rowless, were left to a claim, were asked for
@@ -10826,7 +10829,7 @@ struct OracleTotals {
     s4_cut_paths: [u64; 4],
     /// Round 6, one predicate on both arms (`Report::s4_pred`): EIOs under a
     /// held-release span, of them root-blocked; under a cut span, of them
-    /// root-blocked, of them with the cut row unshippable, of them both.
+    /// root-blocked; then, over both kinds, the row unshippable (the factual excuse) and of them root-blocked.
     s4_pred: [u64; 6],
     s4_span_max_ms: u64,
     violation_causes: std::collections::BTreeMap<String, u64>,
@@ -11084,12 +11087,15 @@ impl OracleTotals {
         self.s4_cut_spans.1 += u64::from(r.cut_release_spans > 0);
         self.s4_cut_settles += r.settles_sent_in_cut;
         self.s4_answered_at_cut += r.settles_answered_at_cut;
+        // (The resume counters over every incarnation: `Report::resume_counts`.)
+        let [sent, taken, stale, received, inherited] = r.resume_counts;
+        for (n, v) in self.r8[..4].iter_mut().zip([sent, taken, stale, inherited]) {
+            *n += v;
+        }
+        self.r9[0] += received;
         for s in r.stats.values() {
-            for (n, v) in self.r8.iter_mut().zip([
-                s.deleg_stream_resumes_sent,
-                s.deleg_stream_resumes,
-                s.deleg_stream_resumes_stale,
-                s.deleg_inherited,
+            self.r9[1] += s.settles_backoff_resolved;
+            for (n, v) in self.r8[4..].iter_mut().zip([
                 s.settles_woken_at_cut,
                 s.settles_woken_at_cut_phase,
                 s.settles_woken_at_cut_released,
@@ -11317,7 +11323,7 @@ impl OracleTotals {
     /// apart, over the excused ones (a sticky stream's are `designation_held`).
     fn s4_line(&self, label: &str, seeds: u64) -> String {
         format!(
-            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms; cut spans {} in {} seeds; settles sent while a cut waited {}; settles answered at a cut {}; rowless held releases {}; executions refused under a cut {}; cut_rowless_after {}; cut_left_to_claim {}; cut_repeated {}; cut_absorbed {}; under the one predicate (the requester judged against the root over the span, `Question::new`): EIOs under a held-release span {}, root-blocked {}; under a cut span {}, root-blocked {}, cut row unshippable {} (named excuse), blocked and unshippable {}",
+            "SWEEP-S4 {label} seeds {}/{seeds}: unsettled EIOs while the owning stream's release waited on read recalls {} (violations {}, allowed {}) in {} seeds; tagged among the excused (designation-held, isolated, lost chunk) {} in {} seeds; held-release spans seen {} in {} seeds; settles sent {}, whose window overlapped a held release {}; longest closed span {} ms; cut spans {} in {} seeds; settles sent while a cut waited {}; settles answered at a cut {}; rowless held releases {}; executions refused under a cut {}; cut_rowless_after {}; cut_left_to_claim {}; cut_repeated {}; cut_absorbed {}; under the one predicate (the requester judged against the root over the span, `Question::new`): EIOs under a held-release span {}, root-blocked {}; under a cut span {}, root-blocked {}; row unshippable on either kind of span {} (named excuse; no root appended the span's row and its holder had no root for one round trip), of them root-blocked {}",
             self.seeds,
             self.s4.0,
             self.s4.1,
@@ -11415,8 +11421,8 @@ impl OracleTotals {
         );
         eprintln!("{}", self.s4_line(label, seeds));
         eprintln!(
-            "SWEEP-R8 {label}: resumes sent {} (generations taken on {}), resumes taken {}, resumes ignored {}; settles woken at a cut {} (from the acquire waits {}, by the pre-apply snapshot only {}), forwarded to a root alive {}",
-            self.r8[0], self.r8[3], self.r8[1], self.r8[2], self.r8[4], self.r8[5], self.r8[6], self.r8[7]
+            "SWEEP-R8 {label}: resumes sent {} (generations taken on {}), resumes taken {}, resumes ignored {}; settles woken at a cut {} (from the acquire waits {}, by the pre-apply snapshot only {}), forwarded to a root alive {}; resumes received {}; settles resolved out of the back-off by the node's own acquisition {}",
+            self.r8[0], self.r8[3], self.r8[1], self.r8[2], self.r8[4], self.r8[5], self.r8[6], self.r8[7], self.r9[0], self.r9[1]
         );
         eprintln!(
             "SWEEP-I4-CAUSES {label} seeds {}/{seeds}: violations by cause {:?}",
@@ -21815,6 +21821,24 @@ const FLOOR_CAUSES: [&str; 2] = [
     sim::reach::CAUSE_NO_LEASE_READ_RETRY,
 ];
 
+/// `sticky-s4-merge+unsettled`, as the sweep label builds it.
+fn sticky_s4_merge_unsettled_config() -> SimConfig {
+    SimConfig {
+        strict_settle: true,
+        strict_unsettled: true,
+        ..sticky_s4_merge_config()
+    }
+}
+
+/// `sticky-s4-root-restart+unsettled`, as the sweep label builds it.
+fn sticky_s4_root_restart_unsettled_config() -> SimConfig {
+    SimConfig {
+        strict_settle: true,
+        strict_unsettled: true,
+        ..sticky_s4_root_restart_config()
+    }
+}
+
 /// Plan 46 M0.3, the ratchet, in two halves, both over seeds 0 to 99 of each
 /// configuration without the lease-reads knob, the configurations run in
 /// parallel. The sweeps that set the lists are in PROGRESS ("Plan 43 C2h").
@@ -21894,7 +21918,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // in seeds 0..99); never raised for a count the ceiling already saw:
     // delegated-backup-and-delegate-die's allowed ceiling was set while its
     // runs that end waiting for a group's tail counted nothing)
-    let ceilings: [(&str, Config, usize, usize); 19] = [
+    let ceilings: [(&str, Config, usize, usize); 21] = [
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
         // (Allowed 0 to 26: the runs that end with a root waiting for a
@@ -22028,6 +22052,24 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
         ),
         ("placement-hot", placement_hot_config, 0, 0),
+        // (ADR-64 round 9, 2026-11-20, fix tree of round 9, the `+unsettled`
+        // form of each label (`strict_settle` and `strict_unsettled`): seeds
+        // 0..99 measure 0 violations and 2 allowed (isolated) in each. In 2,000
+        // seeds `sticky-s4-merge+unsettled` has the untagged I4 seeds of
+        // `PROGRESS` (round 9 section); `sticky-s4-root-restart+unsettled`
+        // fails 287 only (round 8). The ceilings only go down.)
+        (
+            "sticky-s4-merge+unsettled",
+            sticky_s4_merge_unsettled_config,
+            0,
+            2,
+        ),
+        (
+            "sticky-s4-root-restart+unsettled",
+            sticky_s4_root_restart_unsettled_config,
+            0,
+            2,
+        ),
     ];
     // ADR-58's `held-behind-lost-chunk` has a column of its own (a row that
     // waits behind a chunk that exists nowhere: allowed, checked against the
@@ -24033,6 +24075,62 @@ fn s4_fix_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
     assert_eq!(fix.exec_in_cut, 0);
 }
 
+/// Round 9 (review 3, MUST-2): seed 73 of `sticky-s4-merge`. The cut row of
+/// `d5` wakes the requester's settle out of `AcquireRetry`, the fenced root
+/// answers `Busy`, and the settle backs off past the second deadline while
+/// the requester takes the lease and runs as the root (the control arm
+/// answers it `Abandoned` from the acquisition). The made-moot resolver now
+/// takes a settle in `Backoff`. Fails on round 8's tree: the unsettled `EIO`
+/// is tagged (the factual excuse of round 9 does not cover it: the root
+/// appended the cut row 460 ms before). Needs the counter, too.
+#[test]
+fn s4_merge_seed_73_a_woken_settle_is_answered_by_the_nodes_own_acquisition() {
+    let fix = run_seed(
+        73,
+        SimConfig {
+            no_release_cut: false,
+            ..sticky_s4_merge_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("sticky-s4-merge seed 73: the fix arm failed: {e}"));
+    assert_eq!((fix.unsettled_s4, fix.s4_strict.len()), (0, 0));
+    assert_eq!(fix.exec_in_cut, 0);
+    let resolved: u64 = fix.stats.values().map(|s| s.settles_backoff_resolved).sum();
+    assert!(
+        resolved > 0,
+        "no settle resolved from Backoff: the seed no longer exercises the path"
+    );
+}
+
+/// Round 9 (review 3, MUST-1): seed 36 of `sticky-s4-root-restart`. The cut
+/// row of `d4` woke the settle of `d5` (rid 3/1/53), the extra trip moved its
+/// lease observation and its one deadline extension ended before the
+/// restarted root answered: an unsettled `EIO` at 19.79 s (allowed, so no
+/// tag), answered on round 7 at 20.37 s. The wake is filtered by the cut
+/// dirs. Fails on round 8's tree: the rid is told `EIO`.
+#[test]
+fn s4_root_restart_seed_36_a_settle_of_another_subtree_is_not_woken() {
+    let fix = run_seed(
+        36,
+        SimConfig {
+            no_release_cut: false,
+            ..sticky_s4_root_restart_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("sticky-s4-root-restart seed 36: the fix arm failed: {e}"));
+    assert_eq!((fix.unsettled_s4, fix.s4_strict.len()), (0, 0));
+    let rid = constellation_meta::Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 53,
+    };
+    assert!(
+        !fix.unsettled_rids.contains(&rid),
+        "rid {rid:?} was told EIO unsettled: {:?}",
+        fix.unsettled_rids
+    );
+}
+
 /// Round 7 (R5b): the requester has the cut row from the log a second before
 /// its next retry, which the root answered `Busy` and then `NotHolder { 0 }`
 /// after its idle release, and the settle ran out one retry cycle after the
@@ -24119,9 +24217,22 @@ fn s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle() {
         }
         // (The bounds of the review: a resume is sent once per generation
         // taken on, and a settle is forwarded alive only after being woken.)
+        // (By count over every incarnation of every node, a rebooted root's
+        // included: `[sent, taken, stale, received, inherited]`.)
+        let [sent, taken, stale, received, inherited] = fix.resume_counts;
         assert!(
-            sum(&fix, |s| s.deleg_stream_resumes_sent) <= sum(&fix, |s| s.deleg_inherited),
-            "seed {seed}: more resumes sent than generations taken on"
+            sent <= inherited,
+            "seed {seed}: more resumes sent ({sent}) than generations taken on ({inherited})"
+        );
+        assert_eq!(
+            taken + stale,
+            received,
+            "seed {seed}: the delegates' own/stale split lost a resume"
+        );
+        assert!(
+            taken + stale <= sent,
+            "seed {seed}: delegates handled {} resumes, the roots sent {sent} (a duplicate delivery or a lost counter)",
+            taken + stale
         );
         assert!(
             alive <= sum(&fix, |s| s.settles_woken_at_cut),
@@ -24184,6 +24295,13 @@ fn the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_suspend() {
 #[test]
 fn the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_merge() {
     s4_knob_fires("sticky-s4-merge", sticky_s4_merge_config, 8);
+}
+
+/// Round 9 (review 3, MUST-3): the label with the most `EIO`s under a span
+/// has both negative controls too.
+#[test]
+fn the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_root_restart() {
+    s4_knob_fires("sticky-s4-root-restart", sticky_s4_root_restart_config, 23);
 }
 
 /// Plan 46 M1.3 step 15a, S4 (review MUST-2), now the control arm

@@ -45234,6 +45234,154 @@ fn a_settle_in_the_acquire_backoff_is_routed_again_when_its_cut_row_is_applied()
     assert_eq!(h.core.stats.settles_woken_at_cut_phase, 1);
 }
 
+/// [`apply_cut_segment`] as segment `seq`.
+fn apply_foreign_segment(
+    h: &mut Harness,
+    node: NodeId,
+    seq: Seq,
+    records: &[LogRecord],
+) -> Vec<Action> {
+    let payload = crate::segment::encode(node, 1, 0, &[], &[], records).unwrap();
+    h.core.ship.next_seq = seq;
+    let mut out = Vec::new();
+    h.core
+        .apply_incoming(h.clk(), seq, &payload, &h.meta, &mut out)
+        .unwrap();
+    out
+}
+
+/// ADR-64 (R5b, round 9, review 3 MUST-1, `sticky-s4-root-restart` seed 36):
+/// a generation holds two subtrees (`/d`, and a sibling `/e`), and the
+/// settle waits on `/d`. The cut row of `/e` names the generation but not
+/// `/d`: it wakes nothing (its keys are not at that cut), and the wake of the
+/// settle belongs to the segment that cuts `/d`. Before, any cut row of the
+/// generation woke it, and the extra trip moved its lease observation and
+/// with it the one deadline extension of a lease-path settle. Fails on the
+/// parent: the settle is sent to the root at `/e`'s cut.
+#[test]
+fn a_cut_of_one_subtree_does_not_wake_a_settle_of_another() {
+    let (mut h, dir, rid) = waiting_settle_at_a_delegate();
+    let sibling = h.meta.allocate_ino(ROOT_INO).unwrap();
+    apply_foreign_segment(
+        &mut h,
+        1,
+        2,
+        &[
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "e".into(),
+                ino: sibling,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::delegate_one(3, 7, sibling, constellation_meta::SubtreeKind::Placed),
+        ],
+    );
+    let mut out = Vec::new();
+    h.core.lease_path(h.clk(), rid, &h.meta, &mut out);
+    h.core
+        .on_acquire_finished(h.clk(), false, &h.meta, &mut out);
+    assert_eq!(
+        h.core.clients[&rid].phase,
+        crate::core::client::Phase::AcquireRetry,
+        "{out:?}"
+    );
+    let cut_of = |d| LogRecord::ReleaseCut {
+        node: 3,
+        gen: 7,
+        dirs: vec![d],
+        at: 0,
+    };
+    let out = apply_foreign_segment(&mut h, 1, 3, &[cut_of(sibling)]);
+    assert!(
+        !settle_sent_to(&out, rid, 1) && !settle_sent_to(&out, rid, 3),
+        "the cut of /e woke the settle of /d: {out:?}"
+    );
+    assert_eq!(
+        h.core.clients[&rid].phase,
+        crate::core::client::Phase::AcquireRetry
+    );
+    assert_eq!(h.core.stats.settles_woken_at_cut, 0);
+    // The segment that cuts its own subtree wakes it.
+    let out = apply_foreign_segment(&mut h, 1, 4, &[cut_of(dir)]);
+    assert!(settle_sent_to(&out, rid, 1), "no settle sent to 1: {out:?}");
+    assert_eq!(h.core.stats.settles_woken_at_cut, 1);
+}
+
+/// A node-1 settle of a create, forwarded to the holder 2 and backing off
+/// (`Backoff`) after the forward failed; `settle` is whether it is a settle.
+fn op_backing_off(settle: bool) -> (Harness, Rid) {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: h.create("own"),
+        tag: Default::default(),
+    });
+    h.core.clients.get_mut(&rid).expect("in flight").settle = settle;
+    let mut out = Vec::new();
+    h.core.on_forward_failed(h.clk(), rid, &h.meta, &mut out);
+    assert_eq!(
+        h.core.clients[&rid].phase,
+        crate::core::client::Phase::Backoff,
+        "{out:?}"
+    );
+    (h, rid)
+}
+
+/// ADR-64 (round 9, review 3 MUST-2, `sticky-s4-merge` seed 73): a settle of
+/// this node's own backing off between forwards (the fenced root answered
+/// `Busy`) while this node's acquisition wins the lease and opens its view is
+/// resolved then (answered from the log or executed once), as its own
+/// back-off timer would, not left to run past its deadline. Fails on the
+/// parent: the resolver skips `Backoff`; the settle stays.
+#[test]
+fn a_settle_backing_off_is_resolved_when_this_nodes_acquisition_opens_the_view() {
+    let (mut h, rid) = op_backing_off(true);
+    assert!(h.core.clients[&rid].timer.is_some(), "no back-off timer");
+    // (Not yet the holder: nothing resolves it.)
+    let out = h.step(Event::Activity {
+        last_write: WaitMs(0),
+        acked_seqs: Vec::new(),
+    });
+    assert!(replies(&out).is_empty(), "{out:?}");
+    assert_eq!(h.core.stats.settles_backoff_resolved, 0);
+    h.hold(2, None);
+    let out = h.step(Event::Activity {
+        last_write: WaitMs(0),
+        acked_seqs: Vec::new(),
+    });
+    assert_eq!(h.core.stats.settles_backoff_resolved, 1, "{out:?}");
+    assert!(
+        h.core
+            .clients
+            .get(&rid)
+            .is_none_or(|c| c.phase != crate::core::client::Phase::Backoff),
+        "still backing off: {out:?}"
+    );
+}
+
+/// The guard: an op that is not a settle, backing off, is the back-off
+/// timer's (its lost dependencies are checked first), not the resolver's.
+#[test]
+fn a_non_settle_backing_off_is_not_resolved_by_the_acquisition() {
+    let (mut h, rid) = op_backing_off(false);
+    h.hold(2, None);
+    h.step(Event::Activity {
+        last_write: WaitMs(0),
+        acked_seqs: Vec::new(),
+    });
+    assert_eq!(h.core.stats.settles_backoff_resolved, 0);
+    assert_eq!(
+        h.core.clients[&rid].phase,
+        crate::core::client::Phase::Backoff
+    );
+}
+
 /// ADR-64 (R5b, round 8, seed 60): the cut row and the release row of the
 /// subtree arrive in one segment. After the apply the release row has
 /// cleared the cut mark, the keys resolve to the root and are not at the

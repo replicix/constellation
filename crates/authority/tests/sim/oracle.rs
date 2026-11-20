@@ -424,7 +424,7 @@ impl HeldReleases {
         subtrees: &BTreeSet<(u64, u64)>,
         from_ms: u64,
         to_ms: u64,
-    ) -> Option<(u64, NodeId)> {
+    ) -> Option<(u64, NodeId, u64, u64)> {
         self.first_overlap(from_ms, to_ms, |gen, dir| subtrees.contains(&(gen, dir)))
     }
 
@@ -435,7 +435,7 @@ impl HeldReleases {
         gens: &BTreeSet<u64>,
         from_ms: u64,
         to_ms: u64,
-    ) -> Option<(u64, NodeId)> {
+    ) -> Option<(u64, NodeId, u64, u64)> {
         self.first_overlap(from_ms, to_ms, |gen, _| gens.contains(&gen))
     }
 
@@ -444,15 +444,15 @@ impl HeldReleases {
         from_ms: u64,
         to_ms: u64,
         want: impl Fn(u64, u64) -> bool,
-    ) -> Option<(u64, NodeId)> {
+    ) -> Option<(u64, NodeId, u64, u64)> {
         self.spans
             .iter()
             .filter(|((_, gen, dir), _)| want(*gen, *dir))
-            .flat_map(|((node, _, _), spans)| {
+            .flat_map(|((node, gen, dir), spans)| {
                 spans
                     .iter()
                     .filter(move |&&(s, e)| s <= to_ms && e.is_none_or(|e| e > from_ms))
-                    .map(move |&(s, _)| (s, *node))
+                    .map(move |&(s, _)| (s, *node, *gen, *dir))
             })
             .min()
     }
@@ -503,6 +503,12 @@ pub struct S4Span {
     pub cut: bool,
     pub root_blocked: bool,
     pub unshippable: bool,
+    /// When a root appended the span's row (the cut row, or the held
+    /// release's row), if it did by the `EIO`.
+    pub appended: Option<u64>,
+    /// The holder's first run with a root to ship to (itself, or one round
+    /// trip of P2P), if any.
+    pub holder_root: Option<(u64, u64)>,
 }
 
 impl S4Span {
@@ -514,7 +520,7 @@ impl S4Span {
     pub fn describe(&self) -> String {
         format!(
             "{} span of node {} from {} ms: the root judged for the requester over the span: {}; \
-             cut row unshippable: {}",
+             row unshippable: {} (appended by a root: {:?}; the holder's root run: {:?})",
             if self.cut { "cut" } else { "held-release" },
             self.holder,
             self.start,
@@ -523,7 +529,9 @@ impl S4Span {
             } else {
                 "allowed"
             },
-            self.unshippable
+            self.unshippable,
+            self.appended,
+            self.holder_root
         )
     }
 }
@@ -1040,6 +1048,29 @@ impl Oracles {
         (out, born)
     }
 
+    /// Round 9: when a lease holder's table first shows the span's row over
+    /// `[from, to]`: the subtree `dir` of `gen` cut (a cut span), or `gen`
+    /// gone after that holder had it (the release row; a held span's `dir`
+    /// is the whole stream).
+    fn span_row_appended(&self, gen: u64, dir: u64, from: u64, to: u64) -> Option<u64> {
+        let tables = self.tables.lock().unwrap();
+        let mut had: BTreeSet<NodeId> = BTreeSet::new();
+        for (at, h, tb) in tables.iter().filter(|t| t.0 <= to) {
+            let live = tb
+                .iter()
+                .any(|d| d.gen == gen && (dir == 0 || d.dir == dir));
+            let cut = dir != 0 && tb.cut_of(dir).is_some_and(|(_, g)| g == gen);
+            let shown = cut || (!live && had.contains(h));
+            if live && !cut {
+                had.insert(*h);
+            }
+            if shown && *at >= from {
+                return Some(*at);
+            }
+        }
+        None
+    }
+
     /// The `(gen, subtree)` pairs the op's keys resolved to in the holder's
     /// table at any instant of `[from, to]` (the subtrees a cut span must
     /// lie under to tag the op's `EIO`, `HeldReleases::overlaps_subtrees`).
@@ -1159,30 +1190,36 @@ impl Oracles {
             .lock()
             .unwrap()
             .first_gens_overlap(&question_gens(&question), from_ms, at)
-            .map(|(start, holder)| (start, holder, false));
+            .map(|(start, holder, gen, dir)| (start, holder, gen, dir, false));
         let cut_span = self
             .cut_releases
             .lock()
             .unwrap()
             .first_subtree_overlap(&self.op_subtrees(node, rid, from_ms, at), from_ms, at)
-            .map(|(start, holder)| (start, holder, true));
+            .map(|(start, holder, gen, dir)| (start, holder, gen, dir, true));
         let s4_span = held_span
             .into_iter()
             .chain(cut_span)
-            .min_by_key(|&(start, _, _)| start)
-            .map(|(start, holder, cut)| S4Span {
-                start,
-                holder,
-                cut,
-                root_blocked: !self
-                    .reach
-                    .classify(super::reach::Question::new(node, from_ms.max(start), at))
-                    .allowed(),
-                unshippable: cut
-                    && self
+            .min_by_key(|&(start, ..)| start)
+            .map(|(start, holder, gen, dir, cut)| {
+                // Round 9 (review 3, MUST-2): the excuse is a fact, the same on
+                // both arms: no root appended the span's row (the cut row, or
+                // the held release's row) by the `EIO`, and the holder had no
+                // root to ship it to for one round trip over the span.
+                let appended = self.span_row_appended(gen, dir, start, at);
+                let holder_root = self.reach.root_run_for_a_row(holder, start, at);
+                S4Span {
+                    start,
+                    holder,
+                    cut,
+                    root_blocked: !self
                         .reach
-                        .classify(super::reach::Question::new(holder, start, at))
+                        .classify(super::reach::Question::new(node, from_ms.max(start), at))
                         .allowed(),
+                    unshippable: appended.is_none() && holder_root.is_none(),
+                    appended,
+                    holder_root,
+                }
             });
         let release_read_recall = s4_span.as_ref().is_some_and(S4Span::fires);
         let verdict = self.reach.classify(question.clone());
@@ -4424,6 +4461,8 @@ mod tests {
             cut: true,
             root_blocked,
             unshippable,
+            appended: None,
+            holder_root: None,
         };
         assert!(span(true, false).fires());
         assert!(
@@ -4451,7 +4490,7 @@ mod tests {
         let both = BTreeSet::from([(5, 40), (5, 41)]);
         assert_eq!(
             c.first_subtree_overlap(&both, 2_500, 3_500),
-            Some((1_000, 2))
+            Some((1_000, 2, 5, 40))
         );
         assert_eq!(c.first_subtree_overlap(&both, 4_000, 5_000), None);
         // After the cut of 40 ended only 41's counts.
@@ -4844,6 +4883,71 @@ mod tests {
             });
         }
         t
+    }
+
+    /// `rows` as [`table`], then the cut of each `(node, gen, dir)` of `cuts`.
+    fn table_cut(
+        rows: &[(u64, u64, u64)],
+        cuts: &[(u64, u64, u64)],
+    ) -> constellation_meta::delegation::DelegationTable {
+        use constellation_meta::delegation::DelegationRecord;
+        let mut t = table(rows);
+        for &(node, gen, dir) in cuts {
+            t.apply(DelegationRecord::ReleaseCut {
+                node,
+                gen,
+                dirs: vec![dir],
+            });
+        }
+        t
+    }
+
+    /// Round 9 (review 3, MUST-3): "a root appended the span's row" is read
+    /// from the lease holder's table history: a cut snapshot of the subtree
+    /// (a cut span), or the generation gone after that same holder's table
+    /// had it live (the release row; a held span, whose `dir` is `WHOLE`),
+    /// not from a table that never had it.
+    #[test]
+    fn a_span_row_is_appended_when_a_roots_table_shows_the_cut_or_the_release() {
+        let w = world();
+        // Cut spans: the subtree 100 of generation 7 is live at 1 000, cut at
+        // 2 000 and released (gone) at 3 000.
+        w.o.note_table_at(1_000, 1, table(&[(100, 2, 7), (200, 2, 7)]));
+        w.o.note_table_at(
+            2_000,
+            1,
+            table_cut(&[(100, 2, 7), (200, 2, 7)], &[(2, 7, 100)]),
+        );
+        w.o.note_table_at(3_000, 1, table(&[(200, 2, 7)]));
+        assert_eq!(w.o.span_row_appended(7, 100, 1_500, 4_000), Some(2_000));
+        // Not by an EIO before the row, and only from the span's start.
+        assert_eq!(w.o.span_row_appended(7, 100, 1_500, 1_999), None);
+        assert_eq!(w.o.span_row_appended(7, 100, 2_500, 4_000), Some(3_000));
+        // The other subtree of the stream shows no row of its own.
+        assert_eq!(w.o.span_row_appended(7, 200, 1_500, 4_000), None);
+        // A held span (the whole stream): gone only when no subtree is left.
+        assert_eq!(w.o.span_row_appended(7, 0, 1_500, 4_000), None);
+        w.o.note_table_at(3_500, 1, table(&[]));
+        assert_eq!(w.o.span_row_appended(7, 0, 1_500, 4_000), Some(3_500));
+        // A holder whose table never had the generation (a restarted root's
+        // empty or other table) appends nothing.
+        let w = world();
+        w.o.note_table_at(1_000, 4, table(&[(300, 5, 9)]));
+        assert_eq!(w.o.span_row_appended(7, 100, 500, 4_000), None);
+        assert_eq!(w.o.span_row_appended(7, 0, 500, 4_000), None);
+    }
+
+    #[test]
+    fn a_span_row_is_not_appended_by_a_holder_that_never_had_the_generation() {
+        let w = world();
+        // Node 1's table had generation 7 live; node 4's (a successor's, from
+        // a restart) never did, and shows it gone.
+        w.o.note_table_at(1_000, 1, table(&[(100, 2, 7)]));
+        w.o.note_table_at(2_000, 4, table(&[(300, 5, 9)]));
+        assert_eq!(w.o.span_row_appended(7, 100, 500, 4_000), None);
+        // Node 1's own later table, without it, is the release.
+        w.o.note_table_at(3_000, 1, table(&[]));
+        assert_eq!(w.o.span_row_appended(7, 100, 500, 4_000), Some(3_000));
     }
 
     #[test]

@@ -2233,6 +2233,13 @@ pub struct Stats {
     pub deleg_stream_resumes_sent: u64,
     pub deleg_stream_resumes: u64,
     pub deleg_stream_resumes_stale: u64,
+    /// Round 9: every `DelegateStreamResume` a delegate handled, before the
+    /// own/stale split (`deleg_stream_resumes + deleg_stream_resumes_stale`).
+    pub deleg_stream_resumes_received: u64,
+    /// ADR-64 round 9 (review 3, MUST-2): this node's own settles found
+    /// backing off (`Backoff`) when its acquisition opened the view, resolved
+    /// then and not at the back-off timer.
+    pub settles_backoff_resolved: u64,
     /// Plan 46 M0.3 (S1): settles a takeover gate answered on the keys it
     /// owns (a refusal journaled, or a dedup'd outcome), settles it left
     /// `Held` because its journal work was not done yet, and settles of a

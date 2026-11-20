@@ -1905,8 +1905,10 @@ pub struct Report {
     /// Round 6 (review MUST-1), the one predicate on both arms over every
     /// unsettled `EIO` (excused ones included) that overlapped a span:
     /// `[held-release spans, of them the root judged for the requester over
-    /// the span was blocked, cut spans, of them root-blocked, of them with
-    /// the cut row unshippable, root-blocked and unshippable]`.
+    /// the span was blocked, cut spans, of them root-blocked, then over both
+    /// kinds of span the EIOs whose row was unshippable (round 9: no root
+    /// appended the span's row and the holder had no root for one round
+    /// trip), of them root-blocked]`.
     pub s4_pred: [usize; 6],
     /// The cut spans the run saw (`Oracles::cut_releases`), the settles the
     /// roots answered at a cut, the releases that held their note without a
@@ -1936,6 +1938,9 @@ pub struct Report {
     /// `AUTHORITY_SIM_UNSETTLED_ALL` (a sweep prints them, to compare the
     /// verdicts of two classifiers EIO by EIO).
     pub unsettled_all: Vec<String>,
+    /// Round 9: the rid of every unsettled `EIO` (excused ones included), for
+    /// the pins that name one.
+    pub unsettled_rids: Vec<Rid>,
     /// I5: acknowledged, rolled-back ops whose answer was not Lone.
     pub non_lone_rollbacks: usize,
     /// Plan 46 M1.3 step 13: I5's operator branch (see `Findings::i5_operator`).
@@ -1950,6 +1955,10 @@ pub struct Report {
     pub ungated_shadows: u64,
     /// `Stats::settle_frozen_asks` over every incarnation of every node.
     pub settle_frozen_asks: u64,
+    /// Round 9 (review 3): `[deleg_stream_resumes_sent, deleg_stream_resumes,
+    /// deleg_stream_resumes_stale, deleg_stream_resumes_received,
+    /// deleg_inherited]` over every incarnation of every node.
+    pub resume_counts: [u64; 5],
     /// Plan 46 M0.4 (`Meta::unjustified_ships`, every incarnation); must be 0.
     pub unjustified_ships: u64,
     /// Deposition rebuilds run, `(succeeded, failed)`, over every
@@ -2273,6 +2282,20 @@ impl Cluster {
                     + old.view().stats.settle_frozen_asks
             })
             .unwrap_or_default();
+        let resumes_before = self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|old| {
+                let st = old.view().stats;
+                let mut c = *old.shared.resumes_before.lock().unwrap();
+                for (c, n) in c.iter_mut().zip(resume_counts_of(&st)) {
+                    *c += n;
+                }
+                c
+            })
+            .unwrap_or_default();
         let rebuilds = self.nodes.lock().unwrap().get(&id).map(|old| {
             (
                 old.shared
@@ -2307,6 +2330,7 @@ impl Cluster {
             .shared
             .settle_asks_before
             .store(asks_before, std::sync::atomic::Ordering::Relaxed);
+        *handle.shared.resumes_before.lock().unwrap() = resumes_before;
         handle
             .shared
             .unjustified_ships_before
@@ -5731,10 +5755,9 @@ fn count_unsettled(
         let slot = if span.cut { 2 } else { 0 };
         report.s4_pred[slot] += 1;
         report.s4_pred[slot + 1] += usize::from(span.root_blocked);
-        if span.cut {
-            report.s4_pred[4] += usize::from(span.unshippable);
-            report.s4_pred[5] += usize::from(span.unshippable && span.root_blocked);
-        }
+        // (Round 9: the excuse is one predicate on both arms, counted on both.)
+        report.s4_pred[4] += usize::from(span.unshippable);
+        report.s4_pred[5] += usize::from(span.unshippable && span.root_blocked);
         if print_all {
             eprintln!(
                 "SWEEP-S4-EIO seed {seed}: {}{}; tagged {}; {}",
@@ -5827,6 +5850,7 @@ fn count_unsettled(
         }
     }
     report.unsettled_examples = bad.iter().take(5).cloned().collect();
+    report.unsettled_rids = everything.iter().map(|u| u.rid).collect();
     if std::env::var_os("AUTHORITY_SIM_UNSETTLED_ALL").is_some() {
         report.unsettled_all = everything
             .iter()
@@ -8723,6 +8747,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     .load(std::sync::atomic::Ordering::Relaxed)
             })
             .sum::<u64>();
+    for id in cluster.ids() {
+        let n = cluster.get(id);
+        let before = *n.shared.resumes_before.lock().unwrap();
+        let now = resume_counts_of(&n.view().stats);
+        for (i, c) in report.resume_counts.iter_mut().enumerate() {
+            *c += before[i] + now[i];
+        }
+    }
     report.ungated_shadows = report
         .stats
         .values()
@@ -9593,4 +9625,15 @@ mod s4_count_tests {
         );
         assert_eq!(s4_note(&other, &unsettled), "");
     }
+}
+
+/// The counters of `Report::resume_counts`, in order.
+fn resume_counts_of(s: &Stats) -> [u64; 5] {
+    [
+        s.deleg_stream_resumes_sent,
+        s.deleg_stream_resumes,
+        s.deleg_stream_resumes_stale,
+        s.deleg_stream_resumes_received,
+        s.deleg_inherited,
+    ]
 }
