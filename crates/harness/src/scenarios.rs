@@ -9078,7 +9078,11 @@ fn unmount_drain(seed: u64) -> Result<()> {
     let backend = format!("s3://{BUCKET}/unmount-drain-{}", ts());
     let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
     c0.fs_create()?;
-    c0.mount()?;
+    // A write-through `close` waits out an S3 cut like an `fsync` (ADR-66),
+    // and this scenario cannot heal until its write returns: the soft
+    // timeout makes the close answer `EIO` after 2 s (which `fs::write`'s
+    // drop ignores), the data staying pending.
+    c0.mount_view(None, &["--fsync-timeout", "2s"])?;
 
     let data = pattern(seed, 2 * 1024 * 1024);
     let path = c0.mnt.join("f.bin");
