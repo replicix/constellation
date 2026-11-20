@@ -312,28 +312,64 @@ pub struct HandoffStats {
 }
 
 /// A drain's claim on the chunks it uploads ([`UploadRuntime::in_flight`]):
-/// [`Self::land`] tells the drains waiting on a chunk that it is in S3,
-/// and the claim is released when the drain ends, however it ends.
+/// a hash is claimed only once its upload holds a permit ([`Self::claim`]),
+/// [`Self::land`] tells the drains waiting on it that it is in S3, and
+/// [`Self::release`] ends the claim at once when the upload ends without the
+/// chunk in S3, so a waiter goes round again instead of waiting out the
+/// pass. Whatever is still claimed is released when the drain ends, however
+/// it ends.
 struct InFlightClaim<'a> {
     upload: &'a UploadRuntime,
-    landed:
+    landed: std::sync::Mutex<
         std::collections::HashMap<replicix_chunkfmt::ChunkHash, tokio::sync::watch::Sender<bool>>,
+    >,
 }
 
 impl InFlightClaim<'_> {
+    /// Claims `hash` for this pass, or returns the receiver of the drain
+    /// that holds it.
+    fn claim(
+        &self,
+        hash: &replicix_chunkfmt::ChunkHash,
+    ) -> Result<(), tokio::sync::watch::Receiver<bool>> {
+        let mut in_flight = self.upload.in_flight.lock().unwrap();
+        if let Some(outcome) = in_flight.get(hash) {
+            return Err(outcome.clone());
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        in_flight.insert(*hash, rx);
+        self.landed.lock().unwrap().insert(*hash, tx);
+        Ok(())
+    }
+
     fn land(&self, hash: &replicix_chunkfmt::ChunkHash) {
-        if let Some(landed) = self.landed.get(hash) {
+        if let Some(landed) = self.landed.lock().unwrap().get(hash) {
             landed.send_replace(true);
+        }
+    }
+
+    /// Ends this pass's claim on `hash` without the chunk in S3: waiters
+    /// see "not landed" and upload it themselves.
+    fn release(&self, hash: &replicix_chunkfmt::ChunkHash) {
+        let sender = self.landed.lock().unwrap().remove(hash);
+        if sender.is_some() {
+            self.upload.in_flight.lock().unwrap().remove(hash);
+        }
+        // The sender drops last, once the hash is claimable again.
+        drop(sender);
+    }
+
+    fn release_all(&self) {
+        let hashes: Vec<_> = self.landed.lock().unwrap().keys().copied().collect();
+        for hash in hashes {
+            self.release(&hash);
         }
     }
 }
 
 impl Drop for InFlightClaim<'_> {
     fn drop(&mut self) {
-        let mut in_flight = self.upload.in_flight.lock().unwrap();
-        for hash in self.landed.keys() {
-            in_flight.remove(hash);
-        }
+        self.release_all();
     }
 }
 
@@ -916,26 +952,16 @@ async fn upload_dirty_chunks_pass(
         }
         grouped.entry(hash).or_default().push(ino);
     }
-    // Rows another drain is uploading right now are its; this one waits
-    // for that upload below instead of uploading them again.
-    let mut deferred = Vec::new();
-    let mut landed = std::collections::HashMap::new();
-    {
-        let mut in_flight = upload.in_flight.lock().unwrap();
-        grouped.retain(|hash, inos| match in_flight.get(hash) {
-            Some(outcome) => {
-                deferred.push((*hash, std::mem::take(inos), outcome.clone()));
-                false
-            }
-            None => {
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                in_flight.insert(*hash, rx);
-                landed.insert(*hash, tx);
-                true
-            }
-        });
-    }
-    let claim = InFlightClaim { upload, landed };
+    // A hash is claimed only inside its upload future, once it holds a
+    // permit: a hash another drain is uploading right now is its, and this
+    // pass waits for that upload below instead of uploading it again. (A
+    // pass that claimed its whole backlog up front made every other drain
+    // of those chunks wait for the pass to end.)
+    let deferred = std::sync::Mutex::new(Vec::new());
+    let claim = InFlightClaim {
+        upload,
+        landed: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
     let total = grouped.len() as u64;
     let priority = only_ino.is_some() && total <= PRIORITY_DRAIN_CHUNKS;
     if total > 0 {
@@ -963,7 +989,11 @@ async fn upload_dirty_chunks_pass(
         constellation_fs_core::Ino,
     )>::new()));
     let awaiting = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let claim_ref = &claim;
+    let deferred_ref = &deferred;
     let in_flight = futures::stream::iter(grouped.into_iter().map(|(hash, inos)| {
+        let claim = claim_ref;
+        let deferred = deferred_ref;
         let missing_count = missing_count.clone();
         let missing_sample = missing_sample.clone();
         let missing_rows = missing_rows.clone();
@@ -979,6 +1009,12 @@ async fn upload_dirty_chunks_pass(
                 upload.hold.note_deferred();
                 return Ok(None);
             }
+            if let Err(outcome) = claim.claim(&hash) {
+                deferred.lock().unwrap().push((hash, inos, outcome));
+                return Ok(None);
+            }
+            // Whatever ends without the chunk in S3 ends the claim at once.
+            let outcome: Result<Option<_>> = async {
             if fault::lose_chunk(&hash) {
                 tracing::warn!(%hash, "fault injection: dropping a pending chunk from the cache");
                 let _ = cache.remove(&hash);
@@ -1076,6 +1112,12 @@ async fn upload_dirty_chunks_pass(
             }
             upload.record_error(std::time::Instant::now());
             Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
+            }
+            .await;
+            if !matches!(outcome, Ok(Some(_))) {
+                claim.release(&hash);
+            }
+            outcome
         }
     }))
     .buffer_unordered(upload.max_concurrency());
@@ -1175,6 +1217,7 @@ async fn upload_dirty_chunks_pass(
     // records) and a transient error there is retried here, never turned
     // into this caller's error.
     let mut not_landed = false;
+    let deferred = std::mem::take(&mut *deferred.lock().unwrap());
     for (hash, inos, mut outcome) in deferred {
         let landed =
             match tokio::time::timeout(DEFERRED_UPLOAD_WAIT, outcome.wait_for(|landed| *landed))
@@ -1207,7 +1250,7 @@ async fn upload_dirty_chunks_pass(
         if depth >= 3 {
             anyhow::bail!("chunks other drains claimed were still not in S3 after 4 passes");
         }
-        drop(claim);
+        claim.release_all();
         return Box::pin(upload_dirty_chunks_pass(
             cache,
             meta,
@@ -2831,6 +2874,123 @@ pub(crate) mod pending_upload_tests {
         assert!(f.failing.puts() > 3, "the file's drain put the chunk");
         assert_eq!(f.meta.pending_upload_claims(&hash, file).unwrap(), 0);
         assert_eq!(rt().block_on(f.store.get_chunk(&hash)).unwrap(), data);
+    }
+
+    /// A background pass of tens of chunks, each stalled in its PUT, must
+    /// not make an `fsync` drain of another file wait for the pass to end:
+    /// the pass claimed its whole backlog at its start, so the drain found
+    /// its chunk claimed (and untouched, the pass holding the one permit
+    /// elsewhere) and waited up to two minutes on it. A hash is claimed
+    /// only once its upload holds a permit. Fails on the parent: the drain
+    /// does not finish while the pass is stalled.
+    #[test]
+    fn a_drain_is_not_held_behind_a_stalled_background_backlog() {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        // The pass takes its chunks in a hash map's order: when it happens
+        // to upload the drained file's chunk before it stalls there is
+        // nothing to check, and the attempt is repeated.
+        for _ in 0..20 {
+            let f = Arc::new(fixture());
+            let upload = Arc::new(UploadRuntime::for_test_fixed(true, 1));
+            let root = constellation_fs_core::types::ROOT_INO;
+            let stalled: Vec<ChunkHash> = (0..50u8).map(|k| ChunkHash::of(&[k; 4096])).collect();
+            let big = f.meta.create(root, "big", 0o644, 0, 0).unwrap().ino;
+            for (k, hash) in stalled.iter().enumerate() {
+                f.cache
+                    .insert(hash, &[k as u8; 4096], ChunkState::Dirty)
+                    .unwrap();
+                f.failing.hold(hash);
+            }
+            f.meta
+                .set_manifest_dirty(big, None, b"M", 50 * 4096, None, None, &stalled)
+                .unwrap();
+            let (small, small_hash) = enqueue(&f, "small", &[0xb0; 4096]);
+            let checked = rt().block_on(async {
+                let pass = {
+                    let (f, upload) = (f.clone(), upload.clone());
+                    tokio::spawn(async move {
+                        upload_dirty_chunks_background(
+                            &f.cache,
+                            &f.meta,
+                            &f.store,
+                            CompressionSetting::RAW,
+                            &upload,
+                        )
+                        .await
+                    })
+                };
+                until("the pass stalls in a PUT", || f.failing.parked() == 1).await;
+                let checked = !f.meta.pending_uploads_for_ino(small).unwrap().is_empty();
+                if checked {
+                    let drain = spawn_drain(&f, &upload, small);
+                    let done = tokio::time::timeout(BOUND, drain).await;
+                    assert!(
+                        done.is_ok(),
+                        "the drain waited behind the stalled background pass"
+                    );
+                    done.unwrap().unwrap().expect("the small file's drain");
+                    assert!(!pass.is_finished(), "the pass is still stalled");
+                    assert_eq!(f.meta.pending_upload_claims(&small_hash, small).unwrap(), 0);
+                }
+                for hash in &stalled {
+                    f.failing.release(hash);
+                }
+                pass.await.unwrap().unwrap();
+                checked
+            });
+            if checked {
+                return;
+            }
+        }
+        panic!("the pass took the small file's chunk first in every attempt");
+    }
+
+    /// The claimer's PUT of a chunk fails while another of its PUTs is
+    /// still stalled: the pass has not ended, but its claim on the failed
+    /// chunk has, and the drain waiting on it uploads the chunk itself at
+    /// once. Fails on the parent: a failed PUT released nothing and the
+    /// drain waited for the pass to end.
+    #[test]
+    fn a_failed_put_releases_its_claim_before_the_pass_ends() {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let f = Arc::new(fixture());
+        let upload = Arc::new(UploadRuntime::for_test_fixed(true, 2));
+        let (_, stalled) = enqueue(&f, "stalled", &[0x51; 4096]);
+        let (small, hash) = enqueue(&f, "small", &[0x52; 4096]);
+        f.failing.hold(&stalled);
+        f.failing.set_fail_puts(true);
+        rt().block_on(async {
+            let pass = {
+                let (f, upload) = (f.clone(), upload.clone());
+                tokio::spawn(async move {
+                    upload_dirty_chunks_background(
+                        &f.cache,
+                        &f.meta,
+                        &f.store,
+                        CompressionSetting::RAW,
+                        &upload,
+                    )
+                    .await
+                })
+            };
+            until("the pass stalls in a PUT", || f.failing.parked() == 1).await;
+            // The small chunk's three tries (the stalled one counts one).
+            until("the small chunk's PUT has failed", || f.failing.puts() >= 4).await;
+            f.failing.set_fail_puts(false);
+            assert!(!pass.is_finished(), "the pass is still stalled");
+            let drain = spawn_drain(&f, &upload, small);
+            let done = tokio::time::timeout(BOUND, drain).await;
+            assert!(
+                done.is_ok(),
+                "the drain waited for the pass: the failed PUT kept its claim"
+            );
+            done.unwrap().unwrap().expect("the small file's drain");
+            assert_eq!(f.meta.pending_upload_claims(&hash, small).unwrap(), 0);
+            f.failing.release(&stalled);
+            pass.await
+                .unwrap()
+                .expect_err("the pass reports the failed PUT");
+        });
     }
 
     /// The same when the claimer finds the chunk gone from the cache and
