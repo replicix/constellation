@@ -27569,7 +27569,10 @@ mod locks {
     }
 
     /// Node 2 holds the lock, node 3 parked behind it at `t0 + 10` and was
-    /// answered `Waiting` (to re-send in 9.5 s at a 20 s lock ttl); returns
+    /// answered `Waiting` (to re-send in 3.37 s under the 10 s lease, the
+    /// capped push window of 3.87 s less two holds, or in 9.5 s with the
+    /// lease out of the way, at a 20 s lock ttl: uncapped, the configured
+    /// interval); returns
     /// `t0`, node 2's grant and the waiter tick that is armed.
     fn node_3_parked_behind_node_2(h: &mut Harness, ino: Ino) -> (Ms, GrantId, TimerId) {
         let out = request(h, 2, 7, ino, X, true);
@@ -27589,7 +27592,7 @@ mod locks {
                     3,
                     OpId(8),
                     LockOutcome::Waiting {
-                        retry_ms: 9_500,
+                        retry_ms: 3_370 | 9_500,
                         grace: false
                     }
                 )]
@@ -27663,6 +27666,118 @@ mod locks {
         );
         assert!(pushes(&out).is_empty(), "{out:?}");
         assert_eq!(h.core.stats.lock_asked_again, 1);
+    }
+
+    /// A lease-capped root in a takeover grace, a remote waiter parked in it.
+    /// The root tells the waiter to re-send within the window a push has at
+    /// the ttl the root grants (`(min(ttl, cap) - margin) / 2`), not within
+    /// the configured ttl's: with a 15 s lock ttl and a lease that caps the
+    /// grant at 13.5 s the waiter was told 7 s, the push window is 6.25 s,
+    /// and a grace that ended 6.6 s after its last request found that
+    /// request too old: the grace-end timer asked it to ask again and
+    /// served nothing (the harness's `lock-grace-wait`). The lease is
+    /// renewed to 14.5 s before every event, as the root's own renewals do.
+    #[test]
+    fn a_held_waiter_is_told_to_re_send_inside_the_capped_push_window() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 15_000;
+        h.set_lease_end(h.now.plus(14_500));
+        let t0 = h.now;
+        let until = t0.0 + 13_850;
+        h.meta.locks().set_quarantine(WaitMs(until));
+        let mut req = 8;
+        let mut out = request(&mut h, 3, req, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let end = timer_of(&out, TimerKind::LockGraceEnd);
+        // The waiter re-sends as told, every hold and retry, until the grace
+        // would end.
+        loop {
+            let held = timer_of(&out, TimerKind::LockHeldReply);
+            h.advance(250);
+            h.set_lease_end(h.now.plus(14_500));
+            let out_held = h.step(Event::Timer { id: held });
+            let replies = lock_replies(&out_held);
+            let [(3, _, LockOutcome::Waiting { retry_ms, .. })] = replies.as_slice() else {
+                panic!("held reply: {out_held:?}")
+            };
+            assert!(
+                *retry_ms <= 6_250,
+                "inside the push window at the capped ttl: {retry_ms}"
+            );
+            if h.now.0 + *retry_ms as i64 >= until {
+                break;
+            }
+            h.advance(*retry_ms);
+            h.set_lease_end(h.now.plus(14_500));
+            req += 1;
+            out = request(&mut h, 3, req, ino, X, true);
+            assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        }
+        h.now = Ms(until);
+        h.set_lease_end(h.now.plus(14_500));
+        let out = h.step(Event::Timer { id: end });
+        assert_eq!(h.core.stats.lock_asked_again, 0, "{out:?}");
+        let ps = pushes(&out);
+        assert!(
+            matches!(ps.as_slice(), [(3, _, LockOutcome::Granted { .. })]),
+            "served at the grace's end: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_grace_end_serves, 1);
+    }
+
+    /// The cap shortens the interval only where it binds. A root whose lease
+    /// lets it grant the configured ttl keeps the configured interval
+    /// (`(ttl - margin) / 2`: 9.5 s at a 20 s ttl and the 1 s margin); a
+    /// request that ages past the push window there is asked again, as it
+    /// was. Once the lease is short enough to cap the grant, the same waiter
+    /// is told the capped window less two holds.
+    #[test]
+    fn an_uncapped_owner_keeps_the_configured_re_send_interval() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        assert_eq!(grants_to(&out).len(), 1, "node 2 holds: {out:?}");
+        h.advance(10);
+        let held = park(&mut h, 3, 8, ino);
+        h.advance(250);
+        let out = h.step(Event::Timer { id: held });
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(
+                    3,
+                    OpId(8),
+                    LockOutcome::Waiting {
+                        retry_ms: 9_500,
+                        grace: false
+                    }
+                )]
+            ),
+            "the configured interval: {out:?}"
+        );
+        // The lease shortens until it caps the grant: 9.74 s of it left as
+        // the reply is made, a cap of 8.74 s, a push window of 3.87 s less
+        // two holds (as `node_3_parked_behind_node_2` under its 10 s lease).
+        h.advance(9_500);
+        h.set_lease_end(h.now.plus(9_990));
+        let held = park(&mut h, 3, 9, ino);
+        h.advance(250);
+        let out = h.step(Event::Timer { id: held });
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(
+                    3,
+                    OpId(9),
+                    LockOutcome::Waiting {
+                        retry_ms: 3_370,
+                        grace: false
+                    }
+                )]
+            ),
+            "the capped window less two holds: {out:?}"
+        );
     }
 
     /// An asked waiter that does not ask again is passed over after two

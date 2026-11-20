@@ -16346,14 +16346,17 @@ fn capped_grants_hand_a_lock_over_within_a_round_trip() {
         |s| s.lock_asks_answered,
     ];
     // (label, config, seeds, heavy: nine ops on a file, asked: an ask is
-    // expected in these seeds)
+    // expected in these seeds; the delegated single-op config none now: a
+    // waiter told to re-send inside the capped push window is never too old
+    // to push, which three of its 40 seeds were before; the heavy ones still
+    // ask, 533 and 818 times before and 60 and 23 after)
     for (label, cfg, seeds, heavy, asked) in [
         (
             "locks-delegated-production-ttl+nomove",
             config_variant(locks_delegated_production_ttl_config(), "nomove"),
             0..40,
             false,
-            true,
+            false,
         ),
         (
             "locks-production-ttl",

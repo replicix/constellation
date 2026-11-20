@@ -1753,20 +1753,109 @@ fn counter_turn(path: PathBuf, start_after: Duration) -> Result<(Instant, Instan
     Ok((acquired, unlocked, took))
 }
 
+/// A paused daemon, thawed when this goes out of scope (an early return
+/// must not leave it stopped).
+struct Frozen<'a> {
+    client: &'a Client,
+    stopped: bool,
+}
+
+impl<'a> Frozen<'a> {
+    fn new(client: &'a Client) -> Result<Self> {
+        client.pause()?;
+        Ok(Self {
+            client,
+            stopped: true,
+        })
+    }
+
+    /// Thaw it now.
+    fn thaw(&mut self) -> Result<()> {
+        self.stopped = false;
+        self.client.resume()
+    }
+}
+
+impl Drop for Frozen<'_> {
+    fn drop(&mut self) {
+        if self.stopped {
+            let _ = self.client.resume();
+        }
+    }
+}
+
+/// What the stale-waiter round of `lock-contention-delegated` measured.
+struct StaleRound {
+    /// When the lone waiter was thawed, and when it was granted.
+    resumed: Instant,
+    acquired: Instant,
+    /// The delegate's `asked_again` before and after the round.
+    asked_before: u64,
+    asked_after: u64,
+}
+
+/// A waiter that did not re-send: node b holds the lock for `hold`, node c
+/// asks for it 300 ms in (as `counter_turn` does), and 500 ms later c's
+/// daemon is stopped, to be thawed 500 ms after b's unlock. Frozen, c cannot
+/// re-send its request, so at the unlock it is older than the push window of
+/// the capped grant and b must ask it again rather than push to it.
+fn stale_waiter_round(clients: &[Client], hold: Duration) -> Result<StaleRound> {
+    use std::os::unix::fs::FileExt;
+    let asked =
+        |c: &Client| -> Result<u64> { Ok(locks_of(c)?["asked_again"].as_u64().unwrap_or(0)) };
+    let asked_before = asked(&clients[1])?;
+    let hf = open_rw(&clients[1].mnt.join("d1/counter"))?;
+    let locked_at = Instant::now();
+    flock(&hf, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("holder flock: {e}"))?;
+    let path = clients[2].mnt.join("d1/counter");
+    let waiter = std::thread::spawn(move || counter_turn(path, Duration::from_millis(300)));
+    std::thread::sleep(Duration::from_millis(800));
+    let mut frozen = Frozen::new(&clients[2])?;
+    std::thread::sleep(hold.saturating_sub(locked_at.elapsed()));
+    {
+        let mut buf = [0u8; 8];
+        let got = hf.read_at(&mut buf, 0)?;
+        let cur = if got == 8 { u64::from_be_bytes(buf) } else { 0 };
+        hf.write_at(&(cur + 1).to_be_bytes(), 0)?;
+        hf.sync_all()?;
+    }
+    flock(&hf, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("holder unlock: {e}"))?;
+    drop(hf);
+    std::thread::sleep(Duration::from_millis(500));
+    let resumed = Instant::now();
+    frozen.thaw()?;
+    let (acquired, _, _) = waiter.join().expect("counter turn")?;
+    Ok(StaleRound {
+        resumed,
+        acquired,
+        asked_before,
+        asked_after: asked(&clients[1])?,
+    })
+}
+
 /// Three nodes at the default lock TTL (20 s) and a delegation TTL of 5 s
 /// (the core's default; the daemon's is the lock TTL: see `DELEG_TTL_MS`)
 /// contend for one `flock`ed counter in a directory delegated to node b,
-/// whose grants a 2 to 3 s delegation caps, while a waiter re-sends its
-/// request every 9.5 s. Each round one node holds the lock for 4 s (an
-/// application doing its work under it: a `git commit`), the other two ask
-/// for it a third of a second after it, and every node increments once. A
-/// grant pushed to a waiter whose request was seconds old reached it lapsed,
-/// was recalled by the waiter behind it and outwaited: the waiters got the
-/// lock seconds after the holder let go (sim `locks-delegated-production-ttl`:
-/// 14 of 300 seeds never got a lock in a minute). Now the owner asks such a
-/// waiter to send its request again and grants over it (plan 43 "ask
-/// again"): the lock changes hands within `MEDIAN_GAP` of the unlock at the median
-/// and `MAX_GAP` at most, the count is exact, and b asked (`asked_again`). Prints each handoff's gap, the
+/// whose grants a 2 to 3 s delegation caps, while a held waiter is told to
+/// re-send its request within the push window of that capped grant
+/// (`on_lock_held_reply_timer`; it was every 9.5 s, which a push from a
+/// request seconds old did not fit). Each round one node holds the lock for
+/// 4 s (an application doing its work under it: a `git commit`), the other
+/// two ask for it a third of a second after it, and every node increments
+/// once. A grant pushed to a waiter whose request was seconds old reached it
+/// lapsed, was recalled by the waiter behind it and outwaited: the waiters
+/// got the lock seconds after the holder let go (sim
+/// `locks-delegated-production-ttl`: 14 of 300 seeds never got a lock in a
+/// minute). Now the waiters re-send in time and are rarely stale: the lock
+/// changes hands within `MEDIAN_GAP` of the unlock at the median and
+/// `MAX_GAP` at most, and the count is exact. One more round has a waiter that
+/// does not re-send (plan 43 "ask again"): b holds, only c waits, and c's
+/// daemon is stopped across b's unlock. Its request is then too old to be
+/// pushed to, so b asks it again (`asked_again` rises), and c is granted
+/// within `MAX_GAP` of its thaw. That round's freeze is the harness's own
+/// and excuses only its own gap, measured from the thaw; its gap is kept out
+/// of the other rounds' checks. Skipped at the daemon's default delegation
+/// TTL (17 s caps: nothing is asked there). Prints each handoff's gap, the
 /// waits' distribution and the owner's `asked_again`, `ask_again_passed_over`,
 /// `reserved_waits` and `recalls_expired`.
 pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
@@ -1860,13 +1949,27 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
                 &gaps[gaps.len() - turns.len()..]
             );
         }
+        let rounds_end = Instant::now();
+        // The waiter that does not re-send (not in the gaps above).
+        let stale = if at_default {
+            None
+        } else {
+            let r = stale_waiter_round(&clients, HOLD)?;
+            eprintln!(
+                "    {NAME}: stale-waiter round: asked_again {} -> {}, c granted {:?} after its thaw",
+                r.asked_before,
+                r.asked_after,
+                r.acquired.saturating_duration_since(r.resumed)
+            );
+            Some(r)
+        };
         let longest = gaps.iter().max().copied().unwrap_or_default();
         eprintln!(
             "    {NAME}: handoff gaps (unlock to the next grant) {}; waits behind the 4 s hold {}",
             super::m8::dist(gaps.clone()),
             super::m8::dist(waits)
         );
-        let expected = 3 * ROUNDS as u64;
+        let expected = 3 * ROUNDS as u64 + if stale.is_some() { 2 } else { 0 };
         let got = read_counter(&clients[0].mnt.join("d1/counter"))?;
         let b = locks_of(&clients[1])?;
         let g = |k: &str| b[k].as_u64().unwrap_or(0);
@@ -1897,7 +2000,7 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
         let median = sorted[sorted.len() / 2];
         crate::hostlag::latency_bound_over(
             &format!("{NAME}: the median handoff gap"),
-            (started, Instant::now()),
+            (started, rounds_end),
             median,
             Duration::from_millis(5),
             MEDIAN_GAP,
@@ -1906,7 +2009,7 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
         // judged against the host-lag probe like the median.
         crate::hostlag::latency_bound_over(
             &format!("{NAME}: the longest handoff gap"),
-            (started, Instant::now()),
+            (started, rounds_end),
             longest,
             Duration::from_millis(100),
             MAX_GAP,
@@ -1928,10 +2031,27 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
                 lag.max
             ));
         }
-        anyhow::ensure!(
-            at_default || g("asked_again") > 0,
-            "the delegate never asked a stale waiter to ask again: the scenario did not exercise the rule"
-        );
+        // The stale waiter: b asked it again, and it was granted within
+        // `MAX_GAP` of its thaw, judged against the host-lag probe from
+        // there (the freeze is the harness's own, and excuses nothing else:
+        // the `recalls_expired` check above does not look at it).
+        if let Some(r) = &stale {
+            anyhow::ensure!(
+                r.asked_after > r.asked_before,
+                "the delegate never asked the stale waiter to ask again (asked_again {} -> {}): the \
+                 scenario did not exercise the rule",
+                r.asked_before,
+                r.asked_after
+            );
+            let gap = r.acquired.saturating_duration_since(r.resumed);
+            crate::hostlag::latency_bound_over(
+                &format!("{NAME}: the stale waiter's grant after its thaw"),
+                (r.resumed, r.acquired.max(r.resumed)),
+                gap,
+                Duration::from_millis(100),
+                MAX_GAP,
+            )?;
+        }
         Ok(())
     })();
     if result.is_err() {

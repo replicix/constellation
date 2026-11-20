@@ -2222,9 +2222,14 @@ impl Core {
         // request it answers, and its holder renews it at `(ttl - margin)
         // / 2` into that window (`renew_point`), so it must reach the
         // holder before then: from a request no older than that. A
-        // waiter re-sends every `(lock_ttl - margin) / 2` (9.5 s at the
-        // defaults) and a delegate (or a lease-capped root) grants for what
-        // is left of its authority, about 2 to 3 s: a push served from a
+        // waiter is told to re-send within that window for the ttl granted
+        // now, less the hold and a round trip, where a cap binds the ttl
+        // (`on_lock_held_reply_timer`; it was `(lock_ttl - margin) / 2`,
+        // 9.5 s at the defaults, which a capped grant's window is not), and
+        // every `(lock_ttl - margin) / 2` otherwise, so that a request which
+        // ages past the window there is asked again. A delegate (or a
+        // lease-capped root)
+        // grants for what is left of its authority, about 2 to 3 s: a push served from a
         // request seconds old arrived lapsed (the holder drops those: see
         // `lock_op_outcome`) and asked again behind the next waiter's
         // recall, or the owner's record of it was expired when made (the
@@ -3160,16 +3165,50 @@ impl Core {
 
     /// A waiter's RPC has been held long enough: answer `Waiting` (the
     /// requester re-sends; the grant is pushed if it comes first).
-    pub(crate) fn on_lock_held_reply_timer(&mut self, wid: u64, out: &mut Vec<Action>) {
-        // Re-sent well inside the window a grant served from the re-send
-        // would have (`ttl - margin` from its arrival): a waiter silent
-        // for that long is skipped (`lock_serve_waiters`).
-        let retry_ms = (self
+    pub(crate) fn on_lock_held_reply_timer(
+        &mut self,
+        now: Now,
+        wid: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        // Re-sent well inside the window a push served from the re-send
+        // has (`lock_try_grant`'s ask-again rule: `(ttl - margin) / 2`
+        // from the request, for the ttl the owner grants *now*, cut to
+        // its authority's end). The configured ttl is not that one at a
+        // lease-capped root or a delegate: a waiter told to re-send by
+        // it had a request too old for a timer push (the grace's end, a
+        // release) and was asked again instead of served. Less the time
+        // the request was held and a round trip (two `recall_hold_ms`),
+        // the request a waiter last sent is then never older than the
+        // push window when its turn comes.
+        //
+        // Only where the cap binds (`cap < lock_ttl`): an owner that grants
+        // the configured ttl keeps the configured interval, its schedule
+        // unchanged (a request that ages past the window there by the hold
+        // and a round trip is asked again, as before; `lock_try_grant`).
+        let uncapped = (self
             .cfg
             .lock_ttl_ms
             .saturating_sub(self.cfg.expiry_margin_ms)
             / 2)
         .max(50);
+        let cap = self.lk.waiters.iter().find(|w| w.id == wid).and_then(|w| {
+            match self.lock_route_answering(now, w.ino, replica, w.node, false) {
+                Route::Me { cap_ms, .. } => Some(cap_ms),
+                _ => None,
+            }
+        });
+        let retry_ms = match cap {
+            Some(cap) if cap < self.lock_ttl_ms() => {
+                let window = (cap - self.lock_margin_ms()) / 2;
+                let slack = 2 * self.cfg.recall_hold_ms as i64;
+                u64::try_from((window - slack).max(50))
+                    .unwrap_or(50)
+                    .min(uncapped)
+            }
+            _ => uncapped,
+        };
         // A waiter this owner cannot push to is granted only over a
         // request of its own: it asks again at once, so one is held here
         // nearly all the time.

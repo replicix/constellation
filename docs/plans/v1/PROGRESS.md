@@ -71276,3 +71276,48 @@ Open item (placement): a node's covered top subtree masks its other dominated su
   `--workspace --all-targets -D warnings` clean; lib tests meta (`--features test-util`), engine, authority (+ `meta_repro`) and model in debug
   (808 / 1003 / 1789 / 300 passed) and release (807 / 1003 / 1789 / 185 passed), 0 failed; release sim suite 589 passed, 0 failed, 16 ignored;
   `tools/sim-determinism-gate.sh` defaults (300 seeds, 8 labels, 2 vs 16 threads): identical. Not done: ADR-20 sentence (review NIT 5, optional).
+
+### A held lock waiter is told to re-send inside the push window a capped owner enforces (lockre, 2026-11-20)
+
+Harness `lock-grace-wait` failed intermittently (also on the tree before the O2 and D11 landings): the successor's
+`LockGraceEnd` timer asked the parked remote waiter to ask again instead of serving it (`grace_end_serves` 0).
+- **Cause:** `on_lock_held_reply_timer` told a held waiter to re-send after `(lock_ttl - m) / 2` of the configured TTL
+  (7.0 s at 15 s), but `lock_try_grant` pushes only from a request younger than `(min(lock_ttl, cap) - m) / 2`, and a
+  freshly taken-over root's cap is the lease left (about 6.3 s window). A last request aged between the two failed the
+  push. No safety or liveness loss: the waiter was granted one round trip later.
+- **Fix (`core/locks.rs`), where the cap binds only:** when the route is `Route::Me { cap_ms }` with `cap_ms <
+  lock_ttl`, the re-send interval is `(cap - m) / 2` less two `recall_hold_ms` (the hold and a round trip), at least 50
+  ms and at most the configured interval; an owner that grants the configured ttl keeps `(lock_ttl - m) / 2` (a request
+  that ages past the window there is asked again, as before). The push rule, the unreachable-node branch, D8 and the ADRs
+  are unchanged. (The first form of the fix, lockre, shortened it everywhere: it moved the uncapped schedules, 8 sim
+  pins and the `locks-unlinked-delegated-blips+unsettled` ceiling's measure; the cap-only form leaves them.)
+- **Fail-before:** `a_held_waiter_is_told_to_re_send_inside_the_capped_push_window` (a lease-capped root in a grace, a
+  waiter re-sending as told, the grace ending 6.6 s after its last request under the old cadence) fails on main (told
+  7,000 ms against a 6,250 ms window; with that assertion removed the grace-end timer asks again and serves nothing);
+  `an_uncapped_owner_keeps_the_configured_re_send_interval` (9,500 ms uncapped at a 20 s ttl, 3,370 ms once the lease caps
+  the grant) fails on main in its capped half.
+- **Sim pins:** main's `tests/sim.rs` unchanged except `capped_grants_hand_a_lock_over_within_a_round_trip`, whose
+  delegated single-op config (a capped delegate) no longer expects an ask (told in time: 0 asks in 40 seeds against 3);
+  the heavy configs still ask. No m03 change: `locks-unlinked-delegated-blips+unsettled` keeps `with_margin(0)` = 2
+  (1 allowed in seeds 0..99 on main and here; the CEILING lines are identical to main's, 38 of 38).
+- **Harness:** `lock-contention-delegated` no longer requires `asked_again > 0` over all rounds (the waiters now
+  re-send in time under the capped grants). It gains a round with a waiter that does not re-send: b holds, only c waits,
+  c's daemon is stopped 0.5 s after its request and thawed 0.5 s after b's unlock; `asked_again` must rise, c must get
+  the lock within `MAX_GAP` of the thaw and the counter is `3 * ROUNDS + 2`. The freeze excuses that round's own gap only
+  (measured from the thaw; the other rounds' median and max, and the `recalls_expired` check, are unchanged). Skipped at
+  the default delegation TTL. Fail-before: with c not stopped, `asked_again` does not rise.
+- **Measured (fresh per-tree builds of main a313f1db and this change):**
+  - 104 `locks*` labels, 2,000 seeds each: 103 have identical failing sets; `locks-late-stale-mirror-naive` (a mutant
+    control) fails 40 seeds instead of 43, a strict subset (688, 1582, 1987 no longer fail). The standing failures repeat
+    exactly (`locks-core-stall-backup-long*` and the own-clock label).
+  - `locks-unlinked-delegated-blips+unsettled`, 0..10,000: 51 allowed unsettled EIOs on both arms (1 in seeds 0..99 on both),
+    20 I4-failing seeds against main's 21 (the ADR-58 residual class).
+  - Harness (quiet box, 5 runs each): `lock-grace-wait` 5 of 5 and `lock-contention-delegated` 5 of 5 on this change
+    (stale round: `asked_again` 0 to 1, c granted 1.6 to 84 ms after its thaw), both 5 of 5 on main (whose scenario has no
+    stale round). On a loaded box lockre measured `lock-grace-wait` 3 of 15 (the EINTR-margin check, also on main).
+    With the freeze stubbed out the new round fails (`asked_again` 0 to 0). The other `lock*` scenarios pass once each
+    (not `lock-device-stall-lone-node` and `lock-xcheckfs-cell`, which need a device-mapper device and an xcheckfs script).
+- **Gates:** fmt, `clippy --workspace --all-targets -D warnings` clean; lib tests meta (`--features test-util`), authority
+  (+ `meta_repro`), engine, model and harness in debug and release, 0 failed; release sim suite 589 passed, 0 failed, 16
+  ignored; m03 passes with the 38 CEILING lines identical to main's; `tools/sim-determinism-gate.sh` defaults: 8 labels x
+  300 seeds identical at 2 and 16 threads.

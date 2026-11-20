@@ -4519,7 +4519,7 @@ impl Core {
             Timer::DelegLapse(gen) => self.on_deleg_lapse(now, gen, replica, out),
             Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, replica, out),
             Timer::LockRetry(op) => self.on_lock_retry(now, op, replica, out),
-            Timer::LockHeldReply(w) => self.on_lock_held_reply_timer(w, out),
+            Timer::LockHeldReply(w) => self.on_lock_held_reply_timer(now, w, replica, out),
             Timer::LockGrantExpiry(id) => self.on_lock_grant_expiry(now, id, replica, out),
             Timer::LockRenewTick => self.on_lock_renew_tick(now, replica, out),
             Timer::LockReleaseWait(ino, grant) => {
