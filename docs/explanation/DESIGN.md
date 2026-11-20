@@ -701,7 +701,11 @@ matter here:
   inode is a point get and a seek at that name, not a scan over the
   tombstones that unlinked names left. Local derived state like
   `xattr_by_name`, not published or journaled: it is maintained in the `ns`
-  funnel, in the transaction of the name write
+  funnel, in the transaction of the name write. A bootstrap writes the rows
+  from the key-ordered cursor, on a second thread, and a `bootstrapping`
+  marker in `local` (set before the first ingested page, removed with the
+  derived state) makes a store whose bootstrap never finished refuse to open;
+  the node removes it and bootstraps again
   ([ADR-42](DECISIONS.md#adr-42-a-takeover-gate-whose-journal-work-is-done-serves-the-generations-it-inherits)).
 - `journal` and `journal_tx`: the local operations not yet in the log,
   with one row per transaction (where it ends, its op and rid, its epoch).
