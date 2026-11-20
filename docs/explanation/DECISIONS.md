@@ -6553,6 +6553,16 @@ tagged), and `sticky-s4-merge`, `sticky-s4-suspend`, `delegated-strict`, `sticky
 negative controls still fire: merge 13 and 14, suspend 51 and 51). The `+unsettled` lanes keep their untagged I4 seeds of earlier rounds
 (merge now also 73, 1191, 1234, by schedule: the same class, a short reachable span, no tag).
 
+**Evidence, round 9.** The excuse of the S4 tag is one predicate on both arms: an `EIO` under a span is excused as "row unshippable"
+only if no root appended the span's row by the `EIO` and the holder had no root to ship it to for one round trip; both facts are
+printed per `EIO`. The harness reads "appended" from the lease holder's table history, which keeps a table only when its signature
+changes, so a cut that arrives alone is not recorded yet (it shows once the release row changes the set); recording it is a follow-up
+of the harness, and with it repaired no verdict of the three lanes changed (a prototype, 2,000 seeds each). On the fix, 2,000 seeds:
+`sticky-s4-root-restart` 906 `EIO`s (round 7: 923), 0 tagged; `sticky-s4-suspend` 675 (675); `sticky-s4-merge` 186 against round 7's
+185, and on 6,000 seeds 539 against 543 (22 seeds worse, 27 better, sign test p = 0.57), 0 tagged against 2. The negative controls
+fire: root-restart 250 (cut row withheld) and 11 (cut ignored), merge 14 and 14, suspend 51 and 51. The table was built on a313f1db;
+the root-restart fix arm was re-verified identical on bb97ccc6 and the merge confirmation was run there.
+
 **Rejected**: the message form (`DelegCut`, unordered with the rows); bounding
 the hold (D11', releases merge without bound); un-merging held notes (the
 s4bound study); closing S4 on evidence (the maintainer, 2026-11-18).

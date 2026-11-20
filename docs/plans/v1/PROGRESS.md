@@ -71682,9 +71682,13 @@ polled segment too) is kept with its cost (ADR-64). No timer, window, ceiling of
 | `delegated-strict`, `sticky-leave`, `sticky-holder-restarts-placed` | 0, 0, 0 | | | | | |
 
 `sticky-s4-root-restart`: 597 of the 906 `EIO`s fall in 19 to 20 s (round 7: 597; the control 590), 185 in 20 to 21.5 s. The fix arm is at
-or below round 7 and the control on every lane in total `EIO`s (root-restart 906 against 923 and 1,162; the round-8 tree's 1,170 was
-the spurious wake of F2a/F2b). Every failing seed on the fix arm is untagged: 287 and 1537 (round 6 classes), 1191 (F1's schedule). Both
-negative controls fire on all three plain lanes (11 to 14 tagged seeds on root-restart and merge, 51 on suspend).
+or below round 7 and the control in total `EIO`s on root-restart (906 against 923 and 1,162; the round-8 tree's 1,170 was the spurious
+wake of F2a/F2b) and on suspend (675 against 675). On merge it is not below round 7 in 2,000 seeds (186 against 185); the 6,000-seed
+confirmation below finds no difference in either direction (539 against 543). Every failing seed on the fix arm is untagged: 287 and 1537
+(round 6 classes), 1191 (red on both arms, review 3). Both negative controls fire on all three plain lanes: root-restart 250 tagged seeds
+with the root's restart withheld and 11 with the cut ignored, merge 14 and 14, suspend 51 and 51. The 2,000-seed table was built on
+a313f1db; the root-restart fix arm was re-verified identical on bb97ccc6 (906 `EIO`s, 0 tagged) and the merge confirmation was run on
+bb97ccc6. The suspend and negative-control cells were not re-run on bb97ccc6.
 
 **Merge-lane confirmation, 6,000 seeds, one main (bb97ccc6).** Plain `sticky-s4-merge`, seeds 0 to 5,999, fix arm (this tip) against the
 round-7 tree rebuilt on the same main (fresh builds, `AUTHORITY_SIM_S4_EIO=1`). Per 1,000 seeds, fix / round 7 (unsettled `EIO`s, of them

@@ -4750,8 +4750,9 @@ resolved when this node's own acquisition opens its view (core tests
 `settles_backoff_resolved > 0`). The excuse of the S4 tag is a fact, one predicate on both
 arms: an `EIO` under a span (held-release or cut) is excused as "row unshippable" only if no
 root appended the span's row by the `EIO` (`Oracles::span_row_appended`, read from the lease
-holder's table history: the cut snapshot, or the generation gone after that same holder's table
-had it live) and the holder had no root to ship it to for one round trip
+holder's table history: the generation gone after that same holder's table had it live; the
+history keeps a table only when its signature changes, so a cut that arrives alone is not recorded
+yet and a cut-only span reads as "not appended", a follow-up of the harness) and the holder had no root to ship it to for one round trip
 (`Reach::root_run_for_a_row`: itself, or the root in force for `min_p2p_ms`). Each excuse
 prints both facts (`appended by a root`, `the holder's root run`) in the `SWEEP-S4-EIO` line;
 unit tests `a_span_row_is_appended_when_a_roots_table_shows_the_cut_or_the_release`,

@@ -21918,7 +21918,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // in seeds 0..99); never raised for a count the ceiling already saw:
     // delegated-backup-and-delegate-die's allowed ceiling was set while its
     // runs that end waiting for a group's tail counted nothing)
-    let ceilings: [(&str, Config, usize, usize); 21] = [
+    let ceilings: [(&str, Config, usize, usize); 19] = [
         ("backup-strict", backup_strict_config, 0, 0),
         ("backup-two", backup_two_config, 0, 0),
         // (Allowed 0 to 26: the runs that end with a root waiting for a
@@ -22052,24 +22052,6 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             0,
         ),
         ("placement-hot", placement_hot_config, 0, 0),
-        // (ADR-64 round 9, 2026-11-20, fix tree of round 9, the `+unsettled`
-        // form of each label (`strict_settle` and `strict_unsettled`): seeds
-        // 0..99 measure 0 violations and 2 allowed (isolated) in each. In 2,000
-        // seeds `sticky-s4-merge+unsettled` has the untagged I4 seeds of
-        // `PROGRESS` (round 9 section); `sticky-s4-root-restart+unsettled`
-        // fails 287 only (round 8). The ceilings only go down.)
-        (
-            "sticky-s4-merge+unsettled",
-            sticky_s4_merge_unsettled_config,
-            0,
-            2,
-        ),
-        (
-            "sticky-s4-root-restart+unsettled",
-            sticky_s4_root_restart_unsettled_config,
-            0,
-            2,
-        ),
     ];
     // ADR-58's `held-behind-lost-chunk` has a column of its own (a row that
     // waits behind a chunk that exists nowhere: allowed, checked against the
@@ -22101,7 +22083,15 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // (`delegated-long-delegation-prod` joins at 0 and 0: seed 54 of 0..99
     // failed I4 before (7 seeds of 2,000 did, an own settle that the inbox
     // rule sent back for ever); fixed, 0 of 2,000.)
-    let exact_strict: [(&str, Config, usize, usize); 2] = [
+    // (ADR-64 round 9, 2026-11-20, fix tree of round 9: the two sticky-s4
+    // entries are the `+unsettled` form of each label (`strict_settle` and
+    // `strict_unsettled`), seeds 0..99 measuring 0 violations and 2 allowed
+    // (isolated) in each, no margin. `strict_unsettled` fails a seed on a
+    // violation before it is counted, so the violations ceiling is 0 in
+    // effect. In 2,000 seeds `sticky-s4-merge+unsettled` has the untagged I4
+    // seeds of `PROGRESS` (round 9 section); `sticky-s4-root-restart+unsettled`
+    // fails 287 only (round 8). The ceilings only go down.)
+    let exact_strict: [(&str, Config, usize, usize); 4] = [
         (
             "locks-blips-tight-single",
             locks_blips_tight_single_config,
@@ -22113,6 +22103,13 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
             delegated_long_delegation_prod_config,
             0,
             0,
+        ),
+        ("sticky-s4-merge", sticky_s4_merge_unsettled_config, 0, 2),
+        (
+            "sticky-s4-root-restart",
+            sticky_s4_root_restart_unsettled_config,
+            0,
+            2,
         ),
     ];
     const SEEDS: u64 = 100;
