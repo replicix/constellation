@@ -755,6 +755,73 @@ fn an_unexpected_ungated_wait_is_counted_and_resubmitted() {
     assert_eq!(session.stats().fast_acks_downgraded, 0);
 }
 
+/// A holder's close whose published class (`Final`, an epoch hold, the gate
+/// off) was neither a group's nor a singleton's when the flush decided what
+/// to keep, but whose node may no longer answer alone by the time the row is
+/// waited for (a continuation epoch closed): the wait comes back in doubt.
+/// The close re-commits through the core from the inputs it kept and
+/// returns `Ok`. Fails on the parent: no inputs were kept for such a row,
+/// and the close returned `EIO` (and an `fsync` around it did not retry).
+#[test]
+fn an_in_doubt_close_without_a_gated_class_recommits_through_the_core() {
+    use constellation_meta::RowCommit;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let session = meta.session();
+    session.set_durable(false, u64::MAX, false, RowCommit::FINAL, false);
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    fs.do_write(file.ino, 0, b"small file").unwrap();
+    let mut forwarded = Vec::new();
+    std::thread::scope(|scope| {
+        let close = scope.spawn(|| fs.flush_inode(file.ino, false));
+        let started = std::time::Instant::now();
+        loop {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => reply.send(Ok(())).unwrap(),
+                Ok(SyncRequest::Submit {
+                    op,
+                    reply,
+                    in_doubt,
+                    ..
+                }) => {
+                    forwarded.push((op, in_doubt));
+                    reply
+                        .send(constellation_authority::ClientReply::Outcome(
+                            constellation_meta::MutateOutcome::Accepted {
+                                epoch: 1,
+                                records: Vec::new(),
+                            },
+                        ))
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(_) if close.is_finished() => break,
+                Err(_) => {
+                    assert!(
+                        started.elapsed() < LIVENESS_DEADLINE,
+                        "the close is stuck: {forwarded:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        close
+            .join()
+            .unwrap()
+            .expect("the in-doubt close re-commits");
+    });
+    assert!(
+        session.stats().ungated_unexpected >= 1,
+        "the wait was in doubt"
+    );
+    assert!(
+        forwarded
+            .iter()
+            .any(|(op, _)| matches!(op, constellation_meta::MutateOp::SetManifest { .. })),
+        "the manifest went through the core: {forwarded:?}"
+    );
+}
+
 /// Plan 43 C2f review (D5): the core published that this node may no longer
 /// answer alone (a release, a handoff, a deposition: published before the
 /// replica stops being the holder's), while the engine's lease mirror still

@@ -1273,28 +1273,19 @@ impl View {
             // Plan 30 §M9: under a durability gate the commit is
             // acknowledged (the close returns) only once its row is
             // durable, as `execute_mutate`'s fast path does; an in-doubt
-            // outcome re-commits through the core, so keep the inputs.
+            // outcome re-commits through the core, so the inputs are kept.
             //
             // Plan 43 C1-2: whether to wait is the committed row's own class
-            // (as `execute_mutate`'s fast path); `gated` only says whether
-            // the inputs are kept for the in-doubt re-commit. A gate that
-            // came on between the two leaves a gated row without them: it
-            // is waited for all the same, and an in-doubt outcome there
-            // fails the close (the staged state is kept; the caller retries)
-            // rather than acknowledging a row nothing holds.
-            let gated = admitted.is_some()
-                && self.sync.as_ref().is_some_and(|h| {
-                    h.lease.ack_gated() || self.meta.session().published_class().gated()
-                });
-            // ADR-52: a singleton's row whose lease ran out under the commit
-            // is in doubt too (`FastAck::InDoubt`) and re-commits through
-            // the core like a gated one; so the inputs are kept while the
-            // published class is a singleton's (a clone of what the commit
-            // consumes, paid only on a time-bounded lone root).
-            let keeps_inputs = gated
-                || (admitted.is_some()
-                    && self.sync.is_some()
-                    && self.meta.session().published_class().is_singleton());
+            // (as `execute_mutate`'s fast path).
+            // The inputs are kept for every commit this flush made under the
+            // lease (holder path with a sync handle): the durability wait can
+            // come back in doubt whatever the class was when the commit was
+            // journaled — a gate that came on, a singleton's lease that ran
+            // out, or a continuation epoch that closed under the wait
+            // (`write_gate`'s `Unexpected`) — and the in-doubt branch below
+            // re-commits through the core from them. A clone of what the
+            // commit consumes.
+            let keeps_inputs = admitted.is_some() && self.sync.is_some();
             let retry =
                 keeps_inputs.then(|| (base.clone(), manifest_bytes.clone(), dirty_hashes.clone()));
             constellation_meta::clear_last_journaled();
@@ -1338,6 +1329,11 @@ impl View {
                 };
                 if !acked {
                     let Some((base, bytes, dirty)) = retry else {
+                        // No inputs to re-commit from: the close fails, and
+                        // an `fsync` around it must retry, not give up.
+                        crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
+                            "commit in doubt at a hold change".into(),
+                        ));
                         return Err(FlushFail {
                             errno: Code::Io,
                             ws: Some(Box::new(ws)),
