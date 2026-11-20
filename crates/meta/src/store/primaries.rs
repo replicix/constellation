@@ -6,7 +6,7 @@
 //! The scan was the cost: an unlink is a point delete, which leaves a
 //! tombstone at the name's key until compaction drops it, and a forward
 //! scan from the start of `names_of(ino)` steps over every tombstone that
-//! lies below the first live key (unlinking the names of a 8,192-name
+//! lies below the first live key (unlinking the names of an 8,192-name
 //! inode in the stress tools' order made each of the later unlinks cross
 //! the ones before it).
 //!
@@ -68,8 +68,8 @@ use std::ops::Bound;
 /// Flag bit 0: the inode has exactly the one name of the row.
 const ONE: u8 = 1;
 
-/// The length of `0x04 | ino | parent`, the shortest `0x04` key a name of
-/// one byte can have is one longer.
+/// The length of the shortest `0x04` key: `0x04 | ino | parent` plus one
+/// name byte.
 const RDENTRY_MIN_KEY: usize = 1 + 2 * keys::INO_LEN + 1;
 
 /// One inode's primary name as the `primaries` keyspace holds it.
@@ -87,10 +87,19 @@ impl PrimaryRow {
         Self { one, tail }
     }
 
+    /// The flags byte of a row whose `ONE` bit is `one`.
+    pub(crate) const fn flags(one: bool) -> u8 {
+        if one {
+            ONE
+        } else {
+            0
+        }
+    }
+
     /// `flags | tail`.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + self.tail.len());
-        out.push(if self.one { ONE } else { 0 });
+        out.push(Self::flags(self.one));
         out.extend_from_slice(&self.tail);
         out
     }
@@ -115,12 +124,6 @@ impl PrimaryRow {
             one: flags & ONE != 0,
             tail: tail.to_vec(),
         })
-    }
-
-    /// The inode has more than this name (the bootstrap builder saw a
-    /// second key).
-    pub(crate) fn clear_one(&mut self) {
-        self.one = false;
     }
 
     /// Whether the inode has exactly this name.
@@ -345,7 +348,7 @@ pub(crate) fn check_index(
         let ino = <[u8; 8]>::try_from(&*k)
             .map(Ino::from_be_bytes)
             .map_err(|_| format!("a primary row key of {} bytes", k.len()))?;
-        PrimaryRow::decode(&v).map_err(|e| e.to_string())?;
+        PrimaryRow::decode(&v).map_err(|e| format!("the primary row of {ino}: {e}"))?;
         if !seen.contains_key(&ino) {
             return Err(format!("a primary row of {ino}, which has no 0x04 key"));
         }

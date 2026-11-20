@@ -139,7 +139,7 @@ pub mod spec;
 mod sync_group;
 pub(crate) mod writes;
 
-pub use bootstrap::BootstrapIndexBuilder;
+pub use bootstrap::{BootstrapIndexBuilder, PrimaryRun};
 pub use local::{DelegateTx, LogPrefixView, PublishBasis};
 pub use snapshot::{parse_quota_record, parse_snapshot_record, quota_record, snapshot_record};
 
@@ -267,6 +267,12 @@ pub(crate) const KV_FORMAT: &str = "format";
 /// `local` kv: the store has the `primaries` index (written at genesis; a
 /// store with a root inode and no marker predates it and is refused).
 pub(crate) const KV_PRIMARIES_INDEX: &str = "primaries_index";
+/// `local` kv: a bootstrap from a commit has begun loading this store and
+/// has not finished. Set by the first ingested page, removed in the
+/// transaction of `Meta::apply_bootstrap_indexes`, which also writes the
+/// rows derived from what was loaded; an open that finds it refuses the
+/// store ([`MetaError::BootstrapInterrupted`]).
+pub(crate) const KV_BOOTSTRAPPING: &str = "bootstrapping";
 /// The on-disk format this binary reads and writes. There is no migration:
 /// a store of another format is refused at open. 3: `local` counts each
 /// node's remote-pending marks (`store::remote`, `remote_marks/<node>`),
@@ -1609,6 +1615,9 @@ impl Meta {
     /// predates the marker: format 1.
     fn check_format(&self) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        if kv_get_tx(&tx, &self.local, KV_BOOTSTRAPPING)?.is_some() {
+            return Err(MetaError::BootstrapInterrupted);
+        }
         let found = match kv_get_tx(&tx, &self.local, KV_FORMAT)? {
             Some(v) => v.parse::<u32>().ok(),
             None if tx.get(&self.ns, keys::inode(ROOT_INO))?.is_none() => {

@@ -586,14 +586,19 @@ impl Engine {
         let db_path = state_dir.join("meta.db");
         // Fresh node: rebuild the replica from the commit chain plus log
         // replay (or, with no commit yet, a genesis replay of the whole log).
-        let existing_replica = db_path.exists();
+        // A replica a crash left half-loaded is removed and rebuilt too.
+        let opened = shipper::open_existing_replica(&db_path)?;
+        let existing_replica = opened.is_some();
         if !existing_replica {
             phase(&on_phase, "bootstrapping the metadata replica from S3");
             rt.block_on(shipper::bootstrap(&db_path, &log))
                 .context("bootstrapping metadata replica")?;
         }
         phase(&on_phase, "opening meta.db");
-        let meta = Arc::new(Meta::open(&db_path)?);
+        let meta = Arc::new(match opened {
+            Some(meta) => meta,
+            None => Meta::open(&db_path)?,
+        });
         meta.scratch_purge_all()?;
         if existing_replica {
             // A replica the log was pruned past while this node was

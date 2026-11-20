@@ -104,7 +104,7 @@ pub use store::{
 };
 pub use store::{
     BootstrapIndexBuilder, DelegateTx, ForeignApplyHook, JournalBatch, LogPrefixView, Meta,
-    PublishBasis, RollbackHook, RolledBack, SnapshotChangeHook, SCRATCH_XATTR,
+    PrimaryRun, PublishBasis, RollbackHook, RolledBack, SnapshotChangeHook, SCRATCH_XATTR,
 };
 
 use constellation_fs_core::{FileAttr, Ino};

@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// implementation must also set `complete` when `names.len() < limit`; it
 /// may leave it clear when `names.len() == limit` and the inode has no more
 /// (the store does, for an inode whose primary row is not `ONE`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamePrefix {
     /// `(parent, name)`, in key order.
     pub names: Vec<(u64, String)>,
@@ -37,6 +37,15 @@ pub struct NamePrefix {
 }
 
 impl NamePrefix {
+    /// No names, and that is all of them: an inode with none (or one the
+    /// bounded read does not apply to).
+    pub fn none() -> Self {
+        Self {
+            names: Vec::new(),
+            complete: true,
+        }
+    }
+
     /// The prefix of `limit` names of `full` (sorted), with the tightest
     /// `complete`: set when `full.len() <= limit`.
     #[cfg(any(test, feature = "test-util"))]
@@ -636,7 +645,10 @@ fn replay_name_moves(
         fetched.complete || fetched.names.len() == limit,
         "a prefix that is not complete has `limit` names"
     );
-    let complete = fetched.complete;
+    // `names.len() < limit` is complete by the contract; relying on it
+    // too keeps a provider that broke it from driving the caller's
+    // doubling loop to `usize::MAX` in a release build.
+    let complete = fetched.complete || fetched.names.len() < limit;
     let fetched = fetched.names;
     // A name the moves so far removed (`false`) or added (`true`).
     let mut overlay: BTreeMap<(u64, String), bool> = BTreeMap::new();
@@ -2613,7 +2625,7 @@ mod tests {
                     let from = match &served {
                         Names::Same => &table,
                         Names::Own(own) => own,
-                        Names::Empty => return NamePrefix { names: Vec::new(), complete: true },
+                        Names::Empty => return NamePrefix::none(),
                     };
                     let mut all: Vec<(u64, String)> = (0..SLOTS)
                         .filter(|s| from[*s].map(|t| 10 + t) == Some(i))

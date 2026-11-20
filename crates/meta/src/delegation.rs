@@ -998,18 +998,14 @@ impl Meta {
     pub fn names_of_ino(&self, ino: Ino, limit: usize) -> crate::replay::NamePrefix {
         use crate::replay::NamePrefix;
         if limit == 0 || ino == ROOT_INO || !self.delegations_any() {
-            return NamePrefix {
-                names: Vec::new(),
-                complete: true,
-            };
+            return NamePrefix::none();
         }
         let r = self.db.read_tx();
         // A read error fails open, as it did before the row (an empty or
         // short answer reads as "these are all the names").
-        let got = self.names_prefix_at(&r, ino, limit).unwrap_or(NamePrefix {
-            names: Vec::new(),
-            complete: true,
-        });
+        let got = self
+            .names_prefix_at(&r, ino, limit)
+            .unwrap_or(NamePrefix::none());
         #[cfg(any(test, feature = "test-util"))]
         self.assert_names_prefix_is_scan(&r, ino, limit, &got);
         got
@@ -1024,10 +1020,7 @@ impl Meta {
         use crate::replay::NamePrefix;
         use crate::store::primaries;
         let Some(row) = primaries::primary_of(r, &self.primaries, ino)? else {
-            return Ok(NamePrefix {
-                names: Vec::new(),
-                complete: true,
-            });
+            return Ok(NamePrefix::none());
         };
         if row.is_one() {
             return Ok(NamePrefix {
@@ -1036,9 +1029,42 @@ impl Meta {
             });
         }
         let end = keys::names_of(ino).end().to_vec();
+        let at = row.key(ino);
+        // I-P: the row is the inode's first key, so the seek lands on it.
+        // One that does not (a store whose rows are not its names', such as
+        // a half-built one) reads from the start of the range instead.
+        let names = match self.scan_names(r, at.clone(), &end, limit, Some(&at))? {
+            Some(names) => names,
+            None => {
+                tracing::error!(
+                    ino,
+                    "the primary row is not the inode's first 0x04 key; reading from the start"
+                );
+                let start = keys::names_of(ino).start().to_vec();
+                self.scan_names(r, start, &end, limit, None)?
+                    .unwrap_or_default()
+            }
+        };
+        let complete = names.len() < limit;
+        Ok(NamePrefix { names, complete })
+    }
+
+    /// The first `limit` names of the `0x04` keys in `start..end`. With
+    /// `first`, `None` when the range's first key is not it.
+    fn scan_names(
+        &self,
+        r: &impl Readable,
+        start: Vec<u8>,
+        end: &[u8],
+        limit: usize,
+        first: Option<&[u8]>,
+    ) -> Result<Option<Vec<(u64, String)>>, MetaError> {
         let mut names = Vec::with_capacity(limit.min(8));
-        for guard in r.range(&self.ns, row.key(ino)..end) {
+        for (i, guard) in r.range(&self.ns, start..end.to_vec()).enumerate() {
             let (k, _) = guard.into_inner()?;
+            if i == 0 && first.is_some_and(|f| *k != *f) {
+                return Ok(None);
+            }
             if let keys::Key::RDentry {
                 parent_ino, name, ..
             } = keys::Key::parse(&k)?
@@ -1052,8 +1078,12 @@ impl Meta {
                 }
             }
         }
-        let complete = names.len() < limit;
-        Ok(NamePrefix { names, complete })
+        // A row whose seek finds no key at all is as wrong as one that finds
+        // another.
+        if first.is_some() && names.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(names))
     }
 
     /// Test-util cross-check on the reader's own snapshot: the names are the

@@ -85,6 +85,32 @@ async fn bootstrap_from_tree(db_path: &std::path::Path, log: &LogStore) -> Resul
     }
 }
 
+/// The replica at `db_path`, if there is one worth keeping: `None` when
+/// the directory is absent, or when a crash left it half-loaded (a
+/// bootstrap from a commit that never finished: names without the rows
+/// derived from them, `MetaError::BootstrapInterrupted`). A half-loaded
+/// one is removed, so the caller bootstraps it afresh.
+///
+/// # Errors
+/// Any other failure to open the store.
+pub fn open_existing_replica(db_path: &std::path::Path) -> Result<Option<Meta>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    match Meta::open(db_path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(constellation_meta::MetaError::BootstrapInterrupted) => {
+            tracing::warn!(
+                "the metadata replica was left half-loaded by an interrupted bootstrap; \
+                 removing it to bootstrap again"
+            );
+            remove_db(db_path);
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `db_path` is an fjall database directory (plan 29 M1: no more
 /// `.db`/`-wal`/`-shm` sibling files to clean up).
 fn remove_db(db_path: &std::path::Path) {
@@ -226,6 +252,26 @@ mod tests {
     use object_store::ObjectStore;
     use replicix_objcas::LeaseMode;
     use std::sync::Arc as StdArc;
+
+    /// A replica a crash left half-loaded is removed, so the node
+    /// bootstraps it again; a complete one opens, and a missing one is
+    /// `None`.
+    #[test]
+    fn a_half_loaded_replica_is_removed_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("meta.db");
+        assert!(open_existing_replica(&db).unwrap().is_none());
+        drop(Meta::open(&db).unwrap());
+        assert!(open_existing_replica(&db).unwrap().is_some());
+        {
+            let meta = Meta::open(&db).unwrap();
+            // The first page of a bootstrap, then the process dies.
+            let key = constellation_mtree::keys::rdentry(7, 1, b"x");
+            meta.ns_ingest_page(&[(key, Vec::new())]).unwrap();
+        }
+        assert!(open_existing_replica(&db).unwrap().is_none());
+        assert!(!db.exists());
+    }
 
     /// A writing node for these tests: the real core over a real `Meta`,
     /// with IO run inline (`Standalone`), and a tree publisher.

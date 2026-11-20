@@ -23,7 +23,10 @@
 use crate::error::MetaError;
 use crate::store::local::{DELEG_LOG_IDX_PREFIX, DELEG_VOID_CUT_PREFIX};
 use crate::store::primaries::PrimaryRow;
-use crate::store::{misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
+use crate::store::{
+    kv_get_tx, kv_set_tx, misc, ns, Meta, KV_APPLIED_SEQ, KV_BOOTSTRAPPING, KV_USAGE_BYTES,
+    KV_USAGE_FILES,
+};
 use constellation_fs_core::Ino;
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, BlobHash, InodeRecord, Kind, XattrPlacement};
@@ -61,8 +64,49 @@ pub struct BootstrapIndexBuilder {
     xattr_by_name: Vec<(String, Ino, Vec<u8>)>,
     usage_bytes: u64,
     usage_files: u64,
-    /// The primary rows, in `ino` order ([`Self::observe_name`]).
-    primaries: Vec<(Ino, PrimaryRow)>,
+    /// The primary rows ([`Self::observe_name`]), in `ino` order: each
+    /// inode and where its encoded row (`flags | tail`, as
+    /// [`PrimaryRow::encode`] writes it) starts in `primary_bytes`. A row
+    /// ends where the next one starts.
+    primaries: Vec<(Ino, usize)>,
+    /// The encoded rows, back to back: one buffer, not one allocation a row.
+    primary_bytes: Vec<u8>,
+    /// A `0x04` key arrived out of key order, or without a name: the rows
+    /// may not be the lowest keys, and [`Meta::apply_bootstrap_indexes`]
+    /// refuses them.
+    disordered: bool,
+    /// The rows were taken out ([`Self::take_settled_primaries`]) for
+    /// [`Meta::ingest_primary_runs`]: [`Meta::apply_bootstrap_indexes`]
+    /// leaves `primaries` alone.
+    streamed: bool,
+}
+
+/// A run of primary rows, in `ino` order, taken out of a
+/// [`BootstrapIndexBuilder`] for [`Meta::ingest_primary_runs`].
+pub struct PrimaryRun {
+    rows: Vec<(Ino, usize)>,
+    bytes: Vec<u8>,
+}
+
+impl PrimaryRun {
+    fn rows(&self) -> impl Iterator<Item = (Ino, &[u8])> + '_ {
+        rows_of(&self.rows, &self.bytes)
+    }
+}
+
+/// `(ino, encoded row)` for rows that start at the given offsets of `bytes`.
+fn rows_of<'a>(
+    rows: &'a [(Ino, usize)],
+    bytes: &'a [u8],
+) -> impl Iterator<Item = (Ino, &'a [u8])> + 'a {
+    let ends = rows
+        .iter()
+        .skip(1)
+        .map(|&(_, start)| start)
+        .chain(std::iter::once(bytes.len()));
+    rows.iter()
+        .zip(ends)
+        .map(move |(&(ino, start), end)| (ino, &bytes[start..end]))
 }
 
 impl BootstrapIndexBuilder {
@@ -100,15 +144,70 @@ impl BootstrapIndexBuilder {
     /// Record one `0x04` key. The keys must arrive in key order, as a tree
     /// cursor yields them: the first of an inode is its primary name, and
     /// a second one means the row's `ONE` flag is clear. A key that is not
-    /// a `0x04` key of a name is ignored.
+    /// a `0x04` key is ignored; one out of order, or without a name, makes
+    /// [`Meta::apply_bootstrap_indexes`] refuse the rows.
     pub fn observe_name(&mut self, key: &[u8]) {
-        let Ok(keys::Key::RDentry { ino, .. }) = keys::Key::parse(key) else {
+        if key.first() != Some(&keys::RANGE_RDENTRY) {
             return;
+        }
+        if key.len() <= 1 + 2 * keys::INO_LEN {
+            // A `0x04` key without a name: no row can stand for it.
+            self.disordered = true;
+            return;
+        }
+        let mut b = [0u8; keys::INO_LEN];
+        b.copy_from_slice(&key[1..1 + keys::INO_LEN]);
+        let ino = Ino::from_be_bytes(b);
+        let tail = &key[1 + keys::INO_LEN..];
+        match self.primaries.last() {
+            Some(&(last, start)) if last == ino => {
+                // The row holds the inode's first key; a later one must
+                // sort above it, or the row is not the lowest.
+                if tail <= &self.primary_bytes[start + 1..] {
+                    self.disordered = true;
+                }
+                self.primary_bytes[start] = PrimaryRow::flags(false);
+            }
+            last => {
+                if last.is_some_and(|&(last, _)| last > ino) {
+                    self.disordered = true;
+                }
+                self.primaries.push((ino, self.primary_bytes.len()));
+                self.primary_bytes.push(PrimaryRow::flags(true));
+                self.primary_bytes.extend_from_slice(tail);
+            }
+        }
+    }
+
+    /// Each row as `(ino, encoded row)`, in `ino` order.
+    fn primary_rows(&self) -> impl Iterator<Item = (Ino, &[u8])> + '_ {
+        rows_of(&self.primaries, &self.primary_bytes)
+    }
+
+    /// The rows no later key can change (every inode's but the last one's,
+    /// which a later key may still clear `ONE` of), once there are more than
+    /// `min` of them. The builder keeps the last row.
+    pub fn take_settled_primaries(&mut self, min: usize) -> Option<PrimaryRun> {
+        if self.primaries.len() <= min {
+            return None;
+        }
+        let (last, start) = self.primaries.pop()?;
+        let kept = self.primary_bytes.split_off(start);
+        let run = PrimaryRun {
+            rows: std::mem::take(&mut self.primaries),
+            bytes: std::mem::replace(&mut self.primary_bytes, kept),
         };
-        let tail = key[1 + keys::INO_LEN..].to_vec();
-        match self.primaries.last_mut() {
-            Some((last, row)) if *last == ino => row.clear_one(),
-            _ => self.primaries.push((ino, PrimaryRow::new(true, tail))),
+        self.primaries.push((last, 0));
+        self.streamed = true;
+        Some(run)
+    }
+
+    /// Every row left, at the end of the walk.
+    pub fn take_all_primaries(&mut self) -> PrimaryRun {
+        self.streamed = true;
+        PrimaryRun {
+            rows: std::mem::take(&mut self.primaries),
+            bytes: std::mem::take(&mut self.primary_bytes),
         }
     }
 }
@@ -191,12 +290,82 @@ impl Meta {
         if page.is_empty() {
             return Ok(());
         }
+        self.mark_bootstrapping()?;
         let mut ingestion = self.ns.inner().start_ingestion()?;
         for (k, v) in page {
             ingestion.write(k.clone(), v.clone())?;
         }
         ingestion.finish()?;
         Ok(())
+    }
+
+    /// Record, before the first ingested row reaches a keyspace, that this
+    /// store is half-loaded ([`KV_BOOTSTRAPPING`]). Every ingestion calls it
+    /// first (from either thread of a streamed bootstrap): the marker is
+    /// committed before the rows exist, so a crash at any later point leaves
+    /// a store [`Meta::open`] refuses, and [`Self::apply_bootstrap_indexes`]
+    /// clears it in the transaction that completes the derived state.
+    fn mark_bootstrapping(&self) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        if kv_get_tx(&tx, &self.local, KV_BOOTSTRAPPING)?.is_none() {
+            kv_set_tx(&mut tx, &self.local, KV_BOOTSTRAPPING, "1");
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::ns_ingest_page`] that moves the pairs out of `page` (leaving
+    /// it empty, its capacity kept) instead of copying each key and value
+    /// once more on the way into the ingestion.
+    pub fn ns_ingest_drain(&self, page: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), MetaError> {
+        if page.is_empty() {
+            return Ok(());
+        }
+        self.mark_bootstrapping()?;
+        let mut ingestion = self.ns.inner().start_ingestion()?;
+        for (k, v) in page.drain(..) {
+            ingestion.write(k, v)?;
+        }
+        ingestion.finish()?;
+        Ok(())
+    }
+
+    /// Whether a bootstrap may stream the primary rows in
+    /// ([`Self::ingest_primary_runs`]): `primaries` is empty, as a fresh
+    /// replica's is.
+    pub fn primaries_ingestible(&self) -> Result<bool, MetaError> {
+        Ok(self.primaries.inner().is_empty()?)
+    }
+
+    /// Ingest the primary rows `runs` delivers as one sorted run, ending the
+    /// ingestion at the `None` that says the walk is over. A channel that
+    /// closes before it (the walk failed) abandons the ingestion, as does a
+    /// row out of `ino` order (ingestion would panic on it).
+    pub fn ingest_primary_runs(
+        &self,
+        runs: std::sync::mpsc::Receiver<Option<PrimaryRun>>,
+    ) -> Result<(), MetaError> {
+        self.mark_bootstrapping()?;
+        let mut ingestion = self.primaries.inner().start_ingestion()?;
+        let mut last: Option<Ino> = None;
+        while let Ok(run) = runs.recv() {
+            let Some(run) = run else {
+                ingestion.finish()?;
+                return Ok(());
+            };
+            for (ino, row) in run.rows() {
+                if last.is_some_and(|last| last >= ino) {
+                    return Err(MetaError::Invalid(
+                        "bootstrap: the primary rows are not in inode order".into(),
+                    ));
+                }
+                last = Some(ino);
+                ingestion.write(ino.to_be_bytes(), row)?;
+            }
+        }
+        Err(MetaError::Invalid(
+            "bootstrap: the primary rows ended before the walk did".into(),
+        ))
     }
 
     /// Re-write one ingested `ns` row through an ordinary write, so it
@@ -209,7 +378,11 @@ impl Meta {
     pub fn ns_overwrite_after_ingest(&self, key: &[u8], value: &[u8]) -> Result<(), MetaError> {
         // Not the funnel: the root's `0x01` only, which no primary row
         // follows (`store::primaries`).
-        debug_assert!(key.first() != Some(&keys::RANGE_RDENTRY));
+        if key.first() == Some(&keys::RANGE_RDENTRY) {
+            return Err(MetaError::Invalid(
+                "ns_overwrite_after_ingest: a 0x04 key has a primary row; use the funnel".into(),
+            ));
+        }
         let mut tx = self.db.write_tx();
         tx.insert(&self.ns, key.to_vec(), value.to_vec());
         tx.commit()?;
@@ -267,17 +440,51 @@ impl Meta {
     /// incrementally, which bulk ingestion bypassed, applied here with
     /// no re-decoding of what was already decoded once.
     ///
-    /// Clears the index keyspaces (and `primaries`) first (idempotent: a bootstrap
-    /// that retries lands on the same state either way), then inserts
-    /// `builder`'s rows directly.
+    /// Clears the index keyspaces first (idempotent: a bootstrap that
+    /// retries lands on the same state either way), then inserts
+    /// `builder`'s rows directly. `primaries` is left alone when the rows
+    /// were streamed in ([`Self::ingest_primary_runs`]); otherwise its rows
+    /// go in as one sorted ingestion when the keyspace is empty (a fresh
+    /// replica), and through the transaction, after a clear, when it is not.
+    ///
+    /// # Errors
+    /// The builder saw a `0x04` key out of key order or without a name
+    /// ([`BootstrapIndexBuilder::observe_name`]); a store error. The
+    /// bootstrap marker stays then, so the store is refused at its next open.
     pub fn apply_bootstrap_indexes(&self, builder: BootstrapIndexBuilder) -> Result<(), MetaError> {
+        // The primary rows go in as one sorted run (`start_ingestion`, as
+        // `ns` itself does), not as one transaction insert each: a fresh
+        // replica's `primaries` is empty, and the builder saw the `0x04`
+        // keys in key order, so its rows are strictly ascending by `ino`.
+        // A store that already has rows takes them through the transaction
+        // below, after the clear. (Out-of-order keys were refused above:
+        // ingestion would panic on them, and the rows would be wrong.)
+        if builder.disordered {
+            return Err(MetaError::Invalid(
+                "bootstrap: the 0x04 keys were not observed in key order, or one had no name"
+                    .into(),
+            ));
+        }
+        let ingested = builder.streamed || self.primaries.inner().is_empty()?;
+        if ingested && !builder.streamed && !builder.primaries.is_empty() {
+            let mut ingestion = self.primaries.inner().start_ingestion()?;
+            for (ino, row) in builder.primary_rows() {
+                ingestion.write(ino.to_be_bytes(), row)?;
+            }
+            ingestion.finish()?;
+        }
         let mut tx = self.db.write_tx();
+        // The load is complete with this transaction: the marker goes with
+        // the derived state it guards, never before.
+        tx.remove(&self.local, KV_BOOTSTRAPPING.as_bytes().to_vec());
         clear_tx(&mut tx, &self.chunk_ref)?;
         clear_tx(&mut tx, &self.chunk_ref_by_ino)?;
         clear_tx(&mut tx, &self.xattr_by_name)?;
-        clear_tx(&mut tx, &self.primaries)?;
-        for (ino, row) in &builder.primaries {
-            tx.insert(&self.primaries, ino.to_be_bytes(), row.encode());
+        if !ingested {
+            clear_tx(&mut tx, &self.primaries)?;
+            for (ino, row) in builder.primary_rows() {
+                tx.insert(&self.primaries, ino.to_be_bytes(), row);
+            }
         }
         for (hash, ino) in &builder.chunk_hashes {
             tx.insert(&self.chunk_ref, misc::cr_key(hash, *ino), Vec::new());

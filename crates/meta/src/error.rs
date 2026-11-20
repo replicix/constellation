@@ -67,6 +67,14 @@ pub enum MetaError {
         why: String,
     },
 
+    /// The store was left half-loaded: a bootstrap from a commit began
+    /// (`Meta::ns_ingest_page`) and never finished
+    /// (`Meta::apply_bootstrap_indexes`). It holds names but not the rows
+    /// derived from them. The only repair is to remove the store and
+    /// bootstrap it again.
+    #[error("the store's bootstrap from a commit never finished: remove it and bootstrap again")]
+    BootstrapInterrupted,
+
     #[error("fjall: {0}")]
     Fjall(#[from] fjall::Error),
 
@@ -104,7 +112,7 @@ impl MetaError {
             NoData => Code::NoData,
             Invalid(_) => Code::Invalid,
             Conflict => Code::Again,
-            LockLapsed | NotAdmitted | TailDiverged { .. } => Code::Io,
+            LockLapsed | NotAdmitted | BootstrapInterrupted | TailDiverged { .. } => Code::Io,
             Fjall(_) | Io(_) | Record(_) | Key(_) | Json(_) | Postcard(_) => Code::Io,
         }
     }

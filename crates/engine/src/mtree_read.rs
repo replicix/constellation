@@ -605,6 +605,74 @@ pub(crate) fn load_tree(
     meta: &Meta,
     resolver: &Resolver<'_>,
 ) -> Result<(u64, u64)> {
+    // The primary rows (`constellation_meta::store::primaries`) of a fresh
+    // replica stream into one ingestion on a second thread while the walk
+    // goes on, a run of settled rows at a time, so building them costs the
+    // walk no time; a store that already has rows takes them in
+    // `Meta::apply_bootstrap_indexes` instead.
+    if !meta.primaries_ingestible()? {
+        let (counts, derived, root_row) = load_tree_walk(tree, root, meta, resolver, None)?;
+        return load_tree_end(meta, counts, derived, root_row);
+    }
+    std::thread::scope(|scope| {
+        let (runs, rx) = std::sync::mpsc::sync_channel(4);
+        let worker = scope.spawn(move || meta.ingest_primary_runs(rx));
+        let walked = load_tree_walk(tree, root, meta, resolver, Some(&runs)).and_then(
+            |(counts, mut derived, root_row)| {
+                runs.send(Some(derived.take_all_primaries()))
+                    .and_then(|()| runs.send(None))
+                    .map_err(|_| IngestionStopped)?;
+                Ok((counts, derived, root_row))
+            },
+        );
+        // Closes the channel: a worker still waiting (the walk failed)
+        // abandons its ingestion.
+        drop(runs);
+        let ingested = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("the primary rows' ingestion panicked"))?;
+        match (walked, ingested) {
+            (Ok((counts, derived, root_row)), Ok(())) => {
+                load_tree_end(meta, counts, derived, root_row)
+            }
+            // A send that failed is the worker's error showing.
+            (Err(e), Err(worker)) if e.is::<IngestionStopped>() => Err(worker.into()),
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(worker)) => Err(worker.into()),
+        }
+    })
+}
+
+/// The walk could not hand a run of primary rows to their ingestion: it
+/// stopped (its own error says why).
+#[derive(Debug)]
+struct IngestionStopped;
+
+impl std::fmt::Display for IngestionStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the primary rows' ingestion stopped")
+    }
+}
+
+impl std::error::Error for IngestionStopped {}
+
+/// What [`load_tree_walk`] hands to [`load_tree_end`].
+type Walked = (
+    (u64, u64),
+    constellation_meta::BootstrapIndexBuilder,
+    Option<(Vec<u8>, Vec<u8>)>,
+);
+
+/// [`load_tree`]'s pass over the tree: every page ingested, the derived
+/// state collected; with `runs`, the settled primary rows sent as they
+/// settle.
+fn load_tree_walk(
+    tree: &Tree<Arc<NodeCache>>,
+    root: &NodeHash,
+    meta: &Meta,
+    resolver: &Resolver<'_>,
+    runs: Option<&std::sync::mpsc::SyncSender<Option<constellation_meta::PrimaryRun>>>,
+) -> Result<Walked> {
     let mut main: Vec<Pair> = Vec::with_capacity(LOAD_PAGE);
     let mut local_xattrs: Vec<Pair> = Vec::with_capacity(LOAD_PAGE);
     let (mut n_inodes, mut n_dentries) = (0u64, 0u64);
@@ -624,8 +692,7 @@ pub(crate) fn load_tree(
 
     let flush = |page: &mut Vec<Pair>, force: bool| -> Result<()> {
         if page.len() >= LOAD_PAGE || (force && !page.is_empty()) {
-            meta.ns_ingest_page(page)?;
-            page.clear();
+            meta.ns_ingest_drain(page)?;
         }
         Ok(())
     };
@@ -687,6 +754,11 @@ pub(crate) fn load_tree(
             }
             Key::RDentry { .. } => {
                 derived.observe_name(key);
+                if let Some(runs) = runs {
+                    if let Some(run) = derived.take_settled_primaries(LOAD_PAGE) {
+                        runs.send(Some(run)).map_err(|_| IngestionStopped)?;
+                    }
+                }
                 main.push((key.to_vec(), value.to_vec()));
             }
             Key::Subsystem { .. } => {
@@ -701,6 +773,17 @@ pub(crate) fn load_tree(
     }
     flush(&mut main, true)?;
     flush(&mut local_xattrs, true)?;
+    Ok(((n_inodes, n_dentries), derived, root_row))
+}
+
+/// [`load_tree`] after the walk (and the primary rows' ingestion, if it
+/// streamed) ended.
+fn load_tree_end(
+    meta: &Meta,
+    (n_inodes, n_dentries): (u64, u64),
+    derived: constellation_meta::BootstrapIndexBuilder,
+    root_row: Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<(u64, u64)> {
     if let Some((key, value)) = root_row {
         meta.ns_overwrite_after_ingest(&key, &value)?;
     }
@@ -1232,6 +1315,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.commit.seq, commit.seq);
+        // The primary rows the bootstrap wrote are the loaded `0x04` keys'.
+        fresh.check_primary_index().unwrap();
         crate::mtree_publish::remember_loaded_commit(&fresh, &loaded.commit).unwrap();
         assert!(
             !fresh.has_dirty(),

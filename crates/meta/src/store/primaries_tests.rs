@@ -11,11 +11,13 @@ use crate::record::LogRecord;
 use crate::replay::TouchSet;
 use crate::rid::Rid;
 use crate::store::primaries::{self, PrimaryRow};
+use crate::store::spec::ShadowInstall;
 use crate::store::{BootstrapIndexBuilder, Meta, KV_PRIMARIES_INDEX};
 use constellation_fs_core::types::{now_ns, ROOT_INO};
 use constellation_mtree::keys;
 use proptest::prelude::*;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Directories above 2^32, and the root, which sorts first.
 const PARENTS: [u64; 5] = [
@@ -273,6 +275,12 @@ fn bootstrap_copies(meta: &Meta) -> Result<(), TestCaseError> {
     // its `ONE` only where the copy's is.
     let tight = dump(&ingested.primaries, &ingested);
     prop_assert_eq!(dump(&fresh.primaries, &fresh), tight.clone());
+    // Streamed, a run after every settled row.
+    let streamed = stream_copy(meta, 1);
+    if let Err(e) = streamed.check_primary_index() {
+        return Err(TestCaseError::fail(format!("streamed ingestion: {e}")));
+    }
+    prop_assert_eq!(dump(&streamed.primaries, &streamed), tight.clone());
     let own = dump(&meta.primaries, meta);
     prop_assert_eq!(own.len(), tight.len());
     for ((ka, va), (kb, vb)) in own.iter().zip(&tight) {
@@ -306,12 +314,130 @@ fn ingest_copy(meta: &Meta) -> Meta {
     fresh
 }
 
+/// As [`ingest_copy`], with the primary rows streamed into their own
+/// ingestion on a second thread, a run whenever more than `min` settle
+/// (`BootstrapIndexBuilder::take_settled_primaries`, as `load_tree` does).
+fn stream_copy(meta: &Meta, min: usize) -> Meta {
+    let fresh = Meta::open_in_memory().unwrap();
+    assert!(fresh.primaries_ingestible().unwrap());
+    let mut builder = BootstrapIndexBuilder::new();
+    let rows = meta.ns_dump().unwrap();
+    std::thread::scope(|s| {
+        let (runs, rx) = std::sync::mpsc::sync_channel(1);
+        let target = &fresh;
+        let worker = s.spawn(move || target.ingest_primary_runs(rx));
+        for page in rows.chunks(64) {
+            for (k, _) in page {
+                builder.observe_name(k);
+                if let Some(run) = builder.take_settled_primaries(min) {
+                    runs.send(Some(run)).unwrap();
+                }
+            }
+            fresh.ns_ingest_page(page).unwrap();
+        }
+        runs.send(Some(builder.take_all_primaries())).unwrap();
+        runs.send(None).unwrap();
+        worker.join().unwrap().unwrap();
+    });
+    fresh.apply_bootstrap_indexes(builder).unwrap();
+    fresh
+}
+
+static INSTALLED: AtomicUsize = AtomicUsize::new(0);
+static UNAPPLIED: AtomicUsize = AtomicUsize::new(0);
+
+/// Count what a shadow install did. A batch that skips a record installs
+/// nothing (`Unapplied`): fine, but counted, so the rollback and redo cases
+/// cannot silently stop installing. Any other outcome is a test bug.
+fn count_install(got: ShadowInstall) -> Result<(), TestCaseError> {
+    match got {
+        ShadowInstall::Installed => INSTALLED.fetch_add(1, Ordering::Relaxed),
+        ShadowInstall::Unapplied => UNAPPLIED.fetch_add(1, Ordering::Relaxed),
+        other => return Err(TestCaseError::fail(format!("shadow install: {other:?}"))),
+    };
+    Ok(())
+}
+
 fn rid(n: u64) -> Rid {
     Rid {
         node: 2,
         incarnation: 1,
         seq: n,
     }
+}
+
+/// One case of the property: `ops` through every write path, `verify`
+/// after each.
+fn run_case(ops: &[Op], final_copy: bool) -> Result<(), TestCaseError> {
+    let meta = delegated_store(&PARENTS);
+    let mut clock = Clock(now_ns() + 3_600_000_000_000);
+    let first: Vec<LogRecord> = FILES
+        .iter()
+        .enumerate()
+        .map(|(i, f)| LogRecord::Create {
+            parent: PARENTS[i],
+            name: format!("f{i}"),
+            ino: *f,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: clock.tick(),
+        })
+        .collect();
+    meta.apply_records(&first).unwrap();
+    verify(&meta, &FILES)?;
+    let (mut seq, mut next_rid) = (2u64, 1u64);
+    for op in ops {
+        match op {
+            Op::One(o) => {
+                let recs = records(&meta, &mut clock, std::slice::from_ref(o));
+                meta.apply_records(&recs).unwrap();
+            }
+            Op::Batch(b) => {
+                let recs = records(&meta, &mut clock, b);
+                meta.apply_records(&recs).unwrap();
+            }
+            Op::Rolled(b) => {
+                let mut recs = records(&meta, &mut clock, b);
+                recs.push(LogRecord::Completed { rid: rid(next_rid) });
+                let op = MutateOp::Records {
+                    records: recs.clone(),
+                };
+                let got = meta
+                    .install_shadow_from(rid(next_rid), 1, GEN, &op, &LockTag::NONE, &recs)
+                    .unwrap();
+                next_rid += 1;
+                count_install(got)?;
+                verify(&meta, &FILES)?;
+                meta.strand_recalled_speculation(GEN).unwrap();
+            }
+            Op::Redone(shadow, segment) => {
+                let mut recs = records(&meta, &mut clock, shadow);
+                recs.push(LogRecord::Completed { rid: rid(next_rid) });
+                let op = MutateOp::Records {
+                    records: recs.clone(),
+                };
+                let got = meta.install_shadow(rid(next_rid), 1, &op, &recs).unwrap();
+                next_rid += 1;
+                count_install(got)?;
+                verify(&meta, &FILES)?;
+                let seg = records(&meta, &mut clock, segment);
+                meta.apply_segment(seq, 1, &seg, &TouchSet::default())
+                    .unwrap();
+                seq += 1;
+            }
+            Op::Flush => {
+                meta.ns.inner().rotate_memtable_and_wait().unwrap();
+                meta.primaries.inner().rotate_memtable_and_wait().unwrap();
+            }
+            Op::Bootstrap => bootstrap_copies(&meta)?,
+        }
+        verify(&meta, &FILES)?;
+    }
+    if final_copy {
+        bootstrap_copies(&meta)?;
+    }
+    Ok(())
 }
 
 proptest! {
@@ -326,67 +452,32 @@ proptest! {
         ops in prop::collection::vec(op(), 1..=40),
         final_copy in prop::bool::weighted(0.25),
     ) {
-        let meta = delegated_store(&PARENTS);
-        let mut clock = Clock(now_ns() + 3_600_000_000_000);
-        let first: Vec<LogRecord> = FILES
-            .iter()
-            .enumerate()
-            .map(|(i, f)| LogRecord::Create {
-                parent: PARENTS[i],
-                name: format!("f{i}"),
-                ino: *f,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                time_ns: clock.tick(),
-            })
-            .collect();
-        meta.apply_records(&first).unwrap();
-        verify(&meta, &FILES)?;
-        let (mut seq, mut next_rid) = (2u64, 1u64);
-        for op in &ops {
-            match op {
-                Op::One(o) => {
-                    let recs = records(&meta, &mut clock, std::slice::from_ref(o));
-                    meta.apply_records(&recs).unwrap();
-                }
-                Op::Batch(b) => {
-                    let recs = records(&meta, &mut clock, b);
-                    meta.apply_records(&recs).unwrap();
-                }
-                Op::Rolled(b) => {
-                    let mut recs = records(&meta, &mut clock, b);
-                    recs.push(LogRecord::Completed { rid: rid(next_rid) });
-                    let op = MutateOp::Records { records: recs.clone() };
-                    meta.install_shadow_from(rid(next_rid), 1, GEN, &op, &LockTag::NONE, &recs)
-                        .unwrap();
-                    next_rid += 1;
-                    verify(&meta, &FILES)?;
-                    meta.strand_recalled_speculation(GEN).unwrap();
-                }
-                Op::Redone(shadow, segment) => {
-                    let mut recs = records(&meta, &mut clock, shadow);
-                    recs.push(LogRecord::Completed { rid: rid(next_rid) });
-                    let op = MutateOp::Records { records: recs.clone() };
-                    meta.install_shadow(rid(next_rid), 1, &op, &recs).unwrap();
-                    next_rid += 1;
-                    verify(&meta, &FILES)?;
-                    let seg = records(&meta, &mut clock, segment);
-                    meta.apply_segment(seq, 1, &seg, &TouchSet::default()).unwrap();
-                    seq += 1;
-                }
-                Op::Flush => {
-                    meta.ns.inner().rotate_memtable_and_wait().unwrap();
-                    meta.primaries.inner().rotate_memtable_and_wait().unwrap();
-                }
-                Op::Bootstrap => bootstrap_copies(&meta)?,
-            }
-            verify(&meta, &FILES)?;
-        }
-        if final_copy {
-            bootstrap_copies(&meta)?;
-        }
+        run_case(&ops, final_copy)?;
     }
+}
+
+/// The rollback and redo cases must keep installing shadows: main's
+/// `install_shadow` installs nothing when a record skips, and a property
+/// that quietly stopped installing would test nothing.
+#[test]
+fn the_shadow_cases_install_shadows() {
+    let mut runner = proptest::test_runner::TestRunner::deterministic();
+    let before = INSTALLED.load(Ordering::Relaxed);
+    runner
+        .run(
+            &(
+                prop::collection::vec(op(), 1..=40),
+                prop::bool::weighted(0.25),
+            ),
+            |(ops, final_copy)| run_case(&ops, final_copy),
+        )
+        .unwrap();
+    let got = INSTALLED.load(Ordering::Relaxed) - before;
+    assert!(
+        got >= 100,
+        "only {got} shadows installed ({} unapplied)",
+        UNAPPLIED.load(Ordering::Relaxed)
+    );
 }
 
 /// A store with `n` names for one file under one directory, the base the
@@ -510,9 +601,11 @@ fn a_rolled_back_unlink_of_the_primary_restores_its_row() {
     let op = MutateOp::Records {
         records: recs.clone(),
     };
-    assert!(meta
-        .install_shadow_from(rid(1), 1, GEN, &op, &LockTag::NONE, &recs)
-        .unwrap());
+    assert_eq!(
+        meta.install_shadow_from(rid(1), 1, GEN, &op, &LockTag::NONE, &recs)
+            .unwrap(),
+        ShadowInstall::Installed
+    );
     assert_ne!(
         dump(&meta.primaries, &meta),
         before,
@@ -541,6 +634,59 @@ fn a_store_without_the_index_marker_is_refused() {
         Err(other) => panic!("not the marker refusal: {other}"),
         Ok(_) => panic!("a store without the marker opened"),
     }
+}
+
+/// A crash between the first ingested page and `apply_bootstrap_indexes`
+/// leaves names without rows. The store must not open as a complete
+/// replica then (it would answer "no names, complete"); finishing the
+/// bootstrap makes it open again.
+#[test]
+fn a_bootstrap_that_never_finished_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = vec![(keys::rdentry(FILES[0], PARENTS[1], b"x"), Vec::new())];
+    {
+        let meta = Meta::open(dir.path()).unwrap();
+        meta.ns_ingest_page(&page).unwrap();
+        // The process dies here: no `apply_bootstrap_indexes`.
+    }
+    assert!(matches!(
+        Meta::open(dir.path()),
+        Err(MetaError::BootstrapInterrupted)
+    ));
+    // Not even an open that gets as far as the marker check opens it, twice.
+    assert!(matches!(
+        Meta::open(dir.path()),
+        Err(MetaError::BootstrapInterrupted)
+    ));
+    let finished = tempfile::tempdir().unwrap();
+    {
+        let meta = Meta::open(finished.path()).unwrap();
+        let mut builder = BootstrapIndexBuilder::new();
+        builder.observe_name(&page[0].0);
+        meta.ns_ingest_page(&page).unwrap();
+        meta.apply_bootstrap_indexes(builder).unwrap();
+    }
+    Meta::open(finished.path()).unwrap();
+}
+
+/// The streamed rows' own ingestion marks the store too: a crash after the
+/// rows went in, before the indexes did, is refused.
+#[test]
+fn a_streamed_bootstrap_that_never_finished_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let meta = Meta::open(dir.path()).unwrap();
+        let mut builder = BootstrapIndexBuilder::new();
+        builder.observe_name(&keys::rdentry(FILES[0], PARENTS[1], b"x"));
+        let (runs, rx) = std::sync::mpsc::sync_channel(2);
+        runs.send(Some(builder.take_all_primaries())).unwrap();
+        runs.send(None).unwrap();
+        meta.ingest_primary_runs(rx).unwrap();
+    }
+    assert!(matches!(
+        Meta::open(dir.path()),
+        Err(MetaError::BootstrapInterrupted)
+    ));
 }
 
 /// The ingestion path's rows are the funnel's, byte for byte, after a
@@ -581,11 +727,46 @@ fn bootstrap_rows_equal_the_funnels_rows() {
     assert!(!want.is_empty());
     let ingested = ingest_copy(&meta);
     assert_eq!(dump(&ingested.primaries, &ingested), want);
+    for min in [0, 1, 2, 1000] {
+        let streamed = stream_copy(&meta, min);
+        streamed.check_primary_index().unwrap();
+        assert_eq!(dump(&streamed.primaries, &streamed), want, "min {min}");
+    }
     let copied = Meta::open_in_memory().unwrap();
     copied
         .replace_ns_from_rebuilt(&meta, &HashSet::new())
         .unwrap();
     assert_eq!(dump(&copied.primaries, &copied), want);
+}
+
+/// A builder fed `0x04` keys out of key order (a later inode first, or a
+/// lower name of the same inode after a higher one) is refused, and so is a
+/// `0x04` key without a name.
+#[test]
+fn a_disordered_bootstrap_builder_is_refused() {
+    let (a, b) = (FILES[0], FILES[1]);
+    let p = PARENTS[1];
+    let cases: [Vec<Vec<u8>>; 3] = [
+        vec![keys::rdentry(b, p, b"x"), keys::rdentry(a, p, b"x")],
+        vec![keys::rdentry(a, p, b"y"), keys::rdentry(a, p, b"x")],
+        vec![keys::names_of(a)
+            .start()
+            .iter()
+            .chain(&p.to_be_bytes())
+            .copied()
+            .collect()],
+    ];
+    for fed in cases {
+        let fresh = Meta::open_in_memory().unwrap();
+        let mut builder = BootstrapIndexBuilder::new();
+        for k in &fed {
+            builder.observe_name(k);
+        }
+        assert!(
+            fresh.apply_bootstrap_indexes(builder).is_err(),
+            "{fed:02x?} was taken"
+        );
+    }
 }
 
 /// `PrimaryRow` rows of single-name inodes carry `ONE`.
