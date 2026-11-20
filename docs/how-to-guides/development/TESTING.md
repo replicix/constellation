@@ -403,8 +403,9 @@ run the external tools from the stress lane through the same fault
 injector: `fio-latency` (crc32c-verified random writes under 80 ms S3
 latency), `fio-blips` (fio verify while S3 is cut for 800 ms every
 ~4 s — since plan 39 `fsync` waits out the blips itself instead of
-leaning on the per-request retry budget, which the harness keeps tight at
-`REPLICIX_S3_MAX_RETRIES=2`), and `stress-ng-flap`
+leaning on the per-request retry budget, which the harness keeps tight with
+`REPLICIX_S3_MAX_RETRIES=2` and `REPLICIX_S3_RETRY_TIMEOUT_MS=2000`; since
+ADR-66 so does a write-through `close`), and `stress-ng-flap`
 (metadata churn during S3 flapping; the mount must stay healthy and
 the spool drain afterwards). Both flap from their first instruction, so
 they first write and wait until the node holds the lease: a node without
@@ -1913,9 +1914,7 @@ a documented bug as a regression. `harness run <name>` resolves a name
 in either list. When a later milestone fixes the bug, its scenario
 moves into `SCENARIOS` as the regression test. Plan 30 M2 moved
 `forward-timeout-reexec` (bug A) and M3a moved both bug B scenarios
-below. `stress-ng-fs-faults` moved there too (ADR-66: its `close` and `fsync`
-failures under load were the upload claims, an in-doubt close and a close
-that gave up on a transient failure). The list holds one scenario of
+below. The list holds one scenario of
 [the stress-ng-fs lane](#stress-every-stress-ng-filesystem-stressor-stress-ng-fs)
 today:
 
@@ -1925,6 +1924,17 @@ today:
   epoch, and forwarded mutations wait out their 120 s timeout. One
   non-holder ends with every FUSE worker waiting, and its stress-ng
   processes cannot be killed.
+
+`stress-ng-fs-faults` left the list with ADR-66 (its `close` and `fsync`
+failures under load were the upload claims, an in-doubt close and a close
+that gave up on a transient failure); it is in `SCENARIOS`. One bug it
+found is **not fixed**: every S3 cut opens a continuation epoch on the
+single node, and closing it is handled as the lease going away — every
+cluster lock grant is dropped (`lease gone: lock grants dropped`), the lock
+holders' writes fail with `EIO` and new locks with `ENOLCK` (`fcntl`:
+`F_OFD_SETLK` `ENOLCK`) until the lease is back; once the epoch froze
+instead and a create after the run failed with `EROFS`. The scenario's
+checks may still catch it.
 
 Reproducing these needed two things no scenario had before:
 

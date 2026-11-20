@@ -738,7 +738,10 @@ under it, or a write made under it that may not be published yet — is
   the wait with `EINTR`: the kernel waits uninterruptibly for the answer to
   a request it sent, so a wait that could not be interrupted would leave its
   process unkillable for as long as the park lasts. (A caught signal now
-  gives `EINTR` from `read`/`write` during a park instead of `EIO`.)
+  gives `EINTR` from `read`/`write` during a park instead of `EIO`.) The
+  exception is `close` (`FLUSH`): it is killable, as an `fsync` is (ADR-66),
+  so its park ends on a fatal signal only, never on a caught one (its
+  caller is gone then); the park is bounded by `lock_owner_wait_max_ms` all the same.
   An op the park gate did not hold — it looks before the op's admission and
   at an estimate of the grant's end, so a grant that lapses while the op
   queues, or after a forward step of the clock, passes it — meets the fence

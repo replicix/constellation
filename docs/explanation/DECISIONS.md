@@ -6591,29 +6591,51 @@ second later would have uploaded. Under host load (`--cpu 24`) a PUT that
 takes seconds is enough. An application cannot recover from an `EIO` at
 `close()`: the descriptor is gone and the data is not durable.
 
-**Decision**: when a write-through close (`flush`, or the `release` of a
-description that still has pending writes) has chunks to drain, the drain runs
-under the `fsync` retry loop (`FsyncWaits::run`): a transient failure is
-retried after the capped backoff, a permanent one (access denied, a lost
-chunk) answers `EIO` at once, and the wait ends at the soft timeout
-(`--fsync-timeout`), at the kernel's FUSE request timeout (the cap) or when
-the caller is killed. The wait runs on the `fsync` pool, not on a frontend
-worker, and `FLUSH` and `RELEASE` register their request for `FUSE_INTERRUPT`
-as an `fsync` does (killable, not interruptible). A close that ends early
-answers `EIO`, never `EINTR`, and the data stays pending, so the next `fsync`
-or the background rounds finish it. The publication (the manifest commit) is
-not repeated: only the drain is.
+**Decision**: a write-through `flush` (the application-visible `close()`) that
+publishes runs its whole publication under the `fsync` retry loop
+(`FsyncWaits::run`): the manifest commit and, on a node that forwards it (a
+non-sequencer, a file a delegate owns, the window after a continuation epoch
+closed), the drain before the forward, then the drain after it. A transient
+failure is retried after the capped backoff (a publication that failed
+re-attaches its write state, so repeating it is safe), a permanent one (access
+denied, a lost chunk) answers `EIO` at once, and the wait ends at the soft
+timeout (`--fsync-timeout`), at the kernel's FUSE request timeout (the cap) or
+when the caller is killed. The wait runs on the `fsync` pool, not on a
+frontend worker, with the caller's fencing scope handed over to it (the token
+is the one resolved before the close dropped its locks). `FLUSH` registers
+its request for `FUSE_INTERRUPT` as an `fsync` does (killable, not
+interruptible); it is counted as a bounded deferral from the start, in every
+mode, and takes no lock-wait entry of a ring queue. A frontend that cannot
+answer from another thread keeps the old bounded drain (three tries). A close
+that ends early answers `EIO`, never `EINTR`, and the data stays pending, so
+the next `fsync` or the background rounds finish it.
+
+`RELEASE` is not part of this: the kernel sends it as a background request,
+never interrupts it and ignores its reply, so waiting there would hold a
+`max_background` slot and a pool thread through an outage and delay the
+orphan reap and lock-idle for nothing. A release that still has chunks to
+drain (an `mmap` write, a write after the last flush) keeps the bounded drain;
+what it leaves is the background uploader's.
+
+A cluster-lock mount whose close parks for its caller's lapsed grant ends that
+park only on a fatal signal (the close's token is the killable one): an
+`EINTR` from `close()` is no use to its caller (cluster-locks.md).
 
 **Cost**: during a long S3 outage a process that exits, or a shell that closes a
 file, can block in `close()` until S3 returns or the timeout or the kernel cap
 ends the wait. This is what `fsync` already does, and what an NFS `hard` mount
 does for every operation; an operator who prefers `EIO` sets `--fsync-timeout`.
-`--write-mode back` is unaffected (its close does not drain).
+`--write-mode back` is unaffected (its close does not drain). Closes now share
+the `fsync` pool (1024 threads, FIFO), so a close storm in an outage can queue
+an `fsync` that needs no S3; `node.status.fsync` and the "fsync timed out /
+failed" log lines count closes too; and every `FLUSH` takes the `Interrupts`
+mutex to register and unregister.
 
 **Rejected**: a longer fixed retry count (a different give-up, the same
 `EIO`); retrying in the background only (the close would then claim durability
-it lacks, or answer before the upload as `back` does).
+it lacks, or answer before the upload as `back` does); the unbounded retry for
+`RELEASE` (above).
 
 See: `crates/engine/src/fsync_wait.rs`, `crates/engine/src/view/durable.rs`
-(`close_drain`), `crates/engine/src/view/ops.rs` (`flush`, `release`),
+(`close_run`, `close_publication`), `crates/engine/src/view/ops.rs` (`flush`),
 `crates/frontend-fuse/src/adapter.rs`.
