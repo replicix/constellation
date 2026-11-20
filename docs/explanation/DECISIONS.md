@@ -6406,6 +6406,60 @@ executed, so the cut is a row.
   `settles_woken_at_cut_phase`, `settles_woken_at_cut_released`,
   `settles_cut_forwarded_alive`. No timer, window, ceiling, tag or oracle
   moved.
+- **R5b by the cut's subtrees (round 9, review 3).** The wake of round 8
+  selected the waiting settles by the generation of the segment's `ReleaseCut`
+  rows. A generation holds several subtrees released in turn (the merge shape),
+  so the cut of `d4` woke the settles of `d5`; with the acquire waits woken
+  too, the extra trip changed the requester's lease observation, and the one
+  deadline extension of a lease-path settle (`claim_due` from the first sight
+  of the lease body, fixed once at the second deadline) ended 0.6 to 0.8 s
+  earlier, before the restarted root answered: about 300 more unsettled `EIO`s
+  in the second before the root's return on `sticky-s4-root-restart` than the
+  tree of round 7 had. The snapshot taken before the apply now selects by the
+  rows' `(gen, dir)` pairs (`Core::settles_waiting_cut`): a settle is woken
+  when its keys resolve to a subtree the segment cuts, or to a cross-subtree
+  set that involves one. The post-apply test (`settle_at_cut`) is gone for the
+  same reason. The acquire waits stay woken (without them seeds 403, 822 and
+  1321 fail: the settle sleeps the acquire back-off past the cut row).
+- **A settle backing off is resolved by this node's own acquisition (round 9).**
+  `resolve_moot_waits` took `AwaitingLog`, `InboxWaiting` and `AcquireRetry`
+  once this node's acquisition opened its view. A settle woken out of
+  `AcquireRetry` and answered `Busy` by the fenced root sits in `Backoff`
+  instead (`sticky-s4-merge` seed 73: 450 ms of back-off past the second
+  deadline while this node held the lease and ran as the root). The resolver
+  now takes this node's own settle in `Backoff` too. It is the back-off
+  timer's own transition (`on_forward_backoff`: view open, then
+  `resolve_in_doubt_then_execute`, then `finish`), moved earlier, so it sees no
+  state the timer cannot; every way into `Backoff` ends there. Not added:
+  `Forwarded` (a reply or a timeout moves it to `Backoff`, and the resolver runs
+  after every event) and a non-settle op (its lost dependencies are checked
+  first). Counted `settles_backoff_resolved`.
+- **F2c kept, with its cost (round 9).** "The root whose segment carried the
+  cut is alive" is taken from a segment delivered by the stream or polled from
+  S3 alike. A polled segment proves that the root shipped it, not that this
+  node has a P2P path to it, so a requester cut off from the root over P2P with
+  S3 up spends one forward timeout per cut segment before the inbox. Taking
+  `alive` from the stream only was measured: it reopens seeds 375 and 980 of
+  `sticky-s4-root-restart` (the restarted root's segment reaches the requester
+  by the S3 poll before the stream is subscribed again, the forward never goes
+  and the settle waits on the stale outage record to its deadline). Open: on a
+  polled segment send the forward and keep the inbox route, or take `alive` from
+  a polled segment only while the outage is older than the shipper's last P2P
+  contact.
+- **Evidence of round 9 (2,000 seeds per cell, a313f1db; `SWEEP-S4-EIO`
+  lines).** Fix arm, failing/tagged seeds and unsettled `EIO`s:
+  `sticky-s4-root-restart` 0/0 and 906 (round 7: 7/7 and 923; control 263/263
+  and 1,162; `CUT_ROW_WITHHELD` 250/250; `ROOT_IGNORES_CUT` 11/11),
+  `sticky-s4-merge` 0/0 and 186 (round 7: 185; control 24/24 and 201;
+  withheld 14/14; ignores 14/14), `sticky-s4-suspend` 0/0 and 675 (control
+  51/51 and 741); the three `+unsettled` lanes keep only untagged seeds (287,
+  1191, 1537 on merge, 287 on root-restart, 55 of the known suspend class), with
+  the same controls firing (tagged 263, 24, 51). Merge-lane confirmation on
+  one main (bb97ccc6), seeds 0 to 5,999: fix 539 `EIO`s, 0 tagged seeds;
+  round 7 543, 2 tagged (4309, 4859); fix more on 22 seeds, fewer on 27,
+  two-sided sign test p = 0.57. 203-label equivalence at 300 seeds: identical
+  but `locks-writer-hold-delegated-unsettled-own-clock` 234 (the round-8
+  finding, a pre-existing lock-plane class).
 - **The release row after the reads.** When the recalls are clear the holder
   journals the release row (`SubtreeReleased` or `StreamReleased`), which
   carries the note. Executions on the cut subtrees wait for it, as before.

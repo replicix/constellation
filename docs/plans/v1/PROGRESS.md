@@ -71607,6 +71607,16 @@ no seed of 0 to 9,999 fails on this tree. It is now a regression pin of the path
 unheard generation (a gate answers by a different rule, `gate_settle`, and cannot reach it). The finder is committed
 (`find_settle_not_redirected_unheard_seeds`, ignored).
 
+**Corrections of round 9 (Fable review 3), to the claims of this round.** (1) "`sticky-s4-root-restart` 265 to 0" is 172 of the control's
+265 tagged seeds cured; 30 keep the same `EIO` under no cut span (another subtree), 62 keep the rid's `EIO` 0.8 to 1.5 s earlier while the
+root is still down (the round's F2a/F2b wake, spurious: round 9 section 1), and 2 (32, 871) are the holder-down seeds, excused. (2) The
+plain `sticky-s4-merge` "0 of 2,000" was 1 by the tag's own rule: seed 73 was excused by the reach proxy ("cut row unshippable") although the
+root had appended the cut row 22 ms after the cut. (3) Seed 73 of `+unsettled` is F2b's class (the wake detaches the settle from the node's
+own acquisition: `Busy` from the fenced root, `Backoff`, and the made-moot resolver skipped `Backoff`), not the round-6 class; 1234 is a
+plain release row that wakes no waiting settle and the root's idle-release fence answering `Busy` for over 1.2 s (the lease did not move;
+it is not the 841 shape), pre-existing on main. (4) The `gate-summary.log` of `logs8/` records `exit 1 fmt` for a tree before the format; the tip
+is clean. (5) "resumes taken 1,902, sent 1,814" is a counting artifact: a rebooted node starts its `Stats` from zero.
+
 **Sweeps, 2,000 seeds each, fix arm unless marked** (logs in `logs8/`):
 
 | label | fix arm | control (`NO_RELEASE_CUT`) | `CUT_ROW_WITHHELD` | `ROOT_IGNORES_CUT` |
@@ -71647,3 +71657,56 @@ in the prototype of the spec too), as the full sim suite shows: not claimed fixe
 **Gates** (code commit, box1, fresh gate tree): fmt, clippy `--workspace --all-targets -D warnings`, lib tests meta (495 debug, 494
 release), authority (1,809, debug and release), net (167), engine (1,003), the model suite (debug and release), the release sim suite
 598 passed, 0 failed (17 ignored).
+
+## Plan 46 M1.3 step 15b: ReleaseCut round 9, the review of rounds 6 to 8 (2026-11-20)
+
+Rebased onto origin/main (a313f1db first, then bb97ccc6 with the lock re-send change; the only conflict was PROGRESS, both sides
+kept). Spec: `spec-round9.md`. Changes: the wake of a settle at a cut is selected by the segment's `(generation, subtree)` pairs
+(`Core::settles_waiting_cut`; ADR-64 "R5b by the cut's subtrees"), a settle backing off is resolved by this node's own acquisition
+(`resolve_moot_waits` takes `Backoff`; seed 73), the S4 excuse "row unshippable" is a fact on both arms (`Oracles::span_row_appended`,
+`Reach::root_run_for_a_row`), the resume counters are carried over reboots (`Report::resume_counts`) and `deleg_stream_resumes_received`
+added, both negative controls run on `sticky-s4-root-restart`, m03 has ceilings for the two `+unsettled` S4 labels. F2c (`alive` from a
+polled segment too) is kept with its cost (ADR-64). No timer, window, ceiling of an existing entry, tag or oracle moved to meet a number.
+
+**Table, 2,000 seeds per cell, every number from the `SWEEP-S4-EIO` lines (`AUTHORITY_SIM_S4_EIO=1`) with `rc9-proto/tab.py`**
+(builds on a313f1db; "failing / tagged" are seeds; EIOs are all unsettled `EIO`s, "span" those under a cut or held-release span):
+
+| label | fix arm: failing / tagged, EIOs (span) | control `NO_RELEASE_CUT` | `CUT_ROW_WITHHELD` | `ROOT_IGNORES_CUT` | round 7 | round 8 |
+|---|---|---|---|---|---|---|
+| `sticky-s4-root-restart` | 0 / 0, 906 (180) | 263 / 263, 1,162 | 250 / 250, 1,154 | 11 / 11, 916 | 7 / 7, 923 | 0 / 0, 1,170 |
+| `sticky-s4-root-restart+unsettled` | 1 (287) / 0, 906 | 263 / 263, 1,162 | 250 / 250, 1,154 | 12 / 11, 916 | | |
+| `sticky-s4-merge` | 0 / 0, 186 (7) | 24 / 24, 201 | 14 / 14, 203 | 14 / 14, 201 | 0 / 0, 185 | 1 / 1 (73), 187 |
+| `sticky-s4-merge+unsettled` | 3 (287, 1191, 1537) / 0, 186 | 27 / 24, 201 | 18 / 14, 203 | 17 / 14, 201 | | |
+| `sticky-s4-suspend` | 0 / 0, 675 | 51 / 51, 741 | 51 / 51, 741 | 51 / 51, 724 | 0 / 0, 675 | 0 / 0, 675 |
+| `sticky-s4-suspend+unsettled` | 55 / 0, 675 | 109 / 51, 741 | 109 / 51, 741 | 105 / 51, 724 | | |
+| `delegated-strict`, `sticky-leave`, `sticky-holder-restarts-placed` | 0, 0, 0 | | | | | |
+
+`sticky-s4-root-restart`: 597 of the 906 `EIO`s fall in 19 to 20 s (round 7: 597; the control 590), 185 in 20 to 21.5 s. The fix arm is at
+or below round 7 and the control on every lane in total `EIO`s (root-restart 906 against 923 and 1,162; the round-8 tree's 1,170 was
+the spurious wake of F2a/F2b). Every failing seed on the fix arm is untagged: 287 and 1537 (round 6 classes), 1191 (F1's schedule). Both
+negative controls fire on all three plain lanes (11 to 14 tagged seeds on root-restart and merge, 51 on suspend).
+
+**Merge-lane confirmation, 6,000 seeds, one main (bb97ccc6).** Plain `sticky-s4-merge`, seeds 0 to 5,999, fix arm (this tip) against the
+round-7 tree rebuilt on the same main (fresh builds, `AUTHORITY_SIM_S4_EIO=1`). Per 1,000 seeds, fix / round 7 (unsettled `EIO`s, of them
+under a span, tagged seeds): 0 to 999: 100 (4) / 97 (3), 0 / 0; 1000 to 1999: 86 (3) / 88 (3), 0 / 0; 2000 to 2999: 83 (4) / 86 (5), 0 / 0;
+3000 to 3999: 85 (0) / 86 (4), 0 / 0; 4000 to 4999: 95 (0) / 98 (5), 0 / 2 (4309, 4859); 5000 to 5999: 90 (2) / 88 (1), 0 / 0.
+Total: fix 539 `EIO`s (13 under a span, 410 seeds with an `EIO`, 0 tagged, 0 failing), round 7 543 (21, 415 seeds, 2 tagged, 2
+failing). Per seed, fix has more `EIO`s than round 7 on 22 seeds and fewer on 27 (388 equal); two-sided sign test p = 0.57, no
+difference in either direction. PASS (0 tagged on the fix arm; total at or below round 7's).
+
+**Equivalence**, 203 labels at 300 seeds, origin/main (bb97ccc6) against this tip, fresh per-tree builds, `touch` of every source:
+identical failing-seed sets on 202 labels. The one difference is the known one of round 8,
+`locks-writer-hold-delegated-unsettled-own-clock` seed 234 (this tree only; mutual exclusion of the lock plane, "node 3's held write landed
+after node 1's turn was acknowledged"): a pre-existing class on main that a schedule shift exposes (above), not touched here.
+
+**Open items** (follow-ups, not this round): 1234 of `sticky-s4-merge+unsettled` (a plain release row wakes no waiting settle and the
+root's idle-release fence answers `Busy` for over 1.2 s; the lease did not move to the requester, so it is not the 841 shape and the
+`Backoff` resolver does not reach it; pre-existing on main); the wake on a plain release row and the F1 resume when the gate becomes
+shippable after the inheritance; the deadline extension of a lease-path settle is fixed once from the first sight of the lease body and
+does not follow a later renewal (the rule stays sensitive to the read cadence); F2c on a polled segment (ADR-64); from round 6:
+`deleg_cut_rowless_after` unreached by any label, 287, 1537, the 303 ms bound.
+
+**Gates** (tip with the round-9 code, box, fresh gate tree, logs `logs10/`): fmt, clippy `--workspace --all-targets -D warnings` clean;
+lib tests meta (495 debug with and without `test-util`, 494 release), authority (1,820 debug and release), net (167), engine (1,003),
+all in debug and release, 0 failed; the model suite debug and release, 0 failed; the release sim suite 606 passed, 0 failed (17
+ignored), no `SWEEP-FAIL`; `tools/sim-determinism-gate.sh`: 8 labels, 300 seeds, identical at 2 and 16 threads.

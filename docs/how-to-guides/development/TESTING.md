@@ -4738,6 +4738,36 @@ regression pin (seeds 181, 757, 925), no longer a fail-before: no seed of 0 to 9
 with the rule reverted; the fail-before is the core test
 `a_root_keeps_a_settle_from_an_inherited_delegate_it_has_not_heard`, and the ignored
 `find_settle_not_redirected_unheard_seeds` lists the seeds that reach the path.
+Round 9 answered the review of rounds 6 to 8. The wake of a settle at a cut is selected by
+the `(generation, subtree)` pairs of the segment's `ReleaseCut` rows, not by the generation
+(core test `a_cut_of_one_subtree_does_not_wake_a_settle_of_another`; pin
+`s4_root_restart_seed_36_a_settle_of_another_subtree_is_not_woken`, which asserts that the
+rid of seed 36 has no unsettled `EIO` in `Report::unsettled_rids`), and a settle backing off is
+resolved when this node's own acquisition opens its view (core tests
+`a_settle_backing_off_is_resolved_when_this_nodes_acquisition_opens_the_view` and its guard
+`a_non_settle_backing_off_is_not_resolved_by_the_acquisition`; pin
+`s4_merge_seed_73_a_woken_settle_is_answered_by_the_nodes_own_acquisition`, which also needs
+`settles_backoff_resolved > 0`). The excuse of the S4 tag is a fact, one predicate on both
+arms: an `EIO` under a span (held-release or cut) is excused as "row unshippable" only if no
+root appended the span's row by the `EIO` (`Oracles::span_row_appended`, read from the lease
+holder's table history: the cut snapshot, or the generation gone after that same holder's table
+had it live) and the holder had no root to ship it to for one round trip
+(`Reach::root_run_for_a_row`: itself, or the root in force for `min_p2p_ms`). Each excuse
+prints both facts (`appended by a root`, `the holder's root run`) in the `SWEEP-S4-EIO` line;
+unit tests `a_span_row_is_appended_when_a_roots_table_shows_the_cut_or_the_release`,
+`a_span_row_is_not_appended_by_a_holder_that_never_had_the_generation` and
+`a_holder_has_a_root_for_a_row_when_it_is_the_root_or_reaches_it_for_a_round_trip`. Both
+negative controls now also run on `sticky-s4-root-restart`
+(`the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_root_restart`). Every S4 lane is
+compared with its control and with the previous rounds by one table (total unsettled `EIO`s,
+those under a span, root-blocked, excused, and on the root-restart label the count before and
+after the root's return), built from the `SWEEP-S4-EIO` lines of `AUTHORITY_SIM_S4_EIO=1`
+sweeps; a fix arm above round 7's or its control's total is a regression to fix. The resume
+counters (`deleg_stream_resumes_sent`, `deleg_stream_resumes`, `deleg_stream_resumes_stale`,
+`deleg_stream_resumes_received`, `deleg_inherited`) are carried over a node's reboots
+(`Report::resume_counts`), and the round-8 pin asserts `taken + stale = received <= sent <=
+inherited` by count. `m03_the_configurations_at_zero_violations_stay_there` has ceilings for
+`sticky-s4-merge+unsettled` and `sticky-s4-root-restart+unsettled`.
 `AUTHORITY_SIM_S4_EIO=1` prints every unsettled `EIO` of a sweep with its rid, verdict and
 span (to be kept with the failing-seed logs). The two pins
 `s4_suspend_settle_answered_at_the_cut` and
