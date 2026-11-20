@@ -24,8 +24,7 @@ use crate::error::MetaError;
 use crate::store::local::{DELEG_LOG_IDX_PREFIX, DELEG_VOID_CUT_PREFIX};
 use crate::store::primaries::PrimaryRow;
 use crate::store::{
-    kv_get_tx, kv_set_tx, misc, ns, Meta, KV_APPLIED_SEQ, KV_BOOTSTRAPPING, KV_USAGE_BYTES,
-    KV_USAGE_FILES,
+    kv_set_tx, misc, ns, Meta, KV_APPLIED_SEQ, KV_BOOTSTRAPPING, KV_USAGE_BYTES, KV_USAGE_FILES,
 };
 use constellation_fs_core::Ino;
 use constellation_mtree::keys;
@@ -281,6 +280,8 @@ impl Meta {
     /// converted any spilled payload's blob reference to this replica's
     /// local `blobs` keyspace), so nothing about them is unpublished.
     ///
+    /// [`Self::begin_bootstrap`] must have run first.
+    ///
     /// `page` must be strictly ascending by key (ingestion's own
     /// requirement) and, across calls, each page's keys must sort after
     /// the previous page's — exactly what a single ordered tree cursor,
@@ -290,7 +291,7 @@ impl Meta {
         if page.is_empty() {
             return Ok(());
         }
-        self.mark_bootstrapping()?;
+        self.debug_assert_bootstrapping();
         let mut ingestion = self.ns.inner().start_ingestion()?;
         for (k, v) in page {
             ingestion.write(k.clone(), v.clone())?;
@@ -299,27 +300,47 @@ impl Meta {
         Ok(())
     }
 
-    /// Record, before the first ingested row reaches a keyspace, that this
-    /// store is half-loaded ([`KV_BOOTSTRAPPING`]). Every ingestion calls it
-    /// first (from either thread of a streamed bootstrap): the marker is
-    /// committed before the rows exist, so a crash at any later point leaves
-    /// a store [`Meta::open`] refuses, and [`Self::apply_bootstrap_indexes`]
-    /// clears it ([`Self::finish_bootstrap`]) once the caller's bootstrap is
-    /// whole.
+    /// Record, before any row is ingested, that this store is half-loaded
+    /// ([`KV_BOOTSTRAPPING`]), and make the marker durable. The caller of a
+    /// bootstrap runs it once, first, before it starts any thread that
+    /// ingests ([`Self::ns_ingest_page`], [`Self::ns_ingest_drain`],
+    /// [`Self::ingest_primary_runs`]): a crash at any later point leaves a
+    /// store [`Meta::open`] refuses, until [`Self::finish_bootstrap`] clears
+    /// the marker once the caller's bootstrap is whole.
     ///
-    /// The marker is synced before the first ingested row: the ingested
-    /// tables are fsynced as they are registered, but a buffered commit
-    /// reaches only the OS, so a power loss could keep the names and lose
-    /// the marker, and the next open would take a partial store for a
-    /// complete one. One sync per bootstrap (later pages find the marker).
-    fn mark_bootstrapping(&self) -> Result<(), MetaError> {
+    /// The sync matters: the ingested tables are fsynced as they are
+    /// registered, but a buffered commit reaches only the OS, so a power loss
+    /// could keep the names and lose the marker, and the next open would take
+    /// a partial store for a complete one. No ingestion marks or syncs on its
+    /// own (two threads that did would let the second skip the sync while the
+    /// first was still in it). One sync per bootstrap.
+    ///
+    /// # Errors
+    /// A store error; nothing may be ingested then.
+    pub fn begin_bootstrap(&self) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
-        if kv_get_tx(&tx, &self.local, KV_BOOTSTRAPPING)?.is_none() {
-            kv_set_tx(&mut tx, &self.local, KV_BOOTSTRAPPING, "1");
-            tx.commit()?;
-            self.sync()?;
+        kv_set_tx(&mut tx, &self.local, KV_BOOTSTRAPPING, "1");
+        tx.commit()?;
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let pause = self
+                .marker_pause
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(pause) = pause {
+                pause(self);
+            }
         }
-        Ok(())
+        self.sync()
+    }
+
+    /// Debug builds: an ingestion starts only after [`Self::begin_bootstrap`].
+    fn debug_assert_bootstrapping(&self) {
+        debug_assert!(
+            self.kv_get(KV_BOOTSTRAPPING).is_ok_and(|v| v.is_some()),
+            "an ingestion before begin_bootstrap"
+        );
     }
 
     /// The bootstrap is whole: clear the marker ([`KV_BOOTSTRAPPING`]) and
@@ -344,7 +365,7 @@ impl Meta {
         if page.is_empty() {
             return Ok(());
         }
-        self.mark_bootstrapping()?;
+        self.debug_assert_bootstrapping();
         let mut ingestion = self.ns.inner().start_ingestion()?;
         for (k, v) in page.drain(..) {
             ingestion.write(k, v)?;
@@ -368,7 +389,7 @@ impl Meta {
         &self,
         runs: std::sync::mpsc::Receiver<Option<PrimaryRun>>,
     ) -> Result<(), MetaError> {
-        self.mark_bootstrapping()?;
+        self.debug_assert_bootstrapping();
         let mut ingestion = self.primaries.inner().start_ingestion()?;
         let mut last: Option<Ino> = None;
         while let Ok(run) = runs.recv() {

@@ -703,7 +703,7 @@ matter here:
   `xattr_by_name`, not published or journaled: it is maintained in the `ns`
   funnel, in the transaction of the name write. A bootstrap writes the rows
   from the key-ordered cursor, on a second thread, and a `bootstrapping`
-  marker in `local` (set and synced before the first ingested page, removed
+  marker in `local` (set and synced by the caller of the load before either thread ingests, removed
   and synced once the load, the log replay from the commit and the recorded
   commit are done) makes a store whose bootstrap never finished refuse to
   open; the node removes it and bootstraps again

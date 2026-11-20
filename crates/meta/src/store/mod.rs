@@ -978,7 +978,15 @@ pub struct Meta {
     /// says nothing about what was written).
     #[cfg(any(test, feature = "test-util"))]
     synced_journals: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, Vec<u8>>>>,
+    /// Tests only: called, with this store, between the bootstrap marker's
+    /// commit and its sync ([`Meta::set_marker_pause_for_tests`]).
+    #[cfg(any(test, feature = "test-util"))]
+    marker_pause: std::sync::Mutex<Option<MarkerPause>>,
 }
+
+/// See [`Meta::set_marker_pause_for_tests`].
+#[cfg(any(test, feature = "test-util"))]
+type MarkerPause = std::sync::Arc<dyn Fn(&Meta) + Send + Sync>;
 
 /// The most journal bytes fjall keeps before it asks the keyspaces that
 /// lag behind the oldest journal to flush (fjall's default is 512 MiB, its
@@ -1387,6 +1395,15 @@ impl Meta {
         self.closed.store(true, Ordering::Release);
     }
 
+    /// Tests only: run `pause` (given this store) in the window after the
+    /// bootstrap marker is committed and before its sync starts, so a test
+    /// can see what else happens while the marker is only buffered.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_marker_pause_for_tests(&self, pause: impl Fn(&Meta) + Send + Sync + 'static) {
+        *self.marker_pause.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::sync::Arc::new(pause));
+    }
+
     /// Tests only: from now on remember what each [`Meta::sync`] made
     /// durable, for [`Self::drop_losing_unsynced_for_tests`]. Syncs first.
     #[cfg(any(test, feature = "test-util"))]
@@ -1405,6 +1422,10 @@ impl Meta {
     /// [`Self::arm_power_loss_for_tests`] (a journal created since is
     /// removed), then the store is dropped without closing. Tables and the
     /// version file were fsynced when written, so they stay.
+    ///
+    /// The snapshot is taken after a sync returns, so a commit another
+    /// thread made in between counts as synced: single-threaded callers
+    /// only, or callers that order their commits around the sync.
     ///
     /// # Panics
     /// The store was not armed, or a journal cannot be rewritten.
@@ -1605,6 +1626,8 @@ impl Meta {
             closed: AtomicBool::new(true),
             #[cfg(any(test, feature = "test-util"))]
             synced_journals: std::sync::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            marker_pause: std::sync::Mutex::default(),
         };
         meta.check_format()?;
         meta.init_root_tx_hint()?;

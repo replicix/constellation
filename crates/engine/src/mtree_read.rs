@@ -610,6 +610,9 @@ pub(crate) fn load_tree(
     // goes on, a run of settled rows at a time, so building them costs the
     // walk no time; a store that already has rows takes them in
     // `Meta::apply_bootstrap_indexes` instead.
+    // The store is marked half-loaded, durably, before either thread
+    // ingests anything.
+    meta.begin_bootstrap()?;
     if !meta.primaries_ingestible()? {
         let (counts, derived, root_row) = load_tree_walk(tree, root, meta, resolver, None)?;
         return load_tree_end(meta, counts, derived, root_row);
@@ -1297,6 +1300,51 @@ mod tests {
         };
         assert_eq!(namespace(&fresh), namespace(&meta));
         assert_eq!(fresh.lookup(e, "f2").unwrap().unwrap().nlink, 3);
+    }
+
+    /// No row of the bootstrap reaches a table while the bootstrap marker is
+    /// only buffered. The pause holds whichever thread commits the marker
+    /// between its commit and its sync, and watches the namespace for 300 ms:
+    /// a table that appears then is on the disk (tables are fsynced) while a
+    /// power loss could still take the marker. Fail-before: the worker marked
+    /// the store first, and the walk's first page, finding the marker already
+    /// committed, ingested without waiting for the worker's sync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_row_is_ingested_while_the_marker_is_unsynced() {
+        let (store, _meta, _commit, _dirs) = published(4, 20).await;
+        let scratch = TempDir::new().unwrap();
+        let reader = ChainReader::for_store(Arc::clone(&store), None, scratch.path()).unwrap();
+        let fresh = Arc::new(crate::mtree_publish::test_meta());
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let grew = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (paused, grew) = (Arc::clone(&paused), Arc::clone(&grew));
+            fresh.set_marker_pause_for_tests(move |meta| {
+                paused.store(true, std::sync::atomic::Ordering::SeqCst);
+                let before = meta.ns_dump().unwrap().len();
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                while std::time::Instant::now() < until {
+                    if meta.ns_dump().unwrap().len() > before {
+                        grew.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            });
+        }
+        bootstrap_from_commit(&reader, Arc::clone(&fresh))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            paused.load(std::sync::atomic::Ordering::SeqCst),
+            "the marker was never set"
+        );
+        assert!(
+            !grew.load(std::sync::atomic::Ordering::SeqCst),
+            "a page was ingested while the marker was committed but not synced"
+        );
+        fresh.check_primary_index().unwrap();
     }
 
     /// The first publish after a bootstrap is a small delta, not a

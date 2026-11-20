@@ -340,6 +340,7 @@ fn bootstrap_copies(meta: &Meta) -> Result<(), TestCaseError> {
 /// builder.
 fn ingest_copy(meta: &Meta) -> Meta {
     let fresh = Meta::open_in_memory().unwrap();
+    fresh.begin_bootstrap().unwrap();
     let mut builder = BootstrapIndexBuilder::new();
     let rows = meta.ns_dump().unwrap();
     for page in rows.chunks(64) {
@@ -360,6 +361,7 @@ fn ingest_copy(meta: &Meta) -> Meta {
 fn stream_copy(meta: &Meta, min: usize) -> Meta {
     let fresh = Meta::open_in_memory().unwrap();
     assert!(fresh.primaries_ingestible().unwrap());
+    fresh.begin_bootstrap().unwrap();
     let mut builder = BootstrapIndexBuilder::new();
     let rows = meta.ns_dump().unwrap();
     std::thread::scope(|s| {
@@ -727,23 +729,19 @@ fn a_bootstrap_that_never_finished_is_refused() {
     let page = vec![(keys::rdentry(FILES[0], PARENTS[1], b"x"), Vec::new())];
     {
         let meta = Meta::open(dir.path()).unwrap();
+        meta.begin_bootstrap().unwrap();
         meta.ns_ingest_page(&page).unwrap();
         // The process dies here: no `apply_bootstrap_indexes`.
     }
-    assert!(matches!(
-        Meta::open(dir.path()),
-        Err(MetaError::BootstrapInterrupted)
-    ));
+    assert_refused(dir.path());
     // Not even an open that gets as far as the marker check opens it, twice.
-    assert!(matches!(
-        Meta::open(dir.path()),
-        Err(MetaError::BootstrapInterrupted)
-    ));
+    assert_refused(dir.path());
     let finished = tempfile::tempdir().unwrap();
     {
         let meta = Meta::open(finished.path()).unwrap();
         let mut builder = BootstrapIndexBuilder::new();
         builder.observe_name(&page[0].0);
+        meta.begin_bootstrap().unwrap();
         meta.ns_ingest_page(&page).unwrap();
         meta.apply_bootstrap_indexes(builder).unwrap();
         meta.finish_bootstrap().unwrap();
@@ -766,13 +764,11 @@ fn the_marker_survives_a_power_loss_after_the_first_page() {
         // The genesis reached the disk (the tree fetch outlasted the
         // kernel's writeback delay); the marker's commit is not synced.
         meta.arm_power_loss_for_tests().unwrap();
+        meta.begin_bootstrap().unwrap();
         meta.ns_ingest_page(&page).unwrap();
         meta.drop_losing_unsynced_for_tests();
     }
-    assert!(matches!(
-        Meta::open(dir.path()),
-        Err(MetaError::BootstrapInterrupted)
-    ));
+    assert_refused(dir.path());
 }
 
 /// The same for the streamed rows' own ingestion (the worker thread's
@@ -788,13 +784,11 @@ fn the_marker_survives_a_power_loss_after_the_streamed_rows() {
         let (runs, rx) = std::sync::mpsc::sync_channel(2);
         runs.send(Some(builder.take_all_primaries())).unwrap();
         runs.send(None).unwrap();
+        meta.begin_bootstrap().unwrap();
         meta.ingest_primary_runs(rx).unwrap();
         meta.drop_losing_unsynced_for_tests();
     }
-    assert!(matches!(
-        Meta::open(dir.path()),
-        Err(MetaError::BootstrapInterrupted)
-    ));
+    assert_refused(dir.path());
 }
 
 /// The window after the derived rows are in and before the caller has
@@ -811,21 +805,20 @@ fn a_crash_between_the_load_and_the_finish_is_refused() {
         let meta = Meta::open(dir.path()).unwrap();
         let mut builder = BootstrapIndexBuilder::new();
         builder.observe_name(&page[0].0);
+        meta.begin_bootstrap().unwrap();
         meta.ns_ingest_page(&page).unwrap();
         meta.apply_bootstrap_indexes(builder).unwrap();
         // The replay of the log tail, the recorded commit: not yet.
         meta.drop_without_close_for_tests();
     }
-    assert!(matches!(
-        Meta::open(dir.path()),
-        Err(MetaError::BootstrapInterrupted)
-    ));
+    assert_refused(dir.path());
     let finished = tempfile::tempdir().unwrap();
     {
         let meta = Meta::open(finished.path()).unwrap();
         meta.arm_power_loss_for_tests().unwrap();
         let mut builder = BootstrapIndexBuilder::new();
         builder.observe_name(&page[0].0);
+        meta.begin_bootstrap().unwrap();
         meta.ns_ingest_page(&page).unwrap();
         meta.apply_bootstrap_indexes(builder).unwrap();
         meta.finish_bootstrap().unwrap();
@@ -847,12 +840,10 @@ fn a_streamed_bootstrap_that_never_finished_is_refused() {
         let (runs, rx) = std::sync::mpsc::sync_channel(2);
         runs.send(Some(builder.take_all_primaries())).unwrap();
         runs.send(None).unwrap();
+        meta.begin_bootstrap().unwrap();
         meta.ingest_primary_runs(rx).unwrap();
     }
-    assert!(matches!(
-        Meta::open(dir.path()),
-        Err(MetaError::BootstrapInterrupted)
-    ));
+    assert_refused(dir.path());
 }
 
 /// The ingestion path's rows are the funnel's, byte for byte, after a
@@ -959,4 +950,15 @@ fn a_single_name_inode_has_a_one_row_and_a_complete_read() {
     let got = meta.names_of_ino(f, 1);
     assert_eq!(got.names, vec![(dir, "x".to_string())]);
     assert!(got.complete);
+}
+
+/// `Meta::open` refuses the store as an interrupted bootstrap; a failure
+/// prints what it did instead (opened, or another error).
+#[track_caller]
+fn assert_refused(path: &std::path::Path) {
+    let opened = Meta::open(path).map(|_| "opened");
+    assert!(
+        matches!(opened, Err(MetaError::BootstrapInterrupted)),
+        "expected BootstrapInterrupted, got {opened:?}"
+    );
 }

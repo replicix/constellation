@@ -270,6 +270,7 @@ mod tests {
             let meta = Meta::open(&db).unwrap();
             // The first page of a bootstrap, then the process dies.
             let key = constellation_mtree::keys::rdentry(7, 1, b"x");
+            meta.begin_bootstrap().unwrap();
             meta.ns_ingest_page(&[(key, Vec::new())]).unwrap();
         }
         assert!(open_existing_replica(&db).unwrap().is_none());
