@@ -393,6 +393,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         "stress-ng-fs",
         Skip::Unported("stress-ng on one mount (the lane's pods have no stress-ng) with VolumeSnapshots for its mid-run snapshots"),
     ),
+    (
+        "stress-ng-fs-faults",
+        Skip::Unported("stress-ng on one mount (the lane's pods have no stress-ng) under S3 latency and cuts"),
+    ),
     ("stress-ng-flap", Skip::Local(&[S3_FAULTS])),
     ("big-file-write", Skip::Local(&[RSS, CACHE])),
     ("staging-crash", Skip::Local(&[KILL])),
