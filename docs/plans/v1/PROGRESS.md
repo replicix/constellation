@@ -71287,7 +71287,8 @@ Harness `lock-grace-wait` failed intermittently (also on the tree before the O2 
   push. No safety or liveness loss: the waiter was granted one round trip later.
 - **Fix (`core/locks.rs`), where the cap binds only:** when the route is `Route::Me { cap_ms }` with `cap_ms <
   lock_ttl`, the re-send interval is `(cap - m) / 2` less two `recall_hold_ms` (the hold and a round trip), at least 50
-  ms and at most the configured interval; an owner that grants the configured ttl keeps `(lock_ttl - m) / 2` (a request
+  ms and at most the configured interval (the last request is then within the window for the cap as it stands when the
+  waiter is told; an owner whose authority is not renewed meanwhile may still ask again: liveness only); an owner that grants the configured ttl keeps `(lock_ttl - m) / 2` (a request
   that ages past the window there is asked again, as before). The push rule, the unreachable-node branch, D8 and the ADRs
   are unchanged. (The first form of the fix, lockre, shortened it everywhere: it moved the uncapped schedules, 8 sim
   pins and the `locks-unlinked-delegated-blips+unsettled` ceiling's measure; the cap-only form leaves them.)
@@ -71302,7 +71303,8 @@ Harness `lock-grace-wait` failed intermittently (also on the tree before the O2 
   (1 allowed in seeds 0..99 on main and here; the CEILING lines are identical to main's, 38 of 38).
 - **Harness:** `lock-contention-delegated` no longer requires `asked_again > 0` over all rounds (the waiters now
   re-send in time under the capped grants). It gains a round with a waiter that does not re-send: b holds, only c waits,
-  c's daemon is stopped 0.5 s after its request and thawed 0.5 s after b's unlock; `asked_again` must rise, c must get
+  c's daemon is stopped once b has answered c's held request (polled from b's new `waiting_replies` status counter, bounded, no fixed sleep; parked alone is not enough: stopped before the reply c is not a stale waiter, 4 of 5 failed) and
+  thawed 0.5 s after b's unlock, at least 1.5 s after the stop; `asked_again` must rise, c must get
   the lock within `MAX_GAP` of the thaw and the counter is `3 * ROUNDS + 2`. The freeze excuses that round's own gap only
   (measured from the thaw; the other rounds' median and max, and the `recalls_expired` check, are unchanged). Skipped at
   the default delegation TTL. Fail-before: with c not stopped, `asked_again` does not rise.

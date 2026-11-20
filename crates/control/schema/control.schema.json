@@ -5586,6 +5586,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "waiting_replies": {
+          "description": "Held requests this owner answered \"wait, re-send in `retry_ms`\" (the\nhold's end): a parked waiter has then been told its re-send time.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "would_block": {
           "format": "uint64",
           "minimum": 0,
@@ -5635,6 +5641,7 @@
         "recalls_expired",
         "reclaimed",
         "waiters_parked",
+        "waiting_replies",
         "grace_refusals",
         "grace_wait_answers",
         "not_yet_answers",

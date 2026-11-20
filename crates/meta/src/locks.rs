@@ -870,6 +870,7 @@ pub struct LockStats {
     pub recalls_expired: u64,
     pub reclaimed: u64,
     pub waiters_parked: u64,
+    pub waiting_replies: u64,
     pub grace_refusals: u64,
     /// Plan 30 §M14 phase 2: tagged mutations this executor rejected
     /// because a grant they named was no longer live (`EIO`, nothing

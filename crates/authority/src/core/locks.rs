@@ -2228,9 +2228,8 @@ impl Core {
         // 9.5 s at the defaults, which a capped grant's window is not), and
         // every `(lock_ttl - margin) / 2` otherwise, so that a request which
         // ages past the window there is asked again. A delegate (or a
-        // lease-capped root)
-        // grants for what is left of its authority, about 2 to 3 s: a push served from a
-        // request seconds old arrived lapsed (the holder drops those: see
+        // lease-capped root) grants for what is left of its authority, about
+        // 2 to 3 s: a push served from a request seconds old arrived lapsed (the holder drops those: see
         // `lock_op_outcome`) and asked again behind the next waiter's
         // recall, or the owner's record of it was expired when made (the
         // next waiter of the pass granted over it) — 14 of 300 seeds of the
@@ -3180,8 +3179,11 @@ impl Core {
         // it had a request too old for a timer push (the grace's end, a
         // release) and was asked again instead of served. Less the time
         // the request was held and a round trip (two `recall_hold_ms`),
-        // the request a waiter last sent is then never older than the
-        // push window when its turn comes.
+        // the request a waiter last sent is then not older than the push
+        // window when its turn comes, for the cap as it stands when told:
+        // an owner whose authority is not renewed meanwhile shrinks the
+        // window and may still ask again (liveness only; the ask-again
+        // fallback is intact).
         //
         // Only where the cap binds (`cap < lock_ttl`): an owner that grants
         // the configured ttl keeps the configured interval, its schedule
@@ -3193,6 +3195,8 @@ impl Core {
             .saturating_sub(self.cfg.expiry_margin_ms)
             / 2)
         .max(50);
+        // The route lookup notes a hold grant under an epoch hold
+        // (`lock_cap_ms`): conservative, a slightly later beat guard.
         let cap = self.lk.waiters.iter().find(|w| w.id == wid).and_then(|w| {
             match self.lock_route_answering(now, w.ino, replica, w.node, false) {
                 Route::Me { cap_ms, .. } => Some(cap_ms),
@@ -3310,7 +3314,7 @@ impl Core {
                 }
             }
             // A remote waiter not heard from within its window (a live
-            // one re-sends every `(ttl - margin) / 2`) would find a grant lapsed on
+            // one re-sends within `(ttl - margin) / 2`) would find a grant lapsed on
             // arrival and ask again anyway — or it is gone (killed while
             // parked): granting it would make everyone behind it wait out
             // `ttl + margin` for nothing, once per such waiter. Skipped,
@@ -4866,7 +4870,7 @@ impl Core {
 
     /// A grant was installed that is not recalled: answer every other op
     /// of this node on the inode that it covers now, at its position,
-    /// instead of leaving each to its own request or its re-send (9.5 s at
+    /// instead of leaving each to its own request or its re-send (up to 9.5 s at
     /// the production lock ttl: a push wakes the one op it is matched to).
     /// An op's request in flight is moved to `done_reqs`, as a push moves
     /// it, so its reply installs over the held id. The waiters these ops

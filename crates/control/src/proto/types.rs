@@ -2121,6 +2121,9 @@ pub struct LockStatus {
     pub recalls_expired: u64,
     pub reclaimed: u64,
     pub waiters_parked: u64,
+    /// Held requests this owner answered "wait, re-send in `retry_ms`" (the
+    /// hold's end): a parked waiter has then been told its re-send time.
+    pub waiting_replies: u64,
     pub grace_refusals: u64,
     /// Plan 43 F-b, as the owner: non-blocking requests answered "wait"
     /// for a grace, and for a tenure floor, a barrier or a delegate's

@@ -1771,8 +1771,9 @@ impl<'a> Frozen<'a> {
 
     /// Thaw it now.
     fn thaw(&mut self) -> Result<()> {
+        self.client.resume()?;
         self.stopped = false;
-        self.client.resume()
+        Ok(())
     }
 }
 
@@ -1803,15 +1804,38 @@ fn stale_waiter_round(clients: &[Client], hold: Duration) -> Result<StaleRound> 
     use std::os::unix::fs::FileExt;
     let asked =
         |c: &Client| -> Result<u64> { Ok(locks_of(c)?["asked_again"].as_u64().unwrap_or(0)) };
+    // `waiting_replies`: b has answered c's held request "re-send in ...", so
+    // c has been told its re-send time (a daemon stopped before that is not
+    // the waiter this round is about).
+    let parked =
+        |c: &Client| -> Result<u64> { Ok(locks_of(c)?["waiting_replies"].as_u64().unwrap_or(0)) };
     let asked_before = asked(&clients[1])?;
+    let parked_before = parked(&clients[1])?;
     let hf = open_rw(&clients[1].mnt.join("d1/counter"))?;
     let locked_at = Instant::now();
     flock(&hf, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("holder flock: {e}"))?;
     let path = clients[2].mnt.join("d1/counter");
     let waiter = std::thread::spawn(move || counter_turn(path, Duration::from_millis(300)));
-    std::thread::sleep(Duration::from_millis(800));
+    // Stop c only once b has answered its held request (under load the open,
+    // the flock and the forward take their time): a daemon stopped before it
+    // was told its re-send time leaves b no stale waiter. The deadline scales
+    // with the host load.
+    eventually(
+        "b answered c's held request before c is stopped",
+        Duration::from_secs(30),
+        || {
+            anyhow::ensure!(
+                parked(&clients[1])? > parked_before,
+                "b has not answered c's held request (waiting_replies still {parked_before})"
+            );
+            Ok(())
+        },
+    )?;
     let mut frozen = Frozen::new(&clients[2])?;
-    std::thread::sleep(hold.saturating_sub(locked_at.elapsed()));
+    // Unlock at least `STALE_FOR` after the stop (the request must age past
+    // the push window), and not before the hold is over.
+    const STALE_FOR: Duration = Duration::from_millis(1_500);
+    std::thread::sleep(hold.saturating_sub(locked_at.elapsed()).max(STALE_FOR));
     {
         let mut buf = [0u8; 8];
         let got = hf.read_at(&mut buf, 0)?;

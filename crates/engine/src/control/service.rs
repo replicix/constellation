@@ -761,6 +761,7 @@ impl EngineControl {
                     recalls_expired: stats.lock_recalls_expired,
                     reclaimed: stats.lock_reclaimed,
                     waiters_parked: stats.lock_waiters_parked,
+                    waiting_replies: stats.lock_waiting_replies,
                     grace_refusals: stats.lock_grace_refusals,
                     grace_wait_answers: stats.lock_grace_waits,
                     not_yet_answers: stats.lock_not_yet_waits,

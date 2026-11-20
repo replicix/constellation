@@ -1061,7 +1061,11 @@ When a node asks for a grant that conflicts with grants held elsewhere:
 3. A blocking request (`F_SETLKW`, `flock` without `LOCK_NB`) is
    parked, first-in first-out per inode. The request is answered
    `Waiting` after a short hold (`recall_hold_ms`, 250 ms). The node
-   re-sends it every `(ttl − margin) / 2`, and the grant is pushed to the
+   re-sends it every `(ttl − margin) / 2` (where the owner's authority
+   caps the granted ttl below the configured one, within the capped push
+   window instead: `(cap − margin) / 2` less two `recall_hold_ms`, at
+   least 50 ms, never more than the configured interval), and the grant
+   is pushed to the
    node (`LockGranted`) when it becomes free. A parked request is granted
    live from its latest arrival, not from when it is served — but never
    ending sooner than the node's live grant on the file that it
@@ -1080,8 +1084,11 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    into its window). That is 9.5 s for an uncapped 20 s grant, but a
    delegate's grants (and a lease-capped root's) are capped by what is
    left of its authority: about 2 to 3 s under a delegation of 5 s, so
-   for them it is 0.5 to 1 s, against a waiter that re-sends every 9.5 s
-   (the daemon's default delegation TTL is the lock TTL, `Config::
+   for them it is 0.5 to 1 s. A waiter held there is told to re-send
+   inside that window (less two holds), so the ask is the fallback for a
+   waiter that does not re-send, or whose owner's authority shrinks
+   unrenewed, not the common case (it was a waiter re-sending every
+   9.5 s; the daemon's default delegation TTL is the lock TTL, `Config::
    default_delegation_ttl_ms`: its delegates' grants are capped at 13 to
    18 s and the window at 6 to 8.5 s, so the rule asks less there; it is
    for a short delegation TTL, a delegate whose renewals lag under load,
@@ -2041,7 +2048,7 @@ for both roles:
   see above);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
-  `grace_refusals`, `grace_wait_answers`, `not_yet_answers` and
+  `waiting_replies`, `grace_refusals`, `grace_wait_answers`, `not_yet_answers` and
   `stale_owner_answers` (non-blocking requests told to wait: for a
   grace, for a tenure floor, a barrier or a delegate's authority, and
   for an owner that may not grant at all yet), `grace_end_serves` (grace
