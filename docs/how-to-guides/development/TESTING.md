@@ -153,7 +153,7 @@ for 120 s, against a live mount behind the harness's fault proxy:
 | Scenario | What |
 |---|---|
 | `stress-ng-fs` | one node, one mount; accounting snapshots on, a few seed files written first, two snapshots of `/` taken mid-run |
-| `stress-ng-fs-faults` | the same under 40 ± 20 ms S3 latency and a 1.5 s S3 cut every 4–7 s; no snapshots. A **known-bug reproduction**: run it by name |
+| `stress-ng-fs-faults` | the same under 40 ± 20 ms S3 latency and a 1.5 s S3 cut every 4–7 s; no snapshots. In the default set since ADR-66 (a close retries like an `fsync`) |
 | `stress-ng-fs-nodes` | the same on three P2P nodes of one filesystem at once, each in its own directory; snapshots from a non-holder. A **known-bug reproduction** (`KNOWN_BUG_REPROS`): run it by name |
 
 A run passes when all of these hold:
@@ -225,7 +225,7 @@ CONSTELLATION_FUSE_TRANSPORT=dev-fuse target/release/harness run stress-ng-fs
 sudo env HOME=/root PATH=$PATH \
     CONSTELLATION_FUSE_URING_ZERO_COPY=auto \
     target/release/harness run stress-ng-fs      # as root: uring_zc, passthrough too
-target/release/harness run stress-ng-fs-nodes stress-ng-fs-faults  # known-bug repros
+target/release/harness run stress-ng-fs-nodes  # known-bug repro
 # one stressor (or a few) through the whole harness, excluded ones included:
 STRESS_NG_FS_ONLY=lockmix STRESS_NG_FS_SECS=20 target/release/harness run stress-ng-fs
 # one stressor directly on a mount you made (fresh mount per stressor:
@@ -1913,7 +1913,9 @@ a documented bug as a regression. `harness run <name>` resolves a name
 in either list. When a later milestone fixes the bug, its scenario
 moves into `SCENARIOS` as the regression test. Plan 30 M2 moved
 `forward-timeout-reexec` (bug A) and M3a moved both bug B scenarios
-below. The list holds two scenarios of
+below. `stress-ng-fs-faults` moved there too (ADR-66: its `close` and `fsync`
+failures under load were the upload claims, an in-doubt close and a close
+that gave up on a transient failure). The list holds one scenario of
 [the stress-ng-fs lane](#stress-every-stress-ng-filesystem-stressor-stress-ng-fs)
 today:
 
@@ -1923,11 +1925,6 @@ today:
   epoch, and forwarded mutations wait out their 120 s timeout. One
   non-holder ends with every FUSE worker waiting, and its stress-ng
   processes cannot be killed.
-- `stress-ng-fs-faults` fails about one run in four. Every S3 cut opens a
-  continuation epoch on the single node, and closing it is handled as the
-  lease going away: all cluster lock grants are dropped, lock holders'
-  writes fail with `EIO` and new locks with `ENOLCK`. Once the epoch froze
-  instead, and a create after the run failed with `EROFS`.
 
 Reproducing these needed two things no scenario had before:
 
