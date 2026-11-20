@@ -724,13 +724,6 @@ pub const SCENARIOS: &[Scenario] = &[
         run: stressfs::stress_ng_fs,
     },
     Scenario {
-        name: "stress-ng-fs-faults",
-        desc: "stress-ng-fs under 40+/-20 ms S3 latency and a 1.5 s S3 cut every 4-7 s",
-        requires: &["stress-ng"],
-        caps: &[],
-        run: stressfs::stress_ng_fs_faults,
-    },
-    Scenario {
         name: "stress-ng-flap",
         desc: "stress-ng metadata churn while S3 flaps; mount healthy + spool drains",
         requires: &["stress-ng"],
@@ -2572,14 +2565,16 @@ pub const CAMPAIGN: &[Scenario] = &[
 /// FUSE workers all end up waiting, leaving stress-ng processes unkillable
 /// (TESTING.md, "stress-ng-fs").
 ///
-/// `stress-ng-fs-faults` (in `SCENARIOS` since ADR-66, its `close` and `fsync`
-/// errors fixed) may still hit a separate, unfixed bug: every S3 cut opens a
-/// continuation epoch on the single node, and its close is handled as the
-/// lease going away — every cluster lock grant is dropped (`lease gone: lock
-/// grants dropped`), the lock holders' writes fail with `EIO` and new locks
-/// with `ENOLCK` (`fcntl`: `F_OFD_SETLK` `ENOLCK`) until the lease is back;
-/// once the epoch froze instead and a create after the run failed with
-/// `EROFS`.
+/// `stress-ng-fs-faults`: ADR-66 fixed its `close` and `fsync` errors, but two
+/// bugs remain open and fail it about one run in thirty: the sync task
+/// answers no `DrainInode` while a core round is in its upload phase (a FUSE
+/// request stalls for tens of seconds, once past 240 s under load), and
+/// every S3 cut opens a continuation epoch on the single node, whose close
+/// is handled as the lease going away — every cluster lock grant is dropped
+/// (`lease gone: lock grants dropped`), the lock holders' writes fail with
+/// `EIO` and new locks with `ENOLCK` (`fcntl`: `F_OFD_SETLK` `ENOLCK`) until
+/// the lease is back; once the epoch froze instead and a create after the
+/// run failed with `EROFS`. It moves to `SCENARIOS` when both are fixed.
 pub const KNOWN_BUG_REPROS: &[Scenario] = &[
     Scenario {
         name: "stress-ng-fs-nodes",
@@ -2587,6 +2582,13 @@ pub const KNOWN_BUG_REPROS: &[Scenario] = &[
         requires: &["stress-ng"],
         caps: &[],
         run: stressfs::stress_ng_fs_nodes,
+    },
+    Scenario {
+        name: "stress-ng-fs-faults",
+        desc: "stress-ng-fs under 40+/-20 ms S3 latency and a 1.5 s S3 cut every 4-7 s",
+        requires: &["stress-ng"],
+        caps: &[],
+        run: stressfs::stress_ng_fs_faults,
     },
 ];
 

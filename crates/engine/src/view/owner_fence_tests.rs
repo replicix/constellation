@@ -3852,3 +3852,151 @@ fn a_refused_inline_wait_at_a_publication_discards_nothing() {
     );
     assert_eq!(gate, Ok(false));
 }
+
+/// What a scripted core saw of a deferred close's publication.
+struct CloseSeen {
+    /// The fencing token of each forwarded `SetManifest`.
+    commit_tags: Vec<constellation_meta::locks::LockTag>,
+    /// Whether the grant could not be released while each commit was unanswered.
+    blocked_at_commit: Vec<bool>,
+    /// The same at each drain asked after a commit was answered.
+    blocked_at_later_drain: Vec<bool>,
+    result: Result<(), Code>,
+}
+
+/// A write-through close (deferred to the `fsync` pool) by a process that
+/// holds a cluster lock, on a node that forwards its commit, against a
+/// scripted core that answers each `SetManifest` with `outcome`.
+fn deferred_close_under_a_lock(outcome: constellation_meta::MutateOutcome) -> CloseSeen {
+    let mut f = fenced_fs();
+    let me = std::process::id();
+    let caller = Caller::new(0, 0, Some(me));
+    let root = Caller::root();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    let (file, opened) = f.create(&root, ROOT_INO, "data").unwrap();
+    let until = crate::locks::now().honour.plus(60_000);
+    f.lock(turn.attr.ino, me, until);
+    let ino = file.attr.ino;
+    f.write(&OpCtx::new(OpKind::Write, &caller), ino, opened.fh)
+        .unwrap();
+    f.fs.sync
+        .as_ref()
+        .unwrap()
+        .write_mode
+        .set(crate::writeback::WriteMode::Through);
+    // Not the holder: the commit is forwarded, with the caller's token.
+    f.fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+    let mut core = std::mem::replace(&mut f._core, tokio::sync::mpsc::unbounded_channel().1);
+    let meta = f.meta.clone();
+    // As an engine opens it: the close finishes on the `fsync` pool.
+    let fs = Arc::new(f.fs);
+    fs.bind();
+    let grant = GrantId { node: 9, seq: 1 };
+    let blocked = || {
+        meta.locks()
+            .release_blocked(grant, crate::locks::now())
+            .is_some()
+    };
+    let mut seen = CloseSeen {
+        commit_tags: Vec::new(),
+        blocked_at_commit: Vec::new(),
+        blocked_at_later_drain: Vec::new(),
+        result: Ok(()),
+    };
+    std::thread::scope(|s| {
+        let close = s.spawn(|| {
+            Blocking::run(|r| {
+                fs.flush(
+                    &OpCtx::new(OpKind::Flush, &caller),
+                    ino,
+                    opened.fh,
+                    LockOwner(0),
+                    r,
+                )
+            })
+            .map_err(|e| e.code())
+        });
+        let started = Instant::now();
+        while !close.is_finished() {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => {
+                    if !seen.commit_tags.is_empty() {
+                        seen.blocked_at_later_drain.push(blocked());
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(SyncRequest::Submit {
+                    op: constellation_meta::MutateOp::SetManifest { .. },
+                    tag,
+                    reply,
+                    ..
+                }) => {
+                    seen.commit_tags.push(tag);
+                    seen.blocked_at_commit.push(blocked());
+                    let _ = reply.send(constellation_authority::ClientReply::Outcome(
+                        outcome.clone(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(started.elapsed() < ANSWER, "the close is stuck");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        seen.result = close.join().unwrap();
+    });
+    // The close has answered: its scope and the in-flight count ended.
+    assert!(!blocked(), "nothing holds the grant after the close");
+    seen
+}
+
+/// The deferred close continues on the `fsync` pool under its caller's
+/// fencing scope (`handoff_scope`): the commit it forwards carries the
+/// caller's grant, not an empty tag (which would commit unfenced), and the
+/// grant cannot be released while the commit is unanswered. The scope ends
+/// at the commit, so the drain after it does not hold the grant (another
+/// node waiting for it would otherwise wait out an S3 outage).
+#[test]
+fn a_deferred_close_commits_under_its_callers_fencing_token() {
+    let seen = deferred_close_under_a_lock(constellation_meta::MutateOutcome::Accepted {
+        epoch: 1,
+        records: Vec::new(),
+    });
+    assert_eq!(seen.result, Ok(()));
+    assert_eq!(seen.commit_tags.len(), 1, "{:?}", seen.commit_tags);
+    let tag = &seen.commit_tags[0];
+    assert_eq!(tag.0.len(), 1, "the commit carried no token: {tag:?}");
+    assert_eq!(tag.0[0].grant, GrantId { node: 9, seq: 1 });
+    assert_eq!(
+        seen.blocked_at_commit,
+        vec![true],
+        "the grant is in flight while its commit is"
+    );
+    assert!(
+        !seen.blocked_at_later_drain.is_empty(),
+        "no drain followed the commit: the check below tests nothing"
+    );
+    assert!(
+        seen.blocked_at_later_drain.iter().all(|b| !b),
+        "a drain after the commit holds the grant: {:?}",
+        seen.blocked_at_later_drain
+    );
+}
+
+/// A commit the executor refuses for the grant's window (a stale token) is
+/// answered `EIO` and not retried: the deferred close does not send it
+/// again under a token that is over, and the data is discarded as for an
+/// inline close.
+#[test]
+fn a_deferred_close_with_a_stale_token_is_refused_and_not_retried() {
+    let seen = deferred_close_under_a_lock(constellation_meta::MutateOutcome::LockLapsed);
+    assert_eq!(seen.result, Err(Code::Io));
+    assert_eq!(
+        seen.commit_tags.len(),
+        1,
+        "the refused commit was sent again: {:?}",
+        seen.commit_tags
+    );
+    assert_eq!(seen.commit_tags[0].0.len(), 1, "{:?}", seen.commit_tags);
+}

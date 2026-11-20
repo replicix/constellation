@@ -328,12 +328,16 @@ impl View {
     /// its pending chunks. `published` is the publication's outcome once it
     /// succeeded (whether a drain follows), so a retry after a failed drain
     /// does not publish again; `publishing` (the turn's guard, see
-    /// [`crate::locks::begin_close`]) ends with that commit, as the drain
-    /// after it only waits for what is published to reach S3.
+    /// [`crate::locks::begin_close`]) and `scope` (the caller's fencing scope
+    /// the pool thread continues, [`crate::locks::handoff_scope`]) end with
+    /// that commit, as the drain after it only waits for what is published
+    /// to reach S3 (it carries no fencing token), and another node waiting
+    /// for the grant must not wait out an outage for it.
     pub(super) fn close_publication(
         &self,
         ino: Ino,
         publishing: &mut Option<crate::locks::Publishing>,
+        scope: &mut Option<crate::locks::TagScope>,
         published: &mut Option<bool>,
     ) -> Result<(), Code> {
         let drain = match *published {
@@ -341,6 +345,7 @@ impl View {
             None => {
                 let drain = self.publish_inode(ino, false)?;
                 drop(publishing.take());
+                drop(scope.take());
                 *published = Some(drain);
                 drain
             }

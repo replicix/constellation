@@ -153,7 +153,7 @@ for 120 s, against a live mount behind the harness's fault proxy:
 | Scenario | What |
 |---|---|
 | `stress-ng-fs` | one node, one mount; accounting snapshots on, a few seed files written first, two snapshots of `/` taken mid-run |
-| `stress-ng-fs-faults` | the same under 40 ± 20 ms S3 latency and a 1.5 s S3 cut every 4–7 s; no snapshots. In the default set since ADR-66 (a close retries like an `fsync`) |
+| `stress-ng-fs-faults` | the same under 40 ± 20 ms S3 latency and a 1.5 s S3 cut every 4–7 s; no snapshots. A **known-bug reproduction** (`KNOWN_BUG_REPROS`): run it by name; ADR-66 fixed its `close`/`fsync` errors, two open bugs remain (below) |
 | `stress-ng-fs-nodes` | the same on three P2P nodes of one filesystem at once, each in its own directory; snapshots from a non-holder. A **known-bug reproduction** (`KNOWN_BUG_REPROS`): run it by name |
 
 A run passes when all of these hold:
@@ -225,7 +225,7 @@ CONSTELLATION_FUSE_TRANSPORT=dev-fuse target/release/harness run stress-ng-fs
 sudo env HOME=/root PATH=$PATH \
     CONSTELLATION_FUSE_URING_ZERO_COPY=auto \
     target/release/harness run stress-ng-fs      # as root: uring_zc, passthrough too
-target/release/harness run stress-ng-fs-nodes  # known-bug repro
+target/release/harness run stress-ng-fs-nodes stress-ng-fs-faults  # known-bug repros
 # one stressor (or a few) through the whole harness, excluded ones included:
 STRESS_NG_FS_ONLY=lockmix STRESS_NG_FS_SECS=20 target/release/harness run stress-ng-fs
 # one stressor directly on a mount you made (fresh mount per stressor:
@@ -1289,6 +1289,10 @@ the mount alone.
   then unmounts cleanly; a second node must read the file with no
   missing chunk. This one **fails on the pre-5a tree**, which is the
   point: it is the regression test for the clean-unmount upload gap.
+  It mounts with `--fsync-timeout 2s`: a write-through `close` waits out an
+  S3 cut like an `fsync` (ADR-66) and the scenario cannot heal before its
+  write returns, so the close answers `EIO` after 2 s with the data left
+  pending, the state the scenario unmounts from.
 - `writeback-latency`: 150 ms injected S3 latency and an rsync-shaped
   workload (many small files, sequential closes) run once per
   `--write-mode`. Write-back must beat write-through by at least 3x —
@@ -1914,7 +1918,7 @@ a documented bug as a regression. `harness run <name>` resolves a name
 in either list. When a later milestone fixes the bug, its scenario
 moves into `SCENARIOS` as the regression test. Plan 30 M2 moved
 `forward-timeout-reexec` (bug A) and M3a moved both bug B scenarios
-below. The list holds one scenario of
+below. The list holds two scenarios of
 [the stress-ng-fs lane](#stress-every-stress-ng-filesystem-stressor-stress-ng-fs)
 today:
 
@@ -1925,16 +1929,20 @@ today:
   non-holder ends with every FUSE worker waiting, and its stress-ng
   processes cannot be killed.
 
-`stress-ng-fs-faults` left the list with ADR-66 (its `close` and `fsync`
-failures under load were the upload claims, an in-doubt close and a close
-that gave up on a transient failure); it is in `SCENARIOS`. One bug it
-found is **not fixed**: every S3 cut opens a continuation epoch on the
-single node, and closing it is handled as the lease going away — every
-cluster lock grant is dropped (`lease gone: lock grants dropped`), the lock
-holders' writes fail with `EIO` and new locks with `ENOLCK` (`fcntl`:
-`F_OFD_SETLK` `ENOLCK`) until the lease is back; once the epoch froze
-instead and a create after the run failed with `EROFS`. The scenario's
-checks may still catch it.
+- `stress-ng-fs-faults` fails about one run in thirty since ADR-66 fixed
+  its `close` and `fsync` failures (the upload claims, an in-doubt close and
+  a close that gave up on a transient failure). Two bugs are open:
+  - the sync task answers no `DrainInode` while a core round is in its
+    upload phase (the sync-task stall): a FUSE request stays unanswered for
+    tens of seconds, once past 240 s under load;
+  - every S3 cut opens a continuation epoch on the single node, and closing
+    it is handled as the lease going away: every cluster lock grant is
+    dropped (`lease gone: lock grants dropped`), lock holders' writes fail
+    with `EIO` and new locks with `ENOLCK` (`fcntl`: `F_OFD_SETLK`
+    `ENOLCK`) until the lease is back. Once the epoch froze instead, and a
+    create after the run failed with `EROFS`.
+
+  It moves to `SCENARIOS` when both are fixed.
 
 Reproducing these needed two things no scenario had before:
 

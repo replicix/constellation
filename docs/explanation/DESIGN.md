@@ -1806,7 +1806,8 @@ of another node's `close()` out of band, with no lock between them
 - **Fencing.** A grant that lapses (its holder partitioned past the lock
   TTL, or its owner failing over) while local locks or an unpublished write
   rest on it is first *lapsing*: the I/O the fence would refuse waits,
-  parked off the frontend's threads (a signal ends it with `EINTR`; a `close` ends it only on a fatal one, ADR-66), while
+  parked off the frontend's threads (a signal ends it with `EINTR`; a
+  `close` ends it only on a fatal one, ADR-66), while
   the holder sends late renewals, and the owner admits one only where it
   can prove that nothing conflicting was granted since (a settled record in
   its table or in a bounded memory of outwaited ones, or, at a fast

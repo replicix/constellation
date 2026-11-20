@@ -1691,7 +1691,7 @@ impl Vfs for View {
         let mut publishing = Some(publishing);
         let Some(view) = deferral else {
             let work = if publishes && gate.is_ok() {
-                self.close_publication(ino, &mut publishing, &mut None)
+                self.close_publication(ino, &mut publishing, &mut None, &mut None)
             } else {
                 Ok(())
             };
@@ -1713,7 +1713,8 @@ impl Vfs for View {
         };
         // The caller's fencing scope, with the token it resolved before the
         // locks above were dropped, goes with the publication to the pool
-        // thread (and ends there, counted in flight all along).
+        // thread (counted in flight all along, and ended there with the
+        // commit: the drain after it needs no fencing).
         let scope = crate::locks::handoff_scope();
         let fault_caller = cx.caller.pid;
         drop(_lock_tag);
@@ -1721,11 +1722,11 @@ impl Vfs for View {
         crate::fsync_wait::pool().submit(move || {
             watch.adopt();
             let result = {
-                let _scope = scope.map(|s| s.enter());
+                let mut scope = scope.map(|s| s.enter());
                 let _fault = constellation_meta::fault_caller_scope(fault_caller);
                 let mut published = None;
                 let work = view.close_run(ino, cancel, || {
-                    view.close_publication(ino, &mut publishing, &mut published)
+                    view.close_publication(ino, &mut publishing, &mut scope, &mut published)
                 });
                 drop(publishing);
                 finish(&view, work)

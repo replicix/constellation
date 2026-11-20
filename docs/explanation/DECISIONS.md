@@ -6602,7 +6602,11 @@ denied, a lost chunk) answers `EIO` at once, and the wait ends at the soft
 timeout (`--fsync-timeout`), at the kernel's FUSE request timeout (the cap) or
 when the caller is killed. The wait runs on the `fsync` pool, not on a
 frontend worker, with the caller's fencing scope handed over to it (the token
-is the one resolved before the close dropped its locks). `FLUSH` registers
+is the one resolved before the close dropped its locks); the scope, and with it
+the op's in-flight count under the grant, ends at the commit, not after the
+drain that follows it (that drain only uploads the chunks of a committed
+manifest and carries no token), so a recalled grant's release is not held
+through an outage once the commit is done. `FLUSH` registers
 its request for `FUSE_INTERRUPT` as an `fsync` does (killable, not
 interruptible); it is counted as a bounded deferral from the start, in every
 mode, and takes no lock-wait entry of a ring queue. A frontend that cannot
