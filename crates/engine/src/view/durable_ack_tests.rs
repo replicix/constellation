@@ -1211,6 +1211,8 @@ enum SyncOp {
     Fsync,
     /// A write on an `O_SYNC` descriptor.
     SyncWrite,
+    /// The `close` of a write-through descriptor that wrote (ADR-66).
+    Close,
 }
 
 /// Plan 39 §3.2: `fsyncs` `fsync`s drive the scripted core's drain
@@ -1232,6 +1234,12 @@ fn ops_against(
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
     let (fs, _dir, mut core) = holder_fs(meta, false);
     fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
+    fs.sync
+        .as_ref()
+        .unwrap()
+        .write_mode
+        .set(crate::writeback::WriteMode::Through);
+    let handle = fs.any_handle(file.ino);
     let caller = Caller::new(0, 0, None);
     let mut drains = 0;
     let mut results = Vec::new();
@@ -1261,6 +1269,16 @@ fn ops_against(
                         )
                     })
                     .map(|_| ())
+                    .map_err(|e| e.code()),
+                    SyncOp::Close => Blocking::run(|r| {
+                        fs.flush(
+                            &OpCtx::new(OpKind::Flush, &caller),
+                            file.ino,
+                            handle,
+                            constellation_vfs::LockOwner(0),
+                            r,
+                        )
+                    })
                     .map_err(|e| e.code()),
                 })
                 .collect::<Vec<_>>()
@@ -1306,6 +1324,89 @@ fn a_permanent_drain_failure_is_eio_and_the_next_fsync_drains_again() {
     let (results, drains) = fsync_against(vec![Err(Permanent), Err(Permanent), Ok(())], 3);
     assert_eq!(results, vec![Err(Code::Io), Err(Code::Io), Ok(())]);
     assert_eq!(drains, 3);
+}
+
+/// ADR-66: a write-through close waits out a transient S3 failure as an
+/// `fsync` does. Fails on the parent: the close answered `EIO` after its one
+/// drain (a drain that gave up on the first failed attempt).
+#[test]
+fn a_close_retries_a_transient_drain_failure() {
+    use crate::sync::ErrorClass::Transient;
+    let (results, drains) = ops_against(vec![Err(Transient), Ok(())], &[SyncOp::Close]);
+    assert_eq!(results, vec![Ok(())]);
+    assert_eq!(drains, 2, "the close drained again");
+}
+
+/// A permanent failure stays `EIO` at once for a close: one drain.
+#[test]
+fn a_close_answers_eio_at_once_on_a_permanent_drain_failure() {
+    use crate::sync::ErrorClass::Permanent;
+    let (results, drains) = ops_against(vec![Err(Permanent)], &[SyncOp::Close]);
+    assert_eq!(results, vec![Err(Code::Io)]);
+    assert_eq!(drains, 1);
+}
+
+/// The caller of a close blocked on a transient outage is killed (the
+/// frontend cancels the request's token): the wait ends with `EIO`, never
+/// `EINTR`, and the data stays pending.
+#[test]
+fn a_cancelled_close_blocked_on_an_outage_ends_with_eio() {
+    use constellation_vfs::{Blocking, Caller, CancelToken, OpCtx, OpKind, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
+    fs.sync
+        .as_ref()
+        .unwrap()
+        .write_mode
+        .set(crate::writeback::WriteMode::Through);
+    let handle = fs.any_handle(file.ino);
+    let caller = Caller::new(0, 0, None);
+    let token = CancelToken::new();
+    let mut drains = 0;
+    let result = std::thread::scope(|scope| {
+        let close = scope.spawn(|| {
+            Blocking::run(|r| {
+                fs.flush(
+                    &OpCtx::new(OpKind::Flush, &caller).with_cancel(&token),
+                    file.ino,
+                    handle,
+                    constellation_vfs::LockOwner(0),
+                    r,
+                )
+            })
+            .map_err(|e| e.code())
+        });
+        let started = std::time::Instant::now();
+        while !close.is_finished() {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => {
+                    drains += 1;
+                    let _ = reply.send(Err(crate::sync::SyncFailure {
+                        class: crate::sync::ErrorClass::Transient,
+                        message: "scripted outage".into(),
+                    }));
+                    if drains == 2 {
+                        token.cancel();
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(2)),
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the close never ended"
+            );
+        }
+        close.join().unwrap()
+    });
+    assert_eq!(result, Err(Code::Io));
+    assert!(drains >= 2, "it retried before the caller was killed");
+    assert!(
+        meta.upload_pending_for_ino(file.ino).unwrap(),
+        "the data stays pending"
+    );
 }
 
 /// The same for an `O_SYNC` write that fails: it publishes the write

@@ -306,6 +306,11 @@ acknowledgement of the manifest means is set per filesystem:
   are in S3 and the manifest is committed and acknowledged. A small new
   file costs one S3 request (the conditional create of its chunk) and one
   S3 round trip per close, on the sequencer and on any other node alike.
+  A transient S3 failure during the close's upload is waited out as an
+  `fsync`'s is (capped backoff, `--fsync-timeout`, the kernel's request
+  timeout, a killed caller), so during a long outage a close can block;
+  a permanent failure is `EIO` at once
+  ([ADR-66](DECISIONS.md#adr-66-a-write-through-close-retries-like-an-fsync)).
 - `--write-mode back`: `close()` returns once the uploads are queued
   durably on local disk, with no S3 round trip in the close. The
   manifest ships only once its chunks are up. `fsync`, `O_SYNC`,
@@ -436,9 +441,9 @@ answers once they are in S3. The invariant is unchanged; only *who*
 uploads changes, and `through` still means "in S3 before `close()`
 returns". Later drains hand off at once while there is still no progress
 (for 30 s). With no such peer (a single node, P2P off, every peer cut
-too), a write-through close or `fsync` still needs S3: it fails with
-`EIO` once the node's own upload has used its retry budget (about
-3 × 30 s). A flush holds no lock while it drains: its per-inode
+too), a write-through close or `fsync` still needs S3: it waits for it
+(ADR-66), and fails with `EIO` only at a permanent failure, the soft
+timeout or the kernel's request timeout. A flush holds no lock while it drains: its per-inode
 operation lock ends with its commit, so `stat` and `ls` of other files,
 and the next read and write of the file itself, never wait behind the
 upload, nor does the next close's commit (its own drain waits for every

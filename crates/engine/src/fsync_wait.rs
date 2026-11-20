@@ -24,8 +24,11 @@
 //! retried after a capped exponential backoff with jitter ([`Backoff`]:
 //! 100 ms doubling to 5 s), re-using the same machinery (the drain, its
 //! peer handoff, the round) rather than a second uploader. Background
-//! uploads, `close()` and `--write-mode` behave exactly as before: only
-//! the `fsync` family runs inside a [`Scope`].
+//! uploads and `--write-mode` behave exactly as before. A write-through
+//! `close()` has run inside a [`Scope`] too since ADR-66: its drain (not its
+//! commit) is retried like an `fsync`'s, ends at the same timeout and cap
+//! and by its killed caller, and answers `EIO` (never `EINTR`) when cut
+//! short.
 //!
 //! **Bounded, on request.** Three things end a wait before durability:
 //!

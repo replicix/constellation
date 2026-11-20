@@ -6574,3 +6574,46 @@ See: `crates/meta/src/delegation.rs`, `crates/meta/src/store/local.rs`
 `release_after_cut`), `crates/authority/src/core/client.rs`, `holder.rs`
 (`gate_settle`), `crates/model/src/node_stream.rs`, and
 [delegations](../reference/features/delegations.md).
+
+## ADR-66: A write-through close retries like an fsync
+
+**Status**: decided on 2026-11-20 by the maintainer, after the `stress-ng-fs-faults`
+harness scenario showed `close()` answering `EIO` under load. Supersedes the
+close exclusion of plan 39 (`done/39-fsync-durability.md`, "Unchanged:
+background uploads ... `close()`").
+
+**Context**: plan 39 made `fsync` wait out a transient S3 failure like an NFS
+`hard` mount (capped backoff, the opt-in soft timeout, the kernel's request
+timeout, a killed caller's interrupt) and left `close()` outside it: a
+write-through close gave up after the drain's three PUT tries, 50 ms apart,
+and answered `EIO` for data that was queued and committed, and that a retry a
+second later would have uploaded. Under host load (`--cpu 24`) a PUT that
+takes seconds is enough. An application cannot recover from an `EIO` at
+`close()`: the descriptor is gone and the data is not durable.
+
+**Decision**: when a write-through close (`flush`, or the `release` of a
+description that still has pending writes) has chunks to drain, the drain runs
+under the `fsync` retry loop (`FsyncWaits::run`): a transient failure is
+retried after the capped backoff, a permanent one (access denied, a lost
+chunk) answers `EIO` at once, and the wait ends at the soft timeout
+(`--fsync-timeout`), at the kernel's FUSE request timeout (the cap) or when
+the caller is killed. The wait runs on the `fsync` pool, not on a frontend
+worker, and `FLUSH` and `RELEASE` register their request for `FUSE_INTERRUPT`
+as an `fsync` does (killable, not interruptible). A close that ends early
+answers `EIO`, never `EINTR`, and the data stays pending, so the next `fsync`
+or the background rounds finish it. The publication (the manifest commit) is
+not repeated: only the drain is.
+
+**Cost**: during a long S3 outage a process that exits, or a shell that closes a
+file, can block in `close()` until S3 returns or the timeout or the kernel cap
+ends the wait. This is what `fsync` already does, and what an NFS `hard` mount
+does for every operation; an operator who prefers `EIO` sets `--fsync-timeout`.
+`--write-mode back` is unaffected (its close does not drain).
+
+**Rejected**: a longer fixed retry count (a different give-up, the same
+`EIO`); retrying in the background only (the close would then claim durability
+it lacks, or answer before the upload as `back` does).
+
+See: `crates/engine/src/fsync_wait.rs`, `crates/engine/src/view/durable.rs`
+(`close_drain`), `crates/engine/src/view/ops.rs` (`flush`, `release`),
+`crates/frontend-fuse/src/adapter.rs`.

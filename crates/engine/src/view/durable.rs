@@ -300,6 +300,26 @@ impl View {
         })
     }
 
+    /// A write-through close's drain: the inode's pending chunks into S3,
+    /// waiting out a transient failure as an `fsync` does (ADR-66: the same
+    /// backoff, the soft timeout and the kernel cap; a permanent failure is
+    /// `EIO` at once). Ended early (the caller killed, `cancel`; the
+    /// timeout) it answers `EIO`, never `EINTR`: the bytes were written but
+    /// are not durable, and a `close` that returns claims nothing, yet its
+    /// caller must not be told they are. The data stays pending either way.
+    pub(super) fn close_drain(
+        &self,
+        ino: Ino,
+        cancel: Option<constellation_vfs::CancelToken>,
+    ) -> Result<(), Code> {
+        self.fsync_waits()
+            .run(ino, cancel, || self.drain_inode(ino))
+            .map_err(|code| match code {
+                Code::Intr => Code::Io,
+                code => code,
+            })
+    }
+
     /// An `O_SYNC`/`O_DSYNC` write's publication: [`Self::flush_inode`]
     /// write-through and the inode's drain, waiting out transient S3
     /// failures like an `fsync`. A write that failed here leaves its
