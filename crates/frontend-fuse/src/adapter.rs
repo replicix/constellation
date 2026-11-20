@@ -25,8 +25,8 @@
 //! (plan 39 §3.3). All are counted ([`Deferred`]) for a session handover.
 //!
 //! `FUSE_INTERRUPT` (plan 39 §3.3, vendored fuser patch `interrupt`): an
-//! `fsync`/`fsyncdir`, an `O_SYNC`/`O_DSYNC` write and (ADR-66) a `flush`
-//! or `release`, whose write-through drain waits out an outage, register their
+//! `fsync`/`fsyncdir`, an `O_SYNC`/`O_DSYNC` write and (ADR-66) a `flush`,
+//! whose write-through publication waits out an outage, register their
 //! request with [`Interrupts`] and carry the resulting [`CancelToken`] in
 //! their context. The policy is NFS `hard`'s: **killable, not
 //! interruptible**. An interrupt alone cancels nothing — the kernel sends
@@ -410,10 +410,14 @@ impl<V: Vfs> FuseFs<V> {
         );
     }
 
-    /// A close's reply (`flush`, `release`): registered for `FUSE_INTERRUPT`
-    /// like an `fsync`'s (killable: ADR-66, a write-through close waits out
-    /// an S3 outage) and counted as a bounded deferral, which a close that
-    /// parks (see [`Parkable`]) keeps being able to do.
+    /// A `flush`'s reply: registered for `FUSE_INTERRUPT` like an `fsync`'s
+    /// (killable: ADR-66, a write-through close waits out an S3 outage) and
+    /// counted as a bounded deferral, like an `fsync`'s, from the start, in
+    /// every mode: the close's wait is the `fsync` pool's, never a lock
+    /// wait, so it takes no lock-wait entry of a ring queue. A close that
+    /// parks for its caller's lapsed grant (see [`Parkable`]) still can; the
+    /// park's wait then holds an entry, as every park does, and ends only on
+    /// a fatal signal (the token is the killable one).
     fn closing<R: crate::reply::RingBudget>(
         &self,
         unique: u64,
@@ -423,14 +427,10 @@ impl<V: Vfs> FuseFs<V> {
         let guarded = self
             .interrupts
             .guard_registered(unique, token.clone(), reply);
-        if self.vfs.parking() {
-            Parkable::Park(
-                self.deferred.track_when_waiting(guarded),
-                self.lossy() && !R::RING_BUDGETED,
-            )
-        } else {
-            Parkable::Park(self.deferred.track_bounded(guarded), false)
-        }
+        Parkable::Park(
+            self.deferred.track_bounded(guarded),
+            self.vfs.parking() && self.lossy() && !R::RING_BUDGETED,
+        )
     }
 
     /// `reply` as the op's responder: wrapped to park when the view says an
@@ -2016,15 +2016,13 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         self.passthrough.release(ino.0);
         self.pc
             .released(ino.0, fh.0, open_flags_write_access(open_flags(flags.0)));
-        let unique = req.unique().0;
-        let token = self.interrupts.register(unique, req.pid(), self.lossy());
         self.vfs.release(
-            &op.ctx(&caller).with_cancel(&token),
+            &op.ctx(&caller),
             ino.0,
             Fh(fh.0),
             open_flags(flags.0),
             lock_owner.map(|owner| LockOwner(owner.0)),
-            op.responder(self.closing(unique, &token, EmptyReply(reply))),
+            op.responder(self.parkable(req, EmptyReply(reply))),
         );
     }
 

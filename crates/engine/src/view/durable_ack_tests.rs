@@ -1229,10 +1229,27 @@ fn ops_against(
     replies: Vec<Result<(), crate::sync::ErrorClass>>,
     ops: &[SyncOp],
 ) -> (Vec<Result<(), Code>>, usize) {
+    ops_against_on(replies, ops, false)
+}
+
+/// [`ops_against`] on a node that does not hold the lease when `forwarding`:
+/// its publication drains before it forwards the manifest, and the scripted
+/// core accepts the forward.
+fn ops_against_on(
+    replies: Vec<Result<(), crate::sync::ErrorClass>>,
+    ops: &[SyncOp],
+    forwarding: bool,
+) -> (Vec<Result<(), Code>>, usize) {
     use constellation_vfs::{Blocking, Caller, OpCtx, OpKind, OpenFlags, Vfs, WriteData};
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
-    let (fs, _dir, mut core) = holder_fs(meta, false);
+    let (mut fs, _dir, mut core) = holder_fs(meta, false);
+    if forwarding {
+        fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+    }
+    // As an engine opens it: a close may finish on the `fsync` pool.
+    let fs = Arc::new(fs);
+    fs.bind();
     fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
     fs.sync
         .as_ref()
@@ -1295,6 +1312,14 @@ fn ops_against(
                         message: format!("scripted {} failure", class.as_str()),
                     }));
                 }
+                Ok(SyncRequest::Submit { reply, .. }) => {
+                    let _ = reply.send(constellation_authority::ClientReply::Outcome(
+                        constellation_meta::MutateOutcome::Accepted {
+                            epoch: 1,
+                            records: Vec::new(),
+                        },
+                    ));
+                }
                 Ok(_) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(2)),
             }
@@ -1337,6 +1362,177 @@ fn a_close_retries_a_transient_drain_failure() {
     assert_eq!(drains, 2, "the close drained again");
 }
 
+/// The same on a node that does not hold the lease (a non-sequencer, a file
+/// a delegate owns, the window after a continuation epoch): its publication
+/// drains *before* it forwards the manifest, and that drain is in the retry
+/// loop too. Fails on the parent: the pre-forward drain gave up after its
+/// failed first try (outside any wait) and the close answered `EIO`.
+#[test]
+fn a_forwarding_close_retries_a_transient_drain_failure() {
+    use crate::sync::ErrorClass::Transient;
+    let (results, drains) =
+        ops_against_on(vec![Err(Transient), Ok(()), Ok(())], &[SyncOp::Close], true);
+    assert_eq!(results, vec![Ok(())]);
+    assert!(drains >= 2, "the pre-forward drain was retried: {drains}");
+}
+
+/// A close's responder over a ring whose lock-wait entries are all spent
+/// (`WaitStart::Refused` for every `begin_wait`): counts the calls.
+struct NoWaitSlots {
+    begun: Arc<std::sync::atomic::AtomicUsize>,
+    answer: std::sync::mpsc::Sender<constellation_vfs::VfsResult<()>>,
+}
+
+impl constellation_vfs::Responder<()> for NoWaitSlots {
+    fn done(self, result: constellation_vfs::VfsResult<()>) {
+        let _ = self.answer.send(result);
+    }
+
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        self.begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        constellation_vfs::WaitStart::Refused
+    }
+}
+
+/// ADR-66, over io_uring: a waiting close takes no lock-wait entry of its
+/// queue (it asks its responder for none: with every entry spent a close
+/// that asked was refused and ran its wait inline, on the ring thread, and
+/// the entries it did take made blocking `fcntl` locks answer `ENOLCK`),
+/// and the call returns while the drain is still outstanding: the wait is
+/// the `fsync` pool's. Fails on the parent: the close asked, was refused and
+/// blocked its calling thread in the drain.
+#[test]
+fn a_waiting_close_takes_no_lock_wait_entry_and_never_blocks_its_caller() {
+    use constellation_vfs::{Caller, OpCtx, OpKind, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (fs, _dir, mut core) = holder_fs(meta, false);
+    let fs = Arc::new(fs);
+    fs.bind();
+    fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
+    fs.sync
+        .as_ref()
+        .unwrap()
+        .write_mode
+        .set(crate::writeback::WriteMode::Through);
+    let handle = fs.any_handle(file.ino);
+    let caller = Caller::new(0, 0, None);
+    let begun = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (answer, answered) = std::sync::mpsc::channel();
+    let returned = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let ring_thread = scope.spawn(|| {
+            fs.flush(
+                &OpCtx::new(OpKind::Flush, &caller),
+                file.ino,
+                handle,
+                constellation_vfs::LockOwner(0),
+                NoWaitSlots {
+                    begun: begun.clone(),
+                    answer,
+                },
+            );
+            returned.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let drain = loop {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => break reply,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(started.elapsed() < LIVENESS_DEADLINE, "no drain asked");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        // The drain is outstanding: the ring thread must already be free.
+        let freed = std::time::Instant::now();
+        while !ring_thread.is_finished() && freed.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let was_free = returned.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = drain.send(Ok(()));
+        ring_thread.join().unwrap();
+        assert!(
+            was_free,
+            "the close blocked its calling thread in the drain"
+        );
+    });
+    assert_eq!(answered.recv_timeout(LIVENESS_DEADLINE).unwrap(), Ok(()));
+    assert_eq!(
+        begun.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the close asked for a lock-wait entry"
+    );
+}
+
+/// Fix C's re-commit is idempotent: the first commit survived (the core
+/// answers the forwarded re-commit `Conflict` and this node's replica holds
+/// the first commit), so the rebased second commit carries the very manifest
+/// the first one did, and the file reads back unchanged.
+#[test]
+fn an_in_doubt_recommit_that_conflicts_with_its_own_first_commit_is_the_same_manifest() {
+    use constellation_meta::RowCommit;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let session = meta.session();
+    session.set_durable(false, u64::MAX, false, RowCommit::FINAL, false);
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    fs.do_write(file.ino, 0, b"small file").unwrap();
+    let mut commits: Vec<Vec<u8>> = Vec::new();
+    std::thread::scope(|scope| {
+        let close = scope.spawn(|| fs.flush_inode(file.ino, false));
+        let started = std::time::Instant::now();
+        loop {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => reply.send(Ok(())).unwrap(),
+                Ok(SyncRequest::Submit { op, reply, .. }) => {
+                    let constellation_meta::MutateOp::SetManifest { manifest, .. } = op else {
+                        continue;
+                    };
+                    commits.push(manifest);
+                    let outcome = if commits.len() == 1 {
+                        constellation_meta::MutateOutcome::Conflict { manifest: None }
+                    } else {
+                        constellation_meta::MutateOutcome::Accepted {
+                            epoch: 1,
+                            records: Vec::new(),
+                        }
+                    };
+                    reply
+                        .send(constellation_authority::ClientReply::Outcome(outcome))
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(_) if close.is_finished() => break,
+                Err(_) => {
+                    assert!(started.elapsed() < LIVENESS_DEADLINE, "the close is stuck");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        close.join().unwrap().expect("the close re-commits");
+    });
+    assert_eq!(commits.len(), 2, "one conflict, one acceptance");
+    let first_commit = meta.getattr(file.ino).unwrap().unwrap();
+    assert_eq!(first_commit.size, 10);
+    let replica = fs.load_manifest(file.ino).unwrap();
+    assert_eq!(
+        commits[1],
+        replica.encode(),
+        "the rebased re-commit is the first commit's manifest"
+    );
+    assert_eq!(
+        constellation_fs_core::Manifest::decode(&commits[0])
+            .unwrap()
+            .chunks,
+        constellation_fs_core::Manifest::decode(&commits[1])
+            .unwrap()
+            .chunks,
+        "the same chunk set"
+    );
+}
+
 /// A permanent failure stays `EIO` at once for a close: one drain.
 #[test]
 fn a_close_answers_eio_at_once_on_a_permanent_drain_failure() {
@@ -1355,6 +1551,8 @@ fn a_cancelled_close_blocked_on_an_outage_ends_with_eio() {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
     let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    let fs = Arc::new(fs);
+    fs.bind();
     fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
     fs.sync
         .as_ref()

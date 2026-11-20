@@ -2143,6 +2143,27 @@ impl ClusterLocks {
     }
 }
 
+/// The scope of the op this thread serves taken off it, to continue on
+/// another thread ([`ScopeHandoff::enter`]) with the fencing token it has
+/// resolved (and counted the op in flight under) so far: a close that drops
+/// its caller's locks before it publishes cannot work the token out again
+/// there.
+pub struct ScopeHandoff(ScopeState);
+
+impl ScopeHandoff {
+    /// Continue the op's scope on this thread; ends it (the in-flight
+    /// count) when the returned guard drops.
+    pub fn enter(self) -> TagScope {
+        TagScope::enter(self.0)
+    }
+}
+
+/// Take the scope of the op this thread serves off the thread: its guard
+/// there then ends nothing. `None` outside a scope.
+pub fn handoff_scope() -> Option<ScopeHandoff> {
+    SCOPE.with(|s| s.borrow_mut().take().map(ScopeHandoff))
+}
+
 /// The caller of the op this thread serves, if it is in a scope.
 pub fn scope_caller() -> Option<ScopeCaller> {
     SCOPE.with(|s| {

@@ -300,24 +300,55 @@ impl View {
         })
     }
 
-    /// A write-through close's drain: the inode's pending chunks into S3,
-    /// waiting out a transient failure as an `fsync` does (ADR-66: the same
-    /// backoff, the soft timeout and the kernel cap; a permanent failure is
-    /// `EIO` at once). Ended early (the caller killed, `cancel`; the
-    /// timeout) it answers `EIO`, never `EINTR`: the bytes were written but
-    /// are not durable, and a `close` that returns claims nothing, yet its
-    /// caller must not be told they are. The data stays pending either way.
-    pub(super) fn close_drain(
+    /// A write-through close's retry loop (ADR-66): `attempt` (its
+    /// publication, see [`Self::close_publication`]) run as an `fsync`'s is,
+    /// waiting out a transient failure (the same backoff, the soft timeout
+    /// and the kernel cap; a permanent failure is `EIO` at once). Ended early
+    /// (the caller killed, `cancel`; the timeout) it answers `EIO`, never
+    /// `EINTR`: the bytes were written but are not durable, and a `close`
+    /// that returns claims nothing, yet its caller must not be told they
+    /// are. The data stays pending either way.
+    pub(super) fn close_run(
         &self,
         ino: Ino,
         cancel: Option<constellation_vfs::CancelToken>,
+        attempt: impl FnMut() -> Result<(), Code>,
     ) -> Result<(), Code> {
         self.fsync_waits()
-            .run(ino, cancel, || self.drain_inode(ino))
+            .run(ino, cancel, attempt)
             .map_err(|code| match code {
                 Code::Intr => Code::Io,
                 code => code,
             })
+    }
+
+    /// One attempt of a write-through close: publish `ino`
+    /// ([`Self::publish_inode`]: the commit, and on a node that forwards it
+    /// the drain before the forward, which a failure here retries), then drain
+    /// its pending chunks. `published` is the publication's outcome once it
+    /// succeeded (whether a drain follows), so a retry after a failed drain
+    /// does not publish again; `publishing` (the turn's guard, see
+    /// [`crate::locks::begin_close`]) ends with that commit, as the drain
+    /// after it only waits for what is published to reach S3.
+    pub(super) fn close_publication(
+        &self,
+        ino: Ino,
+        publishing: &mut Option<crate::locks::Publishing>,
+        published: &mut Option<bool>,
+    ) -> Result<(), Code> {
+        let drain = match *published {
+            Some(drain) => drain,
+            None => {
+                let drain = self.publish_inode(ino, false)?;
+                drop(publishing.take());
+                *published = Some(drain);
+                drain
+            }
+        };
+        if drain {
+            self.drain_inode(ino)?;
+        }
+        Ok(())
     }
 
     /// An `O_SYNC`/`O_DSYNC` write's publication: [`Self::flush_inode`]

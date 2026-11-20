@@ -355,7 +355,10 @@ impl InFlightClaim<'_> {
         if sender.is_some() {
             self.upload.in_flight.lock().unwrap().remove(hash);
         }
-        // The sender drops last, once the hash is claimable again.
+        // The sender drops last, once the hash is claimable again: a waiter
+        // woken by the drop (`Err`) goes round and re-claims, and must find
+        // the hash out of `in_flight`; dropped first, it could find it still
+        // claimed, and wait for a claim nobody holds any more (a lost wakeup).
         drop(sender);
     }
 

@@ -1642,26 +1642,28 @@ impl Vfs for View {
         // (`lock_handles`' module doc), so this is the only one.
         let gate = self.lock_publish_gate(ino, fh, &mut waiter!(cx, r));
         let idle = locks.map(|l| l.drop_owner(ino, owner.0));
-        let published = gate.and_then(|owed| {
-            let drain = publishes && self.publish_inode(ino, false)?;
-            Ok((owed, drain))
-        });
-        // The turn's publication is over once its commit is answered: the
-        // write-through drain after it only waits for what is published to
-        // reach S3 (`View::publish_inode`), and a new turn on the file does
-        // not wait for that. A recalled grant's release does not need this
-        // guard for it either: its own flush (`LockFlush`, before the
-        // release is even considered) drains the file's pending chunks,
-        // sharing this drain's in-flight uploads, and syncs the journal.
-        drop(publishing);
-        let drain = matches!(published, Ok((_, true)));
-        // What follows the drain. As in `fsync`: this close's `EIO` reports
-        // every discard its description has not reported yet, including
-        // the one its own publication raised; the description (a `dup` of
-        // it may stay open) does not report it again.
-        let finish = move |view: &View, drained: Result<(), Code>| -> Result<(), Code> {
-            let result = published.and_then(|(owed, _)| {
-                drained?;
+        // Plan 39 (ADR-66): a write-through close waits out a transient S3
+        // failure as an `fsync` does, so its whole publication (the commit
+        // and, on a node that forwards it, the drain before the forward; then
+        // the drain after it) runs in the `fsync` retry loop, on the `fsync`
+        // pool, never on a frontend worker (the workers must stay free to
+        // deliver the interrupt that ends a killed caller's wait). Only a
+        // close that publishes defers; any other, and a frontend that cannot
+        // answer from another thread, publishes here, on the old short drain
+        // (three tries): never an unbounded wait on the caller's thread.
+        let cancel = cx.cancel.cloned();
+        let deferral = if publishes && gate.is_ok() {
+            self.fsync_deferral(OpKind::Flush)
+        } else {
+            None
+        };
+        // What follows the publication. As in `fsync`: this close's `EIO`
+        // reports every discard its description has not reported yet,
+        // including the one its own publication raised; the description (a
+        // `dup` of it may stay open) does not report it again.
+        let finish = move |view: &View, work: Result<(), Code>| -> Result<(), Code> {
+            let result = gate.and_then(|owed| {
+                work?;
                 if owed {
                     return Err(Code::Io);
                 }
@@ -1686,24 +1688,18 @@ impl Vfs for View {
             }
             result
         };
-        // Plan 39 (ADR-66): a write-through close waits out a transient S3
-        // failure as an `fsync` does, so it may last an outage and runs on
-        // the `fsync` pool, never on a frontend worker (the workers must stay
-        // free to deliver the interrupt that ends a killed caller's wait).
-        let cancel = cx.cancel.cloned();
-        let deferral = if drain {
-            self.fsync_deferral(OpKind::Flush)
-                .filter(|_| !matches!(r.begin_wait(), constellation_vfs::WaitStart::Refused))
-        } else {
-            None
-        };
+        let mut publishing = Some(publishing);
         let Some(view) = deferral else {
-            let drained = if drain {
-                self.close_drain(ino, cancel)
+            let work = if publishes && gate.is_ok() {
+                self.close_publication(ino, &mut publishing, &mut None)
             } else {
                 Ok(())
             };
-            let result = finish(self, drained);
+            // The turn's publication is over once its commit is answered
+            // (`close_publication` ends it then; this is the close that
+            // published nothing).
+            drop(publishing);
+            let result = finish(self, work);
             // The close's fencing-token scope ends before its answer, not
             // after (its publication ended above): nothing is published past
             // here, and the release of a recalled grant is not held behind
@@ -1715,15 +1711,24 @@ impl Vfs for View {
             }
             return;
         };
+        // The caller's fencing scope, with the token it resolved before the
+        // locks above were dropped, goes with the publication to the pool
+        // thread (and ends there, counted in flight all along).
+        let scope = crate::locks::handoff_scope();
+        let fault_caller = cx.caller.pid;
         drop(_lock_tag);
         let watch = _w;
-        let caller = crate::locks::scope_caller();
         crate::fsync_wait::pool().submit(move || {
             watch.adopt();
-            let drained = view.close_drain(ino, cancel);
             let result = {
-                let _lock_tag = caller.as_ref().map(|c| c.enter());
-                finish(&view, drained)
+                let _scope = scope.map(|s| s.enter());
+                let _fault = constellation_meta::fault_caller_scope(fault_caller);
+                let mut published = None;
+                let work = view.close_run(ino, cancel, || {
+                    view.close_publication(ino, &mut publishing, &mut published)
+                });
+                drop(publishing);
+                finish(&view, work)
             };
             match result {
                 Ok(()) => r.done(Ok(())),
@@ -1812,125 +1817,96 @@ impl Vfs for View {
         // As in `flush`: the turn's publication ends with its commit, not
         // with the drain after it.
         drop(publishing);
-        let drain = matches!(published, Ok((_, true)));
-        // The close's work after its drain, on the thread that answers.
-        let finish = move |view: &View, drained: Result<(), Code>, r: R| {
-            let flush_result = published.and_then(|(owed, _)| {
-                drained?;
-                if owed {
-                    return Err(Code::Io);
-                }
-                Ok(())
-            });
-            if let (Some(l), true) = (view.cluster_locks(), idle) {
-                l.idle(ino);
+        let flush_result = published.and_then(|(owed, drain)| {
+            if drain {
+                self.drain_inode(ino)?;
             }
-            let (last, still_open) = {
-                let mut opens = view.opens.lock().unwrap();
-                match opens.get_mut(&ino) {
-                    Some(n) => {
-                        *n = n.saturating_sub(1);
-                        let last = *n == 0;
-                        let still_open = *n;
-                        if last {
-                            opens.remove(&ino);
-                            view.prefetch.forget(ino);
-                        }
-                        (last, still_open)
-                    }
-                    None => (false, 0),
-                }
-            };
-            // The chunk file this handle was opened on, if it got one, and the
-            // disk cache's pin on it (plan 38 §3(c)). `release` does not name
-            // which handle closed, so what is dropped is whatever the inode
-            // holds beyond the handles still open on it.
-            view.note_writer_release(ino, flags);
-            view.drop_passthrough(ino, still_open);
-            if last {
-                view.forget_discard_errors(ino);
+            if owed {
+                return Err(Code::Io);
             }
-            // Orphan reap on last close (unlink-while-open, DESIGN.md §3),
-            // with the write session a flush kept for the descriptors
-            // (`flush_inode`: an unlinked file publishes nothing). An inode
-            // the replica lacks but holds no orphan record of is the
-            // sequencer's to judge: its session goes only once the flush
-            // above answered `ESTALE` (no such file there), never with a
-            // success; after any other failure it stays, as a present
-            // file's does. An orphan this view's platform still references
-            // is left to its `forget`, session included: a reopen through
-            // that reference, in this view, reads what this handle wrote
-            // (`View::reap_after_unlink`; sessions are per view). One another
-            // view still has open or references keeps its record for that
-            // view — as `unlink`'s reap already asked every view (84a59be) —
-            // and this view's session, which nothing in this view reaches any
-            // more, goes.
-            let reap = last && !view.unlinked_referenced(ino);
-            let orphan = reap && view.orphaned(ino);
-            if orphan || (reap && view.unlinked(ino) && flush_result == Err(Code::Stale)) {
-                if view.drop_writes(ino) && !orphan {
-                    tracing::warn!(
-                        ino,
-                        "the last close dropped writes to a file the sequencer does not have; \
-                         the close answered ESTALE"
-                    );
-                }
-                let elsewhere = view
-                    .holds
-                    .as_ref()
-                    .is_some_and(|h| h.sources().is_open(ino));
-                if let Ok(Some(attr)) = view.meta.getattr(ino) {
-                    if attr.nlink == 0 && !elsewhere {
-                        // Under a frontend that reports `forget`s, this view's
-                        // own unlinks wait for theirs (above), so one reaped
-                        // here was unlinked elsewhere — another node or view —
-                        // and a reference that outlives it is stale
-                        // (`View::gone`): remembered as this view's own
-                        // removal, its `fstat` answered `nlink` 0 while its
-                        // reopen answered `ENOENT`.
-                        if !view.keeps_referenced() {
-                            view.remember_dead(attr);
-                        }
-                        let _ = view.meta.reap_orphan(ino);
-                    }
-                }
-            }
-            match flush_result {
-                Ok(()) => {
-                    // close() is the close-to-open publication point.
-                    view.nudge_sync();
-                    r.done(Ok(()))
-                }
-                Err(e) => r.done(err(e)),
-            }
-        };
-        // As in `flush`: waits out a transient S3 failure on the `fsync`
-        // pool, like an `fsync` (ADR-66).
-        let cancel = cx.cancel.cloned();
-        let deferral = if drain {
-            self.fsync_deferral(OpKind::Release)
-                .filter(|_| !matches!(r.begin_wait(), constellation_vfs::WaitStart::Refused))
-        } else {
-            None
-        };
-        let Some(view) = deferral else {
-            let drained = if drain {
-                self.close_drain(ino, cancel)
-            } else {
-                Ok(())
-            };
-            finish(self, drained, r);
-            return;
-        };
-        let watch = _w;
-        let caller = crate::locks::scope_caller();
-        crate::fsync_wait::pool().submit(move || {
-            watch.adopt();
-            let drained = view.close_drain(ino, cancel);
-            let _lock_tag = caller.as_ref().map(|c| c.enter());
-            finish(&view, drained, r);
-            drop(watch);
+            Ok(())
         });
+        if let (Some(l), true) = (locks, idle) {
+            l.idle(ino);
+        }
+        let (last, still_open) = {
+            let mut opens = self.opens.lock().unwrap();
+            match opens.get_mut(&ino) {
+                Some(n) => {
+                    *n = n.saturating_sub(1);
+                    let last = *n == 0;
+                    let still_open = *n;
+                    if last {
+                        opens.remove(&ino);
+                        self.prefetch.forget(ino);
+                    }
+                    (last, still_open)
+                }
+                None => (false, 0),
+            }
+        };
+        // The chunk file this handle was opened on, if it got one, and the
+        // disk cache's pin on it (plan 38 §3(c)). `release` does not name
+        // which handle closed, so what is dropped is whatever the inode
+        // holds beyond the handles still open on it.
+        self.note_writer_release(ino, flags);
+        self.drop_passthrough(ino, still_open);
+        if last {
+            self.forget_discard_errors(ino);
+        }
+        // Orphan reap on last close (unlink-while-open, DESIGN.md §3),
+        // with the write session a flush kept for the descriptors
+        // (`flush_inode`: an unlinked file publishes nothing). An inode
+        // the replica lacks but holds no orphan record of is the
+        // sequencer's to judge: its session goes only once the flush
+        // above answered `ESTALE` (no such file there), never with a
+        // success; after any other failure it stays, as a present
+        // file's does. An orphan this view's platform still references
+        // is left to its `forget`, session included: a reopen through
+        // that reference, in this view, reads what this handle wrote
+        // (`View::reap_after_unlink`; sessions are per view). One another
+        // view still has open or references keeps its record for that
+        // view — as `unlink`'s reap already asked every view (84a59be) —
+        // and this view's session, which nothing in this view reaches any
+        // more, goes.
+        let reap = last && !self.unlinked_referenced(ino);
+        let orphan = reap && self.orphaned(ino);
+        if orphan || (reap && self.unlinked(ino) && flush_result == Err(Code::Stale)) {
+            if self.drop_writes(ino) && !orphan {
+                tracing::warn!(
+                    ino,
+                    "the last close dropped writes to a file the sequencer does not have; \
+                     the close answered ESTALE"
+                );
+            }
+            let elsewhere = self
+                .holds
+                .as_ref()
+                .is_some_and(|h| h.sources().is_open(ino));
+            if let Ok(Some(attr)) = self.meta.getattr(ino) {
+                if attr.nlink == 0 && !elsewhere {
+                    // Under a frontend that reports `forget`s, this view's
+                    // own unlinks wait for theirs (above), so one reaped
+                    // here was unlinked elsewhere — another node or view —
+                    // and a reference that outlives it is stale
+                    // (`View::gone`): remembered as this view's own
+                    // removal, its `fstat` answered `nlink` 0 while its
+                    // reopen answered `ENOENT`.
+                    if !self.keeps_referenced() {
+                        self.remember_dead(attr);
+                    }
+                    let _ = self.meta.reap_orphan(ino);
+                }
+            }
+        }
+        match flush_result {
+            Ok(()) => {
+                // close() is the close-to-open publication point.
+                self.nudge_sync();
+                r.done(Ok(()))
+            }
+            Err(e) => r.done(err(e)),
+        }
     }
 
     fn fsync<R: Responder<()>>(

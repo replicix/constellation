@@ -25,10 +25,11 @@
 //! 100 ms doubling to 5 s), re-using the same machinery (the drain, its
 //! peer handoff, the round) rather than a second uploader. Background
 //! uploads and `--write-mode` behave exactly as before. A write-through
-//! `close()` has run inside a [`Scope`] too since ADR-66: its drain (not its
-//! commit) is retried like an `fsync`'s, ends at the same timeout and cap
-//! and by its killed caller, and answers `EIO` (never `EINTR`) when cut
-//! short.
+//! `flush` (the application-visible `close()`) has run inside a [`Scope`]
+//! too since ADR-66: its whole publication (commit, and the drains before
+//! and after it) is retried like an `fsync`'s, ends at the same timeout and
+//! cap and by its killed caller, and answers `EIO` (never `EINTR`) when cut
+//! short. A `release` keeps its bounded drain.
 //!
 //! **Bounded, on request.** Three things end a wait before durability:
 //!
