@@ -304,14 +304,37 @@ impl Meta {
     /// first (from either thread of a streamed bootstrap): the marker is
     /// committed before the rows exist, so a crash at any later point leaves
     /// a store [`Meta::open`] refuses, and [`Self::apply_bootstrap_indexes`]
-    /// clears it in the transaction that completes the derived state.
+    /// clears it ([`Self::finish_bootstrap`]) once the caller's bootstrap is
+    /// whole.
+    ///
+    /// The marker is synced before the first ingested row: the ingested
+    /// tables are fsynced as they are registered, but a buffered commit
+    /// reaches only the OS, so a power loss could keep the names and lose
+    /// the marker, and the next open would take a partial store for a
+    /// complete one. One sync per bootstrap (later pages find the marker).
     fn mark_bootstrapping(&self) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         if kv_get_tx(&tx, &self.local, KV_BOOTSTRAPPING)?.is_none() {
             kv_set_tx(&mut tx, &self.local, KV_BOOTSTRAPPING, "1");
             tx.commit()?;
+            self.sync()?;
         }
         Ok(())
+    }
+
+    /// The bootstrap is whole: clear the marker ([`KV_BOOTSTRAPPING`]) and
+    /// sync, so a store that opens again holds the names, the derived rows,
+    /// the replayed log and the recorded commit together. Called once, by
+    /// the caller of the load, after everything that follows it: until
+    /// then a crash leaves a store [`Meta::open`] refuses.
+    ///
+    /// # Errors
+    /// A store error; the marker stays then.
+    pub fn finish_bootstrap(&self) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        tx.remove(&self.local, KV_BOOTSTRAPPING.as_bytes().to_vec());
+        tx.commit()?;
+        self.sync()
     }
 
     /// [`Self::ns_ingest_page`] that moves the pairs out of `page` (leaving
@@ -474,9 +497,9 @@ impl Meta {
             ingestion.finish()?;
         }
         let mut tx = self.db.write_tx();
-        // The load is complete with this transaction: the marker goes with
-        // the derived state it guards, never before.
-        tx.remove(&self.local, KV_BOOTSTRAPPING.as_bytes().to_vec());
+        // The marker stays: the bootstrap is finished only when the caller
+        // has also replayed the log from the commit and recorded where the
+        // load stands ([`Self::finish_bootstrap`]).
         clear_tx(&mut tx, &self.chunk_ref)?;
         clear_tx(&mut tx, &self.chunk_ref_by_ino)?;
         clear_tx(&mut tx, &self.xattr_by_name)?;

@@ -35,7 +35,7 @@
 //!
 //! The row is written only by [`note_insert`] and [`note_remove`], which
 //! `ns::ns_insert` / `ns::ns_remove` call after the write of a `0x04` key
-//! with a tracked [`ns::Dirty`], in the same transaction. Every write to
+//! with a tracked [`crate::store::ns::Dirty`], in the same transaction. Every write to
 //! `ns` goes through that funnel, but three: bootstrap ingestion (the
 //! [`crate::store::BootstrapIndexBuilder`] writes the rows in
 //! `apply_bootstrap_indexes`, before the node serves), `ns_overwrite_after_ingest`
@@ -59,6 +59,7 @@
 //! range ended, or `ONE` is set.
 
 use crate::error::MetaError;
+#[cfg(any(test, feature = "test-util"))]
 use crate::store::ns;
 use constellation_fs_core::Ino;
 use constellation_mtree::keys;

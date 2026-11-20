@@ -69,8 +69,8 @@ pub enum MetaError {
 
     /// The store was left half-loaded: a bootstrap from a commit began
     /// (`Meta::ns_ingest_page`) and never finished
-    /// (`Meta::apply_bootstrap_indexes`). It holds names but not the rows
-    /// derived from them. The only repair is to remove the store and
+    /// (`Meta::finish_bootstrap`). It may hold names but not the rows
+    /// derived from them, or the log tail on top of them. The only repair is to remove the store and
     /// bootstrap it again.
     #[error("the store's bootstrap from a commit never finished: remove it and bootstrap again")]
     BootstrapInterrupted,

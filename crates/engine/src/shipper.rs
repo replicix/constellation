@@ -61,6 +61,9 @@ async fn bootstrap_from_tree(db_path: &std::path::Path, log: &LogStore) -> Resul
         for ino in meta.orphans()? {
             meta.reap_orphan(ino)?;
         }
+        // Everything the load left to do is done: a crash before this point
+        // leaves the marker, and the store is wiped and loaded again.
+        meta.finish_bootstrap()?;
         tracing::info!(
             seq = loaded.commit.seq,
             inodes = loaded.inodes,

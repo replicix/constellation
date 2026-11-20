@@ -268,10 +268,11 @@ pub(crate) const KV_FORMAT: &str = "format";
 /// store with a root inode and no marker predates it and is refused).
 pub(crate) const KV_PRIMARIES_INDEX: &str = "primaries_index";
 /// `local` kv: a bootstrap from a commit has begun loading this store and
-/// has not finished. Set by the first ingested page, removed in the
-/// transaction of `Meta::apply_bootstrap_indexes`, which also writes the
-/// rows derived from what was loaded; an open that finds it refuses the
-/// store ([`MetaError::BootstrapInterrupted`]).
+/// has not finished. Set (and synced) by the first ingested page, removed
+/// by `Meta::finish_bootstrap` once the caller has loaded the tree
+/// (`Meta::apply_bootstrap_indexes` writes the derived rows), replayed the
+/// log and recorded the commit; an open that finds it refuses the store
+/// ([`MetaError::BootstrapInterrupted`]).
 pub(crate) const KV_BOOTSTRAPPING: &str = "bootstrapping";
 /// The on-disk format this binary reads and writes. There is no migration:
 /// a store of another format is refused at open. 3: `local` counts each
@@ -971,6 +972,12 @@ pub struct Meta {
     /// not flush. An open that refuses the store (another format, a failed
     /// check) leaves it as it found it, its journals included.
     closed: AtomicBool,
+    /// Tests only, once [`Meta::arm_power_loss_for_tests`] ran: each journal
+    /// file's bytes as of the last completed [`Meta::sync`] (what a power
+    /// loss would leave of it; fjall preallocates the files, so a length
+    /// says nothing about what was written).
+    #[cfg(any(test, feature = "test-util"))]
+    synced_journals: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, Vec<u8>>>>,
 }
 
 /// The most journal bytes fjall keeps before it asks the keyspaces that
@@ -1186,7 +1193,32 @@ impl Meta {
         )?;
         gate::note_sync(started.elapsed());
         self.syncs.fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "test-util"))]
+        self.note_synced_journals();
         Ok(())
+    }
+
+    /// Tests only: remember each journal file's bytes now, when armed.
+    #[cfg(any(test, feature = "test-util"))]
+    fn note_synced_journals(&self) {
+        let mut slot = self
+            .synced_journals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            *slot = self.snapshot_journals();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn snapshot_journals(&self) -> Option<std::collections::HashMap<PathBuf, Vec<u8>>> {
+        let root = self.path.as_deref()?;
+        Some(
+            journal_files(root)
+                .into_iter()
+                .filter_map(|f| Some((f.clone(), std::fs::read(&f).ok()?)))
+                .collect(),
+        )
     }
 
     /// Plan 45: how many `0x01` records were read to answer for a dentry
@@ -1353,6 +1385,46 @@ impl Meta {
     #[cfg(any(test, feature = "test-util"))]
     pub fn drop_without_close_for_tests(self) {
         self.closed.store(true, Ordering::Release);
+    }
+
+    /// Tests only: from now on remember what each [`Meta::sync`] made
+    /// durable, for [`Self::drop_losing_unsynced_for_tests`]. Syncs first.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn arm_power_loss_for_tests(&self) -> Result<(), MetaError> {
+        self.sync()?;
+        *self
+            .synced_journals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self.snapshot_journals();
+        Ok(())
+    }
+
+    /// Tests only: drop the store the way a power loss leaves it. Commits
+    /// reach the OS but not the disk until [`Meta::sync`]: every journal
+    /// goes back to its bytes at the last completed sync since
+    /// [`Self::arm_power_loss_for_tests`] (a journal created since is
+    /// removed), then the store is dropped without closing. Tables and the
+    /// version file were fsynced when written, so they stay.
+    ///
+    /// # Panics
+    /// The store was not armed, or a journal cannot be rewritten.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn drop_losing_unsynced_for_tests(self) {
+        self.closed.store(true, Ordering::Release);
+        let root = self.path.clone().expect("an on-disk store");
+        let synced = self
+            .synced_journals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("arm_power_loss_for_tests first");
+        drop(self);
+        for file in journal_files(&root) {
+            match synced.get(&file) {
+                Some(bytes) => std::fs::write(&file, bytes).expect("rewrite a journal"),
+                None => std::fs::remove_file(&file).expect("remove an unsynced journal"),
+            }
+        }
     }
 
     /// [`Self::kv_set`], then [`Self::sync`]: for a value whose loss on
@@ -1531,6 +1603,8 @@ impl Meta {
             sync_group: Default::default(),
             path,
             closed: AtomicBool::new(true),
+            #[cfg(any(test, feature = "test-util"))]
+            synced_journals: std::sync::Mutex::default(),
         };
         meta.check_format()?;
         meta.init_root_tx_hint()?;
@@ -3663,4 +3737,25 @@ mod format_tests {
             "{msg}"
         );
     }
+}
+
+/// Tests only: every `.jnl` file under `root`.
+#[cfg(any(test, feature = "test-util"))]
+fn journal_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                todo.push(path);
+            } else if path.extension().is_some_and(|e| e == "jnl") {
+                out.push(path);
+            }
+        }
+    }
+    out
 }

@@ -16,8 +16,8 @@ use crate::store::{BootstrapIndexBuilder, Meta, KV_PRIMARIES_INDEX};
 use constellation_fs_core::types::{now_ns, ROOT_INO};
 use constellation_mtree::keys;
 use proptest::prelude::*;
+use std::cell::Cell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Directories above 2^32, and the root, which sorts first.
 const PARENTS: [u64; 5] = [
@@ -137,21 +137,27 @@ enum Op1 {
         p: usize,
         n: String,
     },
+    /// `pick` chooses the source among the names the store has now, so the
+    /// record applies whenever there is one; `(p, n)` stands in when the
+    /// files have none.
     Unlink {
         p: usize,
         n: String,
+        pick: usize,
     },
     Rename {
         p: usize,
         n: String,
         np: usize,
         nn: String,
+        pick: usize,
     },
     Exchange {
         p: usize,
         n: String,
         np: usize,
         nn: String,
+        pick: usize,
     },
 }
 
@@ -177,11 +183,11 @@ fn op1() -> impl Strategy<Value = Op1> {
     prop_oneof![
         1 => (f.clone(), p.clone(), name()).prop_map(|(f, p, n)| Op1::Create { f, p, n }),
         5 => (f, p.clone(), name()).prop_map(|(f, p, n)| Op1::Link { f, p, n }),
-        5 => (p.clone(), name()).prop_map(|(p, n)| Op1::Unlink { p, n }),
-        3 => (p.clone(), name(), p.clone(), name())
-            .prop_map(|(p, n, np, nn)| Op1::Rename { p, n, np, nn }),
-        2 => (p.clone(), name(), p, name())
-            .prop_map(|(p, n, np, nn)| Op1::Exchange { p, n, np, nn }),
+        5 => (p.clone(), name(), any::<usize>()).prop_map(|(p, n, pick)| Op1::Unlink { p, n, pick }),
+        3 => (p.clone(), name(), p.clone(), name(), any::<usize>())
+            .prop_map(|(p, n, np, nn, pick)| Op1::Rename { p, n, np, nn, pick }),
+        2 => (p.clone(), name(), p, name(), any::<usize>())
+            .prop_map(|(p, n, np, nn, pick)| Op1::Exchange { p, n, np, nn, pick }),
     ]
 }
 
@@ -207,6 +213,30 @@ impl Clock {
     }
 }
 
+/// Every `(parent, name)` the files hold now, in a fixed order.
+fn live_names(meta: &Meta) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for f in FILES {
+        for (parent, name) in meta.names_of_ino(f, usize::MAX).names {
+            if let Some(p) = PARENTS.iter().position(|x| *x == parent) {
+                out.push((p, name));
+            }
+        }
+    }
+    out
+}
+
+/// The source of an unlink, rename or exchange: the `pick`th live name
+/// when there is one, so most of these records apply.
+fn source(meta: &Meta, pick: usize, p: usize, n: &str) -> (usize, String) {
+    let live = live_names(meta);
+    if live.is_empty() {
+        (p, n.to_owned())
+    } else {
+        live[pick % live.len()].clone()
+    }
+}
+
 fn record(meta: &Meta, clock: &mut Clock, op: &Op1) -> Option<LogRecord> {
     let time_ns = clock.tick();
     Some(match op {
@@ -225,27 +255,37 @@ fn record(meta: &Meta, clock: &mut Clock, op: &Op1) -> Option<LogRecord> {
             name: n.clone(),
             time_ns,
         },
-        Op1::Unlink { p, n } => LogRecord::Unlink {
-            parent: PARENTS[*p],
-            name: n.clone(),
-            time_ns,
-        },
-        Op1::Rename { p, n, np, nn } => LogRecord::Rename {
-            parent: PARENTS[*p],
-            name: n.clone(),
-            new_parent: PARENTS[*np],
-            new_name: nn.clone(),
-            time_ns,
-        },
-        Op1::Exchange { p, n, np, nn } => LogRecord::Exchange {
-            parent: PARENTS[*p],
-            name: n.clone(),
-            new_parent: PARENTS[*np],
-            new_name: nn.clone(),
-            time_ns,
-            ino: meta.child_ino(PARENTS[*p], n).ok().flatten()?,
-            new_ino: meta.child_ino(PARENTS[*np], nn).ok().flatten()?,
-        },
+        Op1::Unlink { p, n, pick } => {
+            let (p, n) = source(meta, *pick, *p, n);
+            LogRecord::Unlink {
+                parent: PARENTS[p],
+                name: n,
+                time_ns,
+            }
+        }
+        Op1::Rename { p, n, np, nn, pick } => {
+            let (p, n) = source(meta, *pick, *p, n);
+            LogRecord::Rename {
+                parent: PARENTS[p],
+                name: n,
+                new_parent: PARENTS[*np],
+                new_name: nn.clone(),
+                time_ns,
+            }
+        }
+        Op1::Exchange { p, n, np, nn, pick } => {
+            let (p, n) = source(meta, *pick, *p, n);
+            let (np, nn) = source(meta, *pick / 7 + 1, *np, nn);
+            LogRecord::Exchange {
+                parent: PARENTS[p],
+                new_parent: PARENTS[np],
+                time_ns,
+                ino: meta.child_ino(PARENTS[p], &n).ok().flatten()?,
+                new_ino: meta.child_ino(PARENTS[np], &nn).ok().flatten()?,
+                name: n,
+                new_name: nn,
+            }
+        }
     })
 }
 
@@ -343,16 +383,44 @@ fn stream_copy(meta: &Meta, min: usize) -> Meta {
     fresh
 }
 
-static INSTALLED: AtomicUsize = AtomicUsize::new(0);
-static UNAPPLIED: AtomicUsize = AtomicUsize::new(0);
+/// What one run's shadow installs did (the run's own, not shared with a
+/// parallel test).
+#[derive(Default)]
+struct Tally {
+    installed: Cell<usize>,
+    unapplied: Cell<usize>,
+    /// Installed shadows whose records unlink or rename a name: a batch with
+    /// a skipped record installs nothing, so each of these applied.
+    moved: Cell<usize>,
+    /// Of those, the ones a rollback then undid.
+    moved_rolled_back: Cell<usize>,
+}
 
 /// Count what a shadow install did. A batch that skips a record installs
 /// nothing (`Unapplied`): fine, but counted, so the rollback and redo cases
 /// cannot silently stop installing. Any other outcome is a test bug.
-fn count_install(got: ShadowInstall) -> Result<(), TestCaseError> {
+fn count_install(
+    tally: &Tally,
+    got: ShadowInstall,
+    recs: &[LogRecord],
+    rolled_back: bool,
+) -> Result<(), TestCaseError> {
     match got {
-        ShadowInstall::Installed => INSTALLED.fetch_add(1, Ordering::Relaxed),
-        ShadowInstall::Unapplied => UNAPPLIED.fetch_add(1, Ordering::Relaxed),
+        ShadowInstall::Installed => {
+            tally.installed.set(tally.installed.get() + 1);
+            if recs
+                .iter()
+                .any(|r| matches!(r, LogRecord::Unlink { .. } | LogRecord::Rename { .. }))
+            {
+                tally.moved.set(tally.moved.get() + 1);
+                if rolled_back {
+                    tally
+                        .moved_rolled_back
+                        .set(tally.moved_rolled_back.get() + 1);
+                }
+            }
+        }
+        ShadowInstall::Unapplied => tally.unapplied.set(tally.unapplied.get() + 1),
         other => return Err(TestCaseError::fail(format!("shadow install: {other:?}"))),
     };
     Ok(())
@@ -368,7 +436,7 @@ fn rid(n: u64) -> Rid {
 
 /// One case of the property: `ops` through every write path, `verify`
 /// after each.
-fn run_case(ops: &[Op], final_copy: bool) -> Result<(), TestCaseError> {
+fn run_case(ops: &[Op], final_copy: bool, tally: &Tally) -> Result<(), TestCaseError> {
     let meta = delegated_store(&PARENTS);
     let mut clock = Clock(now_ns() + 3_600_000_000_000);
     let first: Vec<LogRecord> = FILES
@@ -407,7 +475,7 @@ fn run_case(ops: &[Op], final_copy: bool) -> Result<(), TestCaseError> {
                     .install_shadow_from(rid(next_rid), 1, GEN, &op, &LockTag::NONE, &recs)
                     .unwrap();
                 next_rid += 1;
-                count_install(got)?;
+                count_install(tally, got, &recs, true)?;
                 verify(&meta, &FILES)?;
                 meta.strand_recalled_speculation(GEN).unwrap();
             }
@@ -419,7 +487,7 @@ fn run_case(ops: &[Op], final_copy: bool) -> Result<(), TestCaseError> {
                 };
                 let got = meta.install_shadow(rid(next_rid), 1, &op, &recs).unwrap();
                 next_rid += 1;
-                count_install(got)?;
+                count_install(tally, got, &recs, false)?;
                 verify(&meta, &FILES)?;
                 let seg = records(&meta, &mut clock, segment);
                 meta.apply_segment(seq, 1, &seg, &TouchSet::default())
@@ -452,7 +520,7 @@ proptest! {
         ops in prop::collection::vec(op(), 1..=40),
         final_copy in prop::bool::weighted(0.25),
     ) {
-        run_case(&ops, final_copy)?;
+        run_case(&ops, final_copy, &Tally::default())?;
     }
 }
 
@@ -462,21 +530,34 @@ proptest! {
 #[test]
 fn the_shadow_cases_install_shadows() {
     let mut runner = proptest::test_runner::TestRunner::deterministic();
-    let before = INSTALLED.load(Ordering::Relaxed);
+    let tally = Tally::default();
     runner
         .run(
             &(
                 prop::collection::vec(op(), 1..=40),
                 prop::bool::weighted(0.25),
             ),
-            |(ops, final_copy)| run_case(&ops, final_copy),
+            |(ops, final_copy)| run_case(&ops, final_copy, &tally),
         )
         .unwrap();
-    let got = INSTALLED.load(Ordering::Relaxed) - before;
+    let (got, moved, rolled) = (
+        tally.installed.get(),
+        tally.moved.get(),
+        tally.moved_rolled_back.get(),
+    );
+    eprintln!(
+        "shadow installs: {got} installed, {} unapplied, {moved} with an unlink or rename, \
+         {rolled} of those rolled back",
+        tally.unapplied.get()
+    );
     assert!(
         got >= 100,
         "only {got} shadows installed ({} unapplied)",
-        UNAPPLIED.load(Ordering::Relaxed)
+        tally.unapplied.get()
+    );
+    assert!(
+        moved >= 100 && rolled >= 40,
+        "only {moved} installed shadows moved or removed a name ({rolled} rolled back)"
     );
 }
 
@@ -665,6 +746,91 @@ fn a_bootstrap_that_never_finished_is_refused() {
         builder.observe_name(&page[0].0);
         meta.ns_ingest_page(&page).unwrap();
         meta.apply_bootstrap_indexes(builder).unwrap();
+        meta.finish_bootstrap().unwrap();
+    }
+    Meta::open(finished.path()).unwrap();
+}
+
+/// Power loss after the first ingested page: the page's tables were
+/// fsynced when they were registered, but a buffered commit reaches only
+/// the OS. The marker must be on the disk by then, or the journal replays
+/// the genesis without it and `Meta::open` takes the partial store for a
+/// complete one. Fail-before: the marker was committed buffered, never
+/// synced.
+#[test]
+fn the_marker_survives_a_power_loss_after_the_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = vec![(keys::rdentry(FILES[0], PARENTS[1], b"x"), Vec::new())];
+    {
+        let meta = Meta::open(dir.path()).unwrap();
+        // The genesis reached the disk (the tree fetch outlasted the
+        // kernel's writeback delay); the marker's commit is not synced.
+        meta.arm_power_loss_for_tests().unwrap();
+        meta.ns_ingest_page(&page).unwrap();
+        meta.drop_losing_unsynced_for_tests();
+    }
+    assert!(matches!(
+        Meta::open(dir.path()),
+        Err(MetaError::BootstrapInterrupted)
+    ));
+}
+
+/// The same for the streamed rows' own ingestion (the worker thread's
+/// first call marks the store).
+#[test]
+fn the_marker_survives_a_power_loss_after_the_streamed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let meta = Meta::open(dir.path()).unwrap();
+        meta.arm_power_loss_for_tests().unwrap();
+        let mut builder = BootstrapIndexBuilder::new();
+        builder.observe_name(&keys::rdentry(FILES[0], PARENTS[1], b"x"));
+        let (runs, rx) = std::sync::mpsc::sync_channel(2);
+        runs.send(Some(builder.take_all_primaries())).unwrap();
+        runs.send(None).unwrap();
+        meta.ingest_primary_runs(rx).unwrap();
+        meta.drop_losing_unsynced_for_tests();
+    }
+    assert!(matches!(
+        Meta::open(dir.path()),
+        Err(MetaError::BootstrapInterrupted)
+    ));
+}
+
+/// The window after the derived rows are in and before the caller has
+/// replayed the log and recorded the commit: a crash there (even one that
+/// loses nothing, the journal intact) is refused, so the node bootstraps
+/// again rather than tailing the log from segment 1 over a tree already at
+/// the commit. Finishing the bootstrap clears the marker durably.
+/// Fail-before: `apply_bootstrap_indexes` cleared the marker itself.
+#[test]
+fn a_crash_between_the_load_and_the_finish_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = vec![(keys::rdentry(FILES[0], PARENTS[1], b"x"), Vec::new())];
+    {
+        let meta = Meta::open(dir.path()).unwrap();
+        let mut builder = BootstrapIndexBuilder::new();
+        builder.observe_name(&page[0].0);
+        meta.ns_ingest_page(&page).unwrap();
+        meta.apply_bootstrap_indexes(builder).unwrap();
+        // The replay of the log tail, the recorded commit: not yet.
+        meta.drop_without_close_for_tests();
+    }
+    assert!(matches!(
+        Meta::open(dir.path()),
+        Err(MetaError::BootstrapInterrupted)
+    ));
+    let finished = tempfile::tempdir().unwrap();
+    {
+        let meta = Meta::open(finished.path()).unwrap();
+        meta.arm_power_loss_for_tests().unwrap();
+        let mut builder = BootstrapIndexBuilder::new();
+        builder.observe_name(&page[0].0);
+        meta.ns_ingest_page(&page).unwrap();
+        meta.apply_bootstrap_indexes(builder).unwrap();
+        meta.finish_bootstrap().unwrap();
+        // Power loss right after the finish: the clear was synced.
+        meta.drop_losing_unsynced_for_tests();
     }
     Meta::open(finished.path()).unwrap();
 }
