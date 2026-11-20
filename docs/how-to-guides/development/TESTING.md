@@ -4751,8 +4751,9 @@ resolved when this node's own acquisition opens its view (core tests
 arms: an `EIO` under a span (held-release or cut) is excused as "row unshippable" only if no
 root appended the span's row by the `EIO` (`Oracles::span_row_appended`, read from the lease
 holder's table history: the generation gone after that same holder's table had it live; the
-history keeps a table only when its signature changes, so a cut that arrives alone is not recorded
-yet and a cut-only span reads as "not appended", a follow-up of the harness) and the holder had no root to ship it to for one round trip
+history keeps a table when its signature changes, and the signature includes the subtrees cut in
+each generation, so a cut that arrives alone, before the release row, is recorded; pin
+`a_cut_that_arrives_alone_is_in_the_table_history`) and the holder had no root to ship it to for one round trip
 (`Reach::root_run_for_a_row`: itself, or the root in force for `min_p2p_ms`). Each excuse
 prints both facts (`appended by a root`, `the holder's root run`) in the `SWEEP-S4-EIO` line;
 unit tests `a_span_row_is_appended_when_a_roots_table_shows_the_cut_or_the_release`,

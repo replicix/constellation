@@ -24294,6 +24294,27 @@ fn the_s4_tag_fires_on_the_fix_arm_with_either_negative_control_merge() {
     s4_knob_fires("sticky-s4-merge", sticky_s4_merge_config, 8);
 }
 
+/// Review 4, SHOULD-1: the table history records a cut that arrives alone.
+/// `sticky-s4-suspend` seed 3 with the root ignoring the cut has a cut span
+/// from 4.5 s whose row the root holds from the cut on; the `EIO` must print
+/// the root's append time, not `None` (the history used to keep a table only
+/// when the generations changed, so the cut was seen only with the release).
+#[test]
+fn a_cut_that_arrives_alone_is_in_the_table_history() {
+    let e = run_seed(
+        3,
+        SimConfig {
+            root_ignores_cut: true,
+            ..sticky_s4_suspend_config()
+        },
+    )
+    .expect_err("suspend seed 3 +root_ignores_cut: the tag did not fire");
+    assert!(
+        e.contains("cut span") && e.contains("appended by a root: Some("),
+        "the cut span's row shows as appended by a root: {e}"
+    );
+}
+
 /// Round 9 (review 3, MUST-3): the label with the most `EIO`s under a span
 /// has both negative controls too.
 #[test]

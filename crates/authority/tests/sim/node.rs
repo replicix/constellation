@@ -439,7 +439,7 @@ impl EventKind {
 
 /// The generations (dir, node, gen, recall, ended) the last delegation table
 /// kept was taken at.
-type GensSig = Vec<(Vec<u64>, u64, u64, String, bool)>;
+type GensSig = Vec<(Vec<u64>, u64, u64, String, bool, Vec<u64>)>;
 
 pub struct NodeHandle {
     pub id: NodeId,
@@ -3194,18 +3194,30 @@ impl Driver {
             // The generation history: this holder's delegation table, kept
             // when its generations changed (install, recall, end).
             if held != super::reach::Held::No {
+                // The signature includes the subtrees cut in each generation:
+                // a cut mark that arrives alone (before the release row) is
+                // a table change the history must keep.
+                let table_now = self.meta.delegation_table();
                 let sig: GensSig = view
                     .delegation
                     .gens
                     .iter()
-                    .map(|g| (g.0.clone(), g.1, g.2, g.5.clone(), g.6))
+                    .map(|g| {
+                        (
+                            g.0.clone(),
+                            g.1,
+                            g.2,
+                            g.5.clone(),
+                            g.6,
+                            table_now.cut_dirs(g.1, g.2).into_iter().collect(),
+                        )
+                    })
                     .collect();
                 let mut last = self.deleg_sig.lock().unwrap();
                 let changed = sig != *last;
                 if changed || (!self.meta.delegations_any() && self.oracles.tables_nonempty()) {
                     *last = sig;
-                    self.oracles
-                        .note_table(self.id, self.meta.delegation_table());
+                    self.oracles.note_table(self.id, table_now);
                 }
             }
         }
