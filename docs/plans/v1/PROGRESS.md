@@ -71754,3 +71754,6 @@ Every read of an inode's first names (`names_of_ino`, `primary_parent`, `parent_
 **Harness follow-up (rchist, review 4 SHOULD-1, sim only).** The per-node table history now includes each generation's cut subtrees in
 its signature, so a cut that arrives alone is recorded and the `appended by a root` leg of the S4 excuse and the classifier's R1 arm see
 it before the release row. Pin `a_cut_that_arrives_alone_is_in_the_table_history` (`sticky-s4-suspend` seed 3 with `root_ignores_cut`).
+
+**sfffix A (upload claims).** A pass claims a chunk only inside its upload future, after it holds a permit; a hash another drain holds is deferred, and an upload that fails ends its claim at once. An `fsync` drain no longer waits behind a background pass's backlog (up to 120 s) or behind a failed PUT's claim. Pins `a_drain_is_not_held_behind_a_stalled_background_backlog`, `a_failed_put_releases_its_claim_before_the_pass_ends`.
+**sfffix C (in-doubt close).** A holder's close keeps its retry inputs for every commit made under the lease with a sync handle, so a durability wait that comes back in doubt (a continuation epoch closed under it) re-commits through the core instead of answering `EIO`; a path with no inputs records a transient failure so `fsync` retries. Pin `an_in_doubt_close_without_a_gated_class_recommits_through_the_core`.
