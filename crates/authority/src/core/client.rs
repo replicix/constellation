@@ -702,6 +702,12 @@ impl Core {
     /// yet withdrawn stay with the rid, so the resubmission tombstones them
     /// before any forward, and its send history (unknown: a replay's) stays
     /// the rid's. Bounded with `in_doubt_rids` (`evict_in_doubt`).
+    ///
+    /// A replay that finished with `also_client` (the client joined it and
+    /// hears the outcome, or `InDoubt`, itself) passes `client_waits` false
+    /// when the outcome is definitive and drops its remaining keys on
+    /// purpose: no resubmission follows, and the drain of those batches
+    /// dedups by rid.
     fn repark_replay(&mut self, rid: Rid, c: &ClientOp, client_waits: bool) {
         if !client_waits {
             return;
