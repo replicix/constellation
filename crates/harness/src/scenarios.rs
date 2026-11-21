@@ -724,13 +724,6 @@ pub const SCENARIOS: &[Scenario] = &[
         run: stressfs::stress_ng_fs,
     },
     Scenario {
-        name: "stress-ng-fs-faults",
-        desc: "stress-ng-fs under 40+/-20 ms S3 latency and a 1.5 s S3 cut every 4-7 s",
-        requires: &["stress-ng"],
-        caps: &[],
-        run: stressfs::stress_ng_fs_faults,
-    },
-    Scenario {
         name: "stress-ng-flap",
         desc: "stress-ng metadata churn while S3 flaps; mount healthy + spool drains",
         requires: &["stress-ng"],
@@ -2572,15 +2565,14 @@ pub const CAMPAIGN: &[Scenario] = &[
 /// FUSE workers all end up waiting, leaving stress-ng processes unkillable
 /// (TESTING.md, "stress-ng-fs").
 ///
-/// `stress-ng-fs-faults` left the list when the adaptive upload controller
-/// stopped treating a cut S3 as congestion: a PUT that failed with a
-/// connection-level error no longer halves the concurrency target, so the
-/// target no longer sat at 2-8 between 1.5 s cuts and a file rewritten
-/// meanwhile no longer piled up pending rows for an `fsync` to drain for
-/// minutes (the stall that failed about one run in thirty). It is in
-/// `SCENARIOS`. It also reproduced the frozen-epoch lock-drop bug (`EROFS`
-/// on the canary create), still open and not seen in the 30 promotion runs:
-/// a future failure with that signature is that bug.
+/// `stress-ng-fs-faults`: the `DrainInode`/upload-concurrency stall is fixed
+/// (an S3 cut no longer halves the adaptive upload target, so a rewritten file
+/// no longer piles up pending rows for an `fsync` to drain for minutes). One
+/// bug remains: every S3 cut can open a continuation epoch on the single node
+/// whose close is handled as the lease going away, and once the epoch froze
+/// instead (the frozen-epoch lock-drop bug) a create after the run failed with
+/// `EROFS` (`c0: creating the canary`). It failed 1 of 5 loaded runs after the
+/// stall fix. It moves to `SCENARIOS` when that bug is fixed.
 pub const KNOWN_BUG_REPROS: &[Scenario] = &[
     Scenario {
         name: "stress-ng-fs-nodes",
@@ -2588,6 +2580,13 @@ pub const KNOWN_BUG_REPROS: &[Scenario] = &[
         requires: &["stress-ng"],
         caps: &[],
         run: stressfs::stress_ng_fs_nodes,
+    },
+    Scenario {
+        name: "stress-ng-fs-faults",
+        desc: "stress-ng-fs under 40+/-20 ms S3 latency and a 1.5 s S3 cut every 4-7 s",
+        requires: &["stress-ng"],
+        caps: &[],
+        run: stressfs::stress_ng_fs_faults,
     },
 ];
 

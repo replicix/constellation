@@ -153,7 +153,7 @@ for 120 s, against a live mount behind the harness's fault proxy:
 | Scenario | What |
 |---|---|
 | `stress-ng-fs` | one node, one mount; accounting snapshots on, a few seed files written first, two snapshots of `/` taken mid-run |
-| `stress-ng-fs-faults` | the same under 40 ± 20 ms S3 latency and a 1.5 s S3 cut every 4–7 s; no snapshots. In the default set (a close retries like an `fsync`, ADR-66; an S3 cut does not lower the upload concurrency target) |
+| `stress-ng-fs-faults` | the same under 40 ± 20 ms S3 latency and a 1.5 s S3 cut every 4–7 s; no snapshots. A **known-bug reproduction** (`KNOWN_BUG_REPROS`): run it by name; ADR-66 fixed its `close`/`fsync` errors and dfix its upload-concurrency stall; the frozen-epoch lock-drop bug (`EROFS`) is open (below) |
 | `stress-ng-fs-nodes` | the same on three P2P nodes of one filesystem at once, each in its own directory; snapshots from a non-holder. A **known-bug reproduction** (`KNOWN_BUG_REPROS`): run it by name |
 
 A run passes when all of these hold:
@@ -225,7 +225,7 @@ CONSTELLATION_FUSE_TRANSPORT=dev-fuse target/release/harness run stress-ng-fs
 sudo env HOME=/root PATH=$PATH \
     CONSTELLATION_FUSE_URING_ZERO_COPY=auto \
     target/release/harness run stress-ng-fs      # as root: uring_zc, passthrough too
-target/release/harness run stress-ng-fs-nodes  # known-bug repro
+target/release/harness run stress-ng-fs-nodes stress-ng-fs-faults  # known-bug repros
 # one stressor (or a few) through the whole harness, excluded ones included:
 STRESS_NG_FS_ONLY=lockmix STRESS_NG_FS_SECS=20 target/release/harness run stress-ng-fs
 # one stressor directly on a mount you made (fresh mount per stressor:
@@ -1918,7 +1918,7 @@ a documented bug as a regression. `harness run <name>` resolves a name
 in either list. When a later milestone fixes the bug, its scenario
 moves into `SCENARIOS` as the regression test. Plan 30 M2 moved
 `forward-timeout-reexec` (bug A) and M3a moved both bug B scenarios
-below. The list holds one scenario of
+below. The list holds two scenarios of
 [the stress-ng-fs lane](#stress-every-stress-ng-filesystem-stressor-stress-ng-fs)
 today:
 
@@ -1929,19 +1929,22 @@ today:
   non-holder ends with every FUSE worker waiting, and its stress-ng
   processes cannot be killed.
 
-`stress-ng-fs-faults` left the list with the upload-concurrency fix (it is
-in `SCENARIOS`). It failed about one run in thirty with a FUSE request
-unanswered for tens of seconds (once past 240 s under load): every 1.5 s S3
-cut failed the in-flight PUTs within microseconds and each failed chunk
-halved the adaptive upload concurrency target, which then stayed at 2-8
-between cuts. A file rewritten during the cuts piled up one pending row per
-superseded chunk version, and an `fsync` drained all of them (thousands of
-rows, minutes). A PUT that fails with a connection-level error now leaves the
-target alone; timeouts, 5xx and 429 still back off. The earlier suspicion
-that the sync task answers no `DrainInode` was wrong: it answers them while
-the drain runs. The scenario also reproduced the frozen-epoch lock-drop bug
-(`EROFS` on the canary create), still open and not seen in the 30 promotion
-runs; a future failure with that signature is that bug.
+- `stress-ng-fs-faults` failed about one run in thirty with a FUSE request
+  unanswered for tens of seconds (once past 240 s under load) since ADR-66
+  fixed its `close` and `fsync` failures. That stall is fixed (dfix): every
+  1.5 s S3 cut failed the in-flight PUTs within microseconds and each failed
+  chunk halved the adaptive upload concurrency target, which then stayed at
+  2-8 between cuts; a file rewritten meanwhile piled up one pending row per
+  superseded chunk version and an `fsync` drained thousands of them. A PUT
+  that fails with a connection-level error now leaves the target alone
+  (timeouts, 5xx and 429 still back off). The suspicion that the sync task
+  answers no `DrainInode` was wrong. One bug remains: every S3 cut can open
+  a continuation epoch on the single node, and closing it is handled as the
+  lease going away (`lease gone: lock grants dropped`; that line also
+  appears in a graceful unmount, which releases the lease, and is benign
+  there). The frozen-epoch lock-drop bug failed 1 of 5 loaded runs after the
+  stall fix: a create after the run failed with `EROFS` (`c0: creating the
+  canary`). The scenario moves to `SCENARIOS` when that bug is fixed.
 
 Reproducing these needed two things no scenario had before:
 

@@ -13,8 +13,10 @@
 //! `acl chattr fiemap verity` — still run, so that one that starts to
 //! pass shows in the table.)
 //!
-//! Three scenarios (`stress-ng-fs-nodes` among the known-bug
-//! reproductions, `KNOWN_BUG_REPROS`, until the bug it finds is fixed):
+//! Three scenarios (`stress-ng-fs-nodes` and `stress-ng-fs-faults` among
+//! the known-bug reproductions, `KNOWN_BUG_REPROS`, until the bugs they
+//! find are fixed; `stress-ng-fs-faults`'s `DrainInode`/upload-concurrency
+//! stall is fixed, its frozen-epoch lock-drop bug is open):
 //!
 //! - `stress-ng-fs`: one node, one mount, one stress-ng invocation running
 //!   every stressor of `stress-ng --class filesystem?` that
