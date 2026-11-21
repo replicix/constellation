@@ -784,6 +784,54 @@ impl UploadRuntime {
     }
 }
 
+/// Whether a failed PUT says the store or the path is overloaded, so that
+/// fewer requests in flight would help. `error` is the error of
+/// `put_chunk_mode` (a `StoreError`); its `source()` chain is walked.
+///
+/// `false` when the request got no response because S3 was unreachable: a
+/// connection that could not be made, or was reset, refused, aborted or
+/// interrupted (an `HttpError` of kind Connect, Request or Interrupted, or
+/// an `io::Error` of a connection-level kind). Fewer requests would not
+/// bring S3 back, and halving the target on every cut left it far below
+/// the link's capacity, so files rewritten during the cuts piled up pending
+/// rows that an `fsync` then had to drain. `true` for everything else:
+/// timeouts, 5xx, 429/SlowDown, decode errors and errors we do not
+/// recognise keep backing off.
+///
+/// Accepted risk: a store that sheds load by resetting connections no
+/// longer lowers the target.
+fn is_congestion(error: &(dyn std::error::Error + 'static)) -> bool {
+    use object_store::client::{HttpError, HttpErrorKind};
+    use std::io::ErrorKind;
+    let mut link = Some(error);
+    while let Some(error) = link {
+        if let Some(http) = error.downcast_ref::<HttpError>() {
+            if matches!(
+                http.kind(),
+                HttpErrorKind::Connect | HttpErrorKind::Request | HttpErrorKind::Interrupted
+            ) {
+                return false;
+            }
+        } else if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::HostUnreachable
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::NetworkDown
+            ) {
+                return false;
+            }
+        }
+        link = error.source();
+    }
+    true
+}
+
 /// Plan 30 §M4: [`upload_dirty_chunks_report`] for a caller that needs
 /// every pending chunk durable — an inode drain before a replay or an
 /// `fsync`, a handoff's or an unmount's final flush — so an unrecoverable
@@ -1144,8 +1192,18 @@ async fn upload_dirty_chunks_pass(
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
-            upload.record_error(std::time::Instant::now());
-            Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
+            let Some(last) = last else {
+                bail!("upload {hash} made no attempt");
+            };
+            if is_congestion(&last) {
+                upload.record_error(std::time::Instant::now());
+            } else {
+                tracing::debug!(
+                    concurrency = upload.gate.target(),
+                    "S3 unreachable; upload concurrency kept"
+                );
+            }
+            Err(anyhow::anyhow!("upload {hash} failed: {last}"))
             }
             .await;
             if !matches!(outcome, Ok(Some(_))) {
@@ -3149,4 +3207,56 @@ pub(crate) mod pending_upload_tests {
         assert!(pending, "the failed PUT must not ack its row");
     }
 
+    #[test]
+    fn outage_errors_are_not_congestion() {
+        use object_store::client::{HttpError, HttpErrorKind};
+        use std::io::{Error as IoError, ErrorKind};
+        let http = |kind| HttpError::new(kind, IoError::from(ErrorKind::Other));
+        let generic = |source: Box<dyn std::error::Error + Send + Sync>| {
+            object_store::Error::Generic {
+                store: "test",
+                source,
+            }
+        };
+        for kind in [
+            HttpErrorKind::Connect,
+            HttpErrorKind::Request,
+            HttpErrorKind::Interrupted,
+        ] {
+            assert!(!is_congestion(&generic(Box::new(http(kind)))), "{kind:?}");
+        }
+        for kind in [
+            HttpErrorKind::Timeout,
+            HttpErrorKind::Decode,
+            HttpErrorKind::Unknown,
+        ] {
+            assert!(is_congestion(&generic(Box::new(http(kind)))), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+            ErrorKind::BrokenPipe,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::NetworkDown,
+        ] {
+            let error = generic(Box::new(IoError::from(kind)));
+            assert!(!is_congestion(&error), "{kind:?}");
+        }
+        assert!(is_congestion(&generic(Box::new(IoError::from(
+            ErrorKind::TimedOut
+        )))));
+        assert!(is_congestion(&generic("503 SlowDown".into())));
+        // Through the layers the store adds on the way up.
+        let wrapped = constellation_store_s3::StoreError::from(generic(Box::new(http(
+            HttpErrorKind::Request,
+        ))));
+        assert!(!is_congestion(&wrapped));
+        let wrapped = constellation_store_s3::StoreError::from(generic(Box::new(http(
+            HttpErrorKind::Timeout,
+        ))));
+        assert!(is_congestion(&wrapped));
+    }
 }
