@@ -751,6 +751,37 @@ impl UploadRuntime {
             hold: UploadHold::default(),
         }
     }
+
+    /// Test helper: the adaptive controller at `initial` with ceiling
+    /// `max`, bypassing environment variables so tests are hermetic.
+    #[cfg(test)]
+    fn for_test_adaptive(create_if_absent: bool, initial: usize, max: usize) -> Self {
+        Self {
+            gate: ConcurrencyGate::new(initial),
+            controller: Some(std::sync::Mutex::new(AdaptiveConcurrency::new(
+                initial, 1, max,
+            ))),
+            max_concurrency: max,
+            create_if_absent,
+            probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
+            decisions: std::sync::atomic::AtomicU64::new(0),
+            coop: None,
+            existence: crate::existence::Existence::new(1024, false, None),
+            in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            probe_min_bytes: probe_min_bytes(),
+            forwarded: Default::default(),
+            durable_reports: Default::default(),
+            report_attempts: Default::default(),
+            remote_polls: Default::default(),
+            reported: Default::default(),
+            inherited: Default::default(),
+            last_put_ms: std::sync::atomic::AtomicI64::new(0),
+            handoff: HandoffStats::default(),
+            passes: Default::default(),
+            put_attempts: Default::default(),
+            hold: UploadHold::default(),
+        }
+    }
 }
 
 /// Plan 30 §M4: [`upload_dirty_chunks_report`] for a caller that needs
@@ -1292,8 +1323,20 @@ pub(crate) mod pending_upload_tests {
     };
     use replicix_chunkfmt::ChunkHash;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// How a [`FailingStore`] fails its `put`s.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    pub(crate) enum PutFailure {
+        /// `put`s succeed.
+        None = 0,
+        /// The connection is reset before any response: S3 is unreachable.
+        Unreachable = 1,
+        /// The request times out: the store or the path is overloaded.
+        Overloaded = 2,
+    }
 
     /// Wraps an in-memory backend and can be told to fail every `put`,
     /// simulating a cut S3 path without needing toxiproxy for a unit
@@ -1301,7 +1344,7 @@ pub(crate) mod pending_upload_tests {
     #[derive(Debug)]
     pub(crate) struct FailingStore {
         inner: InMemory,
-        fail_puts: AtomicBool,
+        fail_puts: AtomicU8,
         delay_puts: AtomicBool,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
@@ -1319,7 +1362,7 @@ pub(crate) mod pending_upload_tests {
         pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
                 inner: InMemory::new(),
-                fail_puts: AtomicBool::new(false),
+                fail_puts: AtomicU8::new(PutFailure::None as u8),
                 delay_puts: AtomicBool::new(false),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
@@ -1359,8 +1402,17 @@ pub(crate) mod pending_upload_tests {
             }
         }
 
+        /// `true` cuts S3 ([`PutFailure::Unreachable`]); `false` heals it.
         pub(crate) fn set_fail_puts(&self, fail: bool) {
-            self.fail_puts.store(fail, Ordering::SeqCst);
+            self.set_put_failure(if fail {
+                PutFailure::Unreachable
+            } else {
+                PutFailure::None
+            });
+        }
+
+        fn set_put_failure(&self, failure: PutFailure) {
+            self.fail_puts.store(failure as u8, Ordering::SeqCst);
         }
 
         /// How many `put`s were tried, failed ones included.
@@ -1394,11 +1446,26 @@ pub(crate) mod pending_upload_tests {
             if self.delay_puts.load(Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            if self.fail_puts.load(Ordering::SeqCst) {
+            let failure = self.fail_puts.load(Ordering::SeqCst);
+            if failure != PutFailure::None as u8 {
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                let (kind, io_kind) = if failure == PutFailure::Unreachable as u8 {
+                    (
+                        object_store::client::HttpErrorKind::Request,
+                        std::io::ErrorKind::ConnectionReset,
+                    )
+                } else {
+                    (
+                        object_store::client::HttpErrorKind::Timeout,
+                        std::io::ErrorKind::TimedOut,
+                    )
+                };
                 return Err(object_store::Error::Generic {
                     store: "FailingStore",
-                    source: "S3 path is cut (test injection)".into(),
+                    source: Box::new(object_store::client::HttpError::new(
+                        kind,
+                        std::io::Error::from(io_kind),
+                    )),
                 });
             }
             let result = self.inner.put_opts(location, payload, opts).await;
@@ -3039,4 +3106,47 @@ pub(crate) mod pending_upload_tests {
         assert_eq!(f.meta.pending_upload_claims(&hash, file).unwrap(), 1);
         assert_eq!(f.failing.puts(), 0);
     }
+
+    /// A UploadRuntime with the adaptive controller at `initial` (max 32).
+    fn adaptive_runtime(initial: usize) -> UploadRuntime {
+        UploadRuntime::for_test_adaptive(true, initial, 32)
+    }
+
+    /// One failed drain of one chunk against a store failing as `failure`;
+    /// returns the gate target afterwards and whether the row is pending.
+    fn failed_drain_target(failure: PutFailure) -> (usize, bool) {
+        let f = Arc::new(fixture());
+        let upload = Arc::new(adaptive_runtime(8));
+        let (ino, hash) = enqueue(&f, "cut", &[0x61; 4096]);
+        f.failing.set_put_failure(failure);
+        rt().block_on(async {
+            spawn_drain(&f, &upload, ino)
+                .await
+                .unwrap()
+                .expect_err("the drain reports the failed PUT");
+        });
+        let pending = f.meta.pending_uploads().unwrap() == vec![(hash, ino)];
+        (upload.gate.target(), pending)
+    }
+
+    /// A PUT that failed because S3 was unreachable (the connection was
+    /// reset, no response) said nothing about congestion: halving the
+    /// target on every 1.5 s cut left it at 2-8 and let a file's pending
+    /// rows pile up into drains minutes long. Fails on the parent: the
+    /// target fell to 4.
+    #[test]
+    fn an_s3_cut_does_not_back_off_upload_concurrency() {
+        let (target, pending) = failed_drain_target(PutFailure::Unreachable);
+        assert_eq!(target, 8, "an unreachable store must not lower the target");
+        assert!(pending, "the failed PUT must not ack its row");
+    }
+
+    /// Control: a PUT that timed out still backs off.
+    #[test]
+    fn an_overloaded_store_still_backs_off_upload_concurrency() {
+        let (target, pending) = failed_drain_target(PutFailure::Overloaded);
+        assert_eq!(target, 4, "a timeout is congestion: the target halves");
+        assert!(pending, "the failed PUT must not ack its row");
+    }
+
 }
