@@ -7390,7 +7390,6 @@ fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
 /// a renewal and no unsettled `EIO` left.
 #[test]
 fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
-    let mut reached = 0;
     let mut renewals = 0;
     for seed in [724, 1452, 2452] {
         let cfg = SimConfig {
@@ -7425,13 +7424,12 @@ fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
             sum(|s| s.lease_probes_answered),
             sum(|s| s.release_unresolved_renewals),
         );
-        reached += sum(|s| s.release_unresolved);
+        assert!(
+            sum(|s| s.release_unresolved) > 0,
+            "seed {seed} no longer reaches an unresolved release: the pin would pass vacuously"
+        );
         renewals += sum(|s| s.release_unresolved_renewals);
     }
-    assert!(
-        reached >= 3,
-        "the seeds no longer reach an unresolved release: the pin would pass vacuously"
-    );
     assert!(
         renewals >= 1,
         "no renewal lifted a fence: the path of the fix is not exercised"

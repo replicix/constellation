@@ -88596,6 +88596,121 @@ mod late_landing_inbox {
         assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
     }
 
+    /// M1': the give-up to the lease path does not end the ambiguous PUT's
+    /// memory. Op `a`'s PUT at `(1, 0)` times out six times (the give-up),
+    /// `a` goes to the lease path and is enqueued again under the same
+    /// epoch (the enqueue is called directly: the acquire-refused,
+    /// holder-learned route reaches the same `inbox_enqueue`) together with
+    /// a second op. The PUT at `(1, 0)` gets `Conflict` (the occupant is
+    /// `a`'s own landed batch): `a` keeps its key, and a connected link to
+    /// the holder forwards nothing for `a` until a tombstone of `n`
+    /// succeeded. Fails on 87b24ded: the give-up cleared the record, the
+    /// conflict dropped `a`'s key and the reroute forwarded `a` with its
+    /// batch live and untombstoned.
+    #[test]
+    fn an_op_given_up_and_enqueued_again_keeps_its_key_on_a_conflict_at_its_own_number() {
+        let (mut h, first, mut put) = put_in_flight_op();
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        for failed in 1..=5u32 {
+            h.step(Event::S3 {
+                op: put,
+                result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+            });
+            let id = h.core.inbox.retry_timer.expect("the retry is armed");
+            h.advance(200 * u64::from(failed));
+            let out = h.step(Event::Timer { id });
+            put = the_batch_put(&mut h, out);
+        }
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        assert_eq!(h.core.stats.inbox_unavailable, 1);
+        assert!(!h.core.inbox.is_queued(first));
+        assert_eq!(
+            h.core.inbox.ambiguous_at(),
+            Some((1, 0, 1)),
+            "the give-up keeps the record of the possibly-landed batch"
+        );
+        assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
+        // `a` comes back to the inbox under the same epoch, with `b`.
+        let second = h.rid(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: second,
+            op: h.create("b"),
+            tag: Default::default(),
+        });
+        h.core.inbox_enqueue(h.clk(), first, 1, &h.meta, &mut out);
+        h.core.inbox_enqueue(h.clk(), second, 1, &h.meta, &mut out);
+        let retry = the_batch_put(&mut h, out);
+        h.step(Event::S3 {
+            op: retry,
+            result: S3Result::InboxPut(Err(CasFailure::Conflict)),
+        });
+        assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
+        let out = link_to_holder_up(&mut h);
+        assert!(
+            !mutate_rids_to_2(&out).contains(&first),
+            "forwarded with its batch live: {out:?}"
+        );
+        assert!(h.core.inbox.is_queued(first), "{out:?}");
+        assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
+    }
+
+    /// The give-up prunes the record: a given-up op that is gone leaves it
+    /// empty, and an empty record is dropped.
+    #[test]
+    fn the_give_up_drops_a_record_with_no_live_op() {
+        let (mut h, first, mut put) = put_in_flight_op();
+        for failed in 1..=5u32 {
+            h.step(Event::S3 {
+                op: put,
+                result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+            });
+            let id = h.core.inbox.retry_timer.expect("the retry is armed");
+            h.advance(200 * u64::from(failed));
+            let out = h.step(Event::Timer { id });
+            put = the_batch_put(&mut h, out);
+        }
+        // The op is gone before the last attempt fails.
+        h.core.clients.remove(&first);
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        assert_eq!(h.core.inbox.ambiguous_at(), None);
+    }
+
+    /// A `Conflict` at a different `(epoch, n)` than the ambiguous record,
+    /// and one with no record, are another writer's key: the op's key is
+    /// dropped and it is rerouted keyless as before. Fails under the
+    /// mutation "a `Conflict` always keeps the keys".
+    #[test]
+    fn a_conflict_at_another_number_or_without_a_record_still_drops_the_key() {
+        for planted in [Some((1, 7)), Some((2, 0)), None] {
+            let (mut h, first, put) = put_in_flight_op();
+            if let Some((e, n)) = planted {
+                h.core.inbox.plant_ambiguous(e, n, &[first]);
+            }
+            h.step(Event::S3 {
+                op: put,
+                result: S3Result::InboxPut(Err(CasFailure::Conflict)),
+            });
+            assert!(
+                h.core.clients.get(&first).unwrap().inbox_keys.is_empty(),
+                "{planted:?}: the foreign key was kept"
+            );
+            let out = link_to_holder_up(&mut h);
+            assert_eq!(mutate_rids_to_2(&out), vec![first], "{planted:?}: {out:?}");
+            assert!(!h.core.inbox.is_queued(first), "{planted:?}");
+        }
+    }
+
     /// A kick during the backoff builds the batch that fails next, with the
     /// retry timer already armed: the count carries on (it was reset to a
     /// first attempt, so `SUBMIT_ATTEMPTS` could be pushed back for ever).

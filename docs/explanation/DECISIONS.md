@@ -6696,8 +6696,11 @@ The requester therefore remembers the ambiguous PUT at `(epoch, n)`
 for every op of the ambiguous attempts, so they stay queued with a key (never
 rerouted keyless) and any forward or settle tombstones `n` first. A `Conflict`
 without an ambiguous attempt at that number is another writer's key and is
-dropped as before. The memory ends with an acknowledged PUT, the conflict that
-used it, or the give-up to the lease path.
+dropped as before. The memory ends with an acknowledged PUT, the conflict at its
+own `(epoch, n)` that used it, or a record for a different `(epoch, n)` replacing
+it. The give-up to the lease path does not end it (the batch may still be at `n`
+and a given-up op can be enqueued again under the same epoch); it only prunes
+the ops that no longer exist.
 
 **Rejected**: a holder that reads every requester's inbox once per tenure
 (fixes the seeds, but the extra reads shifted other configurations past their

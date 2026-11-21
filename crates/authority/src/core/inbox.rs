@@ -265,8 +265,12 @@ pub(crate) struct InboxState {
     rerouting: BTreeMap<Rid, (Epoch, InboxKey)>,
     /// The batch PUT that failed ambiguously and has not been resolved
     /// (`on_inbox_put`): a `Conflict` at its `(epoch, n)` keeps its ops'
-    /// keys. Ends with an acknowledged PUT, the conflict that used it, or
-    /// the give-up to the lease path.
+    /// keys. Ends with an acknowledged PUT, the conflict at its own
+    /// `(epoch, n)` that used it, or a record for a different `(epoch, n)`
+    /// replacing it. The give-up to the lease path does not end it: the
+    /// possibly-landed batch is still at `n` (`next_n` has not moved) and a
+    /// given-up op can come back to the inbox under the same epoch, so the
+    /// give-up only prunes the ops that are gone (`on_inbox_put`).
     ambiguous: Option<AmbiguousPut>,
 }
 
@@ -275,6 +279,24 @@ impl InboxState {
     /// settle took the withdrawal over (`ClientOp::withdraw`).
     pub(crate) fn forget_reroute(&mut self, rid: Rid) {
         self.rerouting.remove(&rid);
+    }
+
+    /// The ambiguous PUT's `(epoch, n)` and its op count (tests).
+    #[cfg(test)]
+    pub(crate) fn ambiguous_at(&self) -> Option<(Epoch, u64, usize)> {
+        self.ambiguous
+            .as_ref()
+            .map(|a| (a.epoch, a.n, a.rids.len()))
+    }
+
+    /// Plants an ambiguous record (tests).
+    #[cfg(test)]
+    pub(crate) fn plant_ambiguous(&mut self, epoch: Epoch, n: u64, rids: &[Rid]) {
+        self.ambiguous = Some(AmbiguousPut {
+            epoch,
+            n,
+            rids: rids.iter().copied().collect(),
+        });
     }
 
     /// Whether `rid` is in a reroute's withdrawal (tests).
@@ -892,6 +914,10 @@ impl Core {
                 // key", never rerouted keyless, and a forward or settle
                 // tombstones `n` first. Dropping it let the keyless reroute
                 // forward an op whose own batch was live and untombstoned.
+                // This path has no incarnation in the key: a kept key may
+                // also tombstone a late batch of this node's previous
+                // incarnation at `n`. That is harmless, only a dead
+                // incarnation's unanswered ops are affected.
                 let key = InboxKey {
                     epoch: sub.epoch,
                     node: self.cfg.node_id,
@@ -922,10 +948,36 @@ impl Core {
                     ?other,
                     "inbox: batch PUT failed"
                 );
+                // The failed attempt's ops may be in the landed batch too,
+                // the last attempt's included.
+                match self.inbox.ambiguous.as_mut() {
+                    Some(a) if (a.epoch, a.n) == (sub.epoch, sub.n) => {
+                        a.rids.extend(sub.rids.iter().copied());
+                    }
+                    _ => {
+                        self.inbox.ambiguous = Some(AmbiguousPut {
+                            epoch: sub.epoch,
+                            n: sub.n,
+                            rids: sub.rids.iter().copied().collect(),
+                        });
+                    }
+                }
                 if sub.attempt >= SUBMIT_ATTEMPTS {
                     // The ops keep their keys (their settle withdraws them)
-                    // and leave the inbox path: nothing left to remember.
-                    self.inbox.ambiguous = None;
+                    // and leave the inbox path. The ambiguous record stays:
+                    // the batch may still be at `(epoch, n)` and a given-up
+                    // op can be enqueued again under this epoch (lease path,
+                    // acquire refused, holder learned), so a later `Conflict`
+                    // there must still keep its key. Only ops that no longer
+                    // exist are pruned; an empty record is dropped, which is
+                    // safe because a `Conflict` keeps keys only for rids in
+                    // the record, and a record without a live rid keeps none.
+                    if let Some(a) = self.inbox.ambiguous.as_mut() {
+                        a.rids.retain(|r| self.clients.contains_key(r));
+                        if a.rids.is_empty() {
+                            self.inbox.ambiguous = None;
+                        }
+                    }
                     self.stats.inbox_unavailable += 1;
                     for rid in sub.rids {
                         self.lease_path(now, rid, replica, out);
@@ -933,19 +985,6 @@ impl Core {
                     self.inbox_kick(now, replica, out);
                     return;
                 }
-                let a = self.inbox.ambiguous.get_or_insert_with(|| AmbiguousPut {
-                    epoch: sub.epoch,
-                    n: sub.n,
-                    rids: BTreeSet::new(),
-                });
-                if (a.epoch, a.n) != (sub.epoch, sub.n) {
-                    *a = AmbiguousPut {
-                        epoch: sub.epoch,
-                        n: sub.n,
-                        rids: BTreeSet::new(),
-                    };
-                }
-                a.rids.extend(sub.rids.iter().copied());
                 self.inbox_requeue_front(&sub.rids, sub.epoch);
                 self.inbox_reroute_if_linked(now, replica, out);
                 self.inbox_retry(now, sub.attempt, replica, out);
