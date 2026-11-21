@@ -3014,6 +3014,15 @@ impl Core {
         // holder's would (below). Releasing dropped every grant a moment
         // after the close kept them (`epoch_close_release`), fencing the
         // lock holders with `EIO` all the same.
+        //
+        // Nor does it go when it is this node's own pre-cut lease (the
+        // close let it go, the flush re-claimed it) and nobody wants it:
+        // a node that gave it away held none when the next cut formed its
+        // epoch, and every write in an epoch carrying no lease is refused
+        // `EROFS` until S3 returns (`stress-ng-fs-faults`: the canary
+        // create after the last grant ended). Afterwards the ordinary
+        // rules apply: an idle release, a handoff to a wanter, the release
+        // at unmount.
         let flushed = self.epoch.flushing
             && self.lease.held.is_some()
             && !self.lease.lost
@@ -3037,8 +3046,11 @@ impl Core {
         let foreign_takeover = self.lease.gate.as_ref().is_some_and(|g| {
             (g.takeover && self.lease.prev_holder.is_some()) || g.backup_tail_epoch.is_some()
         });
+        let nobody_wants = self.lease.wanted.is_empty() && !self.lease.release_when_idle;
+        let keep_own = self.lease.resumed_tenure && nobody_wants;
         if flushed
             && (replica.locks().live_grants_len(now.wait) > 0
+                || keep_own
                 || self.in_takeover_floor(now)
                 || fast_gate
                 || foreign_takeover)
@@ -4717,7 +4729,7 @@ impl Core {
             .as_ref()
             .filter(|p| !p.released)
             .map(|p| (p.holder, p.epoch, p.expires_unix_ms));
-        self.epoch_tenure_resumed(replaced, false, replica);
+        let resumed = self.epoch_tenure_resumed(replaced, false, replica);
         // Plan 30 §M14: a released (unexpired) lease's lock grants may
         // still be honoured: a grace before any new grant — when the
         // release says its tenure left any behind. Since plan 43 C7-F
@@ -4836,6 +4848,7 @@ impl Core {
             self.stats.takeovers += 1;
         }
         self.lease.adopt(now, lease, tag, Some(gate));
+        self.lease.resumed_tenure = resumed;
         // Plan 46 M1.4 step 6a (ADR-53): the configuration this tenure starts
         // under is noted before anything parked is released in this event.
         self.sync_cfg_spans(replica);

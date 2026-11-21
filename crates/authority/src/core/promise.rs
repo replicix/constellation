@@ -857,14 +857,20 @@ impl Core {
     /// is one of the objects the close let go (the tenure continues), and
     /// are dropped otherwise. A hold keeps the list: the S3 object is
     /// still that one, for the re-claim after the hold's own close.
+    ///
+    /// Returns whether the lease replaced is this node's own pre-cut lease
+    /// (`from` is one of the objects the close let go and names this node):
+    /// the epoch's flush then keeps it when nobody wants it. A peer's
+    /// carried lease, a plain claim and a hold (`hold`: callers ignore it)
+    /// answer false or are not asked.
     pub(crate) fn epoch_tenure_resumed(
         &mut self,
         from: Option<(NodeId, Epoch, i64)>,
         hold: bool,
         replica: &dyn Replica,
-    ) {
+    ) -> bool {
         if self.pr.closed_tenure.is_empty() {
-            return;
+            return false;
         }
         if from.is_some_and(|f| self.pr.closed_tenure.contains(&f)) {
             tracing::debug!(
@@ -878,7 +884,7 @@ impl Core {
                 self.pr.closed_honour.clear();
                 self.pr.closed_lease = None;
             }
-            return;
+            return from.is_some_and(|f| f.0 == self.cfg.node_id);
         }
         self.pr.closed_tenure.clear();
         self.pr.closed_honour.clear();
@@ -903,6 +909,7 @@ impl Core {
                 "the lease a continuation epoch's close let go was not re-claimed: lock grants dropped"
             );
         }
+        false
     }
 
     /// A lease CAS replacing `prev` failed in doubt: had it landed, `sent`

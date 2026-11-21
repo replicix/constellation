@@ -199,6 +199,13 @@ pub struct LeaseState {
     /// Plan 31 C8: a forward-only (or suspended) node gives the lease back
     /// once idle, whether or not anyone asked for it (`wants_handoff`).
     pub release_when_idle: bool,
+    /// The held lease is this node's own pre-cut lease, re-claimed after a
+    /// continuation epoch's close (`Core::epoch_tenure_resumed`). The
+    /// epoch's flush keeps such a lease when nobody wants it, instead of
+    /// giving it away: the next cut would form an epoch with no lease and
+    /// refuse every write `EROFS` (`stress-ng-fs-faults`). False whenever
+    /// `held` is cleared or another lease is adopted.
+    pub resumed_tenure: bool,
     /// Plan 43 C7-F F-a0 L3: reconfiguration CASes that failed with their
     /// outcome unknown (an answer lost: each may have landed) while this
     /// version was held: S3 may hold one of them instead. Until a version
@@ -277,6 +284,7 @@ impl LeaseState {
     pub fn release_local(&mut self) {
         self.epoch_hold = None;
         self.held = None;
+        self.resumed_tenure = false;
         self.held_gen += 1;
         self.held_since = None;
         self.gate = None;
@@ -854,6 +862,7 @@ impl LeaseState {
     /// `LeaseKeeper::open_won`: take ownership of a won lease.
     pub fn adopt(&mut self, now: Now, lease: Lease, tag: LeaseTag, gate: Option<PendingGate>) {
         self.gate = gate;
+        self.resumed_tenure = false;
         self.wanted.clear();
         self.wanted_noted.clear();
         self.wanted_since = None;
@@ -998,6 +1007,7 @@ impl LeaseState {
     /// `LeaseKeeper::mark_lost`.
     pub fn mark_lost(&mut self, holder: NodeId, epoch: Epoch, my_epoch: Epoch) {
         self.held = None;
+        self.resumed_tenure = false;
         self.held_gen += 1;
         self.epoch_hold = None;
         self.gate = None;
@@ -1009,6 +1019,7 @@ impl LeaseState {
 
     pub fn force_lost(&mut self) {
         self.held = None;
+        self.resumed_tenure = false;
         self.held_gen += 1;
         self.epoch_hold = None;
         self.gate = None;
@@ -1029,6 +1040,7 @@ impl LeaseState {
         self.wanted_since = None;
         self.held_since = None;
         self.held = None;
+        self.resumed_tenure = false;
         self.held_gen += 1;
         self.gate = None;
         self.releasing = false;
