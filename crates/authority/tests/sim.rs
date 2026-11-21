@@ -17142,7 +17142,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [193_262, 195_192, 195_424, 1_507] {
+    for seed in [193_262, 195_192, 195_424] {
         let e = run_seed(
             seed,
             fixed_lane(fast_takeover_skewed_successor_credited_config()),
@@ -17158,6 +17158,16 @@ fn a_credited_arrival_cap_splits() {
         run_seed(seed, fixed_lane(fast_takeover_skewed_successor_config()))
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     }
+    // Seed 1507 shows it as the sweep runs it: the default clock-fault mix
+    // and the sleeping lock lane, not the pinned schedule above.
+    let seed = 1_507;
+    let e = run_clocked_seed(seed, fast_takeover_skewed_successor_credited_config())
+        .expect_err("a cap counted from the credit never failed: no control");
+    assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
+    let at = violation_ms(&e).unwrap_or_else(|| panic!("seed {seed}: no time in {e}"));
+    assert!(at < FIRST_FAILOVER_FLOOR_END_MS, "seed {seed}: t={at}: {e}");
+    run_clocked_seed(seed, fast_takeover_skewed_successor_config())
+        .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
 }
 
 /// The end of the first failover's floor window in
@@ -18431,7 +18441,7 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     // write as its commit returns (plan 46 M1.2 step 15); 3332, 3777 and 4522
     // are the first three seeds from 0 that do, unclocked, the settle clean
     // on each.)
-    for seed in [234u64, 3332, 3777, 4522] {
+    for seed in [3332u64, 3777, 4522] {
         if let Err(e) = run_seed(
             seed,
             locks_writer_hold_delegated_unsettled_own_clock_config(),
@@ -18454,6 +18464,29 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
         !witnessed.is_empty(),
         "no seed showed a held write landing inside the next holder's section"
     );
+    // Seed 234, as the sweep of the label runs it (the default clock-fault
+    // mix): the control fails there on the delegate's own clock, and the
+    // settle keeps the write out of the next holder's turn.
+    let e = run_clocked_seed(
+        234,
+        locks_writer_hold_delegated_unsettled_own_clock_config(),
+    )
+    .expect_err("seed 234 is clean on the delegate's own clock: no control");
+    assert!(e.contains("held write"), "seed 234: {e}");
+    run_clocked_seed(
+        234,
+        SimConfig {
+            settle_tagged_writes: true,
+            ..locks_writer_hold_delegated_unsettled_own_clock_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("seed 234: the settled run is not clean: {e}"));
+}
+
+/// `run_seed` as the sweeps run it (the default clock-fault mix), inside a
+/// test that otherwise uses the pinned (unclocked) runners.
+fn run_clocked_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
+    run_seed(seed, cfg)
 }
 
 /// A delegate's release cut waits for a pinned tagged write once its window
@@ -18464,11 +18497,10 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
 /// taken under the pinned write let the root grant on before it committed.
 #[test]
 fn locks_writer_hold_delegated_unsettled_is_clean_with_the_settle_at_release() {
-    use pinned::run_seed;
     for seed in [1961u64, 2777, 2994] {
-        run_seed(seed, locks_writer_hold_delegated_unsettled_config())
+        run_clocked_seed(seed, locks_writer_hold_delegated_unsettled_config())
             .expect_err("the run is clean without any settle: no control");
-        run_seed(
+        run_clocked_seed(
             seed,
             SimConfig {
                 settle_tagged_writes_at_release: true,
