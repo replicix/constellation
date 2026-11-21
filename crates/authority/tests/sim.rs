@@ -7380,17 +7380,19 @@ fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
 /// the tree without the wait on the `EIO` count of each seed. (Seed 1045 is
 /// not on this path: its re-read succeeded and found the release landed.)
 ///
-/// The inbox reroute on link-up (ADR-68) moved seed 1477's schedule: its
-/// requester now ends unsettled with a lease path reachable for 110 ms of its
-/// settle window (an I4 violation; the 2,000-seed `+unsettled` scan of this
-/// label has 6 such seeds, 8 before the change, 1477 among the new ones).
-/// 471 takes its place (an unresolved release and a renewal, no unsettled
-/// `EIO` left). 64 and 391 are unchanged.
+/// The inbox reroute on link-up (ADR-68) and the review fixes of the inbox
+/// PUT retry (the attempt count kept while a retry is armed, the ambiguous
+/// PUT's key rule) moved the schedules: 64, 391 and 471 no longer reach an
+/// unresolved release (an `+unsettled` replay of seed 1477 passes in release
+/// on main and here; its debug run fails on both, unrelated). The finder
+/// over seeds 0..4,399 gives 724, 1452, 2452, 2777, 3002, 3568 (no renewal)
+/// and 4012; the pin runs 724, 1452 and 2452, each with an unresolved release,
+/// a renewal and no unsettled `EIO` left.
 #[test]
 fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
     let mut reached = 0;
     let mut renewals = 0;
-    for seed in [64, 391, 471] {
+    for seed in [724, 1452, 2452] {
         let cfg = SimConfig {
             strict_unsettled: true,
             ..locks_unlinked_blips_config()
@@ -21690,9 +21692,12 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     // root 3 reachable for the last 1.2 s of the window, is the pin.)
     // (The release record's off-core write, answered 0-25 ms later in the
     // simulation, settled seed 2's EIO. Seed 53, two such EIOs with root
-    // idle, is the first of seeds 0..299 that tells one, and the pin.)
+    // idle, was the first of seeds 0..299 that tells one, and the pin.)
+    // (The inbox PUT retry's review fixes moved the schedule: seed 53 tells
+    // none now. The seeds of 0..299 that tell one are 201, 232, 259 and 294;
+    // 294, root idle, the lease path reachable, is the pin.)
     let cfg = flex_tight_config;
-    let seed = 53;
+    let seed = 294;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
