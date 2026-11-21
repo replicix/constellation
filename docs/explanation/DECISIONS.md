@@ -6700,7 +6700,8 @@ dropped as before. The memory ends with an acknowledged PUT, the conflict at its
 own `(epoch, n)` that used it, or a record for a different `(epoch, n)` replacing
 it. The give-up to the lease path does not end it (the batch may still be at `n`
 and a given-up op can be enqueued again under the same epoch); it only prunes
-the ops that no longer exist.
+the rids that cannot come back (neither a live op nor parked in doubt, since a
+resubmitted op returns with its parked keys).
 
 **Rejected**: a holder that reads every requester's inbox once per tenure
 (fixes the seeds, but the extra reads shifted other configurations past their

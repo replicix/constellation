@@ -88596,6 +88596,30 @@ mod late_landing_inbox {
         assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
     }
 
+    /// Queues `second` (its batch goes out at once) and `first` behind it,
+    /// fails that batch with a timeout and fires the retry: the batch PUT it
+    /// returns is `{second, first}` at the same number, which differs from
+    /// a landed `{first}` (a lone `{first}` would be recognised as the
+    /// node's own by a real store).
+    fn retry_batch_of_second_and_first(
+        h: &mut Harness,
+        second: Rid,
+        first: Rid,
+        out: &mut Vec<Action>,
+    ) -> OpId {
+        h.core.inbox_enqueue(h.clk(), second, 1, &h.meta, out);
+        let put = the_batch_put(h, std::mem::take(out));
+        h.core.inbox_enqueue(h.clk(), first, 1, &h.meta, out);
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        let id = h.core.inbox.retry_timer.expect("the retry is armed");
+        h.advance(200);
+        let out = h.step(Event::Timer { id });
+        the_batch_put(h, out)
+    }
+
     /// M1': the give-up to the lease path does not end the ambiguous PUT's
     /// memory. Op `a`'s PUT at `(1, 0)` times out six times (the give-up),
     /// `a` goes to the lease path and is enqueued again under the same
@@ -88645,9 +88669,7 @@ mod late_landing_inbox {
             op: h.create("b"),
             tag: Default::default(),
         });
-        h.core.inbox_enqueue(h.clk(), first, 1, &h.meta, &mut out);
-        h.core.inbox_enqueue(h.clk(), second, 1, &h.meta, &mut out);
-        let retry = the_batch_put(&mut h, out);
+        let retry = retry_batch_of_second_and_first(&mut h, second, first, &mut out);
         h.step(Event::S3 {
             op: retry,
             result: S3Result::InboxPut(Err(CasFailure::Conflict)),
@@ -88662,12 +88684,74 @@ mod late_landing_inbox {
         assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
     }
 
-    /// The give-up prunes the record: a given-up op that is gone leaves it
-    /// empty, and an empty record is dropped.
+    /// The give-up prunes the record to the rids that can still come back:
+    /// one with a client, or with its keys parked in `in_doubt_batches`. A
+    /// rid that is neither is dropped, and an empty record with it.
     #[test]
-    fn the_give_up_drops_a_record_with_no_live_op() {
-        let (mut h, first, mut put) = put_in_flight_op();
-        for failed in 1..=5u32 {
+    fn the_give_up_drops_the_rids_that_cannot_come_back() {
+        for parked in [false, true] {
+            let (mut h, first, mut put) = put_in_flight_op();
+            for failed in 1..=5u32 {
+                h.step(Event::S3 {
+                    op: put,
+                    result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+                });
+                let id = h.core.inbox.retry_timer.expect("the retry is armed");
+                h.advance(200 * u64::from(failed));
+                let out = h.step(Event::Timer { id });
+                put = the_batch_put(&mut h, out);
+            }
+            // The op is gone before the last attempt fails.
+            h.core.clients.remove(&first);
+            if parked {
+                h.core.in_doubt_batches.insert(first, Vec::new());
+            }
+            h.step(Event::S3 {
+                op: put,
+                result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+            });
+            let want = parked.then_some((1, 0, 1));
+            assert_eq!(h.core.inbox.ambiguous_at(), want, "parked: {parked}");
+        }
+    }
+
+    /// M1'': an op whose PUT failed ambiguously at `(1, 0)` is answered in
+    /// doubt (its keys parked in `in_doubt_batches`), another op's batch at
+    /// the same number then gives up and prunes the record, and the client
+    /// resubmits the rid, which is enqueued under the same epoch with its
+    /// parked key. The `Conflict` at `(1, 0)` keeps that key and nothing is
+    /// forwarded for it without a tombstone of `n`. Fails when the prune
+    /// looks at `clients` only. (The in-doubt answer is set up directly: the
+    /// state is what `finish_in_doubt` leaves, and the resubmission is the
+    /// real `Event::Submit`.)
+    #[test]
+    fn an_op_answered_in_doubt_keeps_its_key_across_the_give_up_of_another_op() {
+        let (mut h, first, put) = put_in_flight_op();
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        // `a` is answered in doubt.
+        let keys = h.core.clients.remove(&first).unwrap().inbox_keys;
+        assert_eq!(keys, vec![key]);
+        h.core.in_doubt_rids.insert(first);
+        h.core.in_doubt_batches.insert(first, keys);
+        // Another op `c` joins the retries at the same number and gives up.
+        let third = h.rid(3);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: third,
+            op: h.create("c"),
+            tag: Default::default(),
+        });
+        h.core.inbox_enqueue(h.clk(), third, 1, &h.meta, &mut out);
+        let mut put = the_batch_put(&mut h, out);
+        for failed in 2..=5u32 {
             h.step(Event::S3 {
                 op: put,
                 result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
@@ -88677,13 +88761,43 @@ mod late_landing_inbox {
             let out = h.step(Event::Timer { id });
             put = the_batch_put(&mut h, out);
         }
-        // The op is gone before the last attempt fails.
-        h.core.clients.remove(&first);
         h.step(Event::S3 {
             op: put,
             result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
         });
-        assert_eq!(h.core.inbox.ambiguous_at(), None);
+        assert_eq!(h.core.stats.inbox_unavailable, 1);
+        assert!(
+            matches!(h.core.inbox.ambiguous_at(), Some((1, 0, n)) if n >= 1),
+            "the record must still hold the parked rid: {:?}",
+            h.core.inbox.ambiguous_at()
+        );
+        // The client resubmits `a`; it comes back with its parked key.
+        let second = h.rid(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: second,
+            op: h.create("b"),
+            tag: Default::default(),
+        });
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: first,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
+        let retry = retry_batch_of_second_and_first(&mut h, second, first, &mut out);
+        h.step(Event::S3 {
+            op: retry,
+            result: S3Result::InboxPut(Err(CasFailure::Conflict)),
+        });
+        assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
+        let out = link_to_holder_up(&mut h);
+        assert!(
+            !mutate_rids_to_2(&out).contains(&first),
+            "forwarded with its batch live: {out:?}"
+        );
+        assert!(h.core.inbox.is_queued(first), "{out:?}");
     }
 
     /// A `Conflict` at a different `(epoch, n)` than the ambiguous record,

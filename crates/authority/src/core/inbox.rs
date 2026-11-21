@@ -270,7 +270,8 @@ pub(crate) struct InboxState {
     /// replacing it. The give-up to the lease path does not end it: the
     /// possibly-landed batch is still at `n` (`next_n` has not moved) and a
     /// given-up op can come back to the inbox under the same epoch, so the
-    /// give-up only prunes the ops that are gone (`on_inbox_put`).
+    /// give-up only prunes the ops that cannot come back, neither live nor
+    /// parked in doubt (`on_inbox_put`).
     ambiguous: Option<AmbiguousPut>,
 }
 
@@ -969,11 +970,20 @@ impl Core {
                     // op can be enqueued again under this epoch (lease path,
                     // acquire refused, holder learned), so a later `Conflict`
                     // there must still keep its key. Only ops that no longer
-                    // exist are pruned; an empty record is dropped, which is
-                    // safe because a `Conflict` keeps keys only for rids in
-                    // the record, and a record without a live rid keeps none.
+                    // exist are pruned: a rid stays while it can still come
+                    // back, that is while it has a client or its keys are
+                    // parked in `in_doubt_batches` (an op answered in doubt
+                    // leaves `clients`, and its resubmission re-creates it
+                    // with those keys and can be enqueued under this epoch).
+                    // The parked entries are bounded (`evict_in_doubt`), and
+                    // the record is replaced once `(epoch, n)` moves. An empty
+                    // record is dropped, which is safe because a `Conflict`
+                    // keeps keys only for rids in the record, and a rid that
+                    // can no longer come back has none to keep.
                     if let Some(a) = self.inbox.ambiguous.as_mut() {
-                        a.rids.retain(|r| self.clients.contains_key(r));
+                        a.rids.retain(|r| {
+                            self.clients.contains_key(r) || self.in_doubt_batches.contains_key(r)
+                        });
                         if a.rids.is_empty() {
                             self.inbox.ambiguous = None;
                         }
