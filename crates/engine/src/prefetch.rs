@@ -803,6 +803,43 @@ mod tests {
         assert_eq!(scheduler.gate.target(), 4, "a timeout is congestion");
     }
 
+    /// The error a node's readahead really sees: the fetch goes through a
+    /// `Coop` (every mounted node has one), whose S3 path must hand the
+    /// store's error up for the classification to see it.
+    fn readahead_failure(failure: crate::upload::pending_upload_tests::PutFailure) -> usize {
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap());
+        let failing = crate::upload::pending_upload_tests::FailingStore::new();
+        failing.set_get_failure(failure);
+        let store = Arc::new(ChunkStore::new(failing));
+        let coop = crate::coop::Coop::new_for_upload_test(cache.clone(), store);
+        let scheduler = adaptive_scheduler(cache);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = rt
+            .block_on(coop.fetch_for_prefetch(&hash(9)))
+            .expect_err("the fetch fails");
+        scheduler.record_failure(error.as_ref());
+        scheduler.gate.target()
+    }
+
+    /// Through a real `Coop`: an S3 that cannot be reached does not back
+    /// readahead off. Fails when the coop's error drops S3's.
+    #[test]
+    fn an_s3_cut_through_the_coop_does_not_back_off_readahead() {
+        use crate::upload::pending_upload_tests::PutFailure;
+        assert_eq!(readahead_failure(PutFailure::Unreachable), 8);
+    }
+
+    /// Control, through a real `Coop`: a timing-out S3 still backs off.
+    #[test]
+    fn an_overloaded_s3_through_the_coop_still_backs_off_readahead() {
+        use crate::upload::pending_upload_tests::PutFailure;
+        assert_eq!(readahead_failure(PutFailure::Overloaded), 4);
+    }
+
     #[test]
     fn scheduler_rotates_between_ready_streams() {
         let dir = TempDir::new().unwrap();

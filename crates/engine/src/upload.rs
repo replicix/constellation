@@ -1357,6 +1357,7 @@ pub(crate) mod pending_upload_tests {
     pub(crate) struct FailingStore {
         inner: InMemory,
         fail_puts: AtomicU8,
+        fail_gets: AtomicU8,
         delay_puts: AtomicBool,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
@@ -1375,6 +1376,7 @@ pub(crate) mod pending_upload_tests {
             Arc::new(Self {
                 inner: InMemory::new(),
                 fail_puts: AtomicU8::new(PutFailure::None as u8),
+                fail_gets: AtomicU8::new(PutFailure::None as u8),
                 delay_puts: AtomicBool::new(false),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
@@ -1425,6 +1427,11 @@ pub(crate) mod pending_upload_tests {
 
         fn set_put_failure(&self, failure: PutFailure) {
             self.fail_puts.store(failure as u8, Ordering::SeqCst);
+        }
+
+        /// How the object `get`s fail (`HEAD`s are not touched).
+        pub(crate) fn set_get_failure(&self, failure: PutFailure) {
+            self.fail_gets.store(failure as u8, Ordering::SeqCst);
         }
 
         /// How many `put`s were tried, failed ones included.
@@ -1501,6 +1508,26 @@ pub(crate) mod pending_upload_tests {
             if options.head {
                 self.heads.fetch_add(1, Ordering::SeqCst);
                 self.stall(location).await;
+            } else if self.fail_gets.load(Ordering::SeqCst) != PutFailure::None as u8 {
+                let (kind, io_kind) =
+                    if self.fail_gets.load(Ordering::SeqCst) == PutFailure::Unreachable as u8 {
+                        (
+                            object_store::client::HttpErrorKind::Request,
+                            std::io::ErrorKind::ConnectionReset,
+                        )
+                    } else {
+                        (
+                            object_store::client::HttpErrorKind::Timeout,
+                            std::io::ErrorKind::TimedOut,
+                        )
+                    };
+                return Err(object_store::Error::Generic {
+                    store: "FailingStore",
+                    source: Box::new(object_store::client::HttpError::new(
+                        kind,
+                        std::io::Error::from(io_kind),
+                    )),
+                });
             }
             self.inner.get_opts(location, options).await
         }

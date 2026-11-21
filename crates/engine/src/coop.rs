@@ -35,7 +35,7 @@ mod exact;
 mod fresh;
 
 use crate::sources::{Selector, SourceId};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use constellation_fs_core::cache::{ChunkState, DigestBatch, DigestChange, DiskCache, SpillFile};
 use constellation_net::bloom::{
     bucket_count_for, bucket_index, ENTRIES_PER_BUCKET, MAX_BITS_BYTES, MAX_BUCKETS,
@@ -335,6 +335,32 @@ enum FetchResult {
     Fail,
 }
 
+/// The last error S3 gave one fetch (`fetch_s3_spilled` records it). A fetch
+/// that fails everywhere carries it as the source of its error, so a caller
+/// can tell an overloaded store from an unreachable one
+/// (`crate::congestion::is_congestion`). Peer failures are never recorded
+/// here: a peer that declined, timed out or could not be reached says
+/// nothing about S3, so a fetch whose peers all failed and whose S3 request
+/// did not fail (or was not made) leaves the error without a source.
+#[derive(Default)]
+struct S3Failure(Mutex<Option<constellation_store_s3::StoreError>>);
+
+impl S3Failure {
+    fn record(&self, error: constellation_store_s3::StoreError) {
+        *self.0.lock().unwrap() = Some(error);
+    }
+
+    /// The error of a fetch that found the chunk nowhere: S3's last error
+    /// is its source when S3 was asked and failed.
+    fn unavailable(&self, hash: &ChunkHash) -> anyhow::Error {
+        let message = format!("chunk {} unavailable from peers and S3", hash.to_hex());
+        match self.0.lock().unwrap().take() {
+            Some(source) => anyhow::Error::new(source).context(message),
+            None => anyhow::anyhow!(message),
+        }
+    }
+}
+
 impl FetchResult {
     fn is_success(&self) -> bool {
         matches!(self, Self::Data { .. } | Self::Spilled { .. })
@@ -482,6 +508,7 @@ impl Coop {
                 hash,
                 DecodePriority::Demand,
                 busy_until,
+                &S3Failure::default(),
             )
             .await
         {
@@ -781,6 +808,7 @@ impl Coop {
         } else {
             DecodePriority::Background
         };
+        let s3_failure = S3Failure::default();
         // Plan 30 §M10: in an open continuation epoch a chunk no digest
         // names may be another member's epoch write — dirty there (digests
         // list clean chunks only) and not in S3 before the close. Ask each
@@ -795,7 +823,9 @@ impl Coop {
                 for id in members {
                     let src = SourceId::Peer(id);
                     self.selector.lock().unwrap().begin(src);
-                    let r = self.fetch_from(src, hash, priority, until).await;
+                    let r = self
+                        .fetch_from(src, hash, priority, until, &s3_failure)
+                        .await;
                     if !r.is_success() {
                         self.selector.lock().unwrap().end(src);
                     }
@@ -838,7 +868,9 @@ impl Coop {
                     // full for longer than S3 would take: S3 now wins.
                     // Not the peer's fault, so no miss is recorded.
                     self.selector.lock().unwrap().end(primary);
-                    return self.last_resort_s3(hash, priority, read_back).await;
+                    return self
+                        .last_resort_s3(hash, priority, read_back, &s3_failure)
+                        .await;
                 }
             },
             SourceId::S3 => None,
@@ -855,7 +887,7 @@ impl Coop {
         // though S3 was never asked.
         let mut s3_tried = primary == SourceId::S3;
 
-        let primary_f = self.fetch_from(primary, hash, priority, peer_wait_until);
+        let primary_f = self.fetch_from(primary, hash, priority, peer_wait_until, &s3_failure);
         tokio::pin!(primary_f);
         let result = if let Some(hsrc) = hedge {
             let sleep = tokio::time::sleep(Duration::from_millis(deadline));
@@ -865,7 +897,7 @@ impl Coop {
                     self.counters.hedges_fired.fetch_add(1, Ordering::Relaxed);
                     self.selector.lock().unwrap().begin(hsrc);
                     s3_tried = s3_tried || hsrc == SourceId::S3;
-                    let hedge_f = self.fetch_from(hsrc, hash, priority, peer_wait_until);
+                    let hedge_f = self.fetch_from(hsrc, hash, priority, peer_wait_until, &s3_failure);
                     tokio::pin!(hedge_f);
                     tokio::select! {
                         r = &mut primary_f => {
@@ -903,8 +935,11 @@ impl Coop {
         match result {
             Some(fetched) => Ok(fetched),
             // Last resort: S3, unless it was already actually tried.
-            None if !s3_tried => self.last_resort_s3(hash, priority, read_back).await,
-            None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
+            None if !s3_tried => {
+                self.last_resort_s3(hash, priority, read_back, &s3_failure)
+                    .await
+            }
+            None => Err(s3_failure.unavailable(hash)),
         }
     }
 
@@ -914,12 +949,13 @@ impl Coop {
         hash: &ChunkHash,
         priority: DecodePriority,
         read_back: bool,
+        s3_failure: &S3Failure,
     ) -> Result<Fetched> {
         self.selector.lock().unwrap().begin(SourceId::S3);
-        let r = self.fetch_s3_spilled(hash, priority).await;
+        let r = self.fetch_s3_spilled(hash, priority, s3_failure).await;
         match self.settle(hash, SourceId::S3, r, read_back, None) {
             Some(fetched) => Ok(fetched),
-            None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
+            None => Err(s3_failure.unavailable(hash)),
         }
     }
 
@@ -1112,9 +1148,10 @@ impl Coop {
         hash: &ChunkHash,
         priority: DecodePriority,
         busy_until: Instant,
+        s3_failure: &S3Failure,
     ) -> FetchResult {
         let SourceId::Peer(id) = src else {
-            return self.fetch_s3_spilled(hash, priority).await;
+            return self.fetch_s3_spilled(hash, priority, s3_failure).await;
         };
         let mut backoff = BUSY_RETRY_FIRST;
         let (t0, fetch) = loop {
@@ -1147,7 +1184,12 @@ impl Coop {
         }
     }
 
-    async fn fetch_s3_spilled(&self, hash: &ChunkHash, priority: DecodePriority) -> FetchResult {
+    async fn fetch_s3_spilled(
+        &self,
+        hash: &ChunkHash,
+        priority: DecodePriority,
+        s3_failure: &S3Failure,
+    ) -> FetchResult {
         for attempt in 0..S3_FETCH_ATTEMPTS {
             let Ok(mut spill) = self.cache.begin_spill() else {
                 return FetchResult::Fail;
@@ -1172,10 +1214,14 @@ impl Coop {
                         total_ms: total.as_secs_f64() * 1000.0,
                     };
                 }
-                Err(_) if attempt + 1 < S3_FETCH_ATTEMPTS => {
+                Err(error) if attempt + 1 < S3_FETCH_ATTEMPTS => {
+                    s3_failure.record(error);
                     tokio::time::sleep(S3_RETRY_BACKOFF).await;
                 }
-                Err(_) => return FetchResult::Fail,
+                Err(error) => {
+                    s3_failure.record(error);
+                    return FetchResult::Fail;
+                }
             }
         }
         FetchResult::Fail
