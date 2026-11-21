@@ -41,7 +41,7 @@ use constellation_store_s3::inbox::{
 };
 use constellation_types::Code;
 use replicix_objcas::LeaseTag;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// PUT attempts per batch before the waiters are told the inbox is
 /// unavailable (they then take the lease path).
@@ -92,6 +92,19 @@ struct Submitting {
     n: u64,
     rids: Vec<Rid>,
     attempt: u32,
+}
+
+/// A batch PUT that failed without a verdict (timeout, 5xx): the batch may
+/// have landed. The retry reuses the number (`next_n` moves only on an
+/// acknowledgement), so a later `Conflict` at the same `(epoch, n)` can be
+/// this node's own earlier PUT, not someone else's key.
+#[derive(Debug)]
+struct AmbiguousPut {
+    epoch: Epoch,
+    n: u64,
+    /// The ops of every ambiguous attempt at this number: the ones whose
+    /// batch may be the landed one.
+    rids: BTreeSet<Rid>,
 }
 
 #[derive(Debug)]
@@ -250,6 +263,11 @@ pub(crate) struct InboxState {
     /// ends with its last tombstone, or with the op (finished, or its
     /// settle took the withdrawal over): `forget_reroute`.
     rerouting: BTreeMap<Rid, (Epoch, InboxKey)>,
+    /// The batch PUT that failed ambiguously and has not been resolved
+    /// (`on_inbox_put`): a `Conflict` at its `(epoch, n)` keeps its ops'
+    /// keys. Ends with an acknowledged PUT, the conflict that used it, or
+    /// the give-up to the lease path.
+    ambiguous: Option<AmbiguousPut>,
 }
 
 impl InboxState {
@@ -831,6 +849,7 @@ impl Core {
                     n: sub.n,
                 };
                 self.inbox.next_n = Some((sub.epoch, sub.n + 1));
+                self.inbox.ambiguous = None;
                 self.stats.inbox_submitted_batches += 1;
                 self.stats.inbox_submitted_ops += sub.rids.len() as u64;
                 self.stats.inbox_largest_batch_ops = self
@@ -863,15 +882,29 @@ impl Core {
                 self.inbox_kick(now, replica, out);
             }
             S3Result::InboxPut(Err(CasFailure::Conflict)) => {
-                // The key is taken by something that is not this batch
-                // (a stale numbering): resync and retry. Not ours, so not
-                // ours to withdraw either.
+                // The key is taken: resync and retry. Usually by something
+                // that is not this batch (a stale numbering), not ours to
+                // withdraw. But after an ambiguous failure at this very
+                // `(epoch, n)` the occupant can be this node's own earlier
+                // PUT that landed after all (the retry reuses `n`, a newly
+                // queued op joins it, and the store compares op sets). The
+                // ops of that attempt keep the key: they stay "queued with a
+                // key", never rerouted keyless, and a forward or settle
+                // tombstones `n` first. Dropping it let the keyless reroute
+                // forward an op whose own batch was live and untombstoned.
                 let key = InboxKey {
                     epoch: sub.epoch,
                     node: self.cfg.node_id,
                     n: sub.n,
                 };
+                let maybe_ours = match self.inbox.ambiguous.take() {
+                    Some(a) if a.epoch == sub.epoch && a.n == sub.n => a.rids,
+                    _ => BTreeSet::new(),
+                };
                 for rid in &sub.rids {
+                    if maybe_ours.contains(rid) {
+                        continue;
+                    }
                     if let Some(c) = self.clients.get_mut(rid) {
                         c.inbox_keys.retain(|k| *k != key);
                     }
@@ -890,6 +923,9 @@ impl Core {
                     "inbox: batch PUT failed"
                 );
                 if sub.attempt >= SUBMIT_ATTEMPTS {
+                    // The ops keep their keys (their settle withdraws them)
+                    // and leave the inbox path: nothing left to remember.
+                    self.inbox.ambiguous = None;
                     self.stats.inbox_unavailable += 1;
                     for rid in sub.rids {
                         self.lease_path(now, rid, replica, out);
@@ -897,6 +933,19 @@ impl Core {
                     self.inbox_kick(now, replica, out);
                     return;
                 }
+                let a = self.inbox.ambiguous.get_or_insert_with(|| AmbiguousPut {
+                    epoch: sub.epoch,
+                    n: sub.n,
+                    rids: BTreeSet::new(),
+                });
+                if (a.epoch, a.n) != (sub.epoch, sub.n) {
+                    *a = AmbiguousPut {
+                        epoch: sub.epoch,
+                        n: sub.n,
+                        rids: BTreeSet::new(),
+                    };
+                }
+                a.rids.extend(sub.rids.iter().copied());
                 self.inbox_requeue_front(&sub.rids, sub.epoch);
                 self.inbox_reroute_if_linked(now, replica, out);
                 self.inbox_retry(now, sub.attempt, replica, out);
@@ -920,6 +969,9 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let _ = replica;
+        // The count carries on even when a retry is already armed (a kick
+        // during the backoff built the batch that just failed).
+        self.inbox.next_attempt = attempt + 1;
         if self.inbox.retry_timer.is_some() {
             return;
         }
@@ -935,7 +987,6 @@ impl Core {
         // too, but only the other-failure branch checks the limit: a
         // conflict is another writer's batch under the key, not an
         // unavailable store.
-        self.inbox.next_attempt = attempt + 1;
     }
 
     /// The holder the last lease read named is P2P-reachable again: the ops
@@ -975,6 +1026,13 @@ impl Core {
     ///   land, the op waits with no outcome until the inbox deadline (lease
     ///   path, resolved by rid) or its settle resolves it: no second
     ///   execution.
+    /// - An op never goes keyless while its own batch may be live: a PUT
+    ///   that failed ambiguously at `(epoch, n)` is remembered
+    ///   (`InboxState::ambiguous`), and a `Conflict` at that same
+    ///   `(epoch, n)` (the retry reuses `n`; the occupant can be this
+    ///   node's own landed PUT) keeps the key for every op of the ambiguous
+    ///   attempts. They stay queued with a key, which this method does not
+    ///   reroute, and any later forward or settle tombstones `n` first.
     ///
     /// Called when the peer links change and after every batch PUT.
     pub(crate) fn inbox_reroute_if_linked(

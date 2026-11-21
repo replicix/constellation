@@ -88537,6 +88537,135 @@ mod late_landing_inbox {
         assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 1);
     }
 
+    fn mutate_rids_to_2(out: &[Action]) -> Vec<Rid> {
+        sends(out)
+            .iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { rid, .. } if *to == 2 => Some(*rid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M1: a PUT that failed ambiguously at `n` may have landed; the retry
+    /// reuses `n`, a newly queued op joins it, and the store answers
+    /// `Conflict` (the occupant is this node's own earlier batch). The
+    /// first op keeps its key: it is not rerouted keyless while its batch
+    /// is live and untombstoned. The second op was in no landed batch: it
+    /// is rerouted keyless as before. Fails on 282bbf0f: the conflict
+    /// dropped the first op's key and the reroute forwarded it with no
+    /// tombstone of `n`.
+    #[test]
+    fn a_conflict_on_the_key_of_an_own_ambiguous_put_keeps_the_op_from_a_keyless_reroute() {
+        let (mut h, first, put) = put_in_flight_op();
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        // A second op joins the retry batch at the same number.
+        let second = h.rid(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: second,
+            op: h.create("b"),
+            tag: Default::default(),
+        });
+        h.core.inbox_enqueue(h.clk(), second, 1, &h.meta, &mut out);
+        let retry = the_batch_put(&mut h, out);
+        h.step(Event::S3 {
+            op: retry,
+            result: S3Result::InboxPut(Err(CasFailure::Conflict)),
+        });
+        assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
+        assert!(h.core.clients.get(&second).unwrap().inbox_keys.is_empty());
+        let out = link_to_holder_up(&mut h);
+        assert_eq!(
+            mutate_rids_to_2(&out),
+            vec![second],
+            "only the op that was in no landed batch goes keyless: {out:?}"
+        );
+        assert!(h.core.inbox.is_queued(first), "{out:?}");
+        assert!(!h.core.inbox.is_queued(second), "{out:?}");
+        assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 1);
+        assert_eq!(h.core.clients.get(&first).unwrap().inbox_keys, vec![key]);
+    }
+
+    /// A kick during the backoff builds the batch that fails next, with the
+    /// retry timer already armed: the count carries on (it was reset to a
+    /// first attempt, so `SUBMIT_ATTEMPTS` could be pushed back for ever).
+    #[test]
+    fn a_failure_while_the_retry_is_armed_keeps_the_attempt_count() {
+        let (mut h, _first, put) = put_in_flight_op();
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        assert!(h.core.inbox.retry_timer.is_some());
+        // A new op kicks the next batch at once: attempt 2.
+        let second = h.rid(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: second,
+            op: h.create("b"),
+            tag: Default::default(),
+        });
+        h.core.inbox_enqueue(h.clk(), second, 1, &h.meta, &mut out);
+        assert_eq!(h.core.inbox.submit_attempt(), Some(2));
+        let put = the_batch_put(&mut h, out);
+        // It fails with the timer still armed.
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        let id = h.core.inbox.retry_timer.expect("still armed");
+        h.advance(1_000);
+        let out = h.step(Event::Timer { id });
+        let _ = the_batch_put(&mut h, out);
+        assert_eq!(h.core.inbox.submit_attempt(), Some(3));
+    }
+
+    /// S6: an op with two keys, rerouted: the first tombstone lands, the
+    /// second fails. Nothing is forwarded and the op waits on its batch
+    /// again, still in `pending`.
+    #[test]
+    fn a_reroute_whose_second_tombstone_fails_leaves_the_op_waiting() {
+        let (mut h, rid) = waiting_inbox_op();
+        let k1 = h.core.clients.get(&rid).unwrap().inbox_keys[0];
+        let k2 = InboxKey { n: k1.n + 1, ..k1 };
+        h.core.clients.get_mut(&rid).unwrap().inbox_keys.push(k2);
+        let out = link_to_holder_up(&mut h);
+        assert_eq!(tombstoned_keys(&out), vec![k1], "{out:?}");
+        let op = tombstone_op(&out).unwrap();
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert_eq!(tombstoned_keys(&out), vec![k2], "{out:?}");
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(h.core.inbox.is_rerouting(rid));
+        let op = tombstone_op(&out).unwrap();
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Err(crate::event::S3Failure("500".into()))),
+        });
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(
+            matches!(
+                h.core.clients().next(),
+                Some((_, ClientPhase::InboxWaiting))
+            ),
+            "{:?}",
+            h.core.clients().collect::<Vec<_>>()
+        );
+        assert!(h.core.inbox.pending.contains_key(&rid));
+        assert!(!h.core.inbox.is_rerouting(rid));
+    }
+
     /// SHOULD-1: a tombstone written twice (the forward's withdrawal still
     /// in flight when the settle begins) is acknowledged twice; the second
     /// acknowledgement of the first key must not remove the second key.

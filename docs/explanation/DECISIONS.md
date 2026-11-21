@@ -6687,6 +6687,18 @@ stale bytes are not run (`inbox_read_fresh`); ADR-47's `touched_gen` stops a
 designee/root split; co-batched ops are re-submitted and the holder dedups by
 rid. The op is live in exactly one place at any time.
 
+An op whose own batch may be live is never rerouted keyless. A batch PUT that
+fails without a verdict (timeout, 5xx) may have landed, and its retry reuses the
+batch number; a newly queued op joins the retry, the store compares op sets, and
+the answer is `Conflict` although the occupant is this node's own earlier batch.
+The requester therefore remembers the ambiguous PUT at `(epoch, n)`
+(`InboxState::ambiguous`); a `Conflict` at that same `(epoch, n)` keeps the key
+for every op of the ambiguous attempts, so they stay queued with a key (never
+rerouted keyless) and any forward or settle tombstones `n` first. A `Conflict`
+without an ambiguous attempt at that number is another writer's key and is
+dropped as before. The memory ends with an acknowledged PUT, the conflict that
+used it, or the give-up to the lease path.
+
 **Rejected**: a holder that reads every requester's inbox once per tenure
 (fixes the seeds, but the extra reads shifted other configurations past their
 ceilings); trying P2P first whenever the holder's lease was re-claimed after the
