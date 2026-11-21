@@ -89477,6 +89477,28 @@ mod late_landing_inbox {
         assert!(!h.core.in_doubt_rids.contains(&rid), "lowest rid evicted");
         assert!(!h.core.in_doubt_batches.contains_key(&rid));
     }
+
+    /// A client op answered in doubt at the cap, whose rid is the lowest:
+    /// it is evicted at once, and its parked batches go with it (an entry
+    /// inserted after the eviction had no mark and was never evicted).
+    #[test]
+    fn a_client_in_doubt_at_the_cap_leaves_no_batches_for_an_evicted_rid() {
+        let (mut h, rid) = waiting_inbox_op();
+        for seq in 2..=(crate::core::client::MAX_IN_DOUBT_RIDS as u64 + 1) {
+            h.core.in_doubt_rids.insert(h.rid(seq));
+        }
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert_eq!(
+            h.core.in_doubt_rids.len(),
+            crate::core::client::MAX_IN_DOUBT_RIDS
+        );
+        assert!(!h.core.in_doubt_rids.contains(&rid), "lowest rid evicted");
+        assert!(
+            !h.core.in_doubt_batches.contains_key(&rid),
+            "batches of an evicted rid left without a mark"
+        );
+    }
 }
 
 /// Late-landing S2: an unacknowledged or foreign stranded row only settles

@@ -6234,10 +6234,14 @@ impl Core {
                     if c.touched_gen != 0 {
                         self.in_doubt_touched.insert(rid, c.touched_gen);
                     }
-                    self.evict_in_doubt();
+                    // Park the batches before evicting, as `repark_replay`
+                    // does: if this rid is itself the lowest it goes with
+                    // its batches, and an entry inserted afterwards would
+                    // have no mark and never be evicted.
                     if c.inbox_ever || !c.inbox_keys.is_empty() {
                         self.in_doubt_batches.insert(rid, c.inbox_keys);
                     }
+                    self.evict_in_doubt();
                 }
                 out.push(Action::Reply {
                     rid,
