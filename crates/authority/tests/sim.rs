@@ -15441,10 +15441,11 @@ fn a_requester_reroutes_its_inbox_op_when_the_link_comes_back() {
             r.unsettled_causes
         );
         // The pin must reach the mechanism: the seeds that fail without the
-        // reroute rerouted at least one op (counters of the nodes' last
+        // reroute rerouted at least one op on a link-up (not through the
+        // recheck, which main has too; counters of the nodes' last
         // incarnations).
         if REACH_SEEDS.contains(&seed) {
-            let rerouted: u64 = r.stats.values().map(|s| s.inbox_rerouted_to_p2p).sum();
+            let rerouted: u64 = r.stats.values().map(|s| s.inbox_link_rerouted).sum();
             assert!(rerouted > 0, "seed {seed}: no op was rerouted to P2P");
         }
     }

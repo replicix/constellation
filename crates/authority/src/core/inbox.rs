@@ -1100,6 +1100,7 @@ impl Core {
         for rid in durable.into_iter().map(|(r, _)| r).chain(queued) {
             self.inbox.pending.remove(&rid);
             self.stats.inbox_rerouted_to_p2p += 1;
+            self.stats.inbox_link_rerouted += 1;
             tracing::info!(
                 node = self.cfg.node_id,
                 ?rid,

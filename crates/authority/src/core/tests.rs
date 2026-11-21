@@ -88438,6 +88438,7 @@ mod late_landing_inbox {
             "{out:?}"
         );
         assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 1);
+        assert_eq!(h.core.stats.inbox_link_rerouted, 1);
     }
 
     /// (a): a tombstone that fails forwards nothing (the batch may still be

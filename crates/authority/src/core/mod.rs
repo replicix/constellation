@@ -1124,6 +1124,10 @@ pub struct Stats {
     /// EC2 follow-up: ops waiting in the inbox forwarded over P2P once
     /// the holder became reachable (it polls only unconnected requesters).
     pub inbox_rerouted_to_p2p: u64,
+    /// Of those, the ops `inbox_reroute_if_linked` forwarded when the link
+    /// to the holder came up (not the 300 ms recheck's): what the sim pins
+    /// of that reroute assert they reach.
+    pub inbox_link_rerouted: u64,
     /// M5 round 4: forwards that first had to withdraw *more than one*
     /// durable batch of the same rid (the op was submitted to the inbox
     /// more than once under one epoch).
