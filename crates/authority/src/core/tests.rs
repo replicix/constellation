@@ -26620,6 +26620,135 @@ mod locks {
         }
     }
 
+    /// The release's half of the renewal test above (sim
+    /// `locks-writer-hold-delegated-unsettled-own-clock` seed 234, and
+    /// `-unsettled` seeds 231, 273, 385, 1961): this delegate's own client
+    /// wrote under a lock the root minted, and the write passed its check at
+    /// the write and is still in its transaction, pinned, when the root's
+    /// recall arrives past the grant's window. The stream cannot release by
+    /// a row (it stopped), so it ends at the cut it reports, and the root
+    /// grants on from there. The cut is read only after the write committed
+    /// (`Replica::settle_tagged_writes`), so it covers it; a cut read before
+    /// lacks a write that lands after the next holder's grant (or is lost
+    /// with the generation's end).
+    #[test]
+    fn a_rowless_release_cuts_after_a_pinned_write_once_its_window_is_over() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::{mpsc, Arc, Mutex};
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (dir, _f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&7), "not installed");
+        let clock = Arc::new(AtomicI64::new(h.now.0));
+        {
+            let c = clock.clone();
+            h.meta
+                .locks()
+                .set_clock(Arc::new(move || Now::same(c.load(Ordering::SeqCst))));
+        }
+        let before = crate::replica::Replica::delegate_idx(&h.meta, 7);
+        // The root's grant: not in this delegate's table.
+        let tag = token(GrantId { node: 1, seq: 77 }, h.now.0 + 1_000);
+        let op = MutateOp::Create {
+            parent: dir,
+            name: "turn".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        let (pinned_tx, pinned_rx) = mpsc::channel::<std::thread::ThreadId>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let go: Arc<Mutex<Option<mpsc::Sender<()>>>> = Arc::new(Mutex::new(Some(go_tx)));
+        let done = Arc::new(Mutex::new(done_rx));
+        let now = h.now.0;
+        let note = std::thread::scope(|sc| {
+            let meta = &h.meta;
+            let writer = sc.spawn(move || {
+                constellation_meta::write_check_hook::set(Some(Box::new(move |at| {
+                    if at == constellation_meta::write_check_hook::At::Pinned {
+                        pinned_tx.send(std::thread::current().id()).unwrap();
+                        go_rx.recv().unwrap();
+                    }
+                    true
+                })));
+                let r = meta.delegate_execute(
+                    &op,
+                    Some(rid),
+                    7,
+                    Position::ZERO,
+                    &tag,
+                    Now::same(now),
+                );
+                constellation_meta::write_check_hook::set(None);
+                done_tx.send(()).unwrap();
+                r
+            });
+            let writer_thread = pinned_rx.recv().unwrap();
+            // Every other writer waits for the pinned commit, as for a slow
+            // one holding the lock.
+            {
+                let (go, done) = (go.clone(), done.clone());
+                meta.set_writer_wait_hook_for_tests(Some(Arc::new(move || {
+                    if std::thread::current().id() == writer_thread {
+                        return;
+                    }
+                    if let Some(g) = go.lock().unwrap().take() {
+                        g.send(()).unwrap();
+                        done.lock().unwrap().recv().unwrap();
+                    }
+                })));
+            }
+            // Past the grant's window, the stream stopped (no release row):
+            // the root's recall.
+            h.now = h.now.plus(1_500);
+            clock.store(h.now.0, Ordering::SeqCst);
+            assert!(meta.locks().unsettled_writes());
+            h.core.dl.mine.get_mut(&7).expect("installed").stopped = true;
+            let out = h.core.handle(
+                h.clk(),
+                Event::Peer {
+                    from: 1,
+                    msg: PeerMsg::ReleaseRequest {
+                        why: ReleaseWhy::Recall,
+                        req: OpId(5),
+                        gen: 7,
+                        dirs: vec![dir],
+                    },
+                },
+                meta,
+            );
+            // Let it go if nothing did.
+            if let Some(g) = go.lock().unwrap().take() {
+                g.send(()).unwrap();
+            }
+            writer.join().unwrap().unwrap();
+            meta.set_writer_wait_hook_for_tests(None);
+            release_note_to(&out, 1).unwrap_or_else(|| panic!("no release note: {out:?}"))
+        });
+        assert_eq!(
+            crate::replica::Replica::delegate_idx(&h.meta, 7),
+            before + 1,
+            "the pinned write did not commit"
+        );
+        assert_eq!(
+            note.end_at,
+            Some(before + 1),
+            "the rowless release's cut lacks the pinned write: {note:?}"
+        );
+        assert_eq!(h.meta.locks().stats().settle_waits, 1);
+    }
+
     /// F1: this node's own grant is outwaited here (its core stalled past
     /// the window, so nothing renewed it) while a mutation of its own
     /// tagged with it is still in flight — forwarded to the sequencer of
