@@ -21189,8 +21189,11 @@ fn c0_the_oracles_do_not_deadlock_with_held_writes() {
 /// while a backup is committed. The I1 oracle must see it (a `root-group`
 /// answer no backup holds) and fail under `+commit`.
 /// (The inbox reroute on link-up, ADR-68, moved the schedules: the planted
-/// run of seed 701 ends in another oracle's failure now, and 705 is not
-/// caught: the window is seeds 702..713, 11 of 12 caught.)
+/// run of seed 701 ends in another oracle's failure now, the log-witness
+/// check "returned success but completed 0 times in the log" (a node's
+/// acknowledged rid the log never completed, after a holder crash, a
+/// suspension and two clock steps), not I1; and 705 is not caught: the
+/// window is seeds 702..713, 11 of 12 caught.)
 #[test]
 fn c0_i1_catches_a_planted_ungated_fast_path() {
     let planted = || SimConfig {
