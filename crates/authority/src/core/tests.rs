@@ -26682,14 +26682,8 @@ mod locks {
                     }
                     true
                 })));
-                let r = meta.delegate_execute(
-                    &op,
-                    Some(rid),
-                    7,
-                    Position::ZERO,
-                    &tag,
-                    Now::same(now),
-                );
+                let r =
+                    meta.delegate_execute(&op, Some(rid), 7, Position::ZERO, &tag, Now::same(now));
                 constellation_meta::write_check_hook::set(None);
                 done_tx.send(()).unwrap();
                 r
