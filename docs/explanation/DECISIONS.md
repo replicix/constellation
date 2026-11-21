@@ -6617,9 +6617,14 @@ the next `fsync` or the background rounds finish it.
 `RELEASE` is not part of this: the kernel sends it as a background request,
 never interrupts it and ignores its reply, so waiting there would hold a
 `max_background` slot and a pool thread through an outage and delay the
-orphan reap and lock-idle for nothing. A release that still has chunks to
-drain (an `mmap` write, a write after the last flush) keeps the bounded drain;
-what it leaves is the background uploader's.
+orphan reap and lock-idle for nothing. The release's own flush still drains:
+a release that has chunks to drain (an `mmap` write, a write after the last
+flush) publishes and drains them as before, with the bounded drain (three
+tries), and what that leaves is the background uploader's. The same holds
+for a close that runs inline on a frontend that cannot answer from another
+thread: it keeps the old bounded drain, and keeps its fencing scope through
+that drain (the scope ends before the answer, not at the commit as on the
+pool thread).
 
 A cluster-lock mount whose close parks for its caller's lapsed grant ends that
 park only on a fatal signal (the close's token is the killable one): an
