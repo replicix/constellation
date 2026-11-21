@@ -88313,6 +88313,196 @@ mod late_landing_inbox {
         assert!(h.core.clients.get(&rid).unwrap().inbox_keys.is_empty());
     }
 
+    /// Answers the numbering read and the batch PUT of `out` and returns the
+    /// batch PUT's op id.
+    fn the_batch_put(h: &mut Harness, mut out: Vec<Action>) -> OpId {
+        for _ in 0..4 {
+            if let Some((op, _)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::InboxPut { .. }))
+            {
+                return op;
+            }
+            let Some((op, _)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::InboxLastN { .. }))
+            else {
+                break;
+            };
+            out = h.step(Event::S3 {
+                op,
+                result: S3Result::InboxLastN(Ok(None)),
+            });
+        }
+        panic!("no batch PUT in {out:?}");
+    }
+
+    /// The submit attempt counter: every failed PUT of a batch counts, and
+    /// after `SUBMIT_ATTEMPTS` (6) the ops leave the inbox path for the
+    /// lease path. Fails on the parent: `inbox_kick` always built a first
+    /// attempt (the count was written into the `submitting` the result had
+    /// just taken), so the PUT was retried every 200 ms for ever.
+    #[test]
+    fn a_failing_batch_put_counts_its_attempts_and_takes_the_lease_path() {
+        let (mut h, rid, mut put) = put_in_flight_op();
+        assert_eq!(h.core.inbox.submit_attempt(), Some(1));
+        for failed in 1..=5u32 {
+            h.step(Event::S3 {
+                op: put,
+                result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+            });
+            assert!(h.core.inbox.is_queued(rid), "attempt {failed}");
+            let id = h.core.inbox.retry_timer.expect("the retry is armed");
+            h.advance(200 * u64::from(failed));
+            let out = h.step(Event::Timer { id });
+            put = the_batch_put(&mut h, out);
+            assert_eq!(
+                h.core.inbox.submit_attempt(),
+                Some(failed + 1),
+                "the retry after failure {failed}"
+            );
+        }
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        assert_eq!(h.core.stats.inbox_unavailable, 1);
+        assert!(!h.core.inbox.is_queued(rid));
+        assert!(
+            matches!(
+                h.core.clients().next(),
+                Some((_, ClientPhase::LearnHolder | ClientPhase::WaitingLease))
+            ),
+            "{:?}",
+            h.core.clients().collect::<Vec<_>>()
+        );
+    }
+
+    /// The link to node 2 comes up, the last lease read naming it holder of
+    /// epoch 1 (the shape after the holder's restart: the requester's
+    /// `reaches` was stale, so the op went to the inbox of a holder that,
+    /// seeing the requester connected, does not poll it).
+    fn link_to_holder_up(h: &mut Harness) -> Vec<Action> {
+        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 30_000));
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: Some(w(h.now)),
+                rtt_ms: Some(1),
+                since: Some(w(h.now)),
+            }],
+            lapses: 0,
+        })
+    }
+
+    fn mutate_requests_to_2(out: &[Action]) -> usize {
+        sends(out)
+            .iter()
+            .filter(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateRequest { .. }))
+            .count()
+    }
+
+    /// (a): a durable inbox op is withdrawn and forwarded over P2P as soon
+    /// as the link to the holder is up, without a lease read. Fails on the
+    /// parent: nothing happens until the 300 ms recheck, which needs S3.
+    #[test]
+    fn a_waiting_inbox_op_is_rerouted_when_the_link_comes_up() {
+        let (mut h, rid) = waiting_inbox_op();
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        let out = link_to_holder_up(&mut h);
+        assert_eq!(tombstoned_keys(&out), vec![key], "{out:?}");
+        assert_eq!(
+            mutate_requests_to_2(&out),
+            0,
+            "forwarded before the tombstone"
+        );
+        assert!(!h.core.inbox.pending.contains_key(&rid));
+        let op = tombstone_op(&out).unwrap();
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Ok(())),
+        });
+        assert!(
+            matches!(sends(&out).first(), Some((2, PeerMsg::MutateRequest { rid: r, .. })) if *r == rid),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 1);
+    }
+
+    /// (a): a tombstone that fails forwards nothing (the batch may still be
+    /// read, and the op must live in one place): the op waits on the batch
+    /// again. Fails on the parent: no reroute at all.
+    #[test]
+    fn a_failed_tombstone_of_a_reroute_leaves_the_op_waiting_on_its_batch() {
+        let (mut h, rid) = waiting_inbox_op();
+        let out = link_to_holder_up(&mut h);
+        let op = tombstone_op(&out).expect("the withdrawal starts");
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Err(crate::event::S3Failure("500".into()))),
+        });
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(
+            matches!(
+                h.core.clients().next(),
+                Some((_, ClientPhase::InboxWaiting))
+            ),
+            "{:?}",
+            h.core.clients().collect::<Vec<_>>()
+        );
+        assert!(h.core.inbox.pending.contains_key(&rid));
+        assert!(h.core.inbox.recheck_timer.is_some());
+    }
+
+    /// (a): a queued op whose PUT failed keeps its key (the batch may have
+    /// landed): withdrawing it needs the failed S3 path, so it stays queued
+    /// for the PUT's retries; nothing is forwarded.
+    #[test]
+    fn a_queued_op_with_a_kept_key_is_not_rerouted() {
+        let (mut h, rid, put) = put_in_flight_op();
+        h.step(Event::S3 {
+            op: put,
+            result: S3Result::InboxPut(Err(CasFailure::Failed("timeout".into()))),
+        });
+        assert_eq!(h.core.clients.get(&rid).unwrap().inbox_keys.len(), 1);
+        let out = link_to_holder_up(&mut h);
+        assert!(h.core.inbox.is_queued(rid), "{out:?}");
+        assert!(tombstoned_keys(&out).is_empty(), "{out:?}");
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 0);
+    }
+
+    /// (a): a queued op that was never put in a batch is forwarded at once
+    /// (no key, no tombstone); the batch in flight is left alone.
+    #[test]
+    fn a_queued_op_without_a_key_is_rerouted_and_the_batch_in_flight_is_not() {
+        let (mut h, first, _put) = put_in_flight_op();
+        let second = h.rid(2);
+        let mut out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: second,
+            op: h.create("b"),
+            tag: Default::default(),
+        });
+        h.core.inbox_enqueue(h.clk(), second, 1, &h.meta, &mut out);
+        assert!(h.core.inbox.is_queued(second));
+        let out = link_to_holder_up(&mut h);
+        assert!(!h.core.inbox.is_queued(second), "{out:?}");
+        assert!(
+            matches!(sends(&out).first(), Some((2, PeerMsg::MutateRequest { rid: r, .. })) if *r == second),
+            "{out:?}"
+        );
+        assert_eq!(h.core.inbox.submit_attempt(), Some(1));
+        assert!(h.core.clients.contains_key(&first));
+        assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 1);
+    }
+
     /// SHOULD-1: a tombstone written twice (the forward's withdrawal still
     /// in flight when the settle begins) is acknowledged twice; the second
     /// acknowledgement of the first key must not remove the second key.

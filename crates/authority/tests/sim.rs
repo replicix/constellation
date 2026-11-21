@@ -15389,6 +15389,38 @@ fn a_delegates_unparked_own_op_is_answered() {
     }
 }
 
+/// An op a requester sent to the holder's S3 inbox while the holder's link
+/// was not up yet (after the holder's restart `reaches` still carried the
+/// old outage verdict) is forwarded over P2P once the link is up: the holder
+/// polls only the inboxes of the requesters it sees as not connected, so the
+/// batch was never read, and the requester's own way out (the 300 ms recheck)
+/// needs an S3 lease read, which its S3 path (cut) cannot make. The op ended
+/// `EIO` at the settle deadline. Seed 1923 fails I4 on the parent; the
+/// others are the seeds that reached the reroute's failed-withdrawal path
+/// (S3 down, the tombstone failing) in the prototype.
+#[test]
+fn a_requester_reroutes_its_inbox_op_when_the_link_comes_back() {
+    let cfg = SimConfig {
+        strict_unsettled: true,
+        ..locks_blips_tight_delegated_config()
+    };
+    for seed in [1923u64, 63, 404, 479, 1290, 1319, 1361] {
+        let r = run_seed(seed, cfg.clone())
+            .unwrap_or_else(|e| panic!("locks-blips-tight-delegated+unsettled seed {seed}: {e}"));
+        assert_eq!(
+            r.unsettled_violations, 0,
+            "seed {seed}: {:?}",
+            r.unsettled_examples
+        );
+        assert!(
+            !r.unsettled_causes
+                .contains_key(sim::reach::CAUSE_UNDER_ASK_CYCLE),
+            "seed {seed}: {:?}",
+            r.unsettled_causes
+        );
+    }
+}
+
 /// Chunk delegate-fenced-io: `locks-blips-tight-delegated` fenced 482
 /// lock I/Os in 0..4000 on main (`locks-blips-tight`: 0), every one a live
 /// holder whose grant lapsed during an S3 cut while the root renewing it

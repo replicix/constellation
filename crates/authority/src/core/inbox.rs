@@ -320,6 +320,18 @@ impl InboxState {
         self.wanted_reg.posted && !self.wanted_reg.gave_up
     }
 
+    /// The attempt number of the batch PUT in flight (tests).
+    #[cfg(test)]
+    pub(crate) fn submit_attempt(&self) -> Option<u32> {
+        self.submitting.as_ref().map(|s| s.attempt)
+    }
+
+    /// Whether `rid` waits in the submitter's queue (tests).
+    #[cfg(test)]
+    pub(crate) fn is_queued(&self, rid: Rid) -> bool {
+        self.queue.iter().any(|(r, _)| *r == rid)
+    }
+
     /// The number of takeover-drain batches still waiting to be re-read.
     #[cfg(test)]
     pub(crate) fn leftover_batches(&self) -> usize {
