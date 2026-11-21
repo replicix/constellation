@@ -7787,7 +7787,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             for e in &events {
                 match e {
                     super::history::HistEvt::Invoke { rid: r, op, .. } if tentative.contains(r) => {
-                        invoked.push(format!("rid({},{},{}) {op:?}", r.node, r.incarnation, r.seq));
+                        invoked.push(format!(
+                            "rid({},{},{}) {op:?}",
+                            r.node, r.incarnation, r.seq
+                        ));
                     }
                     super::history::HistEvt::Return { rid: r, .. } if r == rid => break,
                     _ => {}
