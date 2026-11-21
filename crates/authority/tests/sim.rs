@@ -3106,8 +3106,13 @@ fn a_claim_cut_that_gave_up_does_not_cut_a_later_claim() {
 /// commit fixed it.
 #[test]
 fn an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks_in_the_sim() {
+    // Two clients per node: the shape the seeds were found in.
+    let config = SimConfig {
+        clients_per_node: 2,
+        ..far_root_writes_held_own_config()
+    };
     for seed in [1510u64, 12] {
-        run_seed(seed, far_root_writes_held_own_config())
+        run_seed(seed, config.clone())
             .unwrap_or_else(|e| panic!("far-root-writes-held-own seed {seed}: {e}"));
     }
 }
@@ -10776,7 +10781,8 @@ struct OracleTotals {
     sticky_core: [u64; 16],
     claim_core: [u64; 4],
     root_own_core: [u64; 15],
-    /// `Report::observed_tentative` and `own_stream_observed_rolled_back`, summed over the seeds that passed.
+    /// `Report::observed_tentative` and `own_stream_observed_rolled_back`, summed over the seeds that passed (the
+    /// second is always 0 there: under strict gating a non-zero count fails the seed).
     observed_own: (usize, usize),
     ll_core: [u64; 11],
     quarantine_core: [u64; 6],
@@ -23567,6 +23573,10 @@ fn the_root_takes_its_own_grants_and_keeps_them_across_a_deposition() {
 ///   pins the same fault at the store).
 /// - `root_executes_under_own_grant`: the root's own path runs a key of its
 ///   live stream in its own journal beside the stream's.
+/// - `own_stream_honours_on_record`: R-H without part (b), on
+///   `far-root-writes-held-own`: the deposed root resumes a stream row whose
+///   root-row premise the takeover rolled back; the witnessed check or
+///   `own_stream_observed_rolled_back` fails the run.
 #[test]
 fn the_root_own_controls_fail_the_oracles() {
     let controls: [(&str, SimConfig, &[&str]); 4] = [
@@ -23635,6 +23645,32 @@ fn the_root_own_controls_fail_the_oracles() {
         }
         assert!(failed > 0, "{name}: no seed failed an oracle");
         assert!(named > 0, "{name}: no seed failed {}", expect[0]);
+    }
+}
+
+/// The oracle `own_stream_observed_rolled_back` itself: with the control
+/// `own_stream_honours_on_record`, seeds 1029 and 1496 of
+/// `far-root-writes-held-own` fail by it (a `Final` answer of the root's own
+/// stream saw an effect the deposition rolled back), and the same seeds pass
+/// without the knob.
+#[test]
+fn the_own_stream_observer_oracle_fails_the_control_seeds() {
+    for seed in [1029u64, 1496] {
+        let e = run_seed(
+            seed,
+            SimConfig {
+                own_stream_honours_on_record: true,
+                ..far_root_writes_held_own_config()
+            },
+        )
+        .err()
+        .unwrap_or_else(|| panic!("seed {seed} passed with the knob"));
+        assert!(
+            e.contains("own_stream_observed_rolled_back"),
+            "seed {seed} failed something else: {e}"
+        );
+        run_seed(seed, far_root_writes_held_own_config())
+            .unwrap_or_else(|e| panic!("seed {seed} fails without the knob: {e}"));
     }
 }
 

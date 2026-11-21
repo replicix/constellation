@@ -938,6 +938,7 @@ pub fn check_linearizable_witnessed_with(
                 });
             if by_drop_alone {
                 witness.observed_dropped += 1;
+                witness.dropped_observers.insert(*rid);
             }
             continue;
         }
@@ -1026,6 +1027,10 @@ pub struct Witness {
     /// generic tester runs on) with one such refusal failed as "not
     /// linearizable" (`locks-faults` seed 195356).
     pub observers: HashSet<Rid>,
+    /// The rids among `observers` that the operator's drop explains on its
+    /// own (counted in `observed_dropped`): what the drop took away is the
+    /// operator's cost, not a rollback of the protocol's.
+    pub dropped_observers: HashSet<Rid>,
 }
 
 /// Plan 30 §M6/§M11 (EC2 campaign 7, finding B-1): the log keeps every

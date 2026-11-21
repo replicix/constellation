@@ -7754,9 +7754,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         &oracles.acks.lock().unwrap(),
         &oracles.own_stream_rows.lock().unwrap(),
     );
+    // (A refusal that the ops of an operator's `repair drop-held` explain on
+    // their own saw the operator's cost, ADR-59 part A: not counted, as
+    // `strict_durability` below subtracts `observed_dropped`.)
     let mut observed_own: Vec<Rid> = witness
         .observers
-        .intersection(&own_answered)
+        .difference(&witness.dropped_observers)
+        .filter(|rid| own_answered.contains(rid))
         .copied()
         .collect();
     observed_own.sort();

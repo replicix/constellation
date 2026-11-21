@@ -71820,7 +71820,10 @@ log carries it). Only a deposed root that resumes a stream row whose root-row pr
 knob opens. With four clients per node the grant comes at about 0.5 to 1.8 s and far requesters run ops on a held root row's names while
 the row is unshipped.
 
-Regression check: `far_root_writes_and_the_sticky_stubs_run_in_report_mode` (it includes held-own) and the fix1510 sim pin (seeds 1510 and
-12) pass with four clients. Logs: the job's README.
+Regression check: `far_root_writes_and_the_sticky_stubs_run_in_report_mode` (it includes held-own) passes. The fix1510 sim pin now runs
+held-own with two clients per node, the shape its seeds were found in (its timing is the 2-client one). The oracle gained a
+`Witness::dropped_observers` set: a refusal that only an operator's `repair drop-held` explains (ADR-59 part A) is not counted. A second pin,
+`the_own_stream_observer_oracle_fails_the_control_seeds`, takes seeds 1029 and 1496 with the knob (they must fail by the oracle) and
+without it (they pass). Logs: the job's README.
 Fail-before: with the strict branch of `own_stream_observed_rolled_back` off the new entry still fails seeds (by step 2's message); with the
 witnessed check's step 2 and step 3 failures also off it fails "no seed failed an oracle".
