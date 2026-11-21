@@ -93171,6 +93171,37 @@ mod root_own_sticky {
         );
     }
 
+    /// ADR-55 R-H: the unhonoured release does not wait for the ops its
+    /// honour parks. An op of the stream's subtree parked on the unhonoured
+    /// stream is not in flight (nothing executed); the release the bound
+    /// gives up on journals its row at once and sends the parked op to the
+    /// root. Fails before: the release "waits for the drain" on that op, and
+    /// the op waits for the honour: no row, ever.
+    #[test]
+    fn an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks() {
+        let (mut h, dirs, d, _r_rid, _rows) = grant_over_an_unshipped_row(false);
+        let (a_rid, out) = submit_in(&mut h, 2, dirs[0], "a");
+        assert!(!accepted(&out, a_rid), "{out:?}");
+        assert!(
+            !h.core.dl.mine[&d.gen].parked.is_empty(),
+            "the op did not park on the unhonoured stream"
+        );
+        let bound = h.core.dl_t().own_first_op_wait;
+        h.advance(bound / 2);
+        h.hold(1, None);
+        activity(&mut h);
+        h.advance(bound);
+        h.hold(1, None);
+        activity(&mut h);
+        assert_eq!(h.core.stats.root_own_released_unhonoured, 1);
+        let st = &h.core.dl.mine[&d.gen];
+        assert!(
+            st.release.as_ref().is_some_and(|r| r.row.is_some()),
+            "the release journaled no row: it waits for the drain"
+        );
+        assert!(st.parked.is_empty(), "the op stayed parked on the stream");
+    }
+
     /// A grant whose record row was not reported (`record == u64::MAX`) is
     /// not parked for good: the bound counts from the grant, and the root
     /// releases it. Fails before: the stream stayed parked, since the

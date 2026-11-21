@@ -3083,6 +3083,23 @@ fn a_claim_cut_that_gave_up_does_not_cut_a_later_claim() {
     }
 }
 
+/// Seed 1510 of `far-root-writes-held-own`: node 1, the root, granted itself
+/// `d1` at about 2.9 s and was cut off at 3 s. R-H kept the own stream
+/// unhonoured behind an unshipped root row of its keys, and the bound released
+/// it. The release waited for the drain, and the ops the unhonoured stream had
+/// parked (they wait for the honour) counted as in flight: the release and the
+/// ops waited for each other for good, and after the deposition every
+/// handover request met the same wait ("a client op was never answered").
+/// Seed 12 of the same label is the other half: the release then ends the
+/// stream locally, which the successor must be able to recall.
+#[test]
+fn an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks_in_the_sim() {
+    for seed in [1510u64, 12] {
+        run_seed(seed, far_root_writes_held_own_config())
+            .unwrap_or_else(|e| panic!("far-root-writes-held-own seed {seed}: {e}"));
+    }
+}
+
 /// Two stalls of `sticky-root-designee-inbox`, pinned on the seeds that showed
 /// them: seed 216, 1025 and 1128, a delegate that held the lease itself (no
 /// root in view) and then met a root whose cursor was behind the old root's
