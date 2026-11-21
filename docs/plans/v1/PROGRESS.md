@@ -71792,3 +71792,35 @@ parked) and sim `an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_
 main 0d157e56: 1510 still hangs; seed 12, which failed with the spec-1510 prototype (a deposed root's unshipped own-stream end), passes
 on main and with this fix. That is not a fix of its shape: spec-996 part B (a deposed root's own-stream release or end that never
 shipped) is still open and no commit fixed it, so pinning seed 12 is a weak guard. Logs: see the job's README.
+
+**Plan 46 M1.3 step 9: the sim control for R-H (b) is pinned (2026-11-21).** The knob `own_stream_honours_on_record` (R-H without part
+(b)) is now caught by the sim: `far-root-writes-held-own` with `clients_per_node: 4`, run with the knob, fails 10 of 2,000 seeds, and the
+fourth entry of `the_root_own_controls_fail_the_oracles` pins it (seeds 0..250 include 95 and 223, which fail "took effect in the log but
+the spec refuses it"). The oracle `own_stream_observed_rolled_back` is on main now: an own-stream `Final` answer whose transaction origin is a
+generation the answering node minted for itself as root and that only a rolled-back effect explains fails the run under `strict_lone ||
+strict_durability` (counted always, `OWN-OBSERVED-TOTALS`); nothing else is relaxed (`observed_tentative` and the `strict_durability`
+check are as they were). Precondition: the held-own hang fix (fix1510, main 74b78710) touches only the release's `busy` test for an
+unhonoured stream; it changes neither R-H (b) nor what a deposed root does with own-stream rows held behind a rolled-back root row, and the
+re-run of the knob arm below gives the same ten seeds as before the fix.
+
+Step 2 (release sim binary, 2,000 seeds per arm, 4 threads, `far-root-writes-held-own`, tree 739c6de4):
+
+| arm | failing | seeds and the first oracle named |
+|---|---|---|
+| no knob | 0 | none |
+| knob | 10 | 95, 223, 594, 997, 1457, 1517, 1960: "took effect in the log but the spec refuses it"; 1029, 1496: `own_stream_observed_rolled_back`; 1586: "but no state in its window" |
+
+Why the 2-client labels never showed the harm: with two clients per node the root dominates `d1` only at about 2.9 s, so the own window
+before the pause at 3 s is almost empty and node 1's clients block on their own chunk writes; no op of the stream ran on a held row's
+names. Elsewhere the held row was a manifest row (R) that no answer reads (S unlinks or renames the file whose `SetManifest` is pending: the
+keys overlap, the answer does not depend on R's effect), and after a restart with the journal, or after the heal, no takeover rolls R back
+(the ship plan ships R, then S). Two mechanisms cover every case except a deposition: the ship plan's transitive hold (`store::held`: a row
+that conflicts with a held row is held with it) and a far requester's wait for the log (an answer from the own stream is not final until the
+log carries it). Only a deposed root that resumes a stream row whose root-row premise the takeover rolled back is left, and that is what the
+knob opens. With four clients per node the grant comes at about 0.5 to 1.8 s and far requesters run ops on a held root row's names while
+the row is unshipped.
+
+Regression check: `far_root_writes_and_the_sticky_stubs_run_in_report_mode` (it includes held-own) and the fix1510 sim pin (seeds 1510 and
+12) pass with four clients. Logs: the job's README.
+Fail-before: with the strict branch of `own_stream_observed_rolled_back` off the new entry still fails seeds (by step 2's message); with the
+witnessed check's step 2 and step 3 failures also off it fails "no seed failed an oracle".

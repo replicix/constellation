@@ -4819,7 +4819,10 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
     journal (R-I4), cross-boundary ops release the grant first, inbox ops are
     stream rows. Decided once per event from the ship state, cached per
     generation (`OwnGrant { record, honoured }`); the lease epoch is no input. A
-    growth of the grant (a new record) is honoured again per generation.
+    growth of the grant (a new record) is honoured again per generation. Part
+    (b) is not defensive: the sim control is `far-root-writes-held-own` under
+    `AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD=1` (the deposed root resumes a
+    stream row whose root-row premise the takeover rolled back).
   - *R-X (execute).* An own-stream op executes as a far delegate's: the stream
     is honoured (`Core::stream_honoured`) and its dependencies are reached.
     While the node holds a root tenure that is the streams part and "not lost"

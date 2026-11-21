@@ -23569,7 +23569,7 @@ fn the_root_takes_its_own_grants_and_keeps_them_across_a_deposition() {
 ///   live stream in its own journal beside the stream's.
 #[test]
 fn the_root_own_controls_fail_the_oracles() {
-    let controls: [(&str, SimConfig, &[&str]); 3] = [
+    let controls: [(&str, SimConfig, &[&str]); 4] = [
         (
             "root_sticky_on_slash",
             SimConfig {
@@ -23604,6 +23604,18 @@ fn the_root_own_controls_fail_the_oracles() {
                 "root_path_executes_own_stream",
                 "I2",
                 "I1",
+            ],
+        ),
+        (
+            "own_stream_honours_on_record",
+            SimConfig {
+                own_stream_honours_on_record: true,
+                ..far_root_writes_held_own_config()
+            },
+            &[
+                "took effect in the log but the spec refuses it",
+                "own_stream_observed_rolled_back",
+                "but no state in its window",
             ],
         ),
     ];
