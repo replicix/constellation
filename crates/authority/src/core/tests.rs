@@ -89293,6 +89293,64 @@ mod late_landing_inbox {
         assert!(c.settle);
         assert!(replies(&out).is_empty(), "{out:?}");
     }
+
+    /// A replay of a rid takes the client's parked batches with it
+    /// (`in_doubt_batches`), and a replay that ends in doubt parks nothing:
+    /// the client's later resubmission by the same rid came back keyless and
+    /// not inbox-ever (`touched_gen` 0: the op had only been in the inbox),
+    /// and was forwarded over P2P while its batch was live and untombstoned.
+    /// A designee runs such a forward (only `inbox_ever` fences it), and the
+    /// root's drain of the batch then refuses or runs the rid a second time.
+    #[test]
+    fn a_replay_in_doubt_does_not_take_the_clients_parked_batch_away() {
+        let (mut h, rid) = waiting_inbox_op();
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        // The client's op is answered in doubt: its batch is parked.
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert!(h.core.in_doubt_rids.contains(&rid));
+        assert_eq!(h.core.in_doubt_batches.get(&rid), Some(&vec![key]));
+        // The replay drain submits the rid's queue entry while no holder is
+        // known; it ends in doubt before it withdrew the batch.
+        h.core.lease.cached_holder = None;
+        let op = h.create("a");
+        let mut out = Vec::new();
+        h.core.submit(
+            h.clk(),
+            rid,
+            op,
+            Policy::Client,
+            Default::default(),
+            crate::core::client::Origin::Replay {
+                queue_seq: 1,
+                deps: Default::default(),
+            },
+            &h.meta,
+            &mut out,
+        );
+        assert!(tombstoned_keys(&out).is_empty(), "{out:?}");
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert!(!h.core.clients.contains_key(&rid));
+        // The client resubmits once the link to the holder is up.
+        h.core.lease.cached_holder = Some(2);
+        link_to_holder_up(&mut h);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        assert!(
+            !mutate_rids_to_2(&out).contains(&rid),
+            "forwarded with its batch live: {out:?}"
+        );
+        assert_eq!(tombstoned_keys(&out), vec![key], "{out:?}");
+    }
 }
 
 /// Late-landing S2: an unacknowledged or foreign stranded row only settles
