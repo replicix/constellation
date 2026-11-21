@@ -4992,6 +4992,8 @@ impl Core {
             started: delay == 0,
         });
         self.inbox.pending.remove(&rid);
+        // The settle's withdrawal replaces a reroute's (`under_way`).
+        self.inbox.forget_reroute(rid);
         self.stats.settles_withdrawn_first += 1;
         if several {
             self.stats.settle_multi_batch_withdrawals += 1;
@@ -6117,6 +6119,7 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        self.inbox.forget_reroute(rid);
         self.end_lock_hold(&c, rid, replica);
         if let Some(t) = c.withdraw.and_then(|w| w.retry) {
             self.cancel_timer(t, out);
@@ -6375,6 +6378,7 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        self.inbox.forget_reroute(rid);
         self.end_lock_hold(&c, rid, replica);
         self.log_if_slow(now, rid, &c, &format!("{outcome:?}"), replica);
         self.cancel_timer(c.deadline, out);

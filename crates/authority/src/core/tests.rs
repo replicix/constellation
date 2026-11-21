@@ -88423,11 +88423,16 @@ mod late_landing_inbox {
             "forwarded before the tombstone"
         );
         assert!(!h.core.inbox.pending.contains_key(&rid));
+        assert!(h.core.inbox.is_rerouting(rid));
         let op = tombstone_op(&out).unwrap();
         let out = h.step(Event::S3 {
             op,
             result: S3Result::InboxTombstone(Ok(())),
         });
+        assert!(
+            !h.core.inbox.is_rerouting(rid),
+            "the last tombstone ends it"
+        );
         assert!(
             matches!(sends(&out).first(), Some((2, PeerMsg::MutateRequest { rid: r, .. })) if *r == rid),
             "{out:?}"
@@ -88458,6 +88463,35 @@ mod late_landing_inbox {
         );
         assert!(h.core.inbox.pending.contains_key(&rid));
         assert!(h.core.inbox.recheck_timer.is_some());
+        assert!(!h.core.inbox.is_rerouting(rid));
+    }
+
+    /// (a): the settle that takes a reroute's withdrawal over ends the
+    /// reroute's entry: a failure of that tombstone is the settle's to
+    /// handle, not a return to waiting on the batch.
+    #[test]
+    fn a_settle_that_takes_over_a_reroutes_withdrawal_ends_the_reroute() {
+        let (mut h, rid) = waiting_inbox_op();
+        let out = link_to_holder_up(&mut h);
+        let op = tombstone_op(&out).expect("the withdrawal starts");
+        assert!(h.core.inbox.is_rerouting(rid));
+        h.advance(h.core.dl_t().attempts + 1);
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(!h.core.inbox.is_rerouting(rid), "{out:?}");
+        let out = h.step(Event::S3 {
+            op,
+            result: S3Result::InboxTombstone(Err(crate::event::S3Failure("500".into()))),
+        });
+        assert!(
+            !matches!(
+                h.core.clients().next(),
+                Some((_, ClientPhase::InboxWaiting))
+            ),
+            "{out:?}"
+        );
+        assert!(!h.core.inbox.pending.contains_key(&rid));
     }
 
     /// (a): a queued op whose PUT failed keeps its key (the batch may have

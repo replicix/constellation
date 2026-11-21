@@ -241,6 +241,29 @@ pub(crate) struct InboxState {
     /// `SUBMIT_ATTEMPTS` failures the counter starts again at 1 for the
     /// next batch).
     next_attempt: u32,
+    /// Durable ops `inbox_reroute_if_linked` is withdrawing for a forward,
+    /// with the epoch and key they waited under. A tombstone that fails
+    /// puts the op back to waiting on that batch (it is still in the
+    /// holder's inbox, or the tombstone landed after all and the deadline
+    /// or the settle resolves it) instead of sending it down the lease
+    /// path, which a node whose own S3 path is down cannot take. An entry
+    /// ends with its last tombstone, or with the op (finished, or its
+    /// settle took the withdrawal over): `forget_reroute`.
+    rerouting: BTreeMap<Rid, (Epoch, InboxKey)>,
+}
+
+impl InboxState {
+    /// The op is no longer in a reroute's withdrawal: it finished, or its
+    /// settle took the withdrawal over (`ClientOp::withdraw`).
+    pub(crate) fn forget_reroute(&mut self, rid: Rid) {
+        self.rerouting.remove(&rid);
+    }
+
+    /// Whether `rid` is in a reroute's withdrawal (tests).
+    #[cfg(test)]
+    pub(crate) fn is_rerouting(&self, rid: Rid) -> bool {
+        self.rerouting.contains_key(&rid)
+    }
 }
 
 /// The takeover drain's batches that wait for the holder tick (see
@@ -836,6 +859,7 @@ impl Core {
                 self.arm_inbox_recheck(now, out);
                 // Tail at the hot interval for the outcome.
                 self.nudge(now, out);
+                self.inbox_reroute_if_linked(now, replica, out);
                 self.inbox_kick(now, replica, out);
             }
             S3Result::InboxPut(Err(CasFailure::Conflict)) => {
@@ -854,6 +878,7 @@ impl Core {
                 }
                 self.inbox.next_n = None;
                 self.inbox_requeue_front(&sub.rids, sub.epoch);
+                self.inbox_reroute_if_linked(now, replica, out);
                 self.inbox_retry(now, sub.attempt, replica, out);
             }
             other => {
@@ -873,6 +898,7 @@ impl Core {
                     return;
                 }
                 self.inbox_requeue_front(&sub.rids, sub.epoch);
+                self.inbox_reroute_if_linked(now, replica, out);
                 self.inbox_retry(now, sub.attempt, replica, out);
             }
         }
@@ -910,6 +936,125 @@ impl Core {
         // conflict is another writer's batch under the key, not an
         // unavailable store.
         self.inbox.next_attempt = attempt + 1;
+    }
+
+    /// The holder the last lease read named is P2P-reachable again: the ops
+    /// this node routed to its inbox while it was not go to it over P2P at
+    /// once. After the holder's restart `reaches` still carries the outage
+    /// verdict, so `on_holder_learned` sends the op (often a settle) to the
+    /// inbox; the holder, seeing this node connected, polls only the inboxes
+    /// of requesters it sees as not connected and never reads the batch; and
+    /// the requester's own way out, the 300 ms `on_inbox_recheck`, needs an
+    /// S3 lease read: none while its S3 path is down. Queued ops were never
+    /// rerouted at all.
+    ///
+    /// Guards, as the recheck's arm has them but with the last-seen lease in
+    /// place of a fresh read: inbox and forwarding on; ops waiting; the
+    /// holder is another node, its lease not claimable, its link connected,
+    /// `reaches`. Rerouted: the durable ops waiting under the holder's
+    /// epoch (`InboxWaiting`), and the queued ops of that epoch that were
+    /// never put in a batch (no key). A queued op that has a key (its PUT
+    /// failed and the batch may have landed) stays queued: withdrawing it
+    /// needs the S3 path that just failed, and the PUT's retries decide for
+    /// it. The batch in flight (`submitting`) is never touched while its PUT
+    /// is outstanding; its result calls this again.
+    ///
+    /// Invariants (one execution, the op live in one place):
+    /// - `send_forward` writes a tombstone for every batch the rid was put
+    ///   in (a failed PUT's possibly landed key included) before the
+    ///   forward leaves, and forwards only after every tombstone succeeded.
+    ///   A drain that reads a tombstone runs nothing; a holder that ran the
+    ///   batch before the tombstone answers the later forward from its
+    ///   `completed` by rid; stale bytes are not run (`Halt::Stale`,
+    ///   `inbox_read_fresh`); ADR-47's `touched_gen` stops a designee/root
+    ///   split; co-batched ops are re-submitted
+    ///   (`inbox_resubmit_cobatched`) and the holder dedups them by rid.
+    /// - A tombstone that fails forwards nothing: the op waits on the batch
+    ///   again (`on_inbox_withdrawn`, `rerouting`), so a later read of the
+    ///   batch cannot re-run an op answered over P2P. If that tombstone did
+    ///   land, the op waits with no outcome until the inbox deadline (lease
+    ///   path, resolved by rid) or its settle resolves it: no second
+    ///   execution.
+    ///
+    /// Called when the peer links change and after every batch PUT.
+    pub(crate) fn inbox_reroute_if_linked(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.cfg.inbox
+            || !self.cfg.forwarding
+            || (self.inbox.pending.is_empty() && self.inbox.queue.is_empty())
+        {
+            return;
+        }
+        let Some((holder, epoch)) = self.lease.last_seen.as_ref().map(|l| (l.holder, l.epoch))
+        else {
+            return;
+        };
+        if holder == self.cfg.node_id
+            || holder == 0
+            || self.lease.claimable_observed(now, &self.cfg)
+            || !self
+                .roster
+                .links()
+                .get(&holder)
+                .is_some_and(|k| k.connected)
+            || !self.reaches(now, holder)
+        {
+            return;
+        }
+        let in_flight: &[Rid] = self
+            .inbox
+            .submitting
+            .as_ref()
+            .map_or(&[], |s| s.rids.as_slice());
+        let durable: Vec<(Rid, InboxKey)> = self
+            .inbox
+            .pending
+            .iter()
+            .filter(|(rid, _)| {
+                self.clients
+                    .get(rid)
+                    .is_some_and(|c| c.phase == Phase::InboxWaiting { epoch })
+            })
+            .map(|(r, k)| (*r, *k))
+            .collect();
+        let queued: Vec<Rid> = self
+            .inbox
+            .queue
+            .iter()
+            .filter(|(rid, e)| {
+                *e == epoch
+                    && !in_flight.contains(rid)
+                    && self
+                        .clients
+                        .get(rid)
+                        .is_some_and(|c| c.inbox_keys.is_empty())
+            })
+            .map(|(rid, _)| *rid)
+            .collect();
+        self.inbox.queue.retain(|(rid, _)| !queued.contains(rid));
+        for (rid, key) in &durable {
+            self.inbox.rerouting.insert(*rid, (epoch, *key));
+        }
+        for rid in durable.into_iter().map(|(r, _)| r).chain(queued) {
+            self.inbox.pending.remove(&rid);
+            self.stats.inbox_rerouted_to_p2p += 1;
+            tracing::info!(
+                node = self.cfg.node_id,
+                ?rid,
+                holder,
+                "inbox: the holder is reachable over P2P again; forwarding the op"
+            );
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.attempts = 0;
+                c.fence_bounces = 0;
+                c.redirected = 0;
+            }
+            self.send_forward(now, rid, holder, 0, replica, out);
+        }
     }
 
     fn arm_inbox_recheck(&mut self, now: Now, out: &mut Vec<Action>) {
@@ -1909,6 +2054,9 @@ impl Core {
         // A settle's own tombstones (`ClientOp::withdraw`) run beside it,
         // whatever its phase is.
         if c.withdraw.is_some() {
+            // The settle took the withdrawal over: its own failure handling
+            // applies, not the reroute's.
+            self.inbox.forget_reroute(rid);
             self.on_settle_withdrawn(now, rid, key, result, replica, out);
             return;
         }
@@ -1925,10 +2073,31 @@ impl Core {
                 // `send_forward` withdraws the next batch, if any, before
                 // it forwards.
                 c.inbox_keys.retain(|k| *k != key);
+                if c.inbox_keys.is_empty() {
+                    self.inbox.rerouting.remove(&rid);
+                }
                 self.stats.inbox_withdrawn_ops += 1;
                 self.inbox_forget_leftover(key);
                 self.inbox_resubmit_cobatched(now, key, replica, out);
                 self.send_forward(now, rid, holder, gen, replica, out);
+            }
+            // A reroute's tombstone failed (`inbox_reroute_if_linked`):
+            // nothing is forwarded, and the op waits on its batch again
+            // rather than take the lease path, which a node whose S3 path
+            // is down cannot take. Before the lease-path arm.
+            other if self.inbox.rerouting.contains_key(&rid) => {
+                let Some((epoch, waiting)) = self.inbox.rerouting.remove(&rid) else {
+                    return;
+                };
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    ?other,
+                    "inbox: withdrawing the batch for a P2P forward failed; the op waits on it again"
+                );
+                c.phase = Phase::InboxWaiting { epoch };
+                self.inbox.pending.insert(rid, waiting);
+                self.arm_inbox_recheck(now, out);
             }
             other => {
                 tracing::debug!(

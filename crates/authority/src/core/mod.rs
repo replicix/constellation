@@ -3715,6 +3715,7 @@ impl Core {
                 self.roster.install_links(links, registry_complete, lapses);
                 self.stream_on_peers(now);
                 self.deleg_on_peers();
+                self.inbox_reroute_if_linked(now, replica, &mut out);
             }
             Event::OwnS3 {
                 stalled,
