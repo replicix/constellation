@@ -160,6 +160,12 @@ outcome = "skipped"
 reason = "Not yet ported (F6): needs stress-ng in the workload pod (the lane's pods run the driver image), its mid-run snapshots as VolumeSnapshots."
 
 [[expect]]
+scenario = "stress-ng-fs-faults"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): needs stress-ng in the workload pod (the lane's pods run the driver image) and S3 cuts under it."
+
+[[expect]]
 scenario = "existence-bloom-dedup"
 lanes = ["linux-csi"]
 outcome = "skipped"
