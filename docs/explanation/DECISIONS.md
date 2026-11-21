@@ -6644,6 +6644,44 @@ See: `crates/engine/src/fsync_wait.rs`, `crates/engine/src/view/durable.rs`
 (`close_run`, `close_publication`), `crates/engine/src/view/ops.rs` (`flush`),
 `crates/frontend-fuse/src/adapter.rs`.
 
+## ADR-67: An epoch flush keeps its own re-claimed tenure nobody wants, and a sole writer's lease
+
+**Status**: decided on 2026-11-21, after the `stress-ng-fs-faults` scenario
+answered `EROFS` on its canary create.
+
+**Context**: a continuation epoch's close lets the node's lease go locally;
+its flush re-claims the lease and, with no lock grant live, released it
+again. The next S3 cut then formed an epoch with no carried lease, and every
+write in such an epoch is refused `EROFS` (ADR-62) until S3 returns; that
+epoch's own flush acquired a fresh lease and released it, so the loop went on
+for every cut after the first epoch that closed without a live grant. A lone
+node went read-only for each S3 blip, and for a whole outage. Only the epoch
+flush gave a lease away unasked: an ordinary idle holder releases it when
+someone wants it.
+
+**Decision**: the flush keeps the lease (and reports the epoch flushed) in two
+more cases, besides live grants, the takeover floor and a pending takeover's
+gate: the lease is this node's own pre-cut lease, re-claimed after the close
+(`LeaseState::resumed_tenure`, set by the acquisition that replaced an object
+the close let go, from this node), and no node wants it and the node does not
+release when idle; or this node is the only write-eligible node on a complete
+roster read. An unread or partial roster counts as having peers. After the
+flush the ordinary rules apply: an idle release, a handoff to a wanter, the
+release at unmount. Nothing is added to the release side, and the flush of
+`leave`, a suspension and an unmount releases as before.
+
+**Consequence**: a node holds its lease, with its renewals, through idle
+periods after a cut where it used to give it away; a node that joined unseen
+asks for the lease and gets the usual handoff.
+
+**Rejected**: retrying the canary create in the harness (the refusal is a
+real liveness bug, not a flake); relaxing `EROFS` in lease-less epochs (an
+epoch with no lease has no authority to order writes, ADR-62 stands).
+
+See: `Core::round_release` and `Core::epoch_tenure_resumed`
+(`crates/authority/src/core`), the sim test
+`a_lone_node_keeps_its_lease_through_an_epoch_flush`.
+
 ## ADR-68: An inbox op is rerouted to P2P when the link to the holder is up
 
 **Status**: decided on 2026-11-21, after the

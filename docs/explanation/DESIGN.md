@@ -1612,7 +1612,10 @@ What an epoch may carry:
   handed its hold away, or closed its epoch, never takes that hold back,
   even after a restart. A member closes its epoch only once the carried
   lease is gone from S3 (the holder re-claimed it by its flush, released
-  it, or lost it).
+  it, or lost it). The flush keeps the lease it re-claimed when no node
+  asks for it, and a sole writer's lease; either way the next cut finds
+  the node holding a lease, not an epoch with none that refuses writes
+  ([ADR-67](DECISIONS.md#adr-67-an-epoch-flush-keeps-its-own-re-claimed-tenure-nobody-wants-and-a-sole-writers-lease)).
 - A member that can still reach S3 declines to join. A node whose own S3
   fails first asks every member to probe S3; if any does reach it, the
   outage is its own and it proposes nothing (its closes hand their chunks

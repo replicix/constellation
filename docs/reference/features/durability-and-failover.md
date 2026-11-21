@@ -1410,7 +1410,14 @@ Operational rules:
   that nobody held it in between, so they stand. Any other acquisition
   drops them, and grants nothing over them until they lapse. After the
   flush, a lease with live grants is kept rather than released (it is
-  released as an idle lease is, once they are gone). A node re-adopting
+  released as an idle lease is, once they are gone). So is the node's own
+  pre-cut lease the flush re-claimed when no node asks for it, and the
+  lease of the only write-eligible node (a complete roster listing it
+  alone): the flush used to release them, and the next S3 cut formed an
+  epoch carrying no lease and refused every write with `EROFS`
+  ([ADR-67](../../explanation/DECISIONS.md#adr-67-an-epoch-flush-keeps-its-own-re-claimed-tenure-nobody-wants-and-a-sole-writers-lease)).
+  A lease another node asks for, and one taken in any other way, is
+  released after the flush as before. A node re-adopting
   its own lease keeps the lease's granting mark, so a re-claim that S3
   cuts again before it could mark the lease does not refuse every lock.
 - A member of an epoch that carries a lease closes it once S3 is back
