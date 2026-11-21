@@ -3017,9 +3017,10 @@ impl Core {
         //
         // Nor does it go when it is this node's own pre-cut lease (the
         // close let it go, the flush re-claimed it) and nobody wants it, or
-        // when this node is the only write-eligible one (the acquisition
-        // and its release would repeat at every cut): a node that gave it
-        // away held none when the next cut formed its epoch, and every write in an epoch carrying no lease is refused
+        // when this node is the only write-eligible one and nobody wants it
+        // (the acquisition and its release would repeat at every cut): a
+        // node that gave it away held none when the next cut formed its
+        // epoch, and every write in an epoch carrying no lease is refused
         // `EROFS` until S3 returns (`stress-ng-fs-faults`: the canary
         // create after the last grant ended). Afterwards the ordinary
         // rules apply: an idle release, a handoff to a wanter, the release
@@ -3033,7 +3034,8 @@ impl Core {
         // a *fast takeover's* gate before its marker landed (no floor yet,
         // no adopted delegation table). Not the epoch's own re-claim's
         // gate: `locks-blips-tight-faults` seed 5379 reaches that one, and
-        // there the release is the epoch's design.
+        // there the release is the epoch's design when a node wants the
+        // lease; with nobody wanting it, `keep_own` holds it.
         let fast_gate = self.lease.gate.as_ref().is_some_and(|g| g.fast_prev);
         // And a takeover of another node's lease: its gate strands what the
         // previous tenure acknowledged to its clients but never shipped, and

@@ -15351,9 +15351,13 @@ fn blips_single_idle_config() -> SimConfig {
 fn a_lone_node_keeps_its_lease_through_an_epoch_flush() {
     let mut erofs = 0;
     let mut returned = 0;
+    let mut epochs = 0;
+    let mut releases = 0;
     for seed in 0..40 {
         let report = run_seed(seed, blips_single_idle_config())
             .unwrap_or_else(|e| panic!("blips-single-idle seed {seed}: {e}"));
+        epochs += report.epochs_formed;
+        releases += report.stats.values().map(|s| s.releases).sum::<u64>();
         if report.erofs_returned > 0 {
             eprintln!(
                 "blips-single-idle seed {seed}: {} EROFS",
@@ -15365,6 +15369,10 @@ fn a_lone_node_keeps_its_lease_through_an_epoch_flush() {
     }
     eprintln!("blips-single-idle: {erofs} EROFS of {returned} returned");
     assert_eq!(erofs, 0, "a lone node refused writes EROFS in an S3 cut");
+    // Not vacuous: the cuts formed epochs (the flushes ran), and the node
+    // never let the lease go, so 0 EROFS is the lease kept, not no cut.
+    assert!(epochs > 0, "no continuation epoch formed in 40 seeds");
+    assert_eq!(releases, 0, "the lone node released its lease");
 }
 
 /// The M1.2 exit sweep: 267 of 2,000 seeds failed "history is not
@@ -15488,7 +15496,7 @@ fn a_delegates_unparked_own_op_is_answered() {
 #[test]
 fn a_requester_reroutes_its_inbox_op_when_the_link_comes_back() {
     /// The seeds that fail on the parent: they must reroute.
-    const REACH_SEEDS: [u64; 1] = [1923];
+    const REACH_SEEDS: [u64; 3] = [1923, 1505, 1818];
     let cfg = SimConfig {
         strict_unsettled: true,
         ..locks_blips_tight_delegated_config()

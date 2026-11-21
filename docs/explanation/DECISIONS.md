@@ -6665,7 +6665,7 @@ gate: the lease is this node's own pre-cut lease, re-claimed after the close
 (`LeaseState::resumed_tenure`, set by the acquisition that replaced an object
 the close let go, from this node), and no node wants it and the node does not
 release when idle; or this node is the only write-eligible node on a complete
-roster read. An unread or partial roster counts as having peers. After the
+roster read and, again, no node wants the lease. An unread or partial roster counts as having peers. After the
 flush the ordinary rules apply: an idle release, a handoff to a wanter, the
 release at unmount. Nothing is added to the release side, and the flush of
 `leave`, a suspension and an unmount releases as before.
