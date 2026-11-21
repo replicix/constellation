@@ -2106,8 +2106,15 @@ fn far_root_writes_paused_config() -> SimConfig {
 /// rename on the same two names is answered by the stream. Without the
 /// control `AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD=1` R-H (b) keeps that
 /// stream unhonoured until the row ships; with it, the deposition rolls the
-/// row back after the answer that saw it (the oracle that names it is not on
-/// this main yet).
+/// row back after the answer that saw it (the oracle that names it is
+/// `own_stream_observed_rolled_back`).
+///
+/// Four clients per node, not two. With two, the root dominates `d1` only at
+/// about 2.9 s, so the own window before the pause at 3 s is almost empty,
+/// and node 1's clients block on their own chunk writes: no op of the
+/// stream ever runs on a held row's names. With four, the grant comes at
+/// about 0.5 to 1.8 s, and far requesters run ops on a held root row's
+/// names while the row is unshipped.
 fn far_root_writes_held_own_config() -> SimConfig {
     SimConfig {
         dirs: vec!["d1".into()],
@@ -2116,6 +2123,7 @@ fn far_root_writes_held_own_config() -> SimConfig {
         chunk_writes: 0.6,
         chunk_write_nodes: vec![1],
         upload_hold_ms: 12_000,
+        clients_per_node: 4,
         ..far_root_writes_paused_config()
     }
 }
