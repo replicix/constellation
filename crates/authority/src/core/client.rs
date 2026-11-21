@@ -687,6 +687,39 @@ impl Core {
         self.evict_in_doubt();
     }
 
+    /// A replay of `rid` leaves `clients` (answered or in doubt) while a
+    /// client's resubmission of the same rid can still come
+    /// (`in_doubt_rids`, or merged into it): what the replay took from the
+    /// client's parked record goes back, with what it added.
+    ///
+    /// Invariant (ADR-68): the op is live in exactly one place. While the
+    /// replay runs it holds the parked batches (`submit` takes them); when it
+    /// leaves, the parked record holds them and the client's resubmission
+    /// inherits the record and tombstones every batch before any forward. A
+    /// replay that left nothing parked made that resubmission keyless, not
+    /// `inbox_ever` and `touched_gen` 0, so a designee could run it while the
+    /// root's drain of the batch refused or ran it as well. Its batches not
+    /// yet withdrawn stay with the rid, so the resubmission tombstones them
+    /// before any forward, and its send history (unknown: a replay's) stays
+    /// the rid's. Bounded with `in_doubt_rids` (`evict_in_doubt`).
+    fn repark_replay(&mut self, rid: Rid, c: &ClientOp, client_waits: bool) {
+        if !client_waits {
+            return;
+        }
+        self.in_doubt_rids.insert(rid);
+        if c.touched_gen != 0 {
+            let touched = self.in_doubt_touched.entry(rid).or_insert(0);
+            *touched = (*touched).max(c.touched_gen);
+        }
+        let keys = self.in_doubt_batches.entry(rid).or_default();
+        for key in &c.inbox_keys {
+            if !keys.contains(key) {
+                keys.push(*key);
+            }
+        }
+        self.evict_in_doubt();
+    }
+
     /// Keeps `in_doubt_rids` within `MAX_IN_DOUBT_RIDS`: the lowest rid goes,
     /// with what was remembered of it. An own rid evicted raises the
     /// watermark (ADR-47): every own rid at or below it is submitted with an
@@ -6213,6 +6246,14 @@ impl Core {
                 });
             }
             Origin::Replay { queue_seq, .. } => {
+                // A replay's submit leaves `in_doubt_rids` alone (only a
+                // client's resubmission removes the mark), and a client
+                // that joined it (`also_client`) leaves it in place too. So
+                // the mark is still the client's own while it has not come;
+                // a client that joined has just heard `InDoubt` and will
+                // resubmit again, even if the mark was evicted meanwhile.
+                let client_waits = c.also_client || self.in_doubt_rids.contains(&rid);
+                self.repark_replay(rid, &c, client_waits);
                 if c.also_client {
                     out.push(Action::Reply {
                         rid,
@@ -6414,6 +6455,13 @@ impl Core {
                 });
             }
             Origin::Replay { queue_seq, .. } => {
+                // Here a client that joined (`also_client`) hears the
+                // outcome below: no resubmission follows, nothing is parked.
+                // Otherwise the mark in `in_doubt_rids` (still there, see
+                // `finish_in_doubt`) says the client's own resubmission has
+                // yet to come.
+                let client_waits = !c.also_client && self.in_doubt_rids.contains(&rid);
+                self.repark_replay(rid, &c, client_waits);
                 if c.also_client {
                     if rid.node == self.cfg.node_id && rid.incarnation == self.cfg.incarnation {
                         self.acked.mark_done(rid.seq);

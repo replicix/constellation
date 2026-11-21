@@ -6741,6 +6741,23 @@ and a given-up op can be enqueued again under the same epoch); it only prunes
 the rids that cannot come back (neither a live op nor parked in doubt, since a
 resubmitted op returns with its parked keys).
 
+**Addendum (2026-11-21): a replay returns what it took.** An op answered in
+doubt parks its batch keys (`in_doubt_batches`) for the client's resubmission.
+The replay drain submits the same rid as `Origin::Replay` and takes the parked
+keys; a replay that then ended in doubt, or finished, before it tombstoned them
+parked nothing, so the client's later resubmission was keyless, not
+`inbox_ever` and `touched_gen` 0, and was forwarded over P2P while its batch
+was live. Under a live non-stealable designation of another node the root's
+drain of the batch journaled a refusal while the designee executed the op. A
+replay leaving `clients` now re-parks (`Core::repark_replay`) whenever a client
+resubmission can still come: the rid goes back into `in_doubt_rids`,
+`in_doubt_touched` is raised to the replay's `touched_gen`, the batches the
+replay still holds are merged into `in_doubt_batches[rid]` (an entry is always
+made, so the resubmission is `inbox_ever`), and the in-doubt cap applies. The
+op is live in exactly one place: the replay while it runs, then the parked
+record the resubmission inherits and tombstones before any forward. A client
+that joined the replay and heard the outcome gets nothing parked.
+
 **Rejected**: a holder that reads every requester's inbox once per tenure
 (fixes the seeds, but the extra reads shifted other configurations past their
 ceilings); trying P2P first whenever the holder's lease was re-claimed after the

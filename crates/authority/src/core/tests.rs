@@ -89351,6 +89351,132 @@ mod late_landing_inbox {
         );
         assert_eq!(tombstoned_keys(&out), vec![key], "{out:?}");
     }
+
+    /// The client's op answered in doubt with its batch parked, then the
+    /// rid's replay submitted (it takes the parked keys). Returns the
+    /// harness, the rid and the batch key.
+    fn replay_holding_the_parked_batch() -> (Harness, Rid, InboxKey) {
+        let (mut h, rid) = waiting_inbox_op();
+        let key = InboxKey {
+            epoch: 1,
+            node: 1,
+            n: 0,
+        };
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert_eq!(h.core.in_doubt_batches.get(&rid), Some(&vec![key]));
+        h.core.lease.cached_holder = None;
+        let op = h.create("a");
+        let mut out = Vec::new();
+        h.core.submit(
+            h.clk(),
+            rid,
+            op,
+            Policy::Client,
+            Default::default(),
+            crate::core::client::Origin::Replay {
+                queue_seq: 1,
+                deps: Default::default(),
+            },
+            &h.meta,
+            &mut out,
+        );
+        assert!(h.core.clients.contains_key(&rid));
+        assert!(!h.core.in_doubt_batches.contains_key(&rid), "taken");
+        (h, rid, key)
+    }
+
+    fn accepted() -> MutateOutcome {
+        MutateOutcome::Accepted {
+            epoch: 2,
+            records: Vec::new(),
+        }
+    }
+
+    /// A replay that finishes (not in doubt) while the client has not
+    /// resubmitted gives the batches it still holds back to the client's
+    /// record: the resubmission finds the rid done or tombstones them.
+    #[test]
+    fn a_replay_that_finishes_gives_a_waiting_client_its_batch_back() {
+        let (mut h, rid, key) = replay_holding_the_parked_batch();
+        let mut out = Vec::new();
+        h.core.finish(h.clk(), rid, accepted(), &h.meta, &mut out);
+        assert!(!h.core.clients.contains_key(&rid));
+        assert!(h.core.in_doubt_rids.contains(&rid));
+        assert_eq!(h.core.in_doubt_batches.get(&rid), Some(&vec![key]));
+    }
+
+    /// A client that resubmitted under the replay hears its answer: nothing
+    /// is parked for a resubmission that cannot come.
+    #[test]
+    fn a_replay_that_answers_its_client_parks_no_batch() {
+        let (mut h, rid, _key) = replay_holding_the_parked_batch();
+        let _ = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        assert!(h.core.clients.get(&rid).unwrap().also_client);
+        let mut out = Vec::new();
+        h.core.finish_as(
+            h.clk(),
+            rid,
+            accepted(),
+            crate::AnswerSource::None,
+            &h.meta,
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|a| matches!(a, Action::Reply { .. })),
+            "the client hears it: {out:?}"
+        );
+        assert!(!h.core.clients.contains_key(&rid));
+        assert!(
+            !h.core.in_doubt_batches.contains_key(&rid),
+            "stale entry for an answered client"
+        );
+        assert!(!h.core.in_doubt_touched.contains_key(&rid));
+    }
+
+    /// A replay that held no batch any more still leaves the (empty) entry:
+    /// the resubmission comes back inbox-ever, so no designee takes it
+    /// unfenced.
+    #[test]
+    fn a_replay_with_no_batch_left_still_marks_the_rid_inbox_ever() {
+        let (mut h, rid, _key) = replay_holding_the_parked_batch();
+        h.core.clients.get_mut(&rid).unwrap().inbox_keys.clear();
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert_eq!(h.core.in_doubt_batches.get(&rid), Some(&Vec::new()));
+        h.core.lease.cached_holder = Some(2);
+        link_to_holder_up(&mut h);
+        let _ = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("a"),
+            tag: Default::default(),
+        });
+        assert!(h.core.clients.get(&rid).is_some_and(|c| c.inbox_ever));
+    }
+
+    /// The re-park is bounded like every in-doubt mark: at the cap the
+    /// lowest rid goes with its batches, the replay's own rid included.
+    #[test]
+    fn a_replay_re_park_respects_the_in_doubt_cap() {
+        let (mut h, rid, _key) = replay_holding_the_parked_batch();
+        for seq in 2..=(crate::core::client::MAX_IN_DOUBT_RIDS as u64 + 1) {
+            h.core.in_doubt_rids.insert(h.rid(seq));
+        }
+        let mut out = Vec::new();
+        h.core.finish_in_doubt(h.clk(), rid, &h.meta, &mut out);
+        assert_eq!(
+            h.core.in_doubt_rids.len(),
+            crate::core::client::MAX_IN_DOUBT_RIDS
+        );
+        assert!(!h.core.in_doubt_rids.contains(&rid), "lowest rid evicted");
+        assert!(!h.core.in_doubt_batches.contains_key(&rid));
+    }
 }
 
 /// Late-landing S2: an unacknowledged or foreign stranded row only settles
