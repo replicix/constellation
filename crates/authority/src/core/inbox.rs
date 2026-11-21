@@ -234,6 +234,13 @@ pub(crate) struct InboxState {
     // ---- reachability (round 3a) ----
     /// Per holder, when its P2P path first failed since it last answered.
     down_since: BTreeMap<NodeId, WaitMs>,
+    /// The attempt the next batch PUT counts as: a failed PUT's retry
+    /// carries `attempt + 1` here (`inbox_retry`), since the batch it
+    /// retried is no longer `submitting` then (its result took it);
+    /// `inbox_kick` takes it. 0: a first attempt (and after
+    /// `SUBMIT_ATTEMPTS` failures the counter starts again at 1 for the
+    /// next batch).
+    next_attempt: u32,
 }
 
 /// The takeover drain's batches that wait for the holder tick (see
@@ -647,6 +654,9 @@ impl Core {
             return;
         }
         let Some(epoch) = self.inbox.queue.iter().map(|(_, e)| *e).max() else {
+            // Nothing left to retry (its ops were rerouted or settled): the
+            // count of the failed batch ends with it.
+            self.inbox.next_attempt = 0;
             return;
         };
         // Stale-epoch items: the holder changed under them.
@@ -745,7 +755,9 @@ impl Core {
             epoch,
             n,
             rids,
-            attempt: 1,
+            // A retry carries its count (`inbox_retry`); a new batch starts
+            // at 1 (the take leaves 0).
+            attempt: std::mem::take(&mut self.inbox.next_attempt).max(1),
         });
     }
 
@@ -888,10 +900,16 @@ impl Core {
         let delay = 200 * u64::from(attempt);
         let id = self.set_timer_wait(now.wait.plus(delay), Timer::InboxSubmitRetry, out);
         self.inbox.retry_timer = Some(id);
-        // The attempt count carries into the next PUT.
-        if let Some(sub) = self.inbox.submitting.as_mut() {
-            sub.attempt = attempt + 1;
-        }
+        // The attempt count carries into the next PUT. The failed batch was
+        // taken off `submitting` by its result, so the count waits in
+        // `next_attempt` until `inbox_kick` builds the next batch (written
+        // into `submitting` here it was lost: every retry counted as a
+        // first attempt, and `SUBMIT_ATTEMPTS` never sent the ops to the
+        // lease path while the PUT kept failing). Conflict retries count
+        // too, but only the other-failure branch checks the limit: a
+        // conflict is another writer's batch under the key, not an
+        // unavailable store.
+        self.inbox.next_attempt = attempt + 1;
     }
 
     fn arm_inbox_recheck(&mut self, now: Now, out: &mut Vec<Action>) {
