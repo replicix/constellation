@@ -93199,7 +93199,7 @@ mod root_own_sticky {
         activity(&mut h);
         h.advance(bound);
         h.hold(1, None);
-        activity(&mut h);
+        let out = activity(&mut h);
         assert_eq!(h.core.stats.root_own_released_unhonoured, 1);
         let st = &h.core.dl.mine[&d.gen];
         assert!(
@@ -93207,6 +93207,35 @@ mod root_own_sticky {
             "the release journaled no row: it waits for the drain"
         );
         assert!(st.parked.is_empty(), "the op stayed parked on the stream");
+        // Exactly once: the op left the stream's parks by one redirect
+        // (`answer_not_owner`: an own client op goes back to the ordinary
+        // route, here the lease path, which asks the store once), and
+        // further steps neither redirect nor answer it again.
+        assert_eq!(h.core.stats.deleg_not_owner, 1, "redirected not once");
+        let lease_gets = |out: &[Action]| {
+            out.iter()
+                .filter(|a| matches!(a, Action::S3 { req: S3Op::LeaseGet, .. }))
+                .count()
+        };
+        assert_eq!(lease_gets(&out), 1, "the op's route did not start once: {out:?}");
+        assert!(
+            h.core
+                .clients
+                .get(&a_rid)
+                .is_some_and(|c| matches!(c.phase, crate::core::client::Phase::WaitingLease)),
+            "the op is not on the ordinary route"
+        );
+        let mut later = Vec::new();
+        for _ in 0..3 {
+            later.extend(archive_and_step(&mut h));
+            h.advance(50);
+            later.extend(activity(&mut h));
+        }
+        assert_eq!(h.core.stats.deleg_not_owner, 1, "redirected again");
+        assert!(
+            replies(&out).iter().chain(replies(&later).iter()).all(|(r, _)| *r != a_rid),
+            "the parked op was answered by the stream's release"
+        );
     }
 
     /// A grant whose record row was not reported (`record == u64::MAX`) is

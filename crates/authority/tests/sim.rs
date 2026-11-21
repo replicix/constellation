@@ -2105,7 +2105,8 @@ fn far_root_writes_paused_config() -> SimConfig {
 /// rename on the same two names is answered by the stream. Without the
 /// control `AUTHORITY_SIM_OWN_STREAM_HONOURS_ON_RECORD=1` R-H (b) keeps that
 /// stream unhonoured until the row ships; with it, the deposition rolls the
-/// row back after the answer that saw it (`own_stream_observed_rolled_back`).
+/// row back after the answer that saw it (the oracle that names it is not on
+/// this main yet).
 fn far_root_writes_held_own_config() -> SimConfig {
     SimConfig {
         dirs: vec!["d1".into()],
@@ -3090,8 +3091,10 @@ fn a_claim_cut_that_gave_up_does_not_cut_a_later_claim() {
 /// parked (they wait for the honour) counted as in flight: the release and the
 /// ops waited for each other for good, and after the deposition every
 /// handover request met the same wait ("a client op was never answered").
-/// Seed 12 of the same label is the other half: the release then ends the
-/// stream locally, which the successor must be able to recall.
+/// Seed 12 of the same label passes on this main, but it is a weak guard: the
+/// shape it had with the first prototype (a deposed root's own-stream
+/// release or end that never shipped, spec-996 part B) is still open, and no
+/// commit fixed it.
 #[test]
 fn an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks_in_the_sim() {
     for seed in [1510u64, 12] {

@@ -71790,4 +71790,5 @@ other drain condition stays. `release_subtrees` hands each parked op of the give
 ADR-55 R-H notes it. Fail-before: core `an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks` (no release row, op still
 parked) and sim `an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks_in_the_sim` (seeds 1510 and 12). Premise check on
 main 0d157e56: 1510 still hangs; seed 12, which failed with the spec-1510 prototype (a deposed root's unshipped own-stream end), passes
-on main and with this fix, so the blocker the spec named is gone. Logs: see the job's README.
+on main and with this fix. That is not a fix of its shape: spec-996 part B (a deposed root's own-stream release or end that never
+shipped) is still open and no commit fixed it, so pinning seed 12 is a weak guard. Logs: see the job's README.

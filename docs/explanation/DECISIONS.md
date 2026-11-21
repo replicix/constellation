@@ -4845,7 +4845,11 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   executed under the stream, so those ops are not in flight, and counting them
   made the release (the drain, `sticky_release_progress`) and the ops wait for
   each other for good. They go to the root with the release, as any parked op
-  of a subtree the release gives up does.
+  of a subtree the release gives up does. When an own stream grows,
+  `note_own_grant_row` sets `honoured` false again, so ops parked on its
+  dependencies then go to the root with the release too: safe, because the
+  release still waits for `streamed >= idx` and `release_subtrees` starts the
+  read recalls.
   The ship plan keeps a stream's indexes contiguous in the log (M3): a held
   transaction of a stream holds every later one of it (oracle
   `stream_log_contiguous`).
