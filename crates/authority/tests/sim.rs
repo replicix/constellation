@@ -15420,6 +15420,8 @@ fn a_delegates_unparked_own_op_is_answered() {
 /// (S3 down, the tombstone failing) in the prototype.
 #[test]
 fn a_requester_reroutes_its_inbox_op_when_the_link_comes_back() {
+    /// The seeds that fail on the parent: they must reroute.
+    const REACH_SEEDS: [u64; 1] = [1923];
     let cfg = SimConfig {
         strict_unsettled: true,
         ..locks_blips_tight_delegated_config()
@@ -15438,6 +15440,13 @@ fn a_requester_reroutes_its_inbox_op_when_the_link_comes_back() {
             "seed {seed}: {:?}",
             r.unsettled_causes
         );
+        // The pin must reach the mechanism: the seeds that fail without the
+        // reroute rerouted at least one op (counters of the nodes' last
+        // incarnations).
+        if REACH_SEEDS.contains(&seed) {
+            let rerouted: u64 = r.stats.values().map(|s| s.inbox_rerouted_to_p2p).sum();
+            assert!(rerouted > 0, "seed {seed}: no op was rerouted to P2P");
+        }
     }
 }
 
