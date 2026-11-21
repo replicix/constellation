@@ -3212,12 +3212,11 @@ pub(crate) mod pending_upload_tests {
         use object_store::client::{HttpError, HttpErrorKind};
         use std::io::{Error as IoError, ErrorKind};
         let http = |kind| HttpError::new(kind, IoError::from(ErrorKind::Other));
-        let generic = |source: Box<dyn std::error::Error + Send + Sync>| {
-            object_store::Error::Generic {
+        let generic =
+            |source: Box<dyn std::error::Error + Send + Sync>| object_store::Error::Generic {
                 store: "test",
                 source,
-            }
-        };
+            };
         for kind in [
             HttpErrorKind::Connect,
             HttpErrorKind::Request,
