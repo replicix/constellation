@@ -3667,13 +3667,22 @@ the pinned write before it reads its head.
 root's lock cut was as of the delegate's own send time. Since plan 46 M1.2
 step 11 the cut is as of a moment of the root's clock that precedes the
 renewal, and no seed of 0 to 140 000 shows the held write inside the next
-holder's section any more; the three seeds that did stay pinned, clean, in
+holder's section through a renewal any more. A rowless release (the stream
+stopped, capped, rebooted or lost its dependency) reports a cut of its own,
+which did not wait for the pinned write either; since
+`Core::release_subtrees` settles first (`SimConfig::settle_tagged_writes_at_release`
+turns that on alone in the settle-off labels), seeds 1961, 2777 and 2994 of
+`-unsettled` fail without it and pass with it
+(`locks_writer_hold_delegated_unsettled_is_clean_with_the_settle_at_release`;
+core pin `a_rowless_release_cuts_after_a_pinned_write_once_its_window_is_over`).
+The three seeds that stayed pinned, clean, after step 11 are in
 `locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cut`
 (they fail again with the cut taken from the delegate's clock). `locks-writer-hold-delegated-doubt` has the
 client give up on the held write (in doubt), so the recalled grant takes
 the doubt lapse (`locks_writer_hold_delegated_doubt_lapses_the_grant`).
-Its released twin cannot fail here, because a pinned commit ends at the
-node's next store write. The release decision is pinned in core tests.
+Its released twin cannot fail here through a row release, because a pinned
+commit ends at the node's next store write; a rowless release has no row to
+order it, and is covered by the settle above. The release decision is pinned in core tests.
 `locks-core-stall-backup-long-beats` and its neighbours (plan 41 D3,
 `a_backed_lock_root_stuck_in_a_step_keeps_its_own_grants`,
 `a_probe_that_ignores_what_it_reads_is_caught`): the lease holder of a backed
