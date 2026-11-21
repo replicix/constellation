@@ -4841,6 +4841,11 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   (`root_own_released_unhonoured`); the quarantine keeps the placement from
   granting it again at once. Measured: `root_own_honour_wait_ms_max`. After the
   first honour an own op is answered at local speed whatever the load on `/`.
+  The unhonoured release does not wait for the ops its honour parks: nothing
+  executed under the stream, so those ops are not in flight, and counting them
+  made the release (the drain, `sticky_release_progress`) and the ops wait for
+  each other for good. They go to the root with the release, as any parked op
+  of a subtree the release gives up does.
   The ship plan keeps a stream's indexes contiguous in the log (M3): a held
   transaction of a stream holds every later one of it (oracle
   `stream_log_contiguous`).

@@ -71779,3 +71779,15 @@ Dfix round 3: `stress-ng-fs-faults` stays in `KNOWN_BUG_REPROS`, not promoted: 1
 - **Promotion** (erofsfix): `stress-ng-fs-faults` passed 20 of 20 loaded (`stress-ng --cpu 24 --io 2` alongside) and 10 of 10 idle runs with defaults. In every `mount.log` the only `released the lease` is the graceful unmount's, and no epoch line shows `carrier=None` after the first acquisition. It moves from `KNOWN_BUG_REPROS` to `SCENARIOS`; its parity entries return.
 
 **keyfix (a replay took the client's parked inbox batch).** A client op answered in doubt parks its inbox batch keys for its own resubmission; the replay drain's submit of the same rid removed them, and a replay that ended in doubt or finished before tombstoning them parked nothing, so the resubmission was keyless, not `inbox_ever`, `touched_gen` 0, and was forwarded over P2P with its batch live (a designee under a live designation executes it while the root's drain journals a refusal: two outcomes for one rid). `Core::repark_replay` (called in the Replay arms of `finish_in_doubt` and `finish`) re-adds the rid to `in_doubt_rids`, raises `in_doubt_touched`, merges the replay's remaining keys into `in_doubt_batches` (entry always made) and applies the cap; a client that joined the replay and heard the answer gets nothing. ADR-68 addendum. Pins in `late_landing_inbox`: `a_replay_in_doubt_does_not_take_the_clients_parked_batch_away` (fails on main), `a_replay_that_finishes_gives_a_waiting_client_its_batch_back`, `a_replay_that_answers_its_client_parks_no_batch`, `a_replay_with_no_batch_left_still_marks_the_rid_inbox_ever`, `a_replay_re_park_respects_the_in_doubt_cap`.
+
+**fix1510 (an unhonoured own release waited for the ops its honour parks).** `far-root-writes-held-own` seed 1510 (the m13s9 workload,
+added here unchanged as `far_root_writes_held_own_config`) never answered a client op. Node 1, the root, granted itself `d1` at 2.9 s and was
+cut off at 3 s; R-H kept the stream unhonoured behind an unshipped root row of its keys, and after `own_first_op_wait` the grant was
+released unhonoured. `sticky_release_progress` counted the ops that unhonoured stream had parked as in flight (`busy`); they wait for the
+honour, the release waited for them, and after the deposition every handover request hit the same wait while root 3 answered `NotHolder`
+to every op under `d1`. Fix: an own stream that is not honoured has executed nothing, its parked ops do not make the release busy; every
+other drain condition stays. `release_subtrees` hands each parked op of the given-up subtrees to the root once (`answer_not_owner`).
+ADR-55 R-H notes it. Fail-before: core `an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks` (no release row, op still
+parked) and sim `an_unhonoured_own_release_does_not_wait_for_the_ops_its_honour_parks_in_the_sim` (seeds 1510 and 12). Premise check on
+main 0d157e56: 1510 still hangs; seed 12, which failed with the spec-1510 prototype (a deposed root's unshipped own-stream end), passes
+on main and with this fix, so the blocker the spec named is gone. Logs: see the job's README.
