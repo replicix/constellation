@@ -3016,9 +3016,10 @@ impl Core {
         // lock holders with `EIO` all the same.
         //
         // Nor does it go when it is this node's own pre-cut lease (the
-        // close let it go, the flush re-claimed it) and nobody wants it:
-        // a node that gave it away held none when the next cut formed its
-        // epoch, and every write in an epoch carrying no lease is refused
+        // close let it go, the flush re-claimed it) and nobody wants it, or
+        // when this node is the only write-eligible one (the acquisition
+        // and its release would repeat at every cut): a node that gave it
+        // away held none when the next cut formed its epoch, and every write in an epoch carrying no lease is refused
         // `EROFS` until S3 returns (`stress-ng-fs-faults`: the canary
         // create after the last grant ended). Afterwards the ordinary
         // rules apply: an idle release, a handoff to a wanter, the release
@@ -3048,9 +3049,16 @@ impl Core {
         });
         let nobody_wants = self.lease.wanted.is_empty() && !self.lease.release_when_idle;
         let keep_own = self.lease.resumed_tenure && nobody_wants;
+        // A complete roster read listing only this node: nobody else can
+        // write, so there is no one to hand the lease to. An unread or
+        // partial roster counts as having peers.
+        let sole_writer = nobody_wants
+            && !self.roster.peers_unknown()
+            && self.roster.write_eligible() == [self.cfg.node_id];
         if flushed
             && (replica.locks().live_grants_len(now.wait) > 0
                 || keep_own
+                || sole_writer
                 || self.in_takeover_floor(now)
                 || fast_gate
                 || foreign_takeover)
