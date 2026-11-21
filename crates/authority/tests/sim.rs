@@ -7380,14 +7380,18 @@ fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
 /// the tree without the wait on the `EIO` count of each seed. (Seed 1045 is
 /// not on this path: its re-read succeeded and found the release landed.)
 ///
-/// The inbox reroute on link-up (ADR-68) and the review fixes of the inbox
-/// PUT retry (the attempt count kept while a retry is armed, the ambiguous
-/// PUT's key rule) moved the schedules: 64, 391 and 471 no longer reach an
-/// unresolved release (an `+unsettled` replay of seed 1477 passes in release
-/// on main and here; its debug run fails on both, unrelated). The finder
-/// over seeds 0..4,399 gives 724, 1452, 2452, 2777, 3002, 3568 (no renewal)
-/// and 4012; the pin runs 724, 1452 and 2452, each with an unresolved release,
-/// a renewal and no unsettled `EIO` left.
+/// ADR-67 (an epoch's flush keeps the lease it re-claimed when nobody wants
+/// it): the release CAS that seeds 64, 391 and 1477 timed out on was the
+/// epoch flush's own, which no longer happens in a cut, so those seeds stopped
+/// reaching an unresolved release (0 of 3). The pin now runs seeds 1118, 1519
+/// and 1934, the first of seeds 0..4,400 whose release in doubt reaches the
+/// wait and has a renewal lift the fence, with no unsettled `EIO` left. They
+/// were chosen by reaching the path, not by failing on a tree without the
+/// wait: the original seeds were that evidence, on the tree before the flush
+/// kept its lease. The inbox reroute on link-up (ADR-68) moved the schedules
+/// again: 1118, 1519 and 1934 no longer reach an unresolved release; of seeds
+/// 0..4,399 the finder gives 724, 1452, 2452, 2777, 3002 and 4012 (each with a
+/// renewal), and the pin runs 724, 1452 and 2452.
 #[test]
 fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
     let mut renewals = 0;
@@ -7446,11 +7450,20 @@ fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
 /// (264 of 1,500). The node now stays fenced on a peer's read, and on its own
 /// re-read until a renewal CAS of its own lands (the new version kills the late
 /// PUT): none of 1,500 seeds fails.
+///
+/// ADR-67 (an epoch's flush keeps the lease it re-claimed when nobody wants
+/// it): the release in doubt of seeds 3, 4, 5, 7 and 16 was the epoch flush's
+/// own, which no longer happens in a cut, so they stopped reaching one (the
+/// pin's own guard failed). It now runs seeds 9, 11, 13, 26 and 42, five of
+/// seeds 0..60 with a release in doubt that waited and had a renewal; the
+/// sim's invariants (I1, two authorities) still judge each. They were chosen
+/// by reaching the path; the failing seeds above are the evidence on the tree
+/// before the flush kept its lease.
 #[test]
 fn regression_a_late_applied_release_makes_no_second_authority() {
     let mut waited = 0;
     let mut renewed = 0;
-    for seed in [3, 4, 5, 7, 16] {
+    for seed in [9, 11, 13, 26, 42] {
         let r = run_seed(seed, late_release(flex_tight_config())).unwrap_or_else(|e| {
             panic!(
                 "seed {seed}: {e}\n  replay with \
@@ -21741,10 +21754,12 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     // root 3 reachable for the last 1.2 s of the window, is the pin.)
     // (The release record's off-core write, answered 0-25 ms later in the
     // simulation, settled seed 2's EIO. Seed 53, two such EIOs with root
-    // idle, was the first of seeds 0..299 that tells one, and the pin.)
-    // (The inbox PUT retry's review fixes moved the schedule: seed 53 tells
-    // none now. The seeds of 0..299 that tell one are 201, 232, 259 and 294;
-    // 294, root idle, the lease path reachable, is the pin.)
+    // idle, is the first of seeds 0..299 that tells one, and the pin.)
+    // (ADR-67, an epoch's flush keeps the lease it re-claims when nobody
+    // wants it: seed 53's two EIOs came with the flush's release, which no
+    // longer happens, and it tells none now. The seeds of 0..299 that tell
+    // one are 151, 232 and 294; 294, root idle, the lease path reachable,
+    // is the pin.)
     let cfg = flex_tight_config;
     let seed = 294;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
