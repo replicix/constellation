@@ -4215,6 +4215,18 @@ fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
             }),
         );
         h.core.lease.prev_holder = foreign.then_some(2);
+        // The gate is the only thing under test: a peer on the roster, the
+        // lease a re-claimed pre-cut one (the kind an epoch's flush keeps
+        // unless somebody wants it), and node 2 asking for it. Case
+        // (false, false, false) therefore releases because a peer wants
+        // the lease, as the epoch's re-claim gate always did
+        // (`locks-blips-tight-faults` seed 5379), not because the flush
+        // releases whatever it holds: a re-claimed lease nobody wants, or
+        // a sole writer's, is kept (see
+        // `an_epoch_flush_keeps_its_own_reclaimed_tenure_nobody_wants`).
+        peers_on_roster(&mut h, true);
+        h.core.lease.resumed_tenure = true;
+        h.core.lease.wanted = vec![2];
         h.step(Event::Control {
             op: OpId(1 << 40),
             req: Control::Epoch {
@@ -4237,6 +4249,118 @@ fn an_epoch_flush_holds_for_a_fast_or_foreign_takeovers_gate_only() {
             "the epoch's flush release with a gate pending (fast takeover: {fast}, foreign: {foreign}, tail: {tail})"
         );
     }
+}
+
+/// An epoch's flush keeps what it re-claimed: the lease it takes back is
+/// this node's own pre-cut lease, and with no grant live and nobody asking
+/// for it, releasing it only left the next cut's epoch without a lease,
+/// every write in it refused `EROFS` (`stress-ng-fs-faults`). A peer that
+/// asks for it (`wanted`) gets it as before, and so does an ordinary
+/// acquisition's flush with a peer on the roster.
+#[test]
+fn an_epoch_flush_keeps_its_own_reclaimed_tenure_nobody_wants() {
+    let flush_round = |h: &mut Harness| {
+        h.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: false,
+                active: false,
+                frozen: false,
+                flushing: true,
+                base: 0,
+                members: vec![1, 2],
+                carrier: None,
+                stale_below: 1,
+            },
+        });
+        let mut out = Vec::new();
+        h.core.round_release(h.clk(), &h.meta, &mut out);
+        out
+    };
+    // Nobody wants it: kept, the flush reported done.
+    let mut h = Harness::new(1);
+    peers_on_roster(&mut h, true);
+    h.hold(1, None);
+    h.core.lease.resumed_tenure = true;
+    let out = flush_round(&mut h);
+    assert!(
+        !h.core.lease.releasing,
+        "released its own re-claimed lease nobody wanted"
+    );
+    assert!(h.core.lease.held.is_some());
+    assert!(
+        out.iter().any(|a| matches!(a, Action::EpochFlushed)),
+        "the flush was not reported done: {out:?}"
+    );
+    // A peer wants it: released as before.
+    let mut h = Harness::new(1);
+    peers_on_roster(&mut h, true);
+    h.hold(1, None);
+    h.core.lease.resumed_tenure = true;
+    h.core.lease.wanted = vec![2];
+    flush_round(&mut h);
+    assert!(h.core.lease.releasing, "kept a lease a peer asked for");
+    // Not this node's own pre-cut lease, a peer on the roster: released.
+    let mut h = Harness::new(1);
+    peers_on_roster(&mut h, true);
+    h.hold(1, None);
+    assert!(!h.core.lease.resumed_tenure);
+    flush_round(&mut h);
+    assert!(
+        h.core.lease.releasing,
+        "kept a lease that was not this node's re-claimed one"
+    );
+}
+
+/// A sole write-eligible node keeps its lease through an epoch's flush: no
+/// other node can write, so releasing it only gives the next cut an epoch
+/// without a lease. Only on a complete roster read: unknown peers count as
+/// peers. A node that joined unseen asks for the lease (`wanted`) and gets
+/// the ordinary handoff.
+#[test]
+fn an_epoch_flush_keeps_a_sole_writers_lease() {
+    let flush_round = |h: &mut Harness| {
+        h.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: false,
+                active: false,
+                frozen: false,
+                flushing: true,
+                base: 0,
+                members: vec![1, 2],
+                carrier: None,
+                stale_below: 1,
+            },
+        });
+        let mut out = Vec::new();
+        h.core.round_release(h.clk(), &h.meta, &mut out);
+        out
+    };
+    // Sole writer (not a re-claimed lease): kept.
+    let mut h = Harness::new(1);
+    peers_on_roster(&mut h, false);
+    h.hold(1, None);
+    assert!(!h.core.lease.resumed_tenure);
+    let out = flush_round(&mut h);
+    assert!(!h.core.lease.releasing, "a sole writer gave its lease away");
+    assert!(out.iter().any(|a| matches!(a, Action::EpochFlushed)));
+    // A peer asks for it: handed over.
+    let mut h = Harness::new(1);
+    peers_on_roster(&mut h, false);
+    h.hold(1, None);
+    h.core.lease.wanted = vec![2];
+    flush_round(&mut h);
+    assert!(h.core.lease.releasing, "kept a lease a peer asked for");
+    // The roster is not known complete: peers are assumed, released.
+    let mut h = Harness::new(1);
+    peers_on_roster(&mut h, false);
+    h.core.roster.forget_reads_for_test();
+    h.core.roster.mark_peers_seen_for_test(false);
+    assert!(h.core.roster.peers_unknown());
+    h.hold(1, None);
+    flush_round(&mut h);
+    assert!(h.core.lease.releasing, "kept a lease on an unknown roster");
 }
 
 /// A journal that cannot be read is not a drained one: the idle release and
@@ -4290,6 +4414,8 @@ fn a_journal_read_error_does_not_release_an_idle_holder() {
 #[test]
 fn a_journal_read_error_does_not_release_a_flushing_epoch() {
     let mut h = Harness::new(1);
+    // A peer on the roster, so that the flush would release.
+    peers_on_roster(&mut h, true);
     h.hold(1, None);
     h.step(Event::Control {
         op: OpId(1 << 40),
@@ -23083,6 +23209,10 @@ mod locks {
     #[test]
     fn a_round_release_after_recalls_fails_closed_on_a_journal_read_error() {
         let mut h = Harness::new(1);
+        // The release under test is the flush's own: a peer on the roster
+        // (a sole writer's flush keeps its lease), an ordinary acquisition
+        // (not a re-claimed pre-cut lease).
+        peers_on_roster(&mut h, true);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
         h.hold(1, None);
@@ -33840,8 +33970,9 @@ mod locks {
     #[test]
     fn lock_grants_kept_at_an_epoch_close_go_if_another_tenure_intervened() {
         let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
-        // The close, as the driver reports it once S3 is back (flushed:
-        // a flushing node would release the lease it acquires below).
+        // The close, as the driver reports it once S3 is back (not
+        // flushing: this test is about the grants; what a flush does with
+        // the lease it re-claims is pinned elsewhere).
         h.step(epoch_report(
             false,
             false,
