@@ -1308,8 +1308,12 @@ peer directory, or an outage to it longer than
 CAS-creates batches `inbox/<epoch>/<node>/<n>`, the holder polls each
 such requester with an adaptive backoff (and never one it is P2P-connected
 to), and outcomes ride the log (`Completed`, `Refused`, `InboxAck`). An op
-waiting in the inbox is re-sent over P2P by the same rid as soon as the
-holder is reachable again. Sustained demand (8 inbox ops, or 1.5 s of
+waiting in the inbox, or queued for it, is re-sent over P2P by the same rid
+as soon as the link to the holder is up, from the lease read last seen (no S3
+access needed): its batches are tombstoned first, and a tombstone that fails
+leaves the op waiting on its batch
+([ADR-68](DECISIONS.md#adr-68-an-inbox-op-is-rerouted-to-p2p-when-the-link-to-the-holder-is-up)).
+Sustained demand (8 inbox ops, or 1.5 s of
 waiting, within 10 s) escalates to a lease request: a create storm still
 moves the lease, a sporadic write does not. Locks and strict ReadIndex
 never go through the inbox

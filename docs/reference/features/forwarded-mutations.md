@@ -769,7 +769,12 @@ stays in `wanted_by` until the escalation ends. Before an op that went into the 
 forwarded over a P2P path that came back (or held back because a
 dependency was lost), the requester withdraws its own batch, so the op
 is not executed through both paths out of order; the rid dedups either
-way. It withdraws by overwriting the batch with a **tombstone** (the
+way. The requester does this as soon as the link to the holder is up (from
+the lease read it last saw, so it needs no S3 read), for an op queued for the
+submitter as well as one durable in a batch; a queued op whose batch PUT failed
+stays queued, and a tombstone that fails forwards nothing: the op waits on its
+batch again ([ADR-68](../../explanation/DECISIONS.md#adr-68-an-inbox-op-is-rerouted-to-p2p-when-the-link-to-the-holder-is-up)).
+It withdraws by overwriting the batch with a **tombstone** (the
 same key, no ops; one plain PUT), never by DELETE: a deleted key was a
 hole in the numbering, and a holder that had not read it GET-nexted it
 forever while every later batch of that requester in the epoch waited

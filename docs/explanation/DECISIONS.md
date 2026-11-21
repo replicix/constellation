@@ -6643,3 +6643,54 @@ it lacks, or answer before the upload as `back` does); the unbounded retry for
 See: `crates/engine/src/fsync_wait.rs`, `crates/engine/src/view/durable.rs`
 (`close_run`, `close_publication`), `crates/engine/src/view/ops.rs` (`flush`),
 `crates/frontend-fuse/src/adapter.rs`.
+
+## ADR-68: An inbox op is rerouted to P2P when the link to the holder is up
+
+**Status**: decided on 2026-11-21, after the
+`locks-blips-tight-delegated+unsettled` floor seeds (63, 404, 1505, 1818, 1923)
+were traced to one requester-side cause. A refinement of the rule ADR-24 and
+the forwarded-mutations reference already state ("an op waiting in the inbox is
+re-sent over P2P once the holder is reachable again"), made true for the cases
+where it was not.
+
+**Context**: after the holder restarts, the requester's `reaches(holder)` still
+carries the outage verdict (the link is not `connected` yet), so the op, often a
+settle, goes to the holder's S3 inbox. The holder polls only the inboxes of
+requesters it sees as not connected and has already dialled this one: it never
+reads the batch. The requester's own way out, the 300 ms inbox recheck, needs an
+S3 lease read, which it cannot make while its S3 path is down, and an op still
+queued for the submitter was never rerouted at all. The op ended `EIO` at its
+settle deadline. Separately the submit attempt counter never advanced
+(`inbox_kick` always built attempt 1), so a failing batch PUT was retried every
+200 ms for ever and never reached the lease path after six attempts.
+
+**Decision**: `Core::inbox_reroute_if_linked` runs when the peer links change
+and after every batch PUT. With the inbox and forwarding on, ops waiting, the
+holder named by the last lease read another node whose lease is not claimable,
+its link connected and `reaches` true, it forwards over P2P: every durable op
+waiting under that epoch, and every queued op of the epoch that was never put
+in a batch. The batch PUT in flight is never touched while it is outstanding,
+and a queued op whose PUT failed (its key kept, the batch possibly landed) stays
+queued: withdrawing it needs the S3 path that just failed. The forward is the
+existing `send_forward`, which writes a tombstone for every batch the rid was
+put in before the forward leaves and forwards only after all of them succeeded.
+A tombstone that fails forwards nothing and returns the op to waiting on its
+batch (`InboxState::rerouting`), not to the lease path, which a node without S3
+cannot take; if that tombstone had landed after all, the inbox deadline (lease
+path, resolved by rid) or the settle resolves the op. The submit attempt count
+is carried across the retry (`InboxState::next_attempt`).
+
+**Why it executes once**: every batch the rid was in is tombstoned before any
+forward; a drain that reads a tombstone runs nothing; a holder that ran the
+batch before the tombstone answers the later forward from `completed` by rid;
+stale bytes are not run (`inbox_read_fresh`); ADR-47's `touched_gen` stops a
+designee/root split; co-batched ops are re-submitted and the holder dedups by
+rid. The op is live in exactly one place at any time.
+
+**Rejected**: a holder that reads every requester's inbox once per tenure
+(fixes the seeds, but the extra reads shifted other configurations past their
+ceilings); trying P2P first whenever the holder's lease was re-claimed after the
+outage began (not needed once the reroute exists).
+
+See: `crates/authority/src/core/inbox.rs` (`inbox_reroute_if_linked`,
+`on_inbox_withdrawn`, `inbox_retry`).
