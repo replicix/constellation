@@ -1939,7 +1939,9 @@ superseded chunk version, and an `fsync` drained all of them (thousands of
 rows, minutes). A PUT that fails with a connection-level error now leaves the
 target alone; timeouts, 5xx and 429 still back off. The earlier suspicion
 that the sync task answers no `DrainInode` was wrong: it answers them while
-the drain runs.
+the drain runs. The scenario also reproduced the frozen-epoch lock-drop bug
+(`EROFS` on the canary create), still open and not seen in the 30 promotion
+runs; a future failure with that signature is that bug.
 
 Reproducing these needed two things no scenario had before:
 

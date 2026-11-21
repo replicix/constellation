@@ -2578,7 +2578,9 @@ pub const CAMPAIGN: &[Scenario] = &[
 /// target no longer sat at 2-8 between 1.5 s cuts and a file rewritten
 /// meanwhile no longer piled up pending rows for an `fsync` to drain for
 /// minutes (the stall that failed about one run in thirty). It is in
-/// `SCENARIOS`.
+/// `SCENARIOS`. It also reproduced the frozen-epoch lock-drop bug (`EROFS`
+/// on the canary create), still open and not seen in the 30 promotion runs:
+/// a future failure with that signature is that bug.
 pub const KNOWN_BUG_REPROS: &[Scenario] = &[
     Scenario {
         name: "stress-ng-fs-nodes",
