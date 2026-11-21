@@ -15303,6 +15303,57 @@ fn locks_blips_tight_single_config() -> SimConfig {
     }
 }
 
+/// `stress-ng-fs-faults` (EROFS on the canary create): a lone node whose
+/// lease went through an S3 cut (the epoch carried it) re-claims it at the
+/// close, flushes, and then released it (no lock grants live, nobody
+/// wanting it). The next cut formed an epoch carrying no lease, and every
+/// write in it was refused `EROFS` until S3 came back. No locks here, no
+/// reboots, no clock faults: nothing else leaves the node without its lease.
+fn blips_single_idle_config() -> SimConfig {
+    let faults = (0..6)
+        .map(|i| ScheduledFault {
+            at_ms: 700 + i * 4_000,
+            kind: FaultKind::EpochOutage {
+                members: 1,
+                for_ms: 1_500,
+            },
+        })
+        .collect();
+    SimConfig {
+        nodes: 1,
+        clients_per_node: 2,
+        ops_per_client: 24,
+        names: 4,
+        random_faults: 0,
+        clock_faults: false,
+        lock_files: 0,
+        lock_ratio: 0.0,
+        idle_gaps: true,
+        faults,
+        ..SimConfig::default()
+    }
+}
+
+#[test]
+fn a_lone_node_keeps_its_lease_through_an_epoch_flush() {
+    let mut erofs = 0;
+    let mut returned = 0;
+    for seed in 0..40 {
+        let report = run_seed(seed, blips_single_idle_config())
+            .unwrap_or_else(|e| panic!("blips-single-idle seed {seed}: {e}"));
+        if report.erofs_returned > 0 {
+            eprintln!(
+                "blips-single-idle seed {seed}: {} EROFS",
+                report.erofs_returned
+            );
+        }
+        erofs += report.erofs_returned;
+        returned += report.ops_returned;
+    }
+    eprintln!("blips-single-idle: {erofs} EROFS of {returned} returned");
+    assert_eq!(erofs, 0, "a lone node refused writes EROFS in an S3 cut");
+}
+
 /// The M1.2 exit sweep: 267 of 2,000 seeds failed "history is not
 /// linearizable", the product unchanged since before M1.2. A lone node that
 /// reboots inside an S3 cut forms an epoch that carries no lease and answers
