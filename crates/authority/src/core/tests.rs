@@ -88870,6 +88870,9 @@ mod late_landing_inbox {
         // `a` is answered in doubt.
         let keys = h.core.clients.remove(&first).unwrap().inbox_keys;
         assert_eq!(keys, vec![key]);
+        // What the real in-doubt finish does besides parking the keys: the
+        // op leaves the inbox queue, so only the prune rule is under test.
+        h.core.inbox_forget(first);
         h.core.in_doubt_rids.insert(first);
         h.core.in_doubt_batches.insert(first, keys);
         // Another op `c` joins the retries at the same number and gives up.
