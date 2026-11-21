@@ -1,5 +1,6 @@
 //! Adaptive sequential readahead (DESIGN.md §7).
 
+use crate::congestion::is_congestion;
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::SparseChunks;
 use constellation_fs_core::Ino;
@@ -269,7 +270,18 @@ impl Scheduler {
             .store(target as u64, Ordering::Relaxed);
     }
 
-    fn record_error(&self) {
+    /// A failed fetch: backs the readahead off only when the store looks
+    /// overloaded (`is_congestion`, as for uploads). An S3 that could not be
+    /// reached says nothing about the right concurrency, and halving the
+    /// target on every cut left readahead slow after the store came back.
+    fn record_failure(&self, error: &(dyn std::error::Error + 'static)) {
+        if !is_congestion(error) {
+            tracing::debug!(
+                concurrency = self.gate.target(),
+                "S3 unreachable; readahead concurrency kept"
+            );
+            return;
+        }
         let Some(controller) = &self.controller else {
             return;
         };
@@ -346,7 +358,7 @@ impl Scheduler {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        scheduler.record_error();
+                        scheduler.record_failure(error.as_ref());
                         tracing::debug!(
                             chunk = %hash.to_hex(),
                             %error,
@@ -736,6 +748,59 @@ mod tests {
             }),
             wake: tokio::sync::Notify::new(),
         })
+    }
+
+    fn adaptive_scheduler(cache: Arc<DiskCache>) -> Arc<Scheduler> {
+        let mut scheduler = Arc::try_unwrap(scheduler(cache)).ok().unwrap();
+        scheduler.gate = Arc::new(ConcurrencyGate::new(8));
+        scheduler.controller = Some(Mutex::new(AdaptiveConcurrency::with_intervals(
+            8,
+            1,
+            16,
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+        )));
+        Arc::new(scheduler)
+    }
+
+    fn store_error(kind: object_store::client::HttpErrorKind) -> anyhow::Error {
+        let http = object_store::client::HttpError::new(
+            kind,
+            std::io::Error::from(std::io::ErrorKind::Other),
+        );
+        anyhow::Error::from(constellation_store_s3::StoreError::from(
+            object_store::Error::Generic {
+                store: "test",
+                source: Box::new(http),
+            },
+        ))
+    }
+
+    /// A fetch that failed because S3 was unreachable said nothing about
+    /// congestion: it must not lower the readahead target (as for uploads).
+    #[test]
+    fn an_s3_cut_does_not_back_off_readahead() {
+        use object_store::client::HttpErrorKind;
+        let dir = TempDir::new().unwrap();
+        let scheduler = adaptive_scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap()));
+        for kind in [
+            HttpErrorKind::Connect,
+            HttpErrorKind::Request,
+            HttpErrorKind::Interrupted,
+        ] {
+            scheduler.record_failure(store_error(kind).as_ref());
+            assert_eq!(scheduler.gate.target(), 8, "{kind:?}");
+        }
+    }
+
+    /// Control: a fetch that timed out still backs readahead off.
+    #[test]
+    fn an_overloaded_store_still_backs_off_readahead() {
+        let dir = TempDir::new().unwrap();
+        let scheduler = adaptive_scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap()));
+        scheduler
+            .record_failure(store_error(object_store::client::HttpErrorKind::Timeout).as_ref());
+        assert_eq!(scheduler.gate.target(), 4, "a timeout is congestion");
     }
 
     #[test]
