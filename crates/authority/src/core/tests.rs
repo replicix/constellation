@@ -93214,10 +93214,22 @@ mod root_own_sticky {
         assert_eq!(h.core.stats.deleg_not_owner, 1, "redirected not once");
         let lease_gets = |out: &[Action]| {
             out.iter()
-                .filter(|a| matches!(a, Action::S3 { req: S3Op::LeaseGet, .. }))
+                .filter(|a| {
+                    matches!(
+                        a,
+                        Action::S3 {
+                            req: S3Op::LeaseGet,
+                            ..
+                        }
+                    )
+                })
                 .count()
         };
-        assert_eq!(lease_gets(&out), 1, "the op's route did not start once: {out:?}");
+        assert_eq!(
+            lease_gets(&out),
+            1,
+            "the op's route did not start once: {out:?}"
+        );
         assert!(
             h.core
                 .clients
@@ -93233,7 +93245,10 @@ mod root_own_sticky {
         }
         assert_eq!(h.core.stats.deleg_not_owner, 1, "redirected again");
         assert!(
-            replies(&out).iter().chain(replies(&later).iter()).all(|(r, _)| *r != a_rid),
+            replies(&out)
+                .iter()
+                .chain(replies(&later).iter())
+                .all(|(r, _)| *r != a_rid),
             "the parked op was answered by the stream's release"
         );
     }
