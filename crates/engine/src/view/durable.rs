@@ -164,6 +164,22 @@ impl Drop for Closing<'_> {
     }
 }
 
+/// What a write-through close holds until its commit is answered: the
+/// turn's publication guard and the caller's fencing scope (none on the
+/// inline close, which keeps its scope through its bounded drain).
+pub(super) struct CommitGuards {
+    pub(super) publishing: Option<crate::locks::Publishing>,
+    pub(super) scope: Option<crate::locks::TagScope>,
+}
+
+impl CommitGuards {
+    /// Ends both: the drain after the commit carries no token.
+    fn end(&mut self) {
+        drop(self.publishing.take());
+        drop(self.scope.take());
+    }
+}
+
 impl View {
     /// A new open file description of `ino`, opened with `flags` (see
     /// the module doc).
@@ -327,7 +343,7 @@ impl View {
     /// the drain before the forward, which a failure here retries), then drain
     /// its pending chunks. `published` is the publication's outcome once it
     /// succeeded (whether a drain follows), so a retry after a failed drain
-    /// does not publish again; `publishing` (the turn's guard, see
+    /// does not publish again; `guards` hold `publishing` (the turn's guard, see
     /// [`crate::locks::begin_close`]) and `scope` (the caller's fencing scope
     /// the pool thread continues, [`crate::locks::handoff_scope`]) end with
     /// that commit, as the drain after it only waits for what is published
@@ -336,16 +352,14 @@ impl View {
     pub(super) fn close_publication(
         &self,
         ino: Ino,
-        publishing: &mut Option<crate::locks::Publishing>,
-        scope: &mut Option<crate::locks::TagScope>,
+        guards: &mut CommitGuards,
         published: &mut Option<bool>,
     ) -> Result<(), Code> {
         let drain = match *published {
             Some(drain) => drain,
             None => {
                 let drain = self.publish_inode(ino, false)?;
-                drop(publishing.take());
-                drop(scope.take());
+                guards.end();
                 *published = Some(drain);
                 drain
             }

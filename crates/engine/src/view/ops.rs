@@ -1688,17 +1688,20 @@ impl Vfs for View {
             }
             result
         };
-        let mut publishing = Some(publishing);
+        let mut guards = durable::CommitGuards {
+            publishing: Some(publishing),
+            scope: None,
+        };
         let Some(view) = deferral else {
             let work = if publishes && gate.is_ok() {
-                self.close_publication(ino, &mut publishing, &mut None, &mut None)
+                self.close_publication(ino, &mut guards, &mut None)
             } else {
                 Ok(())
             };
             // The turn's publication is over once its commit is answered
             // (`close_publication` ends it then; this is the close that
             // published nothing).
-            drop(publishing);
+            drop(guards);
             let result = finish(self, work);
             // The close's fencing-token scope ends before its answer, not
             // after (its publication ended above): nothing is published past
@@ -1722,13 +1725,14 @@ impl Vfs for View {
         crate::fsync_wait::pool().submit(move || {
             watch.adopt();
             let result = {
-                let mut scope = scope.map(|s| s.enter());
+                let mut guards = guards;
+                guards.scope = scope.map(|s| s.enter());
                 let _fault = constellation_meta::fault_caller_scope(fault_caller);
                 let mut published = None;
                 let work = view.close_run(ino, cancel, || {
-                    view.close_publication(ino, &mut publishing, &mut scope, &mut published)
+                    view.close_publication(ino, &mut guards, &mut published)
                 });
-                drop(publishing);
+                drop(guards.publishing.take());
                 finish(&view, work)
             };
             match result {
