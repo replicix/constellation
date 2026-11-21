@@ -499,6 +499,8 @@ pub struct NodeEnv {
     pub tag_check_at_write: bool,
     /// F1's other one (`SimConfig::settle_tagged_writes`).
     pub settle_tagged_writes: bool,
+    /// `SimConfig::settle_tagged_writes_at_release`.
+    pub settle_tagged_writes_at_release: bool,
     /// See `SimConfig::holder_beats`.
     pub holder_beats: super::run::HolderBeats,
     /// See `SimConfig::timers_first_after_lag`.
@@ -819,6 +821,8 @@ impl NodeHandle {
             meta.locks()
                 .set_tag_check_at_write_for_tests(env.tag_check_at_write);
             meta.locks().set_settle_for_tests(env.settle_tagged_writes);
+            meta.locks()
+                .set_settle_at_release_for_tests(env.settle_tagged_writes_at_release);
         }
         env.bus.attach(id, tx.clone());
         // The root's delegation windows, shared with the answerer below

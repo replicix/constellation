@@ -865,6 +865,9 @@ pub struct SimConfig {
     /// a position is reported while a tagged write that passed its check
     /// is still committing.
     pub settle_tagged_writes: bool,
+    /// With the settle off, `true` turns it on for a delegate's release cut
+    /// alone (`Meta::settle_tagged_writes_at_release`).
+    pub settle_tagged_writes_at_release: bool,
     /// How long a lock client waits for its turn write's answer before it
     /// leaves it in doubt (`None`: 3 s, 30 s under `strict_lock_turns`).
     pub lock_write_wait_ms: Option<u64>,
@@ -1466,6 +1469,7 @@ impl Default for SimConfig {
             tag_check_at_write: true,
             strict_lock_turns: false,
             settle_tagged_writes: true,
+            settle_tagged_writes_at_release: false,
             lock_write_wait_ms: None,
             holder_beats: HolderBeats::Off,
             reader_nodes: Vec::new(),
@@ -6122,6 +6126,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         world: ChunkWorld::new(),
         tag_check_at_write: cfg.tag_check_at_write,
         settle_tagged_writes: cfg.settle_tagged_writes,
+        settle_tagged_writes_at_release: cfg.settle_tagged_writes_at_release,
         holder_beats: cfg.holder_beats,
         timers_first_after_lag: cfg.timers_first_after_lag,
         own_lapses_unreported: cfg.own_lapses_unreported,

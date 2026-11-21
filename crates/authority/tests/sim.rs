@@ -17142,7 +17142,7 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
 #[test]
 fn a_credited_arrival_cap_splits() {
     use pinned::run_seed;
-    for seed in [193_262, 195_192, 195_424] {
+    for seed in [193_262, 195_192, 195_424, 1_507] {
         let e = run_seed(
             seed,
             fixed_lane(fast_takeover_skewed_successor_credited_config()),
@@ -18431,7 +18431,7 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     // write as its commit returns (plan 46 M1.2 step 15); 3332, 3777 and 4522
     // are the first three seeds from 0 that do, unclocked, the settle clean
     // on each.)
-    for seed in [3332u64, 3777, 4522] {
+    for seed in [234u64, 3332, 3777, 4522] {
         if let Err(e) = run_seed(
             seed,
             locks_writer_hold_delegated_unsettled_own_clock_config(),
@@ -18454,6 +18454,29 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
         !witnessed.is_empty(),
         "no seed showed a held write landing inside the next holder's section"
     );
+}
+
+/// A delegate's release cut waits for a pinned tagged write once its window
+/// is over (ADR-25 F1: `Core::release_subtrees`). With the settle off for
+/// every other position, these seeds of `locks-writer-hold-delegated-unsettled`
+/// fail with the release settle off too, and pass with it on alone
+/// (`SimConfig::settle_tagged_writes_at_release`): a rowless release cut
+/// taken under the pinned write let the root grant on before it committed.
+#[test]
+fn locks_writer_hold_delegated_unsettled_is_clean_with_the_settle_at_release() {
+    use pinned::run_seed;
+    for seed in [1961u64, 2777, 2994] {
+        run_seed(seed, locks_writer_hold_delegated_unsettled_config())
+            .expect_err("the run is clean without any settle: no control");
+        run_seed(
+            seed,
+            SimConfig {
+                settle_tagged_writes_at_release: true,
+                ..locks_writer_hold_delegated_unsettled_config()
+            },
+        )
+        .unwrap_or_else(|e| panic!("seed {seed}: not clean with the release settle: {e}"));
+    }
 }
 
 /// Plan 43 C2d: a delegate whose group is not itself (the root near, or a

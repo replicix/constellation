@@ -9672,6 +9672,16 @@ impl Core {
             self.stats.deleg_release_drop_pending += 1;
             return;
         }
+        // F1 (ADR-25): the release cut is a position this node reports as
+        // covering what it executed under the stream, so it waits, as every
+        // other head it reports does (`lock_position`, `lock_release_floor`,
+        // the renewal), for a tagged write that passed its check at the
+        // write and is still in its transaction under a grant whose window is
+        // over. Only the rowless branch needs it: the row branch is ordered by
+        // `delegate_release`'s writer lock. `lock_hand_back` takes its `at`
+        // from here. One atomic load while no tagged write is in a
+        // transaction.
+        replica.settle_tagged_writes_at_release();
         let asked: BTreeSet<Ino> = dirs.into_iter().collect();
         let Some(d) = self.dl.mine.get(&gen) else {
             // Never installed here (the grant was parked, or not committed
