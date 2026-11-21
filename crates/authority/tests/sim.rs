@@ -15481,7 +15481,10 @@ fn a_delegates_unparked_own_op_is_answered() {
 /// needs an S3 lease read, which its S3 path (cut) cannot make. The op ended
 /// `EIO` at the settle deadline. Seed 1923 fails I4 on the parent; the
 /// others are the seeds that reached the reroute's failed-withdrawal path
-/// (S3 down, the tombstone failing) in the prototype.
+/// (S3 down, the tombstone failing) in the prototype. Seeds 1505 and 1818 end
+/// in an I4 violation (the epoch flush keeps its re-claimed lease, ADR-67, so
+/// a restarted root's requester goes to the inbox at the same epoch and the
+/// holder never polls it) on the tree without the reroute.
 #[test]
 fn a_requester_reroutes_its_inbox_op_when_the_link_comes_back() {
     /// The seeds that fail on the parent: they must reroute.
@@ -15490,7 +15493,7 @@ fn a_requester_reroutes_its_inbox_op_when_the_link_comes_back() {
         strict_unsettled: true,
         ..locks_blips_tight_delegated_config()
     };
-    for seed in [1923u64, 63, 404, 479, 1290, 1319, 1361] {
+    for seed in [1923u64, 63, 404, 479, 1290, 1319, 1361, 1505, 1818] {
         let r = run_seed(seed, cfg.clone())
             .unwrap_or_else(|e| panic!("locks-blips-tight-delegated+unsettled seed {seed}: {e}"));
         assert_eq!(
