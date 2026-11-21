@@ -1321,7 +1321,13 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // simulation, moved 16329: it reaches the withdraw no more. Over
     // 14000-18999 the finder gives 14435 twice and 14369, 15369 and 16674
     // once; 14435 takes 16329's place (25521 still reaches it twice).
-    for seed in [14435, 25521] {
+    // The inbox reroute on link-up (ADR-68) forwards an op over P2P as soon
+    // as the link is up, so fewer ops go through a second batch: 14435 no
+    // longer reaches the withdraw, and over 10000-25999 the finder gives
+    // 25521 (twice) and 14369, 16674, 22774 and 25146 once each. The two
+    // pins now ask for one withdrawal each (still a witness that the path is
+    // reached, not a detector).
+    for seed in [14369, 25521] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -1329,7 +1335,7 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
             .map(|s| s.inbox_multi_batch_withdrawals)
             .sum();
         assert!(
-            multi >= 2,
+            multi >= 1,
             "seed {seed} no longer forwards an op with several batches to withdraw ({multi})"
         );
         assert!(report.converged_checked, "seed {seed} did not converge");
@@ -1344,7 +1350,10 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
 /// 5–21 s and slow lease reads tells two (labelled twice); without the label
 /// it is an I4 violation. (Seeds 317, 412 and 467 do the same on this tree;
 /// `find_failed_tombstone_seeds` re-pins over a schedule change. Seed 41,
-/// pinned before kept rows v2, no longer gives up a tombstone.)
+/// pinned before kept rows v2, no longer gives up a tombstone. The inbox
+/// reroute on link-up (ADR-68) moved the schedules again: seed 271 no longer
+/// gives up a tombstone; of seeds 0..1,499 the finder gives 146, 207, 358
+/// (two, both labelled), 412 and 467 (two), among others: 358 is the pin.)
 #[test]
 fn a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3() {
     let mut cfg = config_variant(base_config("long-backup"), "cuts32@5000:16000");
@@ -1352,7 +1361,7 @@ fn a_failed_tombstone_with_s3_cut_is_labelled_isolated_from_s3() {
         before: (0, 0),
         reply: (800, 1_000),
     };
-    let r = run_seed(271, cfg).unwrap_or_else(|e| panic!("seed 271: {e}"));
+    let r = run_seed(358, cfg).unwrap_or_else(|e| panic!("seed 358: {e}"));
     let failed: u64 = r.stats.values().map(|s| s.settle_withdraw_failed).sum();
     assert!(failed >= 1, "no settle gave up its tombstone ({failed})");
     assert!(
@@ -6449,8 +6458,10 @@ fn regression_a_readoption_landing_after_a_seal_is_not_served() {
     // simulation, moved 1115's schedule: its seal no longer reaches the
     // re-adoption in flight. Over seeds 0..2499 the finder gives 8, 61, 204,
     // 411 and ten more; 8 takes 1115's place. 8 reaches the path, it is not
-    // a fail-before witness: the guard is the drop itself.)
-    for seed in [204, 8] {
+    // a fail-before witness: the guard is the drop itself. The inbox reroute
+    // on link-up (ADR-68) moved 8's schedule in turn: over seeds 0..2499 the
+    // finder gives 61, 204, 282, 730 and five more; 61 takes 8's place.)
+    for seed in [204, 61] {
         let cfg = strict(
             SimConfig {
                 s3_latency: (60, 200),
@@ -6568,7 +6579,9 @@ fn regression_a_seq_between_kept_copies_within_the_carried_union_is_no_gap() {
 /// reaching the gate's drop once the singleton answer and the sim's held
 /// writes moved the schedules; 224 reaches it and drops 2 rows. No seed of 0
 /// to 2 000 keeps a copy without the gate's drop any more: the fail-before is
-/// `meta/tests/member_copy.rs`.)
+/// `meta/tests/member_copy.rs`. The inbox reroute on link-up (ADR-68) moved
+/// 224's schedule: of seeds 0..2,499 the finder gives 385 (3 rows), 669, 689
+/// (2 rows), 828 and five more; 689 is the pin.)
 #[test]
 fn regression_a_self_claim_keeps_no_copy_of_its_unshipped_archive_rows() {
     let cfg = strict(
@@ -6578,8 +6591,8 @@ fn regression_a_self_claim_keeps_no_copy_of_its_unshipped_archive_rows() {
         },
         "commit",
     );
-    let r = run_seed(224, cfg).unwrap_or_else(|e| {
-        panic!("seed 224: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash-slow+commit")
+    let r = run_seed(689, cfg).unwrap_or_else(|e| {
+        panic!("seed 689: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash-slow+commit")
     });
     assert_eq!(r.member_copy_rows_left, 0);
     assert!(
@@ -7366,11 +7379,18 @@ fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
 /// (`regression_a_late_applied_release_makes_no_second_authority`). Fails on
 /// the tree without the wait on the `EIO` count of each seed. (Seed 1045 is
 /// not on this path: its re-read succeeded and found the release landed.)
+///
+/// The inbox reroute on link-up (ADR-68) moved seed 1477's schedule: its
+/// requester now ends unsettled with a lease path reachable for 110 ms of its
+/// settle window (an I4 violation; the 2,000-seed `+unsettled` scan of this
+/// label has 6 such seeds, 8 before the change, 1477 among the new ones).
+/// 471 takes its place (an unresolved release and a renewal, no unsettled
+/// `EIO` left). 64 and 391 are unchanged.
 #[test]
 fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
     let mut reached = 0;
     let mut renewals = 0;
-    for seed in [64, 391, 1477] {
+    for seed in [64, 391, 471] {
         let cfg = SimConfig {
             strict_unsettled: true,
             ..locks_unlinked_blips_config()
@@ -21083,6 +21103,9 @@ fn c0_the_oracles_do_not_deadlock_with_held_writes() {
 /// `Core::ack_gated` ignored answers a holder's own op from its local disk
 /// while a backup is committed. The I1 oracle must see it (a `root-group`
 /// answer no backup holds) and fail under `+commit`.
+/// (The inbox reroute on link-up, ADR-68, moved the schedules: the planted
+/// run of seed 701 ends in another oracle's failure now, and 705 is not
+/// caught: the window is seeds 702..713, 11 of 12 caught.)
 #[test]
 fn c0_i1_catches_a_planted_ungated_fast_path() {
     let planted = || SimConfig {
@@ -21091,7 +21114,7 @@ fn c0_i1_catches_a_planted_ungated_fast_path() {
         ..backup_config()
     };
     let mut caught = 0usize;
-    for seed in 700..712 {
+    for seed in 702..714 {
         // (Not `strict_durability`: the planted holder is allowed to lose
         // what it acknowledged; only the oracle is under test.)
         let cfg = SimConfig {
@@ -21112,7 +21135,7 @@ fn c0_i1_catches_a_planted_ungated_fast_path() {
         "the planted ungated fast path was caught on only {caught} of 12 seeds"
     );
     // Without the plant the same seeds are clean of root-group violations.
-    for seed in 700..712 {
+    for seed in 702..714 {
         let cfg = SimConfig {
             fast_path: sim::run::FastPath::Checked,
             strict_durability: false,
@@ -21771,9 +21794,13 @@ fn a_seal_before_the_holders_renewal_never_revives_a_sealed_epoch() {
 // early re-claim at 180 to 192 ms only (none in 5,800 seeds at 250 ms).
 // Plan 46 M1.4 step 6: with the harness no longer moving a suspended host's
 // honour clock, 1134 shows it at 170 to 180 ms (holder 2 sealed by peer
-// claimant 3), and no seed of 0 to 6,000 at 186 ms: 175 ms.)
-const SEAL_GAP_DELAY_MS: u64 = 175;
-const SEAL_GAP_PINNED_SEED: u64 = 1134;
+// claimant 3), and no seed of 0 to 6,000 at 186 ms: 175 ms.
+// The inbox reroute on link-up (ADR-68) moved the schedules: no seed of
+// 0 to 5,999 shows an early re-claim at 150 to 200 ms (every 5 ms) any more,
+// 1134 included; of seeds 6,000 to 19,999 at 165, 170, 175, 180 and 185 ms
+// the one that does is seed 17786 at 165 ms: 165 ms.)
+const SEAL_GAP_DELAY_MS: u64 = 165;
+const SEAL_GAP_PINNED_SEED: u64 = 17786;
 const SEAL_GAP_SEEDS: std::ops::Range<u64> = 0..300;
 
 /// Plan 46 M0.3: the isolated requesters of `flex-crash` (nodes cut from every
@@ -24178,10 +24205,15 @@ fn s4_merge_seed_841_a_settle_is_routed_again_when_the_cut_row_arrives() {
 /// `d5`; the cut row, sent while it was away, waited out the delegate's
 /// doubled back-off after the root returned. The link coming back starts a
 /// new stream round. Fails on the parent on both arms; the control arm still
-/// fails by the tag.
+/// fails by the tag. (Seed 1725, the original witness, was moved by the inbox
+/// reroute on link-up, ADR-68: its control arm no longer fails by the tag.
+/// Of seeds 0..1,499 the finder gives 8, 23, 166, 197 and 14 more where the
+/// control fails by the tag and the fix arm is clean; 633, with a stream
+/// resume and a settle woken from its acquire wait, is the pin: chosen by
+/// reaching the path, not by failing on the parent.)
 #[test]
-fn s4_merge_seed_1725_the_cut_row_does_not_wait_out_the_roots_backoff() {
-    s4_pin_with("sticky-s4-merge", sticky_s4_merge_config, 1725, false);
+fn s4_merge_the_cut_row_does_not_wait_out_the_roots_backoff() {
+    s4_pin_with("sticky-s4-merge", sticky_s4_merge_config, 633, false);
 }
 
 /// Round 7: the root reboots over `d5`'s release (`sticky-s4-root-restart`).
@@ -24215,12 +24247,21 @@ fn s4_root_restart_the_cut_row_reaches_the_returned_root_in_time() {
 ///
 /// The control arm (the held release) fires the strict tag on each. Each pin
 /// fails on the tree of round 7.
+///
+/// The inbox reroute on link-up (ADR-68) moved these schedules: 375 no longer
+/// has its control arm fail by the tag, and 403 no longer wakes a settle from
+/// an acquire wait. Of seeds 0..1,499 the finder (control fails by the tag,
+/// fix arm clean) gives 772 (a resume and a settle forwarded alive; with 808
+/// and 853) for 375's half, and 95 (a resume and a settle woken from the
+/// acquire waits; with 121, 162, 197 and more) for 403's. These witness that
+/// each path is reached on this tree; they were chosen by reaching it, not
+/// by failing on the tree of round 7, which the originals were.
 #[test]
 fn s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle() {
     let sum = |r: &Report, f: fn(&constellation_authority::Stats) -> u64| -> u64 {
         r.stats.values().map(f).sum()
     };
-    for seed in [375u64, 403, 980] {
+    for seed in [772u64, 95, 980] {
         let fix = s4_pin_with(
             "sticky-s4-root-restart",
             sticky_s4_root_restart_config,
@@ -24231,13 +24272,13 @@ fn s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle() {
         let phase = sum(&fix, |s| s.settles_woken_at_cut_phase);
         let alive = sum(&fix, |s| s.settles_cut_forwarded_alive);
         match seed {
-            375 => assert!(
+            772 => assert!(
                 resumes > 0 && alive > 0,
-                "seed 375: resumes {resumes}, forwarded alive {alive}: the seed no longer exercises the path"
+                "seed 772: resumes {resumes}, forwarded alive {alive}: the seed no longer exercises the path"
             ),
-            403 => assert!(
+            95 => assert!(
                 phase > 0,
-                "seed 403: no settle woken from the acquire waits: the seed no longer exercises the path"
+                "seed 95: no settle woken from the acquire waits: the seed no longer exercises the path"
             ),
             _ => assert!(
                 alive > 0,
