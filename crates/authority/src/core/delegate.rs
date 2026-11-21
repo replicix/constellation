@@ -16000,14 +16000,20 @@ impl Core {
         }
         // The ops of the subtrees that are in flight here: parked for their
         // dependencies or a read recall, not the ones this release holds.
-        let busy = d.parked.iter().any(|p| {
-            !p.held
-                && matches!(
-                    replica.resolve_ownership(&super::holder::keys_of_op_in(&p.op, replica)),
-                    Ownership::Delegated(t)
-                        if t.node == me && t.gen == gen && still.contains(&t.dir)
-                )
-        });
+        // ADR-55 R-H: nor the ops an unhonoured own stream parks. Nothing
+        // executed under it and nothing is in flight: they wait for the
+        // honour this very release gives up, and go to the root with the
+        // release (`release_subtrees` hands every parked op of a subtree it
+        // gives up to `answer_not_owner`, once).
+        let busy = self.own_honoured(gen)
+            && d.parked.iter().any(|p| {
+                !p.held
+                    && matches!(
+                        replica.resolve_ownership(&super::holder::keys_of_op_in(&p.op, replica)),
+                        Ownership::Delegated(t)
+                            if t.node == me && t.gen == gen && still.contains(&t.dir)
+                    )
+            });
         let (inflight, stopped, refused, streamed) = (
             d.inflight.is_some(),
             d.stopped,

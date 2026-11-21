@@ -93164,10 +93164,17 @@ mod root_own_sticky {
         h.hold(1, None);
         activity(&mut h);
         assert_eq!(h.core.stats.root_own_released_unhonoured, 1);
-        assert_eq!(h.meta.delegate_idx(d.gen).unwrap(), 0, "something executed");
+        // The one row of the stream is its release (nothing executed): it
+        // is journaled now, the parked op went to the root.
+        let st = &h.core.dl.mine[&d.gen];
         assert!(
-            !h.core.dl.sticky_cmds.is_empty() || h.core.dl.mine[&d.gen].release.is_some(),
-            "no release under way"
+            st.release.as_ref().is_some_and(|r| r.row == Some(1)),
+            "no release row"
+        );
+        assert_eq!(
+            h.meta.delegate_idx(d.gen).unwrap(),
+            1,
+            "something besides the release row executed"
         );
     }
 

@@ -23615,7 +23615,10 @@ fn the_root_own_controls_fail_the_oracles() {
 fn far_root_writes_and_the_sticky_stubs_run_in_report_mode() {
     let cases = [
         ("far-root-writes", far_root_writes_config()),
-        ("far-root-writes-held-own", far_root_writes_held_own_config()),
+        (
+            "far-root-writes-held-own",
+            far_root_writes_held_own_config(),
+        ),
         ("sticky-idle-release", sticky_idle_release_config()),
         (
             "sticky-handover-ping-pong",
