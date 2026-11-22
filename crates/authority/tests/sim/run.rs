@@ -1062,6 +1062,9 @@ pub struct SimConfig {
     /// fast path ignores `Core::ack_gated`, so a holder answers its own op
     /// from its local disk while a backup is committed.
     pub plant_ungated_fast_path: bool,
+    /// Check every change of a node's refusal set against a read of the
+    /// whole journal (costs that read per change; on in debug builds).
+    pub refusal_crosscheck: bool,
     /// Test-only: nodes publish `admits` without the release fence
     /// (`NodeEnv::plant_release_admits`).
     pub plant_release_admits: bool,
@@ -1516,6 +1519,7 @@ impl Default for SimConfig {
             strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
+            refusal_crosscheck: cfg!(debug_assertions),
             plant_release_admits: false,
             skip_deleg_dep_wait: false,
             plant_claim_root_group_on_lone: false,
@@ -6098,6 +6102,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let recall_drops: super::node::RecallDrops = Arc::new(Mutex::new(Vec::new()));
     let hold_lifetimes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let oracles = super::oracle::Oracles::new(bucket.clone());
+    oracles
+        .refusal_crosscheck
+        .store(cfg.refusal_crosscheck, std::sync::atomic::Ordering::Relaxed);
     // Plan 43 C7a (commit 6): the default clock-fault mix.
     let horizon = cfg.ops_per_client * 400 + 2_000;
     let (mix_rates, mix_faults) = gen_clock_mix(&cfg, seed, horizon);

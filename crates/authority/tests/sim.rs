@@ -24492,13 +24492,20 @@ fn s4_fix_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
 
 /// The refusal bookkeeping (`Driver::note_journaled_refusals`) reads the
 /// journal rows a change appended, not the whole journal again: on one
-/// `sticky-s4-merge` seed the rows it read stay within one and a half times the rows
-/// appended, per node and in all. Re-reading the journal on every change
-/// made that quadratic in the journal's length.
+/// `sticky-s4-merge` seed the rows it read stay within one and a half times
+/// the rows appended, per node and in all, with every change of the refusal
+/// set checked against a read of the whole journal. Re-reading the journal
+/// on every change read each row of the backlog once per change.
 #[test]
 fn the_refusal_bookkeeping_reads_each_journal_row_a_bounded_number_of_times() {
-    let r = run_seed(0, sticky_s4_merge_config())
-        .unwrap_or_else(|e| panic!("sticky-s4-merge seed 0 failed: {e}"));
+    let r = run_seed(
+        0,
+        SimConfig {
+            refusal_crosscheck: true,
+            ..sticky_s4_merge_config()
+        },
+    )
+    .unwrap_or_else(|e| panic!("sticky-s4-merge seed 0 failed: {e}"));
     let (mut scanned, mut appended) = (0u64, 0u64);
     for (node, (s, a)) in &r.journal_scan {
         assert!(
@@ -24508,7 +24515,10 @@ fn the_refusal_bookkeeping_reads_each_journal_row_a_bounded_number_of_times() {
         scanned += s;
         appended += a;
     }
-    assert!(appended > 0, "no journal row was appended: nothing measured");
+    assert!(
+        appended > 0,
+        "no journal row was appended: nothing measured"
+    );
     assert!(
         2 * scanned <= 3 * appended,
         "{scanned} journal rows read for {appended} appended"

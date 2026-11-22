@@ -1022,6 +1022,7 @@ impl NodeHandle {
             // its first event, so what its recovery stranded is dated then.)
             rolled_back_seen: (u64::MAX, u64::MAX, u64::MAX),
             journal_seen: None,
+            refusal_rows: BTreeMap::new(),
             timers: HashSet::new(),
             timer_kinds: HashMap::new(),
             bootstrap: None,
@@ -1350,6 +1351,9 @@ struct Driver {
     /// `(journal tip, journal length)` when `Shared::journaled_refusals`
     /// was last taken.
     journal_seen: Option<(u64, u64)>,
+    /// The journal rows carrying a `Refused`, by seq, as of `journal_seen`
+    /// (`Driver::note_journaled_refusals`).
+    refusal_rows: BTreeMap<u64, Rid>,
     timers: HashSet<constellation_authority::TimerId>,
     /// What each pending timer is for (the watchdog's histogram names
     /// the kind, not just "Timer").
@@ -3654,6 +3658,18 @@ impl Driver {
     }
 
     /// Retake `Shared::journaled_refusals` when the journal changed.
+    ///
+    /// Kept incrementally: `refusal_rows` maps the seq of every journal row
+    /// carrying a `Refused` to its rid, and a change reads only the rows
+    /// past the journal tip of the last read (rows are appended above the
+    /// tip, and only a ship's acknowledgement removes them). The rows a
+    /// change removed are told by the length: it fell short of the old
+    /// length plus the rows read, and then each tracked row is probed
+    /// (a refusal's row that is gone was acknowledged out of the journal).
+    /// A tip that went down, a length that rose more than the rows read, or
+    /// a first read (a restarted node) starts over from the whole journal.
+    /// The published set is what a read of the whole journal would give;
+    /// `SimConfig::refusal_crosscheck` asserts it on every change.
     fn note_journaled_refusals(&mut self) {
         let seen = (
             Replica::journal_tip(&*self.meta),
@@ -3662,25 +3678,115 @@ impl Driver {
         if self.journal_seen == Some(seen) {
             return;
         }
-        let appended = seen.0.saturating_sub(self.journal_seen.map_or(0, |(tip, _)| tip));
-        self.journal_seen = Some(seen);
-        let txs = Replica::journal_txs_from(&*self.meta, 0, usize::MAX);
-        let scanned: usize = txs.iter().map(|tx| tx.records.len()).sum();
+        let prev = self.journal_seen.replace(seen);
+        let (tip, len) = seen;
+        let (old_tip, old_len) = prev.unwrap_or((0, 0));
+        let mut scanned = 0u64;
+        let mut start_over = prev.is_none() || tip < old_tip;
+        if !start_over {
+            let mut read = 0u64;
+            if tip > old_tip {
+                scanned += self.read_refusals_from(old_tip + 1, &mut read);
+            }
+            let expected = old_len + read;
+            if len > expected {
+                start_over = true;
+            } else if len < expected {
+                let tracked: Vec<(u64, Rid)> = self
+                    .refusal_rows
+                    .range(..=old_tip)
+                    .map(|(seq, rid)| (*seq, *rid))
+                    .collect();
+                for (seq, rid) in tracked {
+                    let (row, n) = Self::journal_row(&self.meta, seq);
+                    scanned += n;
+                    let alive = matches!(
+                        row,
+                        Some(constellation_meta::LogRecord::Refused { rid: r, .. }) if r == rid
+                    );
+                    if !alive {
+                        self.refusal_rows.remove(&seq);
+                    }
+                }
+            }
+        }
+        if start_over {
+            self.refusal_rows.clear();
+            scanned = self.read_refusals_from(0, &mut 0);
+        }
         {
             let mut scan = self.oracles.journal_scan.lock().unwrap();
             let c = scan.entry(self.id).or_default();
-            c.0 += scanned as u64;
-            c.1 += appended;
+            c.0 += scanned;
+            c.1 += tip.saturating_sub(old_tip);
         }
-        let refusals: BTreeSet<Rid> = txs
-            .into_iter()
-            .flat_map(|tx| tx.records)
-            .filter_map(|rec| match rec {
-                constellation_meta::LogRecord::Refused { rid, .. } => Some(rid),
-                _ => None,
-            })
-            .collect();
+        let refusals: BTreeSet<Rid> = self.refusal_rows.values().copied().collect();
+        if self.oracles.refusal_crosscheck.load(Ordering::Relaxed) {
+            let full: BTreeSet<Rid> = Replica::journal_txs_from(&*self.meta, 0, usize::MAX)
+                .into_iter()
+                .flat_map(|tx| tx.records)
+                .filter_map(|rec| match rec {
+                    constellation_meta::LogRecord::Refused { rid, .. } => Some(rid),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                refusals, full,
+                "node {}: the incremental refusal set differs from the journal's (tip {tip}, \
+                 length {len}, last read {prev:?})",
+                self.id
+            );
+        }
         *self.shared.journaled_refusals.lock().unwrap() = refusals;
+    }
+
+    /// Track the `Refused` rows of the journal from `from` up, adding the
+    /// rows read to `read`. Returns the rows read.
+    fn read_refusals_from(&mut self, from: u64, read: &mut u64) -> u64 {
+        let txs = Replica::journal_txs_from(&*self.meta, from, usize::MAX);
+        let mut scanned = 0u64;
+        for tx in txs {
+            let n = tx.records.len() as u64;
+            scanned += n;
+            *read += n;
+            if !tx
+                .records
+                .iter()
+                .any(|r| matches!(r, constellation_meta::LogRecord::Refused { .. }))
+            {
+                continue;
+            }
+            if n == tx.last + 1 - tx.first {
+                for (i, rec) in tx.records.iter().enumerate() {
+                    if let constellation_meta::LogRecord::Refused { rid, .. } = rec {
+                        self.refusal_rows.insert(tx.first + i as u64, *rid);
+                    }
+                }
+            } else {
+                // Rows missing inside the transaction: the records do not
+                // say which seqs they are; read the rows one by one.
+                for seq in tx.first..=tx.last {
+                    let (row, m) = Self::journal_row(&self.meta, seq);
+                    scanned += m;
+                    if let Some(constellation_meta::LogRecord::Refused { rid, .. }) = row {
+                        self.refusal_rows.insert(seq, rid);
+                    }
+                }
+            }
+        }
+        scanned
+    }
+
+    /// The journal row at `seq` (`None`: gone) and the rows read for it.
+    fn journal_row(meta: &Meta, seq: u64) -> (Option<constellation_meta::LogRecord>, u64) {
+        let txs = Replica::journal_txs_from(meta, seq, 1);
+        match txs.into_iter().next() {
+            Some(tx) if tx.first == seq && !tx.records.is_empty() => {
+                let n = tx.records.len() as u64;
+                (tx.records.into_iter().next(), n)
+            }
+            _ => (None, 0),
+        }
     }
 
     /// M12 round 2: the daemon's FUSE fast path (`SimConfig::fast_path`).
