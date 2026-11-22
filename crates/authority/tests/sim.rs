@@ -18488,8 +18488,9 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
     .unwrap_or_else(|e| panic!("seed 234: the settled run is not clean: {e}"));
 }
 
-/// `run_seed` as the sweeps run it (the default clock-fault mix), inside a
-/// test that otherwise uses the pinned (unclocked) runners.
+/// `run_seed` as the sweeps run it (the default clock-fault mix). It exists
+/// to name the plain runner in a test that also imports `pinned::run_seed`
+/// (which shadows it) or that sits next to the pinned ones.
 fn run_clocked_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     run_seed(seed, cfg)
 }
@@ -18498,8 +18499,8 @@ fn run_clocked_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
 /// is over (ADR-25 F1: `Core::release_subtrees`), also in the settle-off
 /// label: `settle_tagged_writes: false` does not switch the release settle off
 /// (`SimConfig::settle_tagged_writes_at_release` does). Seeds 1961, 2777 and
-/// 2994 of `locks-writer-hold-delegated-unsettled` and seed 627 with
-/// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` showed the held write inside the
+/// 2994 of `locks-writer-hold-delegated-unsettled` and seeds 627 and 2000
+/// with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` showed the held write inside the
 /// next holder's section (or lost after an acknowledged turn) before; with
 /// the release settle off they still do, and this test fails with it.
 #[test]
@@ -18511,7 +18512,13 @@ fn locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle() {
         },
         ..cfg
     };
-    let seeds: [(u64, bool); 4] = [(1961, false), (2777, false), (2994, false), (627, true)];
+    let seeds: [(u64, bool); 5] = [
+        (1961, false),
+        (2777, false),
+        (2994, false),
+        (627, true),
+        (2000, true),
+    ];
     for (seed, slow) in seeds {
         let cfg = |release_settle: bool| {
             let c = SimConfig {
@@ -18524,11 +18531,32 @@ fn locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle() {
                 c
             }
         };
-        run_clocked_seed(seed, cfg(false))
+        let e = run_clocked_seed(seed, cfg(false))
             .expect_err("the run is clean without the release settle: no control");
+        assert!(e.contains("held write"), "seed {seed}: {e}");
         run_clocked_seed(seed, cfg(true))
             .unwrap_or_else(|e| panic!("seed {seed}: not clean with the release settle: {e}"));
     }
+}
+
+/// Seed 2578 of `locks-writer-hold-delegated-unsettled` under
+/// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` is an effect of the control, not
+/// of the release: a release settle that waits for every pinned write (window
+/// open or over) does not clear it, and it is clean with the settle on.
+#[test]
+fn locks_writer_hold_delegated_unsettled_seed_2578_needs_the_renewal_settle() {
+    let slow = |cfg: SimConfig| SimConfig {
+        lease_reads: sim::store::SlowReads {
+            before: (0, 0),
+            reply: (800, 1_000),
+        },
+        ..cfg
+    };
+    let e = run_clocked_seed(2578, slow(locks_writer_hold_delegated_unsettled_config()))
+        .expect_err("seed 2578 is clean without the renewal settle: no control");
+    assert!(e.contains("held write"), "{e}");
+    run_clocked_seed(2578, slow(locks_writer_hold_delegated_config()))
+        .unwrap_or_else(|e| panic!("seed 2578 is not clean with the settle on: {e}"));
 }
 
 /// Plan 43 C2d: a delegate whose group is not itself (the root near, or a
