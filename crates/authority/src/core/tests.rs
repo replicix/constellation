@@ -86381,6 +86381,117 @@ mod route_fence_executor {
         assert_eq!(h.core.stats.settles_refused, 1);
     }
 
+    /// The routed-0 settle of an untouched inbox-ever rid from node 2
+    /// (request `seq`) answers `Fenced` at node 3, runs nothing and leaves
+    /// no refusal row.
+    fn assert_settle_fenced_and_untouched(
+        h: &mut Harness,
+        d1: constellation_fs_core::Ino,
+        seq: u64,
+    ) {
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq,
+        };
+        let out = forward_as(h, d1, 2, seq, (seq, true), (0, 0, true), Position::ZERO);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert!(!ran(h, 2, seq), "the settle was decided here: {out:?}");
+        assert_eq!(h.core.stats.settles_refused, 0);
+        assert!(journaled_outcomes(h, rid).is_empty(), "a refusal row");
+        assert!(h.meta.lookup(d1, &format!("f{seq}")).unwrap().is_none());
+    }
+
+    /// WP6.1 round 3, the holder's bound: the lease holder decides a routed-0
+    /// settle of an untouched inbox-ever rid only while its lease is
+    /// unexpired. A holder whose honour time has run out fences it like an
+    /// ex-holder (the batch may sit in another root's drain). Fails if the
+    /// rule asks only whether the node ever held an epoch.
+    #[test]
+    fn a_lease_holder_fences_an_untouched_inbox_ever_settle_once_its_lease_expired() {
+        // Control: with time left on the lease the holder decides it.
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        h.advance(9_000);
+        let out = forward_as(&mut h, d1, 2, 1, (1, true), (0, 0, true), Position::ZERO);
+        assert_ne!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert!(ran(&h, 2, 1));
+        // The held lease's honour time has run out.
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        h.advance(10_001);
+        assert!(h.core.lease.epoch().is_some());
+        assert!(!h.core.lease.holds_unexpired(h.clk(), &h.core.cfg));
+        assert_settle_fenced_and_untouched(&mut h, d1, 1);
+    }
+
+    /// WP6.1 round 3, the holder's bound: a holder whose lease is lost (with
+    /// honour time still left on it) fences a routed-0 settle of an untouched
+    /// inbox-ever rid like an ex-holder. Fails if the rule asks only whether
+    /// the node ever held an epoch.
+    #[test]
+    fn a_lease_holder_fences_an_untouched_inbox_ever_settle_once_its_lease_was_lost() {
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        h.core.lease.lost = true;
+        assert!(h.core.lease.epoch().is_some());
+        assert!(!h.core.lease.holds_unexpired(h.clk(), &h.core.cfg));
+        assert_settle_fenced_and_untouched(&mut h, d1, 1);
+    }
+
+    /// WP6.1 round 3: the lease holder decides the settle of an untouched
+    /// inbox-ever rid (a refusal row and the `completed` entry), then its own
+    /// drain reads the batch that carries the same rid: the drain journals
+    /// the ack only, executes nothing and counts no second refusal. One
+    /// outcome exists for the rid.
+    #[test]
+    fn the_lease_holders_drain_dedups_to_its_own_decided_settle() {
+        let (mut h, d1) = designee();
+        h.hold(5, None);
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 2,
+        };
+        let out = forward_as(&mut h, d1, 2, 2, (2, true), (0, 0, true), Position::ZERO);
+        assert_ne!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert!(ran(&h, 2, 2));
+        assert_eq!(h.core.stats.settles_refused, 1);
+        assert_eq!(journaled_outcomes(&h, rid), vec![true], "one refusal row");
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "f2".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let mut batch = inbox_batch(2, 0, 2, &op);
+        batch.ops[0].settle = true;
+        let refused_rows = h.core.stats.inbox_refused_ops;
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.clk(), vec![batch], h.clk().wait, &h.meta, &mut out)
+            .unwrap();
+        assert!(h.meta.lookup(d1, "f2").unwrap().is_none(), "executed");
+        assert_eq!(h.core.stats.settles_refused, 1, "a second decision");
+        assert_eq!(h.core.stats.inbox_refused_ops, refused_rows);
+        assert_eq!(h.core.dl.mine[&7].executed, 0, "executed");
+        assert_eq!(journaled_outcomes(&h, rid), vec![true], "one outcome");
+    }
+
     /// The lease holder, designee of its own generation, parks an
     /// inbox-ever forward of `x` (its dependencies not reached): `x` has no
     /// outcome yet, so the drain may decide it first (here: a journaled
