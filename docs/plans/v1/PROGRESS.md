@@ -71858,3 +71858,25 @@ Ceilings: 2.5 s and 10 s, about four times the medians, so a loaded shared box (
 - Control label `far-root-writes-shared-designee-runs` (`far-root-writes-shared` plus `fence_accepts_unrouted` and `holder_runs_inbox_ever`): lr seeds 0..1999 on the parent fail only at 182 and 649 (an op refused and completed, node 2's rid). Neither trace passes through a reroute on a stale view ("holder is reachable over P2P now" does not occur), and both fail the same way on the fix, so none is pinned; the core tests carry the case.
 - Sweeps, 2,000 seeds, parent and fix: the failing seed sets are identical in every label of plain and lr except lr `far-root-writes-shared` (parent 1621, fix none), `+lost-chunk` (1301 and 1844, none) and `+lost-chunk-late` (238, none). Strict scans (`locks-blips-tight-delegated+unsettled`) have the same fail sets and floor counters; no ceiling changed.
 - Not changed: `LeaseState::note_object` still lets a late read regress `last_seen` (the same cause as WP6.5).
+
+## A lapse alone asks for a registry read at once (single1, 2026-11-22)
+
+After a core step of 187 ms or more (a step lapse, ADR-50), a lone root had to wait for the next 5 s registry poll before `Roster::singleton` held again, because only a registry read stamped after the lapse ends the doubt and nothing but the poll took one (`DESIGN.md` said the daemon took one at once; that was true of the directory snapshot before plan 46 M1.3 step 10). In the doubt every root op waits for one segment write. On btrfs the S3(SegmentPut) result step of a burst runs 200 to 370 ms, so the doubt came back every few seconds.
+
+Change (no rule, margin, bump, oracle or ceiling touched): `Event::OwnLag`, and each installed read, call `Core::ask_read_after_lapse`, which pushes `Action::RefreshRoster` when `Roster::lapse_reread_due` holds: the installed read predates a lapse, and the lapse alone keeps the node from being a singleton (`alone_but_for_lapse`, `singleton()` unchanged). One read out at a time; an unanswered ask is repeated after 1 s (`LAPSE_REREAD_RETRY_MS`) at the next lapse or read, else the poll covers it. It does not use `ask_roster_reread`, whose 1 s limiter is shared with placement. Counter `status.ack.lapse_rereads`. No driver change. Tests: core `a_lapse_alone_asks_for_a_read_at_once` (fails on `00a269fd` at "the lapse's own event asks for a read"), roster `a_lapse_asks_for_a_read_only_when_it_alone_blocks_the_singleton`.
+
+Gates on the code commit (`141263225ccb`): fmt, clippy `-D warnings`, workspace lib tests debug and release, authority sim suite release (614 passed, m03 green), determinism gate 300 seeds (8 labels, 2 and 6 threads identical), harness lib, smoke seed 42 (`fresh-node-bootstrap`, `stress-ng-fs`, `singleton-peer-join`, `unmount-drain`) and the single-node S3-fault scenarios (`s3-flap`, `s3-outage`, `s3-retry`, `fio-blips`, `fsync-hard-outage`, `fsync-soft-timeout`) all passed. Sweeps, 2,000 seeds each, `00a269fd` against the branch: `singleton-peer-join`, `singleton-stall-takeover` and `backup-crash-slow` have no failing seed on either side.
+
+Quiet-box timing (burst and control phases, `release` builds, share of creates taking 0.5 to 2.6 ms):
+
+| fs | base | fix |
+|---|---|---|
+| btrfs, 6 + 6 interleaved cells | 0.520 0.485 0.440 0.408 0.398 0.356 (median 0.42) | 0.113 0.113 0.099 0.092 0.085 0.066 (median 0.095) |
+| xfs, 2 + 2 | 0.006 0.004 | 0.006 0.005 |
+| ext4, 2 + 2 | 0.064 0.073 | 0.072 0.073 |
+| tmpfs, 2 + 2 | 0.022 0.016 | 0.023 0.012 |
+
+Every btrfs fix cell is below every base cell. Create p99 is unchanged within noise on every file system (btrfs about 2.1 ms in both arms; xfs 0.29 to 0.34 ms; ext4 2.1 to 2.2 ms; tmpfs 0.4 to 0.7 ms). A status probe every 0.25 s during a fix burst showed `ack.lapse_rereads` reach 6. The residual 0.09 on btrfs is the two lease CASes (the bump to non-singleton in the lapse event and the bump back), about 250 to 400 ms on a file-backed store; deferring the bump (step 2 of the spec) is not part of this change.
+
+Docs: `DESIGN.md` and `durability-and-failover.md` no longer say the daemon takes the read at once; ADR-50's consequences gain one bullet (no decision change).
+

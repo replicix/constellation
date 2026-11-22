@@ -4396,6 +4396,13 @@ quarantine and abandon audience, status) asks the object.
   process), and a committed backup that a later complete read omits or lists as
   read-only is removed.
 - M2.3 deletes only `AckPolicy::Local`.
+- The doubt after a lapse ends with a registry read stamped after it, and the
+  core asks for that read in the lapse's own event (`Action::RefreshRoster`,
+  `Roster::lapse_reread_due`; counter `status.ack.lapse_rereads`) when the
+  lapse alone keeps the node from being a singleton: one read out at a time,
+  asked again after 1 s if unanswered, else the periodic poll covers it. No
+  rule or margin changes, only when the read is taken: before, the doubt
+  lasted until the next 5 s poll.
 - `status.roster` shows the installed read, whether it is complete, the nodes
   known and heard, and the verdict.
 

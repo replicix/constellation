@@ -146,8 +146,8 @@ process freeze, a held runtime) was handed to its core: the links a root held
 before it stopped cannot show that no peer came up while it was stopped, and
 the snapshots that show it are queued behind the event that resumes it. After
 a lapse, even a true singleton waits for the archive until the core receives a
-snapshot taken after it (the daemon takes one at once; the sim's ticker, within
-500 ms), plus one housekeeping pass (50 ms), and the FUSE fast path does not
+snapshot taken after it (the core asks for one in the lapse's own event,
+`status.ack.lapse_rereads`; the sim answers at once), plus one housekeeping pass (50 ms), and the FUSE fast path does not
 answer alone while a lapse the lag probe reports has not been handed to the
 core (a row it journaled `Lone` is then in doubt, answered through the core by
 rid). Before the first snapshot nothing is known either. The cost is latency

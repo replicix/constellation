@@ -642,7 +642,8 @@ archive, or for the backup it brings up (`Core::backup_could_be_had` remains
 the candidate and delegate test; the RTT budget no longer decides who answers
 alone). Knowledge older than the node's own lapse (a pause, a freeze, a held
 runtime) is not knowledge: after a lapse even a true singleton waits for the
-archive until a read issued after it arrives (the daemon takes one at once). A
+archive until a read issued after it arrives (the core asks for one in the
+lapse's own event, `Action::RefreshRoster`). A
 freeze shorter than the lag probe's threshold (about 187 ms) counts as no
 lapse; a node that registers in so short a window is the singleton's
 accepted death-then-join window, which ends at that node's first message to
