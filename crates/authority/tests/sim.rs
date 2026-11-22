@@ -2162,6 +2162,10 @@ fn far_root_writes_shared_config() -> SimConfig {
 /// stream (`holder_runs_inbox_ever`). A requester's reroute on a lease view
 /// older than its own tenure then shows as a refusal beside an execution of
 /// one rid (`refused_and_completed`, `nonholder_refused_a_designee_ran`).
+/// With slow lease reads, seeds 182 and 649 fail under these knobs on the
+/// parent and on the fix alike (a refusal beside an execution of node 2's rid,
+/// by no reroute on a stale view): the label is a control, not a clean
+/// configuration.
 fn far_root_writes_shared_designee_runs_config() -> SimConfig {
     SimConfig {
         fence_accepts_unrouted: true,
@@ -11104,7 +11108,7 @@ impl OracleTotals {
         // ADR-47: the delegate fence's counters, per seed (`SWEEP-FENCE`).
         eprintln!(
             "SWEEP-FENCE {label} seed {seed}: fenced {} resends {} bounce-limit {} held {} unsettled-eio {} \
-             root-holds {} inbox-halts {} outcome-answers {} own-grant-halts {} ever-fenced {} ever-rerouted {} \
+             root-holds {} inbox-halts {} outcome-answers {} own-grant-halts {} ever-fenced {} ever-rerouted {} ever-settle-rerouted {} \
              local-withdrawals {} holds-by-reason [root u/s/l {}/{}/{}, nonplaced {}/{}/{}, cross {}/{}/{}]",
             r.stats.values().map(|s| s.deleg_fenced_forwards).sum::<u64>(),
             r.stats.values().map(|s| s.fenced_resends).sum::<u64>(),
@@ -11117,6 +11121,7 @@ impl OracleTotals {
             r.stats.values().map(|s| s.inbox_own_grant_halts).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_ever_fenced).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_ever_rerouted).sum::<u64>(),
+            r.stats.values().map(|s| s.inbox_ever_settle_rerouted).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_local_withdrawals).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_hold_root_unknown).sum::<u64>(),
             r.stats.values().map(|s| s.inbox_hold_root_sent).sum::<u64>(),

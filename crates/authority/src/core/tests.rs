@@ -86685,6 +86685,13 @@ mod route_fence_executor {
         };
         let (h, rid, out) = run(0);
         assert!(!routed_by_7(&out), "resent to the designee: {out:?}");
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseGet)),
+            "the rid is routed afresh (a lease read), not dropped: {out:?}"
+        );
+        assert!(h.core.clients.contains_key(&rid));
         assert_eq!(h.core.clients[&rid].touched_gen, 0);
         assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 1);
         assert_eq!(h.core.stats.fenced_resends, 0);
@@ -86694,6 +86701,130 @@ mod route_fence_executor {
         assert_eq!(h.core.clients[&rid].touched_gen, 7);
         assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 0);
         assert_eq!(h.core.stats.fenced_resends, 1);
+    }
+
+    /// WP6.1 review M1: the node that fences a routed-0 settle is the lease
+    /// holder itself, a root that holds its own sticky generation. The
+    /// requester (no holder, not acquiring, its view of the lease current)
+    /// resends routed by the generation, as before: the root decides the
+    /// settle after its dedup. Dropping the cache and routing afresh would
+    /// send it routed 0 to the same root for ever (an unsettled `EIO`).
+    /// Fails on the branch tip before the change: no resend to node 1.
+    #[test]
+    fn a_settle_fenced_by_the_lease_holder_is_resent_to_it_routed_by_the_generation() {
+        let mut h = Harness::new(1);
+        h.core.cfg.inbox = true;
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, .. } if to == 2 => Some(*req),
+                _ => None,
+            })
+            .expect("forwarded to the holder");
+        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 30_000));
+        {
+            let c = h.core.clients.get_mut(&rid).unwrap();
+            c.settle = true;
+            c.inbox_ever = true;
+            c.touched_gen = 0;
+        }
+        let reply = |req: OpId, outcome: MutateOutcome, gen: u64| Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome,
+                base: None,
+                position: Position::ZERO,
+                gen,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+                non_stealable: false,
+            },
+        };
+        let out = h.step(reply(req, MutateOutcome::Fenced { gen: 7 }, 7));
+        let sent: Vec<_> = sends(&out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req, routed_gen, ..
+                } if to == 2 => Some((*req, *routed_gen)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 1, "{out:?}");
+        assert_eq!(sent[0].1, 7, "routed by the generation: {out:?}");
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
+        assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 0);
+        assert_eq!(h.core.stats.fenced_resends, 1);
+        // The root decides it (a settle with no outcome here: abandoned):
+        // the client is answered, no second round.
+        let out = h.step(reply(sent[0].0, MutateOutcome::Abandoned, 7));
+        assert!(!replies(&out).is_empty(), "{out:?}");
+        assert!(!h.core.clients.contains_key(&rid));
+    }
+
+    /// The same settle when this node holds the lease (seed 1621's node 3):
+    /// its own drain decides, the fencing holder named by a stale view is
+    /// not resent to.
+    #[test]
+    fn a_settle_fenced_by_the_holder_of_a_stale_view_is_not_resent_by_a_lease_holder() {
+        let mut h = Harness::new(1);
+        h.core.cfg.inbox = true;
+        h.core.lease.cached_holder = Some(2);
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, .. } if to == 2 => Some(*req),
+                _ => None,
+            })
+            .expect("forwarded");
+        {
+            let c = h.core.clients.get_mut(&rid).unwrap();
+            c.settle = true;
+            c.inbox_ever = true;
+        }
+        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 30_000));
+        h.hold(2, None);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Fenced { gen: 7 },
+                base: None,
+                position: Position::ZERO,
+                gen: 7,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+                non_stealable: false,
+            },
+        });
+        assert!(
+            !sends(&out).iter().any(
+                |(to, m)| *to == 2 && matches!(m, PeerMsg::MutateRequest { routed_gen: 7, .. })
+            ),
+            "{out:?}"
+        );
+        assert_eq!(h.core.clients[&rid].touched_gen, 0);
+        assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 1);
     }
 
     /// Fence C9.3 at the requester: an inbox-ever rid follows the root's
@@ -89957,6 +90088,92 @@ mod late_landing_inbox {
         let mut out = Vec::new();
         h.core
             .on_inbox_recheck(h.clk(), stale_read_of_2(), &h.meta, &mut out);
+        assert!(tombstone_op(&out).is_some(), "{out:?}");
+    }
+    /// WP6.1 review S1: the stale read also regressed the cached holder; the
+    /// acquire retry of the rid on the lease path (this node's gate still
+    /// open) must not forward to it. Fails without the cache repair.
+    #[test]
+    fn a_lease_holders_acquire_retry_does_not_forward_to_the_regressed_holder() {
+        let (mut h, rid) = waiting_inbox_op();
+        link_up_only(&mut h);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: false,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: false,
+            }),
+        );
+        let mut out = Vec::new();
+        h.core
+            .on_inbox_recheck(h.clk(), stale_read_of_2(), &h.meta, &mut out);
+        assert_eq!(h.core.lease.cached_holder, Some(1));
+        h.core.clients.get_mut(&rid).unwrap().phase = Phase::AcquireRetry;
+        let mut out = Vec::new();
+        h.core.on_acquire_retry(h.clk(), rid, &h.meta, &mut out);
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(tombstone_op(&out).is_none(), "{out:?}");
+    }
+
+    fn start_acquiring(h: &mut Harness) {
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.clk(),
+            crate::core::jobs::JobReq::Acquire {
+                reason: "test",
+                ask_handoff: false,
+            },
+            &h.meta,
+            &mut out,
+        );
+        assert!(h.core.acquiring());
+    }
+
+    /// WP6.1 review S3: a node acquiring the lease does not forward on a
+    /// current read (its takeover will drain the epoch's batch).
+    #[test]
+    fn a_node_acquiring_the_lease_does_not_forward_its_inbox_op() {
+        let (mut h, rid) = waiting_inbox_op();
+        link_up_only(&mut h);
+        start_acquiring(&mut h);
+        let mut out = Vec::new();
+        h.core
+            .on_inbox_recheck(h.clk(), stale_read_of_2(), &h.meta, &mut out);
+        assert!(tombstone_op(&out).is_none(), "{out:?}");
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(h.core.inbox.pending.contains_key(&rid));
+    }
+
+    /// WP6.1 review S3: nor does the link-up reroute.
+    #[test]
+    fn a_node_acquiring_the_lease_does_not_reroute_on_a_link_coming_up() {
+        let (mut h, rid) = waiting_inbox_op();
+        start_acquiring(&mut h);
+        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 30_000));
+        let out = link_up_only(&mut h);
+        assert!(tombstone_op(&out).is_none(), "{out:?}");
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(!h.core.inbox.is_rerouting(rid));
+    }
+
+    /// WP6.1 review S3: a non-holder that applied a newer epoch than its
+    /// last view does not reroute on it (positive control: at the same epoch
+    /// it does).
+    #[test]
+    fn a_node_that_knows_a_newer_epoch_does_not_reroute_on_a_link_coming_up() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 30_000));
+        h.core.ship.max_epoch = 2;
+        let out = link_up_only(&mut h);
+        assert!(tombstone_op(&out).is_none(), "{out:?}");
+        assert!(!h.core.inbox.is_rerouting(rid));
+        h.core.ship.max_epoch = 1;
+        let out = link_up_only(&mut h);
         assert!(tombstone_op(&out).is_some(), "{out:?}");
     }
 }
