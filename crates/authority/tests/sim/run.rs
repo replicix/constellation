@@ -1408,6 +1408,10 @@ impl Default for SimConfig {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .map_or(0, |p| (p.clamp(0.0, 1.0) * 1_000_000.0) as u32),
+            // `AUTHORITY_SIM_REFUSAL_CROSSCHECK=1`: check every change of a node's
+            // refusal set against a read of the whole journal (release sweeps).
+            refusal_crosscheck: cfg!(debug_assertions)
+                || std::env::var_os("AUTHORITY_SIM_REFUSAL_CROSSCHECK").is_some_and(|v| v == "1"),
             claim_ends_silently: std::env::var_os("AUTHORITY_SIM_CLAIM_ENDS_SILENTLY")
                 .is_some_and(|v| v == "1"),
             no_release_cut: std::env::var_os("AUTHORITY_SIM_NO_RELEASE_CUT")
@@ -1519,7 +1523,6 @@ impl Default for SimConfig {
             strict_lease_claims: true,
             rebuild_stub: false,
             plant_ungated_fast_path: false,
-            refusal_crosscheck: cfg!(debug_assertions),
             plant_release_admits: false,
             skip_deleg_dep_wait: false,
             plant_claim_root_group_on_lone: false,

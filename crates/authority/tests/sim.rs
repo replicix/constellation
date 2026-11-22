@@ -5263,7 +5263,14 @@ fn backup_no_acked_op_lost() {
 /// and every acknowledged op is in the log exactly once.
 #[test]
 fn backup_failover_reships_the_tail() {
-    let t = run_m9("backup-crash", backup_crash_config(), 800..1400);
+    let t = run_m9(
+        "backup-crash",
+        SimConfig {
+            refusal_crosscheck: true,
+            ..backup_crash_config()
+        },
+        800..1400,
+    );
     assert!(t.seals >= 20, "the backup rarely sealed: {t:?}");
     assert!(
         t.backup_takeovers >= 20,
@@ -6966,7 +6973,11 @@ fn drop_held_chain_regression_seeds() {
         ),
     ] {
         for seed in 0u64..40 {
-            let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            let cfg = SimConfig {
+                refusal_crosscheck: true,
+                ..cfg.clone()
+            };
+            let report = run_seed(seed, cfg).unwrap_or_else(|e| {
                 panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
             });
             for s in report.stats.values() {

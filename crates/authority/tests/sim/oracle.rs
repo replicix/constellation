@@ -31,7 +31,7 @@ use constellation_store_s3::LogStore;
 use constellation_types::Code;
 use replicix_objcas::{AckPolicy, Lease};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// `epoch -> (members other than the holder, through)` of a same-epoch
@@ -180,7 +180,7 @@ pub struct Oracles {
     pub journal_scan: Mutex<BTreeMap<NodeId, (u64, u64)>>,
     /// Whether every change of a node's refusal set is checked against a
     /// read of the whole journal (`SimConfig::refusal_crosscheck`).
-    pub refusal_crosscheck: std::sync::atomic::AtomicBool,
+    pub refusal_crosscheck: AtomicBool,
     /// Descriptions of I1 violations, in order (judged at emission, failed
     /// at the end of the run).
     pub i1_violations: Mutex<Vec<String>>,
@@ -844,7 +844,7 @@ impl Oracles {
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
             journal_scan: Mutex::new(BTreeMap::new()),
-            refusal_crosscheck: std::sync::atomic::AtomicBool::new(false),
+            refusal_crosscheck: AtomicBool::new(false),
             i1_violations: Mutex::new(Vec::new()),
             root_group_by_epoch: Mutex::new(Vec::new()),
             fence_audit: Mutex::new(FenceAudit::default()),

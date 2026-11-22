@@ -3684,9 +3684,13 @@ impl Driver {
         let mut scanned = 0u64;
         let mut start_over = prev.is_none() || tip < old_tip;
         if !start_over {
+            // (What sits above the old tip is read again below.)
+            self.refusal_rows.retain(|seq, _| *seq <= old_tip);
             let mut read = 0u64;
             if tip > old_tip {
-                scanned += self.read_refusals_from(old_tip + 1, &mut read);
+                let (n, rows) = self.read_refusals_from(old_tip + 1);
+                scanned += n;
+                read = rows;
             }
             let expected = old_len + read;
             if len > expected {
@@ -3712,13 +3716,16 @@ impl Driver {
         }
         if start_over {
             self.refusal_rows.clear();
-            scanned = self.read_refusals_from(0, &mut 0);
+            scanned += self.read_refusals_from(0).0;
         }
         {
             let mut scan = self.oracles.journal_scan.lock().unwrap();
             let c = scan.entry(self.id).or_default();
             c.0 += scanned;
-            c.1 += tip.saturating_sub(old_tip);
+            // (A first read has no earlier tip: the rows it finds are not new.)
+            if prev.is_some() {
+                c.1 += tip.saturating_sub(old_tip);
+            }
         }
         let refusals: BTreeSet<Rid> = self.refusal_rows.values().copied().collect();
         if self.oracles.refusal_crosscheck.load(Ordering::Relaxed) {
@@ -3740,15 +3747,16 @@ impl Driver {
         *self.shared.journaled_refusals.lock().unwrap() = refusals;
     }
 
-    /// Track the `Refused` rows of the journal from `from` up, adding the
-    /// rows read to `read`. Returns the rows read.
-    fn read_refusals_from(&mut self, from: u64, read: &mut u64) -> u64 {
+    /// Track the `Refused` rows of the journal from `from` up. Returns the
+    /// rows read (probes included) and the rows the journal gave from `from`.
+    fn read_refusals_from(&mut self, from: u64) -> (u64, u64) {
+        let mut read = 0u64;
         let txs = Replica::journal_txs_from(&*self.meta, from, usize::MAX);
         let mut scanned = 0u64;
         for tx in txs {
             let n = tx.records.len() as u64;
             scanned += n;
-            *read += n;
+            read += n;
             if !tx
                 .records
                 .iter()
@@ -3774,7 +3782,7 @@ impl Driver {
                 }
             }
         }
-        scanned
+        (scanned, read)
     }
 
     /// The journal row at `seq` (`None`: gone) and the rows read for it.
