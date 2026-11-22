@@ -12,7 +12,7 @@
 > `epoch-holder-retired` is fixed on main, `b5d53fe7`); the B4 A/B/B/A of
 > topologies 1–5 has run. M1.2 is not closed: still open are the
 > topology-2 forward-unlink slowdown (tmpfs +23 % p50), the `stress-ng-fs`
-> load failure, the quiet-box `hardlink-burst` gates, and the PROGRESS "M1.2
+> load failure, the quiet-box `hardlink-burst-single` and `hardlink-burst-two-node` gates, and the PROGRESS "M1.2
 > exit" and RESULTS.md entries. The fold, `MutateOp::Records` and
 > `RebuildReplica`'s non-delegation branch moved from M1.2 to M2.x (below). M1.3 steps 0–5, 7,
 > 8, 9, 10, 11 and 13, route fencing (ADR-47), the restart quarantine (ADR-46),
@@ -116,8 +116,8 @@ chosen for that, not for size.
   nodes needs both grants, and while one holder is lost mid-write it
   fails with `EXDEV` (`mv` falls back to copy and delete; `ln` fails, as
   POSIX allows) until the holder returns or `repair abandon` runs;
-  `delegations.md` (its hard-link section) says so in M1.3. `hardlink-burst`
-  and plan 45's box gates on four file systems are re-run at M1.2's exit.
+  `delegations.md` (its hard-link section) says so in M1.3. `hardlink-burst-single`
+  and `hardlink-burst-two-node` and plan 45's box gates on four file systems are re-run at M1.2's exit.
 - **Plan 42** (kernel race workarounds, done). Its invalidations follow
   applied log and stream entries, which this plan does not change; the
   `kernel-race-*` harness rows are part of M1.2's and M1.3's exits.
@@ -1222,7 +1222,7 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       group; I1/I2/I2c/I5 strict on every config including flex ×2,000;
       the harness catalogue green with the retired scenarios removed,
       including plan 40's, 41's, 42's (`kernel-race-*`) and 45's
-      (`hardlink-burst`, its box gates on four file systems) rows re-run at
+      (`hardlink-burst-single` and `-two-node`, their box gates on four file systems) rows re-run at
       M1.2's and M1.3's exits; G1–G6
       re-measured on four file systems; DESIGN, the feature docs and
       ADR-40 updated; the "Deleted" tables complete.

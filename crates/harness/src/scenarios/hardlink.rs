@@ -40,8 +40,21 @@
 //!   1,024 links of the burst average at most `HARDLINK_BURST_RATIO` times
 //!   the first 1,024 (the quadratic code is 40 times and more).
 //!
+//! Two scenarios run this burst. `hardlink-burst-single` is one node, with no
+//! backup and no replay (B's comparisons and the `ls`/`du` loop are skipped),
+//! and keeps the 0.7 s class of plan 45's close (reference `ac897d7b`).
+//! `hardlink-burst-two-node` is the burst above: since ADR-50 peer counting
+//! (`97f323e2`) each link waits one backup append and ack, so its link phase
+//! is several times the single node's; it has its own ceiling, which later
+//! round-trip speedups ratchet down. Each scenario fails when its link phase
+//! (the 8,192 links and the four `chmod`/append points, not the unlinks)
+//! takes longer than its ceiling, `SINGLE_UP_MS` and `TWO_NODE_UP_MS`; the
+//! measurements behind both are in `docs/how-to-guides/development/TESTING.md`.
+//!
 //! Sizes: `HARDLINK_BURST_LINKS` (8,192, the plan's), `HARDLINK_BURST_META_MIB`
-//! (64), `HARDLINK_BURST_RATIO` (20).
+//! (64), `HARDLINK_BURST_RATIO` (20), `HARDLINK_BURST_SINGLE_UP_MS` and
+//! `HARDLINK_BURST_TWO_NODE_UP_MS` (the ceilings; the check is off when the
+//! number of links is not the default).
 
 use super::eventually;
 use super::readdirplus::{env_usize, Fixture, Loop};
@@ -54,7 +67,44 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const NAME: &str = "hardlink-burst";
+/// Which of the two scenarios runs the burst.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// One node: no backup, no replay. The reference the burst's cost is
+    /// measured against (the 0.7 s class of plan 45's close).
+    Single,
+    /// Two nodes: every link waits one backup append and ack (ADR-50), and
+    /// the second node replays and lists under the burst.
+    TwoNode,
+}
+
+impl Variant {
+    fn name(self) -> &'static str {
+        match self {
+            Variant::Single => "hardlink-burst-single",
+            Variant::TwoNode => "hardlink-burst-two-node",
+        }
+    }
+
+    /// The default ceiling of the 8,192-link phase, in milliseconds, and the
+    /// variable that overrides it. See the module docs for how they were set.
+    fn up_ceiling_ms(self) -> (&'static str, usize) {
+        match self {
+            Variant::Single => ("HARDLINK_BURST_SINGLE_UP_MS", SINGLE_UP_MS),
+            Variant::TwoNode => ("HARDLINK_BURST_TWO_NODE_UP_MS", TWO_NODE_UP_MS),
+        }
+    }
+}
+
+/// Ceiling of the link phase on one node, milliseconds: about four times the
+/// quiet-box median of 12 runs (0.60 s; range 0.54 to 0.76 s); a shared box at
+/// load 30 measured up to 1.5 s.
+const SINGLE_UP_MS: usize = 2_500;
+/// Ceiling of the link phase with a backup, milliseconds: about four times the
+/// quiet-box median of 12 runs (2.70 s; range 2.68 to 2.75 s), the ADR-50
+/// backup round trip per link; a shared box at load 30 measured up to 7.8 s.
+/// Ratchet it down with each round-trip speedup.
+const TWO_NODE_UP_MS: usize = 10_000;
 
 /// What one name of the tree shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,13 +346,29 @@ fn check_shape(
     Ok(())
 }
 
-pub fn burst(_seed: u64) -> Result<()> {
+/// `hardlink-burst-single`: the burst on one node.
+pub fn single_node(_seed: u64) -> Result<()> {
+    run(Variant::Single)
+}
+
+/// `hardlink-burst-two-node`: the burst with a backup and a replaying node.
+pub fn two_node(_seed: u64) -> Result<()> {
+    run(Variant::TwoNode)
+}
+
+fn run(variant: Variant) -> Result<()> {
+    let name = variant.name();
+    let two = variant == Variant::TwoNode;
     let links = env_usize("HARDLINK_BURST_LINKS", 8192);
     let meta_max = env_usize("HARDLINK_BURST_META_MIB", 64) as u64 * (1 << 20);
     let ratio = env_usize("HARDLINK_BURST_RATIO", 20) as u32;
-    let mut fx = Fixture::new(NAME, &["a", "b"], &[], None, &[])?;
+    let names: &[&str] = if two { &["a", "b"] } else { &["a"] };
+    let mut fx = Fixture::new(name, names, &[], None, &[])?;
     let r = (|| -> Result<()> {
-        let (a, b) = (&fx.clients[0], &fx.clients[1]);
+        let a = &fx.clients[0];
+        let b = fx.clients.get(1);
+        // The node the trees are compared on; on one node, A itself.
+        let ob = b.unwrap_or(a);
         let da = a.mnt.join("d");
         let singles = 64usize;
         std::fs::create_dir(&da)?;
@@ -323,6 +389,7 @@ pub fn burst(_seed: u64) -> Result<()> {
             size: content.len() as u64,
         };
         let sync = |what: &str, want: &BTreeMap<String, Entry>| -> Result<()> {
+            let Some(b) = b else { return Ok(()) };
             eventually(what, Duration::from_secs(180), || {
                 let got = walk(&b.mnt)?;
                 let d = tree_diff(want, &got, 5);
@@ -335,7 +402,7 @@ pub fn burst(_seed: u64) -> Result<()> {
         sync("B holds the starting tree", &tree)?;
 
         // B lists and walks the directories while A changes them.
-        let lister = {
+        let lister = b.map(|b| {
             let (d, e) = (b.mnt.join("d"), b.mnt.join("e"));
             // A name that vanishes under a listing is the burst's own doing.
             let vanished = |r: Result<()>| match r {
@@ -348,7 +415,7 @@ pub fn burst(_seed: u64) -> Result<()> {
                 }
                 vanished(du(&d, true).map(|_| ()))
             })
-        };
+        });
 
         // ---- up: 1 -> 2 -> ... -> links + 1 names
         let target = |i: usize| -> String {
@@ -364,14 +431,20 @@ pub fn burst(_seed: u64) -> Result<()> {
         // The burst is timed in steady state: once A lists B as its backup
         // (ADR-50: one backup round trip per link). Before that its ops
         // commit by the archive, an S3 PUT each.
-        let b_id = super::m9::node_id(b)?;
         let t_wait = Instant::now();
-        let backups = super::m9::wait_for_backup(a, Duration::from_secs(60))?;
+        let backups = match b {
+            Some(b) => {
+                let b_id = super::m9::node_id(b)?;
+                let backups = super::m9::wait_for_backup(a, Duration::from_secs(60))?;
+                ensure!(
+                    backups == vec![b_id],
+                    "A lists {backups:?} as its backups, expected B ({b_id})"
+                );
+                backups
+            }
+            None => Vec::new(),
+        };
         let waited = t_wait.elapsed();
-        ensure!(
-            backups == vec![b_id],
-            "A lists {backups:?} as its backups, expected B ({b_id})"
-        );
         let t_up = Instant::now();
         for i in 0..links {
             let t = Instant::now();
@@ -399,7 +472,7 @@ pub fn burst(_seed: u64) -> Result<()> {
         tree = walk(&a.mnt)?;
         check_shape(&tree, &extras, links as u64 + 1, &want, singles)?;
         sync("B holds the top of the burst", &tree)?;
-        let (up_a, up_b) = (replica_bytes(a), replica_bytes(b));
+        let (up_a, up_b) = (replica_bytes(a), replica_bytes(ob));
 
         let lai_a: Vec<String> = ["d", "e"]
             .iter()
@@ -410,7 +483,7 @@ pub fn burst(_seed: u64) -> Result<()> {
             Duration::from_secs(60),
             || {
                 for (d, want) in ["d", "e"].iter().zip(&lai_a) {
-                    let got = ls_lai(&b.mnt.join(d))?;
+                    let got = ls_lai(&ob.mnt.join(d))?;
                     ensure!(&got == want, "ls -lai {d} differs on B");
                 }
                 Ok(())
@@ -421,7 +494,7 @@ pub fn burst(_seed: u64) -> Result<()> {
             "B's du equals A's at the top",
             Duration::from_secs(60),
             || {
-                let got = [du(&b.mnt, true)?, du(&b.mnt, false)?];
+                let got = [du(&ob.mnt, true)?, du(&ob.mnt, false)?];
                 ensure!(got == du_top, "du on B {got:?}, on A {du_top:?}");
                 Ok(())
             },
@@ -439,7 +512,9 @@ pub fn burst(_seed: u64) -> Result<()> {
             "meta.db at the top of the burst: A {up_a} bytes, B {up_b} bytes, bound {meta_max}"
         );
         fsck_clean(a, "at the top")?;
-        fsck_clean(b, "at the top")?;
+        if let Some(b) = b {
+            fsck_clean(b, "at the top")?;
+        }
 
         // ---- down: unlink every extra name, back to one
         let t_down = Instant::now();
@@ -462,7 +537,10 @@ pub fn burst(_seed: u64) -> Result<()> {
             }
         }
         let down = t_down.elapsed();
-        let looped = lister.finish().context("B's ls/du loop")?;
+        let looped = match lister {
+            Some(l) => l.finish().context("B's ls/du loop")?,
+            None => 0,
+        };
         tree = walk(&a.mnt)?;
         check_shape(&tree, &[], 1, &want, singles)?;
         ensure!(
@@ -470,7 +548,7 @@ pub fn burst(_seed: u64) -> Result<()> {
             "an extra name is still on A"
         );
         sync("B holds the bottom of the burst", &tree)?;
-        let (down_a, down_b) = (replica_bytes(a), replica_bytes(b));
+        let (down_a, down_b) = (replica_bytes(a), replica_bytes(ob));
         let lai_a: Vec<String> = ["d", "e"]
             .iter()
             .map(|d| ls_lai(&a.mnt.join(d)))
@@ -480,7 +558,7 @@ pub fn burst(_seed: u64) -> Result<()> {
             Duration::from_secs(60),
             || {
                 for (d, want) in ["d", "e"].iter().zip(&lai_a) {
-                    let got = ls_lai(&b.mnt.join(d))?;
+                    let got = ls_lai(&ob.mnt.join(d))?;
                     ensure!(&got == want, "ls -lai {d} differs on B");
                 }
                 Ok(())
@@ -491,7 +569,7 @@ pub fn burst(_seed: u64) -> Result<()> {
             "B's du equals A's at the bottom",
             Duration::from_secs(60),
             || {
-                let got = [du(&b.mnt, true)?, du(&b.mnt, false)?];
+                let got = [du(&ob.mnt, true)?, du(&ob.mnt, false)?];
                 ensure!(got == du_bottom, "du on B {got:?}, on A {du_bottom:?}");
                 Ok(())
             },
@@ -501,8 +579,10 @@ pub fn burst(_seed: u64) -> Result<()> {
             "meta.db at the bottom: A {down_a} bytes, B {down_b} bytes, bound {meta_max}"
         );
         fsck_clean(a, "at the bottom")?;
-        fsck_clean(b, "at the bottom")?;
-        super::ensure_no_conflicts(&[a, b])?;
+        if let Some(b) = b {
+            fsck_clean(b, "at the bottom")?;
+        }
+        super::ensure_no_conflicts(&fx.clients.iter().collect::<Vec<_>>())?;
 
         // The cost of a link does not grow with the names.
         let window = 1024.min(links / 2).max(1);
@@ -510,7 +590,7 @@ pub fn burst(_seed: u64) -> Result<()> {
         let mut sorted = took.clone();
         sorted.sort();
         eprintln!(
-            "    {NAME}: A listed backup {backups:?} after {waited:?}; {links} links in {up:?} \
+            "    {name}: A listed backup {backups:?} after {waited:?}; {links} links in {up:?} \
              (first {window} avg {first:?}, last {window} avg {last:?}, p50 {:?}, p99 {:?}, \
              max {:?}), {links} unlinks in {down:?}; B's ls/du loop ran {looped} times; \
              meta.db top A {up_a} B {up_b}, bottom A {down_a} B {down_b} bytes; \
@@ -518,6 +598,13 @@ pub fn burst(_seed: u64) -> Result<()> {
             percentile(&sorted, 0.5),
             percentile(&sorted, 0.99),
             sorted[sorted.len() - 1],
+        );
+        let (ceiling_var, ceiling_default) = variant.up_ceiling_ms();
+        let ceiling = Duration::from_millis(env_usize(ceiling_var, ceiling_default) as u64);
+        // The ceiling is for the full burst; a smaller one is not comparable.
+        ensure!(
+            links != 8192 || up <= ceiling,
+            "{links} links took {up:?}, over this scenario's ceiling {ceiling:?} ({ceiling_var})"
         );
         ensure!(
             last <= first * ratio,

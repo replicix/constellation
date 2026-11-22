@@ -359,7 +359,10 @@ under a timeout.
   unlinks of one file on node A while node B replays; both roots equal;
   `ls -la` on B equals A; `meta.db` under 64 MB on both; `du` equal. The
   xcheckfs stress lane **keeps `--link 1`** in its mix with the normal bound
-  (decided, §9). *Landed 2026-10-29.*
+  (decided, §9). *Landed 2026-10-29.* The scenario was split on 2026-11-22 into
+  `hardlink-burst-single` and `hardlink-burst-two-node` (ADR-50: with a backup
+  each link waits one append and ack), each with its own ceiling on the link
+  phase (`docs/how-to-guides/development/TESTING.md`, "Hard links").
 - **H5 — Docs.** `DESIGN.md`'s statement of the dentry value forms is
   proposed text recorded in PROGRESS (CONVENTIONS rule 5), plan 28 §P6's
   dated pointer to this plan (done with the plan), `docs/reference`'s

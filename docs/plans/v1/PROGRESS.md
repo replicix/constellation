@@ -71827,3 +71827,18 @@ held-own with two clients per node, the shape its seeds were found in (its timin
 without it (they pass). Logs: the job's README.
 Fail-before: with the strict branch of `own_stream_observed_rolled_back` off the new entry still fails seeds (by step 2's message); with the
 witnessed check's step 2 and step 3 failures also off it fails "no seed failed an oracle".
+
+## Hard-link burst split (hlsplit, 2026-11-22)
+
+The harness scenario `hardlink-burst` is now two scenarios, by the user's decision of 2026-11-17: `hardlink-burst-single` (one node, no backup, no replay) keeps the 0.7 s class of plan 45's close (`ac897d7b`), and `hardlink-burst-two-node` has its own target, the ADR-50 backup round trip each link now waits for (`97f323e2`). The old name is gone (no other scenario, parity entry or workflow named it; `k8s/parity.rs` lists both new names as local-only for `REPLICA_DISK`).
+
+Each scenario fails when its 8,192-link phase exceeds a ceiling (`SINGLE_UP_MS`, `TWO_NODE_UP_MS` in `scenarios/hardlink.rs`, overridable by `HARDLINK_BURST_SINGLE_UP_MS` and `HARDLINK_BURST_TWO_NODE_UP_MS`); before this the scenario bounded only the growth ratio, never the time.
+
+Quiet-box timing (12 interleaved runs of each, release build of `d835dac0`, seed 42, idle 16-core box, 24 of 24 passed):
+
+| scenario | median | p90 | range | p50 per link |
+|---|---|---|---|---|
+| `hardlink-burst-single` | 0.60 s | 0.74 s | 0.54 to 0.76 s | 58 to 87 us |
+| `hardlink-burst-two-node` | 2.70 s | 2.73 s | 2.68 to 2.75 s | 136 to 145 us |
+
+Ceilings: 2.5 s and 10 s, about four times the medians, so a loaded shared box (load 30: 0.7 to 1.5 s and 6.8 to 7.8 s measured) still passes while a regression of the 7x kind fails. The two-node ceiling is to be ratcheted down by the append, persist and ack round-trip speedups; `TESTING.md` "Hard links" gives the re-measure procedure. This closes the M1.2 review's R3 setup item (the two-node target); R3's four-file-system box gates still run both scenarios.

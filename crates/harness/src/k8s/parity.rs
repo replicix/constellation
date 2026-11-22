@@ -679,7 +679,8 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("readdir-huge-delete", Skip::Local(&[READDIR_KNOBS, WRITE_MODE])),
     ("readdir-seekdir-after-delete", Skip::Local(&[KILL, WRITE_MODE])),
     ("readdir-many-open-dirs", Skip::Local(&[READDIR_KNOBS, WRITE_MODE, RSS])),
-    ("hardlink-burst", Skip::Local(&[REPLICA_DISK])),
+    ("hardlink-burst-single", Skip::Local(&[REPLICA_DISK])),
+    ("hardlink-burst-two-node", Skip::Local(&[REPLICA_DISK])),
     (
         "session-handover-idle",
         Skip::Covered(

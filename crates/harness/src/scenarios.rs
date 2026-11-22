@@ -1865,11 +1865,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: readdir_pins::many_open_dirs,
     },
     Scenario {
-        name: "hardlink-burst",
-        desc: "plan 45 H4: two nodes; one links a file 8192 times (a chmod and an append at four points on the way up), then unlinks every extra name (a chmod and a truncate at three), while the other replays and loops ls -lai and du; at the top and the bottom the other's tree equals the first's name for name (mode, link count, size, inode, mtime, ctime, content), its ls -lai and du are the same, each meta.db is under 64 MiB and fsck is clean, and a link at 8192 names costs at most 20 times one at 1",
+        name: "hardlink-burst-single",
+        desc: "plan 45 H4: one node links a file 8192 times (a chmod and an append at four points on the way up), then unlinks every extra name (a chmod and a truncate at three); the tree is what the burst should have produced (link count, mode, size, one inode counted once by du), meta.db is under 64 MiB and fsck is clean, a link at 8192 names costs at most 20 times one at 1, and the link phase stays under its ceiling (the 0.7 s class reference of plan 45's close)",
         requires: &[],
         caps: &[Cap::HardLinks],
-        run: hardlink::burst,
+        run: hardlink::single_node,
+    },
+    Scenario {
+        name: "hardlink-burst-two-node",
+        desc: "plan 45 H4: two nodes; one links a file 8192 times once it lists the other as its backup (each link waits one backup append and ack, ADR-50), then unlinks every extra name, while the other replays and loops ls -lai and du; at the top and the bottom the other's tree equals the first's name for name (mode, link count, size, inode, mtime, ctime, content), its ls -lai and du are the same, each meta.db is under 64 MiB and fsck is clean, a link at 8192 names costs at most 20 times one at 1, and the link phase stays under its ceiling (the backup round-trip cost, to be ratcheted down)",
+        requires: &[],
+        caps: &[Cap::HardLinks],
+        run: hardlink::two_node,
     },
     Scenario {
         name: "session-handover-idle",

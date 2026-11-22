@@ -3355,23 +3355,50 @@ Ad hoc, an engine-level measurement of listing time is the ignored test
 
 ## Hard links (plan 45)
 
-`hardlink-burst` (`crates/harness/src/scenarios/hardlink.rs`) is the system
-check of plan 45's rule (a dentry carries the attribute copy only while its
-inode has one name; ADR-36). Two nodes: A links one file 8,192 times over two
-directories, with a `chmod` and an append at four points on the way up, then
-unlinks every extra name, with a `chmod` and a truncate at three points on the
-way down; B replays, and meanwhile loops `ls -lai` and `du`. At the top and at
-the bottom, once B has caught up: B's tree equals A's name for name (kind,
-mode, owner, link count, size, inode, mtime, ctime, content), and A's tree is
-what the burst should have produced (so an equal-but-wrong pair fails);
-`ls -lai` prints the same text on both and `du` is equal and counts the file
-once; each `meta.db` is under 64 MiB (before the plan: 150 to 215 MB at the
-top, 773 MB for `stress-ng link`); `fsck` is clean on both; no conflicts; and
-the last 1,024 links average at most 20 times the first 1,024 (the quadratic
-code is 40 times and more). Sizes: `HARDLINK_BURST_LINKS` (8,192),
-`HARDLINK_BURST_META_MIB` (64), `HARDLINK_BURST_RATIO` (20). The comparison
-and the shape check have unit tests (`cargo test -p constellation-harness
-hardlink`). The xcheckfs stress lane keeps `--link 1` in its mix.
+`hardlink-burst-single` and `hardlink-burst-two-node`
+(`crates/harness/src/scenarios/hardlink.rs`; one burst, two scenarios since
+2026-11-22) are the system check of plan 45's rule (a dentry carries the
+attribute copy only while its inode has one name; ADR-36). Node A links one
+file 8,192 times over two directories, with a `chmod` and an append at four
+points on the way up, then unlinks every extra name, with a `chmod` and a
+truncate at three points on the way down. In the two-node scenario B replays,
+and meanwhile loops `ls -lai` and `du`; the single-node scenario has no B (its
+comparisons run on A, and nothing else loads the mount while the links are
+timed). At the top and at the bottom, once B has caught up: B's tree equals
+A's name for name (kind, mode, owner, link count, size, inode, mtime, ctime,
+content), and A's tree is what the burst should have produced (so an
+equal-but-wrong pair fails); `ls -lai` prints the same text on both and `du`
+is equal and counts the file once; each `meta.db` is under 64 MiB (before the
+plan: 150 to 215 MB at the top, 773 MB for `stress-ng link`); `fsck` is clean;
+no conflicts; and the last 1,024 links average at most 20 times the first
+1,024 (the quadratic code is 40 times and more). Sizes:
+`HARDLINK_BURST_LINKS` (8,192), `HARDLINK_BURST_META_MIB` (64),
+`HARDLINK_BURST_RATIO` (20). The comparison and the shape check have unit
+tests (`cargo test -p constellation-harness hardlink`). The xcheckfs stress
+lane keeps `--link 1` in its mix.
+
+Each scenario also bounds the time of its 8,192-link phase (the links and the
+four `chmod`/append points, not the unlinks):
+
+| scenario | quiet-box median (12 runs) | range | ceiling | variable |
+|---|---|---|---|---|
+| `hardlink-burst-single` | 0.60 s | 0.54 to 0.76 s | 2.5 s | `HARDLINK_BURST_SINGLE_UP_MS` |
+| `hardlink-burst-two-node` | 2.70 s | 2.68 to 2.75 s | 10 s | `HARDLINK_BURST_TWO_NODE_UP_MS` |
+
+The single-node time keeps the 0.7 s class plan 45 closed at (`ac897d7b`). The
+two-node time is the ADR-50 backup round-trip cost: since peer counting
+(`97f323e2`) each link waits one backup append and ack (about 140 us p50 on a
+quiet box), which the single node does not pay; it is a ceiling relaxation the
+user decided on 2026-11-17 (split the scenario, set the two-node target from
+the measurement, ratchet it down with round-trip speedups). The ceiling is
+about four times the quiet-box median, not the 2x of the range used for other
+bounds here, because the scenarios also run on shared boxes: a loaded box
+(load 30 of 16 cores) measured 0.7 to 1.5 s and 6.8 to 7.8 s, which pass. A
+regression like the 7x of 2026-11-16 (about 4.2 s and 19 s here) fails both. The quiet-box median is the
+target; when a speedup lands, re-measure (12 runs on an idle box, one release
+build, `harness run <name> --seed 42`, the line printed as `8192 links in`)
+and lower the constants `SINGLE_UP_MS` and `TWO_NODE_UP_MS`. The check is off
+when `HARDLINK_BURST_LINKS` is not 8,192.
 
 ## Linux FUSE client races (plan 42)
 
