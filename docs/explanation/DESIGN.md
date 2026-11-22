@@ -1088,7 +1088,14 @@ a grant goes to a *node* and covers a set of subtrees under one stream:
   releases one subtree; `at` is the last stream index that touched it) and
   `StreamReleased { node, gen, through }` (it releases every subtree: an
   unmount, a suspension, `constellation release`); the generation itself
-  ends with the root's `DelegateNodeEnded`. The table
+  ends with the root's `DelegateNodeEnded`. The holder applies its own
+  release rows ahead of the log, so a whole release empties its view of the
+  stream at once, and a grow the root journaled before it appended the row can
+  reach the holder afterwards: a holder that released its whole stream takes
+  up no subtree of it again while the stream is live, and such a grow ends
+  with the stream, by the root's `DelegateNodeEnded`
+  ([ADR-64](DECISIONS.md#adr-64-a-release-cuts-first-the-holders-stop-is-a-stream-row-and-settles-are-answered-there),
+  the WP6.2 amendment). The table
   (`DelegationTable`, one `NodeStream` per `(node, gen)` with an index from
   each subtree's directory) is these records applied in log order; a commit
   carries it and a bootstrapped replica learns it from the head commit. A

@@ -71880,3 +71880,32 @@ Every btrfs fix cell is below every base cell. Create p99 is unchanged within no
 
 Docs: `DESIGN.md` and `durability-and-failover.md` no longer say the daemon takes the read at once; ADR-50's consequences gain one bullet (no decision change).
 
+
+## WP6.2: a holder's whole release, then a late grow (2026-11-22)
+
+Sim seed 1264 of `sticky-s4-merge` and of `sticky-s4-root-restart` with the idle release (`AUTHORITY_SIM_STICKY_IDLE_MS=1200`) failed `acked_at_or_below_cut`: a Final row answered past the stream's cut (an acknowledged `ok` that the root voided and re-executed by rid). The root grew the sticky stream by two subtrees, then ended the whole generation at the holder's whole release, which the holder decided on a view without them. The holder's table, ahead of the log, filled the stream again from the grow, and the generation was installed once more. The guard against that existed (`handed_back`, which the install gate refuses a generation by) but was dropped too early: it was kept while the table listed a *subtree* of the generation, and a whole release empties that set at once while the stream lives until the root's `DelegateNodeEnded`. See the ADR-64 amendment "A whole release ends grows it did not see (WP6.2)" and the DESIGN.md records paragraph.
+
+Fix: `delegation_sync` keeps the `handed_back` entry while the table lists the *stream* (the install gate counts a skip in `deleg_install_released_whole`); a restart loses the entry, so a generation whose table lists subtrees while this node's journal still holds its unshipped whole-release row is installed as the remnant of that release (stopped, no subtree). No root change: the root's recall guard already refuses a grow once it knows of a release, and appending a whole release sets the recall.
+
+Tests (core, `step5_sticky_release`): `a_late_grow_after_a_whole_release_is_not_taken_up`, `a_restart_after_a_late_grow_does_not_take_the_grown_subtree_up`, `an_unreadable_journal_installs_no_stream_with_a_late_grow_and_retries` (the restart guard fails closed on a journal read error) and the guard `a_late_grow_while_the_release_row_is_unacknowledged_executes_nothing`; the sim pins `a_whole_release_ends_the_grows_it_did_not_see_merge` and `_root_restart` (seed 1264, idle release). On the tests-only commit the first two core tests and both pins fail (the pins with `acked_at_or_below_cut`, the late-grow test with "the late grow was taken up"); with the `handed_back` change alone the restart test still fails, so the remnant change is needed; reverting the `handed_back` retain change on the fix tree fails the first test again. Six existing restart-model tests now also clear `handed_back`, which a restart loses.
+
+Gates on the final tip (rebased on `edb21c0e`; fmt, clippy `-D warnings`, workspace lib tests in debug and release all green, the authority lib 1862 passed; release authority sim suite 617 passed, 0 failed, m03 ceilings unchanged; harness lib 166 passed; `sim-determinism-gate` 8 labels x 300 seeds identical at 1 and 2 threads; smoke seed 42 passed for `fresh-node-bootstrap`, `stress-ng-fs`, `singleton-peer-join` and `unmount-drain`).
+
+Sweeps, base (`3238bea6`) against the fix, 2,000 seeds per cell for every `sticky-*` label (27), 300 seeds for the 29 `locks-*delegated*` labels (plain and `lr`); arms plain, idle (`AUTHORITY_SIM_STICKY_IDLE_MS=1200`) and lr (`AUTHORITY_SIM_LEASE_READS=0:0:800:1000`). The 100-seed pilot of the two slow s4 labels took about 130 s per arm and tree on 3 threads, which sized them at 2,000 seeds. Failing seeds, base to fix; every label not listed is 0 to 0 in every arm it ran, and no cell has a seed the base does not have:
+
+| label | plain | idle | lr |
+|---|---|---|---|
+| `sticky-s4-merge` | 0 to 0 | 6 to 5 (1264 fixed) | 48 to 48 |
+| `sticky-s4-root-restart` | 0 to 0 | 3 to 2 (1264 fixed) | 7 to 7 |
+| `sticky-s4-leave` | 0 to 0 | 15 to 15 | 3 to 3 |
+| `sticky-handover-busy` | 1 to 1 | 1 to 1 | 0 to 0 |
+| `sticky-leave` | 0 to 0 | 1 to 1 | 3 to 3 |
+| `sticky-leave-root` | 0 to 0 | 0 to 0 | 2 to 2 |
+| `sticky-root-designee-inbox`, `-skew` | 0 to 0 | 1 to 1 each | 0 to 0 |
+| `locks-unlinked-delegated-blips` (300) | 0 to 0 | not run | 29 to 29 |
+| `locks-unlinked-delegated-blips-late-applied` (300) | 0 to 0 | not run | 30 to 30 |
+| `locks-writer-hold-delegated-unsettled-own-clock` (300) | 1 to 1 | not run | 1 to 1 |
+
+Round 2 (final tip against `edb21c0e`): idle arm 2,000 seeds of `sticky-s4-merge` and `sticky-s4-root-restart` (chunks of 500), `sticky-s4-leave` and `sticky-leave`, and the plain arm at 300 seeds on all 27 `sticky-*` labels: `sticky-s4-merge` idle 6 to 5 and `sticky-s4-root-restart` idle 3 to 2 (1264 fixed in both), every other cell identical, no new failing seed.
+
+The 151 failing seeds both trees share fail with the same message class on both. The remaining failures are the known classes of the earlier rounds (TRIAGE), not touched here. Open, tracked as WP6.2b (a durable released-whole mark): the restart guard (C) lasts only while the release row is in the journal. Once the row has shipped and been applied, the holder's own table still lists the grown subtrees until the root's end is applied (the holder's own rows are not re-folded when a segment is applied), so the window "release row applied, end not yet, the holder restarts" is open. It is not closed by this change and no test or sweep covers it.

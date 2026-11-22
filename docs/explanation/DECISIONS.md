@@ -6560,6 +6560,60 @@ executed, so the cut is a row.
   `AUTHORITY_SIM_NO_RELEASE_CUT=1`) false restores the held release.
 - **ADR-48 / D11.** D11 no longer carries S4. It stays for the parked settle's
   `Held` outwait.
+- **A whole release ends grows it did not see (WP6.2, 2026-11-22).** The
+  holder applies its own release rows from its journal ahead of the log, so a
+  `StreamReleased` empties its view of the stream at once while the stream
+  lives until the root's `DelegateNodeEnded`. A root that grew the stream
+  (`DelegateNode` on a live generation) before it appended the release row
+  ends the whole generation, the grown subtrees included, at the holder's
+  release, which was decided on a view without them. The holder's table then
+  folded the grow back in, the generation was installed again, and it
+  answered a Final row past the root's cut (sim `sticky-s4-merge` and
+  `sticky-s4-root-restart`, seed 1264, idle release:
+  `acked_at_or_below_cut`). The rule: a holder that released its whole stream
+  takes up none of its subtrees again while the stream is live; a grow its
+  release did not see ends with the stream, at the root's `DelegateNodeEnded`.
+  - *Holder.* The `handed_back` entry that `release_subtrees` makes for a
+    whole release (and that the install gate refuses a generation by) is kept
+    while the table lists the *stream*, not while it lists a subtree of it
+    (`DelegationTable::gens`, as `release_first` and `installed_gens`
+    already are). Lock requests for the generation go to the root until its
+    end is applied, as the field's contract always said. A restart loses the
+    entry: a generation whose subtrees the table lists, whose release row is
+    still in this node's journal unshipped, is installed as the remnant of
+    that release (stopped, holding the row, no subtree); a journal that
+    cannot be read installs nothing for it now and syncs again. **Open
+    (WP6.2b):** this restart guard lasts only while the release row is in
+    the journal. Once the row has shipped and been applied, the holder's own
+    table still lists the grown subtrees until the root's end is applied
+    (the holder's own rows are not re-folded when a segment is applied), so
+    the window "release row applied, end not yet, the holder restarts" is
+    open. It is tracked as WP6.2b (a durable released-whole mark), not
+    closed here.
+  - *Root.* No new code. A grow is refused once the root knows of a release or
+    a recall (`delegate_dir` on `g.recall`), and appending a whole release
+    sets the recall to `Drained`, so no grow follows `StreamReleased` in the
+    log. The release the root cannot see yet (decided on the holder's view
+    before its row arrives) cannot be closed at the root without a handshake,
+    and needs none: the holder never serves the grow.
+  - *Rejected: the root keeps the grown subtrees live.* It conflicts with the
+    fold, in which `StreamReleased` follows the grow in log order, so every
+    replica's table (the root's included) already returns the grown subtrees
+    to the root. It would split the core's `GenState` from its own table,
+    reverse step 10's "`StreamReleased` releases every subtree", and delegate
+    subtrees to a holder that streams nothing, with no expiry for a sticky
+    stream: they would be lost.
+  - *Reach.* A whole release decided on a view lacking a grow the root already
+    journaled, then the holder's state dropped after the root's
+    acknowledgement and before the segment carrying the grow. Idle release,
+    `constellation release` of everything, unmount, suspend and a handover of
+    everything the holder holds reach it in principle. The holder's own leave
+    (`leave_self`), the root's recalls (`delegate_dir` refuses grows during a
+    recall), the root's own stream and a claim of the lease have their own
+    guards.
+  - *Invariants.* I1, I2, I2c and I5 lose a copy rather than gain one; I4 is
+    unchanged (an op under a grown subtree is forwarded to the root and
+    decided once). No ADR-55 or ADR-60 behaviour changes.
 
 **Evidence** (round 6, the tag rebuilt; 2,000 seeds per label on the final tree). The strict S4 tag is one predicate on both
 arms: a held-release span (the control) or a cut span per subtree (the fix) overlapped the `EIO`'s window, and the requester,
