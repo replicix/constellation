@@ -173,6 +173,11 @@ pub struct Oracles {
     /// Answers whose requester-side mapping `(sequencer, req) -> rid` was
     /// missing (must be 0).
     pub acks_unmapped: AtomicU64,
+    /// Per node: journal rows `Driver::note_journaled_refusals` read, and
+    /// journal rows appended (the journal tip's growth). The first is
+    /// what the second costs: linear when the refusal set is kept
+    /// incrementally.
+    pub journal_scan: Mutex<BTreeMap<NodeId, (u64, u64)>>,
     /// Descriptions of I1 violations, in order (judged at emission, failed
     /// at the end of the run).
     pub i1_violations: Mutex<Vec<String>>,
@@ -835,6 +840,7 @@ impl Oracles {
             invoked: Mutex::new(HashSet::new()),
             tick: AtomicU64::new(1),
             acks_unmapped: AtomicU64::new(0),
+            journal_scan: Mutex::new(BTreeMap::new()),
             i1_violations: Mutex::new(Vec::new()),
             root_group_by_epoch: Mutex::new(Vec::new()),
             fence_audit: Mutex::new(FenceAudit::default()),

@@ -3662,8 +3662,17 @@ impl Driver {
         if self.journal_seen == Some(seen) {
             return;
         }
+        let appended = seen.0.saturating_sub(self.journal_seen.map_or(0, |(tip, _)| tip));
         self.journal_seen = Some(seen);
-        let refusals: BTreeSet<Rid> = Replica::journal_txs_from(&*self.meta, 0, usize::MAX)
+        let txs = Replica::journal_txs_from(&*self.meta, 0, usize::MAX);
+        let scanned: usize = txs.iter().map(|tx| tx.records.len()).sum();
+        {
+            let mut scan = self.oracles.journal_scan.lock().unwrap();
+            let c = scan.entry(self.id).or_default();
+            c.0 += scanned as u64;
+            c.1 += appended;
+        }
+        let refusals: BTreeSet<Rid> = txs
             .into_iter()
             .flat_map(|tx| tx.records)
             .filter_map(|rec| match rec {

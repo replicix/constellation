@@ -1751,6 +1751,9 @@ pub struct Report {
     pub unjournaled_landed: usize,
     /// Answers with no recorded request (must be 0).
     pub acks_unmapped: usize,
+    /// Per node: `(journal rows the refusal bookkeeping read, journal rows
+    /// appended)`.
+    pub journal_scan: BTreeMap<NodeId, (u64, u64)>,
     /// I2 (b): rids queued on two nodes at once; (c): answered under a
     /// group class but not completed verbatim in the log.
     pub identity_copies: usize,
@@ -8463,6 +8466,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.acks_unmapped = oracles
         .acks_unmapped
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    report.journal_scan = oracles.journal_scan.lock().unwrap().clone();
     report.identity_copies = found.i2.len();
     report.identity_copies_ungated = found.i2_ungated.len();
     report.identity_foreign_gated = found.i2_foreign_gated.len();

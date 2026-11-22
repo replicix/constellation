@@ -24490,6 +24490,31 @@ fn s4_fix_pin(label: &str, config: fn() -> SimConfig, seed: u64) {
     assert_eq!(fix.exec_in_cut, 0);
 }
 
+/// The refusal bookkeeping (`Driver::note_journaled_refusals`) reads the
+/// journal rows a change appended, not the whole journal again: on one
+/// `sticky-s4-merge` seed the rows it read stay within one and a half times the rows
+/// appended, per node and in all. Re-reading the journal on every change
+/// made that quadratic in the journal's length.
+#[test]
+fn the_refusal_bookkeeping_reads_each_journal_row_a_bounded_number_of_times() {
+    let r = run_seed(0, sticky_s4_merge_config())
+        .unwrap_or_else(|e| panic!("sticky-s4-merge seed 0 failed: {e}"));
+    let (mut scanned, mut appended) = (0u64, 0u64);
+    for (node, (s, a)) in &r.journal_scan {
+        assert!(
+            2 * *s <= 3 * *a,
+            "node {node} read {s} journal rows for {a} appended"
+        );
+        scanned += s;
+        appended += a;
+    }
+    assert!(appended > 0, "no journal row was appended: nothing measured");
+    assert!(
+        2 * scanned <= 3 * appended,
+        "{scanned} journal rows read for {appended} appended"
+    );
+}
+
 /// Round 9 (review 3, MUST-2): seed 73 of `sticky-s4-merge`. The cut row of
 /// `d5` wakes the requester's settle out of `AcquireRetry`, the fenced root
 /// answers `Busy`, and the settle backs off past the second deadline while
