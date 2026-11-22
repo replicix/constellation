@@ -321,6 +321,7 @@ fn replay_seed() {
         Ok("far-root-writes") => far_root_writes_config(),
         Ok("far-root-writes-paused") => far_root_writes_paused_config(),
         Ok("far-root-writes-shared") => far_root_writes_shared_config(),
+        Ok("far-root-writes-shared-designee-runs") => far_root_writes_shared_designee_runs_config(),
         Ok("far-root-writes-cross") => far_root_writes_cross_config(),
         Ok("far-root-writes-held-own") => far_root_writes_held_own_config(),
         Ok("far-placement") => far_placement_config(),
@@ -2152,6 +2153,20 @@ fn far_root_writes_shared_config() -> SimConfig {
         ops_per_client: 30,
         client_plan: vec![(2, 1_700, 8), (3, 1_700, 8)],
         ..far_root_writes_config()
+    }
+}
+
+/// WP6.1's control: `far-root-writes-shared` with the two ADR-47 fault knobs
+/// that make a designee run an inbox-ever non-settle forward instead of
+/// fencing it (`fence_accepts_unrouted`) or the root refusing it in the
+/// stream (`holder_runs_inbox_ever`). A requester's reroute on a lease view
+/// older than its own tenure then shows as a refusal beside an execution of
+/// one rid (`refused_and_completed`, `nonholder_refused_a_designee_ran`).
+fn far_root_writes_shared_designee_runs_config() -> SimConfig {
+    SimConfig {
+        fence_accepts_unrouted: true,
+        holder_runs_inbox_ever: true,
+        ..far_root_writes_shared_config()
     }
 }
 
@@ -8255,6 +8270,7 @@ fn base_config(label: &str) -> SimConfig {
         "far-root-writes" => far_root_writes_config(),
         "far-root-writes-paused" => far_root_writes_paused_config(),
         "far-root-writes-shared" => far_root_writes_shared_config(),
+        "far-root-writes-shared-designee-runs" => far_root_writes_shared_designee_runs_config(),
         "far-root-writes-cross" => far_root_writes_cross_config(),
         "far-root-writes-held-own" => far_root_writes_held_own_config(),
         "far-placement" => far_placement_config(),
@@ -10690,6 +10706,7 @@ fn fingerprint(result: &Result<Report, String>) -> String {
             "inbox_ever_fenced",
             "inbox_local_withdrawals",
             "inbox_ever_rerouted",
+            "inbox_ever_settle_rerouted",
             "inbox_hold_root_unknown",
             "inbox_hold_root_sent",
             "inbox_hold_root_local",
@@ -23404,6 +23421,32 @@ fn a_restarted_root_does_not_depend_on_its_own_unshipped_appends() {
 fn a_stream_holder_drops_its_own_streams_held_rows() {
     run_seed(326, config_variant(far_placement_config(), "lost-chunk"))
         .unwrap_or_else(|e| panic!("far-placement+lost-chunk seed 326: {e}"));
+}
+
+/// WP6.1 (`far-root-writes-shared` with slow lease reads, seed 1621, I1): node
+/// 3 took the lease at epoch 2 while its settle of an op in its epoch-1 inbox
+/// batch was under way, and a lease read 800-1000 ms late (holder 1, epoch 1)
+/// sent the op over P2P to node 1, the sticky designee. The designee refused
+/// the settle for good (`ABANDONED`) beside the new root's drain, which refused
+/// the batch's copy (`EROFS`): two sequencers for one rid. A node that holds
+/// the lease or knows a newer epoch no longer reroutes on such a read, and a
+/// `Fenced` settle of an untouched inbox-ever rid is not resent to the
+/// designee. Failed on 6474e424.
+#[test]
+fn far_root_writes_shared_lr_seed_1621() {
+    let config = SimConfig {
+        lease_reads: sim::store::SlowReads {
+            before: (0, 0),
+            reply: (800, 1_000),
+        },
+        ..far_root_writes_shared_config()
+    };
+    run_seed(1621, config).unwrap_or_else(|e| {
+        panic!(
+            "seed 1621: {e}\n  replay with AUTHORITY_SIM_CONFIG=far-root-writes-shared \
+             AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
 }
 
 /// ADR-47 rule 2 for an inbox-ever rid (every final designation refusal,

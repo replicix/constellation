@@ -86627,6 +86627,75 @@ mod route_fence_executor {
         assert_eq!(h.core.stats.fenced_resends, 0);
     }
 
+    /// WP6.1 (seed 1621, requester side): a settle of an untouched
+    /// inbox-ever rid, sent routed 0 to a designee, comes back `Fenced`. The
+    /// root decides such a settle (ADR-47 rule 2), so it is not resent to
+    /// the designee routed by its generation (that touches the rid there
+    /// alone and the designee refuses it for good beside the root's drain).
+    /// It is routed afresh. Control: a settle that touched a generation
+    /// before is resent routed by it, as before. Fails on the parent: the
+    /// first half resends to node 3 routed by 7.
+    #[test]
+    fn a_fenced_settle_of_an_untouched_inbox_ever_rid_is_not_resent_to_the_designee() {
+        fn run(touched: u64) -> (Harness, Rid, Vec<Action>) {
+            let mut h = Harness::new(2);
+            h.core.cfg.inbox = true;
+            h.core.lease.cached_holder = Some(3);
+            let rid = h.rid(1);
+            let op = h.create("a");
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid,
+                op,
+                tag: Default::default(),
+            });
+            let req = sends(&out)
+                .into_iter()
+                .find_map(|(to, m)| match m {
+                    PeerMsg::MutateRequest { req, .. } if to == 3 => Some(*req),
+                    _ => None,
+                })
+                .expect("forwarded");
+            {
+                let c = h.core.clients.get_mut(&rid).unwrap();
+                c.settle = true;
+                c.inbox_ever = true;
+                c.touched_gen = touched;
+            }
+            let out = h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::MutateReply {
+                    req,
+                    outcome: MutateOutcome::Fenced { gen: 7 },
+                    base: None,
+                    position: Position::ZERO,
+                    gen: 7,
+                    own_chunks: OwnChunks::None,
+                    own_rows: None,
+                    committed: false,
+                    non_stealable: false,
+                },
+            });
+            (h, rid, out)
+        }
+        let routed_by_7 = |out: &[Action]| {
+            sends(out).iter().any(|(to, m)| {
+                *to == 3 && matches!(m, PeerMsg::MutateRequest { routed_gen: 7, .. })
+            })
+        };
+        let (h, rid, out) = run(0);
+        assert!(!routed_by_7(&out), "resent to the designee: {out:?}");
+        assert_eq!(h.core.clients[&rid].touched_gen, 0);
+        assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 1);
+        assert_eq!(h.core.stats.fenced_resends, 0);
+        // Control: touched before, resent routed by the generation.
+        let (h, rid, out) = run(5);
+        assert!(routed_by_7(&out), "{out:?}");
+        assert_eq!(h.core.clients[&rid].touched_gen, 7);
+        assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 0);
+        assert_eq!(h.core.stats.fenced_resends, 1);
+    }
+
     /// Fence C9.3 at the requester: an inbox-ever rid follows the root's
     /// redirect to the designee, routed by its generation (the batch was
     /// withdrawn before the first send). Fails on the parent: it goes the
@@ -88197,6 +88266,7 @@ mod route_fence_root {
 /// acknowledgement.
 mod late_landing_inbox {
     use super::*;
+    use crate::core::client::Phase;
     use constellation_store_s3::inbox::InboxKey;
 
     /// Node 1's op `a`, durable in an inbox batch (key `{1, 1, 0}`) and
@@ -89799,6 +89869,95 @@ mod late_landing_inbox {
             !h.core.in_doubt_batches.contains_key(&rid),
             "batches of an evicted rid left without a mark"
         );
+    }
+
+    /// WP6.1 helper: the link to node 2 is up, with no lease view touched.
+    fn link_up_only(h: &mut Harness) -> Vec<Action> {
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: Some(w(h.now)),
+                rtt_ms: Some(1),
+                since: Some(w(h.now)),
+            }],
+            lapses: 0,
+        })
+    }
+
+    fn stale_read_of_2() -> S3Result {
+        S3Result::LeaseGet(Ok(Some((lease_of(2, 1, i64::MAX / 4), tag()))))
+    }
+
+    /// WP6.1 (seed 1621): this node took the lease at epoch 2 while its op
+    /// waited on its epoch-1 batch; a lease read that is late says holder 2,
+    /// epoch 1. The op must not be forwarded on that read: the node's own
+    /// takeover gate drains the batch, and the rid takes the lease path.
+    /// Fails on the parent: tombstoned and forwarded to node 2.
+    #[test]
+    fn a_lease_holder_does_not_forward_its_inbox_op_on_a_stale_lease_read() {
+        let (mut h, rid) = waiting_inbox_op();
+        link_up_only(&mut h);
+        h.hold(2, None);
+        let mut out = Vec::new();
+        h.core
+            .on_inbox_recheck(h.clk(), stale_read_of_2(), &h.meta, &mut out);
+        assert!(tombstone_op(&out).is_none(), "{out:?}");
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(!h.core.inbox.pending.contains_key(&rid));
+        assert!(!h.core.inbox.is_rerouting(rid));
+        assert!(
+            !matches!(
+                h.core.clients.get(&rid).map(|c| &c.phase),
+                Some(&Phase::InboxWaiting { .. })
+            ),
+            "the rid is on the lease path"
+        );
+        assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 0);
+    }
+
+    /// WP6.1: the same with the P2P reroute (`Event::Peers`), after the
+    /// stale read regressed `last_seen`. Fails on the parent.
+    #[test]
+    fn a_lease_holder_does_not_reroute_its_inbox_op_on_a_regressed_last_seen() {
+        let (mut h, rid) = waiting_inbox_op();
+        h.hold(2, None);
+        h.core.lease.note_object(&lease_of(2, 1, i64::MAX / 4));
+        assert_eq!(h.core.lease.last_seen.as_ref().map(|l| l.holder), Some(2));
+        let out = link_up_only(&mut h);
+        assert!(tombstone_op(&out).is_none(), "{out:?}");
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(!h.core.inbox.is_rerouting(rid));
+        assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 0);
+    }
+
+    /// WP6.1: a node that is not the holder but applied an epoch-2 segment
+    /// knows a newer epoch than a stale epoch-1 read: no forward on it; the
+    /// op keeps waiting on its batch with the recheck armed. Fails on the
+    /// parent.
+    #[test]
+    fn a_node_that_knows_a_newer_epoch_does_not_forward_on_a_stale_read() {
+        let (mut h, rid) = waiting_inbox_op();
+        link_up_only(&mut h);
+        h.core.ship.max_epoch = 2;
+        let mut out = Vec::new();
+        h.core
+            .on_inbox_recheck(h.clk(), stale_read_of_2(), &h.meta, &mut out);
+        assert!(tombstone_op(&out).is_none(), "{out:?}");
+        assert_eq!(mutate_requests_to_2(&out), 0, "{out:?}");
+        assert!(h.core.inbox.pending.contains_key(&rid));
+        assert!(matches!(
+            h.core.clients.get(&rid).map(|c| &c.phase),
+            Some(&Phase::InboxWaiting { epoch: 1 })
+        ));
+        assert!(h.core.inbox.recheck_timer.is_some());
+        // A read as new as the epoch still forwards.
+        h.core.ship.max_epoch = 1;
+        let mut out = Vec::new();
+        h.core
+            .on_inbox_recheck(h.clk(), stale_read_of_2(), &h.meta, &mut out);
+        assert!(tombstone_op(&out).is_some(), "{out:?}");
     }
 }
 

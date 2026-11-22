@@ -1498,6 +1498,10 @@ pub struct Stats {
     pub inbox_ever_redirects: u64,
     pub inbox_local_withdrawals: u64,
     pub inbox_ever_rerouted: u64,
+    /// WP6.1: a `Fenced` reply to a settle of an untouched inbox-ever rid,
+    /// routed afresh instead of resent to the designee by its generation
+    /// (the root decides such a settle, ADR-47 rule 2).
+    pub inbox_ever_settle_rerouted: u64,
     /// ADR-47: the requester's inbox liveness hold (`inbox_ok`), by what its
     /// keys resolved to on its table (`root`: lags a routed generation;
     /// `nonplaced`: a stealable grant; `cross`: a set with a stealable
