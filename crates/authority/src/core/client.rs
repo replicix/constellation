@@ -2192,13 +2192,27 @@ impl Core {
                 // is a designee, not the lease holder: it is dropped from
                 // the cache and the rid is routed afresh, never resent to it
                 // by its generation. An execution there would not be seen by
-                // a drain that still holds the rid's batch.)
+                // a drain that still holds the rid's batch. A settle is
+                // included unless the rid touched a generation before it:
+                // rule 2's settle sentence has the root decide a settle of an
+                // untouched inbox-ever rid (`inbox_only` at the root), and a
+                // resend routed by the designee's generation would touch the
+                // rid there alone and have it refused for good beside the
+                // drain's own refusal of the batch copy.)
+                let settle_untouched = self
+                    .clients
+                    .get(&rid)
+                    .is_some_and(|c| c.inbox_ever && c.settle && c.touched_gen == 0);
                 if self
                     .clients
                     .get(&rid)
-                    .is_some_and(|c| c.inbox_ever && !c.settle)
+                    .is_some_and(|c| c.inbox_ever && (!c.settle || c.touched_gen == 0))
                 {
-                    self.stats.inbox_ever_rerouted += 1;
+                    if settle_untouched {
+                        self.stats.inbox_ever_settle_rerouted += 1;
+                    } else {
+                        self.stats.inbox_ever_rerouted += 1;
+                    }
                     if self.lease.cached_holder == Some(from) {
                         self.lease.cached_holder = None;
                     }
