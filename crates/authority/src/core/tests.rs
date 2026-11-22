@@ -18854,6 +18854,7 @@ mod backup_crash {
         settle_singleton(&mut h);
         assert!(h.core.root_lone(), "a singleton again after one read");
         assert_eq!(h.core.ack_need(&pos), None);
+        assert_eq!(h.core.stats.lapse_rereads, 2);
         // An ask that is never answered (S3 failed) is asked again after a
         // second, at the next lapse.
         assert_eq!(asks(&own_lapse(&mut h, 1)), 1);

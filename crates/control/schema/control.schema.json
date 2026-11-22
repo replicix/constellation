@@ -273,6 +273,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "lapse_rereads": {
+          "default": 0,
+          "description": "Registry reads asked for at once after a lapse of this node's own\nthat alone kept it from being a singleton (ADR-50).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "last_seal": {
           "anyOf": [
             {

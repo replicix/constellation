@@ -38,6 +38,10 @@
 
 use super::*;
 
+/// How long an asked-for read after a lapse ([`Roster::lapse_reread_due`])
+/// may stay unanswered before another is asked for.
+const LAPSE_REREAD_RETRY_MS: i64 = 1_000;
+
 /// One registry read as the core receives it (`Event::Roster`).
 #[derive(Debug, Clone)]
 pub(crate) struct RosterRead {
@@ -100,6 +104,11 @@ pub(crate) struct Roster {
     /// A snapshot has arrived whose directory a complete registry scan
     /// filled; it stays set.
     peers_complete: bool,
+    /// When this node last asked for a registry read because a lapse of its
+    /// own was the only thing between it and the singleton
+    /// ([`Self::lapse_reread_due`]); cleared by the next complete read
+    /// installed.
+    lapse_reread: Option<WaitMs>,
     /// Every node that was on the roster or in the directory since the first
     /// complete snapshot. It only grows.
     audience: BTreeSet<NodeId>,
@@ -120,6 +129,7 @@ impl Roster {
             peers_lapses: 0,
             peers_seen: false,
             peers_complete: false,
+            lapse_reread: None,
             audience: BTreeSet::new(),
         }
     }
@@ -146,6 +156,7 @@ impl Roster {
             self.listed = read.write_eligible.into_iter().collect();
             self.read_only = read.read_only.into_iter().collect();
             self.installed = Some(stamp);
+            self.lapse_reread = None;
             if self.last_incomplete.is_some_and(|l| l.seq < read.seq) {
                 self.last_incomplete = None;
                 self.added.clear();
@@ -350,11 +361,16 @@ impl Roster {
     ///
     /// Read by the root's singleton test (`Core::singleton_now`).
     pub(crate) fn singleton(&self, me: NodeId) -> bool {
-        let Some(installed) = self.installed else {
-            return false;
-        };
-        self.last_incomplete.is_none()
-            && installed.lapses >= self.lapses_seen
+        self.installed.is_some_and(|i| i.lapses >= self.lapses_seen) && self.alone_but_for_lapse(me)
+    }
+
+    /// Every condition of [`Self::singleton`] but the lapse one: a complete
+    /// read is installed, nothing newer is incomplete, it lists nobody but
+    /// `me`, nobody unlisted messaged, no link is a peer's the read cannot
+    /// speak for.
+    fn alone_but_for_lapse(&self, me: NodeId) -> bool {
+        self.installed.is_some()
+            && self.last_incomplete.is_none()
             && self.write_eligible.iter().all(|n| *n == me)
             && self.heard.is_empty()
             && !self.links.values().any(|l| self.link_is_peer(me, l))
@@ -377,6 +393,26 @@ impl Roster {
         self.write_peers(me).next().is_some()
             || !self.heard.is_empty()
             || self.links.values().any(|l| self.link_is_peer(me, l))
+    }
+
+    /// Whether to ask for a registry read now (`Action::RefreshRoster`): a
+    /// lapse of this node's own, newer than the installed read, is all that
+    /// keeps `me` from being a singleton, and no such read was asked for in
+    /// the last [`LAPSE_REREAD_RETRY_MS`] (one in flight; a failed one is
+    /// asked again after that, or left to the periodic poll). Notes the ask.
+    /// It changes no rule: only a read issued after the lapse ends the doubt.
+    pub(crate) fn lapse_reread_due(&mut self, me: NodeId, now: WaitMs) -> bool {
+        let lapse_only = self.installed.is_some_and(|i| i.lapses < self.lapses_seen)
+            && self.alone_but_for_lapse(me);
+        if !lapse_only
+            || self
+                .lapse_reread
+                .is_some_and(|at| now.since(at) < LAPSE_REREAD_RETRY_MS)
+        {
+            return false;
+        }
+        self.lapse_reread = Some(now);
+        true
     }
 
     // ------------------------------------------------------- test hooks
@@ -680,5 +716,53 @@ mod tests {
             ..read(9, &[1], true)
         }));
         assert!(r.singleton(1));
+    }
+
+    /// ADR-50: a read is asked for after a lapse only when the lapse alone
+    /// keeps the node from being a singleton, one at a time.
+    #[test]
+    fn a_lapse_asks_for_a_read_only_when_it_alone_blocks_the_singleton() {
+        let me = 1;
+        let mut r = Roster::new();
+        r.note_lapse();
+        assert!(!r.lapse_reread_due(me, w(0)), "no read installed yet");
+        assert!(r.install_read(read(2, &[1], true)));
+        assert!(r.install_read(RosterRead {
+            lapses: 1,
+            ..read(3, &[1], true)
+        }));
+        assert!(!r.lapse_reread_due(me, w(10)), "a read after the lapse");
+        assert!(r.singleton(me));
+        // A lapse after the installed read: due once, then not for a second.
+        r.note_lapse();
+        assert!(!r.singleton(me));
+        assert!(r.lapse_reread_due(me, w(100)));
+        assert!(!r.lapse_reread_due(me, w(600)), "one read out at a time");
+        assert!(!r.lapse_reread_due(me, w(1_099)));
+        assert!(r.lapse_reread_due(me, w(1_100)), "unanswered: asked again");
+        // A complete read that still misses the lapse frees the next ask.
+        assert!(r.install_read(read(4, &[1], true)));
+        assert!(r.lapse_reread_due(me, w(1_200)));
+        // An incomplete newer read, a heard node, a listed peer, a peer's
+        // link: the lapse is not all that is wrong, nothing is asked.
+        let mut r = Roster::new();
+        assert!(r.install_read(read(2, &[1], true)));
+        r.note_lapse();
+        assert!(r.install_read(read(3, &[1], false)));
+        assert!(!r.lapse_reread_due(me, w(10)), "incomplete newer read");
+        let mut r = Roster::new();
+        assert!(r.install_read(read(2, &[1], true)));
+        r.note_lapse();
+        r.note_heard(7, w(5));
+        assert!(!r.lapse_reread_due(me, w(10)), "a node was heard");
+        let mut r = Roster::new();
+        assert!(r.install_read(read(2, &[1, 2], true)));
+        r.note_lapse();
+        assert!(!r.lapse_reread_due(me, w(10)), "a peer is listed");
+        let mut r = Roster::new();
+        assert!(r.install_read(read(2, &[1], true)));
+        r.install_links(vec![link(5)], true, 0);
+        r.note_lapse();
+        assert!(!r.lapse_reread_due(me, w(10)), "a peer's link");
     }
 }

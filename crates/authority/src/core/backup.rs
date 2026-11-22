@@ -1904,6 +1904,19 @@ impl Core {
             || self.roster.peer_evident(self.cfg.node_id)
     }
 
+    /// ADR-50: after a lapse of its own, a node that would otherwise be a
+    /// singleton asks for a registry read at once
+    /// (`Action::RefreshRoster`) instead of waiting for the periodic poll:
+    /// the read is stamped after the lapse was handed, so only it can end
+    /// the doubt, and until it is installed every rule that reads
+    /// `singleton_now` keeps treating the peers as unknown.
+    pub(crate) fn ask_read_after_lapse(&mut self, now: Now, out: &mut Vec<Action>) {
+        if self.roster.lapse_reread_due(self.cfg.node_id, now.wait) {
+            self.stats.lapse_rereads += 1;
+            out.push(Action::RefreshRoster);
+        }
+    }
+
     /// Plan 46 M1.1 step 5 (C8 conditions 1 and 3), ADR-50: a message from
     /// `node` is a singleton-test event, whatever its kind: a node that
     /// writes to this one is a peer, linked, whatever the roster read in

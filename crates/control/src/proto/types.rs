@@ -2636,6 +2636,10 @@ pub struct AckStatus {
     /// Roster re-reads backup selection asked for: a linked peer the roster
     /// does not list yet.
     pub backup_roster_rereads: u64,
+    /// Registry reads asked for at once after a lapse of this node's own
+    /// that alone kept it from being a singleton (ADR-50).
+    #[serde(default)]
+    pub lapse_rereads: u64,
     pub backup_appends: u64,
     pub backup_acks: u64,
     pub backup_ack_timeouts: u64,

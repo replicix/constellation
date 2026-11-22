@@ -2131,6 +2131,9 @@ pub struct Stats {
     /// roster does not list yet could be a candidate
     /// ([`Core::ask_roster_reread`]).
     pub backup_roster_rereads: u64,
+    /// Registry reads asked for because a lapse of this node's own was all
+    /// that kept it from being a singleton (`Core::ask_read_after_lapse`).
+    pub lapse_rereads: u64,
     /// Holder: appends sent, acks received, backups that timed out.
     pub backup_appends: u64,
     pub backup_acks: u64,
@@ -3691,6 +3694,8 @@ impl Core {
                 if !self.roster.install_read(read) {
                     return out;
                 }
+                // A lapse handed while this read was out: ask again.
+                self.ask_read_after_lapse(now, &mut out);
                 if foreign {
                     self.note_foreign(now, replica, &mut out);
                 }
@@ -3764,6 +3769,7 @@ impl Core {
             Event::OwnLag { from, until } => {
                 self.roster.note_lapse();
                 self.on_own_lag(from, until);
+                self.ask_read_after_lapse(now, &mut out);
                 // The directory this node holds may predate the lapse: not
                 // a singleton again until a read issued after it arrives (a
                 // parked ack waits, or is released by the log, not by the
