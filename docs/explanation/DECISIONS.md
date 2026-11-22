@@ -3932,14 +3932,15 @@ The rules:
    to a settle of an untouched inbox-ever rid (`touched_gen == 0`) now sends
    the requester the route afresh, as for a non-settle: the cache entry is
    dropped and the rid is never resent to the designee by its generation
-   (`inbox_ever_settle_rerouted`). The one exception is a fence by the lease
-   holder itself, a root that holds its own sticky generation and fences a
-   routed-0 settle like any designee: the requester resends routed by the
-   generation when the fencing node is the holder on a view not older than
-   the highest epoch it knows, and the requester neither holds nor acquires
-   the lease. The root then decides the settle after its dedup; routing afresh
-   would send it routed 0 to the same root for ever. A settle that touched a
-   generation before still goes to the designee. One sequencer decides an inboxed rid:
+   (`inbox_ever_settle_rerouted`). The requester's view of who holds the
+   lease is never the guard (it can name a node that lost the lease while a
+   third node's drain holds the batch). The fence is the root's: a node that
+   holds an unexpired lease does not fence a routed-0 settle of an untouched
+   inbox-ever rid under its own generation. It decides the settle as the lease
+   holder and the drainer of the batch copy, and dedups by rid against its own
+   drain's outcome, so one outcome exists; an ex-holder, the designee only,
+   still fences it. A settle that touched a generation before keeps the route
+   rule and is resent to the designee by it. One sequencer decides an inboxed rid:
    a rid tombstoned before it went anywhere is decided by its receiver
    (ADR-68); a rid whose batch is live and untouched, by the drainer of that
    batch, the lease holder or its takeover gate (this rule); a touched one, by
@@ -6814,10 +6815,12 @@ refusal). Neither the recheck's forward arm nor `inbox_reroute_if_linked` acts
 while the node holds or is acquiring the lease, while its takeover gate is
 open, or when the view's epoch is below the highest epoch the node knows (its
 own, or `ship.max_epoch`). A node that holds the lease and gets a read naming
-another holder (or an older epoch of itself) takes Round 3b's lease path,
+another holder takes Round 3b's lease path (a read of an older epoch of
+the node's own tenure already took that path through the first arm),
 which waits for its own takeover gate's drain; the rid's outcome is that
-drain's, by dedup. The read's regression of the cached holder is undone, so
-the acquire retry does not forward to it either. A stale read on any other
+drain's, by dedup. The read's regression of the cached holder is undone
+(unless the read names a successor of the node's own epoch), so the acquire
+retry does not forward to it either. A stale read on any other
 node waits for a fresh one. A read whose epoch lies above the batch's but
 below the epoch the node knows still resubmits the op under the read's epoch,
 as before; that batch is read by the next drain and the next recheck sees a
