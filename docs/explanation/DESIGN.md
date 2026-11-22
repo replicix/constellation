@@ -868,8 +868,9 @@ is never run by a designee of a non-stealable generation, the lease holder's
 own included: the holder refuses it (`EROFS`) as a row of its stream, after its
 dedup, so no clock decides whether a refused rid also ran. The drain halts such
 a batch instead of refusing it, and a rid of unknown history counts as touched; a
-settle of an untouched one that comes back `Fenced` goes through the lease
-holder, never to the designee by its generation. The
+settle of an untouched one that comes back `Fenced` is routed afresh, never
+resent to a designee by its generation (a fence by the lease holder itself is
+resent to it: the root decides). The
 client hears the unsettled `EIO` at the deadlines, counted apart
 (`unsettled_nonstealable_holder`;
 [ADR-47](DECISIONS.md#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by),
