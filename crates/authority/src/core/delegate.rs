@@ -1681,10 +1681,13 @@ pub(crate) struct DelegationState {
     /// refused with `NotOwner { 0 }` until the `DelegateNodeEnded` record reaches
     /// this table — under an S3 cut, only after it. Also for a
     /// generation never installed here (an epoch was active when the
-    /// table named it). `(root, recalled at, row seen)`: dropped once the
-    /// generation's table row was seen here and is gone, or — a row
-    /// never seen (the recall overtook the record naming this node) —
-    /// after [`HANDED_BACK_UNSEEN_MS`].
+    /// table named it). `(root, recalled at, stream seen)`: dropped once the
+    /// generation's stream was seen here and is gone (the root's
+    /// `DelegateNodeEnded` was applied), or — a stream never seen (the
+    /// recall overtook the record naming this node) — after
+    /// [`HANDED_BACK_UNSEEN_MS`]. The stream, not its subtrees: a whole
+    /// release empties the stream's set at once, and a grow it did not see
+    /// is never taken up while the stream lives (WP6.2).
     pub handed_back: BTreeMap<u64, (NodeId, WaitMs, bool)>,
     /// Plan 46 M1.2 step 11: `Leave` ends grants first. The leaves waiting
     /// for the grants of a node to end in the log (see [`LeaveWait`]).
@@ -3239,8 +3242,14 @@ impl Core {
         for gen in kept_parked {
             self.hand_back_kept_parks(now, gen, replica, out);
         }
+        // WP6.2: by the stream, not by its subtrees. A whole release empties
+        // the stream's set of subtrees at once (the holder's own journal
+        // applied the row) while the stream lives until the root's
+        // `DelegateNodeEnded`; a grow the release did not see can reach this
+        // node in that time, and a state installed for it would answer rows
+        // past the root's cut.
         self.dl.handed_back.retain(|gen, (_, at, seen)| {
-            if live_mine.contains(gen) {
+            if streams_mine.contains(gen) {
                 *seen = true;
                 return true;
             }
@@ -3338,6 +3347,7 @@ impl Core {
             // sit in a later segment than its `DelegateNode`; the sync that
             // applies that one drops the `handed_back` entry.
             if self.dl.handed_back.contains_key(&d.gen) {
+                self.stats.deleg_install_released_whole += 1;
                 continue;
             }
             let awaiting = awaiting_end.get_or_insert_with(|| {

@@ -82064,6 +82064,7 @@ mod step5_sticky_release {
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let d = &h.core.dl.mine[&7];
@@ -82137,6 +82138,7 @@ mod step5_sticky_release {
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let d = &h.core.dl.mine[&7];
@@ -82273,6 +82275,7 @@ mod step5_sticky_release {
         assert!(last_is_release(&h), "the root's request did not release");
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
+        h.core.dl.handed_back.clear();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let d = &h.core.dl.mine[&7];
@@ -82299,6 +82302,7 @@ mod step5_sticky_release {
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let (req, round, last) =
@@ -82340,6 +82344,7 @@ mod step5_sticky_release {
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         let (req, round, last) =
@@ -82370,6 +82375,7 @@ mod step5_sticky_release {
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(h.core.dl.mine[&7].release.is_some());

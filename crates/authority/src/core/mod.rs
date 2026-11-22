@@ -1263,6 +1263,9 @@ pub struct Stats {
     /// generation's rows were still in the journal, its end not yet
     /// applied from the log (path B).
     pub deleg_install_waits_end: u64,
+    /// Delegate: installs skipped because this node already handed the
+    /// generation back whole (WP6.2: a grow its release did not see).
+    pub deleg_install_released_whole: u64,
     /// Delegate: installs put off because the grant's `DelegateNode` record
     /// is not committed yet (plan 46 M1.2 step 8b).
     pub deleg_install_waits_commit: u64,
