@@ -3316,6 +3316,26 @@ impl Core {
             // it none: the cut row is no release row, and the release row
             // is still to journal.
             let own_cut = replica.own_cut_dirs(st.gen);
+            // WP6.2: a restart lost `handed_back`, and the table here, ahead
+            // of the log, lists subtrees a grow added after this node's
+            // whole release: the release row is still in the journal, so the
+            // stream is the remnant of that release, with no subtree. A grow
+            // the release did not see ends with the stream.
+            let st = if !st.subtrees.is_empty()
+                && own_cut.is_empty()
+                && !self.dl.installed_gens.contains(&st.gen)
+                && !self.dl.mine.contains_key(&st.gen)
+                && replica.delegate_idx(st.gen) > replica.log_stream_idx(st.gen)
+                && self.release_row_journaled(st.gen, replica)
+            {
+                self.stats.deleg_install_released_whole += 1;
+                constellation_meta::delegation::NodeStream {
+                    subtrees: Vec::new(),
+                    ..st
+                }
+            } else {
+                st
+            };
             let remnant = st.subtrees.is_empty() && own_cut.is_empty();
             if remnant
                 && (self.dl.installed_gens.contains(&st.gen)
