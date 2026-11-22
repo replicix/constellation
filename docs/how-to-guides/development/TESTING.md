@@ -1292,7 +1292,9 @@ the mount alone.
   It mounts with `--fsync-timeout 2s`: a write-through `close` waits out an
   S3 cut like an `fsync` (ADR-66) and the scenario cannot heal before its
   write returns, so the close answers `EIO` after 2 s with the data left
-  pending, the state the scenario unmounts from.
+  pending, the state the scenario unmounts from. The two
+  `backup-takeover-*-held-chunks` scenarios mount A the same way, for the
+  same reason (their write-through `close` under an S3 cut).
 - `writeback-latency`: 150 ms injected S3 latency and an rsync-shaped
   workload (many small files, sequential closes) run once per
   `--write-mode`. Write-back must beat write-through by at least 3x —

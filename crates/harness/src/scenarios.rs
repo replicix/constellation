@@ -6482,9 +6482,11 @@ fn deposed_reintegration_backup(_seed: u64) -> Result<()> {
 /// backup; A alone is cut from S3 (its own switch — B declines the
 /// continuation epoch A proposes, since B reaches S3). Then:
 ///
-/// - a write-through close on A returns an error: its upload failed, so
-///   the write was never acknowledged (the manifest row, already backed
-///   up, is not lost data: it is held like the next one);
+/// - a write-through close on A returns `EIO` through the mount's soft
+///   timeout (`--fsync-timeout 2s`; without it the close would wait out the
+///   cut, ADR-66): its upload failed, so the write was never acknowledged,
+///   and the data stays pending (the manifest row, already backed up, is
+///   not lost data: it is held like the next one);
 /// - a write-back close on A succeeds at once: acknowledged, its bytes
 ///   only on A;
 /// - A freezes; B seals and takes the lease over, adopting both manifests
@@ -6520,7 +6522,10 @@ fn backup_takeover_held_chunks(name: &str, returns: bool) -> Result<()> {
         .with_env("CONSTELLATION_CHUNK_HANDOFF_AFTER_MS", "0");
     let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
     c0.fs_create()?;
-    c0.mount()?;
+    // A write-through `close` waits out an S3 cut like an `fsync` (ADR-66),
+    // and A's cut heals only after the close returns: the soft timeout makes
+    // it answer `EIO` after 2 s, the data staying pending.
+    c0.mount_view(None, &["--fsync-timeout", "2s"])?;
     c1.mount()?;
     let mut paused = false;
     let result = (|| -> Result<()> {

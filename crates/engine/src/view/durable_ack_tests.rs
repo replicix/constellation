@@ -1607,6 +1607,71 @@ fn a_cancelled_close_blocked_on_an_outage_ends_with_eio() {
     );
 }
 
+/// The soft `--fsync-timeout` ends a write-through close blocked on a
+/// transient outage (ADR-66: without it the close waits the outage out):
+/// the close answers `EIO` and the data stays pending.
+#[test]
+fn a_close_blocked_on_an_outage_ends_with_eio_at_the_soft_timeout() {
+    use constellation_vfs::{Blocking, Caller, OpCtx, OpKind, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (mut fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    fs.sync.as_mut().unwrap().fsync = Arc::new(crate::fsync_wait::FsyncWaits::with_kernel_timeout(
+        Some(Duration::from_millis(300)),
+        None,
+    ));
+    let fs = Arc::new(fs);
+    fs.bind();
+    fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
+    fs.sync
+        .as_ref()
+        .unwrap()
+        .write_mode
+        .set(crate::writeback::WriteMode::Through);
+    let handle = fs.any_handle(file.ino);
+    let caller = Caller::new(0, 0, None);
+    let mut drains = 0;
+    let result = std::thread::scope(|scope| {
+        let close = scope.spawn(|| {
+            Blocking::run(|r| {
+                fs.flush(
+                    &OpCtx::new(OpKind::Flush, &caller),
+                    file.ino,
+                    handle,
+                    constellation_vfs::LockOwner(0),
+                    r,
+                )
+            })
+            .map_err(|e| e.code())
+        });
+        let started = std::time::Instant::now();
+        while !close.is_finished() {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => {
+                    drains += 1;
+                    let _ = reply.send(Err(crate::sync::SyncFailure {
+                        class: crate::sync::ErrorClass::Transient,
+                        message: "scripted outage".into(),
+                    }));
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(2)),
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the close outlived the soft timeout"
+            );
+        }
+        close.join().unwrap()
+    });
+    assert_eq!(result, Err(Code::Io));
+    assert!(drains >= 1, "the close tried the drain before giving up");
+    assert!(
+        meta.upload_pending_for_ino(file.ino).unwrap(),
+        "the data stays pending"
+    );
+}
+
 /// The same for an `O_SYNC` write that fails: it publishes the write
 /// session, so the `fsync` after it finds none — and under `--fsync-mode
 /// local` would skip the drain and answer 0 for chunks still only on this
