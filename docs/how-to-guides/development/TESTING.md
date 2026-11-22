@@ -3667,16 +3667,26 @@ the pinned write before it reads its head.
 root's lock cut was as of the delegate's own send time. Since plan 46 M1.2
 step 11 the cut is as of a moment of the root's clock that precedes the
 renewal, and no seed of 0 to 140 000 shows the held write inside the next
-holder's section through a renewal any more. A rowless release (the stream
-stopped, capped, rebooted or lost its dependency) reports a cut of its own,
-which did not wait for the pinned write either; since
-`Core::release_subtrees` settles first, and that settle is not switched off by
+holder's section through a renewal any more, unclocked. A rowless release (the
+stream stopped, capped, rebooted or lost its dependency) reports a cut of its
+own, which did not wait for the pinned write either; since
+`Core::release_subtrees` and `release_after_cut` (the rowless end of a due
+ADR-64 cut) settle first, and that settle is not switched off by
 `settle_tagged_writes: false` (only `SimConfig::settle_tagged_writes_at_release`
-does, for a must-fail control), `-unsettled` is clean at seeds 1961, 2777 and
-2994, and at 627 with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, which fail
-without it
+does, for a must-fail control), `-unsettled` is clean, in the sweeps' clock-fault
+mix, at seeds 1961, 2777 and 2994, and with
+`AUTHORITY_SIM_LEASE_READS=0:0:800:1000` at 627 and 2000, which fail without it
 (`locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle`;
-core pin `a_rowless_release_cuts_after_a_pinned_write_once_its_window_is_over`).
+core pins `a_rowless_release_cuts_after_a_pinned_write_once_its_window_is_over`,
+`a_due_cut_ending_the_stream_rowless_cuts_after_a_pinned_write` and
+`a_release_of_a_stream_not_taken_up_cuts_after_a_pinned_write`). The label is
+not clean over every mix: seed 2578 under the lease-reads knob still fails (on
+main too). It needs the label's disabled renewal settle: the settled label
+`locks-writer-hold-delegated` is clean at 2578 under the same knob, and so is
+`-unsettled` with `settle_tagged_writes: true`; a release settle that waits for
+every pinned write, window open or not, does not clear it (checked on the
+branch, not kept). It is an effect of the control, pinned as such by
+`locks_writer_hold_delegated_unsettled_seed_2578_needs_the_renewal_settle`.
 The three seeds that stayed pinned, clean, after step 11 are in
 `locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cut`
 (they fail again with the cut taken from the delegate's clock). `locks-writer-hold-delegated-doubt` has the

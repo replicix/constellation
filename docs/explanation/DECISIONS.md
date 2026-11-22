@@ -1263,8 +1263,8 @@ write. Then the order between the check and the next grant: a write
 that passed the check *pins* its grants until it commits, which can
 still take seconds. A position the node reports as covering what it
 executed (a grant's floor or position, an outwait's cut, a delegate's
-stream head, a delegate's release cut) first waits for the pinned writes under grants no longer
-live in its table — ended there, or, for another sequencer's grant,
+stream head, a delegate's release cut) first waits for the pinned
+writes under grants no longer live in its table — ended there, or, for another sequencer's grant,
 past its token's window (earlier, no cut it reports can settle a
 barrier that needs the write, so a delegate's renewal does not wait for
 every commit in flight). They hold the writer lock, so taking it once is
