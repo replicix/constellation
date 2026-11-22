@@ -1100,6 +1100,14 @@ impl Core {
         else {
             return;
         };
+        // One sequencer per inboxed rid (WP6.1): a node that holds or is
+        // acquiring the lease, or knows an epoch above this view, has a
+        // takeover gate or leftover drain that decides the rid from its
+        // batch. `last_seen` can predate this node's own tenure (a late
+        // lease read regresses it), so it is not acted on then.
+        if self.lease.epoch().is_some() || self.acquiring() || epoch < self.known_epoch() {
+            return;
+        }
         if holder == self.cfg.node_id
             || holder == 0
             || self.lease.claimable_observed(now, &self.cfg)
@@ -1165,6 +1173,12 @@ impl Core {
         }
     }
 
+    /// The highest lease epoch this node knows of: its own tenure's, or the
+    /// newest segment it applied.
+    fn known_epoch(&self) -> Epoch {
+        self.ship.max_epoch.max(self.lease.epoch().unwrap_or(0))
+    }
+
     fn arm_inbox_recheck(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.inbox.recheck_timer.is_some() || self.inbox.pending.is_empty() {
             return;
@@ -1206,6 +1220,7 @@ impl Core {
             }
             _ => None,
         };
+        let known = self.known_epoch();
         let waiting: Vec<(Rid, InboxKey)> =
             self.inbox.pending.iter().map(|(r, k)| (*r, *k)).collect();
         for (rid, key) in waiting {
@@ -1223,6 +1238,17 @@ impl Core {
                     // landed). Its takeover gate drains the batch and
                     // writes the outcome locally; the lease path resolves
                     // the rid against `completed` once the gate is done.
+                    self.inbox.pending.remove(&rid);
+                    self.lease_path(now, rid, replica, out);
+                }
+                Some(_) if self.lease.epoch().is_some() => {
+                    // This node holds the lease and the read does not say
+                    // so: it predates this node's own tenure (a late read).
+                    // The takeover gate, or the leftover run, drains the
+                    // epoch's batch; the rid is answered from that outcome
+                    // like Round 3b's. Never forward on this read: the
+                    // designee of an older generation would decide it beside
+                    // the drain (WP6.1, ADR-68).
                     self.inbox.pending.remove(&rid);
                     self.lease_path(now, rid, replica, out);
                 }
@@ -1248,14 +1274,14 @@ impl Core {
                         self.stats.inbox_unavailable += 1;
                         self.lease_path(now, rid, replica, out);
                     } else {
-                        // No hold for a designee here (`on_holder_learned`
-                        // has one): an op is `InboxWaiting` only after it
-                        // passed that hold, and nothing marks it sent to a
-                        // designee while it stays in the inbox (`send_forward`
-                        // withdraws the batch first, then the mark is set and
-                        // the op leaves this phase). A drain may have read
-                        // the old-epoch batch already, which a guard here
-                        // could not undo either.
+                        // One sequencer per inboxed rid (ADR-47 rule 2,
+                        // ADR-68): a non-settle `send_forward` withdraws
+                        // the batch before the rid goes anywhere, and a
+                        // settle goes only to the lease holder or the root.
+                        // So a rid in this phase was never sent to a
+                        // designee, and a drain that read the old-epoch
+                        // batch already decides it (the new batch's run
+                        // dedups by rid).
                         self.inbox_enqueue(now, rid, new_epoch, replica, out);
                     }
                 }
@@ -1264,6 +1290,9 @@ impl Core {
                         && l.holder != self.cfg.node_id
                         && l.holder != 0
                         && l.epoch == epoch
+                        && l.epoch >= known
+                        && !self.acquiring()
+                        && self.lease.gate.is_none()
                         && !self.lease.claimable_observed(now, &self.cfg)
                         && self
                             .roster
