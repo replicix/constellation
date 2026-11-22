@@ -4734,6 +4734,21 @@ impl Core {
             return false;
         }
         // (A settle executes nothing: it keeps the route rule.)
+        // The one exception, WP6.1 (`far-root-writes-shared` seed 1621, ADR-47
+        // rule 2's settle sentence): the node that holds an unexpired lease
+        // decides a settle of an untouched inbox-ever rid itself, as the
+        // lease holder and the drainer of the rid's batch copy. It dedups by
+        // rid against its own drain's outcome (`delegate_execute_now`), so one
+        // outcome exists. An ex-holder (the designee only) still fences it: the
+        // requester then routes afresh and never resends it to the designee
+        // by its generation.
+        if fence.inbox_ever
+            && settle
+            && fence.touched_gen == 0
+            && self.lease.holds_unexpired(now, &self.cfg)
+        {
+            return false;
+        }
         if fence.inbox_ever && !settle {
             // Non-stealable: never run here (`refuses_in_stream` refuses it
             // in the stream). Stealable: the lease holder may still run it;

@@ -1174,12 +1174,16 @@ impl Core {
     }
 
     /// The highest lease epoch this node knows of: its own tenure's, or the
-    /// newest segment it applied. Both are in the S3 lease object's epoch
-    /// space: a continuation epoch carries its holder's lease epoch (it
-    /// adopts the hold at `lease.epoch()`, no new number), so a view of the
-    /// lease object is below this only when it is older than what the node
-    /// itself has seen.
-    pub(crate) fn known_epoch(&self) -> Epoch {
+    /// newest segment it applied. In the S3 lease object's epoch space, with
+    /// one exception: a hold taken over P2P by a node that does not carry
+    /// the lease (a continuation epoch's non-carrier) journals under the
+    /// carried epoch plus one, a number no lease object has until the flush
+    /// CAS. A view of the object is then below this, so the reroute stays
+    /// off (it is off anyway on the hold owner itself, which holds); a node
+    /// that only applied such segments waits for the object to catch up, or
+    /// for the inbox deadline (the lease path). Safe: it only withholds a
+    /// forward.
+    fn known_epoch(&self) -> Epoch {
         self.ship.max_epoch.max(self.lease.epoch().unwrap_or(0))
     }
 
@@ -1242,13 +1246,15 @@ impl Core {
                     // landed). Its takeover gate drains the batch and
                     // writes the outcome locally; the lease path resolves
                     // the rid against `completed` once the gate is done.
+                    // (A read of an older epoch of this node's own earlier
+                    // tenure takes this arm too.)
                     self.inbox.pending.remove(&rid);
                     self.lease_path(now, rid, replica, out);
                 }
                 Some(l) if self.lease.epoch().is_some() => {
-                    // This node holds the lease (the read named another
-                    // holder, or an older epoch of it: it predates this
-                    // node's own tenure, or a successor's already). Its
+                    // This node holds the lease and the read names another
+                    // holder (it predates this node's own tenure, or
+                    // names a successor's). Its
                     // takeover gate, or the leftover run, drains the
                     // epoch's batch and the rid takes the lease path, which
                     // waits for that drain (its outcome is the rid's, by
@@ -1258,7 +1264,9 @@ impl Core {
                     // regressed the cached holder (`note_object`), which
                     // the acquire retry would forward to: it is this node
                     // again.
-                    if l.holder != self.cfg.node_id {
+                    // (Only for a read not newer than this node's own epoch:
+                    // one that names a successor stays visible.)
+                    if l.holder != self.cfg.node_id && l.epoch <= self.lease.epoch().unwrap_or(0) {
                         self.lease.cached_holder = Some(self.cfg.node_id);
                     }
                     self.inbox.pending.remove(&rid);

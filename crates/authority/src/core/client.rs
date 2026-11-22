@@ -2204,23 +2204,7 @@ impl Core {
                         (c.inbox_ever, c.settle, c.touched_gen)
                     });
                 let settle_untouched = ever && settle && touched == 0;
-                // The one designee a settle does go to: the lease holder
-                // itself, on a view at least as new as this node knows, when
-                // this node is no holder or claimant (so no drain of its own
-                // decides the rid). A root that holds its own sticky
-                // generation fences a routed-0 settle like any designee;
-                // routing afresh would send it routed 0 to the same node for
-                // ever. Its answer to the resend is the root's decision,
-                // after its dedup (WP6.1).
-                let from_is_lease_holder = settle_untouched
-                    && self.lease.epoch().is_none()
-                    && !self.acquiring()
-                    && self
-                        .lease
-                        .last_seen
-                        .as_ref()
-                        .is_some_and(|l| l.holder == from && l.epoch >= self.known_epoch());
-                if ever && (!settle || (settle_untouched && !from_is_lease_holder)) {
+                if ever && (!settle || settle_untouched) {
                     if settle_untouched {
                         self.stats.inbox_ever_settle_rerouted += 1;
                     } else {
