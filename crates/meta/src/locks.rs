@@ -1654,7 +1654,7 @@ pub struct LockTables {
     /// Tests only: [`LockTables::set_settle_for_tests`].
     no_settle: AtomicBool,
     /// Tests only: [`LockTables::set_settle_at_release_for_tests`].
-    settle_at_release: AtomicBool,
+    no_settle_at_release: AtomicBool,
     /// Tests only: [`LockTables::set_gap_hook_for_tests`].
     #[cfg(any(test, feature = "test-util"))]
     gap_hook: Mutex<Option<GapHook>>,
@@ -2730,18 +2730,18 @@ impl LockTables {
         !self.no_settle.load(Ordering::Relaxed)
     }
 
-    /// Tests only: `true` makes [`crate::Meta::settle_tagged_writes_at_release`]
-    /// wait although the settle is off for every other position
-    /// ([`Self::set_settle_for_tests`]): a delegate's release cut alone
-    /// settles.
+    /// Tests only: `false` makes [`crate::Meta::settle_tagged_writes_at_release`]
+    /// wait for nothing (a delegate's release cut before it settled). It is
+    /// independent of [`Self::set_settle_for_tests`]: a release settles
+    /// although the settle is off for every other position.
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_settle_at_release_for_tests(&self, on: bool) {
-        self.settle_at_release.store(on, Ordering::Relaxed);
+        self.no_settle_at_release.store(!on, Ordering::Relaxed);
     }
 
     /// See [`Self::set_settle_at_release_for_tests`].
     pub(crate) fn settles_at_release(&self) -> bool {
-        self.settles() || self.settle_at_release.load(Ordering::Relaxed)
+        !self.no_settle_at_release.load(Ordering::Relaxed)
     }
 
     /// Tests only: `hook(tables, point)` runs, on the calling thread and with no
@@ -4844,8 +4844,9 @@ impl crate::Meta {
         self.settle_if(self.locks.settles())
     }
 
-    /// [`Self::settle_tagged_writes`] for a delegate's release cut, which
-    /// the simulation's settle-off controls can switch on alone
+    /// [`Self::settle_tagged_writes`] for a delegate's release cut. The
+    /// simulation's settle-off controls (`LockTables::set_settle_for_tests`)
+    /// do not switch it off; only its own knob does
     /// ([`LockTables::set_settle_at_release_for_tests`]).
     pub fn settle_tagged_writes_at_release(&self) -> bool {
         self.settle_if(self.locks.settles_at_release())

@@ -18387,9 +18387,14 @@ fn locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cu
     // committing is no longer claimed for writes that began after that
     // moment, so the settle is not what keeps the held write out of the next
     // holder's section here: 635, 3358 and 3403 show none, and no seed of
-    // 0 to 140 000 does, unclocked. The control is therefore a regression pin
-    // on the bound: these three seeds, which fail on the delegate's clock,
-    // must stay clean without the settle. Plan 46 M1.2 step 13: a delegate's
+    // 0 to 140 000 does, unclocked, through a renewal. The control is therefore
+    // a regression pin on the bound: these three seeds, which fail on the
+    // delegate's clock, must stay clean without the settle. A rowless release
+    // cut is the other way a head reaches the root, and it did not wait: seeds
+    // 1961, 2777 and 2994 of the sweeps (the default clock-fault mix) and 627
+    // with slow lease reads showed the held write inside the next holder's
+    // section until `Core::release_subtrees` settled; the release settle is
+    // not switched off by `settle_tagged_writes: false` (see the pin below). Plan 46 M1.2 step 13: a delegate's
     // own ops wait for the root, the trajectories moved, and 287 and 396 are
     // the two of seeds 0 to 400 that fail on the delegate's clock.)
     let seeds = [635, 3358, 3403, 287, 396];
@@ -18490,24 +18495,39 @@ fn run_clocked_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
 }
 
 /// A delegate's release cut waits for a pinned tagged write once its window
-/// is over (ADR-25 F1: `Core::release_subtrees`). With the settle off for
-/// every other position, these seeds of `locks-writer-hold-delegated-unsettled`
-/// fail with the release settle off too, and pass with it on alone
-/// (`SimConfig::settle_tagged_writes_at_release`): a rowless release cut
-/// taken under the pinned write let the root grant on before it committed.
+/// is over (ADR-25 F1: `Core::release_subtrees`), also in the settle-off
+/// label: `settle_tagged_writes: false` does not switch the release settle off
+/// (`SimConfig::settle_tagged_writes_at_release` does). Seeds 1961, 2777 and
+/// 2994 of `locks-writer-hold-delegated-unsettled` and seed 627 with
+/// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` showed the held write inside the
+/// next holder's section (or lost after an acknowledged turn) before; with
+/// the release settle off they still do, and this test fails with it.
 #[test]
-fn locks_writer_hold_delegated_unsettled_is_clean_with_the_settle_at_release() {
-    for seed in [1961u64, 2777, 2994] {
-        run_clocked_seed(seed, locks_writer_hold_delegated_unsettled_config())
-            .expect_err("the run is clean without any settle: no control");
-        run_clocked_seed(
-            seed,
-            SimConfig {
-                settle_tagged_writes_at_release: true,
+fn locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle() {
+    let slow_lease_reads = |cfg: SimConfig| SimConfig {
+        lease_reads: sim::store::SlowReads {
+            before: (0, 0),
+            reply: (800, 1_000),
+        },
+        ..cfg
+    };
+    let seeds: [(u64, bool); 4] = [(1961, false), (2777, false), (2994, false), (627, true)];
+    for (seed, slow) in seeds {
+        let cfg = |release_settle: bool| {
+            let c = SimConfig {
+                settle_tagged_writes_at_release: release_settle,
                 ..locks_writer_hold_delegated_unsettled_config()
-            },
-        )
-        .unwrap_or_else(|e| panic!("seed {seed}: not clean with the release settle: {e}"));
+            };
+            if slow {
+                slow_lease_reads(c)
+            } else {
+                c
+            }
+        };
+        run_clocked_seed(seed, cfg(false))
+            .expect_err("the run is clean without the release settle: no control");
+        run_clocked_seed(seed, cfg(true))
+            .unwrap_or_else(|e| panic!("seed {seed}: not clean with the release settle: {e}"));
     }
 }
 

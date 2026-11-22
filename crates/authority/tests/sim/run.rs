@@ -865,8 +865,9 @@ pub struct SimConfig {
     /// a position is reported while a tagged write that passed its check
     /// is still committing.
     pub settle_tagged_writes: bool,
-    /// With the settle off, `true` turns it on for a delegate's release cut
-    /// alone (`Meta::settle_tagged_writes_at_release`).
+    /// `false` makes a delegate's release cut wait for nothing
+    /// (`Meta::settle_tagged_writes_at_release`), whatever
+    /// `settle_tagged_writes` says: a must-fail control only.
     pub settle_tagged_writes_at_release: bool,
     /// How long a lock client waits for its turn write's answer before it
     /// leaves it in doubt (`None`: 3 s, 30 s under `strict_lock_turns`).
@@ -1469,7 +1470,7 @@ impl Default for SimConfig {
             tag_check_at_write: true,
             strict_lock_turns: false,
             settle_tagged_writes: true,
-            settle_tagged_writes_at_release: false,
+            settle_tagged_writes_at_release: true,
             lock_write_wait_ms: None,
             holder_beats: HolderBeats::Off,
             reader_nodes: Vec::new(),

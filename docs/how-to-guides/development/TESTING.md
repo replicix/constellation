@@ -3670,10 +3670,12 @@ renewal, and no seed of 0 to 140 000 shows the held write inside the next
 holder's section through a renewal any more. A rowless release (the stream
 stopped, capped, rebooted or lost its dependency) reports a cut of its own,
 which did not wait for the pinned write either; since
-`Core::release_subtrees` settles first (`SimConfig::settle_tagged_writes_at_release`
-turns that on alone in the settle-off labels), seeds 1961, 2777 and 2994 of
-`-unsettled` fail without it and pass with it
-(`locks_writer_hold_delegated_unsettled_is_clean_with_the_settle_at_release`;
+`Core::release_subtrees` settles first, and that settle is not switched off by
+`settle_tagged_writes: false` (only `SimConfig::settle_tagged_writes_at_release`
+does, for a must-fail control), `-unsettled` is clean at seeds 1961, 2777 and
+2994, and at 627 with `AUTHORITY_SIM_LEASE_READS=0:0:800:1000`, which fail
+without it
+(`locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle`;
 core pin `a_rowless_release_cuts_after_a_pinned_write_once_its_window_is_over`).
 The three seeds that stayed pinned, clean, after step 11 are in
 `locks_writer_hold_delegated_without_the_settle_stays_clean_under_the_roots_cut`

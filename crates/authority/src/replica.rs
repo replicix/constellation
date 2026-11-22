@@ -546,8 +546,8 @@ pub trait Replica {
     /// while no such write is in its transaction.
     fn settle_tagged_writes(&self) -> bool;
     /// [`Self::settle_tagged_writes`] for a delegate's release cut
-    /// (`Meta::settle_tagged_writes_at_release`; only the simulation's
-    /// settle-off controls tell the two apart).
+    /// (`Meta::settle_tagged_writes_at_release`): the simulation's
+    /// settle-off controls do not switch it off, its own knob does.
     fn settle_tagged_writes_at_release(&self) -> bool;
     /// This node's takeover gate ended its own generation `gen`
     /// (`Meta::deleg_ended_at_gate`): the generation is never executed in
