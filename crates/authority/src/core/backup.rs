@@ -1911,7 +1911,7 @@ impl Core {
     /// the doubt, and until it is installed every rule that reads
     /// `singleton_now` keeps treating the peers as unknown.
     pub(crate) fn ask_read_after_lapse(&mut self, now: Now, out: &mut Vec<Action>) {
-        if self.roster.lapse_reread_due(self.cfg.node_id, now.wait) {
+        if self.roster.take_lapse_reread(self.cfg.node_id, now.wait) {
             self.stats.lapse_rereads += 1;
             out.push(Action::RefreshRoster);
         }

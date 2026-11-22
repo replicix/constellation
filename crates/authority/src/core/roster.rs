@@ -38,7 +38,7 @@
 
 use super::*;
 
-/// How long an asked-for read after a lapse ([`Roster::lapse_reread_due`])
+/// How long an asked-for read after a lapse ([`Roster::take_lapse_reread`])
 /// may stay unanswered before another is asked for.
 const LAPSE_REREAD_RETRY_MS: i64 = 1_000;
 
@@ -106,7 +106,7 @@ pub(crate) struct Roster {
     peers_complete: bool,
     /// When this node last asked for a registry read because a lapse of its
     /// own was the only thing between it and the singleton
-    /// ([`Self::lapse_reread_due`]); cleared by the next complete read
+    /// ([`Self::take_lapse_reread`]); cleared by the next complete read
     /// installed.
     lapse_reread: Option<WaitMs>,
     /// Every node that was on the roster or in the directory since the first
@@ -398,10 +398,13 @@ impl Roster {
     /// Whether to ask for a registry read now (`Action::RefreshRoster`): a
     /// lapse of this node's own, newer than the installed read, is all that
     /// keeps `me` from being a singleton, and no such read was asked for in
-    /// the last [`LAPSE_REREAD_RETRY_MS`] (one in flight; a failed one is
-    /// asked again after that, or left to the periodic poll). Notes the ask.
+    /// the last [`LAPSE_REREAD_RETRY_MS`] (at most one ask per second while
+    /// unanswered; any installed complete read clears the limiter, so one that
+    /// still misses a lapse asks again; an unanswered ask is repeated only at
+    /// the next lapse or read event, else the periodic poll covers it). Notes
+    /// the ask when it returns `true`.
     /// It changes no rule: only a read issued after the lapse ends the doubt.
-    pub(crate) fn lapse_reread_due(&mut self, me: NodeId, now: WaitMs) -> bool {
+    pub(crate) fn take_lapse_reread(&mut self, me: NodeId, now: WaitMs) -> bool {
         let lapse_only = self.installed.is_some_and(|i| i.lapses < self.lapses_seen)
             && self.alone_but_for_lapse(me);
         if !lapse_only
@@ -725,44 +728,47 @@ mod tests {
         let me = 1;
         let mut r = Roster::new();
         r.note_lapse();
-        assert!(!r.lapse_reread_due(me, w(0)), "no read installed yet");
+        assert!(!r.take_lapse_reread(me, w(0)), "no read installed yet");
         assert!(r.install_read(read(2, &[1], true)));
         assert!(r.install_read(RosterRead {
             lapses: 1,
             ..read(3, &[1], true)
         }));
-        assert!(!r.lapse_reread_due(me, w(10)), "a read after the lapse");
+        assert!(!r.take_lapse_reread(me, w(10)), "a read after the lapse");
         assert!(r.singleton(me));
         // A lapse after the installed read: due once, then not for a second.
         r.note_lapse();
         assert!(!r.singleton(me));
-        assert!(r.lapse_reread_due(me, w(100)));
-        assert!(!r.lapse_reread_due(me, w(600)), "one read out at a time");
-        assert!(!r.lapse_reread_due(me, w(1_099)));
-        assert!(r.lapse_reread_due(me, w(1_100)), "unanswered: asked again");
+        assert!(r.take_lapse_reread(me, w(100)));
+        assert!(
+            !r.take_lapse_reread(me, w(600)),
+            "at most one ask per second"
+        );
+        assert!(!r.take_lapse_reread(me, w(1_099)));
+        assert!(r.take_lapse_reread(me, w(1_100)), "unanswered: asked again");
         // A complete read that still misses the lapse frees the next ask.
         assert!(r.install_read(read(4, &[1], true)));
-        assert!(r.lapse_reread_due(me, w(1_200)));
+        assert!(r.take_lapse_reread(me, w(1_200)));
         // An incomplete newer read, a heard node, a listed peer, a peer's
         // link: the lapse is not all that is wrong, nothing is asked.
         let mut r = Roster::new();
         assert!(r.install_read(read(2, &[1], true)));
         r.note_lapse();
         assert!(r.install_read(read(3, &[1], false)));
-        assert!(!r.lapse_reread_due(me, w(10)), "incomplete newer read");
+        assert!(!r.take_lapse_reread(me, w(10)), "incomplete newer read");
         let mut r = Roster::new();
         assert!(r.install_read(read(2, &[1], true)));
         r.note_lapse();
         r.note_heard(7, w(5));
-        assert!(!r.lapse_reread_due(me, w(10)), "a node was heard");
+        assert!(!r.take_lapse_reread(me, w(10)), "a node was heard");
         let mut r = Roster::new();
         assert!(r.install_read(read(2, &[1, 2], true)));
         r.note_lapse();
-        assert!(!r.lapse_reread_due(me, w(10)), "a peer is listed");
+        assert!(!r.take_lapse_reread(me, w(10)), "a peer is listed");
         let mut r = Roster::new();
         assert!(r.install_read(read(2, &[1], true)));
         r.install_links(vec![link(5)], true, 0);
         r.note_lapse();
-        assert!(!r.lapse_reread_due(me, w(10)), "a peer's link");
+        assert!(!r.take_lapse_reread(me, w(10)), "a peer's link");
     }
 }
