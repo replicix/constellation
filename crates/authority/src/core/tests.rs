@@ -81877,6 +81877,154 @@ mod step5_sticky_release {
         );
     }
 
+    /// The holder of stream 7 released the whole stream and the root
+    /// appended its row, and the holder's state is dropped (the table lists
+    /// no subtree of the stream); the row's index is returned. WP6.2 trace of
+    /// sim `sticky-s4-merge` seed 1264 with the idle release.
+    fn whole_release_acked_and_dropped(h: &mut Harness) -> u64 {
+        let out = release(h, 50, Vec::new(), false);
+        assert!(last_is_release(h), "{out:?}");
+        let row = Replica::delegate_idx(&h.meta, 7);
+        drain_stream(h, out);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the state was kept after the acknowledged row"
+        );
+        row
+    }
+
+    /// The root's grow of stream 7 by the sticky subtree `name`, which its
+    /// journal carried before the holder's whole release (the release row
+    /// follows it in the log), reaches this node after the release was
+    /// acknowledged: the stream installs ahead of the log. Returns the
+    /// subtree.
+    fn late_grow(h: &mut Harness, name: &str, first: u64) -> constellation_fs_core::Ino {
+        let (d, rec) = mkdir(h, name);
+        let records = vec![
+            rec,
+            LogRecord::DelegateNode {
+                node: 3,
+                gen: 7,
+                dirs: vec![constellation_meta::SubtreeGrant {
+                    dir: d,
+                    kind: SubtreeKind::Sticky,
+                }],
+            },
+        ];
+        Replica::install_streamed(&h.meta, 1, 1, first, first + 1, &records, true, (0, 0)).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        d
+    }
+
+    fn no_create_journaled(h: &Harness) -> bool {
+        !records(h)
+            .iter()
+            .any(|r| matches!(r, LogRecord::Create { .. }))
+    }
+
+    /// WP6.2 (sim `sticky-s4-merge` seed 1264, idle release): a holder that
+    /// released its whole stream takes up none of its subtrees again while
+    /// the stream is live. The root's grow of the stream by a subtree came
+    /// before the release row in its journal; it reaches the holder after
+    /// the root's acknowledgement dropped the state. The install was passed
+    /// (the `handed_back` entry went with the table's subtree row) and the
+    /// stream answered a Final row past the root's cut. The entry lasts
+    /// until the root's `DelegateNodeEnded`. Fails without keeping
+    /// `handed_back` while the stream is live.
+    #[test]
+    fn a_late_grow_after_a_whole_release_is_not_taken_up() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let row = whole_release_acked_and_dropped(&mut h);
+        let b = late_grow(&mut h, "b", 3);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the late grow was taken up: {:?}",
+            h.core.dl.mine.get(&7).map(|d| d.dirs.clone())
+        );
+        assert!(h.core.dl.handed_back.contains_key(&7));
+        // An op under the grown subtree is not executed here.
+        let out = create_in(&mut h, b, 1);
+        assert!(
+            h.core.dl.mine.get(&7).is_none_or(|d| d.executed == 0),
+            "{out:?}"
+        );
+        assert!(
+            no_create_journaled(&h),
+            "the op was executed under the stream"
+        );
+        // The root's end of the stream drops the entry.
+        let seq = Replica::applied_seq(&h.meta).unwrap_or(0) + 1;
+        Replica::apply_segment(
+            &h.meta,
+            seq,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: row - 1,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.handed_back.is_empty(),
+            "{:?}",
+            h.core.dl.handed_back
+        );
+    }
+
+    /// WP6.2, the restart variant of the test above: the node restarts after
+    /// the late grow is applied (its `handed_back`, state and installed set
+    /// are gone). The stream is not installed with the grown subtree
+    /// honoured.
+    #[test]
+    fn a_restart_after_a_late_grow_does_not_take_the_grown_subtree_up() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        whole_release_acked_and_dropped(&mut h);
+        let b = late_grow(&mut h, "b", 3);
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.core.dl.mine.get(&7).is_some_and(|d| d.dirs.contains(&b)),
+            "the grown subtree was honoured after the restart"
+        );
+        create_in(&mut h, b, 1);
+        assert!(
+            no_create_journaled(&h),
+            "the op was executed under the stream"
+        );
+    }
+
+    /// WP6.2 guard (passes before the fix as well): while the holder's
+    /// state is kept for its unacknowledged release row, a grow that reaches
+    /// it is not executed under: the stream is stopped.
+    #[test]
+    fn a_late_grow_while_the_release_row_is_unacknowledged_executes_nothing() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        let b = late_grow(&mut h, "b", 3);
+        create_in(&mut h, b, 1);
+        let d = h.core.dl.mine.get(&7).expect("the state was dropped");
+        assert!(d.stopped, "{:?}", d.dirs);
+        assert_eq!(d.executed, 0);
+        assert!(
+            no_create_journaled(&h),
+            "the op was executed under a stopped stream"
+        );
+    }
+
     /// Plan 46 M1.3 step 5 (996 B round 3, S1): the state of a holder that
     /// released every subtree stays for the root's append of the row, and the
     /// sync does not hand its parked op back or abort an acknowledgement that

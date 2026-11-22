@@ -24732,6 +24732,37 @@ fn s4_merge_first_release_settle_answered_at_the_cut() {
     s4_pin("sticky-s4-merge", sticky_s4_merge_config, 8);
 }
 
+/// WP6.2 (seed 1264 of `sticky-s4-merge` and of `sticky-s4-root-restart`
+/// with the idle release): the root grew a holder's stream by two subtrees
+/// and then ended the whole generation at the holder's whole release, decided
+/// on a view without them; the holder's table, ahead of the log, filled the
+/// stream again from the grow and installed it. It answered a Final row past
+/// the cut (`acked_at_or_below_cut`). A holder that released its whole stream
+/// takes up none of it again while the stream is live. Fails on the tree
+/// before the fix with `acked_at_or_below_cut`.
+fn wp62_pin(label: &str, config: fn() -> SimConfig) {
+    let config = SimConfig {
+        sticky_idle_ms: Some(1_200),
+        ..config()
+    };
+    run_seed(1264, config).unwrap_or_else(|e| {
+        panic!(
+            "{label} seed 1264: {e}\n  replay with AUTHORITY_SIM_CONFIG={label} \
+             AUTHORITY_SIM_STICKY_IDLE_MS=1200 AUTHORITY_SIM_START=1264 AUTHORITY_SIM_SEEDS=1"
+        )
+    });
+}
+
+#[test]
+fn a_whole_release_ends_the_grows_it_did_not_see_merge() {
+    wp62_pin("sticky-s4-merge", sticky_s4_merge_config);
+}
+
+#[test]
+fn a_whole_release_ends_the_grows_it_did_not_see_root_restart() {
+    wp62_pin("sticky-s4-root-restart", sticky_s4_root_restart_config);
+}
+
 /// Round 6 (review MUST-2): the final tag has fired on the fix arm. Each
 /// fix-arm negative control, run on the pin seed of its label, fails by the
 /// strict S4 tag with a cut span in its text: (a) the cut row kept off the
