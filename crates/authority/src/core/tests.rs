@@ -81946,11 +81946,11 @@ mod step5_sticky_release {
         );
         assert!(h.core.dl.handed_back.contains_key(&7));
         // An op under the grown subtree is not executed here.
-        let out = create_in(&mut h, b, 1);
         assert!(
-            h.core.dl.mine.get(&7).is_none_or(|d| d.executed == 0),
-            "{out:?}"
+            h.core.stats.deleg_install_released_whole >= 1,
+            "the install gate did not refuse the generation"
         );
+        let _ = create_in(&mut h, b, 1);
         assert!(
             no_create_journaled(&h),
             "the op was executed under the stream"
@@ -81993,17 +81993,60 @@ mod step5_sticky_release {
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
         h.core.dl.handed_back.clear();
+        let counted = h.core.stats.deleg_install_released_whole;
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(
             !h.core.dl.mine.get(&7).is_some_and(|d| d.dirs.contains(&b)),
             "the grown subtree was honoured after the restart"
         );
+        // Held as the remnant of the release: stopped, holding the row.
+        let d = h
+            .core
+            .dl
+            .mine
+            .get(&7)
+            .expect("the remnant was not installed");
+        assert!(d.stopped && d.release.is_some() && d.dirs.is_empty());
+        assert_eq!(h.core.stats.deleg_install_released_whole, counted + 1);
         create_in(&mut h, b, 1);
         assert!(
             no_create_journaled(&h),
             "the op was executed under the stream"
         );
+    }
+
+    /// WP6.2: the restart guard fails closed. A journal that cannot be read
+    /// installs nothing for the stream and syncs again; once it reads, the
+    /// stream is installed as the remnant of its release.
+    #[test]
+    fn an_unreadable_journal_installs_no_stream_with_a_late_grow_and_retries() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        whole_release_acked_and_dropped(&mut h);
+        let b = late_grow(&mut h, "b", 3);
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
+        let before = h.core.stats.journal_read_errors;
+        let counted = h.core.stats.deleg_install_released_whole;
+        h.meta.fail_journal_emptiness_reads_for_tests(1_000);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the stream was installed over an unreadable journal"
+        );
+        assert!(
+            h.core.stats.journal_read_errors > before,
+            "the guard did not count its read error"
+        );
+        assert_eq!(h.core.stats.deleg_install_released_whole, counted);
+        h.meta.fail_journal_emptiness_reads_for_tests(0);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = h.core.dl.mine.get(&7).expect("not installed once readable");
+        assert!(d.stopped && d.release.is_some() && !d.dirs.contains(&b));
+        assert_eq!(h.core.stats.deleg_install_released_whole, counted + 1);
     }
 
     /// WP6.2 guard (passes before the fix as well): while the holder's

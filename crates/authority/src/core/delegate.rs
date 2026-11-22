@@ -3321,21 +3321,35 @@ impl Core {
             // whole release: the release row is still in the journal, so the
             // stream is the remnant of that release, with no subtree. A grow
             // the release did not see ends with the stream.
-            let st = if !st.subtrees.is_empty()
+            // (The cheap tests come first; the journal is read once, for a
+            // stream that passes them. A read error installs nothing for
+            // the stream now and syncs again, like the own-end remnants.)
+            let mut st = st;
+            if !st.subtrees.is_empty()
                 && own_cut.is_empty()
                 && !self.dl.installed_gens.contains(&st.gen)
                 && !self.dl.mine.contains_key(&st.gen)
                 && replica.delegate_idx(st.gen) > replica.log_stream_idx(st.gen)
-                && self.release_row_journaled(st.gen, replica)
             {
-                self.stats.deleg_install_released_whole += 1;
-                constellation_meta::delegation::NodeStream {
-                    subtrees: Vec::new(),
-                    ..st
+                match self.release_row_journaled_checked(st.gen, replica) {
+                    Ok(true) => {
+                        self.stats.deleg_install_released_whole += 1;
+                        st.subtrees.clear();
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        self.stats.journal_read_errors += 1;
+                        tracing::warn!(
+                            node = me,
+                            gen = st.gen,
+                            error = %e,
+                            "journal read failed; the delegation sync installs no stream with a released-whole row now and retries"
+                        );
+                        retry = true;
+                        continue;
+                    }
                 }
-            } else {
-                st
-            };
+            }
             let remnant = st.subtrees.is_empty() && own_cut.is_empty();
             if remnant
                 && (self.dl.installed_gens.contains(&st.gen)
@@ -3367,6 +3381,8 @@ impl Core {
             // sit in a later segment than its `DelegateNode`; the sync that
             // applies that one drops the `handed_back` entry.
             if self.dl.handed_back.contains_key(&d.gen) {
+                // WP6.2: counted per sync and per generation, a recalled
+                // one that was never installed here included.
                 self.stats.deleg_install_released_whole += 1;
                 continue;
             }
@@ -15143,20 +15159,27 @@ impl Core {
     /// Whether this node's journal holds a `StreamReleased` of its own stream
     /// `gen` already.
     fn release_row_journaled(&self, gen: u64, replica: &dyn Replica) -> bool {
-        if !replica
-            .journal_own_gens()
-            .unwrap_or_default()
-            .contains(&gen)
-        {
-            return false;
+        self.release_row_journaled_checked(gen, replica)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::release_row_journaled`] with the read error of the journal's
+    /// own generations returned (the caller fails closed on it).
+    fn release_row_journaled_checked(
+        &self,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> Result<bool, constellation_meta::MetaError> {
+        if !replica.journal_own_gens()?.contains(&gen) {
+            return Ok(false);
         }
         let from = replica.journal_acked_seq().unwrap_or(0) + 1;
-        replica
+        Ok(replica
             .journal_txs_from(from, usize::MAX)
             .iter()
             .filter(|t| t.origin.0 == gen)
             .flat_map(|t| t.records.iter())
-            .any(|r| matches!(r, LogRecord::StreamReleased { gen: g, .. } if *g == gen))
+            .any(|r| matches!(r, LogRecord::StreamReleased { gen: g, .. } if *g == gen)))
     }
 
     /// Whether stream `gen` is one this node's own tenure granted itself (its
