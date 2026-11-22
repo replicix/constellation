@@ -86317,6 +86317,70 @@ mod route_fence_executor {
         }
     }
 
+    /// WP6.1 review M1b (seed 1621, the root side of ADR-47 rule 2's settle
+    /// sentence): a node that holds an unexpired lease decides a routed-0
+    /// settle of an untouched inbox-ever rid itself instead of fencing it
+    /// (the requester would route afresh to the same root for ever), and
+    /// dedups by rid: the same settle again makes no second decision (one
+    /// refusal row). An ex-holder (the designee only) still fences it, and a
+    /// touched rid's settle keeps the route rule. Fails on the round-2 tip:
+    /// the lease holder fences it.
+    #[test]
+    fn a_lease_holder_decides_an_untouched_inbox_ever_settle_and_an_ex_holder_fences_it() {
+        let (mut h, d1) = designee();
+        // No lease here: fenced.
+        let out = forward_as(&mut h, d1, 2, 1, (1, true), (0, 0, true), Position::ZERO);
+        assert_eq!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 1);
+        assert!(!ran(&h, 2, 1));
+        // The lease held: decided here, no `Fenced`.
+        h.hold(5, None);
+        // The predicate: a touched rid's settle keeps the route rule, an
+        // untouched one is not fenced by the lease holder.
+        let op = MutateOp::Create {
+            parent: d1,
+            name: "x".into(),
+            ino: h.meta.allocate_ino(d1).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let now = h.clk();
+        let fence = |touched_gen| crate::core::holder::Fence {
+            routed_gen: 0,
+            touched_gen,
+            inbox_ever: true,
+        };
+        assert!(h
+            .core
+            .fenced_at_delegate(now, 2, &op, (fence(7), true), &h.meta));
+        assert!(!h
+            .core
+            .fenced_at_delegate(now, 2, &op, (fence(0), true), &h.meta));
+        let out = forward_as(&mut h, d1, 2, 2, (2, true), (0, 0, true), Position::ZERO);
+        assert_ne!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_fenced_forwards, 1);
+        assert!(ran(&h, 2, 2), "the settle was decided here: {out:?}");
+        // The same settle again (the retry of a lost answer): no second
+        // decision, one refusal row.
+        assert_eq!(h.core.stats.settles_refused, 1);
+        let out = forward_as(&mut h, d1, 2, 3, (2, true), (0, 0, true), Position::ZERO);
+        assert_ne!(
+            outcome_to(&out, 2),
+            Some(MutateOutcome::Fenced { gen: 7 }),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.settles_refused, 1);
+    }
+
     /// The lease holder, designee of its own generation, parks an
     /// inbox-ever forward of `x` (its dependencies not reached): `x` has no
     /// outcome yet, so the drain may decide it first (here: a journaled
@@ -86703,81 +86767,15 @@ mod route_fence_executor {
         assert_eq!(h.core.stats.fenced_resends, 1);
     }
 
-    /// WP6.1 review M1: the node that fences a routed-0 settle is the lease
-    /// holder itself, a root that holds its own sticky generation. The
-    /// requester (no holder, not acquiring, its view of the lease current)
-    /// resends routed by the generation, as before: the root decides the
-    /// settle after its dedup. Dropping the cache and routing afresh would
-    /// send it routed 0 to the same root for ever (an unsettled `EIO`).
-    /// Fails on the branch tip before the change: no resend to node 1.
+    /// WP6.1 review M1b: three nodes. This requester's view of the lease
+    /// names node 2, which fences the settle (it is the designee of its own
+    /// generation) while another node holds the lease and drains the
+    /// batch copy. The requester never resends such a settle to the
+    /// designee by its generation, whatever its view says: it routes afresh.
+    /// Fails on the round-2 tip: its view names the fencing node, so it
+    /// resends routed by the generation.
     #[test]
-    fn a_settle_fenced_by_the_lease_holder_is_resent_to_it_routed_by_the_generation() {
-        let mut h = Harness::new(1);
-        h.core.cfg.inbox = true;
-        h.core.lease.cached_holder = Some(2);
-        let rid = h.rid(1);
-        let op = h.create("a");
-        let out = h.step(Event::Submit {
-            policy: Policy::Client,
-            rid,
-            op,
-            tag: Default::default(),
-        });
-        let req = sends(&out)
-            .into_iter()
-            .find_map(|(to, m)| match m {
-                PeerMsg::MutateRequest { req, .. } if to == 2 => Some(*req),
-                _ => None,
-            })
-            .expect("forwarded to the holder");
-        h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 30_000));
-        {
-            let c = h.core.clients.get_mut(&rid).unwrap();
-            c.settle = true;
-            c.inbox_ever = true;
-            c.touched_gen = 0;
-        }
-        let reply = |req: OpId, outcome: MutateOutcome, gen: u64| Event::Peer {
-            from: 2,
-            msg: PeerMsg::MutateReply {
-                req,
-                outcome,
-                base: None,
-                position: Position::ZERO,
-                gen,
-                own_chunks: OwnChunks::None,
-                own_rows: None,
-                committed: false,
-                non_stealable: false,
-            },
-        };
-        let out = h.step(reply(req, MutateOutcome::Fenced { gen: 7 }, 7));
-        let sent: Vec<_> = sends(&out)
-            .into_iter()
-            .filter_map(|(to, m)| match m {
-                PeerMsg::MutateRequest {
-                    req, routed_gen, ..
-                } if to == 2 => Some((*req, *routed_gen)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(sent.len(), 1, "{out:?}");
-        assert_eq!(sent[0].1, 7, "routed by the generation: {out:?}");
-        assert_eq!(h.core.clients[&rid].touched_gen, 7);
-        assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 0);
-        assert_eq!(h.core.stats.fenced_resends, 1);
-        // The root decides it (a settle with no outcome here: abandoned):
-        // the client is answered, no second round.
-        let out = h.step(reply(sent[0].0, MutateOutcome::Abandoned, 7));
-        assert!(!replies(&out).is_empty(), "{out:?}");
-        assert!(!h.core.clients.contains_key(&rid));
-    }
-
-    /// The same settle when this node holds the lease (seed 1621's node 3):
-    /// its own drain decides, the fencing holder named by a stale view is
-    /// not resent to.
-    #[test]
-    fn a_settle_fenced_by_the_holder_of_a_stale_view_is_not_resent_by_a_lease_holder() {
+    fn a_settle_fenced_by_the_node_its_stale_view_names_is_routed_afresh() {
         let mut h = Harness::new(1);
         h.core.cfg.inbox = true;
         h.core.lease.cached_holder = Some(2);
@@ -86800,9 +86798,9 @@ mod route_fence_executor {
             let c = h.core.clients.get_mut(&rid).unwrap();
             c.settle = true;
             c.inbox_ever = true;
+            c.touched_gen = 0;
         }
         h.core.lease.last_seen = Some(lease_of(2, 1, h.now.0 + 30_000));
-        h.hold(2, None);
         let out = h.step(Event::Peer {
             from: 2,
             msg: PeerMsg::MutateReply {
@@ -86825,6 +86823,7 @@ mod route_fence_executor {
         );
         assert_eq!(h.core.clients[&rid].touched_gen, 0);
         assert_eq!(h.core.stats.inbox_ever_settle_rerouted, 1);
+        assert_eq!(h.core.stats.fenced_resends, 0);
     }
 
     /// Fence C9.3 at the requester: an inbox-ever rid follows the root's
