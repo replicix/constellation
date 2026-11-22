@@ -3890,7 +3890,10 @@ The rules:
    delegate's gates, before the settle's park-drop and before ADR-46's
    `Held`, and again at every re-entry of a parked forward. The requester
    re-sends routed by the named generation (at most twice, then it decides the
-   route afresh); a `Fenced` answer is not an attempt.
+   route afresh); a `Fenced` answer is not an attempt. (Amended 2026-11-22,
+   WP6.1, `far-root-writes-shared` seed 1621 under slow lease reads: the
+   resend routed by the generation is not made for a settle of an untouched
+   inbox-ever rid; see rule 2.)
 2. **The root refuses for good only an untouched rid.** For keys under a
    non-stealable generation whose holder it cannot reach, the root answers
    `EROFS` (unjournaled, final) only at `touched_gen == 0`. With
@@ -3918,6 +3921,23 @@ The rules:
    queue; a settle of an untouched inbox-ever rid under a non-stealable grant
    is decided by the root too, and a gated root answers a settle from the
    rid's outcome before it redirects it to a live holder.
+   *Amended 2026-11-22 (WP6.1, `far-root-writes-shared` seed 1621 with slow
+   lease reads, I1; the requester-side half of that settle sentence).* The
+   requester kept the settle exemption of its `Fenced` branch ("a settle
+   executes nothing"), so a settle of an untouched inbox-ever rid that came
+   back `Fenced` from a designee was resent to it routed by its generation.
+   That raised `touched_gen` at the requester only, and the designee refused
+   the settle for good (`ABANDONED`) beside the root's drain, which refused the
+   batch's untouched copy (`EROFS`): two deciders of one rid. A `Fenced` reply
+   to a settle of an untouched inbox-ever rid (`touched_gen == 0`) now sends
+   the requester through the lease holder, as for a non-settle: the cache entry
+   is dropped, the rid is routed afresh and never resent to the designee by its
+   generation (`inbox_ever_settle_rerouted`). A settle that touched a
+   generation before still goes to it. One sequencer decides an inboxed rid:
+   a rid tombstoned before it went anywhere is decided by its receiver
+   (ADR-68); a rid whose batch is live and untouched, by the drainer of that
+   batch, the lease holder or its takeover gate (this rule); a touched one, by
+   the holder of the generation in its stream (rule 4).
 3. **Inbox-ever rids never run at a designee of a non-stealable generation.**
    A rid that was ever enqueued in the inbox (or whose send history is
    unknown) is forwarded only to the lease holder, or along the lease
@@ -6774,6 +6794,25 @@ made, so the resubmission is `inbox_ever`), and the in-doubt cap applies. The
 op is live in exactly one place: the replay while it runs, then the parked
 record the resubmission inherits and tombstones before any forward. A client
 that joined the replay and heard the outcome gets nothing parked.
+
+**Amendment (2026-11-22, WP6.1): a reroute acts only on a lease view at least
+as new as the node's own.** "Every batch the rid was in is tombstoned before
+any forward" holds for a non-settle. A settle is not tombstoned before its
+forward (its own withdrawal runs beside it, ADR-47), so its batch stays live
+while it travels. A reroute that follows a late lease read can therefore put a
+second decider beside the drain of that batch (`far-root-writes-shared` seed
+1621 with slow lease reads: node 3 held epoch 2 and its takeover gate drained
+its epoch-1 batch, and a read 800 to 1000 ms late, holder 1 at epoch 1, sent
+the settle to the sticky designee, which refused it beside the drain's own
+refusal). Neither the recheck's forward arm nor `inbox_reroute_if_linked` acts
+while the node holds or is acquiring the lease, while its takeover gate is
+open, or when the view's epoch is below the highest epoch the node knows (its
+own, or `ship.max_epoch`). A node that holds the lease and gets a read naming
+another holder takes Round 3b's lease path, answered from its own drain's
+outcome; a stale read on any other node waits for a fresh one. The late read
+that overwrote `last_seen` (`LeaseState::note_object`) is the same cause as
+WP6.5 and is not changed here. Tombstone-before-forward, `rerouting` and the
+ambiguous-PUT rule are untouched.
 
 **Rejected**: a holder that reads every requester's inbox once per tenure
 (fixes the seeds, but the extra reads shifted other configurations past their

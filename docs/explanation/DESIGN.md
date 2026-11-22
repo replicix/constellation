@@ -867,7 +867,9 @@ under a live non-stealable holder goes to that holder, as a requester's does. A 
 is never run by a designee of a non-stealable generation, the lease holder's
 own included: the holder refuses it (`EROFS`) as a row of its stream, after its
 dedup, so no clock decides whether a refused rid also ran. The drain halts such
-a batch instead of refusing it, and a rid of unknown history counts as touched. The
+a batch instead of refusing it, and a rid of unknown history counts as touched; a
+settle of an untouched one that comes back `Fenced` goes through the lease
+holder, never to the designee by its generation. The
 client hears the unsettled `EIO` at the deadlines, counted apart
 (`unsettled_nonstealable_holder`;
 [ADR-47](DECISIONS.md#adr-47-an-executor-runs-a-forward-only-under-the-generation-it-was-routed-by),
@@ -1310,7 +1312,9 @@ such requester with an adaptive backoff (and never one it is P2P-connected
 to), and outcomes ride the log (`Completed`, `Refused`, `InboxAck`). An op
 waiting in the inbox, or queued for it, is re-sent over P2P by the same rid
 as soon as the link to the holder is up, from the lease read last seen (no S3
-access needed): its batches are tombstoned first, and a tombstone that fails
+access needed), and only on a view at least as new as the node's own (never
+while it holds or acquires the lease, never below an epoch it applied): its
+batches are tombstoned first, and a tombstone that fails
 leaves the op waiting on its batch
 ([ADR-68](DECISIONS.md#adr-68-an-inbox-op-is-rerouted-to-p2p-when-the-link-to-the-holder-is-up)).
 Sustained demand (8 inbox ops, or 1.5 s of
