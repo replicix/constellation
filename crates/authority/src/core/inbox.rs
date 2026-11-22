@@ -1174,8 +1174,12 @@ impl Core {
     }
 
     /// The highest lease epoch this node knows of: its own tenure's, or the
-    /// newest segment it applied.
-    fn known_epoch(&self) -> Epoch {
+    /// newest segment it applied. Both are in the S3 lease object's epoch
+    /// space: a continuation epoch carries its holder's lease epoch (it
+    /// adopts the hold at `lease.epoch()`, no new number), so a view of the
+    /// lease object is below this only when it is older than what the node
+    /// itself has seen.
+    pub(crate) fn known_epoch(&self) -> Epoch {
         self.ship.max_epoch.max(self.lease.epoch().unwrap_or(0))
     }
 
@@ -1241,14 +1245,22 @@ impl Core {
                     self.inbox.pending.remove(&rid);
                     self.lease_path(now, rid, replica, out);
                 }
-                Some(_) if self.lease.epoch().is_some() => {
-                    // This node holds the lease and the read does not say
-                    // so: it predates this node's own tenure (a late read).
-                    // The takeover gate, or the leftover run, drains the
-                    // epoch's batch; the rid is answered from that outcome
-                    // like Round 3b's. Never forward on this read: the
-                    // designee of an older generation would decide it beside
-                    // the drain (WP6.1, ADR-68).
+                Some(l) if self.lease.epoch().is_some() => {
+                    // This node holds the lease (the read named another
+                    // holder, or an older epoch of it: it predates this
+                    // node's own tenure, or a successor's already). Its
+                    // takeover gate, or the leftover run, drains the
+                    // epoch's batch and the rid takes the lease path, which
+                    // waits for that drain (its outcome is the rid's, by
+                    // dedup). Nothing is forwarded on this read: the
+                    // designee of an older generation would decide the rid
+                    // beside the drain (WP6.1, ADR-68). The read also
+                    // regressed the cached holder (`note_object`), which
+                    // the acquire retry would forward to: it is this node
+                    // again.
+                    if l.holder != self.cfg.node_id {
+                        self.lease.cached_holder = Some(self.cfg.node_id);
+                    }
                     self.inbox.pending.remove(&rid);
                     self.lease_path(now, rid, replica, out);
                 }
@@ -1292,7 +1304,6 @@ impl Core {
                         && l.epoch == epoch
                         && l.epoch >= known
                         && !self.acquiring()
-                        && self.lease.gate.is_none()
                         && !self.lease.claimable_observed(now, &self.cfg)
                         && self
                             .roster
