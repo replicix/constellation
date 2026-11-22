@@ -18804,6 +18804,71 @@ mod backup_crash {
         assert!(h.core.root_lone());
     }
 
+    /// ADR-50, r3diag (btrfs): a lapse of the root's own is all that keeps
+    /// it from being a singleton, and its own ops wait for the archive until
+    /// a read issued after the lapse is installed. The lapse's own event
+    /// asks for that read (`Action::RefreshRoster`), once while it is out;
+    /// a lapse handed while it was out asks again when it lands; a root
+    /// with a listed peer does not ask. The doubt itself is unchanged: only
+    /// a read stamped after the lapse ends it. Fails before: no read is
+    /// asked for, and the doubt lasts until the periodic poll (5 s).
+    #[test]
+    fn a_lapse_alone_asks_for_a_read_at_once() {
+        let pos = pos_5();
+        let asks = |a: &[Action]| {
+            a.iter()
+                .filter(|a| matches!(a, Action::RefreshRoster))
+                .count()
+        };
+        let read = |h: &mut Harness, lapses: u64| {
+            h.step(Event::Roster {
+                seq: next_roster_seq(),
+                write_eligible: vec![1],
+                read_only: Vec::new(),
+                complete: true,
+                lapses,
+                issued: w(h.now),
+            })
+        };
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1]);
+        h.hold(1, None);
+        assert!(h.core.root_lone());
+        assert!(!h.core.root_commits_by_archive());
+        let out = own_lapse(&mut h, 1);
+        assert_eq!(asks(&out), 1, "the lapse's own event asks for a read");
+        assert!(!h.core.root_lone());
+        assert!(h.core.root_commits_by_archive(), "the doubt is kept");
+        assert!(h.core.ack_need(&pos).is_some());
+        // A second lapse while the read is out asks for nothing more.
+        h.advance(50);
+        assert_eq!(asks(&own_lapse(&mut h, 1)), 0, "one read out at a time");
+        // The read lands stamped with the first lapse only: still in doubt,
+        // and the second lapse asks again now.
+        h.advance(10);
+        let out = read(&mut h, 1);
+        assert!(!h.core.root_lone(), "a read taken before the second lapse");
+        assert_eq!(asks(&out), 1, "asked again for the lapse it missed");
+        h.advance(10);
+        assert_eq!(asks(&read(&mut h, 2)), 0);
+        settle_singleton(&mut h);
+        assert!(h.core.root_lone(), "a singleton again after one read");
+        assert_eq!(h.core.ack_need(&pos), None);
+        // An ask that is never answered (S3 failed) is asked again after a
+        // second, at the next lapse.
+        assert_eq!(asks(&own_lapse(&mut h, 1)), 1);
+        h.advance(500);
+        assert_eq!(asks(&own_lapse(&mut h, 1)), 0);
+        h.advance(600);
+        assert_eq!(asks(&own_lapse(&mut h, 1)), 1);
+        // A root with a listed peer: the lapse is not what keeps it from
+        // being alone, and it asks for nothing.
+        let mut h = Harness::new(1);
+        backup_node(&mut h, vec![1, 2]);
+        h.hold(1, None);
+        assert_eq!(asks(&own_lapse(&mut h, 1)), 0);
+    }
+
     /// ADR-50 (S2): a root with P2P off that claimed across a lapse (so the
     /// claim stamped no singleton) returns to the singleton's configuration
     /// at the next read, as one with P2P on does; before, it waited for the
