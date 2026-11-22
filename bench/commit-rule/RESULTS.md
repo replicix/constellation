@@ -408,3 +408,87 @@ stalls of 3 to 5 ms per run in both builds; ext4 holder chmod p90 had two fix ro
 
 vfs-bench (`cargo bench -p constellation-engine --bench vfs_bench`) times `getattr`, `lookup` and `read` dispatch only.
 It runs no unlink and no xattr, so it never reaches the changed code and was not run.
+
+## Plan 46 §8, after M1.2: `ack-latency` topologies 1 to 5 and 9, A/B/B/A on four file systems (2026-11-23)
+
+A = `5907c65d` (the parent of M1.2 step 1, the baseline of the 2026-11-14 and 2026-11-15 exit runs); B = `060e6fa6`
+(`origin/main` when the run started; M1.2 plus M1.3 steps up to the stale-clock and sticky work: the build is later than
+M1.2's exit, so B also carries what landed since). Release builds with debuginfo off, each from its own `git archive`
+extracted with `tar -m`, every file touched, a fresh target dir, on the quiet box (16 CPUs, nothing else running; the
+1-minute load was below 1 before every run). sha256 of the daemon / harness: A `6a32d4e0...25d48bfb` /
+`32535b6a...d3ddfa6`, B `8af700a3...a718d5d` / `4cfa7652...bddd`. ext4, xfs and btrfs on separate partitions of one
+local device, tmpfs under `/tmp`; the file system measured is the run's `TMPDIR`.
+Invocation (the earlier runs'): `ACK_LATENCY_SAMPLES=300 ACK_LATENCY_TOPOLOGIES=1,2,3,4,9 harness run ack-latency` with
+`CONSTELLATION_BIN` the variant's daemon; topology 5: `ACK_LATENCY_SAMPLES=100 ACK_LATENCY_TOPOLOGIES=5
+CONSTELLATION_HARNESS_LOAD=net-wan`. Per file system: LAN, 12 runs (6 per arm, three blocks in the order A B B A, B A A B,
+A B B A); WAN, 8 runs (4 per arm). 80 runs, one failed and was repeated (xfs, B, topology 4 setup: "node 2 has no peer
+within the backup RTT budget (5 ms)", the load-induced refusal of the 2026-11-14 run; the repeat passed). Topology 9
+did not exist in A, so it has no A/B. Every topology ran on every file system, a superset of what §8 asks.
+Metric: per op and actor, the median over the runs of p50 and p90; B/A is the median over the three blocks of the block's
+B median over its A median (all-run ratios and the min/max over blocks are in the raw summary).
+
+p50 B/A, the range over the ops of the topology, and the cells above 1.05 (blocks of 6+6 runs, 4+4 for WAN):
+
+| topology | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| 1 (holder) | 1.00 to 1.12 (write 1.005; unlink 1.12, chmod 1.09, rename 1.08) | 1.00 to 1.17 (write 1.004; create 1.15 to 1.17, rename 1.10, unlink 1.08) | 0.87 to 1.00 | 1.00 to 1.09 (write 1.004; create 1.09, chmod 1.07) |
+| 2 (backed holder, forward) | 0.57 to 0.97 | 0.64 to 0.95 | 0.60 to 0.97 | 0.62 to 0.98 |
+| 3 delegate | 0.68 to 0.94 | 0.68 to 0.91 | 0.70 to 0.94 | 0.68 to 0.99 |
+| 3 forward (writer on b) | 0.33 (flock) to 0.99 | 0.34 (flock) to 1.18: rename 1.18, unlink 1.16 | 0.34 to 1.05 (rename 1.05) | 0.34 to 1.10 (rename 1.10) |
+| 4 (delegate with a backup) | 0.67 to 0.96 | 0.67 to 0.95 | 0.69 to 0.96 | 0.66 to 0.80 |
+
+p90 of topologies 2 to 4 is 0.39 to 1.05 on every file system; only tmpfs topology 2 holder unlink (1.11) is above
+1.05. B is faster than A on the LAN topologies 2 to 4 by 5 to 65 % at p50 (the group acknowledgement, the nudge of the
+archive waits and the later work on the fast path), most of all on the delegate's `create` / `rename` (about 0.68 to
+0.75 on all four file systems) and on `flock` forwarded from b (0.33).
+
+The control (A, A' = the same A binary at another path, B, B' likewise; topologies 1 and 3, 3 rounds in a rotating
+order, 300 samples; 48 runs): A'/A and B'/B of the 30 to 100 us ops of topology 1 differ by up to 0.68 to 1.53 at p50 (ext4
+rename B'/B 1.42, xfs rename A'/A 1.41 and B'/B 0.68, xfs chmod A'/A 1.53), so with 12 runs a side the ±3 % gate of
+topology 1 cannot be resolved on them (the 2026-11-14 run found the same). The two cells of topology 1 that the
+fsync-dominated `write` gives are resolved: B/A 1.002 (ext4), 1.008 (xfs), 1.002 (btrfs) pooled over main and control
+runs, CI of the median ratio 0.994 to 1.018; tmpfs `write` (130 us) 1.07, CI 0.90 to 1.18, and its A'/A is 0.88. For the
+small ops, pooling the 12 + 12 runs per arm of the main run and the control (median B/A, 95 % bootstrap interval over runs):
+ext4 unlink 1.37 (56 -> 76 us, [1.03, 1.59]: the one topology-1 cell whose interval excludes 1; in the control B'/B is
+0.79 and A'/A 1.06, so one B run set is slow and one is not), ext4 rename 1.10 [0.92, 1.55], xfs rename 1.12 [0.79,
+1.56], xfs unlink 1.09 [0.89, 1.52], xfs create 1.02 [0.96, 1.08]; the rest 0.88 to 1.03 (btrfs create 0.88, chmod
+0.94, rename 0.94, unlink 0.93; tmpfs 0.98 to 1.02). The evidence for a rename or unlink cost on topology 1 of ext4 and
+xfs is therefore a direction (+5 to +10 % at p50, +5 to +20 us on a 60 to 100 us op) that the noise of this host
+neither confirms nor excludes; the 3 % gate is unresolved for those four cells, not met and not broken. The product path
+of a lone holder was not touched after the ADR-52 measurement (above), which found these cells within the A/A noise.
+
+Topology 3, the writer on b (`forward`), p50 B/A, A -> B in us: xfs rename 2,222 -> 2,642 (pooled 1.19, interval [1.08,
+2.14]; control A'/A 1.04, B'/B 1.00, B/A of the control 1.20) and unlink 2,138 -> 2,611 (1.22, [0.95, 1.69]; control
+B/A 1.09, noisy: A'/A 1.26); btrfs rename 2,481 -> 2,620 (1.056, [1.01, 1.09]); tmpfs rename 2,392 -> 2,564 (1.07,
+[0.96, 1.16]); ext4 rename 1.04. A's forward rename and unlink on xfs are its fastest (2.1 to 2.2 ms against 2.4 to 2.6
+on the other three file systems), while B's are 2.6 to 2.7 ms on all four: B's forward
+`rename` costs about 0.1 to 0.4 ms more than A's, a consistent slowdown of 4 to 19 % at p50 and 3 to 5 % at p90 (1.03 to 1.05,
+all four file systems), the only LAN cell over 5 % that the control reproduces (b and b' agree to 1 %, a and a' to 4 %).
+Not diagnosed. B's other forwarded ops of topology 3 are 0.85 to 0.97 (create, write, chmod, `flock`).
+
+Topology 5 (`net-wan`, 100 samples, the archive waits that the 2026-11-15 entry above explains), p50 A -> B in us, ext4 (the
+other three within 10 %): root create 71 -> 1,479, rename 83 -> 1,466, unlink 54 -> 1,478, chmod 34 -> 1,460; forward
+unlink 75 -> 1,448, forward chmod 36 -> 1,406; root `write` 3,130 -> 4,582 (1.46; xfs 1.73, btrfs 1.45, tmpfs 118 us
+-> 1.3 ms); the forwarded `create`, `write`, `rename` and `flock` (a WAN round trip of 107 to 126 ms) 0.96 to 1.01 on
+all four. That is the known cost of ADR-50's interim rule (a lone root with a write-eligible peer and no backup in
+budget answers its own ops on the archive), not a new one: the A binary predates it. A/A' of the WAN cells at p50 1.0 to 1.4.
+
+Topology 9 (B only, no A: the topology is new in M1.2 step 15), median over six runs of p50 / p90 / largest p99 (us):
+
+| file system | 4 writers, two subtrees, create | 4 writers, one subtree, create | delegate rename-across |
+|---|---|---|---|
+| ext4 | 932 / 1,967 / 2,536 | 1,779 / 2,708 / 3,288 | 350 / 799 / 1,770 |
+| xfs | 891 / 1,163 / 1,743 | 1,503 / 1,777 / 2,301 | 367 / 514 / 878 |
+| btrfs | 820 / 1,073 / 1,717 | 1,328 / 1,582 / 2,031 | 338 / 470 / 709 |
+| tmpfs | 799 / 1,027 / 1,914 | 1,305 / 1,611 / 2,240 | 328 / 459 / 671 |
+
+Against the first measurement (the M1.2 step 15 table above): two subtrees 1.25 to 1.4 ms -> 0.8 to 0.93 ms, one subtree
+1.9 to 2.5 -> 1.3 to 1.8, rename-across 0.48 to 0.52 -> 0.33 to 0.37; the ratio of one subtree to two (1.6 to 1.9) and
+the wider ext4 tail (rename-across p90 2.3 times its p50) are as before.
+
+Flags: topology 1 is unresolved at the 3 % gate for the 30 to 100 us ops (noise 0.7 to 1.5 in A/A'), resolved and neutral
+(0.2 to 0.8 %) for the three fsync-bound `write` rows; ext4 `unlink` (pooled +37 %, interval above 1) and the ext4 and xfs
+`rename` and xfs `unlink` p50 point up and are worth a quiet re-run with more runs; topology 3's forward `rename` on xfs
+(+19 %, control-confirmed) and, less, on btrfs and tmpfs is the one consistent slowdown on the LAN; topology 5's archive
+waits and the root `write` +45 % are the documented ADR-50 cost. No tuning, no gate changed. Raw logs, per-run JSON and the
+analysis scripts: the job directory of the run (not in the repository).
