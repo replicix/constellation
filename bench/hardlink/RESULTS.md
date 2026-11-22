@@ -166,3 +166,108 @@ listing tables `h0 -> head ; headnp`. `n` and the spreads are in
 - **Comparison with `main`.** `h0` is 180 commits older than `head`. Besides plan
   40's listing, the intervening changes are not isolated here; the burst and bogo-op
   differences are two orders of magnitude, far outside any of them.
+
+## Plan 46 M1.2 exit: the box gates re-run (2026-11-22)
+
+Plan 46 section 12 asks for plan 45's box gates and the two `hardlink-burst`
+scenarios again at M1.2's exit. The run used the quiet timing host, a release
+build of `060e6fa6`, and the build under test only (no `h0`). There were 5
+interleaved rounds. Each round ran these steps on ext4, xfs, btrfs and tmpfs in
+turn:
+
+1. `harness run hardlink-burst-single --seed 42`.
+2. `harness run hardlink-burst-two-node --seed 42`, with `TMPDIR` on the
+   file system measured.
+3. One `abba.sh` cell, with `PHASES=link,burst,control` and
+   `BURST_ROUNDS_HEAD=3`.
+
+Each gate is judged on the median over the five cells. The xfs links gate was
+thin, so xfs got 5 more rounds by the same method; the "10" figures include
+them.
+
+**Every gate holds on all four file systems.** The first run of this kind was
+on `6474e424`, and two gates failed there:
+
+- btrfs: one bogo-op took 5.11 s, and the last-100 / first-100 link p50 was
+  1.64.
+- xfs: the create p99 during the links was 1.29 of the control.
+
+The btrfs failures were a regression from `e7c863ec`, which stopped the root's
+own sticky grant on a node with no evident peer. After a long core step (a
+segment write of 300 ms or more on btrfs), a single node doubted that it was a
+singleton. Its root ops then waited for the archive, about 1.5 to 2 ms each,
+until the next registry poll. `060e6fa6` (PROGRESS, "A lapse alone asks for a
+registry read at once") ends the doubt at once. The xfs 1.29 did not repeat
+(below).
+
+| gate (plan 45 section 7, box), median over 5 cells (max) | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| one `stress-ng link` bogo-op <= 5 s (s) | 1.28 (1.66) | 1.12 (1.17); 10: 1.12 (1.22) | 2.21 (2.30) | 1.00 (1.52) |
+| `meta.db` after it <= 64 MB: max (MB) | 30.1 | 29.6 | 29.4 | 28.8 |
+| remount after `kill -9` <= 2 s (s) | 0.544 (0.584) | 0.545 (0.566) | 0.544 (0.796) | 0.485 (0.514) |
+| `link` p50 at 2,000 names / first 100 <= 1.5 | 1.09 (1.48) | 1.34 (1.46); 10: 1.25 | 1.21 (1.71) | 1.10 (1.52) |
+| `link` p50 last 100 (8,192 names) / first 100 <= 1.5 | 1.40 (1.53) | 1.22 (1.79); 10: 1.15 | 1.25 (1.77) | 1.26 (1.53) |
+| concurrent `create` p99 during the links / control <= 1.2 (ratio of medians; us) | 0.98 (2430 / 2469) | 1.19 (315 / 264); 10: 1.187 (318 / 268) | 1.01 (2134 / 2103) | 1.00 (654 / 655) |
+| concurrent `create` p99 during the unlinks / control <= 1.2 | 0.95 | 0.60; 10: 0.57 | 1.01 | 0.48 |
+
+The `unlink` p50 gate (2,000 names against the first 100) was not computed in
+this re-run.
+
+Per-run ratios of the links gate (burst p99 over the same cell's control p99):
+
+| fs | 5 rounds | over 1.2 |
+|---|---|---|
+| ext4 | 1.00 0.94 1.21 0.98 1.01 | 1 of 5 |
+| xfs | 1.25 1.11 1.13 1.08 1.23; rounds 6 to 10: 1.46 1.11 1.12 1.17 1.23 | 4 of 10 |
+| btrfs | 1.00 1.00 1.02 1.02 7.82 | 1 of 5 |
+| tmpfs | 2.11 0.78 1.00 2.71 0.78 | 2 of 5 |
+
+The large btrfs and tmpfs values are cells whose control p99 happened to be
+fast (btrfs 274 us against about 2,100 us; tmpfs 260 and 300 us against 650 to
+840 us). The xfs round 6 (1.46) started at a host load of 4.7, minutes after
+the box booted and built (the load gate let it start); rounds 7 to 10 started
+at 2.5 to 3.1. Without round 6 the nine-round ratio of medians is still under
+1.2.
+
+### `hardlink-burst-single` and `hardlink-burst-two-node`
+
+The 8,192-link phase of each scenario, seed 42, over 5 runs per file system;
+on xfs, 10 runs. Every run passed: 40 of 40, plus 10 more on xfs.
+
+| scenario (ceiling) | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| `hardlink-burst-single` (2.5 s): median / p90 / max (s) | 0.827 / 0.945 / 0.963 | 0.565 / 0.710 / 0.738 | 0.589 / 0.687 / 0.734 | 0.620 / 0.738 / 0.743 |
+| `hardlink-burst-two-node` (10 s): median / p90 / max (s) | 2.653 / 2.676 / 2.679 | 2.652 / 2.677 / 2.678 | 2.674 / 2.686 / 2.687 | 2.509 / 2.542 / 2.564 |
+
+These match the split's own quiet-box timing (PROGRESS, "Hard-link burst
+split": medians of 0.60 s and 2.70 s).
+
+### Not gates (information only)
+
+These are the absolute concurrent `create` p99 during the link burst and its
+control, and the share of creates that took 0.5 to 2.6 ms (the btrfs slow
+mode's signature). The figures are medians over 5 cells, with the per-cell
+values in brackets.
+
+| fs | p99 links (us) | p99 control (us) | slow share, links | slow share, control |
+|---|---|---|---|---|
+| ext4 | 2430 | 2469 | 0.082 | 0.068 |
+| xfs | 315 | 264 | 0.004 | 0.003 |
+| btrfs | 2134 | 2103 | 0.119 [0.035 0.030 0.119 0.124 0.140] | 0.084 |
+| tmpfs | 654 | 655 | 0.012 | 0.008 |
+
+- **btrfs.** `060e6fa6` brought the slow share from about 0.4 to about 0.1:
+  0.42 to 0.095 in that change's own interleaved cells.
+  - It is not back to plan 45's level. The p99 during the links is about 2.1 ms;
+    plan 45's close measured 0.4 ms (the table "concurrent `create`" above).
+  - The control is just as slow, so the ratio gate does not see this.
+  - What remains is the two lease CASes, one into the doubt and one out of it.
+    Deferring the first of them is the queued step 2 of that change.
+- **xfs.** Creates during the link burst are about 10 to 15 % slower than at
+  plan 45. The p99 was 263 us then and is 315 us now; at plan 45 the burst p99
+  was below its control's, and now it is 1.19 of it.
+  - A separate A/B of plan 45's build against `6474e424` measured the same shift.
+    In that A/B every cell of the newer build was above every cell of the older
+    one, and the ratio was 1.10 against 1.00.
+  - It is not bisected. The 1.29 of the first run did not repeat (1.19 at 5
+    rounds, 1.187 at 10).

@@ -1,30 +1,68 @@
 # Plan 46 — Committed or final: one stream per node, the commit rule per configuration, no server-side replay
 
-> **Status (2026-11-16): stage 0 and most of stage 1 landed; stage 1 is not
-> closed.** Landed: stage 0 (M0.1–M0.4, 2026-11-05; plan 43 is done and closed
-> into this plan, D-4, D-5); M1.0 (the model, chunks 1–14); M1.1; M1.2 steps
-> 0–15 (step 15's harness and perf part landed 2026-11-14:
-> `two-subtrees-one-stream-rename`, `ack-latency` topology 9) and the strict
-> flip of step 16 (2026-11-15: `acked_at_or_below_cut`, I2c and
-> `member_copies_drained` judge every configuration; `+report` is the opt-out).
-> The fable review of M1.2 has run and its B1 and B5 fixes landed; the
-> harness catalogue ran on `08aa3fa3` (294 pass, 2 fail;
-> `epoch-holder-retired` is fixed on main, `b5d53fe7`); the B4 A/B/B/A of
-> topologies 1–5 has run. M1.2 is not closed: still open are the
-> topology-2 forward-unlink slowdown (tmpfs +23 % p50), the `stress-ng-fs`
-> load failure, the quiet-box `hardlink-burst-single` and `hardlink-burst-two-node` gates, and the PROGRESS "M1.2
-> exit" and RESULTS.md entries. The fold, `MutateOp::Records` and
-> `RebuildReplica`'s non-delegation branch moved from M1.2 to M2.x (below). M1.3 steps 0–5, 7,
-> 8, 9, 10, 11 and 13, route fencing (ADR-47), the restart quarantine (ADR-46),
-> the roster singleton (ADR-50), the stale-clock re-check (ADR-52), the deadline
-> module (ADR-48) and late landing (ADR-49); M1.4 steps 0–5, 6a and the kept
-> rows (ADR-51, ADR-53), with ADR-57 (read holds), ADR-58 (settle windows) and
-> ADR-59 (parts A and B, the fill and the D1 widening) alongside. Open: M1.3
-> step 6 (`sticky.rs`; unmount and suspend release were pulled into step 7, no
-> idle release or `constellation release` yet) and steps 12, 14–18; M1.4 step 6
-> (the flex strict flags: some seeds still fail) and step 7; M1.5; stages 2
-> and 3. Step 9's simulation control S2 fails no seed yet. Status per step and
-> the open seeds: PROGRESS and the triage log.
+> **Status (2026-11-22): stage 0, M1.0, M1.1 and M1.2 are closed; M1.3 and M1.4
+> are open; M1.5 and stages 2 and 3 have not started.**
+>
+> - **Closed.**
+>   - Stage 0 (M0.1 to M0.4, 2026-11-05). Plan 43 is done and closed into this
+>     plan (D-4, D-5).
+>   - M1.0 (the model, chunks 1 to 14) and M1.1.
+>   - M1.2, 2026-11-22 on `060e6fa6`: steps 0 to 16, the review's conditions
+>     and the close fixes. PROGRESS, "Plan 46 M1.2 exit", has R1 (every
+>     configuration at 2,000 seeds), R2 (the harness catalogue), R3 (plan 45's
+>     box gates on four file systems, both `hardlink-burst` scenarios) and the
+>     "Deleted" table. The fold, `MutateOp::Records` and `RebuildReplica`'s
+>     non-delegation branch moved from M1.2 to M2.x. The Fable check of the exit
+>     write-up is pending.
+> - **M1.3.**
+>   - Landed:
+>     - steps 0 to 15, among them 6 and 12 (ADR-60), 14 (ADR-61), 15 (S4 as
+>       `ReleaseCut`, ADR-64), and 9 (closed with its simulation control on
+>       2026-11-22);
+>     - the status half of step 17;
+>     - route fencing (ADR-47), the restart quarantine (ADR-46), the roster
+>       singleton (ADR-50), the stale-clock re-check (ADR-52), the deadline
+>       module (ADR-48) and late landing (ADR-49).
+>   - Step 16 (the self-fence setting) moved to stage 2.
+>   - Open:
+>     - step 17's docs half;
+>     - step 18, the exit: every configuration at 2,000 seeds in the plain,
+>       idle-release and slow-lease-read arms, the ceilings, the harness at 3
+>       runs, `ack-latency` topologies 1 to 5 on four file systems, G1 and G2,
+>       and the Fable review.
+>   - The work packages of the 2026-11-22 sweep classification:
+>     - landed: WP6.1 (one sequencer per inboxed rid, `00a269fd`) and WP6.4
+>       (the release-path settle, `e41e1577`);
+>     - in review: WP6.2 (a delegate re-installs the grown subtrees of a
+>       generation it ended whole);
+>     - in coding: WP6.3 (a successor root grants a sticky generation to a
+>       leaving node);
+>     - open:
+>       - WP6.2b: a whole release whose `StreamReleased` and
+>         `DelegateNodeEnded` land in different segments. It is narrow and
+>         was already there.
+>       - WP6.5: idle hangs on a stale `last_seen`.
+>       - WP6.6: I4 under slow lease reads and idle release.
+>       - WP6.7: the rest of D3.
+>       - WP6.8: `tail_done_skipped`.
+>       - WP6.9: the handover oracle's clock slack.
+>   - Also open:
+>     - step 2 of the lapse fix (defer the singleton-to-non-singleton bump; it
+>       needs a review first);
+>     - F2, `Meta::outcome_row`'s unbounded reverse seek while a release is
+>       held.
+> - **M1.4.**
+>   - Landed: steps 0 to 5, 6a and the kept rows (ADR-51, ADR-53), with ADR-57
+>     (read holds), ADR-58 (settle windows) and ADR-59 (parts A and B, the fill
+>     and the D1 widening) alongside.
+>   - Open:
+>     - step 6: 6b and 6c are partly done; 6d, the flex strict flags, still
+>       fails seeds;
+>     - step 7, which waits for 6d.
+> - **Not started:** M1.5, stage 2 (M2.0 to M2.4, with the self-fence) and
+>   stage 3.
+>
+> Status per step and the open seeds: PROGRESS and the triage log.
 
 Read `docs/plans/v1/CONVENTIONS.md` first. This plan changes the
 *direction* of the acknowledgement and ordering-node work that plan 43
@@ -934,6 +972,36 @@ landed on 2026-11-02 as an interim form of C3 item 4's member copy: M1.2's
 member copy closes the window it covers, and M1.2 may revert the rule (it
 deletes `root_committed` with the lone delegate and the per-row classes).
 
+*M1.2 closed (2026-11-22, on `060e6fa6`; PROGRESS, "Plan 46 M1.2 exit").*
+
+The exit items:
+
+- Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds.
+  - R1 ran on `0d157e56`, 293 labels, plain. Its failing labels are negative
+    controls and tracked items.
+  - The changes landed after it ran their own sweeps. There was no full
+    re-sweep on the close commit.
+- The harness catalogue is green.
+  - R2 ran on `6474e424` with 301 passed and 2 failed. Both failures were a
+    scenario that mounted without `--fsync-timeout` since ADR-66; `3238bea6`
+    fixed it.
+  - Plan 45's box gates and both `hardlink-burst` scenarios pass on ext4, xfs,
+    btrfs and tmpfs (R3, `bench/hardlink/RESULTS.md`).
+  - The xfs create-p99 gate passes at 1.19 over 10 rounds, the thinnest margin.
+- The "Deleted" table is complete. It is in PROGRESS, as §13 asks.
+  - The row's "plan 45's key-move rule removed" is the cross-generation half
+    only (step 12; ADR-39's note). The key move itself stays: an unlink that
+    moves inode keys is an ordinary single-owner op.
+  - ADR-41's interim `root_committed` was kept.
+
+The header's three open items are closed:
+
+- the topology-2 forward unlink (`da2aec2a`, the orphan xattr span);
+- `stress-ng-fs` (`99dcae9c`, `ba2f7cdd`: lost locks and a stalled driver under
+  the root's own sticky grant);
+- the quiet-box `hardlink-burst` gates (hlfix, the scenario split `6474e424`,
+  and `060e6fa6`).
+
 ### Stage 2 — no server-side replay (4–6 weeks)
 
 | M | Scope | Deletions | Fail-before | Oracles / sims / scenarios / model | Exit |
@@ -1226,6 +1294,23 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       M1.2's and M1.3's exits; G1–G6
       re-measured on four file systems; DESIGN, the feature docs and
       ADR-40 updated; the "Deleted" tables complete.
+
+      *M1.2's part, done (2026-11-22; PROGRESS, "Plan 46 M1.2 exit"):*
+      - one stream per node with the records of §5.2;
+      - no range, generation-set or xgen code left;
+      - no lone delegate;
+      - I1, I2, I2c and I5 at zero on every configuration at 2,000 seeds,
+        plain (the flex strict flags stay with M1.4);
+      - the harness catalogue green, with the retired split scenarios
+        removed;
+      - plan 45's rows, the `hardlink-burst-single` and `-two-node` box gates
+        on four file systems, re-run at M1.2's exit;
+      - M1.2's "Deleted" table complete;
+      - M1.2 reviewed (Fable, 2026-11-18).
+
+      Still open for this box: everything owned by M1.3, M1.4 and M1.5.
+      That includes plan 40's, 41's, 42's and 45's rows at M1.3's exit,
+      and G1 to G6 on four file systems.
 - [ ] Stage 2: the coverage verification recorded with the minimal piece
       landed and proven; no `Origin::Replay`, no replay queue, no fold, no
       `derive_replay_op`, no `AckPolicy::Local`; conflict copies only from

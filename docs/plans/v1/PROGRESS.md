@@ -72023,3 +72023,193 @@ W14 class K (`flex-tight+commit+identity+settle+durability` 460, `flex-tight-lat
 - **Own path narrowed** (`journaled_answer_class`): only a `Singleton`, `Group{Root}`, `Archive` or `Hold` row is re-tagged in a hold; a `Final` row and a delegate-group row (its version a generation, not a configuration) keep their tags and the arms they had.
 - **Tests** (`hold_ack`): `a_failed_retag_at_the_holds_release_answers_eio_as_uncommitted`, `..._answers_a_remote_requester_eio_uncommitted` (the `Reply` arm), `a_failed_retag_in_a_hold_is_an_error_and_the_retry_answers` (own path), `an_answer_parked_under_the_archive_is_the_holds_when_the_hold_releases_it` (own and remote), `an_answer_parked_in_an_earlier_epochs_hold_is_re_tagged_to_the_current_one`, `an_answer_the_archive_covers_keeps_its_label_in_a_hold`, `a_refused_park_released_by_the_hold_keeps_its_refusal`, `an_own_answer_in_a_hold_re_tags_only_the_rows_weaker_than_the_holds`, `an_answer_that_waited_for_no_copy_is_not_relabelled_by_a_hold`, `an_answer_parked_as_the_current_hold_is_released_as_it_is`, `a_hold_that_ends_before_the_release_leaves_the_answer_as_it_was_given`.
 - **Nits.** `hold_answer_class` asserts `hold_group()`; the `reclass_journal_tx` doc says which targets keep the row's version; the let-chain is not available (edition 2021).
+
+## Plan 46 M1.2 exit (2026-11-22)
+
+M1.2 (one stream per node, no lone delegate, C3 verbatim) closes on `main` at `060e6fa6`.
+
+M1.2's code is steps 0 to 16, each with its own entry above. The step 16 strict flip and its review fixes are "M1.2 close: B5 and D1 fixes, strict
+defaults", 2026-11-15.
+
+The milestone review (Fable, 2026-11-18) ended "close with conditions".
+
+- Its MUSTs:
+  - M1, a stale exit sweep: closed by R1 below.
+  - M2, the harness catalogue and plan 45's gates: closed by R2 and R3 below.
+  - M3, this write-up: closed by this entry.
+  - M4, the L2b pin: closed by the pin's retirement with its unreachability argument ("M4: the L2b orphan-end pin retired with its argument",
+    `e64c4ba1`).
+- Its SHOULDs:
+  - S1, a member-copy read error read as "no copy", and S2, the gap tripwire: closed by `m12tail` ("A member-copy read error ends the claim"; the
+    tail gap is decided inside the append transaction).
+  - S3, C3 item 3 made crash-atomic: closed by `b0103098`.
+  - S4 to S6 went to M1.3.
+
+The plan's M1.2 header listed three items as open on 2026-11-16. All three are closed:
+
+| item | cause | fix | evidence |
+|---|---|---|---|
+| Topology 2 forward unlink slower than before M1.2 (tmpfs +23 % p50, ext4 +3 %; the B4 A/B/B/A, ext4 and tmpfs, topologies 2 and 4) | `ns::clear_orphan_xattrs` scanned from the orphan's own record key, which every rewind of b's speculative unlinks rewrites | `da2aec2a` (orphanscan, "M1.2 close" above): the scan ranges over the xattr keys only | topology 2, four file systems, 4 A/B/B/A rounds: forward unlink p50 x0.77 (ext4, xfs, btrfs), x0.92 (tmpfs); no cell above x1.02 (`bench/commit-rule/RESULTS.md`, "Orphan xattr span") |
+| `stress-ng-fs` failing, first seen under load | a product regression from ADR-55's root-own sticky grants, failing idle as well: a grant that left the root's own stream took the only lock record with it (writes discarded with `EIO`), and a driver stall | `99dcae9c`, `ba2f7cdd` and `sync::WakeCoalesce` ("Lost locks and a stalled driver under the root's own sticky grant", 2026-11-16) | `stress-ng-fs` passed 5 of 5 with no lost lock at landing, and 3 of 3 again in R2's named extras |
+| The quiet-box `hardlink-burst-single` and `hardlink-burst-two-node` gates | plan 45's burst went from 0.7 s to 7 s: the ADR-50 backup round trip per link (kept, an integrity wait), the btrfs sticky-grant scan, and the btrfs lapse doubt | hlfix C1 to C4 (2026-11-17/18); the scenario split by the user's decision (`6474e424`, "Hard-link burst split"); `060e6fa6` ("A lapse alone asks for a registry read at once") | R3 below: both scenarios and every plan 45 gate pass on ext4, xfs, btrfs and tmpfs |
+
+### Exit evidence
+
+The plan's exit criteria for M1.2 are:
+
+- zero I1, I2, I2c and I5 on every configuration at 2,000 seeds;
+- the harness catalogue green;
+- the "Deleted" table complete.
+
+**R1: every sim configuration at 2,000 seeds, plain.**
+
+The sweep ran on `0d157e56`, 293 labels with seeds 0..1999. It also ran the M1.3 arms, idle release on and slow lease reads, which belong to M1.3's
+exit. The replays ran one thread per seed; all 17 replayed seeds failed with the sweep's own message (determinism gate `2469d9fc`).
+
+- I1, I2, I2c, I4, I5, exactly-once and panics are 0 on every label.
+- The `m03` ceilings are green.
+- The tail tripwires (`tail_own_gated_beyond_gap`, `tail_answer_gaps`, `tail_done_skipped`) are 0.
+
+The labels with a failing seed are 14 negative controls, 6 tracked items and one new item:
+
+| label | failing seeds | class |
+|---|--:|---|
+| `acks3-runtime-lag-unaware`, `backup-lag-in-margin-unaware`, `backup-runtime-lag-unaware` | 1,423, 737, 1,956 | control (`unaware()`, the non-vacuity half) |
+| `delegated-core-stall-unlaned`, `delegated-core-stall-root-unlaned`, `delegated-core-stall-root-backup-unprobed` | 2,000 each | control |
+| `fast-takeover-skewed-successor-credited` | 1 (1507) | control (must fail) |
+| `locks-core-stall-backup-long-blind`, `-unfresh`, `-dated-at-return`, `-beats-unprobed` | 22, 32, 3, 2 | control (`-beats-unprobed` fails only on the tracked seeds 946 and 1838, so its own non-vacuity is not shown at 2,000 seeds) |
+| `locks-late-stale-mirror-naive`, `locks-writer-hold-delegated-unsettled-own-clock`, `strict-isolated-reader-skewed-credited` | 40, 14, 52 | control |
+| `locks-core-stall-backup-long`, `-beats`, `-slow-lease` | 2 each (946, 1838) | tracked: `LockIdle` unanswered (plan 41 L5/L6) |
+| `double-seal-after-the-grace` | 5 | tracked: the lock workload takes no lock under that clock mix (vacuous) |
+| `backup-lag-keeps-its-backup` | 3 (362, 1045, 1552) | tracked: a spurious backup drop |
+| `locks-writer-hold-delegated-unsettled` | 1 (1961) | tracked: cleared by the release-path settle (WP6.4, landed with `e41e1577`) |
+| `sticky-handover-busy` | 1 (1071) | new, recorded here as tracked (WP6.9): the handover oracle has no clock slack (799 against 800 ms); not integrity |
+
+Nothing in the plain arm is integrity class.
+
+`0d157e56` is not the close commit. Each change that landed after it ran its own sweeps on the labels it touches. None of them was a full re-sweep:
+
+- `74b78710` (seed 1510);
+- `46956587` (the M1.3 step 9 control);
+- `6474e424` (hlsplit);
+- `3238bea6` (closefix);
+- `e41e1577` (lockfix);
+- `00a269fd` (WP6.1);
+- `edb21c0e` (refusal scan);
+- `060e6fa6` (singlefix step 1).
+
+**R2: the harness catalogue, seed 42.**
+
+The run used `6474e424`, in six shards, plus a root run for the scenarios that need `CAP_SYS_ADMIN`.
+
+- 301 passed and 2 failed; 11 were skipped for `CAP_SYS_ADMIN` and passed 11 of 11 in the root run.
+- `backup-takeover-holds-missing-chunks` and `backup-takeover-drops-held-chunks` hung 3 of 3 in `close()`.
+  - The cause was a scenario regression since ADR-66 (`88ebdd2f`). The scenario mounted without `--fsync-timeout`, cut S3, and expected the
+    write-through close to fail fast. Under ADR-66 the close waits for S3.
+  - `3238bea6` mounts the scenario with `--fsync-timeout 2s`, as `unmount-drain` already does. Both scenarios then passed 3 of 3.
+  - No other scenario has the pattern.
+  - This had no integrity impact.
+- The named extras all passed:
+  - `singleton-peer-join` and `-nobackup`;
+  - `two-subtrees-one-stream-rename`;
+  - `delegate-backup-handoff-failover`;
+  - `stress-ng-fs` (3 runs);
+  - `delegate-partition`, idle and under load;
+  - `epoch-holder-retired`;
+  - `kernel-race-dir-version`, `-rename-ctime` and `-dir-version-remote` (3 runs each).
+- `e41e1577` (lockfix) landed after R2. It touches the delegate's release cut only, and R2's delegate scenarios were not re-run on it.
+
+**R3: plan 45's box gates and both `hardlink-burst` scenarios, quiet box, four file systems.**
+
+The run used `060e6fa6` with 5 interleaved rounds per file system, and xfs got 5 more rounds. The method and the full tables are in
+`bench/hardlink/RESULTS.md`, "Plan 46 M1.2 exit". Every gate holds.
+
+- The bogo-op median is 1.00 to 2.21 s, with a largest run of 2.30 s (gate 5 s).
+- `meta.db` is at most 30.1 MB (gate 64 MB).
+- The remount after `kill -9` is 0.796 s at most (gate 2 s).
+- Link p50 at 2,000 names and at the last 100, against the first 100, is at most 1.40 by median (gate 1.5).
+- Create p99 during the links against the control is 0.98 to 1.19 (gate 1.2).
+  - On xfs it is 1.19 at 5 rounds and 1.187 at 10. 4 of the 10 per-run ratios are above 1.2. This is the thinnest margin in the table.
+- `hardlink-burst-single` has a median of 0.57 to 0.83 s (ceiling 2.5 s). `hardlink-burst-two-node` has a median of 2.51 to 2.67 s (ceiling 10 s).
+  Every run passed.
+
+The first R3, on `6474e424`, failed two gates:
+
+- btrfs: one bogo-op took 5.11 s, and the last-100 / first-100 link p50 was 1.64.
+- xfs: create p99 was 1.29.
+
+The btrfs cause was bisected to `e7c863ec`. A single node doubted that it was a singleton after a long core step, so its root ops waited for the
+archive until the next registry poll. `060e6fa6` fixes it without moving a rule or a margin. The xfs 1.29 did not repeat.
+
+Not gates, recorded:
+
+- btrfs's absolute create p99 during a burst is about 2.1 ms. Plan 45 measured 0.4 ms.
+- The share of 0.5 to 2.6 ms creates on btrfs is 3 to 14 % per cell.
+- xfs creates are about 10 to 15 % slower than at plan 45.
+
+**Performance (§8).** The A/B/B/A of `ack-latency` topologies 1 to 5 against the commit before step 1 ran on 2026-11-14, on four file systems. It
+found two regressions:
+
+- The topology 5 root ops waited one sync interval for the archive. The archive-wait nudge fixed this ("Archive waits nudge a ship", 2026-11-15):
+  202 ms to 1.4 ms at p50.
+- The topology 2 forward unlink regression is the orphanscan row of the first table.
+
+The other LAN cells moved 4 to 15 % at p50 on small ops, with 3 or 4 runs per variant. The B4 re-run judged them noise on ext4 and tmpfs,
+topologies 2 and 4. Topology 3, and xfs and btrfs on topologies 2 to 4, were not re-run after the first comparison. Topology 1's ±3 % is not
+resolvable on 30 to 100 us ops with this harness (the same caveat as the earlier milestones).
+
+### Exit checklist (plan 46 §6, M1.2 row)
+
+- [x] Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds (R1, plain, `0d157e56`).
+- [x] The harness catalogue green (R2 on `6474e424`, its two failures fixed by `3238bea6`).
+- [x] Plan 45's box gates and both `hardlink-burst` scenarios on ext4, xfs, btrfs and tmpfs (R3, `060e6fa6`).
+- [x] The "Deleted" table complete (below).
+- [x] The milestone reviewed (Fable, 2026-11-18), with its conditions closed.
+
+### Deleted
+
+This table follows §13: per mechanism, the commit that introduced it, the bug it was for, the step that deleted it, and the test that shows the state
+cannot arise. Each step entry above has the symbol lists.
+
+| mechanism | introduced (why) | deleted | the state cannot arise |
+|---|---|---|---|
+| Hash-range splits: `Range` / `range`, `place_splits`, the 16-bucket histograms, the per-range window state, `delegate --range`, `CONSTELLATION_DELEGATION_SPLIT`, `DirOwner::Split` | `87cfe36b` (plan 30 M12: GIGA+ ranges for a hot shared directory) | step 1, `723be3c7` (D5) | `delegated-fast-path` against its control `delegated-fast-path-unchecked` (491 failing seeds); `old_shape_delegate_record_is_refused`, `old_shape_table_row_is_refused` (the decoders refuse the old shapes) |
+| The model `hotdir.rs`; harness `hash-range-split-merge`, `cross-range-rename`, `two-gens-ack-cost`; sim `shared-dir-split*`, `delegated-two-gens-*`; `dirsplit-bench` configurations `b` and `c` | `87cfe36b` and the ADR-39 rounds | step 1 | ADR-39's case is `delegated-two-dirs-one-backed` (one node, two subtrees, one stream), clean at 2,000 seeds; `ack-latency` topology 9 replaces `two-gens-ack-cost` |
+| Records `Delegate`, `Recall`, `RecallCut`, `DelegGroup` | `578ff9cf` (plan 30 M11: the delegation and its recall); `48d65e82` (plan 43 C2: a generation's end carries its cut); `0a7c55c7` (plan 43 C2c: the delegate's group) | step 8a, `d69540c4`: `DelegateNode`, `SubtreeReleased`, `StreamReleased`, `DelegateNodeGroup`, `DelegateNodeEnded` | `the_table_folds_a_grow_a_partial_release_and_an_end`, `the_stores_walk_resolves_both_subtrees_to_one_stream`; old shapes refused by `from_bytes_exact` |
+| `Delegation.designated` | `d214b1c7` (plan 30 M11 phase 2b: designations as delegations) | step 8a: `SubtreeGrant.kind` (`Placed`, `Sticky`, `Designated`) | the record round trips of all three kinds |
+| `DelegRecall` / `DelegRecalled` (the recall as a cut the root takes) | `578ff9cf` | step 10, `03de1fed`: `ReleaseRequest` answered by `SubtreeReleased` | the `step9_one_stream_per_node` release tests (each fails on step 9's base) |
+| One generation per subtree on a node (a second grant made a second stream) | `578ff9cf` | step 9, `0d1a9865`: a grant to a live stream grows it | `delegated_two_dirs_one_backed_is_one_stream_and_a_rename_between_them_recalls_nothing` |
+| ADR-39's cross-generation rule: `deleg_caps`, `deleg_note_xdeps`, `deleg_xgen_*`, `DelegateState::{xdeps,xrec,xheld_since}`, `status.delegation.xgen_*` | `9c93a9e0` (ADR-39: a group acknowledgement waited for the row's dependencies on the node's other generations) | step 12, `b2a3b666` | as above: one stream per node has no other generation. `causal_cut` stays strict and its knob stays caught (`the_causal_cut_oracle_catches_a_delegate_that_skips_its_dependency_wait`) |
+| Plan 45's key move, its cross-generation half (`gated_open_elsewhere_tx`, `deleg_gated_open`, the open-elsewhere clause) | `c8cdce55` (the lone hysteresis spans the generations a node holds) | step 12 | as above. The key move itself stays: inode keys follow the owner of the primary link's parent, and an unlink that moves them is a single-owner op (ADR-39 note, `79e05b42`). The plan row's "key-move rule removed" is this half only |
+| The lone delegate, the lead and the lone/group hysteresis: `deleg_lone*`, `delegation_lone_lead`, `delegation_lone_hysteresis`, `deleg_publish_rule`, `PendingClass` own states, the `LoneLead` oracle and its three configurations | `dc4dff2f`, `5008d56a`, `c8cdce55`, `6070c5e4` (a lone delegate's rows had to wait for the root once its journal ran a batch ahead) | step 13, `cb2089e3` | `a_stealable_grant_to_a_node_with_no_group_within_budget_is_refused`, `a_far_writer_is_forwarded_not_delegated`; the control `AUTHORITY_SIM_LONE_DELEGATE=1` fails I1 and I5 (`the_lone_delegate_control_fails_the_oracles`) |
+| `delegation_stream_rows` as a commit input (through the lead) | `5008d56a` | step 13; kept as the batch size | the wait for the group holds every own row until the root's append (step 13) |
+| `deleg_lost_after_ack` | `930e5b59` (ADR-39 review: no acknowledgement of a row read after its dependency's generation left) | step 13 | an answered row is committed (step 13's oracle: a delegate's `Singleton` is a violation) |
+| Holed generations (`deleg_stranded`, `on_deleg_recall`'s holed branch) | `96f45659` (a restarted delegate re-sent a holed generation forever) | step 6, `0c8bf011`: the counter is the log's index | `a_row_the_gate_does_not_re_append_leaves_no_hole_in_its_stream`, `a_takeover_strand_ends_every_own_generation` |
+| The deposed root's rebuild-replay of a delegate's appended rows: `Strand::rebuild`, `Strand::deleg_copy`, `strand_tx_deleg`, `Action::RebuildReplica`'s delegation branch | `af1ad1f4` (M0.3 L2: a deposed root's rebuild queued a gated copy) | step 7, `3c342548` (the member copy); step 14, `b54f04de` (an append is never queued) | `a_root_append_is_kept_as_a_member_copy_by_a_deposition_and_a_rebuild`, `a_rebuild_queues_no_append_of_a_delegates_row`; counter `deleg_append_queued` 0 in every sweep (the sim fails a run on it); the control `AUTHORITY_SIM_DELEG_APPEND_REPLAY=1` fails |
+
+Moved to M2.x (stage 2's replay deletion), not deleted here:
+
+- the fold (`derive_replay_op`);
+- `MutateOp::Records`;
+- `RebuildReplica`'s non-delegation branch.
+
+These serve the root's own rows and the replay queue.
+
+### Unchanged on purpose
+
+- `SessionState::deleg_covered`: the map stays as the fast path's covered-for-good watermark. The function went in step 13.
+- `deps_lost`, `void_cut`, `lost_from`, `deleg_note_lost`: a lost dependency on another node's generation, or on an ended one, is not
+  cross-stream.
+- ADR-41's interim `root_committed`: the root's copy, counted through rows its configuration committed. The plan let M1.2 revert it; it was kept.
+- `Config::lone_delegate` and `Config::per_row_class`: negative controls.
+
+### Open, not part of M1.2's exit (carried)
+
+- WP6.9: `sticky-handover-busy` seed 1071. This is the oracle's clock slack (above).
+- singlefix step 2: defer the singleton-to-non-singleton bump during a lapse-only doubt. This needs a Fable review first. It is the rest of btrfs's
+  slow share.
+- The absolute create-latency signal that plan 45's ratio gate does not see (btrfs about 2.1 ms against 0.4 ms). The unexplained xfs shift of
+  about 10 to 15 %.
+- F2: `Meta::outcome_row`'s unbounded reverse seek over retired heads while a release is held (CPU only).
+- R2's delegate scenarios have not been re-run on `e41e1577`.
+- The idle and slow-lease-read arms of the same sweep found WP6.1 (landed, `00a269fd`) and WP6.2 to WP6.8. They are M1.3 exit items.
