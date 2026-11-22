@@ -9673,14 +9673,15 @@ impl Core {
             return;
         }
         // F1 (ADR-25): the release cut is a position this node reports as
-        // covering what it executed under the stream, so it waits, as every
-        // other head it reports does (`lock_position`, `lock_release_floor`,
-        // the renewal), for a tagged write that passed its check at the
-        // write and is still in its transaction under a grant whose window is
-        // over. Only the rowless branch needs it: the row branch is ordered by
-        // `delegate_release`'s writer lock. `lock_hand_back` takes its `at`
-        // from here. One atomic load while no tagged write is in a
-        // transaction.
+        // covering what it executed under the stream, so it waits, as the
+        // other heads it reports do (`lock_position`, `lock_release_floor`,
+        // the renewal), for a tagged write that passed its check at the write
+        // and is still in its transaction under a grant whose window is over.
+        // Only the rowless branch needs it: the row branch is ordered by
+        // `delegate_release`'s writer lock. The rowless end of a due ADR-64
+        // cut settles in `release_after_cut`, the one other place a release
+        // reads the stream's index as its end. One atomic load while no
+        // tagged write is in a transaction.
         replica.settle_tagged_writes_at_release();
         let asked: BTreeSet<Ino> = dirs.into_iter().collect();
         let Some(d) = self.dl.mine.get(&gen) else {
@@ -10347,6 +10348,10 @@ impl Core {
             self.stats.deleg_cut_left_to_claim += 1;
             return;
         }
+        // F1 (ADR-25): the index is the end of the stream when the release
+        // turns rowless below, so a pinned tagged write is waited for first
+        // (`release_subtrees`).
+        replica.settle_tagged_writes_at_release();
         let idx = replica.delegate_idx(gen);
         let append_cap = self.holder_append_cap(gen, replica);
         let lost = self.deleg_find_lost(gen, replica);

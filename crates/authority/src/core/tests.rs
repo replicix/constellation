@@ -47323,6 +47323,110 @@ fn a_lapsed_delegation_renewed_before_the_reclaim_executes_again() {
     assert!(d.renew_timer.is_none());
 }
 
+/// F1 for a release cut: a tagged create under `dir` passes its check at the
+/// write (a grant of the root's, not in this node's table, window 1 s) and is
+/// held in its transaction, pinned. The clock then runs past the window and
+/// `trigger` runs the release; every other writer waits for the pinned commit
+/// (a slow one holding the lock). Returns what `trigger` returned and the
+/// stream's index (generation `gen`) before the write; the write has
+/// committed by then, one settle waited for it.
+fn release_over_a_pinned_write(
+    h: &mut Harness,
+    gen: u64,
+    dir: constellation_fs_core::Ino,
+    trigger: impl FnOnce(&mut Core, Now, &Meta) -> Vec<Action>,
+) -> (Vec<Action>, u64) {
+    use constellation_meta::locks::{GrantId, LockTag, LockToken};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    let clock = Arc::new(AtomicI64::new(h.now.0));
+    {
+        let c = clock.clone();
+        h.meta
+            .locks()
+            .set_clock(Arc::new(move || Now::same(c.load(Ordering::SeqCst))));
+    }
+    let before = crate::replica::Replica::delegate_idx(&h.meta, gen);
+    let now = h.now.0;
+    let tag = LockTag(vec![LockToken::window(
+        GrantId { node: 1, seq: 77 },
+        now + 1_000,
+    )]);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "turn".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let rid = Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 900,
+    };
+    let (pinned_tx, pinned_rx) = mpsc::channel::<std::thread::ThreadId>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let go: Arc<Mutex<Option<mpsc::Sender<()>>>> = Arc::new(Mutex::new(Some(go_tx)));
+    let done = Arc::new(Mutex::new(done_rx));
+    let out = std::thread::scope(|sc| {
+        let meta = &h.meta;
+        let writer = sc.spawn(move || {
+            constellation_meta::write_check_hook::set(Some(Box::new(move |at| {
+                if at == constellation_meta::write_check_hook::At::Pinned {
+                    pinned_tx.send(std::thread::current().id()).unwrap();
+                    go_rx.recv().unwrap();
+                }
+                true
+            })));
+            let r = meta.delegate_execute(
+                &op,
+                Some(rid),
+                gen,
+                constellation_meta::Position::ZERO,
+                &tag,
+                Now::same(now),
+            );
+            constellation_meta::write_check_hook::set(None);
+            done_tx.send(()).unwrap();
+            r
+        });
+        let writer_thread = pinned_rx.recv().unwrap();
+        {
+            let (go, done) = (go.clone(), done.clone());
+            meta.set_writer_wait_hook_for_tests(Some(Arc::new(move || {
+                if std::thread::current().id() == writer_thread {
+                    return;
+                }
+                if let Some(g) = go.lock().unwrap().take() {
+                    g.send(()).unwrap();
+                    done.lock().unwrap().recv().unwrap();
+                }
+            })));
+        }
+        h.now = h.now.plus(1_500);
+        clock.store(h.now.0, Ordering::SeqCst);
+        assert!(meta.locks().unsettled_writes());
+        let clk = h.clk();
+        let out = trigger(&mut h.core, clk, meta);
+        // Let it go if nothing did.
+        if let Some(g) = go.lock().unwrap().take() {
+            g.send(()).unwrap();
+        }
+        writer.join().unwrap().unwrap();
+        meta.set_writer_wait_hook_for_tests(None);
+        out
+    });
+    assert_eq!(
+        crate::replica::Replica::delegate_idx(&h.meta, gen),
+        before + 1,
+        "the pinned write did not commit"
+    );
+    assert_eq!(h.meta.locks().stats().settle_waits, 1);
+    (out, before)
+}
+
 /// A delegate of `/d` (generation 7, root node 1) whose first renewal was
 /// answered at `t0` with a 5 s ttl (honoured until `t0 + 4 s`, lapse
 /// watch at `t0 + 6 s`, next renewal due at `t0 + 2.5 s`), and the watch
@@ -77980,6 +78084,45 @@ mod step9_one_stream_per_node {
         assert!(h.core.dl.mine[&7].cuts.is_empty());
     }
 
+    /// F1 (ADR-25) for the other rowless cut: a due cut of a stopped stream
+    /// (`release_cut_rowless`, not `release_subtrees`) reports the stream's
+    /// index as its end, so it waits for a tagged write of another subtree
+    /// that passed its check and is still in its transaction once its
+    /// window is over. Fails without the settle: the stream ends at the
+    /// index before the write, which then lands past the root's cut.
+    #[test]
+    fn a_due_cut_ending_the_stream_rowless_cuts_after_a_pinned_write() {
+        let (mut h, d1, d2, _d3, _f1, _f2) = delegate_of_three();
+        let until = h.clk().wait.plus(5_000);
+        h.meta.read_delegations().grant(2, d1, until);
+        let out = release_request(&mut h, 5, vec![d1]);
+        let r1 = sends(&out)
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                PeerMsg::DelegationRecall { req, .. } => Some(*req),
+                _ => None,
+            })
+            .expect("recall");
+        h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+        let (out, before) = release_over_a_pinned_write(&mut h, 7, d2, |core, clk, meta| {
+            core.handle(
+                clk,
+                Event::Peer {
+                    from: 2,
+                    msg: PeerMsg::DelegationRecalled { req: r1 },
+                },
+                meta,
+            )
+        });
+        assert_eq!(h.core.stats.deleg_cut_rowless_after, 1);
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release note: {out:?}"));
+        assert_eq!(
+            note.end_at,
+            Some(before + 1),
+            "the rowless cut lacks the pinned write: {note:?}"
+        );
+    }
+
     /// ADR-64 (review S-1): a stopped stream takes no row of a part of it: a
     /// due cut ends it rowless. Fails on the parent: `SubtreeReleased` was
     /// journaled after the stop.
@@ -84927,6 +85070,38 @@ mod step14_release_seal {
         let out = rowless_note(&mut r, 2, note.seal);
         assert!(seal_reqs(&out, 4).is_empty(), "sealed: {out:?}");
         assert_eq!(r.core.dl.gens[&7].recall, RecallPhase::Drained(2));
+    }
+
+    /// F1 (ADR-25), the never-installed arm of `release_subtrees`: the rows
+    /// this node holds of a stream it did not take up are the cut, and a
+    /// tagged write still in its transaction past its window is one of them.
+    /// Fails without the settle (the cut is the index before the write).
+    #[test]
+    fn a_release_of_a_stream_not_taken_up_cuts_after_a_pinned_write() {
+        let (mut h, dir, _, _) = delegate_renewed_once();
+        let _ = super::deleg_group::forward_create(&mut h, dir, 1, 500);
+        h.core.dl.mine.remove(&7);
+        let (out, before) = release_over_a_pinned_write(&mut h, 7, dir, |core, clk, meta| {
+            core.handle(
+                clk,
+                Event::Peer {
+                    from: 1,
+                    msg: PeerMsg::ReleaseRequest {
+                        why: ReleaseWhy::Recall,
+                        req: OpId(5),
+                        gen: 7,
+                        dirs: Vec::new(),
+                    },
+                },
+                meta,
+            )
+        });
+        let note = release_note_to(&out, 1).unwrap_or_else(|| panic!("no release: {out:?}"));
+        assert_eq!(
+            note.end_at,
+            Some(before + 1),
+            "the cut lacks the pinned write: {note:?}"
+        );
     }
 
     /// A stream this node never installed but held on another boot (its grant
