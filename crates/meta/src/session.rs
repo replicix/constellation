@@ -93,9 +93,65 @@ pub struct JournalPos {
 }
 
 /// Plan 30 §M11: how many delegation streams a position can name. An
-/// op whose requester observed more goes to the root, which reads its
-/// own log and needs no tracking (`deps_overflow_to_root`).
+/// op whose causal past names more streams than this, past what the log
+/// this replica applied already holds (`SessionState::shipped`), is held at
+/// the requester until it fits (`deps_overflow_holds`, ADR-69): it is
+/// never sent with a truncated table, and not to the root either (the
+/// root orders only after the rows it appended, and a delegate
+/// acknowledges before that).
 pub const STREAMS_CAP: usize = 8;
+
+thread_local! {
+    /// Sim knob (`SimConfig::deps_cap`): the number of streams past which
+    /// `deps`, `frontier` and `floor_join` treat a table as overflowing,
+    /// so the sims' two or three delegates reach the nine-generation case.
+    /// Per thread: a sim runs on one.
+    static DEPS_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(STREAMS_CAP) };
+}
+
+/// Set the sim knob for this thread (clamped to `1..=STREAMS_CAP`).
+#[doc(hidden)]
+pub fn set_deps_cap_for_sim(cap: usize) {
+    DEPS_CAP.with(|c| c.set(cap.clamp(1, STREAMS_CAP)));
+}
+
+/// The streams cap in force on this thread (`STREAMS_CAP` outside the sims).
+pub fn deps_cap() -> usize {
+    DEPS_CAP.with(std::cell::Cell::get)
+}
+
+/// An op's causal past as the session names it, without the table's cap:
+/// what an op whose [`SessionState::deps`] overflow waits on
+/// ([`SessionState::compact_wide`]). A snapshot: it only ever shrinks
+/// (entries the log carries, or whose generation ended) until it fits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WideDeps {
+    pub seq: u64,
+    pub pending: Option<JournalPos>,
+    pub streams: std::collections::BTreeMap<u64, u64>,
+}
+
+impl WideDeps {
+    /// Add `streams` (the highest index per generation wins).
+    pub fn raise_all(&mut self, streams: &Streams) {
+        for (g, i) in streams.iter() {
+            let e = self.streams.entry(g).or_insert(0);
+            *e = (*e).max(i);
+        }
+    }
+}
+
+/// One look at a [`WideDeps`] ([`SessionState::compact_wide`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WideStep {
+    /// What is still owed fits the table: the op's `deps` now.
+    Fits(Position),
+    /// More than the cap is still owed: hold on.
+    Holds,
+    /// An entry names a row of a generation that ended below it: the
+    /// snapshot is dead, the op takes its `deps` afresh (`deps_lost`).
+    Lost,
+}
 
 /// Plan 30 §M11: the per-stream pending part of a [`Position`] — for
 /// each delegation generation, the highest stream index observed (a
@@ -517,6 +573,9 @@ pub struct SessionStats {
     /// `status.ack.settled_eio`), as opposed to an unsettled in-doubt
     /// `EIO`.
     pub settled_eio: u64,
+    /// ADR-69: stream entries a floor (`frontier`) still left out after the
+    /// applied log's were: what a lock release's floor could not name.
+    pub floor_truncated: u64,
 }
 
 #[derive(Default)]
@@ -621,6 +680,16 @@ struct Inner {
     /// for a waiter that comes or wakes after it; the withdrawn
     /// generations' share is bounded by [`WITHDRAWN_COVERED_CAP`].
     deleg_covered: std::collections::BTreeMap<u64, u64>,
+    /// ADR-69: per generation, the highest stream index the log this
+    /// replica applied carries: raised only at a segment's apply (stream
+    /// fills included) and at the acknowledgement of this node's own
+    /// shipped rows, after `applied_seq` covers that segment, and seeded at
+    /// the open below this node's unshipped journal rows of the
+    /// generation. Never the persisted log index (which counts a root's
+    /// appended and adopted rows that are not in the log yet) and never
+    /// `streams` (which counts executed and appended rows): an entry at or
+    /// below it is covered by `deps.seq` at every executor.
+    shipped: std::collections::BTreeMap<u64, u64>,
 }
 
 /// How many withdrawn generations keep their high-water `through`
@@ -694,6 +763,94 @@ impl RowRanges {
 }
 
 impl Inner {
+    /// The log sequence a write's `deps` name (see `SessionState::deps`).
+    fn log_seq(&self) -> u64 {
+        self.observed
+            .seq
+            .max(self.frontier_log.seq)
+            .max(self.applied_seq)
+    }
+
+    /// The journal position a write's `deps` name.
+    fn log_pending(&self) -> Option<JournalPos> {
+        self.observed
+            .pending
+            .max(self.frontier_log.pending)
+            .max(self.applied)
+    }
+
+    /// `deps` as it always was: `None` when more than the cap of
+    /// generations are named, the voided ones counted.
+    fn deps_exact(&self) -> Option<Position> {
+        let mut streams = self.observed.streams;
+        for (gen, idx) in self.frontier.iter().chain(self.streams.iter()) {
+            if self.voided.contains(gen) {
+                continue;
+            }
+            if !streams.raise(*gen, *idx) {
+                return None;
+            }
+        }
+        if streams.len() > deps_cap() {
+            return None;
+        }
+        // A voided generation is depended on only up to its cut: past it
+        // nothing will ever be appended (this node's own tentative rows
+        // are replayed by rid, and its writes wait for those replays), and
+        // a dependency there would never be met (`deps_lost`). `observed`
+        // can name one past the cut (a reply that arrived after the
+        // `DelegateNodeEnded` applied here: long-delegated seed 70176).
+        for gen in self.voided.iter() {
+            if streams.get(*gen).is_some() {
+                streams.lower(*gen, self.cut_of(*gen));
+            }
+        }
+        Some(Position {
+            seq: self.log_seq(),
+            pending: self.log_pending(),
+            streams,
+        })
+    }
+
+    /// The cut of voided generation `gen` (see `SessionState::void_cut`).
+    fn cut_of(&self, gen: u64) -> u64 {
+        self.void_cuts
+            .get(&gen)
+            .copied()
+            .unwrap_or_else(|| self.streams.get(&gen).copied().unwrap_or(0))
+    }
+
+    /// Whether an entry names a row of a generation that ended below it.
+    fn is_lost(&self, gen: u64, idx: u64) -> bool {
+        idx > 0 && self.voided.contains(&gen) && idx > self.cut_of(gen)
+    }
+
+    /// The streams `deps` names, with no cap: `observed`'s, and the
+    /// unvoided generations of `frontier` and `streams`, each at its
+    /// highest; a voided generation lowered to its cut.
+    fn wide_streams(&self) -> std::collections::BTreeMap<u64, u64> {
+        let mut all: std::collections::BTreeMap<u64, u64> = self.observed.streams.iter().collect();
+        for (gen, idx) in self.frontier.iter().chain(self.streams.iter()) {
+            if self.voided.contains(gen) {
+                continue;
+            }
+            let e = all.entry(*gen).or_insert(0);
+            *e = (*e).max(*idx);
+        }
+        for gen in self.voided.iter() {
+            if let Some(i) = all.get_mut(gen) {
+                *i = (*i).min(self.cut_of(*gen));
+            }
+        }
+        all.retain(|_, i| *i > 0);
+        all
+    }
+
+    /// Leave out what the applied log carries (`shipped`).
+    fn drop_shipped(&self, all: &mut std::collections::BTreeMap<u64, u64>) {
+        all.retain(|gen, idx| *idx > self.shipped.get(gen).copied().unwrap_or(0));
+    }
+
     /// `a` joined with `b`, for a watermark: stream entries this replica
     /// already reaches (applied that far, or voided) are dropped first —
     /// they wait for nothing — so the cap is spent on what is still
@@ -1081,6 +1238,13 @@ impl SessionState {
         self.stats.lock().unwrap().settled_eio += 1;
     }
 
+    /// ADR-69: `n` stream entries a floor could not name (`floor_truncated`).
+    pub fn count_floor_truncated(&self, n: u64) {
+        if n > 0 {
+            self.stats.lock().unwrap().floor_truncated += n;
+        }
+    }
+
     pub fn count_fast_ack_stale_lease(&self) {
         self.stats.lock().unwrap().fast_acks_stale_lease += 1;
     }
@@ -1115,51 +1279,100 @@ impl SessionState {
     /// Plan 30 §M11: the position a write submitted here depends on —
     /// `observed`, with every delegation stream position this node
     /// holds or was answered with (its own delegate executions, the
-    /// streams it applied, the replies it installed). `None` when they
-    /// do not fit `Streams` (the write goes to the root, which orders
-    /// after everything).
+    /// streams it applied, the replies it installed).
+    ///
+    /// ADR-69: when they do not fit `Streams`, the entries the log this
+    /// replica applied already carries are left out (`shipped`: `deps.seq`
+    /// covers them at every executor), this included for what `observed`
+    /// names. Only then; a table that fits is returned as it always was.
+    /// `None` when what is still owed does not fit either: the op is held
+    /// by its requester ([`Self::deps_wide`], [`Self::compact_wide`]); it is
+    /// never sent with fewer streams than it depends on.
     pub fn deps(&self) -> Option<Position> {
         let g = self.inner.lock().unwrap();
-        let mut streams = g.observed.streams;
-        for (gen, idx) in g.frontier.iter().chain(g.streams.iter()) {
-            if g.voided.contains(gen) {
-                continue;
-            }
-            if !streams.raise(*gen, *idx) {
-                return None;
-            }
+        if let Some(p) = g.deps_exact() {
+            return Some(p);
         }
-        // A voided generation is depended on only up to its cut: past it
-        // nothing will ever be appended (this node's own tentative rows
-        // are replayed by rid, and its writes wait for those replays), and
-        // a dependency there would never be met (`deps_lost`). `observed`
-        // can name one past the cut (a reply that arrived after the
-        // `DelegateNodeEnded` applied here: long-delegated seed 70176).
-        for gen in g.voided.iter() {
-            if streams.get(*gen).is_some() {
-                let cut = g
-                    .void_cuts
-                    .get(gen)
-                    .copied()
-                    .unwrap_or_else(|| g.streams.get(gen).copied().unwrap_or(0));
-                streams.lower(*gen, cut);
-            }
+        let mut all = g.wide_streams();
+        g.drop_shipped(&mut all);
+        if all.len() > deps_cap() {
+            return None;
         }
         Some(Position {
-            seq: g.observed.seq.max(g.frontier_log.seq).max(g.applied_seq),
-            pending: g
-                .observed
-                .pending
-                .max(g.frontier_log.pending)
-                .max(g.applied),
-            streams,
+            seq: g.log_seq(),
+            pending: g.log_pending(),
+            streams: Self::table_of(&all),
         })
+    }
+
+    /// The `Streams` table of `all` (at most [`STREAMS_CAP`] entries).
+    fn table_of(all: &std::collections::BTreeMap<u64, u64>) -> Streams {
+        let mut streams = Streams::NONE;
+        for (gen, idx) in all {
+            let fits = streams.raise(*gen, *idx);
+            debug_assert!(fits, "a wide table that fits the cap fits the table");
+        }
+        streams
+    }
+
+    /// The whole of what [`Self::deps`] depends on, without the table's cap
+    /// and without leaving anything out: an op whose `deps` overflow keeps
+    /// this snapshot and waits ([`Self::compact_wide`]).
+    pub fn deps_wide(&self) -> WideDeps {
+        let g = self.inner.lock().unwrap();
+        WideDeps {
+            seq: g.log_seq(),
+            pending: g.log_pending(),
+            streams: g.wide_streams(),
+        }
+    }
+
+    /// One look at the snapshot of an op held for its `deps` overflow, at
+    /// each tick: the entries the log carries are dropped for good (its
+    /// causal past is fixed at the submission: the snapshot only shrinks,
+    /// whatever generations arrive since). Once what remains fits, the op's
+    /// `deps` are the snapshot's own, with the log position and journal
+    /// position this replica has now (a released op orders after at least
+    /// what it applied meanwhile). An entry of a generation that ended
+    /// below it is lost with it ([`Self::deps_lost`]): the op takes its
+    /// `deps` afresh.
+    pub fn compact_wide(&self, wide: &mut WideDeps) -> WideStep {
+        let g = self.inner.lock().unwrap();
+        if wide.streams.iter().any(|(gen, i)| g.is_lost(*gen, *i)) {
+            return WideStep::Lost;
+        }
+        g.drop_shipped(&mut wide.streams);
+        if wide.streams.len() > deps_cap() {
+            return WideStep::Holds;
+        }
+        wide.seq = wide.seq.max(g.log_seq());
+        wide.pending = wide.pending.max(g.log_pending());
+        WideStep::Fits(Position {
+            seq: wide.seq,
+            pending: wide.pending,
+            streams: Self::table_of(&wide.streams),
+        })
+    }
+
+    /// The generations a snapshot names that this replica neither holds far
+    /// enough nor knows as void (see [`Self::unreached_deps`]).
+    pub fn unreached_wide(&self, wide: &WideDeps) -> Vec<u64> {
+        let g = self.inner.lock().unwrap();
+        wide.streams
+            .iter()
+            .filter(|(gen, i)| {
+                **i > 0 && !g.voided.contains(gen) && !g.streams.get(gen).is_some_and(|m| *m >= **i)
+            })
+            .map(|(gen, _)| *gen)
+            .collect()
     }
 
     /// Everything this node's clients have seen or been acknowledged:
     /// [`Self::deps`], except that a stream table that does not fit
     /// keeps the generations that do (the highest ones: the older a
-    /// generation, the likelier it is applied or void everywhere).
+    /// generation, the likelier it is applied or void everywhere), after
+    /// the entries the applied log carries were left out
+    /// (`floor_truncated` counts what is still dropped).
     ///
     /// A cluster lock's release carries it (EC2 campaign 4 B-1): the
     /// next holder waits for it, so every file the releaser wrote under
@@ -1170,27 +1383,90 @@ impl SessionState {
             return p;
         }
         let g = self.inner.lock().unwrap();
-        let mut all: std::collections::BTreeMap<u64, u64> = g.observed.streams.iter().collect();
-        for (gen, idx) in g.frontier.iter().chain(g.streams.iter()) {
-            if g.voided.contains(gen) {
-                continue;
-            }
-            let e = all.entry(*gen).or_insert(0);
-            *e = (*e).max(*idx);
-        }
+        let mut all = g.wide_streams();
+        g.drop_shipped(&mut all);
         let mut streams = Streams::NONE;
-        for (gen, idx) in all.into_iter().rev().take(STREAMS_CAP) {
-            streams.raise(gen, idx);
+        let mut dropped = 0u64;
+        for (n, (gen, idx)) in all.into_iter().rev().enumerate() {
+            if n < deps_cap() {
+                streams.raise(gen, idx);
+            } else {
+                dropped += 1;
+            }
         }
-        Position {
-            seq: g.observed.seq.max(g.frontier_log.seq).max(g.applied_seq),
-            pending: g
-                .observed
-                .pending
-                .max(g.frontier_log.pending)
-                .max(g.applied),
+        let p = Position {
+            seq: g.log_seq(),
+            pending: g.log_pending(),
             streams,
+        };
+        drop(g);
+        self.stats.lock().unwrap().floor_truncated += dropped;
+        p
+    }
+
+    /// ADR-69: the log this replica applied carries stream `gen` through
+    /// `idx` (a segment applied here, or this node's own rows acknowledged
+    /// shipped); call it only after [`Self::advance_rows`] for that segment.
+    pub fn note_shipped(&self, gen: u64, idx: u64) {
+        if gen == 0 {
+            return;
         }
+        let mut g = self.inner.lock().unwrap();
+        let inner = &mut *g;
+        let cur = inner.shipped.entry(gen).or_insert(0);
+        if idx > *cur {
+            *cur = idx;
+        }
+        while !inner.fills.is_empty() && inner.fills.contains(&(gen, *cur + 1)) {
+            *cur += 1;
+        }
+    }
+
+    /// [`Self::note_stream_fill`]'s twin for `shipped`: the fill stands in
+    /// the log at `(gen, idx)`.
+    pub fn note_shipped_fill(&self, gen: u64, idx: u64) {
+        if gen == 0 || idx == 0 {
+            return;
+        }
+        let reached = self
+            .inner
+            .lock()
+            .unwrap()
+            .shipped
+            .get(&gen)
+            .copied()
+            .unwrap_or(0)
+            + 1
+            >= idx;
+        if reached {
+            self.note_shipped(gen, idx);
+        }
+    }
+
+    /// ADR-69: the open's seed of `shipped` (raise only): the persisted
+    /// log index of `gen`, lowered below this node's lowest unshipped
+    /// journal row of it (a root's appended, tail or adopted row counts in
+    /// the index and is not in the log).
+    pub fn seed_shipped(&self, gen: u64, idx: u64) {
+        if gen == 0 || idx == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let cur = g.shipped.entry(gen).or_insert(0);
+        if idx > *cur {
+            *cur = idx;
+        }
+    }
+
+    /// The stream index of `gen` the applied log carries (0: none known).
+    pub fn shipped_idx(&self, gen: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .shipped
+            .get(&gen)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Plan 30 §M11: this replica holds delegation stream `gen` through
@@ -1588,8 +1864,12 @@ impl SessionState {
     pub fn raise_observed_excusing(&self, pos: Position, excused: &[(u64, u64)]) {
         let mut g = self.inner.lock().unwrap();
         // Past the cap even after dropping what is reached (nine
-        // generations owed at once), the newest are kept: the oldest
-        // generations' streams are the likeliest in the log already.
+        // generations owed at once), the newest are kept in `observed`: the
+        // oldest generations' streams are the likeliest in the log already.
+        // The others are not forgotten (ADR-69): they go to `frontier`,
+        // which `deps` reads whole, and which holds an op whose `deps`
+        // would overflow until the log carries them.
+        let mut folded: Vec<(u64, u64)> = Vec::new();
         let next = match g.join_owed(&g.observed, &pos) {
             Some(p) => p,
             None => {
@@ -1599,7 +1879,14 @@ impl SessionState {
                     let e = all.entry(gen).or_insert(0);
                     *e = (*e).max(i);
                 }
-                let kept: Vec<(u64, u64)> = all.into_iter().rev().take(STREAMS_CAP).collect();
+                let mut kept: Vec<(u64, u64)> = Vec::new();
+                for (n, (gen, i)) in all.into_iter().rev().enumerate() {
+                    if n < STREAMS_CAP {
+                        kept.push((gen, i));
+                    } else {
+                        folded.push((gen, i));
+                    }
+                }
                 Position {
                     seq: g.observed.seq.max(pos.seq),
                     pending: g.observed.pending.max(pos.pending),
@@ -1608,6 +1895,10 @@ impl SessionState {
                 .with_streams_wire(&kept)
             }
         };
+        for (gen, i) in folded {
+            let e = g.frontier.entry(gen).or_insert(0);
+            *e = (*e).max(i);
+        }
         let fresh: std::collections::BTreeSet<u64> = excused
             .iter()
             .flat_map(|(first, last)| *first..=*last)
@@ -2302,6 +2593,20 @@ impl crate::store::Meta {
     pub fn deps_lost_deps(&self, deps: &Position) -> bool {
         self.void_ended_deps(deps);
         self.session.deps_lost(deps)
+    }
+
+    /// [`SessionState::compact_wide`], after the generations the table ended
+    /// before this incarnation began are voided, as [`Self::deps_lost_deps`]
+    /// does for the `deps` of an op that fits.
+    pub fn compact_wide_deps(&self, wide: &mut WideDeps) -> WideStep {
+        let gens: Vec<u64> = self
+            .session
+            .unreached_wide(wide)
+            .into_iter()
+            .filter(|gen| self.session.ended_before_open(*gen))
+            .collect();
+        self.void_ended_among(gens);
+        self.session.compact_wide(wide)
     }
 
     /// [`SessionState::ready`] against this store: whether a read of
@@ -3369,5 +3674,181 @@ mod tests {
         );
         assert!(!meta.durability_pending(&dentry("c")));
         assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));
+    }
+
+    // ---- ADR-69: deps overflow ----
+
+    fn owed(s: &SessionState, gens: std::ops::RangeInclusive<u64>, idx: u64) {
+        for g in gens {
+            let mut p = Position::ZERO;
+            assert!(p.streams.raise(g, idx));
+            s.note_frontier(&p);
+        }
+    }
+
+    /// A table that fits is what it always was: the applied log's entries
+    /// are left out only when it does not.
+    #[test]
+    fn a_deps_table_that_fits_is_not_compacted() {
+        let s = SessionState::default();
+        owed(&s, 1..=3, 4);
+        s.note_shipped(2, 4);
+        let d = s.deps().expect("fits");
+        assert_eq!(
+            d.streams.iter().collect::<Vec<_>>(),
+            vec![(1, 4), (2, 4), (3, 4)]
+        );
+    }
+
+    /// Nine generations overflow; the log's carrying one of them (also one
+    /// `observed` names) leaves eight.
+    #[test]
+    fn an_overflowing_deps_drops_what_the_applied_log_carries() {
+        let s = SessionState::default();
+        let mut obs = Position::ZERO;
+        assert!(obs.streams.raise(1, 5));
+        s.raise_observed(obs);
+        owed(&s, 2..=9, 5);
+        assert!(s.deps().is_none(), "nine generations owed");
+        s.note_shipped(1, 5);
+        let d = s.deps().expect("eight are left");
+        assert_eq!(d.streams.len(), 8);
+        assert!(d.streams.get(1).is_none(), "{d:?}");
+        // Below the entry is not enough.
+        let t = SessionState::default();
+        owed(&t, 1..=9, 5);
+        t.note_shipped(1, 4);
+        assert!(t.deps().is_none());
+    }
+
+    /// Rows this node executed as a delegate or appended as the root are in
+    /// `streams`, not in the log: they stay named however many are shipped
+    /// below them, and only the log's apply (`note_shipped`) drops them.
+    #[test]
+    fn own_executed_and_root_appended_rows_are_kept() {
+        let s = SessionState::default();
+        owed(&s, 1..=8, 2);
+        s.note_stream(9, 6); // executed or appended here, unshipped
+        assert!(s.deps().is_none());
+        for g in 1..=8 {
+            s.note_shipped(g, 2);
+        }
+        let d = s.deps().expect("one owed");
+        assert_eq!(d.streams.iter().collect::<Vec<_>>(), vec![(9, 6)]);
+        s.note_shipped(9, 5);
+        assert_eq!(s.deps().unwrap().streams.get(9), Some(6));
+        s.note_shipped(9, 6);
+        assert!(s.deps().unwrap().streams.is_empty());
+    }
+
+    /// A fill the log carries counts in `shipped` once the stream reaches
+    /// the index below it, as in `streams`.
+    #[test]
+    fn shipped_follows_the_logs_fills() {
+        let s = SessionState::default();
+        s.note_stream_fill(7, 3);
+        s.note_shipped_fill(7, 3);
+        assert_eq!(s.shipped_idx(7), 0, "the stream is not at 2 yet");
+        s.note_shipped(7, 2);
+        s.note_stream_fill(7, 3);
+        s.note_shipped_fill(7, 3);
+        assert_eq!(s.shipped_idx(7), 3);
+    }
+
+    /// An `observed` that does not fit keeps the newest in the table and
+    /// the others in the frontier: `deps` still names them.
+    #[test]
+    fn observed_truncation_folds_into_the_frontier() {
+        let s = SessionState::default();
+        let mut a = Position::ZERO;
+        for g in 1..=6 {
+            assert!(a.streams.raise(g, 3));
+        }
+        s.raise_observed(a);
+        let mut b = Position::ZERO;
+        for g in 7..=10 {
+            assert!(b.streams.raise(g, 3));
+        }
+        s.raise_observed(b);
+        assert_eq!(s.observed().streams.len(), 8);
+        let wide = s.deps_wide();
+        assert_eq!(wide.streams.len(), 10, "{wide:?}");
+        assert!(s.deps().is_none());
+    }
+
+    /// The snapshot of a held op only shrinks: generations that arrive
+    /// after it do not enter it, and it is released once the log carries
+    /// enough, at the log position it has then.
+    #[test]
+    fn a_held_snapshot_is_released_by_log_progress_not_by_churn() {
+        let s = SessionState::default();
+        s.seed_applied(10, None);
+        owed(&s, 1..=10, 2);
+        let mut wide = s.deps_wide();
+        assert_eq!(wide.seq, 10);
+        assert_eq!(s.compact_wide(&mut wide), WideStep::Holds);
+        // New generations arrive every tick: the snapshot does not grow.
+        owed(&s, 11..=40, 9);
+        assert_eq!(s.compact_wide(&mut wide), WideStep::Holds);
+        assert_eq!(wide.streams.len(), 10);
+        s.note_shipped(1, 2);
+        s.advance(12, None);
+        s.note_shipped(2, 2);
+        match s.compact_wide(&mut wide) {
+            WideStep::Fits(p) => {
+                assert_eq!(p.streams.len(), 8);
+                assert!(p.seq >= 12, "{p:?}");
+                assert!(p.streams.get(11).is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An entry above the cut of a generation that ended is lost with it.
+    #[test]
+    fn a_snapshot_entry_above_a_voided_cut_is_lost() {
+        let s = SessionState::default();
+        owed(&s, 1..=10, 5);
+        let mut wide = s.deps_wide();
+        s.void_stream(3, 2);
+        s.note_void_cut(3, 2);
+        assert_eq!(s.compact_wide(&mut wide), WideStep::Lost);
+        // Taken afresh, the voided entry is lowered to its cut.
+        assert_eq!(s.deps_wide().streams.get(&3), None);
+    }
+
+    /// A floor that still does not fit drops the oldest and says so.
+    #[test]
+    fn a_frontier_that_does_not_fit_counts_what_it_drops() {
+        let s = SessionState::default();
+        owed(&s, 1..=10, 5);
+        s.note_shipped(1, 5);
+        s.note_shipped(2, 5);
+        assert_eq!(s.frontier().streams.len(), 8);
+        assert_eq!(s.stats().floor_truncated, 0, "the log's two were left out");
+        let t = SessionState::default();
+        owed(&t, 1..=10, 5);
+        let f = t.frontier();
+        assert_eq!(f.streams.len(), 8);
+        assert!(f.streams.get(10).is_some() && f.streams.get(1).is_none());
+        assert_eq!(t.stats().floor_truncated, 2);
+    }
+
+    /// The sim knob lowers the cap of `deps`, `frontier` and `floor_join`.
+    #[test]
+    fn the_sim_cap_covers_deps_frontier_and_floor_join() {
+        set_deps_cap_for_sim(2);
+        let s = SessionState::default();
+        owed(&s, 1..=3, 1);
+        assert!(s.deps().is_none());
+        assert_eq!(s.frontier().streams.len(), 2);
+        let mut a = Position::ZERO;
+        let mut b = Position::ZERO;
+        a.streams.raise(1, 1);
+        a.streams.raise(2, 1);
+        b.streams.raise(3, 1);
+        assert_eq!(crate::locks::floor_join(&a, &b).streams.len(), 2);
+        set_deps_cap_for_sim(STREAMS_CAP);
+        assert!(s.deps().is_some());
     }
 }

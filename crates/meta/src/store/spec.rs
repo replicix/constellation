@@ -2418,7 +2418,7 @@ fn stranded_local_deps(
             *e = (*e).max(head.idx);
         }
     }
-    Ok(streams_of(&highest))
+    Ok(streams_of(&highest, meta))
 }
 
 /// [`stranded_local_deps`] of every journal transaction, by its first
@@ -2431,7 +2431,7 @@ fn stranded_deps_by_tx(
     let mut highest: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     let mut out = HashMap::new();
     for (start, head) in local::read_journal_tx_heads(r, meta)? {
-        out.insert(start, streams_of(&highest));
+        out.insert(start, streams_of(&highest, meta));
         if head.gen != 0 && !undone.contains(&head.gen) {
             let e = highest.entry(head.gen).or_insert(0);
             *e = (*e).max(head.idx);
@@ -2440,13 +2440,26 @@ fn stranded_deps_by_tx(
     Ok(out)
 }
 
-/// The dependency table for the highest stream index per generation (the
-/// highest generations when it does not fit).
-fn streams_of(highest: &std::collections::BTreeMap<u64, u64>) -> Streams {
+/// The dependency table for the highest stream index per generation: the
+/// entries the applied log carries already are left out (ADR-69:
+/// `SessionState::shipped`), then the highest generations when it still
+/// does not fit (counted: `SessionStats::floor_truncated`).
+fn streams_of(highest: &std::collections::BTreeMap<u64, u64>, meta: &Meta) -> Streams {
+    let session = meta.session();
     let mut deps = Streams::NONE;
-    for (gen, idx) in highest.iter().rev().take(crate::session::STREAMS_CAP) {
-        deps.raise(*gen, *idx);
+    let mut dropped = 0u64;
+    let owed = highest
+        .iter()
+        .rev()
+        .filter(|(gen, idx)| **idx > session.shipped_idx(**gen));
+    for (n, (gen, idx)) in owed.enumerate() {
+        if n < crate::session::deps_cap() {
+            deps.raise(*gen, *idx);
+        } else {
+            dropped += 1;
+        }
     }
+    session.count_floor_truncated(dropped);
     deps
 }
 

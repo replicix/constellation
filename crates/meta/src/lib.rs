@@ -52,8 +52,8 @@ pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::{NamePrefix, TouchSet};
 pub use rid::Rid;
 pub use session::{
-    DelegDurable, DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait,
-    Streams, STREAMS_CAP,
+    deps_cap, set_deps_cap_for_sim, DelegDurable, DurableWait, JournalPos, KeySet, Position,
+    ReadKey, SessionStats, SessionWait, Streams, WideDeps, WideStep, STREAMS_CAP,
 };
 pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
 #[cfg(any(test, feature = "test-util"))]

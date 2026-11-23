@@ -567,19 +567,47 @@ pub struct ReleaseNote {
     pub no_stream: bool,
 }
 
+/// Stream entries a floor join still left out after the applied log's were
+/// (ADR-69), process-wide: [`floor_join_truncated`].
+static FLOOR_JOIN_TRUNCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many stream entries [`floor_join`] has left out for want of room
+/// (what the log carries is not counted), since the process began.
+pub fn floor_join_truncated() -> u64 {
+    FLOOR_JOIN_TRUNCATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Join two lock floors (positions: watermarks, so the join is what both
 /// cover). Unlike [`Position::join`], a streams overflow does not drop
 /// the other side's streams wholesale: the newest generations are kept
 /// (an older generation's stream has long reached the log, which `seq`
 /// covers).
 pub fn floor_join(a: &Position, b: &Position) -> Position {
+    floor_join_by(a, b, &|_| 0)
+}
+
+/// [`floor_join`], where `shipped` says how far the applied log carries a
+/// generation's stream (`SessionState::shipped_idx`; ADR-69): on an
+/// overflow the entries at or below it are left out first, `seq` covers
+/// them, and only what still does not fit is cut (and counted).
+pub fn floor_join_by(a: &Position, b: &Position, shipped: &dyn Fn(u64) -> u64) -> Position {
     let mut all: BTreeMap<u64, u64> = a.streams_wire().into_iter().collect();
     for (g, i) in b.streams_wire() {
         let e = all.entry(g).or_insert(0);
         *e = (*e).max(i);
     }
+    let cap = crate::session::deps_cap();
+    if all.len() > cap {
+        all.retain(|g, i| *i > shipped(*g));
+    }
     let mut kept: Vec<(u64, u64)> = all.into_iter().rev().collect();
-    kept.truncate(crate::session::STREAMS_CAP);
+    if kept.len() > cap {
+        FLOOR_JOIN_TRUNCATED.fetch_add(
+            (kept.len() - cap) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        kept.truncate(cap);
+    }
     Position {
         seq: a.seq.max(b.seq),
         pending: a.pending.max(b.pending),

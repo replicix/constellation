@@ -1703,6 +1703,27 @@ impl Meta {
             &|gen| self.log_stream_idx(gen).unwrap_or(0),
             &|gen| self.void_cut(gen).ok().flatten(),
         );
+        // ADR-69: what the log carries of each generation, for what a
+        // requester's `deps` may leave out. The persisted index also counts
+        // the rows this node's journal holds unshipped (a root's appended
+        // rows, a takeover's tail, adopted rows): the seed stays below the
+        // lowest of them. (An unreadable journal seeds nothing: the
+        // requester then holds an op longer, never sends it short.)
+        if let Ok(heads) = local::read_journal_tx_heads(&self.db.read_tx(), self) {
+            let mut lowest: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            for (_, head) in heads.iter().filter(|(_, h)| h.gen != 0) {
+                let e = lowest.entry(head.gen).or_insert(u64::MAX);
+                *e = (*e).min(head.idx);
+            }
+            for &gen in &gens {
+                let mut idx = self.log_stream_idx(gen).unwrap_or(0);
+                if let Some(low) = lowest.get(&gen) {
+                    idx = idx.min(low.saturating_sub(1));
+                }
+                self.session.seed_shipped(gen, idx);
+            }
+        }
         Ok(())
     }
 

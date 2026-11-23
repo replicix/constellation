@@ -3999,6 +3999,58 @@ mod root_substitution_tests {
         assert!(meta.delegation_table_folded().cut_of(d).is_none());
     }
 
+    /// ADR-69: a restart seeds `shipped` below this node's unshipped
+    /// journal rows of a generation (a root's appended row counts in the
+    /// persisted log index and is not in the log), never at the index.
+    #[test]
+    fn shipped_is_seeded_below_the_unshipped_journal_rows() {
+        let tag = crate::locks::LockTag::NONE;
+        let create = |n: u64| MutateOp::Create {
+            parent: ROOT_INO,
+            name: format!("f{n}"),
+            ino: (3 << 40) | n,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = |seq| Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let delegate = Meta::open_in_memory().unwrap();
+        {
+            let root = Meta::open(&db).unwrap();
+            for n in 1..=3 {
+                let (records, idx) = delegate
+                    .delegate_execute(
+                        &create(n),
+                        Some(rid(n)),
+                        9,
+                        Default::default(),
+                        &tag,
+                        Now::same(0),
+                    )
+                    .unwrap();
+                assert!(root
+                    .apply_delegate_tx(&records, Some(rid(n)), 9, idx, Default::default())
+                    .unwrap());
+            }
+            assert_eq!(root.log_stream_idx(9).unwrap(), 3);
+        }
+        let root = Meta::open(&db).unwrap();
+        assert_eq!(root.log_stream_idx(9).unwrap(), 3, "the index counts them");
+        assert_eq!(
+            root.session().shipped_idx(9),
+            0,
+            "all three are unshipped journal rows"
+        );
+        // The stream's rows are in `streams` as they always were.
+        assert_eq!(root.session().stream_applied(9), 3);
+    }
+
     /// A takeover's strand of this node's own delegate rows takes them out
     /// of the journal and sets the stream counter to the log's index (no
     /// hole: step 6); every generation this node holds is marked in the
