@@ -4237,7 +4237,7 @@ mod root_substitution_tests {
     #[test]
     fn the_rowless_mark_is_synced_before_it_is_reported_and_a_failure_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = Meta::open(&dir.path().join("m.db")).unwrap();
+        let meta = Meta::open(dir.path().join("m.db")).unwrap();
         // A failed write: an error, nothing persisted, no sync.
         let syncs = meta.sync_count();
         meta.fail_released_whole_writes_for_tests(1);
