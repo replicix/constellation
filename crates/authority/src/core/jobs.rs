@@ -201,6 +201,9 @@ enum Phase {
     /// A segment `SegmentPut` outstanding.
     Ship {
         seqs: Vec<u64>,
+        /// The delegation origins of `seqs` (`Replica::journal_origins`),
+        /// as the segment carries them: raised in `shipped` when it lands.
+        origins: Vec<(u64, u64)>,
         seq: Seq,
         payload: Vec<u8>,
         epoch: Epoch,
@@ -906,7 +909,8 @@ impl Core {
                 .collect();
             let seqs = match replica.journal_head_matching(&rows)? {
                 Some(seqs) => {
-                    replica.ack_journal(&seqs, seq, Some(seg.journal_pos()))?;
+                    let origins = replica.journal_origins(&seqs);
+                    replica.ack_journal(&seqs, &origins, seq, Some(seg.journal_pos()))?;
                     seqs
                 }
                 // ADR-59 part B (D2): this node's own `DropHeld`, whose
@@ -1210,6 +1214,7 @@ impl Core {
         self.set_phase(
             Phase::Ship {
                 seqs,
+                origins,
                 seq,
                 payload,
                 epoch,
@@ -1276,6 +1281,7 @@ impl Core {
         self.set_phase(
             Phase::Ship {
                 seqs: Vec::new(),
+                origins: Vec::new(),
                 seq,
                 payload,
                 epoch,
@@ -1318,7 +1324,7 @@ impl Core {
     fn ship_landed(
         &mut self,
         now: Now,
-        seqs: &[u64],
+        (seqs, origins): (&[u64], &[(u64, u64)]),
         seq: Seq,
         (epoch, through): (Epoch, u64),
         payload: Vec<u8>,
@@ -1329,6 +1335,7 @@ impl Core {
         replica
             .ack_journal(
                 seqs,
+                origins,
                 seq,
                 Some(JournalPos {
                     epoch,
@@ -2092,6 +2099,7 @@ impl Core {
         let through = replica.journal_acked_seq().map_err(|e| e.to_string())?;
         replica
             .ack_journal(
+                &[],
                 &[],
                 seq,
                 Some(JournalPos {
@@ -5695,6 +5703,7 @@ impl Core {
             (
                 Phase::Ship {
                     seqs,
+                    origins,
                     seq,
                     payload,
                     epoch,
@@ -5707,7 +5716,7 @@ impl Core {
             ) => {
                 if let Err(error) = self.ship_landed(
                     now,
-                    &seqs,
+                    (&seqs, &origins),
                     seq,
                     (epoch, through),
                     payload,

@@ -544,6 +544,12 @@ pub struct DelegationReport {
     pub reclaimed: u64,
     pub ended: u64,
     pub deps_overflow_holds: u64,
+    /// Stream entries a lock floor (`frontier`, a stranded op's rows)
+    /// still left out after what the applied log carries was, since the
+    /// process began (ADR-69).
+    pub floor_truncated: u64,
+    /// The same for the joins of two floors (`floor_join`).
+    pub floor_join_truncated: u64,
     pub exec_parked: u64,
     /// Delegate rows stranded here by a recall (rolled back, replayed).
     pub stranded: u64,

@@ -621,6 +621,8 @@ impl EngineControl {
                     reclaimed: stats.deleg_reclaimed,
                     ended: stats.deleg_ended,
                     deps_overflow_holds: stats.deps_overflow_holds,
+                    floor_truncated: self.meta.session().stats().floor_truncated,
+                    floor_join_truncated: constellation_meta::locks::floor_join_truncated(),
                     exec_parked: stats.deleg_exec_parked,
                     stranded: stats.local_rolled_back,
                     kinds: v.kinds.clone(),

@@ -9150,12 +9150,14 @@ fn sweep_config() {
                     // unanswered, per seed (summed by the sweep's reader).
                     eprintln!(
                         "SWEEP-OVF {label} seed {seed}: holds {} in_doubt {} settles {} \
-                         abandoned {} unanswered {}",
+                         abandoned {} unanswered {} floor_truncated {} floor_join_truncated {}",
                         c9(|s| s.deps_overflow_holds),
                         c9(|s| s.in_doubt),
                         c9(|s| s.settles_sent),
                         c9(|s| s.settled_local),
-                        report.ops_invoked.saturating_sub(report.ops_returned)
+                        report.ops_invoked.saturating_sub(report.ops_returned),
+                        report.floor_truncated,
+                        report.floor_join_truncated
                     );
                     // Plan 43 C3 item 3: this node's own delegate rows the
                     // takeover gate put back verbatim after the tail.
@@ -12458,7 +12460,7 @@ fn ovfdeps_runs(label: &str, cfg: &SimConfig, base: u64, seeds: u64) -> (Vec<Str
             }
             Err(e) => {
                 eprintln!(
-                    "OVFDEPS FAIL {label} seed {seed}: {}",
+                    "OVFDEPS FAIL {label} {seed} {}",
                     e.lines().next().unwrap_or("")
                 );
                 failures.push(format!("{label} seed {seed}: {e}"));
@@ -12525,34 +12527,45 @@ fn ovfdeps_cap_2_holds_in_the_late_answer_backup_lock_and_restart_labels() {
     eprintln!("OVFDEPS cap 2: {holds} ops held");
 }
 
-/// ADR-69's negative control: the same runs as the cap 1 gate with the hold
-/// off (`SimConfig::skip_deps_overflow_hold`: the op goes on with a
-/// placeholder that names no stream) fail `marker_order`. (The table keeps
-/// what the log does not carry yet, so an overflow with two streams still
-/// owed is rare: 400 seeds per label are run.)
+/// ADR-69's negative control: `long-delegated-late-answers` at cap 1 with the
+/// hold off (`SimConfig::skip_deps_overflow_hold`: the op goes on with a
+/// placeholder that names no stream) fails the marker-order oracle ("saw
+/// marker ... without its data": `marker_order`) on each of these pinned
+/// seeds, and not any other check; the same seeds pass with the hold on.
 #[test]
 fn ovfdeps_negative_control_without_the_hold_fails_marker_order() {
-    let mut failed = 0;
-    for (label, cfg, base) in [
-        ("delegated-marker", delegated_marker_config(), 61_000u64),
-        ("long-delegated", long_delegated_config(), 70_000u64),
-    ] {
-        let cfg = SimConfig {
-            deps_cap: 1,
-            skip_deps_overflow_hold: true,
-            ..cfg
-        };
-        let seeds: u64 = std::env::var("OVFDEPS_CONTROL_SEEDS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(400);
-        let (f, _) = ovfdeps_runs(label, &cfg, base, seeds);
-        failed += f.len();
+    const SEEDS: [u64; 20] = [
+        0, 50, 95, 141, 191, 243, 288, 336, 391, 438, 491, 539, 590, 644, 699, 750, 800, 847, 903,
+        952,
+    ];
+    let label = "long-delegated-late-answers";
+    let base = SimConfig {
+        deps_cap: 1,
+        ..long_delegated_late_answers_config()
+    };
+    let off = SimConfig {
+        skip_deps_overflow_hold: true,
+        ..base.clone()
+    };
+    let mut wrong = Vec::new();
+    for seed in SEEDS {
+        match run_seed(seed, off.clone()) {
+            Ok(_) => wrong.push(format!("seed {seed}: passed with the hold off")),
+            Err(e) => {
+                let head = e.lines().next().unwrap_or("");
+                eprintln!("OVFDEPS FAIL {label} {seed} {head}");
+                if !(head.contains("saw marker") && head.contains("without its data")) {
+                    wrong.push(format!("seed {seed}: not the marker-order oracle: {head}"));
+                }
+            }
+        }
+        if let Err(e) = run_seed(seed, base.clone()) {
+            let head = e.lines().next().unwrap_or("");
+            eprintln!("OVFDEPS FAIL {label} {seed} (hold on) {head}");
+            wrong.push(format!("seed {seed}: failed with the hold on: {head}"));
+        }
     }
-    assert!(
-        failed > 0,
-        "no seed failed with the hold off: the gate proves nothing"
-    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// Plan 30 §M11: the delegate crashes without a backup; the root

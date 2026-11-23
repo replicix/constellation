@@ -45,8 +45,8 @@ pub(super) fn print_deleg(scenario: &str, who: &str, d: &serde_json::Value) {
          forwarded-to-delegate {} deps-waits {} parked-expired {} not-owner {} installed {} \
          streamed {} stream-refused {} renewals {} (refused {}) recalls-received {} | delegated \
          {} appended {} stream-refusals {} deps-unsatisfied {} cross-subtree {} recalls sent {} \
-         drained {} expired {} reclaimed {} ended {} overflow-to-root {} exec-parked {} \
-         stranded {}",
+         drained {} expired {} reclaimed {} ended {} overflow-holds {} floor-truncated {} \
+         floor-join-truncated {} exec-parked {} stranded {}",
         d["enabled"],
         d["table"],
         d["mine"],
@@ -73,6 +73,8 @@ pub(super) fn print_deleg(scenario: &str, who: &str, d: &serde_json::Value) {
         n(d, "reclaimed"),
         n(d, "ended"),
         n(d, "deps_overflow_holds"),
+        n(d, "floor_truncated"),
+        n(d, "floor_join_truncated"),
         n(d, "exec_parked"),
         n(d, "stranded"),
     );

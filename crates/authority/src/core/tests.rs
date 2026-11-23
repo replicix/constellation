@@ -10132,7 +10132,14 @@ fn holder_segment(holder: &mut Harness, name: &str, seq: Seq) -> Vec<u8> {
     let batch = Replica::take_journal(&holder.meta, 100).unwrap();
     let records: Vec<_> = batch.iter().map(|(_, r)| r.clone()).collect();
     let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
-    Replica::ack_journal(&holder.meta, &seqs, seq, None).unwrap();
+    Replica::ack_journal(
+        &holder.meta,
+        &seqs,
+        &Replica::journal_origins(&holder.meta, &seqs),
+        seq,
+        None,
+    )
+    .unwrap();
     holder.core.ship.next_seq = seq + 1;
     holder.core.ship.head_seq = seq;
     crate::segment::encode(1, 1, 0, &[], &[], &records).unwrap()
@@ -10202,7 +10209,14 @@ fn holder_ship(holder: &mut Harness, seq: Seq, max_rows: usize) -> (Vec<u8>, u64
     let records: Vec<_> = batch.iter().map(|(_, r)| r.clone()).collect();
     let rows: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
     let through = *rows.last().expect("something to ship");
-    Replica::ack_journal(&holder.meta, &rows, seq, None).unwrap();
+    Replica::ack_journal(
+        &holder.meta,
+        &rows,
+        &Replica::journal_origins(&holder.meta, &rows),
+        seq,
+        None,
+    )
+    .unwrap();
     holder.core.ship.next_seq = seq + 1;
     holder.core.ship.head_seq = seq;
     let payload = crate::segment::encode(1, 1, through, &rows, &[], &records).unwrap();
@@ -19253,7 +19267,14 @@ mod backup_crash {
         let first = crate::replica::Replica::journal_class_of_rid(&h.meta, rid1)
             .unwrap()
             .0;
-        crate::replica::Replica::ack_journal(&h.meta, &[first], 0, None).unwrap();
+        crate::replica::Replica::ack_journal(
+            &h.meta,
+            &[first],
+            &crate::replica::Replica::journal_origins(&h.meta, &[first]),
+            0,
+            None,
+        )
+        .unwrap();
         h.core.note_shipped(&[first], 0);
         assert_eq!(class_of(&h, rid1), None, "the row is still unshipped");
         assert_eq!(
@@ -26509,7 +26530,14 @@ mod locks {
             .into_iter()
             .map(|(seq, _)| seq)
             .collect();
-        crate::replica::Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        crate::replica::Replica::ack_journal(
+            &h.meta,
+            &seqs,
+            &Replica::journal_origins(&h.meta, &seqs),
+            1,
+            None,
+        )
+        .unwrap();
         let out = lock_control_out(&mut h, 50, ino, true);
         assert!(
             matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }),
@@ -55351,10 +55379,24 @@ mod deleg_group {
         let batch = Replica::take_journal(&h.meta, 100).unwrap();
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         assert!(seqs.len() > 2, "{seqs:?}");
-        Replica::ack_journal(&h.meta, &seqs[1..2], 1, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &seqs[1..2],
+            &Replica::journal_origins(&h.meta, &seqs[1..2]),
+            1,
+            None,
+        )
+        .unwrap();
         h.core.note_shipped(&seqs[1..2], 0);
         assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "one row shipped");
-        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &seqs,
+            &Replica::journal_origins(&h.meta, &seqs),
+            1,
+            None,
+        )
+        .unwrap();
         h.core.note_shipped(&seqs, *seqs.last().unwrap());
         assert_cap_is_the_full_scans_above_the_sent_prefix(&mut h, "all shipped");
         // Two more batches, held by the backup.
@@ -66356,7 +66398,14 @@ mod c2g_settle {
     fn ship_all(h: &mut Harness) {
         let batch = Replica::take_journal(&h.meta, 100).unwrap();
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
-        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &seqs,
+            &Replica::journal_origins(&h.meta, &seqs),
+            1,
+            None,
+        )
+        .unwrap();
         h.core.note_shipped(&seqs, 0);
     }
 
@@ -83746,7 +83795,14 @@ mod step5_sticky_release {
         assert!(h.core.dl.mine[&7].release.is_some());
         let shipped = Replica::take_journal(&h.meta, usize::MAX).unwrap();
         let seqs: Vec<u64> = shipped.iter().map(|(s, _)| *s).collect();
-        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &seqs,
+            &Replica::journal_origins(&h.meta, &seqs),
+            1,
+            None,
+        )
+        .unwrap();
         assert!(Replica::log_stream_idx(&h.meta, 7) >= 1);
         let mut again = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut again);
@@ -83776,7 +83832,14 @@ mod step5_sticky_release {
         let shipped = Replica::take_journal(&h.meta, usize::MAX).unwrap();
         let seqs: Vec<u64> = shipped.iter().map(|(s, _)| *s).collect();
         assert!(!seqs.is_empty());
-        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &seqs,
+            &Replica::journal_origins(&h.meta, &seqs),
+            1,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             Replica::log_stream_idx(&h.meta, 7),
             idx,
@@ -83797,7 +83860,14 @@ mod step5_sticky_release {
         assert_eq!(before, idx + 3);
         let shipped = Replica::take_journal(&h.meta, usize::MAX).unwrap();
         let seqs: Vec<u64> = shipped.iter().map(|(s, _)| *s).collect();
-        Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &seqs,
+            &Replica::journal_origins(&h.meta, &seqs),
+            1,
+            None,
+        )
+        .unwrap();
         assert_eq!(Replica::log_stream_idx(&h.meta, 7), before);
     }
 
@@ -93797,7 +93867,14 @@ mod root_own_sticky {
                 shipped.push(seq);
             }
         }
-        Replica::ack_journal(&h.meta, &shipped, 1, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &shipped,
+            &Replica::journal_origins(&h.meta, &shipped),
+            1,
+            None,
+        )
+        .unwrap();
         h.core.note_shipped(&shipped, 0);
         kept
     }
@@ -93872,7 +93949,14 @@ mod root_own_sticky {
             "appended past a row still in the journal"
         );
         assert!(!h.core.dl.gens[&gen].ended);
-        Replica::ack_journal(&h.meta, &kept, 2, None).unwrap();
+        Replica::ack_journal(
+            &h.meta,
+            &kept,
+            &Replica::journal_origins(&h.meta, &kept),
+            2,
+            None,
+        )
+        .unwrap();
         h.core.note_shipped(&kept, 0);
         archive_and_step(&mut h);
         assert_eq!(h.core.stats.root_own_rows_caught_up, 1);
@@ -93937,7 +94021,14 @@ mod root_own_sticky {
             // (The root's segments ship: its journal leaves the disk.)
             let batch = Replica::take_journal(&h.meta, 100).unwrap();
             let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
-            Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+            Replica::ack_journal(
+                &h.meta,
+                &seqs,
+                &Replica::journal_origins(&h.meta, &seqs),
+                1,
+                None,
+            )
+            .unwrap();
             h.core.note_shipped(&seqs, 0);
             out = archive_and_step(&mut h);
             h.advance(500);
@@ -94593,7 +94684,14 @@ mod root_own_sticky {
             // (The root's segments ship: its journal leaves the disk.)
             let batch = Replica::take_journal(&h.meta, 100).unwrap();
             let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
-            Replica::ack_journal(&h.meta, &seqs, 3, None).unwrap();
+            Replica::ack_journal(
+                &h.meta,
+                &seqs,
+                &Replica::journal_origins(&h.meta, &seqs),
+                3,
+                None,
+            )
+            .unwrap();
             h.core.note_shipped(&seqs, 0);
             out = archive_and_step(&mut h);
             h.advance(500);
@@ -97697,6 +97795,97 @@ mod deps_overflow {
         let mut out = Vec::new();
         assert!(!h.core.hold_for_lost_deps(h.clk(), rx, &h.meta, &mut out));
         assert_eq!(h.core.clients[&rx].deps.streams.get(4), Some(7));
+    }
+
+    /// MUST 1 (the fail-before): an overflowing op on its own delegate is
+    /// released on its first look because the snapshot names generations
+    /// that ended before this incarnation opened (`Lost`: the session is
+    /// taken afresh, and fits). It executes here with the owed stream
+    /// named, not with the placeholder it was submitted with.
+    #[test]
+    fn an_overflowing_op_released_on_its_first_look_runs_as_a_delegate_with_its_deps() {
+        let _cap = constellation_meta::DepsCapForSim::set(1);
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let req = renew_req(&out, 7).expect("no renewal on install");
+        h.step(renewed(&h, req, 7, 5_000));
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: Vec::new(),
+            lapses: 0,
+        });
+        // The table lists generation 7 only: 2 and 3 ended before this
+        // incarnation opened (the session has not voided them yet), 8 is
+        // above it and still owed, from a row this replica has not applied.
+        h.meta
+            .session()
+            .seed_ended_before_open(7, &std::iter::once(7).collect());
+        for (gen, idx) in [(2u64, 3u64), (3, 3), (8, 5)] {
+            let mut p = constellation_meta::Position::ZERO;
+            assert!(p.streams.raise(gen, idx));
+            h.meta.session().note_frontier(&p);
+        }
+        assert!(crate::replica::Replica::deps(&h.meta).is_none());
+        let (rid, _out) = submit_create(&mut h, dir, "m");
+        let c = &h.core.clients[&rid];
+        assert!(c.wide.is_none(), "released on the first look");
+        assert_eq!(c.deps.streams.get(8), Some(5), "{:?}", c.deps);
+        assert!(c.deps.streams.get(2).is_none() && c.deps.streams.get(3).is_none());
+        // Run here as the delegate: waiting for what its deps name, and not
+        // executed ahead of it.
+        let d = &h.core.dl.mine[&7];
+        assert_eq!(d.executed, 0, "executed on a placeholder");
+        let parked: Vec<_> = d.parked.iter().filter(|p| p.from == 0).collect();
+        assert_eq!(parked.len(), 1, "parked on its deps");
+        assert_eq!(
+            parked[0].deps.streams.get(8),
+            Some(5),
+            "{:?}",
+            parked[0].deps
+        );
+    }
+
+    /// MUST 2 (the fail-before): an overflowing op held behind this node's
+    /// replays is released on the session taken afresh once they have
+    /// settled, which names the row they landed at, not on the snapshot of
+    /// before.
+    #[test]
+    fn a_wide_op_held_behind_replays_names_the_row_they_landed_at() {
+        let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
+        let (mut h, [(ry, y), (rx, x)]) = deposed_with_stranded_rows(["y", "x"]);
+        let gens = frontier_gens(&h, 9);
+        let out = resubmit_in_doubt(&mut h, rx, &x);
+        assert!(!forwards_of(&out, rx), "held, not forwarded: {out:?}");
+        assert!(h.core.clients[&rx].wide.is_some(), "on a snapshot");
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        assert!(forwards_of(&out, ry), "ry goes to a delegate: {out:?}");
+        let mut out = Vec::new();
+        assert!(h.core.hold_for_lost_deps(h.clk(), rx, &h.meta, &mut out));
+        // ry lands at (g2, 4) of another generation and settles; two of the
+        // nine are in the log by now.
+        let g2 = (7u64 << 32) | 900;
+        let mut p = constellation_meta::Position::ZERO;
+        assert!(p.streams.raise(g2, 4));
+        h.meta.session().note_frontier(&p);
+        h.meta.session().note_shipped(gens[0], 3);
+        h.meta.session().note_shipped(gens[1], 3);
+        h.core.clients.remove(&ry);
+        h.core.replay.in_flight = None;
+        settle_in_the_log(&mut h, ry, &y);
+        let mut out = Vec::new();
+        h.core.on_drain_tick(h.clk(), &h.meta, &mut out);
+        let mut out = Vec::new();
+        assert!(!h.core.hold_for_lost_deps(h.clk(), rx, &h.meta, &mut out));
+        let c = &h.core.clients[&rx];
+        assert!(c.wide.is_none() && !c.deps_held);
+        assert_eq!(c.deps.streams.get(g2), Some(4), "{:?}", c.deps);
+        assert_eq!(c.deps.streams.len(), 8);
     }
 
     /// A takeover gate replays the queue locally while the root's session

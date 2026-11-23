@@ -999,14 +999,19 @@ impl Core {
             return;
         }
         // Causal order after a generation ended with this node's writes
-        // tentative (see `hold_for_lost_deps`).
+        // tentative (see `hold_for_lost_deps`), and held while its `deps`
+        // overflow (ADR-69).
         if self.hold_for_lost_deps(now, rid, replica, out) {
             return;
         }
+        // The hold may have set the op's deps (an overflow's snapshot
+        // released, or the session taken afresh): the local copy is the
+        // placeholder that names no stream then. Everything below reads
+        // the op's own.
+        let deps = self.clients[&rid].deps;
         // Plan 30 §M11: a delegate executes its own subtree here; an op
         // under another node's delegation goes to that delegate (or to
-        // the root, which recalls, when the observed stream table is
-        // full or the delegate is unreachable).
+        // the root, which recalls, when the delegate is unreachable).
         if self.cfg.delegation {
             let (op_ref, tag) = self
                 .clients
@@ -1355,10 +1360,25 @@ impl Core {
             // arriving). Behind this node's replays first, as any op.
             if unsettled {
                 self.stats.deps_lost_holds += 1;
+                // The snapshot predates where those replays land: once they
+                // have settled it is let go and the session taken afresh
+                // (below), as for any op held behind them.
+                self.clients.get_mut(&rid).expect("present").deps_held = true;
                 self.arm_hold_tick(now, rid, out);
                 return true;
             }
             let c = self.clients.get_mut(&rid).expect("present");
+            if c.deps_held {
+                // Held behind this node's replays, which have settled: the
+                // snapshot does not name the rows they landed at. The
+                // session is taken afresh below, which snapshots again if
+                // it still overflows (once per replay hold, so the hold
+                // stays monotone).
+                c.wide = None;
+                c.wide_counted = false;
+            }
+        }
+        if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.wide.is_some()) {
             let mut w = c.wide.take().expect("checked");
             w.raise_all(&queued_owed);
             match replica.compact_wide(&mut w) {
@@ -1486,9 +1506,17 @@ impl Core {
                 c.wide_counted = false;
             }
         }
-        if self.clients.get(&rid).is_some_and(|c| c.wide.is_some()) {
-            // Looked at once, then each tick.
-            return self.hold_for_lost_deps(now, rid, replica, out);
+        // The session overflows again: held on the new snapshot, looked at
+        // on the next tick (not at once: a look that finds an entry lost
+        // would take the session afresh again, and what ends that is
+        // nothing but the session's own change).
+        if let Some(c) = self.clients.get_mut(&rid).filter(|c| c.wide.is_some()) {
+            if !c.wide_counted {
+                c.wide_counted = true;
+                self.stats.deps_overflow_holds += 1;
+            }
+            self.arm_hold_tick(now, rid, out);
+            return true;
         }
         false
     }

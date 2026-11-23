@@ -571,10 +571,22 @@ pub struct ReleaseNote {
 /// (ADR-69), process-wide: [`floor_join_truncated`].
 static FLOOR_JOIN_TRUNCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+thread_local! {
+    /// [`FLOOR_JOIN_TRUNCATED`] for this thread: the sims run one seed on a
+    /// thread, and read the difference over it.
+    static FLOOR_JOIN_TRUNCATED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// How many stream entries [`floor_join`] has left out for want of room
 /// (what the log carries is not counted), since the process began.
 pub fn floor_join_truncated() -> u64 {
     FLOOR_JOIN_TRUNCATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`floor_join_truncated`] for the calling thread alone.
+#[doc(hidden)]
+pub fn floor_join_truncated_here() -> u64 {
+    FLOOR_JOIN_TRUNCATED_HERE.with(std::cell::Cell::get)
 }
 
 /// Join two lock floors (positions: watermarks, so the join is what both
@@ -602,10 +614,9 @@ pub fn floor_join_by(a: &Position, b: &Position, shipped: &dyn Fn(u64) -> u64) -
     }
     let mut kept: Vec<(u64, u64)> = all.into_iter().rev().collect();
     if kept.len() > cap {
-        FLOOR_JOIN_TRUNCATED.fetch_add(
-            (kept.len() - cap) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let n = (kept.len() - cap) as u64;
+        FLOOR_JOIN_TRUNCATED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        FLOOR_JOIN_TRUNCATED_HERE.with(|c| c.set(c.get() + n));
         kept.truncate(cap);
     }
     Position {

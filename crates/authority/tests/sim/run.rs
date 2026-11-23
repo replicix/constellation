@@ -1662,6 +1662,11 @@ pub struct Report {
     /// Plan 30 §M8: close-to-open (enforced under `strict`).
     pub cto: super::cto::CtoReport,
     pub stats: BTreeMap<NodeId, Stats>,
+    /// ADR-69: stream entries the sessions' floors (`frontier`, a stranded
+    /// op's rows) and the joins of two floors left out for want of room
+    /// after what the applied log carries was.
+    pub floor_truncated: u64,
+    pub floor_join_truncated: u64,
     /// Plan 41 L2: what each node's lock lane did (`RenewLane::stats`).
     pub lane: BTreeMap<NodeId, constellation_authority::lane::LaneStats>,
     pub faults: Vec<String>,
@@ -6137,6 +6142,7 @@ impl Drop for MintLog {
 }
 
 async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
+    let floor_join_before = constellation_meta::locks::floor_join_truncated_here();
     let mut rng = StdRng::seed_from_u64(seed);
     let mint_log = MintLog::install();
     let clock = Clock::start();
@@ -7257,6 +7263,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         }
         report.stats.insert(id, n.view().stats);
+        report.floor_truncated += n.meta.session().stats().floor_truncated;
+        report.floor_join_truncated = constellation_meta::locks::floor_join_truncated_here()
+            .saturating_sub(floor_join_before);
         report.lane.insert(id, n.shared.lane.lock().unwrap().stats);
         report
             .floor_ms

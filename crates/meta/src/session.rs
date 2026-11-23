@@ -120,6 +120,26 @@ pub fn deps_cap() -> usize {
     DEPS_CAP.with(std::cell::Cell::get)
 }
 
+/// [`set_deps_cap_for_sim`] for a scope: the cap this thread had comes back
+/// when the guard is dropped, on every exit of a test.
+#[doc(hidden)]
+#[must_use]
+pub struct DepsCapForSim(usize);
+
+impl DepsCapForSim {
+    pub fn set(cap: usize) -> Self {
+        let before = deps_cap();
+        set_deps_cap_for_sim(cap);
+        Self(before)
+    }
+}
+
+impl Drop for DepsCapForSim {
+    fn drop(&mut self) {
+        set_deps_cap_for_sim(self.0);
+    }
+}
+
 /// An op's causal past as the session names it, without the table's cap:
 /// what an op whose [`SessionState::deps`] overflow waits on
 /// ([`SessionState::compact_wide`]). A snapshot: it only ever shrinks
@@ -688,7 +708,9 @@ struct Inner {
     /// generation. Never the persisted log index (which counts a root's
     /// appended and adopted rows that are not in the log yet) and never
     /// `streams` (which counts executed and appended rows): an entry at or
-    /// below it is covered by `deps.seq` at every executor.
+    /// below it is covered by `deps.seq` at every executor. (Its walk over
+    /// `fills` may pass a fill this node appended itself and has not
+    /// shipped: a no-op row, with no effect for anyone to wait for.)
     shipped: std::collections::BTreeMap<u64, u64>,
 }
 
@@ -846,6 +868,16 @@ impl Inner {
         all
     }
 
+    /// [`Self::drop_shipped`], and the entries of a voided generation at or
+    /// below its cut too: the log's end record of it, which this replica
+    /// applied, is covered by `deps.seq` as the rows below the cut are, and
+    /// no executor waits on them. (A voided entry above its cut is lost,
+    /// not dropped: [`Self::is_lost`].)
+    fn drop_covered(&self, all: &mut std::collections::BTreeMap<u64, u64>) {
+        self.drop_shipped(all);
+        all.retain(|gen, idx| !(self.voided.contains(gen) && *idx <= self.cut_of(*gen)));
+    }
+
     /// Leave out what the applied log carries (`shipped`).
     fn drop_shipped(&self, all: &mut std::collections::BTreeMap<u64, u64>) {
         all.retain(|gen, idx| *idx > self.shipped.get(gen).copied().unwrap_or(0));
@@ -867,6 +899,10 @@ impl Inner {
             }
             let e = owed.entry(g).or_insert(0);
             *e = (*e).max(i);
+        }
+        // (The sims' knob lowers the cap below the table's size.)
+        if owed.len() > deps_cap() {
+            return None;
         }
         let mut streams = Streams::NONE;
         for (g, i) in owed {
@@ -1294,7 +1330,7 @@ impl SessionState {
             return Some(p);
         }
         let mut all = g.wide_streams();
-        g.drop_shipped(&mut all);
+        g.drop_covered(&mut all);
         if all.len() > deps_cap() {
             return None;
         }
@@ -1341,7 +1377,7 @@ impl SessionState {
         if wide.streams.iter().any(|(gen, i)| g.is_lost(*gen, *i)) {
             return WideStep::Lost;
         }
-        g.drop_shipped(&mut wide.streams);
+        g.drop_covered(&mut wide.streams);
         if wide.streams.len() > deps_cap() {
             return WideStep::Holds;
         }
@@ -1408,38 +1444,45 @@ impl SessionState {
     /// `idx` (a segment applied here, or this node's own rows acknowledged
     /// shipped); call it only after [`Self::advance_rows`] for that segment.
     pub fn note_shipped(&self, gen: u64, idx: u64) {
-        if gen == 0 {
+        self.note_shipped_batch(&[(gen, idx)], &[]);
+    }
+
+    /// [`Self::note_shipped_fill`]'s twin for `shipped`: the fill stands in
+    /// the log at `(gen, idx)`.
+    pub fn note_shipped_fill(&self, gen: u64, idx: u64) {
+        self.note_shipped_batch(&[], &[(gen, idx)]);
+    }
+
+    /// [`Self::note_shipped`] for the origins of a batch of applied rows,
+    /// and [`Self::note_shipped_fill`] for the fills it carried, under one
+    /// lock hold (a fill counts once the stream reaches the index below
+    /// it, as in `streams`).
+    pub fn note_shipped_batch(&self, origins: &[(u64, u64)], fills: &[(u64, u64)]) {
+        if origins.iter().all(|(g, _)| *g == 0) && fills.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
-        let cur = inner.shipped.entry(gen).or_insert(0);
-        if idx > *cur {
-            *cur = idx;
+        let mut raise = |gen: u64, idx: u64, fill: bool| {
+            if gen == 0 || (fill && idx == 0) {
+                return;
+            }
+            let cur = inner.shipped.entry(gen).or_insert(0);
+            if fill && *cur + 1 < idx {
+                return;
+            }
+            if idx > *cur {
+                *cur = idx;
+            }
+            while !inner.fills.is_empty() && inner.fills.contains(&(gen, *cur + 1)) {
+                *cur += 1;
+            }
+        };
+        for (gen, idx) in origins {
+            raise(*gen, *idx, false);
         }
-        while !inner.fills.is_empty() && inner.fills.contains(&(gen, *cur + 1)) {
-            *cur += 1;
-        }
-    }
-
-    /// [`Self::note_stream_fill`]'s twin for `shipped`: the fill stands in
-    /// the log at `(gen, idx)`.
-    pub fn note_shipped_fill(&self, gen: u64, idx: u64) {
-        if gen == 0 || idx == 0 {
-            return;
-        }
-        let reached = self
-            .inner
-            .lock()
-            .unwrap()
-            .shipped
-            .get(&gen)
-            .copied()
-            .unwrap_or(0)
-            + 1
-            >= idx;
-        if reached {
-            self.note_shipped(gen, idx);
+        for (gen, idx) in fills {
+            raise(*gen, *idx, true);
         }
     }
 
@@ -1881,7 +1924,7 @@ impl SessionState {
                 }
                 let mut kept: Vec<(u64, u64)> = Vec::new();
                 for (n, (gen, i)) in all.into_iter().rev().enumerate() {
-                    if n < STREAMS_CAP {
+                    if n < deps_cap() {
                         kept.push((gen, i));
                     } else {
                         folded.push((gen, i));
@@ -3837,7 +3880,7 @@ mod tests {
     /// The sim knob lowers the cap of `deps`, `frontier` and `floor_join`.
     #[test]
     fn the_sim_cap_covers_deps_frontier_and_floor_join() {
-        set_deps_cap_for_sim(2);
+        let cap = DepsCapForSim::set(2);
         let s = SessionState::default();
         owed(&s, 1..=3, 1);
         assert!(s.deps().is_none());
@@ -3848,7 +3891,60 @@ mod tests {
         a.streams.raise(2, 1);
         b.streams.raise(3, 1);
         assert_eq!(crate::locks::floor_join(&a, &b).streams.len(), 2);
-        set_deps_cap_for_sim(STREAMS_CAP);
+        drop(cap);
         assert!(s.deps().is_some());
+    }
+
+    /// The sim knob covers the fold of `observed` into `frontier` too: the
+    /// entries past it are not forgotten.
+    #[test]
+    fn the_sim_cap_covers_the_fold_of_observed_into_the_frontier() {
+        let _cap = DepsCapForSim::set(2);
+        let s = SessionState::default();
+        let mut p = Position::ZERO;
+        for g in 1..=4 {
+            assert!(p.streams.raise(g, 3));
+        }
+        s.raise_observed(p);
+        assert_eq!(s.inner.lock().unwrap().observed.streams.len(), 2);
+        assert_eq!(s.inner.lock().unwrap().frontier.len(), 2, "folded");
+        let w = s.deps_wide();
+        assert_eq!(w.streams.len(), 4, "all four are still owed");
+    }
+
+    /// An entry of a voided generation at or below its cut waits for
+    /// nobody: it is left out when the table overflows, so the cap is spent
+    /// on what is owed. Above its cut it is lost, not left out.
+    #[test]
+    fn a_voided_entry_at_or_below_its_cut_is_left_out_on_an_overflow() {
+        let _cap = DepsCapForSim::set(2);
+        let s = SessionState::default();
+        let mut p = Position::ZERO;
+        assert!(p.streams.raise(1, 5) && p.streams.raise(2, 5));
+        s.raise_observed(p);
+        owed(&s, 3..=3, 5);
+        assert!(s.deps().is_none(), "three are owed");
+        s.void_stream(1, 5);
+        s.note_void_cut(1, 5);
+        let d = s.deps().expect("two are owed now");
+        assert!(d.streams.get(1).is_none() && d.streams.len() == 2);
+        // A snapshot taken before the end names it, at the cut: left out.
+        let mut w = WideDeps::default();
+        w.streams.insert(1, 5);
+        w.streams.insert(2, 5);
+        w.streams.insert(3, 5);
+        match s.compact_wide(&mut w) {
+            WideStep::Fits(p) => {
+                assert!(p.streams.get(1).is_none());
+                assert_eq!(p.streams.len(), 2);
+            }
+            other => panic!("not released: {other:?}"),
+        }
+        // Past its cut it is lost with its generation.
+        let mut w = WideDeps::default();
+        w.streams.insert(1, 6);
+        w.streams.insert(2, 5);
+        w.streams.insert(3, 5);
+        assert!(matches!(s.compact_wide(&mut w), WideStep::Lost));
     }
 }

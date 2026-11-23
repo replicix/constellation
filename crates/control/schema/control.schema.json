@@ -1761,6 +1761,18 @@
           "minimum": 0,
           "type": "integer"
         },
+        "floor_join_truncated": {
+          "description": "The same for the joins of two floors (`floor_join`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "floor_truncated": {
+          "description": "Stream entries a lock floor (`frontier`, a stranded op's rows)\nstill left out after what the applied log carries was, since the\nprocess began (ADR-69).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "forwarded_to_delegate": {
           "format": "uint64",
           "minimum": 0,
@@ -2304,6 +2316,8 @@
         "reclaimed",
         "ended",
         "deps_overflow_holds",
+        "floor_truncated",
+        "floor_join_truncated",
         "exec_parked",
         "stranded",
         "kinds",

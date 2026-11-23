@@ -389,7 +389,16 @@ pub trait Replica {
     /// The rows `seqs` shipped in segment `at`: delete them, advance the
     /// applied position (plan 30 §M6: to journal position `pos`, the
     /// segment's `(epoch, through)`), retire their speculation.
-    fn ack_journal(&self, seqs: &[u64], at: Seq, pos: Option<JournalPos>) -> Result<(), MetaError>;
+    /// `origins` are those of `seqs` (`journal_origins`), already read by
+    /// the caller: once `applied_seq` covers segment `at`, the log carries
+    /// them (ADR-69, `SessionState::shipped`).
+    fn ack_journal(
+        &self,
+        seqs: &[u64],
+        origins: &[(u64, u64)],
+        at: Seq,
+        pos: Option<JournalPos>,
+    ) -> Result<(), MetaError>;
     /// Apply a foreign segment: strand what its epoch supersedes, apply,
     /// retire (plan 30 §M9: the streamed transactions `rows` confirm
     /// too), advance the applied position (to `(epoch, through)` too).
@@ -1490,11 +1499,13 @@ impl Replica for Meta {
         Meta::match_own_segment(self, &journaled)
     }
 
-    fn ack_journal(&self, seqs: &[u64], at: Seq, pos: Option<JournalPos>) -> Result<(), MetaError> {
-        // ADR-69: the rows this node shipped are in the log from `at` on;
-        // their origins, read before the acknowledgement retires them,
-        // raise `shipped` once `applied_seq` covers the segment.
-        let origins = Meta::journal_origins(self, seqs).unwrap_or_default();
+    fn ack_journal(
+        &self,
+        seqs: &[u64],
+        origins: &[(u64, u64)],
+        at: Seq,
+        pos: Option<JournalPos>,
+    ) -> Result<(), MetaError> {
         Meta::ack_journal_rows_at(self, seqs, at)?;
         if let Some(pos) = pos {
             // Kept across a restart (see `Meta::open`); best effort, the
@@ -1507,9 +1518,10 @@ impl Replica for Meta {
         // claims a later tenure and merges the kept rows of its own
         // (metered-shared+links seed 1781).
         self.session().advance_rows(at, pos, seqs);
-        for (gen, idx) in origins {
-            self.session().note_shipped(gen, idx);
-        }
+        // ADR-69: the rows this node shipped are in the log from `at` on:
+        // their origins raise `shipped`, now that `applied_seq` covers the
+        // segment.
+        self.session().note_shipped_batch(origins, &[]);
         Ok(())
     }
 
@@ -1594,12 +1606,12 @@ impl Replica for Meta {
         );
         // ADR-69: the log this replica applied carries these streams now
         // (after `advance_rows`: `applied_seq` covers the segment).
-        for (gen, idx) in origins {
-            self.session().note_shipped(*gen, *idx);
-        }
-        for (gen, idx) in records.iter().flat_map(|rec| rec.stream_fills()) {
-            self.session().note_shipped_fill(*gen, *idx);
-        }
+        let fills: Vec<(u64, u64)> = records
+            .iter()
+            .flat_map(|rec| rec.stream_fills())
+            .copied()
+            .collect();
+        self.session().note_shipped_batch(origins, &fills);
         Ok(Applied {
             stranded: applied.stranded,
             skipped: applied.skipped,
@@ -1727,7 +1739,12 @@ impl Replica for Meta {
     }
 
     fn journal_origins(&self, seqs: &[u64]) -> Vec<(u64, u64)> {
-        Meta::journal_origins(self, seqs).unwrap_or_else(|_| vec![(0, 0); seqs.len()])
+        Meta::journal_origins(self, seqs).unwrap_or_else(|e| {
+            // (Read as rows of no origin: an op is held a little longer
+            // for `shipped` not rising, never sent short.)
+            tracing::debug!(error = %e, "the journal's delegation origins could not be read");
+            vec![(0, 0); seqs.len()]
+        })
     }
 
     fn journal_has_undelegated(&self) -> bool {
@@ -2642,9 +2659,9 @@ mod tests {
         assert_eq!(txs.len(), 3);
         let rows = |i: usize| (txs[i].first..=txs[i].last).collect::<Vec<u64>>();
         let at = |jseq| Some(JournalPos { epoch: 1, jseq });
-        Replica::ack_journal(&meta, &rows(0), 1, at(txs[0].last)).unwrap();
+        Replica::ack_journal(&meta, &rows(0), &[], 1, at(txs[0].last)).unwrap();
         // The third ships ahead of the second, which stays held.
-        Replica::ack_journal(&meta, &rows(2), 2, at(txs[0].last)).unwrap();
+        Replica::ack_journal(&meta, &rows(2), &[], 2, at(txs[0].last)).unwrap();
         assert!(Replica::row_in_log(&meta, 1, txs[2].last));
         meta.session()
             .advance(3, Some(JournalPos { epoch: 2, jseq: 0 }));

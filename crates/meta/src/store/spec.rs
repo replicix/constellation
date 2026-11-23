@@ -2440,13 +2440,20 @@ fn stranded_deps_by_tx(
     Ok(out)
 }
 
-/// The dependency table for the highest stream index per generation: the
-/// entries the applied log carries already are left out (ADR-69:
-/// `SessionState::shipped`), then the highest generations when it still
+/// The dependency table for the highest stream index per generation. One
+/// that fits is as it always was; only when it does not (ADR-69), the
+/// entries the applied log carries already are left out
+/// (`SessionState::shipped`), then the highest generations when it still
 /// does not fit (counted: `SessionStats::floor_truncated`).
 fn streams_of(highest: &std::collections::BTreeMap<u64, u64>, meta: &Meta) -> Streams {
-    let session = meta.session();
     let mut deps = Streams::NONE;
+    if highest.len() <= crate::session::deps_cap() {
+        for (gen, idx) in highest {
+            deps.raise(*gen, *idx);
+        }
+        return deps;
+    }
+    let session = meta.session();
     let mut dropped = 0u64;
     let owed = highest
         .iter()
