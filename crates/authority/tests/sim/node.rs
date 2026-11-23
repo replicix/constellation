@@ -546,6 +546,10 @@ pub struct NodeEnv {
     pub plant_release_admits: bool,
     /// See `SimConfig::skip_deleg_dep_wait`.
     pub skip_deleg_dep_wait: bool,
+    /// See `SimConfig::deps_cap`.
+    pub deps_cap: usize,
+    /// See `SimConfig::skip_deps_overflow_hold`.
+    pub skip_deps_overflow_hold: bool,
     /// See `SimConfig::ttl_reclaims_sticky`.
     pub ttl_reclaims_sticky: bool,
     /// See `SimConfig::placement_recalls_sticky`.
@@ -940,6 +944,9 @@ impl NodeHandle {
         env.world.register(id, meta.clone());
         let mut cfg = (env.config)(id, incarnation);
         cfg.skip_deleg_dep_wait = env.skip_deleg_dep_wait;
+        cfg.skip_deps_overflow_hold = env.skip_deps_overflow_hold;
+        // (Per thread, and set at every node start: a sim runs on one.)
+        constellation_meta::set_deps_cap_for_sim(env.deps_cap);
         cfg.ttl_reclaims_sticky = env.ttl_reclaims_sticky;
         cfg.placement_recalls_sticky = env.placement_recalls_sticky;
         cfg.root_sticky_on_slash = env.root_sticky_on_slash;

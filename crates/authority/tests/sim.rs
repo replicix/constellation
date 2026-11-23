@@ -9145,6 +9145,18 @@ fn sweep_config() {
                         );
                     }
                     eprintln!("SWEEP-L3 {label} seed {seed}: {}", recall_stall(&report));
+                    // ADR-69: ops held for a `deps` overflow, and the ops the
+                    // deadline decided (in doubt, settled, abandoned) or left
+                    // unanswered, per seed (summed by the sweep's reader).
+                    eprintln!(
+                        "SWEEP-OVF {label} seed {seed}: holds {} in_doubt {} settles {} \
+                         abandoned {} unanswered {}",
+                        c9(|s| s.deps_overflow_holds),
+                        c9(|s| s.in_doubt),
+                        c9(|s| s.settles_sent),
+                        c9(|s| s.settled_local),
+                        report.ops_invoked.saturating_sub(report.ops_returned)
+                    );
                     // Plan 43 C3 item 3: this node's own delegate rows the
                     // takeover gate put back verbatim after the tail.
                     let reappended = c9(|s| s.own_deleg_rows_reappended);
@@ -12429,6 +12441,118 @@ fn delegated_marker_order_holds() {
     );
     assert!(t.marker_checks > 1_000, "markers rarely checked: {t:?}");
     assert!(t.deps_waits > 0, "the deps wait was never exercised: {t:?}");
+}
+
+/// ADR-69: `seeds` seeds of `cfg` from `base`, the failures (first line of
+/// each) and the ops held for a `deps` overflow over the runs.
+fn ovfdeps_runs(label: &str, cfg: &SimConfig, base: u64, seeds: u64) -> (Vec<String>, u64) {
+    let (mut failures, mut holds) = (Vec::new(), 0);
+    for seed in base..base + seeds {
+        match run_seed(seed, cfg.clone()) {
+            Ok(report) => {
+                holds += report
+                    .stats
+                    .values()
+                    .map(|s| s.deps_overflow_holds)
+                    .sum::<u64>();
+            }
+            Err(e) => {
+                eprintln!(
+                    "OVFDEPS FAIL {label} seed {seed}: {}",
+                    e.lines().next().unwrap_or("")
+                );
+                failures.push(format!("{label} seed {seed}: {e}"));
+            }
+        }
+    }
+    (failures, holds)
+}
+
+/// ADR-69: with the table lowered to one stream (so every op that has seen
+/// two generations overflows), an op is held until the log carries what it
+/// depends on, and no marker is ever seen without its data. 60 seeds that
+/// failed `marker_order` on the code that sent such an op short.
+#[test]
+fn ovfdeps_cap_1_keeps_marker_order_under_a_deps_overflow() {
+    let seeds: u64 = std::env::var("OVFDEPS_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let mut failures = Vec::new();
+    let mut holds = 0;
+    for (label, cfg, base) in [
+        ("delegated-marker", delegated_marker_config(), 61_000u64),
+        ("long-delegated", long_delegated_config(), 70_000u64),
+    ] {
+        let cfg = SimConfig { deps_cap: 1, ..cfg };
+        let (f, h) = ovfdeps_runs(label, &cfg, base, seeds);
+        failures.extend(f);
+        holds += h;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
+    assert!(holds > 0, "the overflow hold was never exercised");
+}
+
+/// ADR-69: the same with two streams, on the configurations that cover the
+/// causal-cut oracle under late answers, a backup, lock floors and a root
+/// restart.
+#[test]
+fn ovfdeps_cap_2_holds_in_the_late_answer_backup_lock_and_restart_labels() {
+    let seeds: u64 = std::env::var("OVFDEPS_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let mut failures = Vec::new();
+    let mut holds = 0;
+    for (label, cfg) in [
+        (
+            "long-delegated-late-answers",
+            long_delegated_late_answers_config(),
+        ),
+        ("long-delegated-backup", long_delegated_backup_config()),
+        (
+            "locks-delegated-writes",
+            with_lock_writes(locks_delegated_config(), "d2"),
+        ),
+        ("sticky-s4-root-restart", sticky_s4_root_restart_config()),
+    ] {
+        let cfg = SimConfig { deps_cap: 2, ..cfg };
+        let (f, h) = ovfdeps_runs(label, &cfg, 0, seeds);
+        failures.extend(f);
+        holds += h;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
+    eprintln!("OVFDEPS cap 2: {holds} ops held");
+}
+
+/// ADR-69's negative control: the same runs as the cap 1 gate with the hold
+/// off (`SimConfig::skip_deps_overflow_hold`: the op goes on with a
+/// placeholder that names no stream) fail `marker_order`. (The table keeps
+/// what the log does not carry yet, so an overflow with two streams still
+/// owed is rare: 400 seeds per label are run.)
+#[test]
+fn ovfdeps_negative_control_without_the_hold_fails_marker_order() {
+    let mut failed = 0;
+    for (label, cfg, base) in [
+        ("delegated-marker", delegated_marker_config(), 61_000u64),
+        ("long-delegated", long_delegated_config(), 70_000u64),
+    ] {
+        let cfg = SimConfig {
+            deps_cap: 1,
+            skip_deps_overflow_hold: true,
+            ..cfg
+        };
+        let seeds: u64 = std::env::var("OVFDEPS_CONTROL_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(400);
+        let (f, _) = ovfdeps_runs(label, &cfg, base, seeds);
+        failed += f.len();
+    }
+    assert!(
+        failed > 0,
+        "no seed failed with the hold off: the gate proves nothing"
+    );
 }
 
 /// Plan 30 §M11: the delegate crashes without a backup; the root
@@ -15920,6 +16044,16 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         },
         "nomove" => SimConfig {
             cross_ratio: 0.0,
+            ..cfg
+        },
+        // ADR-69: the table of streams a position can name is lowered to 1
+        // or 2, so the sims' two or three delegates reach the nine-generation
+        // overflow (`SimConfig::deps_cap`), and `depsnohold` is the negative
+        // control: an op whose `deps` overflow is not held.
+        "depscap1" => SimConfig { deps_cap: 1, ..cfg },
+        "depscap2" => SimConfig { deps_cap: 2, ..cfg },
+        "depsnohold" => SimConfig {
+            skip_deps_overflow_hold: true,
             ..cfg
         },
         // ADR-52's negative control: the singleton answer leaves without the

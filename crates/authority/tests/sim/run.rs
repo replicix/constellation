@@ -1093,6 +1093,15 @@ pub struct SimConfig {
     /// an op's deps (`Config::skip_deleg_dep_wait`), so one executes ahead
     /// of its cause and the root that is current refuses its batch.
     pub skip_deleg_dep_wait: bool,
+    /// ADR-69: the number of delegation streams past which a position's
+    /// table overflows (`constellation_meta::set_deps_cap_for_sim`; 8, the
+    /// production cap, unless a sim lowers it so its two or three
+    /// delegates reach the nine-generation case).
+    pub deps_cap: usize,
+    /// Negative control for the deps overflow hold
+    /// (`Config::skip_deps_overflow_hold`): with a lowered `deps_cap` the
+    /// causal-cut oracle must fail.
+    pub skip_deps_overflow_hold: bool,
     /// Plan 43 C1-3 (§5.8, Q1): the operator abandons the group a claim has
     /// waited for this long (simulated ms), as `constellation repair
     /// abandon --epoch E` does (`Control::Abandon` on the node
@@ -1554,6 +1563,8 @@ impl Default for SimConfig {
             plant_ungated_fast_path: false,
             plant_release_admits: false,
             skip_deleg_dep_wait: false,
+            deps_cap: constellation_meta::STREAMS_CAP,
+            skip_deps_overflow_hold: false,
             plant_claim_root_group_on_lone: false,
             abandon_after_ms: None,
             await_dead_delegates: false,
@@ -6233,6 +6244,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         plant_ungated_fast_path: cfg.plant_ungated_fast_path,
         plant_release_admits: cfg.plant_release_admits,
         skip_deleg_dep_wait: cfg.skip_deleg_dep_wait,
+        deps_cap: cfg.deps_cap,
+        skip_deps_overflow_hold: cfg.skip_deps_overflow_hold,
         ttl_reclaims_sticky: cfg.ttl_reclaims_sticky,
         placement_recalls_sticky: cfg.placement_recalls_sticky,
         root_sticky_on_slash: cfg.root_sticky_on_slash,
