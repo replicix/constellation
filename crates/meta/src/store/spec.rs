@@ -2129,6 +2129,7 @@ fn strand_local_tx(
     for (seq, _) in &rows {
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
     }
+    super::journal::note_rows_stranded_tx(tx, &meta.local, rows.iter().map(|(_, r)| r))?;
     tx.remove(&meta.journal_tx, local::tx_key(first));
     local::remove_journal_origin(tx, meta, row.gen, row.idx, first);
     let count = if row.spec_seq.is_some() {

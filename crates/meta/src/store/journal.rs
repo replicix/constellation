@@ -789,6 +789,11 @@ pub(crate) fn append_tx(
     let seq = next_seq_tx(tx, local)?;
     tx.insert(journal, seq_key(seq), record.to_postcard()?);
     OwnRows::note(seq, record);
+    if matches!(record, LogRecord::DelegateNodeEnded { .. }) {
+        // WP6.2b: counted until its row is acked or stranded
+        // (`Meta::clear_marks_of_shipped_ends_tx`).
+        crate::store::counter_add_tx(tx, local, crate::store::KV_DELEGATE_ENDS_UNACKED, 1)?;
+    }
     if let Some(rid) = PendingCompletion::take() {
         let cseq = next_seq_tx(tx, local)?;
         let completed_row = LogRecord::Completed { rid };
@@ -1154,4 +1159,23 @@ pub(crate) fn conflict_count(
         }
     }
     Ok(n)
+}
+
+/// WP6.2b: `records` leave the journal without an ack (a strand): the
+/// `DelegateNodeEnded` among them leave the count of ends not yet acked.
+pub(crate) fn note_rows_stranded_tx<'a>(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    records: impl IntoIterator<Item = &'a LogRecord>,
+) -> Result<(), MetaError> {
+    let ends = records
+        .into_iter()
+        .filter(|r| matches!(r, LogRecord::DelegateNodeEnded { .. }))
+        .count();
+    crate::store::counter_add_tx(
+        tx,
+        local,
+        crate::store::KV_DELEGATE_ENDS_UNACKED,
+        -(ends as i64),
+    )
 }

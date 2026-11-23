@@ -250,6 +250,10 @@ pub(crate) const KV_JOURNAL_ACKED: &str = "journal_acked";
 pub(crate) const KV_POISONED_COUNT: &str = "poisoned_count";
 /// ADR-59 part B: `DropHeld` records journaled and not yet shipped.
 pub(crate) const KV_DROP_HELD_UNSHIPPED: &str = "drop_held_unshipped";
+/// WP6.2b: `DelegateNodeEnded` records this node journaled and not yet
+/// shipped or stranded: the ship path reads its rows (to clear the
+/// released-whole marks of the ends it carries) only while this is nonzero.
+pub(crate) const KV_DELEGATE_ENDS_UNACKED: &str = "delegate_ends_unacked";
 /// ADR-59: how many acknowledged operations `repair drop-held` rolled
 /// back for good (`held::DroppedHeld::acked_lost`), for `status`.
 pub(crate) const KV_ACKED_LOST_TOTAL: &str = "acked_lost_total";
@@ -710,6 +714,10 @@ pub struct Meta {
     /// loop's read (a flag lowered before a failed clear would fail open);
     /// a scan that finds no mark lowers it.
     pub(crate) released_whole_any: AtomicBool,
+    /// Tests only: shipped rows the released-whole clear decoded
+    /// ([`Meta::clear_rows_decoded_for_tests`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) clear_rows_decoded: std::sync::atomic::AtomicU64,
     /// The generations a `deleg_own_cut` key is held for (kept beside the
     /// keys: raised before the commit that writes one, lowered with the
     /// transaction that clears the last subtree of a generation). Read only
@@ -1578,6 +1586,8 @@ impl Meta {
             deleg_any: AtomicBool::new(false),
             own_cut_any: AtomicBool::new(false),
             released_whole_any: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            clear_rows_decoded: std::sync::atomic::AtomicU64::new(0),
             own_cut_gens: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             deleg_exec_in_cut: AtomicU64::new(0),
             deleg_gate: std::sync::RwLock::new(()),

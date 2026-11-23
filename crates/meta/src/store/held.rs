@@ -3221,11 +3221,9 @@ fn strand_named_leftovers(
     for first in &left {
         let Some(row) = local::get_journal_tx(&*tx, meta, *first)? else {
             // (An uncaptured one-row transaction has no `journal_tx` row.)
-            if tx
-                .get(&meta.journal_ks, journal::seq_key(*first))?
-                .is_some()
-            {
+            if let Some(v) = tx.get(&meta.journal_ks, journal::seq_key(*first))? {
                 tx.remove(&meta.journal_ks, journal::seq_key(*first));
+                journal::note_rows_stranded_tx(tx, &meta.local, [&LogRecord::from_postcard(&v)?])?;
             }
             continue;
         };
@@ -3240,6 +3238,8 @@ fn strand_named_leftovers(
         {
             continue;
         }
+        let rows = local::journal_records(&*tx, meta, *first, row.last)?;
+        journal::note_rows_stranded_tx(tx, &meta.local, rows.iter().map(|(_, r)| r))?;
         for seq in *first..=row.last {
             tx.remove(&meta.journal_ks, journal::seq_key(seq));
         }

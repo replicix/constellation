@@ -1389,8 +1389,11 @@ impl Meta {
     }
 
     /// The generations carrying a released-whole mark.
-    fn released_whole_gens_tx(&self, r: &impl Readable) -> Result<Vec<u64>, MetaError> {
-        let mut out = Vec::new();
+    fn released_whole_gens_tx(
+        &self,
+        r: &impl Readable,
+    ) -> Result<std::collections::BTreeSet<u64>, MetaError> {
+        let mut out = std::collections::BTreeSet::new();
         for guard in r.prefix(&self.local, DELEG_RELEASED_WHOLE_PREFIX.as_bytes()) {
             let (k, _) = guard.into_inner()?;
             if let Some(gen) = std::str::from_utf8(&k)
@@ -1398,7 +1401,7 @@ impl Meta {
                 .and_then(|k| k.strip_prefix(DELEG_RELEASED_WHOLE_PREFIX))
                 .and_then(|g| g.parse::<u64>().ok())
             {
-                out.push(gen);
+                out.insert(gen);
             }
         }
         Ok(out)
@@ -1407,38 +1410,68 @@ impl Meta {
     /// WP6.2b: the generations whose own end this node journaled (the
     /// root's own stream, ADR-55) and ships in `journal_seqs` leave the
     /// marks: the ack of a shipped row is where that end is in the log.
-    /// Never at the journal-time end, which may strand. The shipped rows
-    /// are read only while a mark exists; a scan that finds none lowers the
-    /// flag (under the writer lock, as the raises are).
+    /// Never at the journal-time end, which may strand.
+    ///
+    /// The shipped rows are read only while a `DelegateNodeEnded` this node
+    /// journaled is still unacked (`KV_DELEGATE_ENDS_UNACKED`, raised where
+    /// `journal::append_tx` journals one, lowered here at its ack and where
+    /// a strand takes the row back out): with none (the common ship) the
+    /// ack reads no row. The count is a superset of the marked
+    /// generations' ends (a mark may be written after the end is journaled),
+    /// so it never skips a needed clear. It moves in the transaction of
+    /// the row it counts, so an aborted one leaves it as it was.
+    ///
+    /// The marks are scanned only while the flag may be up. A scan that
+    /// finds none lowers it: under the writer lock no raise and no scan
+    /// overlap, so the flag is down only when no key exists, an abort of
+    /// this transaction or not.
     pub(crate) fn clear_marks_of_shipped_ends_tx(
         &self,
         tx: &mut SingleWriterWriteTx,
         journal_seqs: &[u64],
     ) -> Result<(), MetaError> {
-        if !self.released_whole_any.load(Ordering::Acquire) {
+        if crate::store::counter_get(&*tx, &self.local, crate::store::KV_DELEGATE_ENDS_UNACKED)? == 0
+        {
             return Ok(());
         }
-        let marked = self.released_whole_gens_tx(&*tx)?;
-        if marked.is_empty() {
-            self.released_whole_any.store(false, Ordering::Release);
-            return Ok(());
-        }
-        let mut left = marked.len();
+        let marked = if self.released_whole_any.load(Ordering::Acquire) {
+            let marked = self.released_whole_gens_tx(&*tx)?;
+            if marked.is_empty() {
+                self.released_whole_any.store(false, Ordering::Release);
+            }
+            marked
+        } else {
+            Default::default()
+        };
+        let mut ended = 0i64;
         for seq in journal_seqs {
             let Some(v) = tx.get(&self.journal_ks, journal::seq_key(*seq))? else {
                 continue;
             };
+            #[cfg(any(test, feature = "test-util"))]
+            self.clear_rows_decoded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let LogRecord::DelegateNodeEnded { gen, .. } = LogRecord::from_postcard(&v)? {
+                ended += 1;
                 if marked.contains(&gen) {
                     clear_released_whole_tx(tx, &self.local, gen)?;
-                    left = left.saturating_sub(1);
                 }
             }
         }
-        if left == 0 {
-            self.released_whole_any.store(false, Ordering::Release);
-        }
-        Ok(())
+        crate::store::counter_add_tx(
+            tx,
+            &self.local,
+            crate::store::KV_DELEGATE_ENDS_UNACKED,
+            -ended,
+        )
+    }
+
+    /// Tests only: how many shipped rows [`Self::clear_marks_of_shipped_ends_tx`]
+    /// has read and decoded.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn clear_rows_decoded_for_tests(&self) -> u64 {
+        self.clear_rows_decoded
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Plan 46 M1.3 step 15b (ADR-64): the subtrees this node's stream `gen`
@@ -4286,10 +4319,136 @@ mod root_substitution_tests {
             !meta.released_whole(5).unwrap(),
             "the own end's ack left the mark"
         );
-        // A store with no mark pays nothing: the flag came down.
-        assert!(!meta
-            .released_whole_any
-            .load(std::sync::atomic::Ordering::Acquire));
+        // (The flag stays up here: the scan that ran found a mark. Only a
+        // scan that finds none lowers it, below.)
+        assert_eq!(ends_unacked(&meta), 0);
+    }
+
+    fn ends_unacked(meta: &Meta) -> u64 {
+        let r = meta.db.read_tx();
+        crate::store::counter_get(&r, &meta.local, crate::store::KV_DELEGATE_ENDS_UNACKED).unwrap()
+    }
+
+    fn flag_up(meta: &Meta) -> bool {
+        meta.released_whole_any
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn journaled_end_seq(meta: &Meta, gen: u64) -> Vec<u64> {
+        meta.peek_journal_after(0)
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| matches!(r, LogRecord::DelegateNodeEnded { gen: g, .. } if *g == gen))
+            .map(|(s, _)| *s)
+            .collect()
+    }
+
+    /// WP6.2b (round 2, SHOULD A): the flag comes down only when a scan
+    /// found no mark, never inside a transaction that can still abort. An
+    /// ack that clears a mark and then fails leaves the mark, the flag and
+    /// the count as they were; the next ack clears the mark. A flag that is
+    /// up with no mark left comes down at the next scan that finds none.
+    #[test]
+    fn an_ack_that_fails_after_the_clear_leaves_the_flag_and_the_mark() {
+        let (meta, _, _) = cut_fixture();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        meta.apply_records_journaled(&[stream_end(5)]).unwrap();
+        let end = journaled_end_seq(&meta, 5);
+        assert_eq!(end.len(), 1);
+        assert!(flag_up(&meta));
+        assert_eq!(ends_unacked(&meta), 1);
+        // A row that cannot be decoded, behind the end in the ship: the
+        // clear removes the mark, then the decode fails, the transaction
+        // is dropped.
+        let bad = end[0] + 1000;
+        {
+            let mut tx = meta.db.write_tx();
+            tx.insert(&meta.journal_ks, journal::seq_key(bad), b"\xff\xff".to_vec());
+            tx.commit().unwrap();
+        }
+        assert!(meta.ack_journal_rows_at(&[end[0], bad], 2).is_err());
+        assert!(meta.released_whole(5).unwrap(), "an aborted ack cleared");
+        assert!(flag_up(&meta), "an aborted ack lowered the flag");
+        assert_eq!(ends_unacked(&meta), 1);
+        {
+            let mut tx = meta.db.write_tx();
+            tx.remove(&meta.journal_ks, journal::seq_key(bad));
+            tx.commit().unwrap();
+        }
+        // The later ack clears.
+        meta.ack_journal_rows_at(&end, 2).unwrap();
+        assert!(!meta.released_whole(5).unwrap());
+        assert_eq!(ends_unacked(&meta), 0);
+
+        // A flag up with no mark: the next ack that reads rows scans, finds
+        // none, and lowers it.
+        let (meta, _, _) = cut_fixture();
+        meta.mark_released_whole(9).unwrap();
+        {
+            let mut tx = meta.db.write_tx();
+            clear_released_whole_tx(&mut tx, &meta.local, 9).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(flag_up(&meta));
+        meta.apply_records_journaled(&[stream_end(5)]).unwrap();
+        let end = journaled_end_seq(&meta, 5);
+        meta.ack_journal_rows_at(&end, 2).unwrap();
+        assert!(!flag_up(&meta), "a scan that found no mark left the flag up");
+    }
+
+    /// WP6.2b (round 2, SHOULD B): a mark left behind costs a ship nothing:
+    /// the clear reads and decodes the shipped rows only while an own
+    /// `DelegateNodeEnded` is journaled and not acked.
+    #[test]
+    fn a_left_behind_mark_costs_the_ordinary_ship_no_row_read() {
+        let (meta, _, _) = cut_fixture();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        assert!(meta.released_whole(5).unwrap() && flag_up(&meta));
+        for n in 0..20u64 {
+            execute(
+                &meta,
+                &MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: format!("f{n}"),
+                    ino: (3 << 40) | (2000 + n),
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: n + 1,
+                }),
+            )
+            .unwrap();
+        }
+        let seqs: Vec<u64> = meta
+            .peek_journal_after(0)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert!(seqs.len() >= 20, "{seqs:?}");
+        assert_eq!(ends_unacked(&meta), 0);
+        let before = meta.clear_rows_decoded_for_tests();
+        meta.ack_journal_rows_at(&seqs, 2).unwrap();
+        assert_eq!(
+            meta.clear_rows_decoded_for_tests(),
+            before,
+            "an ordinary ship decoded rows"
+        );
+        assert!(meta.released_whole(5).unwrap(), "the mark is left behind");
+        // The end, once journaled and shipped, is read and clears it.
+        meta.apply_records_journaled(&[stream_end(5)]).unwrap();
+        assert_eq!(ends_unacked(&meta), 1);
+        let end = journaled_end_seq(&meta, 5);
+        meta.ack_journal_rows_at(&end, 3).unwrap();
+        assert!(meta.clear_rows_decoded_for_tests() > before);
+        assert!(!meta.released_whole(5).unwrap());
+        assert_eq!(ends_unacked(&meta), 0);
     }
 
     /// ADR-64: no cut is journaled on a generation the takeover gate ended

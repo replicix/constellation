@@ -117,6 +117,11 @@ impl Meta {
         applied_seq: u64,
     ) -> Result<(), MetaError> {
         use crate::store::spec::{retire_local_tx, retire_tx, Shipped};
+        // WP6.2b: the root's own end of a released stream (ADR-55) is in the
+        // log once its row's ack is (a ship, or its own segment coming
+        // back): its mark goes here, and it leaves the count of ends
+        // journaled and not acked.
+        self.clear_marks_of_shipped_ends_tx(tx, journal_seqs)?;
         // ADR-59 part B (D2): a `DropHeld` this node shipped retires what it
         // names, as it does on every replica that applies it from the log.
         // The drop's decision counts the record as unshipped; a ship that carries no such
@@ -218,9 +223,6 @@ impl Meta {
         // Under the write lock: a row this transaction does not see is
         // committed after it, and noted after that (`clear_unshipped_since`).
         let gen = self.unshipped_gen();
-        // WP6.2b: the root's own end of a released stream (ADR-55) is in the
-        // log once its row's ack is: its mark goes here.
-        self.clear_marks_of_shipped_ends_tx(&mut tx, journal_seqs)?;
         self.ack_rows_tx(&mut tx, journal_seqs, applied_seq)?;
         // Plan 30 §M5: with nothing left unshipped, no key is behind an
         // unshipped record any more (`Meta::unshipped_overlaps`).
