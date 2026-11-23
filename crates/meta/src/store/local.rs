@@ -1430,7 +1430,8 @@ impl Meta {
         tx: &mut SingleWriterWriteTx,
         journal_seqs: &[u64],
     ) -> Result<(), MetaError> {
-        if crate::store::counter_get(&*tx, &self.local, crate::store::KV_DELEGATE_ENDS_UNACKED)? == 0
+        if crate::store::counter_get(&*tx, &self.local, crate::store::KV_DELEGATE_ENDS_UNACKED)?
+            == 0
         {
             return Ok(());
         }
@@ -4364,7 +4365,11 @@ mod root_substitution_tests {
         let bad = end[0] + 1000;
         {
             let mut tx = meta.db.write_tx();
-            tx.insert(&meta.journal_ks, journal::seq_key(bad), b"\xff\xff".to_vec());
+            tx.insert(
+                &meta.journal_ks,
+                journal::seq_key(bad),
+                b"\xff\xff".to_vec(),
+            );
             tx.commit().unwrap();
         }
         assert!(meta.ack_journal_rows_at(&[end[0], bad], 2).is_err());
@@ -4394,7 +4399,10 @@ mod root_substitution_tests {
         meta.apply_records_journaled(&[stream_end(5)]).unwrap();
         let end = journaled_end_seq(&meta, 5);
         meta.ack_journal_rows_at(&end, 2).unwrap();
-        assert!(!flag_up(&meta), "a scan that found no mark left the flag up");
+        assert!(
+            !flag_up(&meta),
+            "a scan that found no mark left the flag up"
+        );
     }
 
     /// WP6.2b (round 2, SHOULD B): a mark left behind costs a ship nothing:
