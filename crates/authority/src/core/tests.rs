@@ -83630,6 +83630,12 @@ mod step5_sticky_release {
             "a kept stream never acknowledged: the self-leave would wait"
         );
         assert!(!h.core.dl.gens.values().any(|g| g.node == 3 && !g.ended));
+        // WP6.2b: the end that shipped is in the log: the generation carries
+        // no released-whole mark (the release row wrote one).
+        assert!(
+            !h.meta.released_whole(7).unwrap(),
+            "the own end shipped and left the generation's mark"
+        );
     }
 
     /// WP6.2, the restart variant of the test above: the node restarts after
