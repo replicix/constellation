@@ -680,6 +680,16 @@ pub struct Meta {
     /// ([`Meta::fail_released_whole_reads_for_tests`]).
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) released_mark_faults: std::sync::atomic::AtomicU32,
+    /// Tests only: how many of the next [`Meta::mark_released_whole`] calls
+    /// fail before writing anything
+    /// ([`Meta::fail_released_whole_writes_for_tests`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) released_mark_write_faults: std::sync::atomic::AtomicU32,
+    /// Tests only: how many of the next [`Meta::mark_released_whole`] calls
+    /// fail between the commit and the sync
+    /// ([`Meta::fail_released_whole_syncs_for_tests`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) released_mark_sync_faults: std::sync::atomic::AtomicU32,
     /// Unit tests of the tree publisher only: publish `ns` as it stands
     /// though this node's unshipped journal holds uncaptured writes
     /// (`Meta::publish_basis_at`). Never set by the daemon.
@@ -694,6 +704,12 @@ pub struct Meta {
     /// (`own_cut_gens` empty): while it is clear,
     /// [`Meta::delegation_table`] is the raw fold with no look at the keys.
     pub(crate) own_cut_any: AtomicBool,
+    /// WP6.2b: a `deleg_released_whole` mark may exist (raised before a
+    /// commit that writes one, and at open when one is found). It gates the
+    /// *clear* at the ack of a shipped own end only, never the install
+    /// loop's read (a flag lowered before a failed clear would fail open);
+    /// a scan that finds no mark lowers it.
+    pub(crate) released_whole_any: AtomicBool,
     /// The generations a `deleg_own_cut` key is held for (kept beside the
     /// keys: raised before the commit that writes one, lowered with the
     /// transaction that clears the last subtree of a generation). Read only
@@ -1554,9 +1570,14 @@ impl Meta {
             journal_read_faults: std::sync::atomic::AtomicU32::new(0),
             #[cfg(any(test, feature = "test-util"))]
             released_mark_faults: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            released_mark_write_faults: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            released_mark_sync_faults: std::sync::atomic::AtomicU32::new(0),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             own_cut_any: AtomicBool::new(false),
+            released_whole_any: AtomicBool::new(false),
             own_cut_gens: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             deleg_exec_in_cut: AtomicU64::new(0),
             deleg_gate: std::sync::RwLock::new(()),
@@ -1645,6 +1666,7 @@ impl Meta {
         meta.load_read_holds()?;
         meta.refresh_holder_append_tip()?;
         meta.load_own_cut_flag()?;
+        meta.load_released_whole_flag()?;
         meta.build_pending_by_ino()?;
         meta.verify_mark_counts()?;
         {

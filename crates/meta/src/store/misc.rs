@@ -271,6 +271,41 @@ impl Meta {
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Tests only (`test-util`): fail this store's next `n` calls of
+    /// [`Meta::mark_released_whole`] before anything is written.
+    pub fn fail_released_whole_writes_for_tests(&self, n: u32) {
+        self.released_mark_write_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Tests only (`test-util`): fail this store's next `n` calls of
+    /// [`Meta::mark_released_whole`] after the commit, before the sync.
+    pub fn fail_released_whole_syncs_for_tests(&self, n: u32) {
+        self.released_mark_sync_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_released_mark_write_fault(&self) -> Result<(), MetaError> {
+        Self::take_fault(&self.released_mark_write_faults, "write")
+    }
+
+    pub(crate) fn take_released_mark_sync_fault(&self) -> Result<(), MetaError> {
+        Self::take_fault(&self.released_mark_sync_faults, "sync")
+    }
+
+    fn take_fault(faults: &std::sync::atomic::AtomicU32, what: &str) -> Result<(), MetaError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if faults
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(MetaError::Io(std::io::Error::other(format!(
+                "injected released-whole {what} fault (testing only)"
+            ))));
+        }
+        Ok(())
+    }
+
     pub(crate) fn take_released_mark_fault(&self) -> Result<(), MetaError> {
         use std::sync::atomic::Ordering::SeqCst;
         let took = self

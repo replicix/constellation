@@ -10983,10 +10983,13 @@ struct OracleTotals {
     /// installed or rebooted, lost dependency, plain stop), the releases the
     /// root sealed the group for, and the seal waits.
     rowless: [u64; 9],
-    /// WP6.2b (`SWEEP-RELMARK`): streams a restart found marked released
-    /// whole, mark reads that failed, mark writes that failed, whole-release
-    /// rows found without a mark (a bug), seeds where the mark fired.
-    relmark: [u64; 5],
+    /// WP6.2b (`SWEEP-RELMARK`): streams an install pass found marked
+    /// released whole (once per stream per process, so per restart), mark
+    /// reads that failed, mark writes that failed, whole-release rows found
+    /// without a mark (a bug), seeds where an install pass found a mark,
+    /// seeds with a failed mark write, recalls answered rowless for a stream
+    /// never installed (the writers of the mark outside a release row).
+    relmark: [u64; 7],
     unsettled_causes: std::collections::BTreeMap<String, u64>,
     /// Sync-on-silence C1: the unsettled `EIO`s of a generation tail the
     /// root could not reach, by whether a strict member had gone silent
@@ -11267,7 +11270,7 @@ impl OracleTotals {
         for (k, n) in &r.unsettled_violation_causes {
             *self.violation_causes.entry(k.clone()).or_default() += *n as u64;
         }
-        let mut fired = 0;
+        let (mut found, mut write_errors) = (0, 0);
         for st in r.stats.values() {
             for (c, n) in self.relmark.iter_mut().zip([
                 st.deleg_install_released_mark,
@@ -11277,9 +11280,12 @@ impl OracleTotals {
             ]) {
                 *c += n;
             }
-            fired += st.deleg_install_released_mark + st.released_mark_write_errors;
+            self.relmark[6] += st.deleg_release_rowless_unseen;
+            found += st.deleg_install_released_mark;
+            write_errors += st.released_mark_write_errors;
         }
-        self.relmark[4] += u64::from(fired > 0);
+        self.relmark[4] += u64::from(found > 0);
+        self.relmark[5] += u64::from(write_errors > 0);
         for st in r.stats.values() {
             for (c, n) in self.rowless.iter_mut().zip([
                 st.deleg_release_rowless_capped,
@@ -11756,15 +11762,18 @@ impl OracleTotals {
             self.seeds, self.seg[0], self.seg[1], self.seg[2], self.seg[3]
         );
         eprintln!(
-            "SWEEP-RELMARK {label} seeds {}/{seeds}: released-whole mark: streams found marked at a restart {}, \
-             mark reads failed {}, mark writes failed (recalls of streams never installed marked) {}, \
-             release rows without a mark {}; seeds where the mark path fired {}",
+            "SWEEP-RELMARK {label} seeds {}/{seeds}: released-whole mark: streams found marked by an install pass \
+             (once per stream per process) {}, mark reads failed {}, mark writes failed {}, \
+             release rows without a mark {}; seeds where an install pass found a mark {}, \
+             seeds with a failed mark write {}; recalls answered rowless for a stream never installed {}",
             self.seeds,
             self.relmark[0],
             self.relmark[1],
             self.relmark[2],
             self.relmark[3],
-            self.relmark[4]
+            self.relmark[4],
+            self.relmark[5],
+            self.relmark[6]
         );
         eprintln!(
             "SWEEP-ROWLESS {label} seeds {}/{seeds}: rowless releases by reason: capped {}, never \

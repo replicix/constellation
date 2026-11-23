@@ -1345,11 +1345,99 @@ impl Meta {
     /// release row, in a transaction of its own: a recall answered rowless
     /// for a stream this process never installed, whose hand-back would
     /// otherwise live in memory only. Cleared by the log's end as the row's
-    /// mark is. The caller answers the recall only once this has committed.
+    /// mark is. The mark is *synced* before this returns (a commit reaches
+    /// the OS, not the disk; a reboot between the answer and the log's end
+    /// would lose it, and no `deleg_held` record exists for a stream never
+    /// installed to say so, as [`Self::deleg_note_held`] and
+    /// `next_delegation_gen` sync what they act on). The caller answers the
+    /// recall only once this has returned `Ok`; on `Err` it answers nothing
+    /// and the root's repeat tries again.
+    ///
+    /// A mark already present is not written again (a repeated recall), but
+    /// still synced: the attempt that wrote it may have failed its sync.
     pub fn mark_released_whole(&self, gen: u64) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        mark_released_whole_tx(&mut tx, &self.local, gen);
-        tx.commit()?;
+        let present = {
+            let r = self.db.read_tx();
+            released_whole_tx(&r, &self.local, gen)?
+        };
+        if !present {
+            #[cfg(any(test, feature = "test-util"))]
+            self.take_released_mark_write_fault()?;
+            let mut tx = self.db.write_tx();
+            // Raised before the commit (it only gates clears: a flag up
+            // with no key costs one seek, and the next scan lowers it).
+            self.released_whole_any.store(true, Ordering::Release);
+            mark_released_whole_tx(&mut tx, &self.local, gen);
+            tx.commit()?;
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        self.take_released_mark_sync_fault()?;
+        self.sync()
+    }
+
+    /// At open: raise [`Meta::released_whole_any`] when a mark was left by a
+    /// previous process.
+    pub(crate) fn load_released_whole_flag(&self) -> Result<(), MetaError> {
+        let r = self.db.read_tx();
+        if r.prefix(&self.local, DELEG_RELEASED_WHOLE_PREFIX.as_bytes())
+            .next()
+            .is_some()
+        {
+            self.released_whole_any.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// The generations carrying a released-whole mark.
+    fn released_whole_gens_tx(&self, r: &impl Readable) -> Result<Vec<u64>, MetaError> {
+        let mut out = Vec::new();
+        for guard in r.prefix(&self.local, DELEG_RELEASED_WHOLE_PREFIX.as_bytes()) {
+            let (k, _) = guard.into_inner()?;
+            if let Some(gen) = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|k| k.strip_prefix(DELEG_RELEASED_WHOLE_PREFIX))
+                .and_then(|g| g.parse::<u64>().ok())
+            {
+                out.push(gen);
+            }
+        }
+        Ok(out)
+    }
+
+    /// WP6.2b: the generations whose own end this node journaled (the
+    /// root's own stream, ADR-55) and ships in `journal_seqs` leave the
+    /// marks: the ack of a shipped row is where that end is in the log.
+    /// Never at the journal-time end, which may strand. The shipped rows
+    /// are read only while a mark exists; a scan that finds none lowers the
+    /// flag (under the writer lock, as the raises are).
+    pub(crate) fn clear_marks_of_shipped_ends_tx(
+        &self,
+        tx: &mut SingleWriterWriteTx,
+        journal_seqs: &[u64],
+    ) -> Result<(), MetaError> {
+        if !self.released_whole_any.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let marked = self.released_whole_gens_tx(&*tx)?;
+        if marked.is_empty() {
+            self.released_whole_any.store(false, Ordering::Release);
+            return Ok(());
+        }
+        let mut left = marked.len();
+        for seq in journal_seqs {
+            let Some(v) = tx.get(&self.journal_ks, journal::seq_key(*seq))? else {
+                continue;
+            };
+            if let LogRecord::DelegateNodeEnded { gen, .. } = LogRecord::from_postcard(&v)? {
+                if marked.contains(&gen) {
+                    clear_released_whole_tx(tx, &self.local, gen)?;
+                    left = left.saturating_sub(1);
+                }
+            }
+        }
+        if left == 0 {
+            self.released_whole_any.store(false, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -4140,6 +4228,70 @@ mod root_substitution_tests {
         assert!(!meta.released_whole(5).unwrap());
     }
 
+    /// WP6.2b (review MUST): the rowless mark is durable before the caller
+    /// answers: committed *and* synced. A failed write persists nothing; a
+    /// failed sync reports the error (the caller answers nothing, the
+    /// root's repeat tries again); a repeat finds the mark and skips the
+    /// write, but still syncs, as the attempt that wrote it may have failed
+    /// its sync.
+    #[test]
+    fn the_rowless_mark_is_synced_before_it_is_reported_and_a_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Meta::open(&dir.path().join("m.db")).unwrap();
+        // A failed write: an error, nothing persisted, no sync.
+        let syncs = meta.sync_count();
+        meta.fail_released_whole_writes_for_tests(1);
+        assert!(meta.mark_released_whole(5).is_err());
+        assert!(!meta.released_whole(5).unwrap(), "a failed write marked");
+        assert_eq!(meta.sync_count(), syncs);
+        // A failed sync: an error (the caller must not answer), no sync done.
+        meta.fail_released_whole_syncs_for_tests(1);
+        assert!(meta.mark_released_whole(5).is_err());
+        assert_eq!(meta.sync_count(), syncs, "a failed sync counted");
+        // The retry: the mark is there, the write is skipped (a write fault
+        // would fire on a write), the sync is done.
+        meta.fail_released_whole_writes_for_tests(1);
+        meta.mark_released_whole(5).unwrap();
+        assert!(meta.released_whole(5).unwrap());
+        assert_eq!(meta.sync_count(), syncs + 1, "the mark was not synced");
+        // The fault was not consumed: no write was made.
+        assert!(meta.mark_released_whole(6).is_err());
+        meta.mark_released_whole(6).unwrap();
+        assert_eq!(meta.sync_count(), syncs + 2);
+    }
+
+    /// WP6.2b (SHOULD 2): the root's own stream (ADR-55) ends through its
+    /// own journal: the end ships and its row's ack is where it is in the
+    /// log, so the ack clears the mark. Not the journal-time end (which may
+    /// strand), nor the ack of a row that is not the end.
+    #[test]
+    fn the_roots_own_end_clears_the_mark_when_its_row_is_acked() {
+        let (meta, _, _) = cut_fixture();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        meta.apply_records_journaled(&[stream_end(5)]).unwrap();
+        assert!(
+            meta.released_whole(5).unwrap(),
+            "a journal-time end cleared the mark"
+        );
+        let rows = meta.peek_journal_after(0).unwrap();
+        let end: Vec<u64> = rows
+            .iter()
+            .filter(|(_, r)| matches!(r, LogRecord::DelegateNodeEnded { gen: 5, .. }))
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(end.len(), 1, "{rows:?}");
+        meta.ack_journal_rows_at(&end, 2).unwrap();
+        assert!(
+            !meta.released_whole(5).unwrap(),
+            "the own end's ack left the mark"
+        );
+        // A store with no mark pays nothing: the flag came down.
+        assert!(!meta
+            .released_whole_any
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
     /// ADR-64: no cut is journaled on a generation the takeover gate ended
     /// (such a stream releases rowless): the store fence refuses it with
     /// nothing written, and the node-local key is not set.
@@ -4439,10 +4591,17 @@ pub(crate) fn mark_own_cut_tx(
 
 /// `local` kv (WP6.2b, ADR-64 amendment): this node released its own stream
 /// `gen` whole. Written in the transaction of its own `StreamReleased` row
-/// ([`Meta::delegate_release`]); cleared by the durable apply of the
-/// stream's `DelegateNodeEnded`. A restart reads it instead of the lost
-/// in-memory hand-back: the stream is taken up as the remnant of its
-/// release, never with a subtree a later grow added.
+/// ([`Meta::delegate_release`]), or alone, synced, for a recall answered
+/// rowless for a stream never installed ([`Meta::mark_released_whole`]).
+/// Cleared where the log ends the generation: `apply_segment`'s end and
+/// orphan loops, the takeover strand's orphan ends, the rebuild's void-cut
+/// branch, and the ack of a shipped own end (the root's own stream,
+/// ADR-55); never at a journal-time or streamed-ahead end, which may
+/// strand. A restart reads it instead of the lost in-memory hand-back: the
+/// stream is taken up as the remnant of its release, never with a subtree a
+/// later grow added. A mark for a generation this node never sees ended
+/// (a recall of a grant the root never ships) is left behind: one key each,
+/// bounded by the number of recalls.
 pub(crate) const DELEG_RELEASED_WHOLE_PREFIX: &str = "deleg_released_whole:";
 
 fn deleg_released_whole_key(gen: u64) -> String {

@@ -1329,6 +1329,8 @@ fn apply_one(
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             crate::store::local::clear_own_cut_tx(tx, meta, *gen, None)?;
             if crate::store::journal::PendingOwnRelease::peek() == Some(*gen) {
+                meta.released_whole_any
+                    .store(true, std::sync::atomic::Ordering::Release);
                 crate::store::local::mark_released_whole_tx(tx, &meta.local, *gen);
             }
             // Plan 46 M1.2 step 11 (L1): the holder's release is the last row

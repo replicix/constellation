@@ -1423,3 +1423,68 @@ fn a_dependency_past_an_orphan_cut_of_the_same_claim_halts_the_re_append() {
     assert!(meta.pending_replays().unwrap().is_empty());
     assert!(!meta.deleg_claim_replayed(h).unwrap());
 }
+
+/// WP6.2b: the orphan ends clear the released-whole mark as the log's end
+/// of a generation does. A grant the log never carried, ended by the
+/// segment of an abandon or of a takeover marker (`apply_segment`'s orphan
+/// loop), by a claimant's own takeover strand with the proof (the strand's
+/// orphan loop), and by a claimant's strand with no proof for a generation
+/// it holds rows of that its table no longer lists (the strand's other
+/// loop). A mark of a generation that is not ended stays.
+#[test]
+fn an_orphan_end_clears_the_released_whole_mark() {
+    let g = gen(1, 1);
+    // `apply_segment`: the marker proves the grant never ships.
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.mark_released_whole(g).unwrap();
+    meta.apply_segment_rows(1, 3, 0, &[], &[], &[no_tail(2, 0)], &TouchSet::default())
+        .unwrap();
+    assert!(
+        meta.released_whole(g).unwrap(),
+        "a marker of another epoch ended it"
+    );
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.mark_released_whole(g).unwrap();
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 5)], &TouchSet::default())
+        .unwrap();
+    assert!(
+        meta.released_whole(g).unwrap(),
+        "a tail that follows ended it"
+    );
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.mark_released_whole(g).unwrap();
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 0)], &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0), "not ended");
+    assert!(
+        !meta.released_whole(g).unwrap(),
+        "the segment's orphan end left the mark"
+    );
+    // The takeover strand, with the proof of an abandon (the orphan loop).
+    let meta = delegate_of_a_streamed_grant(g, true);
+    meta.mark_released_whole(g).unwrap();
+    meta.strand_for_takeover(2, &[], Some(1)).unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0), "not ended");
+    assert!(
+        !meta.released_whole(g).unwrap(),
+        "the strand's orphan end left the mark"
+    );
+    // A claimant's strand for a generation it holds own rows of that the
+    // log never listed (the proof does not cover its epoch): the strand's
+    // other loop ends it at what the log holds.
+    let meta = delegate_of_a_streamed_grant(g, false);
+    meta.mark_released_whole(g).unwrap();
+    meta.apply_segment_rows(1, 2, 0, &[], &[], &[no_tail(1, 5)], &TouchSet::default())
+        .unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), None, "ended nowhere yet");
+    assert!(meta.released_whole(g).unwrap());
+    let proof = constellation_meta::OrphanProof::of(&[no_tail(2, 0)]);
+    assert!(!proof.covers(1));
+    meta.strand_for_takeover_carrying(3, &[], None, &Default::default(), &proof)
+        .unwrap();
+    assert_eq!(meta.void_cut(g).unwrap(), Some(0), "not ended");
+    assert!(
+        !meta.released_whole(g).unwrap(),
+        "the strand's end of an unlisted own generation left the mark"
+    );
+}

@@ -1805,6 +1805,10 @@ pub(crate) struct DelegationState {
     /// The generations a release request reached this node for at least once
     /// (the simulation's loss of the first one, L3).
     pub release_first: BTreeSet<u64>,
+    /// WP6.2b: the generations whose released-whole mark this process has
+    /// counted at an install pass (`Stats::deleg_install_released_mark`):
+    /// once per stream per restart, not per sync. Pruned with the table.
+    pub released_mark_counted: BTreeSet<u64>,
     /// A lease release waiting for the generations whose recall was in
     /// flight when it was issued (`Core::release_recall_waits`).
     pub(crate) release_wait: Option<ReleaseWait>,
@@ -3310,6 +3314,9 @@ impl Core {
         });
         let live: BTreeSet<u64> = table.gens().collect();
         self.dl.release_first.retain(|gen| live.contains(gen));
+        self.dl
+            .released_mark_counted
+            .retain(|gen| live.contains(gen));
         self.dl.installed_gens.retain(|gen| live.contains(gen));
         // Path B: the table here can be ahead of the log (the root's stream
         // installs its records speculatively), and say that a generation of
@@ -3389,7 +3396,9 @@ impl Core {
                 match replica.deleg_released_whole(st.gen) {
                     Ok(true) => {
                         self.stats.deleg_install_released_whole += 1;
-                        self.stats.deleg_install_released_mark += 1;
+                        if self.dl.released_mark_counted.insert(st.gen) {
+                            self.stats.deleg_install_released_mark += 1;
+                        }
                         marked = true;
                         st.subtrees.clear();
                     }
@@ -3428,10 +3437,17 @@ impl Core {
                 // `handed_back`, and the release row must still ship).
                 if marked {
                     let to = self.holder_root().unwrap_or(0);
-                    self.dl
+                    let entry = self
+                        .dl
                         .handed_back
                         .entry(st.gen)
                         .or_insert((to, now.wait, true));
+                    // The root may not be known at the first sync after the
+                    // restart: learned at a later one, the entry routes the
+                    // locks to it (`deleg_handed_back_to` knows no root 0).
+                    if entry.0 == 0 {
+                        entry.0 = to;
+                    }
                 }
                 continue;
             }

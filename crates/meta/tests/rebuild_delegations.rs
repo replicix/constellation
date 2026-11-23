@@ -156,6 +156,7 @@ fn released_fixture() -> (Meta, Vec<LogRecord>, u64, u64) {
         Default::default(),
     )
     .unwrap();
+    // The precondition, a plain fact of the store (written with the row).
     assert!(meta.released_whole(gen).unwrap());
     (meta, setup, d, gen)
 }
@@ -191,8 +192,10 @@ fn a_rebuild_that_carries_the_end_clears_the_released_whole_mark() {
 /// WP6.2b (review MUST 5): a rebuild onto a log that does not carry the
 /// holder's release row (still unshipped here) rolls the row back and keeps
 /// the mark: the stream is not live for the holder to execute under, and
-/// the mark outlives the rollback until the log's end. Safe: the root
-/// reclaims the generation at its lapse.
+/// the mark outlives the rollback until the log's end. Safe: the holder
+/// forwards its ops, the root treats that as disowned and recalls again, and
+/// the holder's rowless answer ends the stream (on demand: a non-stealable
+/// stream has no lapse to wait for).
 #[test]
 fn a_rebuild_that_lacks_the_release_row_keeps_the_mark() {
     let (meta, setup, _d, gen) = released_fixture();

@@ -83723,6 +83723,7 @@ mod step5_sticky_release {
     /// A restart: the process state is gone, the store stays.
     fn forget_process_state(h: &mut Harness) {
         h.core.dl.mine.remove(&7);
+        h.core.dl.released_mark_counted.clear();
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
         h.core.dl.handed_back.clear();
@@ -84013,6 +84014,318 @@ mod step5_sticky_release {
             let _ = create_in(&mut h, dir, 1);
             assert!(no_create_journaled(&h), "{kind:?}: executed under it");
         }
+    }
+
+    /// The release note a holder sent to `to` for stream 7 (its batch).
+    fn note_sent(out: &[Action]) -> Option<constellation_meta::locks::ReleaseNote> {
+        release_note_to(out, 1)
+    }
+
+    fn recall_request(h: &mut Harness, dir: constellation_fs_core::Ino) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
+                req: OpId(5),
+                gen: 7,
+                dirs: vec![dir],
+            },
+        })
+    }
+
+    /// WP6.2b (review MUST): a recall of a stream never installed here is
+    /// answered only once its rowless mark is written and synced. A write
+    /// that fails and a sync that fails each answer nothing (no note, no
+    /// `handed_back`, no mark reported) and are counted; the root's repeat
+    /// finds the mark, answers, and the sync came first. Fails when the
+    /// answer goes out without the sync.
+    #[test]
+    fn a_never_installed_recall_sends_no_note_when_its_mark_cannot_be_written_or_synced() {
+        let (mut h, _records, dir) =
+            delegate_learning_a_streamed_grant_of(false, SubtreeKind::Sticky);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.is_empty());
+        // The write fails.
+        h.meta.fail_released_whole_writes_for_tests(1);
+        let out = recall_request(&mut h, dir);
+        assert!(
+            note_sent(&out).is_none(),
+            "answered without a mark: {out:?}"
+        );
+        assert!(h.core.dl.handed_back.is_empty(), "handed back, no mark");
+        assert!(!h.meta.released_whole(7).unwrap());
+        assert_eq!(h.core.stats.released_mark_write_errors, 1);
+        // The sync fails: the mark is committed, and still nothing is said.
+        h.meta.fail_released_whole_syncs_for_tests(1);
+        let out = recall_request(&mut h, dir);
+        assert!(note_sent(&out).is_none(), "answered before the sync");
+        assert!(h.core.dl.handed_back.is_empty());
+        assert_eq!(h.core.stats.released_mark_write_errors, 2);
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen, 0);
+        // The root asks again: the mark is synced, and then the note goes.
+        let syncs = h.meta.sync_count();
+        let out = recall_request(&mut h, dir);
+        assert!(note_sent(&out).is_some(), "not answered: {out:?}");
+        assert!(
+            h.meta.sync_count() > syncs,
+            "the mark was not synced before the note left"
+        );
+        assert!(h.meta.released_whole(7).unwrap());
+        assert!(h.core.dl.handed_back.contains_key(&7));
+        assert_eq!(h.core.stats.deleg_release_rowless_unseen, 1);
+        assert_eq!(h.core.stats.released_mark_write_errors, 2);
+    }
+
+    /// WP6.2b (review SHOULD 1, M10): the root is not always known at the
+    /// first sync after a restart. The seeded hand-back then names no root,
+    /// and routes nothing until the end; learned at a later sync, the entry
+    /// names it. Fails on the parent's `or_insert` alone.
+    #[test]
+    fn a_marked_restart_routes_the_locks_to_a_root_learned_at_a_later_sync() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        logged_release_with_late_grow(&mut h);
+        forget_process_state(&mut h);
+        h.core.lease.cached_holder = None;
+        h.core.lease.last_seen = None;
+        assert_eq!(h.core.holder_root(), None, "the root is known");
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.handed_back.contains_key(&7), "not seeded");
+        assert_eq!(h.core.deleg_handed_back_to(7), None);
+        h.core.lease.cached_holder = Some(1);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert_eq!(h.core.deleg_handed_back_to(7), Some(1));
+        // The mark is counted once for the stream, not per sync.
+        assert_eq!(h.core.stats.deleg_install_released_mark, 1);
+    }
+
+    /// WP6.2b (review SHOULD 5): a recall answered rowless for a stream this
+    /// process never installed, while the node holds unshipped rows of it
+    /// (`delegate_idx > log_stream_idx`: an earlier process executed them),
+    /// then a restart. The note said `no_stream` and asked for the seal. The
+    /// restart installs the stream as a stopped remnant whose pending
+    /// release names the last ordinary row (nothing is executed under it,
+    /// whatever the sync that follows), and the root, which ended the
+    /// generation at the note, refuses the batch that carries the row.
+    #[test]
+    fn a_marked_never_installed_recall_with_unshipped_rows_restarts_as_a_stopped_remnant() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        create_in(&mut h, dirs[0], 1);
+        let rows_before = records(&h).len();
+        let idx = Replica::delegate_idx(&h.meta, 7);
+        assert!(idx > 0 && idx > Replica::log_stream_idx(&h.meta, 7));
+        // A restart whose install is put off (an epoch is active): the
+        // recall finds no state for the stream.
+        forget_process_state(&mut h);
+        h.core.dl.epoch_active = true;
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.dl.mine.contains_key(&7));
+        let out = recall_request(&mut h, dirs[0]);
+        let note = note_sent(&out).expect("not answered");
+        assert!(note.seal && note.no_stream, "{note:?}");
+        assert_eq!(note.end_at, Some(idx));
+        assert!(h.meta.released_whole(7).unwrap());
+        // The next process.
+        forget_process_state(&mut h);
+        h.core.dl.epoch_active = false;
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = h
+            .core
+            .dl
+            .mine
+            .get(&7)
+            .expect("the remnant was not installed");
+        assert!(d.stopped && d.dirs.is_empty(), "{:?}", d.dirs);
+        assert_eq!(d.release.as_ref().and_then(|r| r.row), Some(idx));
+        create_in(&mut h, dirs[0], 2);
+        assert_eq!(records(&h).len(), rows_before, "an op executed under it");
+        // The root, which took the note (the cut is the row this node holds):
+        // the remnant's row is within the cut and is appended as any row of
+        // the generation (the remnant's pending release only counts it
+        // acknowledged); a row past the cut is refused or never appended.
+        let (mut r, d1) = root_with_dir();
+        control_delegate(&mut r, 60, d1, 3, true);
+        let gen = sticky_gen_of(&r, d1);
+        let note = constellation_meta::locks::ReleaseNote {
+            dirs: vec![d1],
+            ..note
+        };
+        deliver_stream(&mut r, 3, gen, Vec::new(), Some(note));
+        let (_, rec) = mkdir(&r, "x");
+        let out = deliver_stream(&mut r, 3, gen, vec![delegate_tx(1, vec![rec])], None);
+        let ack = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegateStreamAck {
+                    refused, through, ..
+                } if to == 3 => Some((*refused, *through)),
+                _ => None,
+            })
+        };
+        assert_eq!(ack(&out), Some((false, 1)), "{out:?}");
+        let (_, rec) = mkdir(&r, "y");
+        let out = deliver_stream(&mut r, 3, gen, vec![delegate_tx(2, vec![rec])], None);
+        assert!(
+            ack(&out).is_none_or(|(refused, through)| refused || through < 2),
+            "the root took a row past the cut: {out:?}"
+        );
+    }
+
+    /// WP6.2b (M8, ADR-61): a leave that waits for the end of a stream whose
+    /// whole release is marked completes: the end the root's log carries
+    /// clears the mark, the table lists no stream of the node, and the
+    /// leave is answered.
+    #[test]
+    fn a_leave_after_a_whole_release_completes_when_the_end_clears_the_mark() {
+        use crate::core::StickyEnd as E;
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        let mut outs = out;
+        for _ in 0..10 {
+            if h.core.stats.sticky_ended[E::Leave.index()] > 0 {
+                break;
+            }
+            if let Some(id) = h.core.dl.leave_timer {
+                h.advance(600);
+                outs.extend(h.step(Event::Timer { id }));
+            }
+        }
+        assert!(h.core.stats.sticky_ended[E::Leave.index()] > 0, "{outs:?}");
+        assert!(last_is_release(&h));
+        let row = Replica::delegate_idx(&h.meta, 7);
+        assert!(h.meta.released_whole(7).unwrap(), "no mark with the row");
+        assert!(answer(&outs, 77).is_none(), "answered before the end");
+        // The root has heard that the node leaves.
+        let note_req = sends(&outs).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::DelegateStream {
+                req,
+                gen: 0,
+                released: Some(r),
+                ..
+            } if n == 1 && r.leaving => Some(*req),
+            _ => None,
+        });
+        let note_req = note_req.expect("no leave note");
+        let more = drain_stream(&mut h, outs);
+        assert!(answer(&more, 77).is_none());
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegateStreamAck {
+                req: note_req,
+                gen: 0,
+                round: 0,
+                through: 0,
+                committed: 0,
+                refused: false,
+                archive_bound: false,
+            },
+        });
+        // The root's segment appends the row and ends the stream.
+        let seq = Replica::applied_seq(&h.meta).unwrap_or(0) + 1;
+        Replica::apply_segment(
+            &h.meta,
+            seq,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: row,
+            }],
+        )
+        .unwrap();
+        assert!(!h.meta.released_whole(7).unwrap(), "the end left the mark");
+        let mut done = Vec::new();
+        for _ in 0..10 {
+            if let Some(id) = h.core.dl.leave_timer {
+                h.advance(600);
+                done.extend(h.step(Event::Timer { id }));
+            }
+            if answer(&done, 77).is_some() {
+                break;
+            }
+        }
+        let a = answer(&done, 77).unwrap_or_else(|| panic!("the leave never completed: {done:?}"));
+        assert!(a.is_ok(), "{a:?}");
+    }
+
+    /// WP6.2b (documentation of the benign case, spec "not a gap"): a cut of
+    /// every subtree the stream held, a grow the cut did not see, and a
+    /// restart before the release row. The cut lists its subtrees (it has no
+    /// "whole" form), so the release row it leads to is a `SubtreeReleased`
+    /// of those, never a `StreamReleased`: it writes no mark, and the grown
+    /// subtree is the stream's still in the log's fold too, so the restarted
+    /// holder honours it (after the quarantine) and what it executes under
+    /// it is no row past a cut. Nothing executes under the released one.
+    #[test]
+    fn a_cut_with_a_late_grow_and_a_restart_keeps_the_grown_subtree_and_marks_nothing() {
+        let (mut h, dirs) = holder_with_a_grant(SubtreeKind::Sticky);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(
+            matches!(
+                rows(&h).last().unwrap().records.as_slice(),
+                [LogRecord::ReleaseCut { gen: 7, .. }]
+            ),
+            "{:?}",
+            rows(&h)
+        );
+        let b = late_grow(&mut h, "b", 3);
+        let live = h.meta.read_delegations().all_live(h.clk().wait);
+        for g in live.grants {
+            h.meta.read_delegations().forget(g.id);
+        }
+        h.advance(2_000);
+        let cfg = h.core.cfg.clone();
+        h.core = Core::new(cfg);
+        let mut out = Vec::new();
+        h.core.start(h.clk(), &h.meta, &mut out);
+        h.core.lease.cached_holder = Some(1);
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = &h.core.dl.mine[&7];
+        assert!(!d.remnant && d.restart_q.is_some());
+        assert!(
+            d.dirs.contains(&b) && !d.dirs.contains(&dirs[0]),
+            "{:?}",
+            d.dirs
+        );
+        assert!(!has_release_row(&h));
+        // Inside the quarantine nothing executes.
+        create_in(&mut h, b, 1);
+        assert!(no_create_journaled(&h), "executed inside the quarantine");
+        let id = restart_timer(&h);
+        let until = h.core.dl.mine[&7].restart_q.as_ref().unwrap().until;
+        h.advance(until.since(h.clk().wait) as u64);
+        h.step(Event::Timer { id });
+        // The release row is of the cut subtree alone: no mark, no whole
+        // release, and the grown subtree is still the stream's.
+        assert!(
+            records(&h)
+                .iter()
+                .any(|r| matches!(r, LogRecord::SubtreeReleased { dir, .. } if *dir == dirs[0])),
+            "{:?}",
+            records(&h)
+        );
+        assert!(!records(&h)
+            .iter()
+            .any(|r| matches!(r, LogRecord::StreamReleased { .. })));
+        assert!(!h.meta.released_whole(7).unwrap());
+        assert!(h.core.dl.mine[&7].dirs.contains(&b));
+        // Nothing executes under the released subtree past its release row.
+        let creates = |h: &Harness| {
+            records(h)
+                .iter()
+                .filter(|r| matches!(r, LogRecord::Create { parent, .. } if *parent == dirs[0]))
+                .count()
+        };
+        create_in(&mut h, dirs[0], 2);
+        assert_eq!(creates(&h), 0, "executed under the released subtree");
     }
 
     /// WP6.2 guard (passes before the fix as well): while the holder's
