@@ -7158,3 +7158,112 @@ mod view_tests {
         assert!(!view.merge_shipped(keys.iter(), &merge(20)));
     }
 }
+
+/// The shipper's origin guard ([`Meta::check_shippable_origins`]) runs on
+/// every segment build. Its cost must be the batch's, not the shipped
+/// history's: each shipped delegate row leaves a `journal_origin` tombstone
+/// until compaction, and a read from that keyspace's start steps over all
+/// of them.
+#[cfg(test)]
+mod ship_origin_check_cost_tests {
+    use super::*;
+    use crate::session::Position;
+    use crate::MetaStore;
+    use constellation_fs_core::types::ROOT_INO;
+    use std::time::{Duration, Instant};
+
+    const GEN: u64 = 11;
+
+    /// A root's append of delegate `GEN`'s transaction `idx`, one record.
+    fn append(meta: &Meta, idx: u64) {
+        let rec = LogRecord::Create {
+            parent: (2 << 40) | 1,
+            name: format!("c{idx}"),
+            ino: (2 << 40) | (idx + 1),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 5,
+        };
+        meta.apply_delegate_tx(&[rec], None, GEN, idx, Position::ZERO)
+            .unwrap();
+    }
+
+    /// Ships the whole journal head (its rows leave, their origin keys
+    /// become tombstones).
+    fn ship_all(meta: &Meta, seg: &mut u64) {
+        let seqs: Vec<u64> = meta
+            .take_journal(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        *seg += 1;
+        meta.ack_journal_rows_at(&seqs, *seg).unwrap();
+    }
+
+    /// The median time of the guard over a one-transaction delegate batch.
+    fn guard_cost(meta: &Meta, idx: u64, seg: &mut u64) -> Duration {
+        append(meta, idx);
+        let batch = meta.take_journal(usize::MAX).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            meta.journal_origins(&[batch[0].0]).unwrap(),
+            vec![(GEN, idx)]
+        );
+        let mut t: Vec<Duration> = (0..31)
+            .map(|_| {
+                let at = Instant::now();
+                meta.check_shippable_origins(&batch).unwrap();
+                at.elapsed()
+            })
+            .collect();
+        t.sort_unstable();
+        ship_all(meta, seg);
+        t[t.len() / 2]
+    }
+
+    /// Many thousand shipped delegate rows later the guard costs what it
+    /// did after a few hundred (it read `journal_origin` from its start: on
+    /// a root appending a delegate's stream the segment build grew from
+    /// about 70 to 800 us over a run). Medians, with a wide margin: the
+    /// history grows 40-fold, a scan of it costs tens of times more.
+    #[test]
+    fn the_ship_origin_guard_costs_the_batch_not_the_shipped_history() {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.apply_segment(
+            1,
+            1,
+            &[LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "c".into(),
+                ino: (2 << 40) | 1,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+            &TouchSet::default(),
+        )
+        .unwrap();
+        let (mut seg, mut idx) = (1, 0);
+        let churn = |n: u64, seg: &mut u64, idx: &mut u64| {
+            for _ in 0..n {
+                *idx += 1;
+                append(&meta, *idx);
+                ship_all(&meta, seg);
+            }
+        };
+        churn(500, &mut seg, &mut idx);
+        idx += 1;
+        let early = guard_cost(&meta, idx, &mut seg);
+        churn(20_000, &mut seg, &mut idx);
+        idx += 1;
+        let late = guard_cost(&meta, idx, &mut seg);
+        assert!(
+            late <= early * 4 + Duration::from_micros(300),
+            "the guard's cost grew with the shipped history: {early:?} after 500 rows, \
+             {late:?} after 20,500"
+        );
+    }
+}
