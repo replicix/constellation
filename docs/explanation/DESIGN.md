@@ -1099,6 +1099,9 @@ a grant goes to a *node* and covers a set of subtrees under one stream:
   (`DelegationTable`, one `NodeStream` per `(node, gen)` with an index from
   each subtree's directory) is these records applied in log order; a commit
   carries it and a bootstrapped replica learns it from the head commit. A
+  node's leave is a record too, `NodeLeaving { node, req, leaving }` (a row
+  of its own beside the table, not part of it; the latest row in log order
+  wins, and every root reads it before it grants). A
   stream whose set is empty stays live until the root ends it. A stream never
   mixes grant kinds: it holds stealable grants (`Placed`, or a manual
   delegation) only, or sticky grants only, or designations only.
@@ -1279,7 +1282,10 @@ a grant goes to a *node* and covers a set of subtrees under one stream:
   ([ADR-60](DECISIONS.md#adr-60-a-claim-of-the-lease-by-a-non-stealable-holder-is-its-release-and-ends-its-stream-after-the-streams-rows)).
   A node leaves the roster only after the log has ended every grant it holds:
   its own leave releases and waits for the root's end of the stream, and an
-  admin leave of a gone sticky holder is refused until `repair abandon`
+  admin leave of a gone sticky holder is refused until `repair abandon`. The
+  leave is the `NodeLeaving` log row: a root refuses grants to the node the row
+  lists, a successor included, and a leaving node is answered only once its row
+  is durable
   ([ADR-61](DECISIONS.md#adr-61-a-node-leaves-the-roster-only-after-the-log-has-ended-every-grant-it-holds)).
 - **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
   clock stamps (a peer's stamp more than `CONSTELLATION_HLC_SKEW_TOLERANCE_S`

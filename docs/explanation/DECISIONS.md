@@ -6046,10 +6046,14 @@ fixes where it was short.
 
 **Context**: the roster-only singleton test ([ADR-50](#adr-50-a-root-answers-alone-only-when-one-roster-object-lists-no-write-eligible-peer))
 counts a generation of another node that has not ended
-(`Core::singleton_now`). A node retired from the roster while the log still
-lists a live generation of it is read as no peer, so the root would answer
-alone while a holder it does not count writes. The model's property is
-`no_live_grant_off_roster` (`Leave` is enabled only once the root's
+(`Core::singleton_now`), whatever the roster says (since ADR-50 and plan 46
+M1.3 step 14, a node off the roster is still counted while the log lists a live
+generation of it). What the invariant protects is the subtree that a live
+generation of a node that is gone keeps: a sticky or designated stream has no
+expiry and is no one's to steal, so the subtree is unavailable until `repair
+abandon --node N --force`, and the root stays non-singleton for good. It is
+also the guard should that count ever be narrowed to the roster. The model's
+property is `no_live_grant_off_roster` (`Leave` is enabled only once the root's
 `DelegateNodeEnded` shows).
 
 **Decision**:
@@ -6112,6 +6116,59 @@ alone while a holder it does not count writes. The model's property is
   the leave aborts (`leave_self_abort`), the node takes grants again and tells
   the root. That is the intended behaviour: load may cost a leave its
   latency, never integrity. The operator runs the leave again.
+- **The leave is a log row** (`NodeLeaving`, WP6.3). A root marks a leaving
+  node by journaling it and acknowledges the note only once the row is
+  durable; every un-mark (the node's take-back, the lapse, the node's return
+  under a new incarnation, an operator's failed leave, a root's own aborted
+  leave) is a `leaving: false` row; every root, a successor included, refuses grants to a node the
+  row lists. A holder with no root to tell takes a released lease itself
+  (never a live one, never in an epoch) and answers as root once its own row is
+  durable. Why a row: a mark in a root's memory dies with its tenure. A root
+  acknowledged a leave note from memory, idled the lease away, and the
+  successor (the sim's sticky idle driver, production placement) granted the
+  node a sticky subtree that the node was retired with: `no_live_grant_off_roster`
+  on `sticky-s4-leave` (15 of 2,000 seeds with the idle release on) and
+  `sticky-leave` (1). No acknowledged write was lost and two holders never
+  existed (a leaving node installs no grant); the cost is availability of the
+  subtree and the root's singleton count, an integrity-latent defect. Only the
+  node's own take-back ends the request it is for (it writes `false(R)` with
+  the request itself and raises the take-back floor, so a delayed note of `R` is
+  stale for good). The lapse and the incarnation return are not the node's
+  word: they raise nothing and write a `false` row below every request the leave
+  can still send (the lapse: the node's own take-back floor, 0 if none, capped
+  below the mark's request, which is the highest seen and may be a release
+  note's, above the note's own). The incarnation return is the other kind: it
+  ends the leave of a dead incarnation, and writes `false(mark.req)` itself,
+  so a delayed note of that incarnation stays stale and marks nothing, while
+  every request of the new incarnation is above it. The lapse writes below
+  every request because the leaving node sends the same
+  request with every note, and a note found stale marks nothing, so the node
+  would stay un-marked for the rest of its leave while counting it told (the sim's retire delay is shorter than the lapse and does
+  not see it; `AUTHORITY_SIM_LEAVE_SUSPEND_MS` does). A node's own row, as a
+  root running its own leave, carries an `op_id()` like a note, never the
+  driver's control id (those start at `1 << 48`, above every request of an
+  incarnation: a row taken back at one made every later note of the node
+  stale on every other root). A leaving node forgets that its leave is told
+  when its own lag is seen, so it counts it told again only on the ack of a
+  root that has the mark durable. The node's own note that came under an
+  operator's mark is kept, and the mark falls back to it when the operator's
+  leave fails. A root's abort whose take-back row did not journal keeps it
+  and journals it again at its next look. The lapse reads the log's rows for a
+  sender it has no mark of at most once per resend interval. A note that marks nothing
+  is refused, not acknowledged, and the lapse clocks restart when the root's own
+  lag ends or it is usable again: its deaf time is not the leaver's silence. An
+  incarnation return un-marks only a mark or row of an earlier incarnation. The
+  lapse of a mark is a message: a node heard, with no leaving note, a whole
+  `leave_note_lapse` window after its last note (or after the tenure first saw
+  its row) is not leaving and its row is taken back. A suspended node's
+  self-leave, or one during a continuation epoch, takes no lease: it fails at
+  its deadline with "run the leave again". The `NodeLeaving { true }` row of a
+  node that retired stays in the log for good. The sim's knob
+  `AUTHORITY_SIM_RETIRE_DELAY_MS` keeps the node up after its leave, so a
+  successor can grant in the window the row closes; the pin
+  `a_delayed_retirement_does_not_outlive_a_successors_grant` fails without it.
+  This supersedes the "lease released: answered without a root" shortcut of
+  plan 46 M1.2's harness triage (see PROGRESS.md).
 - **The sim** drives leaves (`FaultKind::LeaveNode`; configurations
   `sticky-leave`, `sticky-leave-admin`, `sticky-leave-root`,
   `sticky-leave-root-self`: a root's own leave while it holds its own sticky

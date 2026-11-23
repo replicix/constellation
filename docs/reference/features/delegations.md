@@ -1020,7 +1020,38 @@ every grant it holds
   root carries a frozen continuation epoch no node can take over: a member
   of the epoch runs the leave first, which fences the root's leases and
   leaves the epoch without retiring it (it answers "fenced, not retired
-  yet"), and the leave is then run on the root that takes over.
+  yet"), and the leave is then run on the root that takes over;
+- the leave is a log row (`NodeLeaving`, WP6.3). A root marks a leaving node
+  by journaling `NodeLeaving { node, req, leaving: true }` and acknowledges
+  the node's note only once that row is durable and it lists no live
+  generation of the node. Every undoing is a `leaving: false` row: the node's
+  take-back, an operator's leave that fails, a root's own aborted leave, the
+  node's return under a newer incarnation, and the lapse (a node heard
+  after a whole `leave_note_lapse` window with no note of its leave: a
+  message that is no leaving note; being heard once and then silent never
+  lapses it, and an operator's mark never does). Every root, a successor
+  included, refuses a grant (the operator's, the placement's, a handover's, a
+  designation's) to a node whose latest row says it leaves. A delayed
+  leaving note older than a take-back row is stale on every root and is
+  refused, not acknowledged. Only the node's own take-back writes `false` with
+  its request and makes that request stale; the lapse writes `false` below
+  every request the leave can still send (the node's take-back floor, 0 if
+  none), so the node's next note of the same request marks it again; the
+  incarnation return ends the leave of a dead incarnation and writes
+  `false(mark.req)`, so a delayed note of that incarnation stays stale. The
+  row of a node's own leave as the root carries an `op_id()`, like a note's
+  request, never the driver's control id. A root's abort whose take-back row
+  did not journal journals it again at the next look, and an operator's
+  failed leave falls back to the node's own note when one came under it;
+- a node with no root to tell (the lease it read is released or held by
+  nobody) takes the released lease itself, with a `leave-acquire`
+  acquisition, and answers as the root once its own row is durable. The
+  acquisition never asks a live holder to hand the lease over, never takes an
+  expired lease that was not released, and does not run in a continuation
+  epoch; it is queued at most once per `leave_resend` (`stats.leave_acquires`).
+  A suspended node's self-leave, or one during a continuation epoch, fails at
+  its deadline with "run the leave again". The `NodeLeaving { true }` row of a
+  node that retired stays in the log for good.
 
 A designee answers its rows at once, and its commits reach the OS, not
 the disk, so a power loss can drop the end of its journal. Nothing ends
