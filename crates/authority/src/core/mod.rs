@@ -1277,6 +1277,19 @@ pub struct Stats {
     /// restart found with its whole-release row still in the journal
     /// (installed as the remnant of that release, with no subtree).
     pub deleg_install_released_whole: u64,
+    /// Delegate, WP6.2b: streams a restart found with the durable
+    /// released-whole mark (taken up as the remnant of the release, a grow
+    /// since the release not honoured).
+    pub deleg_install_released_mark: u64,
+    /// Delegate, WP6.2b: reads of that mark that failed (the stream is not
+    /// installed now and the sync retries).
+    pub released_mark_read_errors: u64,
+    /// Delegate, WP6.2b: writes of that mark (a recall answered rowless for
+    /// a stream never installed) that failed; the recall is asked again.
+    pub released_mark_write_errors: u64,
+    /// Delegate, WP6.2b, debug builds: a stream with its whole-release row
+    /// in the journal and no mark (a bug; the sim asserts zero).
+    pub released_mark_missing: u64,
     /// Delegate: installs put off because the grant's `DelegateNode` record
     /// is not committed yet (plan 46 M1.2 step 8b).
     pub deleg_install_waits_commit: u64,

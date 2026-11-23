@@ -1331,6 +1331,28 @@ impl Meta {
         Ok(out)
     }
 
+    /// WP6.2b: this node released its own stream `gen` whole and the log
+    /// has not ended it yet (the node-local mark). `Err`: unreadable; the
+    /// caller fails closed.
+    pub fn released_whole(&self, gen: u64) -> Result<bool, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        self.take_released_mark_fault()?;
+        let r = self.db.read_tx();
+        released_whole_tx(&r, &self.local, gen)
+    }
+
+    /// WP6.2b (review MUST 6): mark the generation released whole without a
+    /// release row, in a transaction of its own: a recall answered rowless
+    /// for a stream this process never installed, whose hand-back would
+    /// otherwise live in memory only. Cleared by the log's end as the row's
+    /// mark is. The caller answers the recall only once this has committed.
+    pub fn mark_released_whole(&self, gen: u64) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        mark_released_whole_tx(&mut tx, &self.local, gen);
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Plan 46 M1.3 step 15b (ADR-64): the subtrees this node's stream `gen`
     /// cut and has not released (empty: none). Node-local; the holder's own
     /// view of what it stopped executing in. Fails closed: a key that cannot
@@ -1594,6 +1616,11 @@ impl Meta {
         // generation the takeover gate ended: `set_release` refuses anything
         // but release records, before a row.
         let _d = journal::PendingDelegate::set_release(gen, deps, records)?;
+        // WP6.2b: a whole release marks the stream in this transaction.
+        let _w = records
+            .iter()
+            .any(|r| matches!(r, LogRecord::StreamReleased { .. }))
+            .then(|| journal::PendingOwnRelease::set(gen));
         self.apply_records_journaled_inner(records, None, Journaled::Plain)?;
         self.delegate_idx(gen)
     }
@@ -3980,6 +4007,97 @@ mod root_substitution_tests {
         assert_eq!(meta.take_deleg_exec_in_cut(), 0);
     }
 
+    fn whole_release(gen: u64) -> LogRecord {
+        LogRecord::StreamReleased {
+            node: 1,
+            gen,
+            through: 3,
+        }
+    }
+
+    fn stream_end(gen: u64) -> LogRecord {
+        LogRecord::DelegateNodeEnded {
+            node: 1,
+            gen,
+            through: 3,
+        }
+    }
+
+    /// WP6.2b: the holder's own `StreamReleased`, journaled, writes the
+    /// released-whole mark in its transaction; a cut, a `SubtreeReleased`,
+    /// and every other replica's apply of the row write none.
+    #[test]
+    fn a_whole_release_writes_the_released_whole_mark_with_its_row() {
+        let (meta, d, e) = cut_fixture();
+        assert!(!meta.released_whole(5).unwrap());
+        meta.delegate_cut(1, 5, &[e], 1, Default::default())
+            .unwrap();
+        meta.delegate_release(
+            &[LogRecord::SubtreeReleased {
+                node: 1,
+                gen: 5,
+                dir: d,
+                at: 0,
+            }],
+            5,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(!meta.released_whole(5).unwrap(), "a cut or a part marks");
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        assert!(meta.released_whole(5).unwrap());
+        // Another replica: the log's apply of the row writes no mark.
+        let (other, _, _) = cut_fixture();
+        other.apply_records(&[whole_release(5)]).unwrap();
+        assert!(!other.released_whole(5).unwrap());
+        // The root's own journaling of a row naming the generation neither.
+        let (root, _, _) = cut_fixture();
+        root.apply_records_journaled(&[whole_release(5)]).unwrap();
+        assert!(!root.released_whole(5).unwrap());
+    }
+
+    /// WP6.2b (review MUST 1, 2): the mark is cleared where the log's
+    /// segment ends the stream, also for an end the root's stream installed
+    /// first (its row is skipped by the segment), and never by a journal-time
+    /// end or a streamed-ahead one, either of which may strand.
+    #[test]
+    fn the_mark_is_cleared_by_the_logs_end_and_not_by_an_end_that_may_strand() {
+        // A journal-time end (a root's own, not yet shipped).
+        let (meta, _, _) = cut_fixture();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        meta.apply_records_journaled(&[stream_end(5)]).unwrap();
+        assert!(
+            meta.released_whole(5).unwrap(),
+            "a journal-time end cleared the mark"
+        );
+        // A streamed-ahead end.
+        let (meta, _, _) = cut_fixture();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        let end = [stream_end(5)];
+        meta.install_streamed(1, 1, 1, 1, &end).unwrap();
+        assert!(
+            meta.released_whole(5).unwrap(),
+            "a streamed end cleared the mark"
+        );
+        // ... and its segment, which skips the confirmed row, clears it.
+        meta.apply_segment_rows(1, 1, 1, &[1], &[(0, 0)], &end, &TouchSet::default())
+            .unwrap();
+        assert!(
+            !meta.released_whole(5).unwrap(),
+            "the segment's end left the mark"
+        );
+        // A plain segment end.
+        let (meta, _, _) = cut_fixture();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        meta.apply_segment(1, 1, &[stream_end(5)], &TouchSet::default())
+            .unwrap();
+        assert!(!meta.released_whole(5).unwrap());
+    }
+
     /// ADR-64: no cut is journaled on a generation the takeover gate ended
     /// (such a stream releases rowless): the store fence refuses it with
     /// nothing written, and the node-local key is not set.
@@ -4275,6 +4393,46 @@ pub(crate) fn mark_own_cut_tx(
     meta.own_cut_any.store(true, Ordering::Release);
     put_own_cut_tx(tx, &meta.local, gen, &set);
     Ok(())
+}
+
+/// `local` kv (WP6.2b, ADR-64 amendment): this node released its own stream
+/// `gen` whole. Written in the transaction of its own `StreamReleased` row
+/// ([`Meta::delegate_release`]); cleared by the durable apply of the
+/// stream's `DelegateNodeEnded`. A restart reads it instead of the lost
+/// in-memory hand-back: the stream is taken up as the remnant of its
+/// release, never with a subtree a later grow added.
+pub(crate) const DELEG_RELEASED_WHOLE_PREFIX: &str = "deleg_released_whole:";
+
+fn deleg_released_whole_key(gen: u64) -> String {
+    format!("{DELEG_RELEASED_WHOLE_PREFIX}{gen}")
+}
+
+pub(crate) fn mark_released_whole_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) {
+    kv_set_tx(tx, local, &deleg_released_whole_key(gen), "1");
+}
+
+pub(crate) fn clear_released_whole_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) -> Result<(), MetaError> {
+    let key = deleg_released_whole_key(gen);
+    if kv_get_tx(&*tx, local, &key)?.is_some() {
+        tx.remove(local, key.into_bytes());
+    }
+    Ok(())
+}
+
+pub(crate) fn released_whole_tx(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) -> Result<bool, MetaError> {
+    Ok(kv_get_tx(r, local, &deleg_released_whole_key(gen))?.is_some())
 }
 
 /// The apply of stream `gen`'s release row: `dir` (`None`: every subtree)

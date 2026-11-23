@@ -743,7 +743,13 @@ what it observed of it to the cut, and keeps the cut (`deleg_void_cut`, a
 node-local key written with the record) so that a restart seeds the same
 cut. A root that journaled the record and is deposed before it ships drops
 the kept cut with the stranded row, since the log never carries that
-record. A delegate that applies the record ends the generation here, and the
+record. A holder that released its stream whole keeps a node-local key,
+`deleg_released_whole`, written in the transaction of its own `StreamReleased`
+row (or, for a recall answered rowless for a stream it never installed, in a
+transaction of its own before the answer) and cleared where the log's segment
+ends the generation: a restart that finds it takes the stream up as the
+remnant of its release and never with a subtree a later grow added. A delegate
+that applies the record ends the generation here, and the
 acknowledgements it parked for a row past the cut are aborted (`Busy`: the
 requester retries by rid at the generation's new owner); a park at or below
 the cut releases once the log's index of the generation reaches it — the

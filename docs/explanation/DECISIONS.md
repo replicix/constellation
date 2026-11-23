@@ -6642,17 +6642,51 @@ executed, so the cut is a row.
     (`DelegationTable::gens`, as `release_first` and `installed_gens`
     already are). Lock requests for the generation go to the root until its
     end is applied, as the field's contract always said. A restart loses the
-    entry: a generation whose subtrees the table lists, whose release row is
-    still in this node's journal unshipped, is installed as the remnant of
-    that release (stopped, holding the row, no subtree); a journal that
-    cannot be read installs nothing for it now and syncs again. **Open
-    (WP6.2b):** this restart guard lasts only while the release row is in
-    the journal. Once the row has shipped and been applied, the holder's own
-    table still lists the grown subtrees until the root's end is applied
-    (the holder's own rows are not re-folded when a segment is applied), so
-    the window "release row applied, end not yet, the holder restarts" is
-    open. It is tracked as WP6.2b (a durable released-whole mark), not
-    closed here.
+    entry, and the table here can list the grown subtrees until the log's
+    end is applied (the holder's own rows are not re-folded when a segment
+    is applied, so its table differs from every other replica's from the
+    segment that carries the grow until the one that carries the end).
+    **WP6.2b, the durable released-whole mark:** the holder's own
+    journal-time apply of `StreamReleased` writes the node-local key
+    `deleg_released_whole:<gen>` in the row's transaction (`Meta::delegate_release`
+    sets a thread-local, as the own-cut key's, so it is written only by the
+    holder's own journaling and never by a root's append or a replica's apply
+    of the row). A restart reads it in place of the earlier guard's journal
+    scan: a marked stream, not installed, is the remnant of its release (no
+    subtree), installed stopped holding the row if the row is still to ship,
+    and otherwise not installed and handed back in memory (lock requests go
+    to the root). A mark that cannot be read installs nothing for the stream
+    now and syncs again (a counter of its own, not the journal read's). The
+    mark is cleared only where the log's segment ends the stream (`apply_segment`'s
+    end loop, which also runs for an end the root's stream installed first and
+    the segment skips, and its orphan ends; the rebuild clears the marks of
+    generations the rebuilt log ended). Never at a journal-time end or a
+    streamed-ahead one, either of which can strand and leave the stream live
+    under a successor, with the grown subtrees: the case that needs the mark
+    without a restart (the end streamed ahead drops the stream from the
+    table, the process forgets its hand-back, the end strands). A recall
+    answered rowless for a stream never installed here writes the mark in a
+    local transaction before it answers (its hand-back was memory only; the
+    test `a_restart_after_a_never_installed_recall_does_not_take_the_grant_up`
+    was red without it). The other rowless releases write none: their causes
+    are durable (a generation the takeover gate ended, a reboot, a remnant)
+    and the restart installs those stopped. Evidence:
+    `a_restart_after_the_release_row_is_logged_does_not_take_the_grown_subtree_up`
+    (red on the parent: the grown subtree honoured after the restart, the
+    stream answering rows past the root's cut). Generation numbers carry
+    their minting epoch (`epoch << 32 | n`) and a grant number is not
+    minted twice for the log, so a stale mark (a stream the log never ends
+    here) is read only for a stream the table lists and never installs a
+    different grant. A deferred remnant (an epoch active, a commit wait) is
+    not handed back: the install gate reads `handed_back`, and its release
+    row must still ship. **Follow-up (recorded, not cosmetic):** the holder's
+    table still diverges from the log's fold until the end; its routing
+    (the hand-back above) and the table it carries into a takeover read
+    it. The cheaper variant is to skip the table's add of a grow while the
+    generation's mark is set, which equals the log's fold and stays off the
+    segment apply's hot path; re-folding the holder's rows on segment apply
+    was rejected as the fix (it needs the journal scan for the window before
+    the row is logged).
   - *Root.* No new code. A grow is refused once the root knows of a release or
     a recall (`delegate_dir` on `g.recall`), and appending a whole release
     sets the recall to `Drained`, so no grow follows `StreamReleased` in the

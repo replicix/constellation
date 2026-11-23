@@ -476,6 +476,12 @@ pub trait Replica {
     /// ADR-64: the subtrees this node's own stream `gen` cut and has not
     /// released (node-local; empty for none).
     fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino>;
+    /// WP6.2b: this node released its own stream `gen` whole and the log
+    /// has not ended it (node-local, durable). `Err`: unreadable.
+    fn deleg_released_whole(&self, gen: u64) -> Result<bool, MetaError>;
+    /// WP6.2b: mark own stream `gen` released whole without a release row
+    /// (a recall answered rowless for a stream never installed here).
+    fn mark_deleg_released_whole(&self, gen: u64) -> Result<(), MetaError>;
     /// ADR-64: the raw fold of the table, this node's own cut subtrees
     /// still listed as its stream's (the holder's re-drive reads it).
     fn delegation_table_folded(&self) -> DelegationTable;
@@ -1704,6 +1710,14 @@ impl Replica for Meta {
 
     fn own_cut_dirs(&self, gen: u64) -> std::collections::BTreeSet<Ino> {
         Meta::own_cut_dirs(self, gen)
+    }
+
+    fn deleg_released_whole(&self, gen: u64) -> Result<bool, MetaError> {
+        Meta::released_whole(self, gen)
+    }
+
+    fn mark_deleg_released_whole(&self, gen: u64) -> Result<(), MetaError> {
+        Meta::mark_released_whole(self, gen)
     }
 
     fn delegation_table_folded(&self) -> DelegationTable {

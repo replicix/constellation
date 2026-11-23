@@ -6499,6 +6499,7 @@ impl Meta {
         for (gen, through) in &ends {
             local::bump_void_cut_tx(&mut tx, &self.local, *gen, *through)?;
             self.release_ended_gen_tx(&mut tx, *gen)?;
+            local::clear_released_whole_tx(&mut tx, &self.local, *gen)?;
         }
         // ADR-43: a generation whose grant the segment proves will never be
         // in the log (an abandon, or a takeover that carries no tail) is
@@ -6516,6 +6517,7 @@ impl Meta {
         for gen in &orphaned {
             let cut = local::bump_void_cut_at_log_idx_tx(&mut tx, &self.local, *gen)?;
             self.release_ended_gen_tx(&mut tx, *gen)?;
+            local::clear_released_whole_tx(&mut tx, &self.local, *gen)?;
             orphan_cuts.push((*gen, cut));
         }
         let recalled: HashSet<u64> = recalled.iter().chain(orphaned.iter()).copied().collect();
@@ -7855,12 +7857,14 @@ impl Meta {
             }
             let cut = local::bump_void_cut_at_log_idx_tx(tx, &self.local, *gen)?;
             self.release_ended_gen_tx(tx, *gen)?;
+            local::clear_released_whole_tx(tx, &self.local, *gen)?;
             orphan_cuts.push((*gen, cut));
         }
         if !orphaned.is_empty() {
             for gen in &orphaned {
                 let cut = local::bump_void_cut_at_log_idx_tx(tx, &self.local, *gen)?;
                 self.release_ended_gen_tx(tx, *gen)?;
+                local::clear_released_whole_tx(tx, &self.local, *gen)?;
                 orphan_cuts.push((*gen, cut));
                 // Never executed in again (`Meta::begin_local`).
                 local::mark_deleg_ended_at_gate_tx(tx, &self.local, *gen);

@@ -675,6 +675,11 @@ pub struct Meta {
     /// thread: the release guard reads the journal on a spawned task.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) journal_read_faults: std::sync::atomic::AtomicU32,
+    /// Tests only (`test-util`): how many of this store's next
+    /// [`Meta::released_whole`] reads fail with an I/O error
+    /// ([`Meta::fail_released_whole_reads_for_tests`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) released_mark_faults: std::sync::atomic::AtomicU32,
     /// Unit tests of the tree publisher only: publish `ns` as it stands
     /// though this node's unshipped journal holds uncaptured writes
     /// (`Meta::publish_basis_at`). Never set by the daemon.
@@ -1547,6 +1552,8 @@ impl Meta {
             drop_plan_read_warned: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             journal_read_faults: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            released_mark_faults: std::sync::atomic::AtomicU32::new(0),
             publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             own_cut_any: AtomicBool::new(false),

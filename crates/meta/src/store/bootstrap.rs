@@ -761,6 +761,8 @@ impl Meta {
                         .and_then(|g| g.parse::<u64>().ok())
                     {
                         self.release_ended_gen_tx(&mut tx, gen)?;
+                        // WP6.2b: the rebuilt log ended it; its mark goes.
+                        crate::store::local::clear_released_whole_tx(&mut tx, &self.local, gen)?;
                     }
                 }
             }

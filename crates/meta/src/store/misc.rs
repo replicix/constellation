@@ -264,6 +264,27 @@ impl Meta {
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Tests only (`test-util`): fail this store's next `n` reads of
+    /// [`Meta::released_whole`] with an I/O error.
+    pub fn fail_released_whole_reads_for_tests(&self, n: u32) {
+        self.released_mark_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_released_mark_fault(&self) -> Result<(), MetaError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let took = self
+            .released_mark_faults
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if took {
+            return Err(MetaError::Io(std::io::Error::other(
+                "injected released-whole read fault (testing only)",
+            )));
+        }
+        Ok(())
+    }
+
     /// The hook's check: consume one injected fault, if any is left.
     pub(crate) fn take_journal_read_fault(&self) -> Result<(), MetaError> {
         use std::sync::atomic::Ordering::SeqCst;

@@ -1093,7 +1093,9 @@ a grant goes to a *node* and covers a set of subtrees under one stream:
   stream at once, and a grow the root journaled before it appended the row can
   reach the holder afterwards: a holder that released its whole stream takes
   up no subtree of it again while the stream is live, and such a grow ends
-  with the stream, by the root's `DelegateNodeEnded`
+  with the stream, by the root's `DelegateNodeEnded` (a restart reads the
+  holder's node-local released-whole mark, written with its release row and
+  cleared by the log's end, to know it)
   ([ADR-64](DECISIONS.md#adr-64-a-release-cuts-first-the-holders-stop-is-a-stream-row-and-settles-are-answered-there),
   the WP6.2 amendment). The table
   (`DelegationTable`, one `NodeStream` per `(node, gen)` with an index from

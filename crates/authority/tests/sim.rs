@@ -10983,6 +10983,10 @@ struct OracleTotals {
     /// installed or rebooted, lost dependency, plain stop), the releases the
     /// root sealed the group for, and the seal waits.
     rowless: [u64; 9],
+    /// WP6.2b (`SWEEP-RELMARK`): streams a restart found marked released
+    /// whole, mark reads that failed, mark writes that failed, whole-release
+    /// rows found without a mark (a bug), seeds where the mark fired.
+    relmark: [u64; 5],
     unsettled_causes: std::collections::BTreeMap<String, u64>,
     /// Sync-on-silence C1: the unsettled `EIO`s of a generation tail the
     /// root could not reach, by whether a strict member had gone silent
@@ -11263,6 +11267,19 @@ impl OracleTotals {
         for (k, n) in &r.unsettled_violation_causes {
             *self.violation_causes.entry(k.clone()).or_default() += *n as u64;
         }
+        let mut fired = 0;
+        for st in r.stats.values() {
+            for (c, n) in self.relmark.iter_mut().zip([
+                st.deleg_install_released_mark,
+                st.released_mark_read_errors,
+                st.released_mark_write_errors,
+                st.released_mark_missing,
+            ]) {
+                *c += n;
+            }
+            fired += st.deleg_install_released_mark + st.released_mark_write_errors;
+        }
+        self.relmark[4] += u64::from(fired > 0);
         for st in r.stats.values() {
             for (c, n) in self.rowless.iter_mut().zip([
                 st.deleg_release_rowless_capped,
@@ -11739,6 +11756,17 @@ impl OracleTotals {
             self.seeds, self.seg[0], self.seg[1], self.seg[2], self.seg[3]
         );
         eprintln!(
+            "SWEEP-RELMARK {label} seeds {}/{seeds}: released-whole mark: streams found marked at a restart {}, \
+             mark reads failed {}, mark writes failed (recalls of streams never installed marked) {}, \
+             release rows without a mark {}; seeds where the mark path fired {}",
+            self.seeds,
+            self.relmark[0],
+            self.relmark[1],
+            self.relmark[2],
+            self.relmark[3],
+            self.relmark[4]
+        );
+        eprintln!(
             "SWEEP-ROWLESS {label} seeds {}/{seeds}: rowless releases by reason: capped {}, never \
              installed {} (of which sealed: rows held or held on another boot {}), rebooted {}, lost dependency {}, \
              plain stop {}; seal waits {}, re-delegated {}, group seals for a release {}",
@@ -11942,6 +11970,14 @@ fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
     let (reclaimed, lapsed) = (sum(|s| s.deleg_reclaimed), sum(|s| s.deleg_lapsed));
     let (ended, off_core) = (sum(|s| s.deleg_ended), sum(|s| s.deleg_renewals_off_core));
     let root_off_core = sum(|s| s.deleg_root_answered_off_core);
+    // WP6.2b: a whole-release row in a journal with no mark is a bug (the
+    // check runs in debug builds only).
+    let missing = sum(|s| s.released_mark_missing);
+    if missing > 0 {
+        return Err(format!(
+            "{missing} restart syncs found a whole-release row with no released-whole mark"
+        ));
+    }
     if std::env::var_os("AUTHORITY_SIM_PROBE_DEBUG").is_some() {
         eprintln!(
             "PROBE-DEBUG {label}: root answers {root_off_core}, probes {} live {} deposed {}, \

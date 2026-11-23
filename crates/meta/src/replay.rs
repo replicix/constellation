@@ -1328,6 +1328,9 @@ fn apply_one(
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             crate::store::local::clear_own_cut_tx(tx, meta, *gen, None)?;
+            if crate::store::journal::PendingOwnRelease::peek() == Some(*gen) {
+                crate::store::local::mark_released_whole_tx(tx, &meta.local, *gen);
+            }
             // Plan 46 M1.2 step 11 (L1): the holder's release is the last row
             // of its stream, and the log carries it only after every row the
             // holder ordered before it: no `Local` row of the generation is
@@ -1350,6 +1353,11 @@ fn apply_one(
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             crate::delegation::remove_group_tx(tx, meta, dirty, *gen)?;
             crate::store::local::clear_own_cut_tx(tx, meta, *gen, None)?;
+            // (The WP6.2b released-whole mark is not cleared here: this apply
+            // also runs at a journal-time end and for a streamed-ahead one,
+            // both of which may strand and leave the generation live. It is
+            // cleared where the log's segment ends the generation:
+            // `apply_segment`'s end and orphan loops.)
             // Only from the durable log (a streamed-ahead
             // install of the record may strand, and the generation would
             // then be live again under the successor) — the void, and the

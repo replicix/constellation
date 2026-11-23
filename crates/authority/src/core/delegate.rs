@@ -3369,34 +3369,47 @@ impl Core {
             // it none: the cut row is no release row, and the release row
             // is still to journal.
             let own_cut = replica.own_cut_dirs(st.gen);
-            // WP6.2: a restart lost `handed_back`, and the table here, ahead
-            // of the log, lists subtrees a grow added after this node's
-            // whole release: the release row is still in the journal, so the
-            // stream is the remnant of that release, with no subtree. A grow
-            // the release did not see ends with the stream.
-            // (The cheap tests come first; the journal is read once, for a
-            // stream that passes them. A read error installs nothing for
-            // the stream now and syncs again, like the own-end remnants.)
+            // WP6.2b: a restart lost `handed_back`, and the table here, which
+            // is not re-folded in the log's order, lists subtrees a grow
+            // added after this node's own whole release. The durable
+            // released-whole mark (written with the release row, cleared by
+            // the log's end of the stream) says so: the stream is the
+            // remnant of that release, with no subtree. A grow the release
+            // did not see ends with the stream. The mark is read for every
+            // own stream not yet installed (a point read; no flag gates it:
+            // a flag lowered before a failed clear would fail open). A read
+            // error installs nothing for the stream now and syncs again,
+            // like the own-end remnants.
             let mut st = st;
+            let mut marked = false;
             if !st.subtrees.is_empty()
-                && own_cut.is_empty()
                 && !self.dl.installed_gens.contains(&st.gen)
                 && !self.dl.mine.contains_key(&st.gen)
-                && replica.delegate_idx(st.gen) > replica.log_stream_idx(st.gen)
             {
-                match self.release_row_journaled_checked(st.gen, replica) {
+                match replica.deleg_released_whole(st.gen) {
                     Ok(true) => {
                         self.stats.deleg_install_released_whole += 1;
+                        self.stats.deleg_install_released_mark += 1;
+                        marked = true;
                         st.subtrees.clear();
                     }
-                    Ok(false) => {}
+                    Ok(false) => {
+                        // Cross-check (debug builds): a whole-release row
+                        // in the journal always has its mark.
+                        if cfg!(debug_assertions)
+                            && replica.delegate_idx(st.gen) > replica.log_stream_idx(st.gen)
+                            && self.release_row_journaled(st.gen, replica)
+                        {
+                            self.stats.released_mark_missing += 1;
+                        }
+                    }
                     Err(e) => {
-                        self.stats.journal_read_errors += 1;
+                        self.stats.released_mark_read_errors += 1;
                         tracing::warn!(
                             node = me,
                             gen = st.gen,
                             error = %e,
-                            "journal read failed; the delegation sync installs no stream with a released-whole row now and retries"
+                            "released-whole mark unreadable; the delegation sync installs no stream that may be one now and retries"
                         );
                         retry = true;
                         continue;
@@ -3408,6 +3421,18 @@ impl Core {
                 && (self.dl.installed_gens.contains(&st.gen)
                     || replica.delegate_idx(st.gen) <= replica.log_stream_idx(st.gen))
             {
+                // A marked stream whose release row is in the log has nothing
+                // to ship and is not installed: its subtrees' locks go to the
+                // root, as the in-process hand-back's did. Seeded only here,
+                // never for a remnant deferred below (the install gate reads
+                // `handed_back`, and the release row must still ship).
+                if marked {
+                    let to = self.holder_root().unwrap_or(0);
+                    self.dl
+                        .handed_back
+                        .entry(st.gen)
+                        .or_insert((to, now.wait, true));
+                }
                 continue;
             }
             if !own_cut.is_empty() && self.dl.installed_gens.contains(&st.gen) {
@@ -9828,6 +9853,20 @@ impl Core {
             // when the root took it back): never installed afterwards. The
             // stream is the root's to end at the rows this node holds of it.
             let seen = replica.delegation_table().stream(me, gen).is_some();
+            // WP6.2b (review MUST 6): the hand-back is process memory; the
+            // durable mark keeps a restart from taking the stream up
+            // before the log's end of it. Written before the answer: a
+            // failed write answers nothing and the root asks again.
+            if let Err(e) = replica.mark_deleg_released_whole(gen) {
+                self.stats.released_mark_write_errors += 1;
+                tracing::warn!(
+                    node = me,
+                    gen,
+                    error = %e,
+                    "released-whole mark not written; the recall of a stream never installed here is not answered now"
+                );
+                return;
+            }
             if self
                 .dl
                 .handed_back

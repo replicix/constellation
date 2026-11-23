@@ -609,6 +609,35 @@ impl Drop for PendingOwnCutGuard {
     }
 }
 
+thread_local! {
+    static PENDING_OWN_RELEASE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// WP6.2b: the generation whose whole release (`StreamReleased`) the
+/// transaction being journaled is this node's own, as the stream's holder
+/// ([`crate::Meta::delegate_release`]); the apply writes the node-local
+/// released-whole mark in the same transaction. Scoped as [`PendingOwnCut`].
+pub(crate) struct PendingOwnRelease;
+
+impl PendingOwnRelease {
+    pub(crate) fn set(gen: u64) -> PendingOwnReleaseGuard {
+        PENDING_OWN_RELEASE.with(|c| c.set(Some(gen)));
+        PendingOwnReleaseGuard
+    }
+
+    pub(crate) fn peek() -> Option<u64> {
+        PENDING_OWN_RELEASE.with(|c| c.get())
+    }
+}
+
+pub(crate) struct PendingOwnReleaseGuard;
+
+impl Drop for PendingOwnReleaseGuard {
+    fn drop(&mut self) {
+        PENDING_OWN_RELEASE.with(|c| c.set(None));
+    }
+}
+
 /// The rid `mutate::execute` is completing, visible only to the thread
 /// running it.
 ///

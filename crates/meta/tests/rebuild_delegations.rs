@@ -129,3 +129,81 @@ fn the_stores_walk_resolves_both_subtrees_to_one_stream() {
     assert_eq!(owner(b, "x"), Ownership::Root);
     assert!(meta.delegation_table().is_empty());
 }
+
+fn released_fixture() -> (Meta, Vec<LogRecord>, u64, u64) {
+    let (d, gen) = ((3u64 << 40) | 900, (1u64 << 32) | 5);
+    let setup = vec![
+        LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: d,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        },
+        LogRecord::delegate_one(1, gen, d, SubtreeKind::Sticky),
+    ];
+    let meta = Meta::open_in_memory().unwrap();
+    meta.apply_records(&setup).unwrap();
+    meta.delegate_release(
+        &[LogRecord::StreamReleased {
+            node: 1,
+            gen,
+            through: 1,
+        }],
+        gen,
+        Default::default(),
+    )
+    .unwrap();
+    assert!(meta.released_whole(gen).unwrap());
+    (meta, setup, d, gen)
+}
+
+/// WP6.2b (review MUST 5): a generation the rebuilt log ended leaves no
+/// `DelegateNodeEnded` apply on this node (the namespace is replaced
+/// wholesale), so the rebuild clears its released-whole mark.
+#[test]
+fn a_rebuild_that_carries_the_end_clears_the_released_whole_mark() {
+    let (meta, setup, _d, gen) = released_fixture();
+    let side = Meta::open_in_memory().unwrap();
+    let mut log = setup;
+    log.push(LogRecord::StreamReleased {
+        node: 1,
+        gen,
+        through: 1,
+    });
+    log.push(LogRecord::DelegateNodeEnded {
+        node: 1,
+        gen,
+        through: 1,
+    });
+    side.apply_segment(1, 1, &log, &TouchSet::default())
+        .unwrap();
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(
+        !meta.released_whole(gen).unwrap(),
+        "the mark of a generation the rebuilt log ended is left"
+    );
+}
+
+/// WP6.2b (review MUST 5): a rebuild onto a log that does not carry the
+/// holder's release row (still unshipped here) rolls the row back and keeps
+/// the mark: the stream is not live for the holder to execute under, and
+/// the mark outlives the rollback until the log's end. Safe: the root
+/// reclaims the generation at its lapse.
+#[test]
+fn a_rebuild_that_lacks_the_release_row_keeps_the_mark() {
+    let (meta, setup, _d, gen) = released_fixture();
+    let side = Meta::open_in_memory().unwrap();
+    side.apply_segment(1, 1, &setup, &TouchSet::default())
+        .unwrap();
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(meta.released_whole(gen).unwrap(), "the mark was lost");
+    assert!(
+        meta.delegation_table().has_gen(gen),
+        "the rebuilt log's stream is live"
+    );
+}

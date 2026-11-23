@@ -83668,23 +83668,14 @@ mod step5_sticky_release {
         );
     }
 
-    /// WP6.2b (fail-before, open gap): the restart variant once the log has
-    /// carried the release row but not yet the end. The root's segment
-    /// carries its grant, its grow of the stream by `b` and then the
-    /// holder's `StreamReleased`; `DelegateNodeEnded` rides a later segment
-    /// (or the root dies before it). The holder applied its own release
-    /// row and the streamed grow ahead of the log, in that order, and the
-    /// segment skips both as already applied: its table still lists `b` as
-    /// the stream's. The row is shipped now (`delegate_idx <=
-    /// log_stream_idx`), so the restart guard's journal scan does not look
-    /// at the stream, and the restart lost `handed_back`: the stream must
-    /// still not be taken up with `b` honoured.
-    #[test]
-    #[ignore = "WP6.2b fail-before: red until the released-whole mark lands"]
-    fn a_restart_after_the_release_row_is_logged_does_not_take_the_grown_subtree_up() {
-        let (mut h, _dirs) = sticky_holder(&["a"]);
-        let row = whole_release_acked_and_dropped(&mut h);
-        let b = late_grow(&mut h, "b", 3);
+    /// The log carries the root's grant, its grow of stream 7 by `b` and the
+    /// holder's `StreamReleased`, in one segment; the end is not in it. The
+    /// holder applied its own release row and the streamed grow ahead of
+    /// the log, in that order, and the segment skips both as applied: its
+    /// table still lists `b` as the stream's. Returns `(row, b)`.
+    fn logged_release_with_late_grow(h: &mut Harness) -> (u64, constellation_fs_core::Ino) {
+        let row = whole_release_acked_and_dropped(h);
+        let b = late_grow(h, "b", 3);
         // The root's segment: its own committed rows (the grant, the grow)
         // in journal order, then its append of the holder's release row.
         let mut records = Vec::new();
@@ -83726,11 +83717,34 @@ mod step5_sticky_release {
             "the table no longer lists b: {:?}",
             h.meta.delegation_table().stream(3, 7)
         );
-        // Restart: the process state is gone, the store stays.
+        (row, b)
+    }
+
+    /// A restart: the process state is gone, the store stays.
+    fn forget_process_state(h: &mut Harness) {
         h.core.dl.mine.remove(&7);
         h.core.dl.installed_gens.clear();
         h.core.dl.sticky_cmds.clear();
         h.core.dl.handed_back.clear();
+    }
+
+    /// WP6.2b (fail-before, open gap): the restart variant once the log has
+    /// carried the release row but not yet the end. The root's segment
+    /// carries its grant, its grow of the stream by `b` and then the
+    /// holder's `StreamReleased`; `DelegateNodeEnded` rides a later segment
+    /// (or the root dies before it). The holder applied its own release
+    /// row and the streamed grow ahead of the log, in that order, and the
+    /// segment skips both as already applied: its table still lists `b` as
+    /// the stream's. The row is shipped now (`delegate_idx <=
+    /// log_stream_idx`), so the restart guard's journal scan does not look
+    /// at the stream, and the restart lost `handed_back`: the stream must
+    /// still not be taken up with `b` honoured.
+    #[test]
+    fn a_restart_after_the_release_row_is_logged_does_not_take_the_grown_subtree_up() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let (_row, b) = logged_release_with_late_grow(&mut h);
+        forget_process_state(&mut h);
+        let marked = h.core.stats.deleg_install_released_mark;
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(
@@ -83743,39 +83757,257 @@ mod step5_sticky_release {
             no_create_journaled(&h),
             "the op was executed under the stream"
         );
+        // M10: the locks of the grown subtree go to the root, and the mark
+        // says why, the log not having ended the stream yet.
+        assert_eq!(h.core.deleg_handed_back_to(7), Some(1));
+        assert_eq!(h.core.stats.deleg_install_released_mark, marked + 1);
+        assert_eq!(h.core.stats.released_mark_missing, 0);
     }
 
-    /// WP6.2: the restart guard fails closed. A journal that cannot be read
-    /// installs nothing for the stream and syncs again; once it reads, the
-    /// stream is installed as the remnant of its release.
+    /// WP6.2b: the restart guard fails closed. A mark that cannot be read
+    /// installs nothing for the stream (the grown subtree included) and
+    /// syncs again, on a counter of its own; once it reads, the stream is
+    /// installed as the remnant of its release.
     #[test]
-    fn an_unreadable_journal_installs_no_stream_with_a_late_grow_and_retries() {
+    fn an_unreadable_mark_installs_no_stream_with_a_late_grow_and_retries() {
         let (mut h, _dirs) = sticky_holder(&["a"]);
         whole_release_acked_and_dropped(&mut h);
         let b = late_grow(&mut h, "b", 3);
-        h.core.dl.mine.remove(&7);
-        h.core.dl.installed_gens.clear();
-        h.core.dl.sticky_cmds.clear();
-        h.core.dl.handed_back.clear();
-        let before = h.core.stats.journal_read_errors;
-        let counted = h.core.stats.deleg_install_released_whole;
-        h.meta.fail_journal_emptiness_reads_for_tests(1_000);
+        forget_process_state(&mut h);
+        let before = h.core.stats.released_mark_read_errors;
+        let journal_errors = h.core.stats.journal_read_errors;
+        let counted = h.core.stats.deleg_install_released_mark;
+        h.meta.fail_released_whole_reads_for_tests(1_000);
         let mut out = Vec::new();
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(
             !h.core.dl.mine.contains_key(&7),
-            "the stream was installed over an unreadable journal"
+            "the stream was installed over an unreadable mark"
         );
         assert!(
-            h.core.stats.journal_read_errors > before,
+            h.core.stats.released_mark_read_errors > before,
             "the guard did not count its read error"
         );
-        assert_eq!(h.core.stats.deleg_install_released_whole, counted);
-        h.meta.fail_journal_emptiness_reads_for_tests(0);
+        assert_eq!(h.core.stats.journal_read_errors, journal_errors);
+        assert_eq!(h.core.stats.deleg_install_released_mark, counted);
+        h.meta.fail_released_whole_reads_for_tests(0);
         h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        let d = h.core.dl.mine.get(&7).expect("not installed once readable");
+        assert_eq!(h.core.stats.deleg_install_released_mark, counted + 1);
+        // The row is acknowledged by the root but not the log's: the
+        // remnant of the release is installed, stopped, holding the row;
+        // nothing honours `b`.
+        let d = h
+            .core
+            .dl
+            .mine
+            .get(&7)
+            .expect("the remnant was not installed");
         assert!(d.stopped && d.release.is_some() && !d.dirs.contains(&b));
-        assert_eq!(h.core.stats.deleg_install_released_whole, counted + 1);
+    }
+
+    /// WP6.2b: the mark and the unreadable-mark retry on the unshipped
+    /// release row: the remnant is installed stopped, holding the row.
+    #[test]
+    fn a_marked_restart_with_an_unshipped_release_row_installs_the_remnant() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        let b = late_grow(&mut h, "b", 3);
+        forget_process_state(&mut h);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = h
+            .core
+            .dl
+            .mine
+            .get(&7)
+            .expect("the remnant was not installed");
+        assert!(d.stopped && d.release.is_some() && !d.dirs.contains(&b));
+        assert!(h.core.dl.handed_back.is_empty());
+    }
+
+    /// WP6.2b (review MUST 3): a remnant whose install is only deferred (an
+    /// epoch is active) is not handed back: the install gate reads
+    /// `handed_back`, and the release row, still unshipped, must ship at
+    /// a later sync. Fails when every marked stream not installed is seeded.
+    #[test]
+    fn a_deferred_marked_remnant_still_ships_its_release_row_on_a_later_sync() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h));
+        forget_process_state(&mut h);
+        h.core.dl.epoch_active = true;
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.dl.mine.contains_key(&7));
+        assert!(
+            h.core.dl.handed_back.is_empty(),
+            "a deferred remnant was handed back: {:?}",
+            h.core.dl.handed_back
+        );
+        h.core.dl.epoch_active = false;
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let d = h
+            .core
+            .dl
+            .mine
+            .get(&7)
+            .expect("the remnant was never installed");
+        assert!(d.stopped && d.release.is_some());
+    }
+
+    /// WP6.2b (review answer 1, no restart): the end streams ahead of the
+    /// log and drops the stream from the table (the process forgets the
+    /// stream and its hand-back); the end strands, the stream is live
+    /// again with the grown subtree. The mark, which a streamed end does
+    /// not clear, keeps `b` from being honoured.
+    #[test]
+    fn a_stranded_streamed_end_does_not_bring_the_grown_subtree_back() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let row = whole_release_acked_and_dropped(&mut h);
+        let b = late_grow(&mut h, "b", 3);
+        Replica::install_streamed(
+            &h.meta,
+            1,
+            1,
+            5,
+            5,
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: row,
+            }],
+            false,
+            (0, 0),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.meta.delegation_table().has_gen(7),
+            "the end did not apply"
+        );
+        assert!(h.core.dl.handed_back.is_empty());
+        // The root is deposed: the streamed end strands.
+        h.meta.strand_below_epoch(2).unwrap();
+        assert!(
+            h.meta
+                .delegation_table()
+                .stream(3, 7)
+                .is_some_and(|s| s.subtrees.iter().any(|(d, _)| *d == b)),
+            "the stream is not live again: {:?}",
+            h.meta.delegation_table().stream(3, 7)
+        );
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.core.dl.mine.get(&7).is_some_and(|d| d.dirs.contains(&b)),
+            "the grown subtree was honoured: {:?}",
+            h.core.dl.mine.get(&7).map(|d| (d.dirs.clone(), d.stopped))
+        );
+        create_in(&mut h, b, 1);
+        assert!(no_create_journaled(&h), "the op was executed");
+    }
+
+    /// WP6.2b (W-c): a rowless plain whole release (a generation the
+    /// takeover gate ended, stopped) writes no row and no mark: its cause is
+    /// durable, the restart re-adopts the stream stopped, so a later grow
+    /// is never executed under.
+    #[test]
+    fn a_restart_after_a_rowless_plain_release_executes_nothing_under_a_late_grow() {
+        // The grant is the log's (a segment), as for a generation the
+        // takeover gate then ends.
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (a, rec) = mkdir(&h, "a");
+        let dirs = [a];
+        Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[rec, LogRecord::delegate_one(3, 7, a, SubtreeKind::Sticky)],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine.contains_key(&7));
+        for n in 1..=2 {
+            create_in(&mut h, dirs[0], n);
+        }
+        h.meta.strand_for_takeover(2, &[7], None).unwrap();
+        assert!(
+            h.meta.deleg_ended_at_gate(7).unwrap(),
+            "not ended at the gate"
+        );
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.lease.cached_holder = Some(1);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].stopped, "re-adopted live");
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReleaseRequest {
+                why: ReleaseWhy::Recall,
+                req: OpId(5),
+                gen: 7,
+                dirs: vec![dirs[0]],
+            },
+        });
+        assert_eq!(h.core.stats.deleg_release_rowless_plain, 1);
+        let b = late_grow(&mut h, "b", 100);
+        forget_process_state(&mut h);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine.get(&7).is_none_or(|d| d.stopped),
+            "the generation was taken up live"
+        );
+        let _ = create_in(&mut h, b, 1);
+        assert!(no_create_journaled(&h), "executed under the stream");
+    }
+
+    /// WP6.2b (review MUST 6): a recall answered rowless for a generation
+    /// never installed here (the grant was parked) leaves only the
+    /// in-memory hand-back. A restart then meets the `DelegateNode` in a
+    /// segment before the end's: the generation must not be installed and
+    /// executed under past the root's cut.
+    #[test]
+    fn a_restart_after_a_never_installed_recall_does_not_take_the_grant_up() {
+        for kind in [
+            SubtreeKind::Placed,
+            SubtreeKind::Sticky,
+            SubtreeKind::Designated,
+        ] {
+            let (mut h, records, dir) = delegate_learning_a_streamed_grant_of(false, kind);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::ReleaseRequest {
+                    why: ReleaseWhy::Recall,
+                    req: OpId(5),
+                    gen: 7,
+                    dirs: vec![dir],
+                },
+            });
+            assert_eq!(h.core.deleg_handed_back_to(7), Some(1), "{kind:?}");
+            // The restart: the process state is gone, the store stays.
+            h.core.dl.handed_back.clear();
+            h.core.dl.installed_gens.clear();
+            Replica::apply_segment(&h.meta, 1, 1, 2, &[1], &[], &records).unwrap();
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            assert!(
+                h.core.dl.mine.is_empty(),
+                "{kind:?}: installed a generation the root recalled"
+            );
+            let _ = create_in(&mut h, dir, 1);
+            assert!(no_create_journaled(&h), "{kind:?}: executed under it");
+        }
     }
 
     /// WP6.2 guard (passes before the fix as well): while the holder's
