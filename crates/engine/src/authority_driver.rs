@@ -2730,6 +2730,37 @@ fn waits_for_renewals(kind: TimerKind) -> bool {
     matches!(kind, TimerKind::LockGrantExpiry | TimerKind::DelegExpiry)
 }
 
+/// Deliver a timer the core armed: after `delay`, or, `at_once`, onto
+/// the channel now. A sleep of zero still goes through the timer wheel,
+/// whose tick is a millisecond; a forward from the root that waits at its
+/// delegate for the root's next ship (`Core::ship_wanted_now`) waited that
+/// tick on every op. Only that poll goes at once: any other nudge's round
+/// starting at once ran its segment build ahead of the op's own backup
+/// acknowledgement and reply. The immediate send queues behind everything
+/// already on the channel.
+fn deliver_timer(
+    tx: &mpsc::UnboundedSender<Internal>,
+    at_once: bool,
+    delay: Duration,
+    id: TimerId,
+    kind: TimerKind,
+) {
+    let timer = Internal::Timer {
+        id,
+        kind,
+        deferred: false,
+    };
+    if at_once {
+        let _ = tx.send(timer);
+        return;
+    }
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = tx.send(timer);
+    });
+}
+
 /// The timers that keep a grant this node holds: a delegate's renewal
 /// and lapse, and a lock holder's renewal tick. Delivered on a lane
 /// served before the internal channel ([`Driver::run`]): a backlog of
@@ -4774,14 +4805,9 @@ impl Driver {
                         constellation_platform::clock::protocol().sleep_ms_for_wait(after_ms);
                     let delay =
                         Duration::from_millis(after_ms).saturating_sub(self.now_at.elapsed());
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = tx.send(Internal::Timer {
-                            id,
-                            kind,
-                            deferred: false,
-                        });
-                    });
+                    let at_once =
+                        after_ms == 0 && kind == TimerKind::Poll && self.core.ship_wanted_now();
+                    deliver_timer(&tx, at_once, delay, id, kind);
                 }
                 Action::CancelTimer { .. } => {}
                 Action::UploadAwaited { inos } => {

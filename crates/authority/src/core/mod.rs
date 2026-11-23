@@ -3154,6 +3154,13 @@ pub struct Core {
     /// A nudge arrived while a round was in flight: run another right
     /// after it (`nudged` in the sync loop).
     nudged: bool,
+    /// A forward this root sent waits at its delegate for journal rows
+    /// not shipped yet (`fresh_deps` orders it after the root's whole
+    /// journal, and the delegate parks it until the root's log brings
+    /// them): the round that ships them is wanted at once, not after the
+    /// timer wheel's tick (`ship_wanted_now`). Cleared when a round
+    /// begins.
+    ship_for_forward: bool,
     /// The dead-root check's lease read is in flight (`dead_root_check`).
     dead_root_get: bool,
     /// A client's control request waiting for a round (`PublishNow`,
@@ -3339,6 +3346,7 @@ impl Core {
             epoch_probes: 0,
             epoch_s3_down: false,
             nudged: false,
+            ship_for_forward: false,
             dead_root_get: false,
             round_waiters: Vec::new(),
             barriers: Vec::new(),
@@ -3518,6 +3526,17 @@ impl Core {
         v.extend(self.dl.container_sizes());
         v.extend(self.lk.container_sizes());
         v
+    }
+
+    /// Whether a zero-wait poll should start its round at once rather
+    /// than through the driver's timer wheel: only while a forward of
+    /// this root waits at a delegate for rows the root has not shipped
+    /// (`send_forward`). Any other nudge keeps the wheel's tick, which
+    /// lets the op's own acknowledgement (a backup's ack, a reply) be
+    /// taken before the round's segment build occupies the core.
+    /// Scheduling only: which rows ship, and in what order, is the same.
+    pub fn ship_wanted_now(&self) -> bool {
+        self.ship_for_forward
     }
 
     pub fn job(&self) -> Option<JobKind> {

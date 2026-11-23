@@ -2391,6 +2391,8 @@ impl Core {
 
     fn begin_round(&mut self, poll_triggered: bool, out: &mut Vec<Action>) {
         self.nudged = false;
+        // This round takes the journal the waiting forward depends on.
+        self.ship_for_forward = false;
         for barrier in &mut self.barriers {
             barrier.rounds += 1;
         }

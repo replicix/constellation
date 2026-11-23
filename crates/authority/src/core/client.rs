@@ -1997,6 +1997,18 @@ impl Core {
                 inbox_ever: c.inbox_ever,
             },
         });
+        // The delegate parks this op until this root's log brings the
+        // journal rows its `deps` name (`fresh_deps`): ask for the round
+        // that ships them now. One round in flight with at most one after
+        // it, as for any nudge; only its start is earlier.
+        if deps.pending.is_some() {
+            if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
+                if replica.journal_position(epoch).is_some() {
+                    self.ship_for_forward = true;
+                    self.nudge(now, out);
+                }
+            }
+        }
     }
 
     // ---- the forward's outcomes ----
