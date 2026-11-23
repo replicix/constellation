@@ -1137,7 +1137,11 @@ a grant goes to a *node* and covers a set of subtrees under one stream:
   streams its transactions in order to the root. The root appends them
   without re-validating, in order, and only once each transaction's `deps`
   (the delegate stream positions the requester had observed) are in its
-  replica: no replica ever holds a record whose causes are missing.
+  replica: no replica ever holds a record whose causes are missing. A
+  requester whose causal past names more than 8 streams the log it applied
+  does not carry yet holds the op until 8 or fewer remain: never sent short,
+  and not to the root
+  ([ADR-69](DECISIONS.md#adr-69-an-op-whose-causal-past-overflows-the-stream-table-is-held-at-its-requester)).
 - **A delegate acknowledges once its group holds the row** (plan 43 C2,
   [ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)).
   The rule is a property of the stream's configuration, not of the row: a row

@@ -1282,6 +1282,12 @@ impl Core {
     /// held (the queue is what the others wait for); its own lost `deps`
     /// are refreshed, and so are the recorded rows (`StrandedOp::deps`) of
     /// a generation the log has ended (see `live_rows`).
+    ///
+    /// ADR-69: an op whose causal past names more streams than a position
+    /// holds, past what the applied log carries (`ClientOp::wide`, from
+    /// `fresh_deps`, or the queue's rows that do not fit beside its own),
+    /// is held here too, on its snapshot, until 8 or fewer remain. A replay
+    /// or a settle is not.
     pub(crate) fn hold_for_lost_deps(
         &mut self,
         now: Now,

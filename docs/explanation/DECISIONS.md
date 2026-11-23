@@ -6956,3 +6956,64 @@ outage began (not needed once the reroute exists).
 
 See: `crates/authority/src/core/inbox.rs` (`inbox_reroute_if_linked`,
 `on_inbox_withdrawn`, `inbox_retry`).
+
+## ADR-69: An op whose causal past overflows the stream table is held at its requester
+
+**Status**: decided on 2026-11-23, after the `ovfdeps` review of the
+`deps_overflow_to_root` path. It amends decision 4 of plan 30 ("an op whose
+deps exceed the cap goes to the root, which reads its own log and needs no
+tracking"), which the code never implemented as written and which would not
+have been sound if it had.
+
+**Context**: a write's `deps` name at most 8 delegation streams
+(`STREAMS_CAP`). When the requester's causal past named more, the table came
+out empty and the op was forwarded to the delegate, or run by this node as the
+delegate, which waited for nothing: its row could reach the log ahead of rows
+it causally follows (sim `marker-order`, 10 of 60 seeds with the table
+lowered to one stream). Sending the op to the root would not repair it: the
+root orders only after the rows it has appended, and a delegate acknowledges
+before the root appends them.
+
+**Decision**: an op whose causal past names more streams than the table holds,
+past what the log this replica applied already carries, is held at its
+requester until 8 or fewer remain. It is never sent with a truncated table,
+and not to the root either.
+
+- The entries at or below the log's index of a generation are covered by
+  `deps.seq` at every executor and are left out, only when the table would
+  overflow (a table that fits is carried as it always was). The index is
+  `SessionState::shipped`: raised at a segment's apply (stream fills
+  included) and at the acknowledgement of this node's own shipped rows,
+  after `applied_seq` covers the segment, and seeded at the open below this
+  node's lowest unshipped journal row of the generation. It is never the
+  persisted log index (which counts a root's appended rows, takeover tails
+  and adopted rows that are not in the log) nor `streams` (which counts
+  executed and appended rows).
+- The hold is on a snapshot of the causal past taken when the op first
+  overflows (`ClientOp::wide`), compacted at each `ForwardBackoff` tick
+  (`delegation_stream_tick_ms`), not retaken: new generations arriving every
+  tick cannot starve it. It is released when 8 or fewer entries remain, with
+  `seq = max(snapshot, applied_seq now)` and `pending = max(snapshot,
+  current)`. An entry of a generation that ended below it is lost with the
+  generation (`deps_lost`): the op takes its deps afresh.
+- Every re-entry of a client op passes `hold_for_lost_deps`, which holds it.
+  The rows a queue entry recorded for the op (`queued_owed`) are part of the
+  snapshot. Replays (`Origin::Replay`) and settles are never held: a takeover
+  gate replays while the root's session holds unshipped tails, and a held
+  replay would never ship them.
+- At its deadline an op that was never sent is answered never executed; one
+  forwarded before and held on a retry is in doubt and settles, as any.
+- The other places the table truncated count what they still drop
+  (`floor_truncated`, `floor_join_truncated`): an `observed` that does not
+  fit folds the older generations into `frontier`; `frontier()`,
+  `floor_join`, `lock_release_floor` and the recorded rows of a stranded op
+  leave out the log's entries first.
+- The stat `deps_overflow_to_root` is `deps_overflow_holds`: it is 0 on a
+  cluster that never names more than 8 unshipped streams.
+
+**Consequences**: a root with 9 or more busy delegates holds its own clients'
+ops for about one ship cadence each. If that shows in latency, raising
+`STREAMS_CAP` is the lever, as a separate change.
+
+See: `crates/meta/src/session.rs` (`deps`, `deps_wide`, `compact_wide`,
+`note_shipped`), `crates/authority/src/core/client.rs` (`hold_for_lost_deps`).

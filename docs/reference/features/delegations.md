@@ -321,8 +321,11 @@ transaction only once everything in its `deps` is in its replica, and a
 delegate executes an op only once its `deps` are in *its* replica. So
 no replica ever contains a record whose causes are missing: data
 written in `D1` and then a marker written in `D2` are never seen in the
-wrong order (`marker-order`). A requester tracks at most 8 streams; if
-its observed set overflows, it sends the op to the root instead. A
+wrong order (`marker-order`). A requester tracks at most 8 streams (the ones
+the log it applied does not carry yet); if its causal past names more, it holds
+the op until 8 or fewer remain (`deps_overflow_holds`, ADR-69): never sent
+with a truncated table, and not to the root, which orders only after the rows
+it appended. A
 dependency on a generation that has ended is void, except one past the
 generation's cut (the transaction was acknowledged but never appended,
 so it is being replayed by rid): an op with such a dependency is not
@@ -1478,7 +1481,7 @@ root's own answers off its stuck core, and why it declined), `off_core_answers_a
 node's whole process was frozen) and `lapses_root_silent` with
 `last_silent_gen` (a renewal sent in time was never answered by the root)
 are classified: see "Grants, renewal and expiry",
-`redelegated`, `deps_overflow_to_root`, `refused_designated`, `root_own`
+`redelegated`, `deps_overflow_holds` (ops held for their deps overflow, ADR-69; 0 unless more than 8 unshipped streams are named), `refused_designated`, `root_own`
 (the root's own sticky grants, ADR-55: `granted`, `released_by_dwell`,
 `released_for_cross_own` and `released_for_cross_forwarded` (ops across a
 boundary that released the grant, by the root's own client or another node),

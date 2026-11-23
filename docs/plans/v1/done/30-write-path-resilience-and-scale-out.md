@@ -1189,7 +1189,12 @@ Decisions made while the milestones were designed:
   `leave --node-id`, which fences its leases.
 - **M11**: `deps` are M6 positions with delegation streams
   (`DelegPosition`), capped at 8 streams; an op with more goes to the
-  root. Designations are non-stealable delegations.
+  root (decision 4, amended by ADR-69, 2026-11-23: the root orders only
+  after the rows it appended, and a delegate acknowledges before that, so
+  such an op is held at its requester until 8 or fewer streams remain that
+  the log it applied does not carry, `deps_overflow_holds`; never sent
+  short, and not to the root; replays and settles are exempt).
+  Designations are non-stealable delegations.
 - **M12**: a hot directory is split into name-hash ranges only where a
   range has a dominant writer. Splitting a directory whose ranges have
   no dominant writer measured slower than leaving it alone.
