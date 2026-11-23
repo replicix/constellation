@@ -657,6 +657,24 @@ pub struct SimConfig {
     /// configuration; a run that retires a node holding a grant fails
     /// `no_live_grant_off_roster`.
     pub leave_keeps_grants: bool,
+    /// WP6.3: a node that left by its own leave (`ReleaseGrants`, then `Flush`)
+    /// is retired this many ms (simulated clock) after the leave was answered
+    /// and flushed, not in the same step. It stays up meanwhile, sending its
+    /// notes and running its clients, so a successor root may take the lease
+    /// and grant in the window: the windows a root's acknowledgement from
+    /// memory (or a leave-acquired lease released by the flush) leaves open
+    /// without the `NodeLeaving` log row. `AUTHORITY_SIM_RETIRE_DELAY_MS=<ms>`
+    /// sets it on every configuration (0: retire at once).
+    pub retire_delay_ms: u64,
+    /// WP6.3 (M-1): the node that runs its own leave is suspended this many ms
+    /// (simulated clock) 400 ms after the leave started, as by
+    /// `FaultKind::Suspend`: it sends no note for longer than
+    /// `leave_note_lapse`, and its first message after the suspension may be
+    /// no note, which lapses the root's mark of it. Opens the window a
+    /// lapse-made stale note leaves (the retire delay of at most 1.5 s is
+    /// below the lapse). `AUTHORITY_SIM_LEAVE_SUSPEND_MS=<ms>` sets it on
+    /// every configuration (0: none).
+    pub leave_suspend_ms: u64,
     /// The operator's leave of a dead node goes to any node when none holds
     /// the lease (`AUTHORITY_SIM_LEAVE_ASKS_ANY=1`): a follower that is not
     /// the root must refuse a dead root's retirement (ADR-61).
@@ -1422,6 +1440,14 @@ impl Default for SimConfig {
                 .is_some_and(|v| v == "1"),
             leave_keeps_grants: std::env::var_os("AUTHORITY_SIM_LEAVE_KEEPS_GRANTS")
                 .is_some_and(|v| v == "1"),
+            retire_delay_ms: std::env::var("AUTHORITY_SIM_RETIRE_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            leave_suspend_ms: std::env::var("AUTHORITY_SIM_LEAVE_SUSPEND_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             leave_asks_any: std::env::var_os("AUTHORITY_SIM_LEAVE_ASKS_ANY")
                 .is_some_and(|v| v == "1"),
             fence_accepts_unrouted: std::env::var_os("AUTHORITY_SIM_FENCE_ACCEPTS_UNROUTED")
@@ -2056,6 +2082,10 @@ pub struct Cluster {
     pub leave_driver: Mutex<LeaveDriver>,
     /// `SimConfig::leave_keeps_grants`.
     pub leave_keeps_grants: bool,
+    /// `SimConfig::retire_delay_ms`.
+    pub retire_delay_ms: u64,
+    /// `SimConfig::leave_suspend_ms`.
+    pub leave_suspend_ms: u64,
     /// `SimConfig::leave_asks_any`.
     pub leave_asks_any: bool,
 }
@@ -4343,6 +4373,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             // (The operator's repeated asks are noted once each: a refusal that
             // lasts is one line.)
             let mut last_asked = String::new();
+            let mut suspended_once = false;
             let mut ask_note = |what: String| {
                 if last_asked != what {
                     note(format!("t={} {what}", cluster.env.clock.elapsed_ms()));
@@ -4386,11 +4417,43 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                         }
                         return;
                     }
-                    let r = tokio::time::timeout(
-                        Duration::from_secs(30),
-                        n.control(constellation_authority::Control::ReleaseGrants),
-                    )
-                    .await;
+                    // WP6.3 (M-1): `leave_suspend_ms`: the node is suspended
+                    // while its leave runs (once per leave), so it is silent
+                    // for longer than the root's `leave_note_lapse`.
+                    let suspend_ms = if suspended_once {
+                        0
+                    } else {
+                        cluster.leave_suspend_ms
+                    };
+                    suspended_once |= suspend_ms > 0;
+                    let suspender = async {
+                        if suspend_ms == 0 {
+                            return std::future::pending::<()>().await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        note(format!(
+                            "t={} suspend node {node} during its leave for {suspend_ms}ms",
+                            cluster.env.clock.elapsed_ms()
+                        ));
+                        let now = cluster.env.clock.wall().0;
+                        cluster
+                            .note_takedown(node, Some(now + suspend_ms as i64), fault.at_ms)
+                            .await;
+                        cluster
+                            .env
+                            .clock_state_of(node)
+                            .suspend(cluster.env.clock.elapsed_ns(), suspend_ms);
+                        let until = tokio::time::Instant::now() + Duration::from_millis(suspend_ms);
+                        cluster.get(node).suspend_until(until);
+                        std::future::pending::<()>().await
+                    };
+                    let r = tokio::select! {
+                        r = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            n.control(constellation_authority::Control::ReleaseGrants),
+                        ) => r,
+                        () = suspender => unreachable!("the suspender never ends"),
+                    };
                     match r {
                         Ok(Ok(Ok(answer))) => {
                             let _ = tokio::time::timeout(
@@ -4402,6 +4465,10 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                                 "t={} node {node} left: {answer:?}",
                                 cluster.env.clock.elapsed_ms()
                             ));
+                            if cluster.retire_delay_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(cluster.retire_delay_ms))
+                                    .await;
+                            }
                             if let Some(root) = root_of().await {
                                 cluster.retire(node, root, false).await;
                             }
@@ -6212,6 +6279,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         leave_violations: Mutex::new(Vec::new()),
         leave_driver: Mutex::new(LeaveDriver::default()),
         leave_keeps_grants: cfg.leave_keeps_grants,
+        retire_delay_ms: cfg.retire_delay_ms,
+        leave_suspend_ms: cfg.leave_suspend_ms,
         leave_asks_any: cfg.leave_asks_any,
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),

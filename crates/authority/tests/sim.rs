@@ -24177,6 +24177,108 @@ fn a_roots_own_leave_ends_its_own_sticky_stream() {
     }
 }
 
+/// WP6.3 (ADR-61): a successor root granted a sticky subtree to a node that
+/// was leaving. The leaving node answered its own leave from a released
+/// lease while no root had acknowledged its note (the root that refused the
+/// note had idled the lease away, and its mark of the node lived only in its
+/// memory); the next root, which the sim's sticky idle driver reached,
+/// journaled a sticky generation for it, and the node was retired with that
+/// generation live: `no_live_grant_off_roster`. The leave is a log row now
+/// (`NodeLeaving`), which every root reads before it grants, and a node with
+/// no root to tell takes the released lease itself. 15 seeds of
+/// `sticky-s4-leave` and 1 of `sticky-leave` failed on the parent with the
+/// idle release on (`AUTHORITY_SIM_STICKY_IDLE_MS=1200`), each reporting two
+/// `sticky_ends_only_by_holder_or_operator` violations as well.
+#[test]
+fn a_successor_root_does_not_grant_to_a_leaving_node() {
+    let idle = |config: SimConfig| SimConfig {
+        sticky_idle_ms: Some(1_200),
+        ..config
+    };
+    let runs = [
+        148u64, 302, 337, 441, 562, 607, 1092, 1096, 1376, 1466, 1476, 1791, 1799, 1822, 1843,
+    ]
+    .map(|seed| (seed, "sticky-s4-leave", idle(sticky_s4_leave_config())))
+    .into_iter()
+    .chain([(208u64, "sticky-leave", idle(sticky_leave_config()))]);
+    for (seed, label, config) in runs {
+        let r = run_seed(seed, config).unwrap_or_else(|e| {
+            panic!(
+                "{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label} \
+                 AUTHORITY_SIM_STICKY_IDLE_MS=1200"
+            )
+        });
+        assert_eq!(
+            r.leave_driver.own, 1,
+            "{label} seed {seed}: the node did not leave"
+        );
+    }
+}
+
+/// WP6.3 (ADR-61, `SimConfig::retire_delay_ms`): the node that left stays up
+/// 1.5 s after its leave was answered and flushed, so a successor can take the
+/// lease and grant before the retirement. The two windows only the log row
+/// closes: a root acknowledges from memory, then loses or idles the lease
+/// away before the retirement and the successor grants (a); the leaving node
+/// takes the lease itself (leave-acquire), answers as root, its flush
+/// releases the lease, and the successor has no mark (b). On the parent, and
+/// with the row's seeding and lookup removed, these seeds fail
+/// `no_live_grant_off_roster` (mostly generation 3:1 of node 2, (b)).
+#[test]
+fn a_delayed_retirement_does_not_outlive_a_successors_grant() {
+    let config = SimConfig {
+        sticky_idle_ms: Some(1_200),
+        retire_delay_ms: 1_500,
+        ..sticky_s4_leave_config()
+    };
+    for seed in [5u64, 18, 22, 25, 28, 35, 37, 40] {
+        run_seed(seed, config.clone()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-s4-leave \
+                 AUTHORITY_SIM_STICKY_IDLE_MS=1200 AUTHORITY_SIM_RETIRE_DELAY_MS=1500"
+            )
+        });
+    }
+}
+
+/// WP6.3 (M-1, `SimConfig::leave_suspend_ms`): the node that runs its own
+/// leave is suspended 12 s during it, longer than the root's
+/// `leave_note_lapse`. The root's mark of it lapses at the node's first message
+/// after the suspension, which is no note; the node then sends the same
+/// request again. The first version of the fix wrote the lapse's row at the
+/// mark's request, the resent note was stale, marked nothing and was
+/// acknowledged all the same, and a successor granted the node a subtree it
+/// was retired with (`no_live_grant_off_roster`, 402 of 4,000 seeds of
+/// `sticky-s4-leave` and `sticky-leave` with the idle release on); the second
+/// wrote the mark's request less one, which is a release note's request below
+/// the note's own, and the leave never completed (seeds 1979 and 883:
+/// `operator_abandon`). The lapse writes a row below every request the leave
+/// sends. The retire delay of at most 1.5 s is below the lapse and sees none
+/// of this.
+#[test]
+fn a_suspended_leaver_is_marked_again_after_the_lapse() {
+    let config = |c: SimConfig| SimConfig {
+        sticky_idle_ms: Some(1_200),
+        leave_suspend_ms: 12_000,
+        ..c
+    };
+    let runs = [11u64, 19, 30, 39, 44, 62, 72, 75, 1979]
+        .map(|seed| (seed, "sticky-s4-leave", config(sticky_s4_leave_config())))
+        .into_iter()
+        .chain(
+            [19u64, 22, 30, 37, 44, 883]
+                .map(|seed| (seed, "sticky-leave", config(sticky_leave_config()))),
+        );
+    for (seed, label, config) in runs {
+        run_seed(seed, config).unwrap_or_else(|e| {
+            panic!(
+                "{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label} \
+                 AUTHORITY_SIM_STICKY_IDLE_MS=1200 AUTHORITY_SIM_LEAVE_SUSPEND_MS=12000"
+            )
+        });
+    }
+}
+
 /// Plan 46 M1.3 step 14 (ADR-61): the operator asks any node to retire the dead
 /// root before a survivor has taken over. A follower that is not the root
 /// answered "holds no delegation of its own" from a table behind the log and
