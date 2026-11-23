@@ -4093,7 +4093,10 @@ mod root_substitution_tests {
             drop(meta);
             Meta::open(&db).unwrap()
         };
-        assert!(!meta.released_whole(5).unwrap(), "the clear was not durable");
+        assert!(
+            !meta.released_whole(5).unwrap(),
+            "the clear was not durable"
+        );
     }
 
     /// WP6.2b (review MUST 1, 2): the mark is cleared where the log's

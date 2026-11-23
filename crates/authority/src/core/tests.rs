@@ -83689,7 +83689,7 @@ mod step5_sticky_release {
             }
         }
         assert_eq!(seg_rows, vec![1, 2, 3, 4], "{records:?}");
-        let rel = rows(&h)
+        let rel = rows(h)
             .into_iter()
             .find(|t| t.idx == row)
             .expect("the release row left the journal");
