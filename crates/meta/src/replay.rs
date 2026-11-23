@@ -159,6 +159,7 @@ impl TouchSet {
             | LogRecord::DelegateNodeGroup { .. }
             | LogRecord::DelegateNodeEnded { .. }
             | LogRecord::ReleaseCut { .. }
+            | LogRecord::NodeLeaving { .. }
             | LogRecord::GroupAbandoned { .. }
             | LogRecord::TailOf { .. }
             | LogRecord::TailFollowsThrough { .. }
@@ -1381,6 +1382,12 @@ fn apply_one(
             ..
         } => {
             crate::delegation::apply_group_tx(tx, meta, dirty, *gen, *version, backups)?;
+            Ok(Applied::Done)
+        }
+        // WP6.3: the leave of a node, a key of its own (same funnel as the
+        // group row). The latest row in log order wins.
+        LogRecord::NodeLeaving { node, req, leaving } => {
+            crate::delegation::apply_leave_tx(tx, meta, dirty, *node, *req, *leaving)?;
             Ok(Applied::Done)
         }
         // The replica's session state reads it (`SessionState::owe`).

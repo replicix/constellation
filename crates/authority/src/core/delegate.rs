@@ -1477,16 +1477,44 @@ struct HeardLately {
 /// generations are `epoch << 32 | n`, and never 0.
 pub(crate) const LEAVE_NOTE_GEN: u64 = 0;
 
-/// Why a node is marked leaving at its root.
+/// Why a root un-marks a leaving node (`leave_unmark`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaveUnmark {
+    /// The node's own note taking its leave of request `.0` back.
+    TakeBack(u64),
+    /// The lapse, without the node's word: every request of its current
+    /// leave stays valid.
+    Lapsed,
+    /// The node came back under a newer incarnation: its current leave's
+    /// requests (those of the new incarnation) stay valid.
+    Returned,
+}
+
+/// A root's tenure-local mark of a leaving node (WP6.3, ADR-61). The log
+/// row (`NodeLeaving`) is the source of truth that every root reads; the mark
+/// blocks grants from the first note, before the row is journaled (or when
+/// journaling it failed), and carries what the root has to remember of the
+/// row of this tenure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaveMark {
-    /// A mark the node's own note made lapses (the node may have stayed up,
-    /// or come back under the same id, and nobody takes the mark back); one
-    /// an operator's leave made (`None`) stays until that leave fails.
-    pub until: Option<WaitMs>,
-    /// The request id of the note that made it: a take-back older than the
-    /// mark is no take-back.
+    /// The request id of the note that made it (0: an operator's mark): a
+    /// take-back older than the mark is no take-back.
     pub req: u64,
+    /// An operator's leave made it: it does not lapse, and goes with the
+    /// leave that fails.
+    pub operator: bool,
+    /// When the node's note last came (the lapse counts from it).
+    pub last_note: WaitMs,
+    /// The `(req, jseq)` of the `NodeLeaving` row this tenure journaled (or
+    /// found in the log) for the mark: the note is acknowledged once `jseq`
+    /// is durable. Keyed on the request, so a new leave after a take-back
+    /// journals again.
+    pub journaled: Option<(u64, u64)>,
+    /// An operator's mark only: the highest request of the node's own leave
+    /// note that came under it. The note is acknowledged under the operator's
+    /// row, and when the operator's leave fails the node, still leaving,
+    /// falls back to a mark of that note (`leave_fail_operator`).
+    pub note: Option<u64>,
 }
 
 /// A note from a leaving node to its root, until acknowledged.
@@ -1736,6 +1764,28 @@ pub(crate) struct DelegationState {
     /// them from the moment their leave starts, so no grant is made between
     /// the end of their grants and the retirement of their registry entry.
     pub leaving: BTreeMap<NodeId, LeaveMark>,
+    /// WP6.3: when this tenure first saw the log's `leaving` row of a node
+    /// that has no mark here (seeded at the start of a tenure,
+    /// `leave_seed_from_rows`): the lapse counts from it, as from a note.
+    pub leave_note_seen: BTreeMap<NodeId, WaitMs>,
+    /// WP6.3 (SHOULD 4): when the lapse last read the log's row of a sender
+    /// that had no mark and was not seen on a row: its next read waits for a
+    /// resend interval. Tenure-scoped.
+    pub leave_row_looked: BTreeMap<NodeId, WaitMs>,
+    /// WP6.3 (M3): this node's own `NodeLeaving` row, journaled by it as the
+    /// root for its own leave: `(req, jseq)`. Tenure-scoped.
+    pub leave_own: Option<(u64, u64)>,
+    /// WP6.3 (SHOULD 5): the request of a `true` row of this node's own
+    /// failed leave that a root's abort could not take back (the journal
+    /// failed): the take-back row is journaled again at the next look, until
+    /// it is (or a new leave of the node supersedes it, or the root is lost
+    /// and the take-back goes as a note).
+    pub leave_abort_row: Option<u64>,
+    /// WP6.3 (M-1): whether this node's root lease was usable at the last
+    /// look; its edge rebases the leave clocks.
+    pub leave_root_was_usable: bool,
+    /// WP6.3 (M6): when this node last queued a leave-acquire.
+    pub leave_acquire_at: Option<WaitMs>,
     /// The latest leave sequence (the request id of the note) of each node
     /// that took its leave back: a leaving note of that sequence or an
     /// older one (a delayed duplicate) marks nothing.
@@ -3758,6 +3808,9 @@ impl Core {
         let level = self.root_deleg_level(now);
         self.dl.root_synced = level;
         if level != RootSync::None {
+            // WP6.3 (4.4): before any grant of this tenure, what the log
+            // says of the nodes that leave.
+            self.leave_seed_from_rows(now, replica);
             let live: BTreeSet<u64> = table.gens().collect();
             // The generations this sync looks at: `table` is the snapshot
             // taken at its start. A generation granted while it runs (the
@@ -14127,7 +14180,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if gen == LEAVE_NOTE_GEN {
-            self.on_leave_note(now, from, req, released, out);
+            self.on_leave_note(now, from, req, released, replica, out);
             return;
         }
         // Plan 46 M0.3 (S5, ADR-42): a takeover gate whose journal work is
@@ -14190,8 +14243,10 @@ impl Core {
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.delegate_heard = Some(now.wait);
         }
-        if released.as_ref().is_some_and(|n| n.leaving) && !self.leave_note_stale(from, req) {
-            self.leave_mark(now, from, Some(req));
+        if released.as_ref().is_some_and(|n| n.leaving)
+            && !self.leave_note_stale(from, req, replica)
+        {
+            self.leave_mark(now, from, Some(req), replica);
         }
         self.deleg_live_by_stream(now, gen);
         let g = self.dl.gens.get(&gen).expect("present");
@@ -14511,7 +14566,7 @@ impl Core {
         if own && (kind != DelegKind::Sticky || source == GrantSource::Operator) {
             return Err("cannot delegate to the root itself".into());
         }
-        if !own && self.is_leaving(now, node) {
+        if !own && self.is_leaving(node, replica) {
             return Err(format!("node {node} is leaving; nothing is granted to it"));
         }
         // ADR-61: nor to the root itself while it leaves (its own leave may
@@ -15652,57 +15707,422 @@ impl Core {
     /// `node` is leaving: this root grants it nothing more, and a
     /// designation waiting to be journaled for it is dropped.
     ///
-    /// `note` is the request of the node's own note. The leaving node sends
-    /// it again every resend interval for as long as its leave lasts (also
-    /// after the core answered it, and to a new root), so the mark lapses
-    /// when no note has come for three resend intervals or
-    /// twice the delegation TTL, whichever is longer (a node that stays up,
-    /// or comes back under the same id, is granted again), not at a fixed
-    /// time after the first one. `None` is an
-    /// operator's leave, whose mark goes with the leave that fails.
-    fn leave_mark(&mut self, now: Now, node: NodeId, note: Option<OpId>) {
-        let mark = match (self.dl.leaving.get(&node), note) {
-            // (An operator's mark is not weakened by the node's note.)
-            (Some(m), Some(_)) if m.until.is_none() => *m,
-            (_, Some(req)) => LeaveMark {
-                until: Some(now.wait.plus(self.leave_note_lapse_ms())),
-                req: req.0,
+    /// WP6.3 (ADR-61): the leave is a log row. A usable root journals
+    /// `NodeLeaving { node, req, leaving: true }` (once per request; a
+    /// failed journal is retried at the next note, and the mark blocks
+    /// grants meanwhile), and every root, a successor included, refuses a
+    /// grant to a node whose latest row says it leaves ([`Self::is_leaving`]).
+    ///
+    /// `note` is the request of the node's own note, which the leaving node
+    /// sends again every resend interval for as long as its leave lasts
+    /// (also after the core answered it, and to a new root): each refreshes
+    /// the mark's `last_note`, which the lapse counts from
+    /// ([`Self::leave_lapse_check`]). `None` is an operator's leave (request
+    /// 0), whose mark goes with the leave that fails.
+    fn leave_mark(&mut self, now: Now, node: NodeId, note: Option<OpId>, replica: &dyn Replica) {
+        let (req, operator) = match note {
+            Some(r) => (r.0, false),
+            None => (0, true),
+        };
+        let mut mark = match self.dl.leaving.get(&node).copied() {
+            // (An operator's mark is not weakened by the node's note, and
+            // keeps the note's request for when the operator's leave fails.)
+            Some(m) if m.operator && !operator => LeaveMark {
+                last_note: now.wait,
+                note: Some(m.note.map_or(req, |n| n.max(req))),
+                ..m
             },
-            (_, None) => LeaveMark {
-                until: None,
+            Some(m) if operator => LeaveMark {
                 req: 0,
+                operator: true,
+                last_note: now.wait,
+                journaled: m.journaled.filter(|(r, _)| *r == 0),
+                note: if m.operator { m.note } else { Some(m.req) },
+            },
+            // (A delayed duplicate of an older note only keeps it fresh.)
+            Some(m) if req < m.req => LeaveMark {
+                last_note: now.wait,
+                ..m
+            },
+            Some(m) => LeaveMark {
+                req,
+                operator: false,
+                last_note: now.wait,
+                journaled: m.journaled.filter(|(r, _)| *r == req),
+                note: None,
+            },
+            None => LeaveMark {
+                req,
+                operator,
+                last_note: now.wait,
+                journaled: None,
+                note: None,
             },
         };
+        self.dl.leave_note_seen.remove(&node);
+        if self.root_usable(now) && mark.journaled.map(|(r, _)| r) != Some(mark.req) {
+            let found =
+                Self::leave_row(replica, node).is_some_and(|r| r.leaving && r.req == mark.req);
+            mark.journaled = if found {
+                // The log carries it already (a predecessor's row, or this
+                // tenure's earlier one): durable once the journal's tip is
+                // (S-2: not at once, the row may be this node's own,
+                // unshipped).
+                Some((mark.req, replica.journal_tip()))
+            } else {
+                self.journal_leave_row(node, mark.req, true, replica)
+                    .map(|jseq| (mark.req, jseq))
+            };
+        }
         self.dl.leaving.insert(node, mark);
         self.dl.designating.retain(|_, n| *n != node);
         self.dl.growing.retain(|_, (n, _)| *n != node);
     }
 
+    /// WP6.3: the latest `NodeLeaving` row of `node` this replica carries.
+    fn leave_row(
+        replica: &dyn Replica,
+        node: NodeId,
+    ) -> Option<constellation_meta::delegation::LeaveRow> {
+        replica
+            .deleg_leaves()
+            .ok()
+            .and_then(|rows| rows.get(&node).copied())
+    }
+
+    /// WP6.3: journal a `NodeLeaving` row (this node is a usable root). The
+    /// journal seq of the row, `None` when it could not be journaled.
+    fn journal_leave_row(
+        &mut self,
+        node: NodeId,
+        req: u64,
+        leaving: bool,
+        replica: &dyn Replica,
+    ) -> Option<u64> {
+        let _class = self.journal_class();
+        let rec = LogRecord::NodeLeaving { node, req, leaving };
+        match replica.apply_records_journaled(&[rec], None) {
+            Ok(()) => {
+                self.stats.leave_rows += 1;
+                Some(replica.journal_tip())
+            }
+            Err(error) => {
+                tracing::warn!(node = self.me(), leaving_node = node, %error, "could not journal a leave row");
+                None
+            }
+        }
+    }
+
+    /// WP6.3: a journaled row of this tenure is durable (acknowledged by
+    /// the group, or in the log; `u64::MAX`: nothing gates).
+    fn leave_row_durable(&self, jseq: u64) -> bool {
+        self.ack_need_at(jseq).is_none()
+    }
+
+    /// WP6.3: `node` is no longer leaving: the mark goes, and a usable root
+    /// journals `leaving: false` when the log's row says `true`. `false`,
+    /// and nothing changed (the mark stays and blocks grants), when the row
+    /// could not be read or the take-back could not be journaled: the caller
+    /// does not acknowledge a take-back then, and a lapse tries again at the
+    /// node's next message.
+    ///
+    /// The rule (M-1, ADR-61): only the node's own take-back
+    /// ([`LeaveUnmark::TakeBack`]) ends the request it is for. It writes
+    /// `false(R)` with the request `R` itself and raises `leave_taken_back`,
+    /// so a delayed leaving note of `R` or older is stale for good. An
+    /// un-mark without the node's word ([`LeaveUnmark::Lapsed`]: the lapse)
+    /// must not make the node's *current* request stale: the leaving node sends the same request again
+    /// with every note, and a stale note marks nothing, so the node would
+    /// stay un-marked for the rest of its leave while counting it told. It
+    /// raises nothing and writes a `false` row below *every* request the leave
+    /// can still send, so the next note marks the node again and journals
+    /// `true`. The requests of one leave are not one number: the mark's is the
+    /// highest seen (a release note's, `R + 1`, may come before the note's
+    /// `R`, and the node resends `R`), so the lapse writes the node's own
+    /// take-back floor (the highest request it took back, below any request of
+    /// a later leave, and 0 if none), capped below the mark's request. The
+    /// return under a newer incarnation ([`LeaveUnmark::Returned`]) ends the
+    /// leave of a dead incarnation: it writes `false(mark.req)` itself, so
+    /// a delayed note of that incarnation (at or below the mark's request)
+    /// is stale and does not mark the node again (SHOULD 2), while every
+    /// request of the new incarnation (above `new << 40`) is above it.
+    pub(crate) fn leave_unmark(
+        &mut self,
+        now: Now,
+        node: NodeId,
+        why: LeaveUnmark,
+        replica: &dyn Replica,
+    ) -> bool {
+        // (An unreadable row is not "no row": hold back.)
+        let Ok(rows) = replica.deleg_leaves() else {
+            return false;
+        };
+        let row = rows.get(&node).copied();
+        let mark = self.dl.leaving.get(&node).copied();
+        let top = mark.map(|m| m.req).or(row.map(|r| r.req)).unwrap_or(0);
+        let below = top.saturating_sub(1);
+        let req = match why {
+            LeaveUnmark::TakeBack(req) => req,
+            LeaveUnmark::Lapsed => self
+                .dl
+                .leave_taken_back
+                .get(&node)
+                .copied()
+                .unwrap_or(0)
+                .min(below),
+            LeaveUnmark::Returned => top,
+        };
+        if self.root_usable(now)
+            && row.is_some_and(|r| r.leaving)
+            && self.journal_leave_row(node, req, false, replica).is_none()
+        {
+            return false;
+        }
+        self.dl.leaving.remove(&node);
+        self.dl.leave_note_seen.remove(&node);
+        if let LeaveUnmark::TakeBack(req) = why {
+            let t = self.dl.leave_taken_back.entry(node).or_insert(0);
+            *t = (*t).max(req);
+        }
+        true
+    }
+
     /// How often a leaving node sends its note again.
-    fn leave_resend_ms(&self) -> i64 {
+    pub(crate) fn leave_resend_ms(&self) -> i64 {
         self.dl_t().leave_resend as i64
     }
 
     /// How long the root's mark of a leaving node lasts without a note.
-    fn leave_note_lapse_ms(&self) -> u64 {
+    pub(crate) fn leave_note_lapse_ms(&self) -> u64 {
         self.dl_t().leave_note_lapse
     }
 
     /// Whether a leaving note of `req` from `node` is a delayed duplicate
-    /// of one a take-back came after.
-    fn leave_note_stale(&self, node: NodeId, req: OpId) -> bool {
+    /// of one a take-back came after (this tenure's, or the log's row).
+    fn leave_note_stale(&self, node: NodeId, req: OpId, replica: &dyn Replica) -> bool {
         self.dl
             .leave_taken_back
             .get(&node)
             .is_some_and(|t| req.0 <= *t)
+            || Self::leave_row(replica, node).is_some_and(|r| !r.leaving && req.0 <= r.req)
     }
 
-    /// `node` is leaving (see [`DelegationState::leaving`]).
-    pub(crate) fn is_leaving(&self, now: Now, node: NodeId) -> bool {
+    /// `node` is leaving: this tenure's mark (see [`DelegationState::leaving`])
+    /// or the log's row says so. Unreadable rows refuse the grant.
+    pub(crate) fn is_leaving(&self, node: NodeId, replica: &dyn Replica) -> bool {
+        if self.dl.leaving.contains_key(&node) {
+            return true;
+        }
+        match replica.deleg_leaves() {
+            Ok(rows) => rows.get(&node).is_some_and(|r| r.leaving),
+            Err(_) => true,
+        }
+    }
+
+    /// A node back under a new incarnation is not the one whose leave note
+    /// marked it: it is granted again (WP6.3: its row is taken back too,
+    /// without making its current request stale, see [`Self::leave_unmark`]).
+    /// An operator's mark stays. Only a mark or a row of an *earlier*
+    /// incarnation (the incarnation sits in the request id's high bits, see
+    /// `Core::new`) is un-marked: a root that last saw the node's old
+    /// incarnation in a lock request would otherwise un-mark the current
+    /// incarnation's durable leave at its first lock request (S-5).
+    pub(crate) fn leave_incarnation_back(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        incarnation: u32,
+        replica: &dyn Replica,
+    ) {
+        let mark = self.dl.leaving.get(&from).copied();
+        if mark.is_some_and(|m| m.operator) {
+            return;
+        }
+        let new = u64::from(incarnation) & 0x3f_ffff;
+        let older = |req: u64| (req >> 40) < new;
+        let row = Self::leave_row(replica, from).filter(|r| r.leaving);
+        if (mark.is_some() || row.is_some())
+            && mark.is_none_or(|m| older(m.req))
+            && row.is_none_or(|r| older(r.req))
+        {
+            self.leave_unmark(now, from, LeaveUnmark::Returned, replica);
+        }
+    }
+
+    /// WP6.3 (4.8): an operator's leave of `node` failed at its deadline: the
+    /// node is not leaving, and may be granted again. A usable root takes
+    /// the row back (request 0) when the log says `true`. Like the lapse, not
+    /// the node's own take-back: `leave_taken_back` stays alone.
+    pub(crate) fn leave_fail_operator(&mut self, now: Now, node: NodeId, replica: &dyn Replica) {
+        let note = self.dl.leaving.get(&node).and_then(|m| m.note);
+        // (SHOULD 3: the node's own note was acknowledged under the
+        // operator's mark, and the node counts its leave told. It still
+        // leaves: a mark of that note takes the operator's place, and its row
+        // the operator's, unless a take-back of the note came since.)
+        if let Some(req) = note {
+            if !self.leave_note_stale(node, OpId(req), replica) {
+                self.dl.leaving.remove(&node);
+                self.leave_mark(now, node, Some(OpId(req)), replica);
+                return;
+            }
+        }
+        // (An unreadable row is not "no row" (NIT): the mark stays and
+        // blocks grants, as a note's mark, which the lapse takes back with
+        // the row once it is readable.)
+        let Ok(rows) = replica.deleg_leaves() else {
+            if let Some(m) = self.dl.leaving.get_mut(&node) {
+                m.operator = false;
+                m.note = None;
+                m.last_note = now.wait;
+            }
+            return;
+        };
+        self.dl.leaving.remove(&node);
+        self.dl.leave_note_seen.remove(&node);
+        if self.root_usable(now) && rows.get(&node).is_some_and(|r| r.leaving) {
+            self.journal_leave_row(node, 0, false, replica);
+        }
+    }
+
+    /// S-4: an operator's mark whose row is not journaled (the journal
+    /// failed) is journaled again.
+    fn leave_operator_row_retry(&mut self, now: Now, node: NodeId, replica: &dyn Replica) {
+        if self.root_usable(now)
+            && self
+                .dl
+                .leaving
+                .get(&node)
+                .is_some_and(|m| m.operator && m.journaled.is_none())
+        {
+            self.leave_mark(now, node, None, replica);
+        }
+    }
+
+    /// WP6.3 (4.4): at a tenure's start, what the log's rows say. A node
+    /// whose row says `leaving` and that has no mark here is timed from now
+    /// (the lapse counts from the first sight, as from a note), and a row
+    /// that says `false` raises the take-back floor, so a delayed leaving
+    /// note a successor receives is stale. The grants themselves never
+    /// depend on this: [`Self::is_leaving`] reads the rows.
+    fn leave_seed_from_rows(&mut self, now: Now, replica: &dyn Replica) {
+        let Ok(rows) = replica.deleg_leaves() else {
+            return;
+        };
+        for (node, row) in &rows {
+            if row.leaving {
+                if !self.dl.leaving.contains_key(node) {
+                    self.dl.leave_note_seen.entry(*node).or_insert(now.wait);
+                }
+            } else {
+                let t = self.dl.leave_taken_back.entry(*node).or_insert(0);
+                *t = (*t).max(row.req);
+                self.dl.leave_note_seen.remove(node);
+            }
+        }
         self.dl
-            .leaving
-            .get(&node)
-            .is_some_and(|m| m.until.is_none_or(|t| now.wait < t))
+            .leave_note_seen
+            .retain(|node, _| rows.get(node).is_some_and(|r| r.leaving));
+    }
+
+    /// WP6.3 (M1): the lapse. A node that has been heard, by a message that
+    /// is no leaving note, after a full lapse window with no note of its
+    /// leave (or none since this tenure first saw its row) is not leaving:
+    /// the row is taken back (`leaving: false`) and it is granted again. An
+    /// exited node never sends such a message, a live leaver keeps sending
+    /// notes, and one that restarted under its id sends messages and no
+    /// notes. An operator's mark never lapses; being heard once and then
+    /// silent never lapses a mark.
+    pub(crate) fn leave_lapse_check(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        msg: &PeerMsg,
+        replica: &dyn Replica,
+    ) {
+        self.leave_usable_edge(now);
+        if from == self.me() || from == 0 || !self.root_usable(now) {
+            return;
+        }
+        if let PeerMsg::DelegateStream {
+            released: Some(note),
+            ..
+        } = msg
+        {
+            if note.leaving {
+                return;
+            }
+        }
+        let last = match self.dl.leaving.get(&from) {
+            Some(m) if m.operator => return,
+            Some(m) => m.last_note,
+            None => {
+                // SHOULD 4: the log's rows are read for a sender that has no
+                // mark and is not yet seen on a row at most once per resend
+                // interval (a read transaction, a prefix scan and a map, for
+                // every peer message otherwise). A row this tenure's first
+                // look missed is seen at the next one; the lapse counts from
+                // the sight.
+                if !self.dl.leave_note_seen.contains_key(&from) {
+                    let due = self
+                        .dl
+                        .leave_row_looked
+                        .get(&from)
+                        .is_none_or(|at| now.wait.since(*at) >= self.leave_resend_ms());
+                    if !due {
+                        return;
+                    }
+                    self.dl.leave_row_looked.insert(from, now.wait);
+                    self.stats.leave_row_scans += 1;
+                    if !Self::leave_row(replica, from).is_some_and(|r| r.leaving) {
+                        return;
+                    }
+                }
+                *self.dl.leave_note_seen.entry(from).or_insert(now.wait)
+            }
+        };
+        if now.wait.since(last) < self.leave_note_lapse_ms() as i64 {
+            return;
+        }
+        if self.leave_unmark(now, from, LeaveUnmark::Lapsed, replica) {
+            self.stats.leave_lapses += 1;
+        }
+    }
+
+    /// WP6.3 (M-1): the time this root could not hear is not the leaver's
+    /// silence. Called when this node's own lag is seen
+    /// (`Event::OwnLag`) and when the root is usable again after it was
+    /// not: every note clock restarts from `now`.
+    pub(crate) fn leave_rebase_clocks(&mut self, now: Now) {
+        for m in self.dl.leaving.values_mut() {
+            m.last_note = now.wait;
+        }
+        for at in self.dl.leave_note_seen.values_mut() {
+            *at = now.wait;
+        }
+    }
+
+    /// WP6.3 (SHOULD 1): this node's own lag (`Event::OwnLag`). A leaving node
+    /// forgets which root told it its leave is known: while it was deaf its
+    /// root may have lapsed the mark (the rebase protects a root's own deaf
+    /// time, not the leaver's), and a grant journaled then may not be on the
+    /// leaver's replica yet. The leave counts told again once a root
+    /// acknowledges the note it sends again, which that root does only when
+    /// its mark and row are durable.
+    pub(crate) fn leave_own_lag(&mut self) {
+        if self.dl.leave_self {
+            self.dl.leave_told = None;
+        }
+    }
+
+    /// The edge of `root_usable`: a root that was not usable and is again
+    /// rebases the leave clocks ([`Self::leave_rebase_clocks`]). Looked at
+    /// by every event (the lapse's door, and `deleg_leave_progress`).
+    fn leave_usable_edge(&mut self, now: Now) {
+        let usable = self.root_usable(now);
+        let was = std::mem::replace(&mut self.dl.leave_root_was_usable, usable);
+        if usable && !was {
+            self.leave_rebase_clocks(now);
+        }
     }
 
     /// The streams the table lists for `node`, with a live generation here
@@ -15719,6 +16139,7 @@ impl Core {
     fn leave_wait_arm(&mut self, now: Now, out: &mut Vec<Action>) {
         // (A leaving node keeps telling its root for as long as it leaves.)
         let telling = self.dl.leave_tell.is_some()
+            || self.dl.leave_abort_row.is_some()
             || (self.dl.leave_self
                 && self.cfg.delegation
                 && self.cfg.p2p
@@ -15756,6 +16177,7 @@ impl Core {
     ) {
         let me = self.me();
         self.dl.leave_self = true;
+        self.dl.leave_abort_row = None;
         self.dl.leave_told = None;
         self.dl.leave_tell = None;
         self.dl.leave_waits.push(LeaveWait {
@@ -16831,7 +17253,7 @@ impl Core {
             return;
         }
         // Nothing more is granted to the node from here on.
-        self.leave_mark(now, node, None);
+        self.leave_mark(now, node, None, replica);
         self.dl.leave_waits.push(LeaveWait {
             op,
             who: node,
@@ -16842,23 +17264,25 @@ impl Core {
         self.leave_wait_arm(now, out);
     }
 
-    /// This node's leave is known to the root it has now: that root
-    /// acknowledged the leave note, or this node holds the lease itself (or
-    /// nobody can grant: delegation is off).
+    /// This node's leave is known to the root it has now (WP6.3, ADR-61): a
+    /// root other than this node acknowledged the leave note, which it does
+    /// only once its `NodeLeaving` row is durable and it lists no live
+    /// generation of this node; or this node is the root itself and its own
+    /// row is durable (`root_usable` alone is not enough: a successor
+    /// reads the log). Nobody can grant when delegation is off. There is no
+    /// "the lease is released" shortcut: with no root to tell, the leave
+    /// takes the released lease itself (`leave_acquire_progress`).
     pub(crate) fn leave_told_ok(&self, now: Now) -> bool {
-        if !self.cfg.delegation || !self.cfg.p2p || self.root_usable(now) {
+        if !self.cfg.delegation || !self.cfg.p2p {
             return true;
         }
-        // (No root to tell: the lease as this node read it is released. A
-        // leaving node takes no grant, so nothing new is granted to it, and
-        // whatever it holds is released or lapses, which the leave waits
-        // for separately; an idle cluster's leave is not stuck on a root
-        // that is nobody.)
-        self.lease
-            .last_seen
-            .as_ref()
-            .is_some_and(|l| l.released || l.holder == 0)
-            || (self.dl.leave_told.is_some() && self.dl.leave_told == self.root_node())
+        if self.root_usable(now) {
+            return self
+                .dl
+                .leave_own
+                .is_some_and(|(_, jseq)| self.leave_row_durable(jseq));
+        }
+        self.dl.leave_told.is_some() && self.dl.leave_told == self.root_node()
     }
 
     /// A leave note to the root: sent when the leave starts and again every
@@ -16969,12 +17393,19 @@ impl Core {
     /// nothing more, from before the answer), or it does not any more (a
     /// leave that failed; a note older than the mark it would take back is
     /// ignored, and an operator's mark stays).
+    ///
+    /// WP6.3: the leaving note is acknowledged only once the node's
+    /// `NodeLeaving` row of this tenure is durable (the holder sends the
+    /// note again every resend, so no timer is needed), and the take-back
+    /// is a `leaving: false` row, journaled also when this root has no mark
+    /// (a predecessor's older `true` row may be the log's).
     fn on_leave_note(
         &mut self,
         now: Now,
         from: NodeId,
         req: OpId,
         note: Option<constellation_meta::locks::ReleaseNote>,
+        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         let ok = self.cfg.delegation && self.cfg.p2p && self.root_usable(now) && note.is_some();
@@ -16989,8 +17420,13 @@ impl Core {
         let mut held_back = false;
         if ok {
             if note.as_ref().is_some_and(|n| n.leaving) {
-                if !self.leave_note_stale(from, req) {
-                    self.leave_mark(now, from, Some(req));
+                if self.leave_note_stale(from, req, replica) {
+                    // (A note that marks nothing is no leave this root
+                    // knows of: refused, so the node does not count the
+                    // leave told on it.)
+                    held_back = true;
+                } else {
+                    self.leave_mark(now, from, Some(req), replica);
                     let live: Vec<u64> = self
                         .dl
                         .gens
@@ -17002,19 +17438,44 @@ impl Core {
                     for gen in live {
                         self.start_recall_for(now, gen, RecallCause::LeaveNote, out);
                     }
+                    // The row is in the log before the node counts the leave
+                    // told (no grant of a successor can then order before it).
+                    let durable = self
+                        .dl
+                        .leaving
+                        .get(&from)
+                        .and_then(|m| m.journaled)
+                        .is_some_and(|(_, jseq)| self.leave_row_durable(jseq));
+                    held_back |= !durable;
                 }
             } else {
                 // (Remembered also when nothing is marked: a delayed
                 // leaving note may still come.)
                 let t = self.dl.leave_taken_back.entry(from).or_insert(0);
                 *t = (*t).max(req.0);
-                if self
-                    .dl
-                    .leaving
-                    .get(&from)
-                    .is_some_and(|m| m.until.is_some() && m.req < req.0)
-                {
-                    self.dl.leaving.remove(&from);
+                let mark = self.dl.leaving.get(&from).copied();
+                // (An operator's mark stays.)
+                if !mark.is_some_and(|m| m.operator) {
+                    // (An unreadable row is not "no row" (S-6): the
+                    // take-back is not acknowledged, the node sends it again.)
+                    match replica.deleg_leaves() {
+                        Err(_) => held_back = true,
+                        Ok(rows) => {
+                            let mark_older = mark.is_some_and(|m| m.req < req.0);
+                            let row_older =
+                                rows.get(&from).is_some_and(|r| r.leaving && r.req < req.0);
+                            if (mark_older || row_older)
+                                && !self.leave_unmark(
+                                    now,
+                                    from,
+                                    LeaveUnmark::TakeBack(req.0),
+                                    replica,
+                                )
+                            {
+                                held_back = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -17033,11 +17494,83 @@ impl Core {
     }
 
     /// This node's own leave failed (out of time): it is not leaving, takes
-    /// grants again, and tells the root so.
-    pub(crate) fn leave_self_abort(&mut self, now: Now, out: &mut Vec<Action>) {
+    /// grants again, and tells the root so. As the root itself (WP6.3, M3) it
+    /// journals the take-back row directly: its own tell is dropped under
+    /// `root_usable`, so the note would never go.
+    pub(crate) fn leave_self_abort(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let told = self.dl.leave_told.take();
         let pending = self.dl.leave_tell.take();
         self.dl.leave_self = false;
+        let own = self.dl.leave_own.take();
+        if self.root_usable(now) {
+            // S-3: keyed on the log's row, not on this tenure's journaling:
+            // `leave_own` is `None` when the journal failed or the abort came
+            // before the first progress as root, and a predecessor's
+            // `true(me)` row is the log's all the same. This node's own tell
+            // is dropped under `root_usable`, so the note would never go.
+            let me = self.me();
+            let row = match replica.deleg_leaves() {
+                Ok(rows) => rows.get(&me).copied().filter(|r| r.leaving),
+                // (Unreadable: take back what this tenure journaled.)
+                Err(_) => own.map(|(req, _)| constellation_meta::delegation::LeaveRow {
+                    req,
+                    leaving: true,
+                }),
+            };
+            if let Some(row) = row {
+                let req = own.map_or(row.req, |(req, _)| req);
+                if self.journal_leave_row(me, req, false, replica).is_none() {
+                    // (Kept until it journals: `leave_abort_retry`.)
+                    self.dl.leave_abort_row = Some(req);
+                    self.leave_wait_arm(now, out);
+                }
+                return;
+            }
+        }
+        self.leave_tell_off(now, told, pending, out);
+    }
+
+    /// WP6.3 (SHOULD 5): a root's abort whose take-back row did not journal:
+    /// tried again at every look while this node is the root. A node that is
+    /// no root any more tells the root there is now, as an abort off the
+    /// lease does; a new leave of the node (its own, later row) supersedes
+    /// the take-back.
+    fn leave_abort_retry(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let Some(req) = self.dl.leave_abort_row else {
+            return;
+        };
+        if self.dl.leave_self {
+            self.dl.leave_abort_row = None;
+            return;
+        }
+        if self.root_usable(now) {
+            if self
+                .journal_leave_row(self.me(), req, false, replica)
+                .is_some()
+            {
+                self.dl.leave_abort_row = None;
+            }
+        } else {
+            self.dl.leave_abort_row = None;
+            self.leave_tell_off(now, None, None, out);
+        }
+    }
+
+    /// Tell the root there is now (else the last one told, or the one the
+    /// pending note was for) that this node's leave is off, until it
+    /// acknowledges.
+    fn leave_tell_off(
+        &mut self,
+        now: Now,
+        told: Option<NodeId>,
+        pending: Option<LeaveTell>,
+        out: &mut Vec<Action>,
+    ) {
         // The root there is now is told (the one that was told may have
         // lost the lease; its mark went with it); the last one told when
         // none is known.
@@ -17065,8 +17598,57 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        self.leave_usable_edge(now);
         self.leave_waits_progress(now, replica, out);
+        self.leave_abort_retry(now, replica, out);
         self.leave_tell_progress(now, out);
+    }
+
+    /// WP6.3 (5.4): a leave with no root to tell, and a lease the last read
+    /// shows released (or held by nobody), takes the lease itself: the node
+    /// is then the root of its own leave and answers once its own row is
+    /// durable. Never a live holder's lease (`LEAVE_ACQUIRE_REASON` never
+    /// asks, and takes only a released one), never in a continuation epoch
+    /// (an epoch's acquisition would send a `LeaseRequest` whatever
+    /// `ask_handoff` says, pulling the hold onto a node about to retire; the
+    /// leave then fails at its deadline: latency, not integrity), at most
+    /// once per resend interval and not before the last acquisition's
+    /// retry hint.
+    fn leave_acquire_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if !self.cfg.delegation || !self.cfg.p2p || self.root_usable(now) {
+            return;
+        }
+        if !self
+            .lease
+            .last_seen
+            .as_ref()
+            .is_some_and(|l| l.released || l.holder == 0)
+        {
+            return;
+        }
+        if self.epoch.open || self.epoch.active || self.dl.epoch_active || self.acquiring() {
+            return;
+        }
+        let resend = self.leave_resend_ms();
+        if self
+            .dl
+            .leave_acquire_at
+            .is_some_and(|at| now.wait.since(at) < resend)
+            || self.acquire_retry_hint.is_some_and(|at| at > now.wait)
+        {
+            return;
+        }
+        self.dl.leave_acquire_at = Some(now.wait);
+        self.stats.leave_acquires += 1;
+        self.enqueue_job(
+            now,
+            super::jobs::JobReq::Acquire {
+                reason: super::jobs::LEAVE_ACQUIRE_REASON,
+                ask_handoff: false,
+            },
+            replica,
+            out,
+        );
     }
 
     fn leave_waits_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -17079,6 +17661,26 @@ impl Core {
         let mut keep = Vec::new();
         for mut w in waits.drain(..) {
             let streams = self.leave_streams_of(w.who, replica);
+            // WP6.3 (M3): this node is the root of its own leave: its own
+            // `NodeLeaving` row is the log's word that it leaves, once per
+            // tenure; the leave is answered when that row is durable.
+            if w.who == me
+                && self.cfg.delegation
+                && self.cfg.p2p
+                && self.dl.leave_own.is_none()
+                && self.root_usable(now)
+            {
+                // (M-2: an `op_id()`, like a note's request, not the
+                // driver's control id: control ids start at `1 << 48`, above
+                // every request of an incarnation, and a row taken back at
+                // that number would make every later note of this node stale
+                // on every other root, which compares a note's request with
+                // the row's. Fresh, so above what the node sent before.)
+                let req = self.op_id().0;
+                if let Some(jseq) = self.journal_leave_row(me, req, true, replica) {
+                    self.dl.leave_own = Some((req, jseq));
+                }
+            }
             let done = if w.who == me {
                 // (This node's own journal applies its release rows to its
                 // table at once, so the table is no witness: the root has
@@ -17118,7 +17720,19 @@ impl Core {
                     && ended
                     && self.dl.mine.values().all(|d| d.release_acked)
             } else {
-                streams.is_empty() && !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
+                // (S-4: the operator's `Ok` is the node's retirement; the
+                // row that refuses its grants is durable first, as a note's
+                // answer waits for it. A row that could not be journaled is
+                // tried again.)
+                self.leave_operator_row_retry(now, w.who, replica);
+                streams.is_empty()
+                    && !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
+                    && self
+                        .dl
+                        .leaving
+                        .get(&w.who)
+                        .and_then(|m| m.journaled)
+                        .is_some_and(|(_, jseq)| self.leave_row_durable(jseq))
             };
             if done {
                 out.push(Action::ControlDone {
@@ -17137,13 +17751,13 @@ impl Core {
                 if w.who != me {
                     // (The retirement does not follow: the node is not
                     // leaving, and may be granted again.)
-                    self.dl.leaving.remove(&w.who);
+                    self.leave_fail_operator(now, w.who, replica);
                     let held = self.non_stealable_live_dirs_of(w.who);
                     if !held.is_empty() {
                         stuck = Some(Self::leave_abandon_first(w.who, &held));
                     }
                 } else {
-                    self.leave_self_abort(now, out);
+                    self.leave_self_abort(now, replica, out);
                 }
                 out.push(Action::ControlDone {
                     op: w.op,
@@ -17158,6 +17772,7 @@ impl Core {
                 continue;
             }
             if w.who == me {
+                self.leave_acquire_progress(now, replica, out);
                 // Release what the table or this node's state lists, once
                 // and again every resend interval (the batch with the note
                 // goes out again; a lost request is the root's to resend, a
@@ -17295,6 +17910,10 @@ impl Core {
         self.dl.designating.clear();
         self.dl.leaving.clear();
         self.dl.leave_taken_back.clear();
+        self.dl.leave_note_seen.clear();
+        self.dl.leave_row_looked.clear();
+        self.dl.leave_own = None;
+        self.dl.leave_root_was_usable = false;
         // An operator's leave waits on this root's own state: a new root
         // does not know the node leaves, and the table here lags, so the
         // wait must not end as done. It is for the operator to run again on

@@ -59,7 +59,7 @@ pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
 #[cfg(any(test, feature = "test-util"))]
 pub use store::backup::{
     append_contiguous_read_faults_on_this_thread_for_tests,
-    fail_deleg_backup_reads_on_this_thread_for_tests,
+    fail_deleg_backup_reads_on_this_thread_for_tests, fail_journal_writes_on_this_thread_for_tests,
     fail_store_reads_after_on_this_thread_for_tests,
 };
 pub use store::backup::{BackupRole, BackupTx, TailAppend};

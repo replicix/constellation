@@ -980,6 +980,33 @@ pub fn append_contiguous_read_faults_on_this_thread_for_tests() -> u32 {
     read_fault::APPEND_HITS.with(|c| c.get())
 }
 
+/// Fail the next `n` journal writes of the stores on this thread
+/// ([`Meta::apply_records_journaled`] and its kin) with an I/O error.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_journal_writes_on_this_thread_for_tests(n: u32) {
+    JOURNAL_WRITE_FAULTS.with(|c| c.set(n));
+}
+
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    static JOURNAL_WRITE_FAULTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn injected_journal_fault() -> Result<(), MetaError> {
+    JOURNAL_WRITE_FAULTS.with(|c| {
+        let n = c.get();
+        c.set(n.saturating_sub(1));
+        if n > 0 {
+            Err(MetaError::Io(std::io::Error::other(
+                "injected journal write fault (testing only)",
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
 /// The test hook's check, for the store's other reads it covers.
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) fn injected_read_fault() -> Result<(), MetaError> {

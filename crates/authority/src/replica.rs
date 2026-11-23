@@ -418,6 +418,12 @@ pub trait Replica {
         &self,
         gen: u64,
     ) -> Result<Option<constellation_meta::delegation::NodeGroupRow>, MetaError>;
+    /// WP6.3 (ADR-61): every node's latest `NodeLeaving` row on this replica.
+    /// `Err`: the rows could not be read; a caller that gates a grant on them
+    /// refuses it.
+    fn deleg_leaves(
+        &self,
+    ) -> Result<std::collections::BTreeMap<u64, constellation_meta::delegation::LeaveRow>, MetaError>;
     /// Who executes an op touching `keys` (an ancestor walk on this
     /// replica's table; `Root` at once when the table is empty).
     fn resolve_ownership(&self, keys: &TouchSet) -> Ownership;
@@ -1588,6 +1594,15 @@ impl Replica for Meta {
     ) -> Result<Option<constellation_meta::delegation::NodeGroupRow>, MetaError> {
         Meta::deleg_group(self, gen).inspect_err(|error| {
             tracing::warn!(%error, gen = %constellation_meta::delegation::GenLabel::of(gen), "reading a delegation's group failed");
+        })
+    }
+
+    fn deleg_leaves(
+        &self,
+    ) -> Result<std::collections::BTreeMap<u64, constellation_meta::delegation::LeaveRow>, MetaError>
+    {
+        Meta::deleg_leaves(self).inspect_err(|error| {
+            tracing::warn!(%error, "reading the delegation leave rows failed");
         })
     }
 

@@ -285,8 +285,14 @@ impl Core {
     /// lease placement to hand it the lease first (harness
     /// `auto-placement`, 2 in 11: `place_skipped_unreachable` 9, the
     /// lease on b at the 5 s evaluation, `d1` never delegated).
-    fn place_eligible(&mut self, now: Now, node: NodeId, out: &mut Vec<Action>) -> bool {
-        if self.is_leaving(now, node) {
+    fn place_eligible(
+        &mut self,
+        now: Now,
+        node: NodeId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if self.is_leaving(node, replica) {
             return false;
         }
         if !self.roster.links().get(&node).is_some_and(|l| l.connected) {
@@ -870,7 +876,7 @@ impl Core {
                 continue;
             }
             // (The root has no link to itself to be eligible by.)
-            if node != me && !self.place_eligible(now, node, out) {
+            if node != me && !self.place_eligible(now, node, replica, out) {
                 self.stats.place_skipped_unreachable += 1;
                 continue;
             }
@@ -1028,7 +1034,7 @@ impl Core {
                 }
                 // The root itself is always a node a subtree can go back to.
                 if to != me
-                    && !(self.place_eligible(now, to, out)
+                    && !(self.place_eligible(now, to, replica, out)
                         && self.place_kind_for(now, to, dir, replica).is_ok())
                 {
                     self.stats.place_handover_ineligible += 1;
@@ -1144,7 +1150,7 @@ impl Core {
                 }
             }
         } else {
-            if !self.place_eligible(now, r.to, out) {
+            if !self.place_eligible(now, r.to, replica, out) {
                 return;
             }
             match self.place_kind_for(now, r.to, dir, replica) {

@@ -2022,6 +2022,7 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
                     | LogRecord::ReleaseCut { .. }
                     | LogRecord::DelegateNodeEnded { .. }
                     | LogRecord::DelegateNodeGroup { .. }
+                    | LogRecord::NodeLeaving { .. }
                     // Plan 43 C1-4: bookkeeping of a re-shipped tail, no
                     // effect to redo.
                     | LogRecord::TailOf { .. }

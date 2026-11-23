@@ -11348,6 +11348,7 @@ impl OracleTotals {
         self.leave_driver.abandons += r.leave_driver.abandons;
         self.leave_driver.own += r.leave_driver.own;
         self.leave_driver.admin += r.leave_driver.admin;
+        self.leave_driver.acquires += r.leave_driver.acquires;
         for (t, c) in self.handover_core.iter_mut().zip(r.handover_core) {
             *t += c;
         }
@@ -11599,8 +11600,8 @@ impl OracleTotals {
             self.sticky_release_rows_judged
         );
         eprintln!(
-            "SWEEP-LEAVE-TOTALS {label} seeds {}/{seeds}: leaves refused at once naming the abandon {}, abandons run for a leave {}, retired by their own leave {}, retired by the admin form {}",
-            self.seeds, self.leave_driver.refused, self.leave_driver.abandons, self.leave_driver.own, self.leave_driver.admin
+            "SWEEP-LEAVE-TOTALS {label} seeds {}/{seeds}: leaves refused at once naming the abandon {}, abandons run for a leave {}, retired by their own leave {}, retired by the admin form {}, leave-acquires queued {}",
+            self.seeds, self.leave_driver.refused, self.leave_driver.abandons, self.leave_driver.own, self.leave_driver.admin, self.leave_driver.acquires
         );
         eprintln!(
             "SWEEP-CLAIM-RELEASE-TOTALS {label} seeds {}/{seeds}: claims that journaled the stream's release {}, with no row to journal {}, ends that waited for the stream's rows {}, ended ahead of held rows when the wait ran out {}",

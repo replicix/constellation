@@ -2302,6 +2302,8 @@ impl Meta {
         rid: Option<crate::Rid>,
         how: Journaled,
     ) -> Result<(), MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        super::backup::injected_journal_fault()?;
         let mut tx = self.db.write_tx();
         let done = self.journal_records_tx(&mut tx, records, rid, how)?;
         tx.commit()?;
@@ -3487,6 +3489,121 @@ mod root_substitution_tests {
         assert_eq!(
             take_last_journaled().unwrap().class,
             RowCommit::group(1, GroupOn::Delegate)
+        );
+    }
+
+    fn leave_rec(node: u64, req: u64, leaving: bool) -> LogRecord {
+        LogRecord::NodeLeaving { node, req, leaving }
+    }
+
+    /// WP6.3: a `NodeLeaving` row is a key of the `ns` funnel like the group row,
+    /// so a root that is deposed before the row ships strands it with the rest of
+    /// its journal, and the previous row's value is back (and a node it had no row
+    /// for has none). Fails if the record were applied outside the funnel: the
+    /// stranded row would stay in `deleg_leaves()`.
+    #[test]
+    fn a_stranded_leave_row_puts_the_previous_row_back() {
+        use crate::delegation::LeaveRow;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.apply_segment(
+            1,
+            1,
+            &[leave_rec(3, 5, true)],
+            &crate::replay::TouchSet::default(),
+        )
+        .unwrap();
+        let before = meta.ns_dump().unwrap();
+        meta.set_holder_epoch(1);
+        meta.apply_records_journaled(&[leave_rec(3, 6, false), leave_rec(4, 1, true)])
+            .unwrap();
+        let rows = meta.deleg_leaves().unwrap();
+        assert_eq!(
+            rows.get(&3),
+            Some(&LeaveRow {
+                req: 6,
+                leaving: false
+            })
+        );
+        assert_eq!(rows.get(&4).map(|r| r.leaving), Some(true));
+        meta.set_holder_epoch(0);
+        assert!(meta.strand_below_epoch(2).unwrap().any());
+        let rows = meta.deleg_leaves().unwrap();
+        assert_eq!(
+            rows.get(&3),
+            Some(&LeaveRow {
+                req: 5,
+                leaving: true
+            }),
+            "the previous row is back"
+        );
+        assert!(!rows.contains_key(&4), "a row with no predecessor is gone");
+        assert_eq!(
+            meta.ns_dump().unwrap(),
+            before,
+            "the strand left ns changed"
+        );
+    }
+
+    /// WP6.3: a replica built from another's namespace (a snapshot bootstrap, a
+    /// rebuild) carries its leave rows.
+    #[test]
+    fn a_bootstrapped_replica_returns_the_leave_rows() {
+        use crate::delegation::LeaveRow;
+        let src = Meta::open_in_memory().unwrap();
+        src.apply_segment(
+            1,
+            1,
+            &[leave_rec(3, 5, true), leave_rec(4, 8, false)],
+            &crate::replay::TouchSet::default(),
+        )
+        .unwrap();
+        let fresh = Meta::open_in_memory().unwrap();
+        assert!(fresh.deleg_leaves().unwrap().is_empty());
+        fresh
+            .replace_ns_from_rebuilt(&src, &Default::default())
+            .unwrap();
+        let rows = fresh.deleg_leaves().unwrap();
+        assert_eq!(
+            rows.into_iter().collect::<Vec<_>>(),
+            vec![
+                (
+                    3,
+                    LeaveRow {
+                        req: 5,
+                        leaving: true
+                    }
+                ),
+                (
+                    4,
+                    LeaveRow {
+                        req: 8,
+                        leaving: false
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// WP6.3: the latest row in log order wins, whatever its request: true(5),
+    /// false(6), true(7) reads true/7.
+    #[test]
+    fn the_latest_leave_row_in_log_order_wins() {
+        use crate::delegation::LeaveRow;
+        let meta = Meta::open_in_memory().unwrap();
+        for (seq, rec) in [
+            (1, leave_rec(3, 5, true)),
+            (2, leave_rec(3, 6, false)),
+            (3, leave_rec(3, 7, true)),
+        ] {
+            meta.apply_segment(seq, 1, &[rec], &crate::replay::TouchSet::default())
+                .unwrap();
+        }
+        assert_eq!(
+            meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 7,
+                leaving: true
+            })
         );
     }
 

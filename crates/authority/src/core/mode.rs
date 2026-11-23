@@ -37,6 +37,11 @@
 //! flush releases it cleanly; renewal until then is what keeps the
 //! tenure's acknowledged work ordered).
 
+/// WP6.3: a node's own leave acquires a released lease when it has no root to
+/// tell (`jobs::LEAVE_ACQUIRE_REASON`). Under a forward-only mode it is admitted
+/// without an ask like any other, and a suspended node's self-leave gets no
+/// acquisition at all: it fails at its deadline ("run the leave again").
+///
 /// See the module docs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuthorityMode {
@@ -85,7 +90,13 @@ mod tests {
     fn hold_admits_everything_as_asked() {
         let hold = AuthorityMode::default();
         assert!(!hold.forwards());
-        for reason in ["fuse-acquire", "claim-offer", "inbox-escalation", "lock"] {
+        for reason in [
+            "fuse-acquire",
+            "claim-offer",
+            "inbox-escalation",
+            "lock",
+            "leave-acquire",
+        ] {
             assert_eq!(hold.admit_acquire(reason, true), Some(true), "{reason}");
             assert_eq!(hold.admit_acquire(reason, false), Some(false), "{reason}");
         }
@@ -105,6 +116,7 @@ mod tests {
             "lock",
             "replay-fallback",
             "copy-fallback",
+            "leave-acquire",
         ] {
             assert_eq!(mode.admit_acquire(reason, true), Some(false), "{reason}");
         }
@@ -127,6 +139,7 @@ mod tests {
             "claim-offer",
             "s3-fast-takeover",
             "lock",
+            "leave-acquire",
         ] {
             assert_eq!(mode.admit_acquire(reason, true), None, "{reason}");
         }

@@ -34,6 +34,9 @@ pub struct LeaveDriver {
     pub own: u64,
     /// Nodes retired by the admin form.
     pub admin: u64,
+    /// WP6.3: acquisitions a node's own leave queued (`Stats::leave_acquires`;
+    /// filled from the cores at the end of the run).
+    pub acquires: u64,
 }
 
 /// A fault the plan schedules at a simulated time.
@@ -8558,6 +8561,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.sticky_ended_released = found.sticky_released;
     report.sticky_ended_abandoned = found.sticky_abandoned;
     let mut sticky_recalled_other = 0u64;
+    let mut leave_acquires = 0u64;
     let (mut claim_halted, mut claim_drop_cancelled) = (0u64, 0u64);
     for s in report.stats.values() {
         for (t, v) in report.ll_core.iter_mut().zip([
@@ -8624,6 +8628,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.release_wait_core[6] += s.lease_probes_answered;
         report.release_wait_core[7] += s.release_record_waits;
         sticky_recalled_other += s.deleg_sticky_recalled_other;
+        leave_acquires += s.leave_acquires;
         report.claim_core[0] += s.claim_released;
         report.claim_core[1] += s.claim_release_rowless;
         report.claim_core[2] += s.claim_end_waits;
@@ -8658,6 +8663,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.handover_min_gap_ms = handover.min_gap_ms;
     report.sticky_driver = *cluster.sticky_driver.lock().unwrap();
     report.leave_driver = *cluster.leave_driver.lock().unwrap();
+    report.leave_driver.acquires = leave_acquires;
     // The holder's release waits for its drain (plan 46 M1.3 step 5), judged
     // from the root's side: the root had appended the stream through the row
     // before the release row when the holder journaled it

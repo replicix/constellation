@@ -78690,6 +78690,16 @@ mod step9_one_stream_per_node {
         }
     }
 
+    /// A message from `node` to the root that is no leaving note (WP6.3: the
+    /// lapse's trigger), the root keeping its lease.
+    fn heard_without_note(r: &mut Harness, node: NodeId) -> Vec<Action> {
+        r.hold(2, None);
+        r.step(Event::Peer {
+            from: node,
+            msg: PeerMsg::DelegationRecalled { req: OpId(77) },
+        })
+    }
+
     /// A leave note from `node` to a root.
     fn leave_note_from(node: NodeId, req: u64, leaving: bool) -> Event {
         Event::Peer {
@@ -78737,31 +78747,1313 @@ mod step9_one_stream_per_node {
         assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
     }
 
-    /// A node leaves while nobody holds the lease (the root released it
-    /// when the cluster went idle): there is no root to hear the note, and
-    /// the leave is not stuck on one. A refusing non-root and a held lease
-    /// are still no acknowledgement.
-    #[test]
-    fn a_self_leave_with_a_released_lease_is_answered_without_a_root() {
+    // ---------------------------------------------------------------
+    // WP6.3 (ADR-61): the leave is a log row (`NodeLeaving`)
+    // ---------------------------------------------------------------
+
+    use crate::core::jobs::LEAVE_ACQUIRE_REASON;
+    use constellation_meta::delegation::LeaveRow;
+
+    /// A segment of the log carrying `rows` (a predecessor's), at `seq`.
+    fn apply_leave_rows(h: &Harness, seq: u64, rows: &[LogRecord]) {
+        crate::replica::Replica::apply_segment(&h.meta, seq, 1, 0, &[], &[], rows).unwrap();
+    }
+
+    fn leave_row(node: NodeId, req: u64, leaving: bool) -> LogRecord {
+        LogRecord::NodeLeaving { node, req, leaving }
+    }
+
+    /// A successor root (node 2, holding the lease) over a log that carries
+    /// `rows`, and a directory `d1`.
+    fn successor_over(rows: &[LogRecord]) -> (Harness, constellation_fs_core::Ino) {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, rec) = mkdir(&h, "d1");
+        crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], &[rec]).unwrap();
+        apply_leave_rows(&h, 2, rows);
+        h.hold(2, None);
+        h.core.roster.mark_seen_for_test(true);
+        (h, dir)
+    }
+
+    /// The answer of `Control::Delegate { dir, node, sticky }`.
+    fn delegate_sticky(
+        h: &mut Harness,
+        op: u64,
+        dir: constellation_fs_core::Ino,
+        node: NodeId,
+    ) -> Result<(), String> {
+        let out = h.step(Event::Control {
+            op: OpId(op),
+            req: Control::Delegate {
+                dir,
+                node,
+                sticky: true,
+            },
+        });
+        match control_answer(&out, op) {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(e)) => Err(e.clone()),
+            None => panic!("no answer: {out:?}"),
+        }
+    }
+
+    /// Answers every S3 request of the acquisition in `out` until it asks
+    /// for no more (the lease read as `lease`, the tail, the claim, the
+    /// gate); the actions of the last step, and every request seen.
+    fn drive_acquire(
+        h: &mut Harness,
+        lease: &Lease,
+        mut out: Vec<Action>,
+    ) -> (Vec<S3Op>, Vec<Action>) {
+        let mut seen = Vec::new();
+        let mut all = Vec::new();
+        for _ in 0..24 {
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                all.append(&mut out);
+                return (seen, all);
+            };
+            all.append(&mut out);
+            seen.push(req.clone());
+            let result = match req {
+                S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+                S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. } => S3Result::LeasePut(Ok(tag())),
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected request in the acquisition: {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        panic!("the acquisition never finished: {out:?}");
+    }
+
+    /// A node that starts its own leave while a root (node 1) is named by
+    /// the lease it knows, and has been told nothing yet.
+    fn self_leave_started() -> (Harness, Vec<Action>) {
         let mut h = Harness::new(3);
         h.core.cfg.delegation = true;
         h.core.cfg.p2p = true;
         h.core.lease.cached_holder = Some(1);
-        let mut lease = Lease::granted("p0", 1, 1, 5_000);
-        h.core.lease.note_object(&lease);
         let out = h.step(Event::Control {
             op: OpId(5),
             req: Control::ReleaseGrants,
         });
-        let (req, _) = leave_note_req(&out, 1).expect("no note");
-        // A lease that is held: the root's refusal is no answer.
-        let out = h.step(leave_note_ack(1, req, true));
-        assert!(control_answer(&out, 5).is_none(), "{out:?}");
-        // The lease is read again, released.
-        lease = lease.released();
-        h.core.lease.note_object(&lease);
+        (h, out)
+    }
+
+    /// WP6.3 T1, replacing `a_self_leave_with_a_released_lease_is_answered_
+    /// without_a_root` (the node-leave bullet of "Harness triage after M1.2
+    /// steps 11 and 13 (seed 42)", superseded): a node that leaves while the
+    /// lease it read is released is not answered from that read. No root
+    /// has the note, and a root that idled the lease away may have refused
+    /// it: the node takes the released lease itself (`leave-acquire`), is
+    /// the root of its own leave, and is answered once its own row is
+    /// durable. Fails on main: answered at the tick, no acquisition.
+    /// Mutation: the `leave_told_ok` shortcut back (a released read answers),
+    /// so T1 fails.
+    #[test]
+    fn a_self_leave_with_a_released_lease_takes_the_lease_before_it_is_answered() {
+        let (mut h, out) = self_leave_started();
+        assert!(leave_note_req(&out, 1).is_some(), "{out:?}");
+        let released = Lease::granted("p0", 1, 1, 5_000).released();
+        h.core.lease.note_object(&released);
         let out = leave_tick(&mut h, 600);
-        assert!(matches!(control_answer(&out, 5), Some(Ok(_))), "{out:?}");
+        assert!(
+            control_answer(&out, 5).is_none(),
+            "answered from a released read: {out:?}"
+        );
+        assert!(h.core.acquiring(), "no acquisition: {out:?}");
+        assert!(h.core.acquiring_for(LEAVE_ACQUIRE_REASON), "{out:?}");
+        assert_eq!(h.core.stats.leave_acquires, 1);
+        // The acquisition: the released lease is claimed, never asked for.
+        let (seen, acted) = drive_acquire(&mut h, &released, out);
+        assert!(
+            seen.iter().any(|r| matches!(r, S3Op::LeaseSwap { .. })),
+            "the released lease was not claimed: {seen:?}"
+        );
+        assert!(h.core.root_usable(h.clk()), "not the root after the claim");
+        // The root of its own leave: its own row is in the log (durable here:
+        // the node is a singleton), and the leave is answered.
+        let mut out = acted;
+        out.extend(leave_tick(&mut h, 600));
+        assert!(
+            matches!(control_answer(&out, 5), Some(Ok(_))),
+            "not answered as the root: {out:?}"
+        );
+        // (An `op_id()` of this core, not the control's id: M-2.)
+        let own = h.core.dl.leave_own.expect("no own row").0;
+        assert_eq!(
+            h.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: own,
+                leaving: true
+            })
+        );
+    }
+
+    /// WP6.3 T2: a successor root that has applied a predecessor's
+    /// `NodeLeaving { 3, true }` row grants nothing to node 3, whatever this
+    /// tenure marked (nothing), and grants again after the log's take-back.
+    /// Mutation: the replica lookup removed from `is_leaving`, so T2 fails.
+    #[test]
+    fn a_successor_root_grants_nothing_to_a_node_whose_leave_the_log_carries() {
+        let (mut h, d1) = successor_over(&[leave_row(3, 9, true)]);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(h.core.dl.leaving.is_empty(), "this tenure marked nothing");
+        let err = delegate_sticky(&mut h, 900, d1, 3).expect_err("granted to a leaving node");
+        assert!(err.contains("leaving"), "{err}");
+        assert!(h.meta.delegation_table().get(d1).is_none());
+        // Another node is granted as ever.
+        delegate_sticky(&mut h, 901, d1, 4).expect("a node that does not leave");
+        // The log takes it back.
+        let (mut h, d1) = successor_over(&[leave_row(3, 9, true)]);
+        apply_leave_rows(&h, 3, &[leave_row(3, 10, false)]);
+        delegate_sticky(&mut h, 902, d1, 3).expect("granted after the take-back row");
+    }
+
+    /// WP6.3 (spec 4.4): a successor's seeding happens at its acquisition,
+    /// before its first grant. The rows are read by the grant check itself
+    /// (no seed needed to refuse), and the sync that follows the acquisition
+    /// times the row from then (`leave_note_seen`) and raises the take-back
+    /// floor of a `false` row, so a delayed leaving note is stale at once.
+    #[test]
+    fn a_successors_leave_rows_are_seeded_before_its_first_grant() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (d1, rec) = mkdir(&h, "d1");
+        crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], &[rec]).unwrap();
+        apply_leave_rows(
+            &h,
+            2,
+            &[
+                leave_row(3, 9, true),
+                leave_row(4, 7, true),
+                leave_row(4, 8, false),
+            ],
+        );
+        // Not the root yet: nothing is seeded, nothing is granted.
+        assert!(h.core.dl.leave_note_seen.is_empty());
+        // The acquisition (a claim over a released lease, as the harness's
+        // `claim_over_with`) ends with a sync of the delegation state.
+        let prev = Lease::granted("p0", 1, 1, 5_000).released();
+        let (_, won) = super::locks::claim_over_with(&mut h, &prev, false, false);
+        drive_acquire(&mut h, &prev, won);
+        assert!(h.core.root_usable(h.clk()));
+        assert!(
+            h.core.dl.leave_note_seen.contains_key(&3),
+            "the row of node 3 was not seeded: {:?}",
+            h.core.dl.leave_note_seen
+        );
+        assert!(!h.core.dl.leave_note_seen.contains_key(&4));
+        assert_eq!(h.core.dl.leave_taken_back.get(&4), Some(&8));
+        let err = delegate_sticky(&mut h, 900, d1, 3).expect_err("granted to a leaving node");
+        assert!(err.contains("leaving"), "{err}");
+        // A delayed leaving note of node 4 (request 7) is stale on this root.
+        let out = h.step(leave_note_from(4, 7, true));
+        assert_eq!(leave_ack_to(&out, 4), Some(true), "{out:?}");
+        assert!(!h.core.is_leaving(4, &h.meta), "a delayed note re-marked");
+    }
+
+    /// WP6.3 T3: a root acknowledges a leaving note only once the row it
+    /// journaled for it is durable: refused while its jseq is past what the
+    /// group has, acknowledged on the next note once it is not.
+    /// Mutation: `held_back` ignores the row's jseq, so T3 fails.
+    #[test]
+    fn a_root_acknowledges_a_leave_note_only_once_its_row_is_durable() {
+        let (mut r, d1) = root_with_dir();
+        // A live generation of another node keeps the root from being a
+        // singleton: its rows wait for the group.
+        assert!(delegate(&mut r, 900, d1, 3));
+        let out = r.step(leave_note_from(4, 100, true));
+        assert_eq!(
+            leave_ack_to(&out, 4),
+            Some(true),
+            "acknowledged at once: {out:?}"
+        );
+        let (req, jseq) = r.core.dl.leaving[&4].journaled.expect("no row journaled");
+        assert_eq!(req, 100);
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&4),
+            Some(&LeaveRow {
+                req: 100,
+                leaving: true
+            })
+        );
+        assert!(r.core.ack_need_at(jseq).is_some(), "the row is durable");
+        let out = r.step(leave_note_from(4, 100, true));
+        assert_eq!(leave_ack_to(&out, 4), Some(true), "{out:?}");
+        // The row is in the group's hands.
+        r.core.ack.shipped_rows.insert(jseq);
+        let out = r.step(leave_note_from(4, 100, true));
+        assert_eq!(leave_ack_to(&out, 4), Some(false), "{out:?}");
+        // (One row for the request, not one per note.)
+        assert_eq!(r.core.stats.leave_rows, 1);
+    }
+
+    /// WP6.3 T4: a root that leaves answers its own leave only once its own
+    /// `NodeLeaving` row is durable: `root_usable` alone is not enough, a
+    /// successor reads the log. Mutation: `root_usable` alone in
+    /// `leave_told_ok`, so T4 fails.
+    #[test]
+    fn a_root_answers_its_own_leave_only_once_its_row_is_durable() {
+        let (mut r, d1) = root_with_dir();
+        assert!(delegate(&mut r, 900, d1, 3));
+        r.step(Event::Control {
+            op: OpId(DRIVER_CTL),
+            req: Control::ReleaseGrants,
+        });
+        let (req, jseq) = r.core.dl.leave_own.expect("no own row");
+        assert!(req < DRIVER_CTL, "the row carries a control id: {req}");
+        for _ in 0..3 {
+            let out = leave_tick(&mut r, 600);
+            assert!(
+                control_answer(&out, DRIVER_CTL).is_none(),
+                "answered with the own row not durable: {out:?}"
+            );
+            r.hold(2, None);
+        }
+        r.core.ack.shipped_rows.insert(jseq);
+        let out = leave_tick(&mut r, 600);
+        assert!(
+            matches!(control_answer(&out, DRIVER_CTL), Some(Ok(_))),
+            "not answered once durable: {out:?}"
+        );
+    }
+
+    /// WP6.3 T5 (M3): a root whose own leave fails journals the take-back
+    /// row directly (its tell is dropped under `root_usable`, so the note
+    /// would never go), and a successor seeded from that log grants to it
+    /// again. Mutation: no journal in `leave_self_abort`, so T5 fails.
+    #[test]
+    fn a_leave_aborted_as_root_journals_its_take_back() {
+        let (mut r, _d1) = root_with_dir();
+        r.step(Event::Control {
+            op: OpId(DRIVER_CTL),
+            req: Control::ReleaseGrants,
+        });
+        let c = r.core.dl.leave_own.expect("no own row").0;
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&1),
+            Some(&LeaveRow {
+                req: c,
+                leaving: true
+            })
+        );
+        let out = r.step(Event::Control {
+            op: OpId(DRIVER_CTL + 1),
+            req: Control::LeaveFailed,
+        });
+        assert!(
+            matches!(control_answer(&out, DRIVER_CTL + 1), Some(Ok(_))),
+            "{out:?}"
+        );
+        assert!(!r.core.dl.leave_self);
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&1),
+            Some(&LeaveRow {
+                req: c,
+                leaving: false
+            }),
+            "the take-back was not journaled"
+        );
+        // A successor over that log: both rows, in order.
+        let (mut s, d1) = successor_over(&[leave_row(1, c, true), leave_row(1, c, false)]);
+        delegate_sticky(&mut s, 900, d1, 1).expect("not granted after the take-back");
+        // Over the first row alone it would refuse.
+        let (mut s, d1) = successor_over(&[leave_row(1, c, true)]);
+        assert!(delegate_sticky(&mut s, 900, d1, 1).is_err());
+    }
+
+    /// WP6.3 T6 (M1): the lapse is a message after a full window with no
+    /// note. A leaver heard once and then silent stays refused; time alone
+    /// lapses nothing; heard after the window without a note, the row is
+    /// taken back (`false`, journaled) and the node is granted again; a
+    /// successor seeded from that log does not mark it. Mutation: lapse on
+    /// time alone (`is_leaving` false past the window), so T6 fails.
+    #[test]
+    fn a_silent_leaver_is_not_granted_after_the_lapse() {
+        let (mut r, d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        // Heard inside the window: nothing lapses.
+        r.advance(1_000);
+        heard_without_note(&mut r, 3);
+        assert!(r.core.is_leaving(3, &r.meta));
+        // Silent for a long time: still refused (time alone lapses nothing).
+        r.advance(3 * r.core.leave_note_lapse_ms());
+        r.hold(2, None);
+        r.step(Event::Slack { epoch_slack: 0 });
+        assert!(r.core.is_leaving(3, &r.meta), "lapsed on time alone");
+        let err = delegate_sticky(&mut r, 900, d1, 3).expect_err("granted after silence");
+        assert!(err.contains("leaving"), "{err}");
+        // A note inside the window keeps it (the window counts from it).
+        r.step(leave_note_from(3, 100, true));
+        heard_without_note(&mut r, 3);
+        assert!(r.core.is_leaving(3, &r.meta));
+        // Heard after a full window with no note: taken back.
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta));
+        assert_eq!(r.core.stats.leave_lapses, 1);
+        // (M-1: below every request of the leave, so the node's note of 100
+        // is not stale: the take-back floor, 0 here.)
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 0,
+                leaving: false
+            })
+        );
+        assert!(!r.core.dl.leave_taken_back.contains_key(&3));
+        delegate_sticky(&mut r, 901, d1, 3).expect("not granted after the lapse");
+        // A successor seeded from that log does not re-mark.
+        let (mut s, d1) = successor_over(&[leave_row(3, 100, true), leave_row(3, 0, false)]);
+        let mut out = Vec::new();
+        s.core.delegation_sync(s.clk(), &s.meta, &mut out);
+        assert!(s.core.dl.leaving.is_empty());
+        assert!(!s.core.is_leaving(3, &s.meta));
+        delegate_sticky(&mut s, 902, d1, 3).expect("a successor re-marked");
+    }
+
+    /// WP6.3 T6, the successor's side: a row of a predecessor with no note
+    /// here is timed from the tenure's start, and a node heard without a note
+    /// after that window is taken back by the successor's own row. An
+    /// operator's mark never lapses.
+    #[test]
+    fn a_leave_row_with_no_note_here_lapses_from_the_tenures_start() {
+        let (mut s, d1) = successor_over(&[leave_row(3, 100, true)]);
+        let mut out = Vec::new();
+        s.core.delegation_sync(s.clk(), &s.meta, &mut out);
+        heard_without_note(&mut s, 3);
+        assert!(s.core.is_leaving(3, &s.meta), "lapsed at once");
+        s.advance(s.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut s, 3);
+        assert!(!s.core.is_leaving(3, &s.meta));
+        delegate_sticky(&mut s, 900, d1, 3).expect("not granted after the lapse");
+        // An operator's mark: heard long after, still leaving.
+        let (mut r, _d1) = root_with_dir();
+        r.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert!(r.core.is_leaving(3, &r.meta));
+        r.advance(10 * r.core.leave_note_lapse_ms());
+        heard_without_note(&mut r, 3);
+        assert!(r.core.is_leaving(3, &r.meta), "an operator's mark lapsed");
+    }
+
+    /// WP6.3 T7: a delayed leaving note after a take-back row is stale on a
+    /// successor: nothing is marked, no row is journaled, the grant succeeds.
+    /// Two things say so, belt and braces: `leave_note_stale` reads the row,
+    /// and the sync that runs on every applied `NodeLeaving` seeds
+    /// `leave_taken_back` from it. Either alone holds the test (the mutation
+    /// log shows both fall together); this one drops the lookup, which the
+    /// seeding of a successor that has not yet synced does not cover.
+    /// Mutation: `leave_note_stale` ignores the log's row, so T7 fails.
+    #[test]
+    fn a_delayed_leaving_note_after_a_take_back_row_is_stale_on_a_successor() {
+        let (mut s, d1) = successor_over(&[leave_row(3, 5, true), leave_row(3, 6, false)]);
+        let out = s.step(leave_note_from(3, 5, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        assert!(s.core.dl.leaving.is_empty(), "a delayed note marked");
+        assert_eq!(s.core.stats.leave_rows, 0, "a row was journaled for it");
+        assert_eq!(
+            s.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 6,
+                leaving: false
+            })
+        );
+        delegate_sticky(&mut s, 900, d1, 3).expect("not granted after the stale note");
+        // A newer leave (request 7) marks and journals again.
+        s.step(leave_note_from(3, 7, true));
+        assert!(s.core.is_leaving(3, &s.meta));
+        assert_eq!(
+            s.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 7,
+                leaving: true
+            })
+        );
+    }
+
+    /// The acquisition of reason `reason` on a node (3) that has just been
+    /// started by `enqueue_job`, its lease read answered with `lease`.
+    fn acquire_for(
+        reason: &'static str,
+        ask_handoff: bool,
+        lease: &Lease,
+        watched: bool,
+    ) -> (Harness, Vec<Action>, Vec<Action>) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.takeover_promise_check = false;
+        if watched {
+            h.watch(lease);
+        }
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.clk(),
+            crate::core::jobs::JobReq::Acquire {
+                reason,
+                ask_handoff,
+            },
+            &h.meta,
+            &mut out,
+        );
+        let (get, req) = s3_ops(&out)[0];
+        assert!(matches!(req, S3Op::LeaseGet), "{out:?}");
+        let answered = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag())))),
+        });
+        (h, out, answered)
+    }
+
+    /// A lease of node 1 that is live for another 10 s.
+    fn live_lease_of_1(h_now: i64) -> Lease {
+        let mut l = lease_of(1, 1, h_now + 10_000);
+        l.holder_wait_ms = h_now + 10_000;
+        l
+    }
+
+    /// WP6.3 T8 (M4): a leave-acquire never asks a live holder: no
+    /// registration in `wanted_by` (a `LeaseSwap`, which would make the
+    /// holder hand the lease over when idle) and no `LeaseRequest`. The same
+    /// acquisition under another reason registers, which is what the test
+    /// sees the difference against. Mutation: the reason dropped from the
+    /// `offered` exemption in `acquire_classified`, so T8 fails.
+    #[test]
+    fn leave_acquire_never_asks_a_live_holder() {
+        let now = Harness::new(3).now.0;
+        let live = live_lease_of_1(now);
+        let (h, _, answered) = acquire_for(LEAVE_ACQUIRE_REASON, false, &live, false);
+        assert!(
+            !s3_ops(&answered)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. })),
+            "registered in wanted_by: {answered:?}"
+        );
+        assert!(
+            !sends(&answered)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::LeaseRequest { .. })),
+            "asked the holder: {answered:?}"
+        );
+        assert!(!h.core.acquiring(), "the acquisition did not give up");
+        // The control: any other reason registers its want.
+        let (_, _, answered) = acquire_for("fuse-acquire", true, &live, false);
+        assert!(
+            s3_ops(&answered)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. })),
+            "the control did not register: {answered:?}"
+        );
+    }
+
+    /// WP6.3 T9: a leave-acquire does not take over an expired lease that
+    /// was not released (a TTL claim): `classify` says `Claim` with
+    /// `!prev.released`, and `finish_acquire(false)` runs with no CAS. A
+    /// released lease is claimed. Mutation: the reason filter after
+    /// `classify` removed, so T9 fails.
+    #[test]
+    fn leave_acquire_does_not_take_over_an_expired_unreleased_lease() {
+        let now = Harness::new(3).now.0;
+        let expired = lease_of(1, 1, now - 5_000);
+        let (h, _, answered) = acquire_for(LEAVE_ACQUIRE_REASON, false, &expired, true);
+        assert!(
+            !s3_ops(&answered)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. })),
+            "took an expired, unreleased lease: {answered:?}"
+        );
+        assert!(!h.core.acquiring(), "the acquisition did not give up");
+        // The control: another reason claims it by TTL.
+        let (_, _, answered) = acquire_for("test", false, &expired, true);
+        assert!(
+            s3_ops(&answered)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. } | S3Op::SegmentRun { .. })),
+            "the control did not claim: {answered:?}"
+        );
+        // A released lease is the leave's to take.
+        let released = lease_of(1, 1, now + 5_000).released();
+        let (_, _, answered) = acquire_for(LEAVE_ACQUIRE_REASON, false, &released, false);
+        assert!(
+            s3_ops(&answered)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. } | S3Op::SegmentRun { .. })),
+            "did not claim a released lease: {answered:?}"
+        );
+    }
+
+    /// WP6.3 T10 (M5): no leave-acquire in a continuation epoch: an epoch
+    /// open or active queues no Acquire job (its acquisition would send a
+    /// `LeaseRequest` whatever `ask_handoff` says). Mutation: the epoch
+    /// guard removed, so T10 fails.
+    #[test]
+    fn no_leave_acquire_in_an_epoch() {
+        for (open, active, dl_active) in [
+            (true, false, false),
+            (true, true, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let (mut h, _) = self_leave_started();
+            h.core.epoch.open = open;
+            h.core.epoch.active = active;
+            h.core.dl.epoch_active = dl_active;
+            h.core
+                .lease
+                .note_object(&Lease::granted("p0", 1, 1, 5_000).released());
+            let out = leave_tick(&mut h, 600);
+            assert!(
+                !h.core.acquiring_for(LEAVE_ACQUIRE_REASON),
+                "queued in an epoch ({open} {active} {dl_active}): {out:?}"
+            );
+            assert_eq!(h.core.stats.leave_acquires, 0);
+            assert!(
+                !sends(&out)
+                    .iter()
+                    .any(|(_, m)| matches!(m, PeerMsg::LeaseRequest { .. })),
+                "{out:?}"
+            );
+        }
+    }
+
+    /// WP6.3 T11 (M6): the leave-acquire is rate limited: two ticks inside
+    /// `leave_resend` queue one (the stat counts 1), and none is queued
+    /// before `acquire_retry_hint`. Mutation: the rate limit removed, so T11
+    /// fails.
+    #[test]
+    fn leave_acquire_is_rate_limited() {
+        let (mut h, _) = self_leave_started();
+        h.core
+            .lease
+            .note_object(&Lease::granted("p0", 1, 1, 5_000).released());
+        let out = leave_tick(&mut h, 100);
+        assert_eq!(h.core.stats.leave_acquires, 1, "{out:?}");
+        // The acquisition ends without the lease (the read failed).
+        let (get, _) = s3_ops(&out)[0];
+        h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into()))),
+        });
+        assert!(!h.core.acquiring());
+        let resend = h.core.dl_t().leave_resend;
+        // Inside the resend interval: not again.
+        let out = leave_tick(&mut h, resend / 4);
+        assert!(
+            !h.core.acquiring(),
+            "queued again inside the interval: {out:?}"
+        );
+        assert_eq!(h.core.stats.leave_acquires, 1);
+        // A retry hint in the future holds it past the interval.
+        h.core.acquire_retry_hint = Some(h.clk().wait.plus(5_000));
+        let out = leave_tick(&mut h, resend);
+        assert!(!h.core.acquiring(), "queued before the retry hint: {out:?}");
+        assert_eq!(h.core.stats.leave_acquires, 1);
+        // Past both: again.
+        h.advance(6_000);
+        let out = leave_tick(&mut h, 600);
+        assert_eq!(h.core.stats.leave_acquires, 2, "{out:?}");
+    }
+
+    /// WP6.3 T12 (M2): a take-back note journals `false` over a
+    /// predecessor's older `true` row even with no mark here: the row is
+    /// `true(5)` with nothing marked, the note of request 6 takes it back.
+    /// Mutation: the take-back only when a mark is present, so T12 fails.
+    #[test]
+    fn a_take_back_journals_false_over_a_predecessors_older_true_row() {
+        let (mut s, d1) = successor_over(&[leave_row(3, 5, true)]);
+        assert!(s.core.dl.leaving.is_empty());
+        assert!(s.core.is_leaving(3, &s.meta));
+        let out = s.step(leave_note_from(3, 6, false));
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        assert_eq!(
+            s.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 6,
+                leaving: false
+            })
+        );
+        assert_eq!(s.core.stats.leave_rows, 1);
+        delegate_sticky(&mut s, 900, d1, 3).expect("not granted after the take-back");
+        // An older take-back (request 4) is none.
+        let (mut s, _d1) = successor_over(&[leave_row(3, 5, true)]);
+        s.step(leave_note_from(3, 4, false));
+        assert!(s.core.is_leaving(3, &s.meta), "an older take-back took it");
+    }
+
+    /// M-1: a lapse must not make the leaver's current request stale. The
+    /// leaving node sends its note again with the same request, so a note of
+    /// 100 after the lapse has to mark again (the row is `false(99)`, below
+    /// it) and is not acknowledged while nothing is marked. On round 1 the
+    /// lapse wrote `false(100)` and raised the take-back floor: the note was
+    /// stale, marked nothing and was acknowledged all the same.
+    /// Mutation: the lapse un-marks with `TakeBack(mark.req)`, so it fails.
+    #[test]
+    fn a_leave_note_after_a_lapse_marks_again_and_is_not_acked_while_unmarked() {
+        let (mut r, d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        assert!(r.core.is_leaving(3, &r.meta));
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta), "the lapse did not un-mark");
+        assert_eq!(r.core.stats.leave_lapses, 1);
+        assert!(!r.core.dl.leave_taken_back.contains_key(&3));
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 0,
+                leaving: false
+            })
+        );
+        // The same request again.
+        let out = r.step(leave_note_from(3, 100, true));
+        assert!(
+            r.core.is_leaving(3, &r.meta),
+            "the node's own note marked nothing: {out:?}"
+        );
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 100,
+                leaving: true
+            })
+        );
+        // Acknowledged only because it marked.
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        let err = delegate_sticky(&mut r, 900, d1, 3).expect_err("granted to the leaver");
+        assert!(err.contains("leaving"), "{err}");
+    }
+
+    /// M-1 (sim seed 1979 of `sticky-s4-leave` under a suspended leaver): the
+    /// mark's request is the highest the leave sent, here a release note's
+    /// 101 that came before the note's own 100, which the node resends. The
+    /// lapse must stay below both: `false(mark.req - 1)` would be `false(100)`,
+    /// and the resent note of 100 would be refused for good. Mutation: the
+    /// lapse writes `mark.req - 1`, so it fails.
+    #[test]
+    fn a_lapse_stays_below_every_request_of_the_leave() {
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        r.step(leave_note_from(3, 101, true));
+        assert_eq!(r.core.dl.leaving[&3].req, 101);
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta));
+        let out = r.step(leave_note_from(3, 100, true));
+        assert!(r.core.is_leaving(3, &r.meta), "the resent note: {out:?}");
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        // A node that took an earlier leave back (request 50): the floor holds
+        // its delayed notes stale across a lapse.
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 50, true));
+        r.step(leave_note_from(3, 51, false));
+        r.step(leave_note_from(3, 100, true));
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut r, 3);
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 51,
+                leaving: false
+            })
+        );
+        r.step(leave_note_from(3, 50, true));
+        assert!(!r.core.is_leaving(3, &r.meta), "a delayed old note marked");
+        r.step(leave_note_from(3, 100, true));
+        assert!(r.core.is_leaving(3, &r.meta));
+    }
+
+    /// M-1, the incarnation path: the node comes back under a newer
+    /// incarnation than the root last saw in a lock request, which un-marks
+    /// the leave of an earlier incarnation (SHOULD 2: with `false(mark.req)`,
+    /// so a delayed note of the dead incarnation stays stale, and the new
+    /// incarnation's leave, above it, marks). Mutation: the row written at
+    /// `mark.req - 1`, so a delayed old note marks again.
+    #[test]
+    fn a_leave_note_after_an_incarnation_un_mark_marks_again() {
+        let (mut r, d1) = root_with_dir();
+        lock_request_from(&mut r, 3, 1, d1);
+        r.step(leave_note_from(3, 100, true));
+        assert!(r.core.is_leaving(3, &r.meta));
+        lock_request_from(&mut r, 3, 2, d1);
+        assert!(!r.core.is_leaving(3, &r.meta), "the new incarnation");
+        assert!(!r.core.dl.leave_taken_back.contains_key(&3));
+        // (SHOULD 2: the row is the dead incarnation's request itself.)
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 100,
+                leaving: false
+            })
+        );
+        // A delayed note of the old incarnation (and its resend) is stale: it
+        // does not mark the node again.
+        let out = r.step(leave_note_from(3, 100, true));
+        assert!(
+            !r.core.is_leaving(3, &r.meta),
+            "a delayed note of the dead incarnation marked: {out:?}"
+        );
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        // The new incarnation's leave marks.
+        let new = (2u64 << 40) | 5;
+        let out = r.step(leave_note_from(3, new, true));
+        assert!(r.core.is_leaving(3, &r.meta), "{out:?}");
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+    }
+
+    /// A lock request of `node` under `incarnation`.
+    fn lock_request_from(
+        h: &mut Harness,
+        node: NodeId,
+        incarnation: u32,
+        ino: constellation_fs_core::Ino,
+    ) {
+        h.step(Event::Peer {
+            from: node,
+            msg: PeerMsg::LockRequest {
+                req: OpId(u64::from(incarnation) << 40 | 7),
+                ino,
+                mode: constellation_meta::locks::LockMode::Shared,
+                blocking: false,
+                sent: h.honour(),
+                incarnation,
+                waited_ms: 0,
+            },
+        });
+    }
+
+    /// S-5: the incarnation un-mark fires only for a mark or row of an
+    /// earlier incarnation. The leave of the node's current incarnation
+    /// (request id above `2 << 40`) survives the first lock request the root
+    /// sees of it. Mutation: the incarnation check removed, so it fails.
+    #[test]
+    fn an_incarnation_un_mark_leaves_the_current_incarnations_leave_alone() {
+        let (mut r, d1) = root_with_dir();
+        lock_request_from(&mut r, 3, 1, d1);
+        let req = (2u64 << 40) | 5;
+        r.step(leave_note_from(3, req, true));
+        assert!(r.core.is_leaving(3, &r.meta));
+        lock_request_from(&mut r, 3, 2, d1);
+        assert!(r.core.is_leaving(3, &r.meta), "un-marked its own leave");
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow { req, leaving: true })
+        );
+        // The same on a successor with only the row.
+        let (mut s, d1) = successor_over(&[leave_row(3, req, true)]);
+        lock_request_from(&mut s, 3, 1, d1);
+        lock_request_from(&mut s, 3, 2, d1);
+        assert!(s.core.is_leaving(3, &s.meta), "the row of the incarnation");
+    }
+
+    /// M-1: a leaving note that marks nothing (stale) is refused, not
+    /// acknowledged. Mutation: the stale branch not held back, so it fails.
+    #[test]
+    fn a_stale_leaving_note_is_refused() {
+        let (mut r, _d1) = root_with_dir();
+        let out = r.step(leave_note_from(3, 5, false));
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        let out = r.step(leave_note_from(3, 5, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        assert!(!r.core.is_leaving(3, &r.meta));
+    }
+
+    /// M-1: the root's own deaf time is not the leaver's silence. After an
+    /// `OwnLag`, and after the root was not usable and is again, a node heard
+    /// without a note is not lapsed on the strength of a window the root could
+    /// not hear. Mutations: no rebase on `OwnLag`; no rebase on the edge.
+    #[test]
+    fn the_roots_deaf_time_is_not_the_leavers_silence() {
+        // OwnLag.
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        let now = r.clk().wait;
+        r.hold(2, None);
+        r.step(Event::OwnLag {
+            from: now,
+            until: now.plus(1),
+        });
+        heard_without_note(&mut r, 3);
+        assert!(r.core.is_leaving(3, &r.meta), "lapsed over the root's lag");
+        assert_eq!(r.core.stats.leave_lapses, 0);
+        // The window counts on from the rebase.
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta));
+
+        // Not usable, then usable.
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        r.step(Event::Slack { epoch_slack: 0 });
+        assert!(!r.core.root_usable(r.clk()), "the lease still holds");
+        heard_without_note(&mut r, 3);
+        assert!(
+            r.core.is_leaving(3, &r.meta),
+            "lapsed over the root's stall"
+        );
+        assert_eq!(r.core.stats.leave_lapses, 0);
+    }
+
+    /// S-1: a leave-acquire that waited behind another job and meets an open
+    /// epoch ends without taking the lease, with no `LeaseRequest`. Mutation:
+    /// the check in `begin_acquire` removed, so it fails.
+    #[test]
+    fn a_leave_acquire_does_not_start_in_an_epoch() {
+        for (open, active, dl_active) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut h = Harness::new(3);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.core.epoch.open = open;
+            h.core.epoch.active = active;
+            h.core.dl.epoch_active = dl_active;
+            let mut out = Vec::new();
+            h.core.enqueue_job(
+                h.clk(),
+                crate::core::jobs::JobReq::Acquire {
+                    reason: LEAVE_ACQUIRE_REASON,
+                    ask_handoff: false,
+                },
+                &h.meta,
+                &mut out,
+            );
+            assert!(
+                !h.core.acquiring(),
+                "started in an epoch ({open} {active} {dl_active}): {out:?}"
+            );
+            assert!(s3_ops(&out).is_empty(), "{out:?}");
+            assert!(
+                !sends(&out)
+                    .iter()
+                    .any(|(_, m)| matches!(m, PeerMsg::LeaseRequest { .. })),
+                "{out:?}"
+            );
+        }
+    }
+
+    /// S-2: a row found in the log counts as durable only once the journal's
+    /// tip is (it may be this node's own, unshipped). The mark is lost (a
+    /// deposition clears it) while the row stays; the next note finds the row
+    /// and must not be acknowledged before the group has it. Mutation: the
+    /// found row stored with jseq 0, so it fails.
+    #[test]
+    fn a_found_leave_row_is_durable_only_with_the_journal_tip() {
+        let (mut r, d1) = root_with_dir();
+        assert!(delegate(&mut r, 900, d1, 3));
+        let out = r.step(leave_note_from(4, 100, true));
+        assert_eq!(leave_ack_to(&out, 4), Some(true), "{out:?}");
+        let (_, jseq) = r.core.dl.leaving[&4].journaled.expect("no row");
+        r.core.dl.leaving.clear();
+        let out = r.step(leave_note_from(4, 100, true));
+        assert_eq!(
+            r.core.stats.leave_rows, 1,
+            "no second row for the same request"
+        );
+        assert_eq!(
+            leave_ack_to(&out, 4),
+            Some(true),
+            "acknowledged with the found row unshipped: {out:?}"
+        );
+        r.core
+            .ack
+            .shipped_rows
+            .insert(jseq.max(crate::replica::Replica::journal_tip(&r.meta)));
+        let out = r.step(leave_note_from(4, 100, true));
+        assert_eq!(leave_ack_to(&out, 4), Some(false), "{out:?}");
+    }
+
+    /// A control id of the driver's range (`authority_driver.rs`: the ids
+    /// start at `1 << 48`, above every request of an incarnation).
+    const DRIVER_CTL: u64 = 1 << 48;
+
+    /// A root (node 1) that runs its own leave under a driver control id:
+    /// the request of its own row.
+    fn own_leave_as_root() -> (Harness, u64) {
+        let (mut r, _d1) = root_with_dir();
+        r.step(Event::Control {
+            op: OpId(DRIVER_CTL),
+            req: Control::ReleaseGrants,
+        });
+        let c = r.core.dl.leave_own.expect("no own row").0;
+        (r, c)
+    }
+
+    /// This root loses the lease to node 2.
+    fn lose_the_lease(r: &mut Harness) {
+        r.core.lease.held = None;
+        r.core.lease.last_seen = None;
+        r.core.lease.cached_holder = Some(2);
+        assert!(!r.core.root_usable(r.clk()));
+    }
+
+    /// M-2 (Fable's round-2 re-check): the own row's request is an `op_id()`,
+    /// not the driver's control id (`1 << 48` and up, above every request of
+    /// an incarnation). A self-leave aborted as root writes `false(C)`; with
+    /// `C` a control id every later note of the node (`R < C`) was stale on
+    /// every other root, which refused it and never marked the node: its
+    /// every later leave failed at its deadline. Fails on 3ca92d23: the
+    /// note is refused and marks nothing.
+    #[test]
+    fn a_node_whose_own_leave_aborted_as_root_can_leave_through_another_root() {
+        let (mut r, c) = own_leave_as_root();
+        r.step(Event::Control {
+            op: OpId(DRIVER_CTL + 1),
+            req: Control::LeaveFailed,
+        });
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&1),
+            Some(&LeaveRow {
+                req: c,
+                leaving: false
+            })
+        );
+        // The lease goes to node 2, and the node leaves again.
+        lose_the_lease(&mut r);
+        let out = r.step(Event::Control {
+            op: OpId(DRIVER_CTL + 2),
+            req: Control::ReleaseGrants,
+        });
+        let (note, leaving) =
+            leave_note_req(&out, 2).unwrap_or_else(|| panic!("the new root was not told: {out:?}"));
+        assert!(leaving);
+        let (mut b, _d1) = successor_over(&[leave_row(1, c, true), leave_row(1, c, false)]);
+        let out = b.step(leave_note_from(1, note.0, true));
+        assert!(
+            b.core.is_leaving(1, &b.meta),
+            "the note marked nothing (stale against the control id): {out:?}"
+        );
+        assert_eq!(leave_ack_to(&out, 1), Some(false), "{out:?}");
+    }
+
+    /// M-2, the milder variant: a node deposed in the middle of its own
+    /// leave (its row `true(C)`, no abort as root) and then taking it back to
+    /// a root that has only that row: the take-back's request is above `C`,
+    /// so the row is taken back at once and not left until the lapse. Fails
+    /// on 3ca92d23: acknowledged, and the row stays `true`.
+    #[test]
+    fn a_node_deposed_mid_leave_takes_its_own_row_back_at_another_root() {
+        let (mut r, c) = own_leave_as_root();
+        lose_the_lease(&mut r);
+        let out = r.step(Event::Control {
+            op: OpId(DRIVER_CTL + 1),
+            req: Control::LeaveFailed,
+        });
+        let (back, leaving) =
+            leave_note_req(&out, 2).unwrap_or_else(|| panic!("the new root was not told: {out:?}"));
+        assert!(!leaving);
+        let (mut b, _d1) = successor_over(&[leave_row(1, c, true)]);
+        let out = b.step(leave_note_from(1, back.0, false));
+        assert_eq!(leave_ack_to(&out, 1), Some(false), "{out:?}");
+        assert!(!b.core.is_leaving(1, &b.meta), "the row stayed true");
+        assert_eq!(
+            b.meta.deleg_leaves().unwrap().get(&1),
+            Some(&LeaveRow {
+                req: back.0,
+                leaving: false
+            })
+        );
+    }
+
+    /// SHOULD 1: after the node's own lag (`Event::OwnLag`) a leaving node
+    /// forgets that its leave is told: its root may have lapsed the mark
+    /// while it was deaf. The note it sends again is acknowledged only by a
+    /// root that marked and made the row durable, and then counts. Fails on
+    /// 3ca92d23: still told after the lag.
+    #[test]
+    fn an_own_lag_makes_the_leaver_tell_its_leave_again() {
+        let (mut h, req) = leaving_node_told(1);
+        assert!(h.core.leave_told_ok(h.clk()));
+        let now = h.clk().wait;
+        h.step(Event::OwnLag {
+            from: now,
+            until: now.plus(1),
+        });
+        assert!(!h.core.leave_told_ok(h.clk()), "still told after the lag");
+        let mut again = None;
+        for _ in 0..8 {
+            let out = leave_tick(&mut h, 500);
+            if let Some(n) = leave_note_req(&out, 1) {
+                again = Some(n);
+                break;
+            }
+        }
+        let (r, leaving) = again.expect("the note was not sent again");
+        assert_eq!((r, leaving), (req, true));
+        assert!(!h.core.leave_told_ok(h.clk()), "told before the ack");
+        h.step(leave_note_ack(1, r, false));
+        assert!(h.core.leave_told_ok(h.clk()));
+    }
+
+    /// SHOULD 3: the node's own note acknowledged under an operator's mark is
+    /// not lost when the operator's leave fails: the node still leaves, and
+    /// stays marked (a note mark, its row `true(R)`). Fails on 3ca92d23: the
+    /// mark goes and the row is taken back.
+    #[test]
+    fn an_operators_failed_leave_keeps_the_nodes_own_note_marked() {
+        let (mut r, d1) = root_with_dir();
+        assert!(delegate(&mut r, 900, d1, 3));
+        r.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        r.step(leave_note_from(3, 100, true));
+        assert_eq!(r.core.dl.leaving[&3].note, Some(100));
+        r.advance(r.core.leave_wait_ms() as u64 + 1_000);
+        r.hold(2, None);
+        let out = leave_tick(&mut r, 600);
+        assert!(matches!(control_answer(&out, 910), Some(Err(_))), "{out:?}");
+        assert!(r.core.is_leaving(3, &r.meta), "the node's note was lost");
+        let m = r.core.dl.leaving[&3];
+        assert!(!m.operator);
+        assert_eq!(m.req, 100);
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 100,
+                leaving: true
+            })
+        );
+        // A take-back of the note since: the operator's failure ends it all.
+        let (mut r, d1) = root_with_dir();
+        assert!(delegate(&mut r, 900, d1, 3));
+        r.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        r.step(leave_note_from(3, 100, true));
+        r.step(leave_note_from(3, 101, false));
+        r.advance(r.core.leave_wait_ms() as u64 + 1_000);
+        r.hold(2, None);
+        leave_tick(&mut r, 600);
+        assert!(!r.core.is_leaving(3, &r.meta));
+    }
+
+    /// NIT: an operator's failed leave with an unreadable row holds back as
+    /// `leave_unmark` does: the mark stays (as a note's, which the lapse takes
+    /// back), and no row is written. Fails on 3ca92d23: the mark went.
+    #[test]
+    fn an_operators_failed_leave_holds_back_on_an_unreadable_row() {
+        let (mut r, _d1) = root_with_dir();
+        r.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        let rows = r.core.stats.leave_rows;
+        let now = r.clk();
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        r.core.leave_fail_operator(now, 3, &r.meta);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert!(r.core.dl.leaving.contains_key(&3), "the mark went");
+        assert!(!r.core.dl.leaving[&3].operator);
+        assert_eq!(r.core.stats.leave_rows, rows, "a row was written");
+        // The lapse takes it back once the row is readable.
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta));
+    }
+
+    /// SHOULD 5: a root's abort whose take-back row did not journal keeps it
+    /// and journals it again at the next look. Fails on 3ca92d23: nothing
+    /// retries, the row stays `true`.
+    #[test]
+    fn a_root_abort_whose_row_did_not_journal_tries_again() {
+        let (mut r, c) = own_leave_as_root();
+        // (The abort, and the retry the same step makes, both fail.)
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(1_000);
+        let out = r.step(Event::Control {
+            op: OpId(DRIVER_CTL + 1),
+            req: Control::LeaveFailed,
+        });
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(0);
+        assert!(
+            matches!(control_answer(&out, DRIVER_CTL + 1), Some(Ok(_))),
+            "{out:?}"
+        );
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&1),
+            Some(&LeaveRow {
+                req: c,
+                leaving: true
+            }),
+            "the failed journal wrote the row"
+        );
+        assert_eq!(r.core.dl.leave_abort_row, Some(c));
+        r.hold(2, None);
+        leave_tick(&mut r, 600);
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&1),
+            Some(&LeaveRow {
+                req: c,
+                leaving: false
+            }),
+            "the take-back was not retried"
+        );
+        assert_eq!(r.core.dl.leave_abort_row, None);
+    }
+
+    /// SHOULD 4: the lapse reads the log's rows for a sender with no mark at
+    /// most once per resend interval, not for every message; a row that
+    /// appears after the first look is still seen and lapses. Prints the
+    /// reads and the time per message (the cost before: one read per message).
+    #[test]
+    fn the_lapse_check_reads_the_rows_once_per_interval_not_per_message() {
+        let (mut r, _d1) = root_with_dir();
+        let resend = r.core.leave_resend_ms() as u64;
+        let n = 4_000u64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            heard_without_note(&mut r, 3);
+            r.advance(1);
+        }
+        let el = t0.elapsed();
+        let scans = r.core.stats.leave_row_scans;
+        eprintln!(
+            "lapse check: {n} messages over {} ms: {scans} row reads, {:.2} us per message",
+            n,
+            el.as_secs_f64() * 1e6 / n as f64
+        );
+        assert!(
+            scans <= 2 + n / resend,
+            "{scans} row reads for {n} messages"
+        );
+        // A row this tenure had not seen at the first look.
+        apply_leave_rows(&r, 20, &[leave_row(3, 100, true)]);
+        r.advance(resend + 1);
+        heard_without_note(&mut r, 3);
+        assert!(r.core.dl.leave_note_seen.contains_key(&3), "not seen");
+        r.advance(r.core.leave_note_lapse_ms() + 1);
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta), "the row never lapsed");
+    }
+
+    /// S-3: a leave aborted as root takes the log's row back whether or not
+    /// this tenure journaled it (`leave_own` is `None` when a predecessor's
+    /// `true(me)` row is the log's). Mutation: the abort keyed on
+    /// `leave_own`, so it fails.
+    #[test]
+    fn a_leave_aborted_as_root_takes_a_predecessors_row_back() {
+        let (mut s, _d1) = successor_over(&[leave_row(2, 5, true)]);
+        s.core.dl.leave_self = true;
+        assert!(s.core.dl.leave_own.is_none());
+        let out = s.step(Event::Control {
+            op: OpId(6),
+            req: Control::LeaveFailed,
+        });
+        assert!(matches!(control_answer(&out, 6), Some(Ok(_))), "{out:?}");
+        assert_eq!(
+            s.meta.deleg_leaves().unwrap().get(&2),
+            Some(&LeaveRow {
+                req: 5,
+                leaving: false
+            }),
+            "the row was not taken back"
+        );
+    }
+
+    /// S-4: an operator's leave is answered `Ok` only once the row that
+    /// refuses the node's grants is durable. Mutation: the durability gate
+    /// removed from the operator's `done`, so it fails.
+    #[test]
+    fn an_operators_leave_is_answered_once_its_row_is_durable() {
+        let (mut r, d1) = root_with_dir();
+        // A live generation of another node: the root's rows wait for the
+        // group.
+        assert!(delegate(&mut r, 900, d1, 4));
+        let out = r.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        let (_, jseq) = r.core.dl.leaving[&3].journaled.expect("no row");
+        assert!(
+            control_answer(&out, 910).is_none(),
+            "answered with the row not durable: {out:?}"
+        );
+        let out = leave_tick(&mut r, 600);
+        assert!(control_answer(&out, 910).is_none(), "{out:?}");
+        r.hold(2, None);
+        r.core.ack.shipped_rows.insert(jseq);
+        let out = leave_tick(&mut r, 600);
+        assert!(matches!(control_answer(&out, 910), Some(Ok(_))), "{out:?}");
+    }
+
+    /// S-6: an unreadable row is not "no row". The take-back is not
+    /// acknowledged, and `leave_unmark` holds back (the mark stays, no row is
+    /// written). Mutation: the read error treated as no row, so it fails.
+    #[test]
+    fn an_unreadable_leave_row_holds_the_un_mark_back() {
+        use crate::core::delegate::LeaveUnmark;
+        let (mut r, _d1) = root_with_dir();
+        r.step(leave_note_from(3, 100, true));
+        let rows = r.core.stats.leave_rows;
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        let now = r.clk();
+        let held = r.core.leave_unmark(now, 3, LeaveUnmark::Lapsed, &r.meta);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert!(!held, "un-marked on an unreadable row");
+        assert!(r.core.dl.leaving.contains_key(&3), "the mark went");
+        assert_eq!(r.core.stats.leave_rows, rows, "a row was written");
+        // The take-back note of a node whose row cannot be read.
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1);
+        let out = r.step(leave_note_from(3, 101, false));
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "acked Ok: {out:?}");
+        // Readable again: it is taken back and acknowledged.
+        let out = r.step(leave_note_from(3, 101, false));
+        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
+        assert!(!r.core.is_leaving(3, &r.meta));
+    }
+
+    /// WP6.3 (4.8): an operator's leave that fails at its deadline journals
+    /// `false` (request 0) over the row it made, so no root keeps refusing
+    /// the node.
+    #[test]
+    fn an_operators_failed_leave_takes_its_row_back() {
+        let (mut r, d1) = root_with_dir();
+        assert!(delegate(&mut r, 900, d1, 3));
+        r.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 0,
+                leaving: true
+            })
+        );
+        // The holder never answers and the leave runs out of time (the root
+        // keeps its lease).
+        r.advance(r.core.leave_wait_ms() as u64 + 1_000);
+        r.hold(2, None);
+        let out = leave_tick(&mut r, 600);
+        assert!(matches!(control_answer(&out, 910), Some(Err(_))), "{out:?}");
+        assert!(!r.core.is_leaving(3, &r.meta));
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: 0,
+                leaving: false
+            })
+        );
     }
 
     /// The note is sent again until it is acknowledged, and an
@@ -78828,6 +80120,15 @@ mod step9_one_stream_per_node {
         let mut out = Vec::new();
         h.core.on_deleg_expiry(h.clk(), gen, &h.meta, &mut out);
         assert!(h.core.dl.gens[&gen].ended, "not ended: {out:?}");
+        // (S-4: the answer is the retirement, and waits for the row that
+        // refuses the node's grants to be durable.)
+        let out = h.step(Event::Slack { epoch_slack: 0 });
+        assert!(
+            control_answer(&out, 910).is_none(),
+            "row not durable: {out:?}"
+        );
+        let (_, jseq) = h.core.dl.leaving[&3].journaled.expect("no row");
+        h.core.ack.shipped_rows.insert(jseq);
         let out = h.step(Event::Slack { epoch_slack: 0 });
         let answer = control_answer(&out, 910).unwrap_or_else(|| panic!("not answered: {out:?}"));
         assert!(answer.is_ok(), "{answer:?}");
@@ -79217,7 +80518,7 @@ mod step9_one_stream_per_node {
         n.core.cfg.p2p = true;
         let out = n.step(leave_note_from(3, 100, true));
         assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
-        assert!(!n.core.is_leaving(n.clk(), 3));
+        assert!(!n.core.is_leaving(3, &n.meta));
     }
 
     /// Plan 46 M1.3 step 14: a leave note is acknowledged once the root lists
@@ -79252,7 +80553,7 @@ mod step9_one_stream_per_node {
         );
         assert_eq!(r.core.stats.deleg_leave_note_recalls, 1);
         assert_eq!(r.core.stats.deleg_sticky_recalled_other, 0);
-        assert!(r.core.is_leaving(r.clk(), 3));
+        assert!(r.core.is_leaving(3, &r.meta));
         let out = r.step(leave_note_from(3, 100, true));
         assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
         // The holder never answers: the generation ends at its expiry.
@@ -79260,6 +80561,12 @@ mod step9_one_stream_per_node {
         let mut out = Vec::new();
         r.core.on_deleg_expiry(r.clk(), gen, &r.meta, &mut out);
         assert!(r.core.dl.gens[&gen].ended, "not ended: {out:?}");
+        // (WP6.3: the generation ended, but the node's `NodeLeaving` row is
+        // not durable yet: the note is refused until it is.)
+        let out = r.step(leave_note_from(3, 100, true));
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        let (_, jseq) = r.core.dl.leaving[&3].journaled.expect("no row journaled");
+        r.core.ack.shipped_rows.insert(jseq);
         let out = r.step(leave_note_from(3, 100, true));
         assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
     }
@@ -79277,11 +80584,17 @@ mod step9_one_stream_per_node {
         r.step(leave_note_from(3, 100, true));
         r.advance(15_000);
         assert!(
-            r.core.is_leaving(r.clk(), 3),
+            r.core.is_leaving(3, &r.meta),
             "the mark lapsed before twice the TTL"
         );
         r.advance(6_000);
-        assert!(!r.core.is_leaving(r.clk(), 3), "the mark does not lapse");
+        // (WP6.3: only a node heard without a note after the window lapses.)
+        assert!(
+            r.core.is_leaving(3, &r.meta),
+            "the mark lapsed on time alone"
+        );
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta), "the mark does not lapse");
     }
 
     /// Re-review MUST-3, the root's side: the mark of a node's own note is
@@ -79295,17 +80608,18 @@ mod step9_one_stream_per_node {
         // Taken back; an older take-back is none.
         let (mut r, _d1) = root_with_dir();
         r.step(leave_note_from(3, 100, true));
-        assert!(r.core.is_leaving(r.clk(), 3));
+        assert!(r.core.is_leaving(3, &r.meta));
         r.step(leave_note_from(3, 50, false));
-        assert!(r.core.is_leaving(r.clk(), 3), "an older note took it back");
+        assert!(r.core.is_leaving(3, &r.meta), "an older note took it back");
         let out = r.step(leave_note_from(3, 101, false));
         assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
-        assert!(!r.core.is_leaving(r.clk(), 3), "the take-back did not");
+        assert!(!r.core.is_leaving(3, &r.meta), "the take-back did not");
         // Lapses.
         r.step(leave_note_from(3, 200, true));
-        assert!(r.core.is_leaving(r.clk(), 3));
+        assert!(r.core.is_leaving(3, &r.meta));
         r.advance(300_000);
-        assert!(!r.core.is_leaving(r.clk(), 3), "the mark does not lapse");
+        heard_without_note(&mut r, 3);
+        assert!(!r.core.is_leaving(3, &r.meta), "the mark does not lapse");
         // A restart: the node's lock requests carry a new incarnation.
         let lock = |r: &mut Harness, incarnation: u32, req: u64| {
             let sent = r.honour();
@@ -79326,10 +80640,10 @@ mod step9_one_stream_per_node {
         lock(&mut r, 1, 1);
         r.step(leave_note_from(3, 300, true));
         lock(&mut r, 1, 2);
-        assert!(r.core.is_leaving(r.clk(), 3));
+        assert!(r.core.is_leaving(3, &r.meta));
         lock(&mut r, 2, 3);
         assert!(
-            !r.core.is_leaving(r.clk(), 3),
+            !r.core.is_leaving(3, &r.meta),
             "a restarted node stays marked"
         );
         // An operator's mark: neither a take-back nor a restart clears it.
@@ -79339,11 +80653,11 @@ mod step9_one_stream_per_node {
             op: OpId(910),
             req: Control::EndGrantsOf { node: 3 },
         });
-        assert!(r.core.is_leaving(r.clk(), 3));
+        assert!(r.core.is_leaving(3, &r.meta));
         r.step(leave_note_from(3, 400, true));
         r.step(leave_note_from(3, 401, false));
         lock(&mut r, 2, 2);
-        assert!(r.core.is_leaving(r.clk(), 3), "an operator's mark went");
+        assert!(r.core.is_leaving(3, &r.meta), "an operator's mark went");
     }
 
     /// Re-review MUST-3, the node's side: a self-leave that runs out of time
@@ -79446,7 +80760,7 @@ mod step9_one_stream_per_node {
             .unwrap();
         let (mut r, _d1) = root_with_dir();
         r.step(Event::Peer { from: 3, msg: note });
-        assert!(r.core.is_leaving(r.clk(), 3), "the new root did not mark");
+        assert!(r.core.is_leaving(3, &r.meta), "the new root did not mark");
         h.step(leave_note_ack(4, req4, false));
         assert!(h.core.leave_told_ok(h.clk()));
     }
@@ -79463,14 +80777,21 @@ mod step9_one_stream_per_node {
             // (The root keeps its lease.)
             r.hold(2, None);
             r.step(leave_note_from(3, 100, true));
-            assert!(r.core.is_leaving(r.clk(), 3), "lapsed at {spent} ms");
+            assert!(r.core.is_leaving(3, &r.meta), "lapsed at {spent} ms");
             r.advance(400);
             spent += 400;
         }
-        assert!(r.core.is_leaving(r.clk(), 3));
+        assert!(r.core.is_leaving(3, &r.meta));
         r.advance(2 * r.core.cfg.delegation_ttl_ms + 3_000);
+        // WP6.3: time alone lapses nothing; a node heard after the window
+        // with no note is not leaving.
         assert!(
-            !r.core.is_leaving(r.clk(), 3),
+            r.core.is_leaving(3, &r.meta),
+            "the mark lapsed on time alone"
+        );
+        heard_without_note(&mut r, 3);
+        assert!(
+            !r.core.is_leaving(3, &r.meta),
             "the mark outlasts the notes"
         );
     }
@@ -79509,17 +80830,18 @@ mod step9_one_stream_per_node {
         let (mut r, _d1) = root_with_dir();
         r.step(leave_note_from(3, 100, true));
         r.step(leave_note_from(3, 101, false));
-        assert!(!r.core.is_leaving(r.clk(), 3));
+        assert!(!r.core.is_leaving(3, &r.meta));
+        // (Refused: it marks nothing, so it is no leave to count told.)
         let out = r.step(leave_note_from(3, 100, true));
-        assert_eq!(leave_ack_to(&out, 3), Some(false), "{out:?}");
-        assert!(!r.core.is_leaving(r.clk(), 3), "a delayed note re-marked");
+        assert_eq!(leave_ack_to(&out, 3), Some(true), "{out:?}");
+        assert!(!r.core.is_leaving(3, &r.meta), "a delayed note re-marked");
         r.step(leave_note_from(3, 102, true));
-        assert!(r.core.is_leaving(r.clk(), 3), "a new leave was ignored");
+        assert!(r.core.is_leaving(3, &r.meta), "a new leave was ignored");
         // (A take-back that came before any mark is remembered too.)
         let (mut r, _d1) = root_with_dir();
         r.step(leave_note_from(3, 201, false));
         r.step(leave_note_from(3, 200, true));
-        assert!(!r.core.is_leaving(r.clk(), 3));
+        assert!(!r.core.is_leaving(3, &r.meta));
     }
 
     /// Re-review SHOULD 3: the take-back goes to the root there is now,
@@ -80515,7 +81837,7 @@ mod step4_sticky {
             "{refused}"
         );
         assert!(h.core.dl.leave_waits.is_empty());
-        assert!(!h.core.is_leaving(h.clk(), 3), "the refused node is marked");
+        assert!(!h.core.is_leaving(3, &h.meta), "the refused node is marked");
         assert!(!h.core.dl.gens[&gen].ended);
     }
 
@@ -80539,7 +81861,7 @@ mod step4_sticky {
                 .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::ReleaseRequest { .. })),
             "the live holder was not recalled: {out:?}"
         );
-        assert!(h.core.is_leaving(h.clk(), 3));
+        assert!(h.core.is_leaving(3, &h.meta));
         // The recall is the operator's: not "another cause" of a sticky
         // recall (the sim's `sticky_ends_only_by_holder_or_operator`).
         let gen = sticky_gen_of(&h, d1);

@@ -445,6 +445,15 @@ pub enum LogRecord {
         dirs: Vec<u64>,
         at: u64,
     },
+    /// WP6.3 (ADR-61): the leave of `node` as a log row. A root journals
+    /// `leaving: true` before it acknowledges the node's leave note, and a
+    /// `leaving: false` row for every un-mark (take-back, lapse, an
+    /// operator's failed leave). Every root, a successor included, refuses a
+    /// grant to a node whose latest row (log order) says `leaving`. `req` is
+    /// the leave's request id (0: an operator's mark). Appended at the end of
+    /// the enum, as the postcard ordering comment on it says. Touches no
+    /// inode or dentry.
+    NodeLeaving { node: u64, req: u64, leaving: bool },
 }
 
 /// What a granted subtree is (§5.2): `Placed` is the placement policy's
@@ -680,6 +689,11 @@ mod tests {
                 gen: 5,
                 dirs: vec![7, 9],
                 at: 11,
+            },
+            LogRecord::NodeLeaving {
+                node: 2,
+                req: 9,
+                leaving: true,
             },
         ];
         for r in recs {

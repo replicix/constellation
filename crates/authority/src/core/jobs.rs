@@ -31,6 +31,13 @@ use std::collections::BTreeSet;
 /// own, unreleased — and gives up on anything else.
 pub(crate) const READOPT_REASON: &str = "readopt-for-forward";
 
+/// WP6.3 (ADR-61): the reason of an acquisition a node's own leave queues
+/// when it has no root to tell and the lease it read is released. It claims
+/// only a lease nobody holds (none, or released): it never asks a live
+/// holder (no `wanted_by` registration, no `LeaseRequest`) and never takes
+/// an expired lease that was not released (see `Core::acquire_classified`).
+pub(crate) const LEAVE_ACQUIRE_REASON: &str = "leave-acquire";
+
 /// Plan 46 M1.3 step 3 (bucket C): claims lost in a row whose waiting ops
 /// retry at the shortest backoff; later ones keep the grown backoff.
 const CLAIM_LOST_FAST_RETRIES: u32 = 3;
@@ -432,6 +439,18 @@ impl Core {
                 .queued_jobs
                 .iter()
                 .any(|q| matches!(q, JobReq::Acquire { .. }))
+    }
+
+    /// An acquisition for `reason` is in the slot or queued for it.
+    #[cfg(test)]
+    pub(crate) fn acquiring_for(&self, reason: &str) -> bool {
+        matches!(
+            self.job.as_ref().map(|j| &j.what),
+            Some(What::Acquire { reason: r, .. }) if *r == reason
+        ) || self
+            .queued_jobs
+            .iter()
+            .any(|q| matches!(q, JobReq::Acquire { reason: r, .. } if *r == reason))
     }
 
     /// A-1: the acquisition in the slot is a re-adoption for a forward
@@ -1079,6 +1098,7 @@ impl Core {
                         | LogRecord::StreamReleased { .. }
                         | LogRecord::DelegateNodeEnded { .. }
                         | LogRecord::DelegateNodeGroup { .. }
+                        | LogRecord::NodeLeaving { .. }
                 )
             }) {
                 self.delegation_sync(now, replica, out);
@@ -3799,6 +3819,17 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
             return;
         }
+        // S-1: a leave-acquire is queued outside an epoch, and the epoch may
+        // open while it waits behind another job: the acquisition of an epoch
+        // sends a `LeaseRequest` whatever `ask_handoff` says, and would pull
+        // the hold onto a node about to retire. The leave then fails at its
+        // deadline (latency, not integrity).
+        if reason == LEAVE_ACQUIRE_REASON
+            && (self.epoch.open || self.epoch.active || self.dl.epoch_active)
+        {
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
         if admitted.is_none() {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -3994,6 +4025,34 @@ impl Core {
                 return;
             }
         }
+        if matches!(
+            self.job.as_ref().map(|j| &j.what),
+            Some(What::Acquire {
+                reason: LEAVE_ACQUIRE_REASON,
+                ..
+            })
+        ) {
+            // WP6.3: a leave takes a lease nobody holds, and only that: the
+            // one it holds already, none, or one its holder released (with
+            // its tail fetch). A live holder is the `Busy` arm's, which
+            // neither registers nor asks for this reason; an expired lease
+            // that was not released is not taken at its TTL by a node that
+            // is about to retire.
+            let takes = match &plan {
+                Plan::Held | Plan::Create | Plan::Busy { .. } => true,
+                Plan::Claim { prev, .. } | Plan::FetchTail { prev, .. } => prev.released,
+                Plan::Refused(_) => false,
+            };
+            if !takes {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?plan,
+                    "leave acquisition: the lease is not a released one"
+                );
+                self.finish_acquire(now, false, replica, out);
+                return;
+            }
+        }
         if !matches!(plan, Plan::FetchTail { .. }) {
             // Plan 43 C1-3: nothing waits for a group any more.
             self.bk.group_wait = None;
@@ -4062,7 +4121,7 @@ impl Core {
                 let offered = matches!(
                     &self.job.as_ref().expect("job").what,
                     What::Acquire {
-                        reason: "claim-offer" | "dead-root",
+                        reason: "claim-offer" | "dead-root" | LEAVE_ACQUIRE_REASON,
                         ..
                     }
                 );

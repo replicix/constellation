@@ -1572,6 +1572,18 @@ pub struct Stats {
     /// Plan 46 M1.3 step 14: recalls of a sticky stream the root started on a
     /// leaving node's own note (`RecallCause::LeaveNote`).
     pub deleg_leave_note_recalls: u64,
+    /// WP6.3 (ADR-61): `NodeLeaving` rows this root journaled (marks, take-
+    /// backs, lapses, its own).
+    pub leave_rows: u64,
+    /// WP6.3 (M1): marks (or rows) of a node heard after a full lapse window
+    /// with no leave note, taken back.
+    pub leave_lapses: u64,
+    /// WP6.3 (SHOULD 4): reads of the log's leave rows by the lapse check
+    /// (one per sender and resend interval at most).
+    pub leave_row_scans: u64,
+    /// WP6.3 (M6): acquisitions a node's own leave queued because there was
+    /// no root to tell and the lease was released (`LEAVE_ACQUIRE_REASON`).
+    pub leave_acquires: u64,
     pub deleg_sticky_recalled_other: u64,
     /// Plan 46 M1.3 step 5, the holder's release (`Control::StickyRelease`):
     /// releases journaled (`_partial`: of some of the stream's subtrees
@@ -3640,6 +3652,9 @@ impl Core {
                 // ADR-50: every message kind from a node counts, here,
                 // before any row of it is journaled.
                 self.note_heard(now, from, replica);
+                // WP6.3 (M1): a node heard after a full lapse window with no
+                // leave note is not leaving.
+                self.leave_lapse_check(now, from, &msg, replica);
                 self.on_peer(now, from, msg, replica, &mut out)
             }
             Event::PeerFailed { req, to, outage } => {
@@ -3776,6 +3791,10 @@ impl Core {
             Event::OwnLag { from, until } => {
                 self.roster.note_lapse();
                 self.on_own_lag(from, until);
+                // WP6.3 (M-1): the root's own deaf time is not a leaver's
+                // silence.
+                self.leave_rebase_clocks(now);
+                self.leave_own_lag();
                 self.ask_read_after_lapse(now, &mut out);
                 // The directory this node holds may predate the lapse: not
                 // a singleton again until a read issued after it arrives (a
@@ -4842,7 +4861,7 @@ impl Core {
             }
             Control::LeaveFailed => {
                 if self.dl.leave_self {
-                    self.leave_self_abort(now, out);
+                    self.leave_self_abort(now, replica, out);
                 }
                 out.push(Action::ControlDone {
                     op,

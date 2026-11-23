@@ -1316,15 +1316,18 @@ impl Core {
         };
         // A node back under a new incarnation is not the one whose leave
         // note marked it: it is granted again. (An operator's mark stays.)
+        self.leave_incarnation_back(now, from, incarnation, replica);
+        // (The take-back floor of an earlier incarnation's requests only: the
+        // new incarnation's requests are above it.)
+        let new = u64::from(incarnation) & 0x3f_ffff;
         if self
             .dl
-            .leaving
+            .leave_taken_back
             .get(&from)
-            .is_some_and(|m| m.until.is_some())
+            .is_some_and(|t| (*t >> 40) < new)
         {
-            self.dl.leaving.remove(&from);
+            self.dl.leave_taken_back.remove(&from);
         }
-        self.dl.leave_taken_back.remove(&from);
         let mut inos = Vec::new();
         let mut dropped = 0u64;
         let mut i = 0;

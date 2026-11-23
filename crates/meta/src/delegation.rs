@@ -643,6 +643,41 @@ pub(crate) fn apply_group_tx(
     Ok(true)
 }
 
+/// WP6.3: one node's leave as this replica's log carries it: the latest
+/// [`LogRecord::NodeLeaving`] row applied (log order wins). A `leaving: false`
+/// row stays (it keeps `req`, so a predecessor's older `true` is stale), and
+/// the row of a retired node stays for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveRow {
+    pub req: u64,
+    pub leaving: bool,
+}
+
+const LEAVE_PREFIX: &[u8] = b"leave/";
+
+/// `0x30 | Delegation | "leave/" | node` (big endian).
+pub fn leave_key(node: NodeId) -> Vec<u8> {
+    let mut id = LEAVE_PREFIX.to_vec();
+    id.extend_from_slice(&node.to_be_bytes());
+    keys::subsystem(keys::Subsystem::Delegation, &id)
+}
+
+/// Apply a `NodeLeaving` record: the row is replaced, in log order (the
+/// latest row wins, whatever its `req`).
+pub(crate) fn apply_leave_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    dirty: ns::Dirty<'_>,
+    node: NodeId,
+    req: u64,
+    leaving: bool,
+) -> Result<(), MetaError> {
+    let bytes = postcard::to_allocvec(&LeaveRow { req, leaving })
+        .map_err(|e| MetaError::Invalid(format!("delegation leave row: {e}")))?;
+    ns::ns_insert(tx, &meta.ns, dirty, leave_key(node), bytes)?;
+    Ok(())
+}
+
 /// The generation ended: its group row goes with its table row.
 pub(crate) fn remove_group_tx(
     tx: &mut SingleWriterWriteTx,
@@ -726,6 +761,27 @@ impl Meta {
         crate::store::backup::injected_read_fault()?;
         let r = self.db.read_tx();
         read_group_tx(&r, self, gen)
+    }
+
+    /// WP6.3: every node's latest `NodeLeaving` row on this replica.
+    pub fn deleg_leaves(&self) -> Result<BTreeMap<NodeId, LeaveRow>, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        crate::store::backup::injected_read_fault()?;
+        let r = self.db.read_tx();
+        let prefix = keys::subsystem(keys::Subsystem::Delegation, LEAVE_PREFIX);
+        let mut out = BTreeMap::new();
+        for guard in r.prefix(&self.ns, prefix.as_slice()) {
+            let (k, v) = guard.into_inner()?;
+            let id = &k[prefix.len()..];
+            let node =
+                NodeId::from_be_bytes(id.try_into().map_err(|_| {
+                    MetaError::Invalid("a delegation leave key with no node".into())
+                })?);
+            let row = crate::record::from_bytes_exact(&v)
+                .map_err(|e| MetaError::Invalid(format!("delegation leave row: {e}")))?;
+            out.insert(node, row);
+        }
+        Ok(out)
     }
 
     /// Simulation oracle: the highest `DelegateNodeGroup` version of `gen` this
