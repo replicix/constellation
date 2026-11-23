@@ -2415,12 +2415,16 @@ impl Core {
     fn lock_grant_position(&self, to: NodeId, ino: Ino, replica: &dyn Replica) -> Position {
         let own = self.lock_position(ino, replica);
         let mut p = match self.lk.floors.get(&ino) {
-            Some(floor) => constellation_meta::locks::floor_join(&own, floor),
+            Some(floor) => {
+                constellation_meta::locks::floor_join_by(&own, floor, &|g| replica.shipped_idx(g))
+            }
             None => own,
         };
         for (dir, floor) in &self.lk.dir_floors {
             if *dir == constellation_fs_core::types::ROOT_INO || replica.is_under(ino, *dir) {
-                p = constellation_meta::locks::floor_join(&p, floor);
+                p = constellation_meta::locks::floor_join_by(&p, floor, &|g| {
+                    replica.shipped_idx(g)
+                });
             }
         }
         if to == self.cfg.node_id && self.lease.held.is_some() {
@@ -2454,19 +2458,22 @@ impl Core {
             if idx > 0 {
                 let mut own = Position::ZERO;
                 if own.streams.raise(*gen, idx) {
-                    p = constellation_meta::locks::floor_join(&p, &own);
+                    p = constellation_meta::locks::floor_join_by(&p, &own, &|g| {
+                        replica.shipped_idx(g)
+                    });
                 }
             }
         }
         if self.lease.epoch().is_some() && self.lease.held.is_some() {
             let epoch = self.lease.epoch().unwrap_or(0);
-            p = constellation_meta::locks::floor_join(
+            p = constellation_meta::locks::floor_join_by(
                 &p,
                 &Position {
                     seq: self.ship.head_seq,
                     pending: replica.journal_position(epoch),
                     streams: Default::default(),
                 },
+                &|g| replica.shipped_idx(g),
             );
         }
         p

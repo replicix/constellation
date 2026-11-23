@@ -169,6 +169,12 @@ pub struct Config {
     /// of its cause. The causal-cut oracle must then fail the run.
     pub skip_deleg_dep_wait: bool,
     /// Fault injection for the simulation's negative control (never set by
+    /// the engine): an op whose `deps` overflow is not held (ADR-69): it
+    /// goes on with a placeholder that names none of the streams, as it did
+    /// before the hold. The causal-cut oracle must then fail a run whose
+    /// `deps_cap` forces overflows.
+    pub skip_deps_overflow_hold: bool,
+    /// Fault injection for the simulation's negative control (never set by
     /// the engine): the root ends a sticky grant by its TTL as it does a
     /// placed one (plan 46 M1.3 step 4, `ttl_reclaims_sticky`). The sim's
     /// `sticky_ends_only_by_holder_or_operator` must then fail the run.
@@ -776,6 +782,7 @@ impl Config {
             partition: constellation_store_s3::log::PARTITION.to_string(),
             single_writer: false,
             skip_deleg_dep_wait: false,
+            skip_deps_overflow_hold: false,
             ttl_reclaims_sticky: false,
             restart_skips_write_quarantine: false,
             release_cut: true,
@@ -1454,9 +1461,11 @@ pub struct Stats {
     /// Root: grants a recall answer handed back while a release waited
     /// for that recall (`Core::lock_install_returned`).
     pub lock_returned_in_release: u64,
-    /// Requester: ops sent to the root because the observed stream
-    /// table was full (coordinator decision 4).
-    pub deps_overflow_to_root: u64,
+    /// Requester: ops held because their causal past names more streams
+    /// than the table holds, past what the applied log carries (ADR-69,
+    /// plan 30 decision 4 as amended): counted once per op; never sent
+    /// short, and not to the root either.
+    pub deps_overflow_holds: u64,
     /// Root: executions parked for a recall of a write delegation.
     pub deleg_exec_parked: u64,
     // ---- M11 phase 2b ----

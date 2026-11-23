@@ -507,7 +507,8 @@ impl View {
             let session = self.meta.session();
             // The op's `deps` (`observed` plus every position this
             // node's clients were answered with); `None` (the streams
-            // overflow) goes through the core, to the root. Likewise a
+            // overflow, past what the applied log carries) goes through the
+            // core, which holds the op until it fits (ADR-69). Likewise a
             // generation the core has not published a class for yet.
             //
             // Plan 43 C2d (§5.1), plan 46 M1.1 step 4: the row is stamped

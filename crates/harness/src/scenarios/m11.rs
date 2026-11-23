@@ -72,7 +72,7 @@ pub(super) fn print_deleg(scenario: &str, who: &str, d: &serde_json::Value) {
         n(d, "recalls_expired"),
         n(d, "reclaimed"),
         n(d, "ended"),
-        n(d, "deps_overflow_to_root"),
+        n(d, "deps_overflow_holds"),
         n(d, "exec_parked"),
         n(d, "stranded"),
     );

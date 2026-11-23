@@ -91,9 +91,12 @@
 //!
 //! Positions: a delegate's acknowledgement carries `(gen, idx)` in the
 //! position's `streams` (M6's watermark with a per-stream pending part);
-//! the root's carries every generation's cursor. A requester whose
-//! observed streams are full sends its op to the root instead
-//! (`deps_overflow_to_root`, coordinator decision 4).
+//! the root's carries every generation's cursor. A requester whose causal
+//! past names more streams than a position holds, past what the log it
+//! applied carries, holds the op until it fits (`deps_overflow_holds`,
+//! ADR-69, which amends coordinator decision 4): never sent with a
+//! truncated table, and not to the root, which orders only after the rows
+//! it appended.
 //!
 //! Continuation epochs (M10): no delegation inside an epoch. When the
 //! driver reports an active epoch the root recalls every live generation
@@ -4529,6 +4532,11 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
+        // ADR-69: an op of this node held for its `deps` overflow is not
+        // run here (the guard of every path that runs a client op).
+        if from == 0 && self.held_for_overflow(now, rid, replica, out) {
+            return true;
+        }
         let keys = super::holder::keys_of_op_in(op, replica);
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;

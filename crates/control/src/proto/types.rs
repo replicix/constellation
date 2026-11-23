@@ -543,7 +543,7 @@ pub struct DelegationReport {
     pub recalls_expired: u64,
     pub reclaimed: u64,
     pub ended: u64,
-    pub deps_overflow_to_root: u64,
+    pub deps_overflow_holds: u64,
     pub exec_parked: u64,
     /// Delegate rows stranded here by a recall (rolled back, replayed).
     pub stranded: u64,

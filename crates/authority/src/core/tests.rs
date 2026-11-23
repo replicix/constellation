@@ -97272,3 +97272,456 @@ fn a_reconfiguration_waits_for_the_release_record() {
     land_release_record(&mut h, id);
     assert!(h.core.lease_cas_in_flight(), "the CAS is out");
 }
+
+/// ADR-69 (plan 30 decision 4, amended): an op whose causal past names more
+/// streams than a position carries, past what the applied log holds, is held
+/// at its requester, never sent short, run, or routed to the root.
+mod deps_overflow {
+    use super::*;
+
+    /// `n` generations the node's clients were answered by (the session's
+    /// `frontier`), none of them the table's: nine overflow the table.
+    fn frontier_gens(h: &Harness, n: u64) -> Vec<u64> {
+        let gens: Vec<u64> = (0..n).map(|i| (7u64 << 32) | (100 + i)).collect();
+        for g in &gens {
+            let mut p = constellation_meta::Position::ZERO;
+            assert!(p.streams.raise(*g, 3));
+            h.meta.session().note_frontier(&p);
+        }
+        gens
+    }
+
+    fn submit_create(
+        h: &mut Harness,
+        dir: constellation_fs_core::Ino,
+        name: &str,
+    ) -> (Rid, Vec<Action>) {
+        let rid = h.rid(1);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: name.into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        (rid, out)
+    }
+
+    fn requests(out: &[Action]) -> Vec<(NodeId, constellation_meta::Position)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { deps, .. } => Some((to, *deps)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `deps` the op goes on with once released: those of its request to
+    /// a peer, or, run at the root (recalling first), its own.
+    fn released_deps(h: &Harness, rid: Rid, out: &[Action]) -> constellation_meta::Position {
+        let sent = requests(out);
+        match sent.as_slice() {
+            [(_, deps)] => *deps,
+            [] => h.core.clients.get(&rid).expect("the op is live").deps,
+            _ => panic!("sent twice: {out:?}"),
+        }
+    }
+
+    fn tick(h: &mut Harness, rid: Rid) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.on_forward_backoff(h.clk(), rid, &h.meta, &mut out);
+        out
+    }
+
+    fn held(h: &Harness, rid: Rid) -> bool {
+        h.core
+            .clients
+            .get(&rid)
+            .is_some_and(|c| c.wide.is_some() && c.phase_kind() == ClientPhase::Backoff)
+    }
+
+    /// The fail-before: nine generations overflow; the op is not forwarded
+    /// (with an empty table or any), not run at the root, and goes on once
+    /// the log carries one of them, with the other eight named.
+    #[test]
+    fn an_op_whose_deps_overflow_is_held_then_released_by_the_log() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        let gens = frontier_gens(&h, 9);
+        assert!(crate::replica::Replica::deps(&h.meta).is_none());
+        let (rid, out) = submit_create(&mut h, dir, "m");
+        assert!(requests(&out).is_empty(), "sent short: {out:?}");
+        assert!(h.meta.lookup(dir, "m").unwrap().is_none(), "ran");
+        assert!(held(&h, rid));
+        assert_eq!(h.core.stats.deps_overflow_holds, 1);
+        // Ticks with nothing shipped hold on, and count the op once.
+        for _ in 0..3 {
+            h.advance(50);
+            let out = tick(&mut h, rid);
+            assert!(requests(&out).is_empty(), "{out:?}");
+            assert!(held(&h, rid));
+        }
+        assert_eq!(h.core.stats.deps_overflow_holds, 1);
+        // The log carries one: the op is released with the other eight.
+        h.meta.session().note_shipped(gens[0], 3);
+        h.advance(50);
+        let out = tick(&mut h, rid);
+        let deps = released_deps(&h, rid, &out);
+        assert_eq!(deps.streams.len(), 8);
+        assert!(deps.streams.get(gens[0]).is_none());
+        assert!(gens[1..].iter().all(|g| deps.streams.get(*g) == Some(3)));
+        assert!(h.core.clients[&rid].wide.is_none());
+    }
+
+    /// The root's own rows: nine generations of rows appended (or executed)
+    /// here and not shipped overflow too; the ship releases the op.
+    #[test]
+    fn a_root_with_nine_generations_of_unshipped_rows_holds_then_releases_after_the_ship() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        let gens: Vec<u64> = (0..9u64).map(|i| (7u64 << 32) | (200 + i)).collect();
+        for g in &gens {
+            h.meta.session().note_stream(*g, 2);
+        }
+        let (rid, out) = submit_create(&mut h, dir, "m");
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert!(held(&h, rid));
+        h.meta.session().note_shipped(gens[4], 2);
+        h.meta.session().advance(5, None);
+        h.advance(50);
+        let out = tick(&mut h, rid);
+        let deps = released_deps(&h, rid, &out);
+        assert!(deps.seq >= 5, "orders after the log applied: {deps:?}");
+        assert!(deps.streams.get(gens[4]).is_none());
+        assert_eq!(deps.streams.len(), 8);
+    }
+
+    /// A deposed root's appended and unshipped row `(g, i)` is in the
+    /// persisted log index and not in the log: it is still named once the
+    /// others are dropped (`shipped`, not the index, is what covers).
+    #[test]
+    fn a_root_appended_unshipped_row_is_still_named_after_the_overflow_compacts() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        // Node 2 executed a row of generation 4; the root appended it (the
+        // adapter notes the stream, as in the engine).
+        let rid2 = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let row = [
+            LogRecord::Create {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino: (2 << 40) | 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 5,
+            },
+            LogRecord::Completed { rid: rid2 },
+        ];
+        assert!(crate::replica::Replica::apply_delegate_tx(
+            &h.meta,
+            &row,
+            Some(rid2),
+            4,
+            1,
+            Default::default()
+        )
+        .unwrap());
+        assert_eq!(h.meta.log_stream_idx(4).unwrap(), 1, "in the index");
+        assert_eq!(h.meta.session().shipped_idx(4), 0, "not in the log");
+        let others = frontier_gens(&h, 8);
+        let (rid, out) = submit_create(&mut h, dir, "m");
+        assert!(requests(&out).is_empty(), "{out:?}");
+        assert!(held(&h, rid));
+        h.meta.session().note_shipped(others[0], 3);
+        h.advance(50);
+        let out = tick(&mut h, rid);
+        let deps = released_deps(&h, rid, &out);
+        assert_eq!(deps.streams.get(4), Some(1), "{deps:?}");
+    }
+
+    /// New generations arrive every tick; the op is released all the same
+    /// (its causal past is the snapshot, not the session as it is now).
+    #[test]
+    fn a_held_op_is_released_while_new_generations_keep_arriving() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        let gens = frontier_gens(&h, 9);
+        let (rid, _) = submit_create(&mut h, dir, "m");
+        assert!(held(&h, rid));
+        for n in 0..6u64 {
+            let mut p = constellation_meta::Position::ZERO;
+            p.streams.raise((9u64 << 32) | n, 1);
+            h.meta.session().note_frontier(&p);
+            h.advance(50);
+            let out = tick(&mut h, rid);
+            assert!(requests(&out).is_empty());
+        }
+        h.meta.session().note_shipped(gens[3], 3);
+        h.advance(50);
+        let out = tick(&mut h, rid);
+        let deps = released_deps(&h, rid, &out);
+        assert!(deps.streams.get((9u64 << 32) | 5).is_none());
+        assert_eq!(deps.streams.len(), 8);
+    }
+
+    /// A generation of the snapshot ends below the row: the dependency is
+    /// lost with it, and the op takes its deps afresh, which no longer name it.
+    #[test]
+    fn a_held_op_whose_entry_is_voided_above_its_cut_takes_its_deps_afresh() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        let gens = frontier_gens(&h, 9);
+        let (rid, _) = submit_create(&mut h, dir, "m");
+        assert!(held(&h, rid));
+        assert_eq!(
+            h.core.clients[&rid].wide.as_ref().unwrap().streams[&gens[2]],
+            3
+        );
+        h.meta.session().void_stream(gens[2], 1);
+        h.meta.session().note_void_cut(gens[2], 1);
+        h.advance(50);
+        let out = tick(&mut h, rid);
+        // (A voided generation's frontier entry is not carried at all: the
+        // session now names eight, and the op goes on.)
+        let deps = released_deps(&h, rid, &out);
+        assert_eq!(deps.streams.len(), 8, "{deps:?}");
+        assert!(deps.streams.get(gens[2]).is_none());
+        assert!(h.core.clients[&rid].wide.is_none());
+    }
+
+    /// A replay is never held for the overflow: it keeps its recorded rows
+    /// and goes on, so a takeover gate that replays locally completes.
+    #[test]
+    fn a_replay_under_an_overflow_is_not_held() {
+        let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
+        let (mut h, rid, q) = deposed_root_with_a_marker_replay();
+        let mut deps = constellation_meta::Streams::NONE;
+        deps.raise(4, 7);
+        list_generation(&h, 1 << 40, 4);
+        for i in 0..9u64 {
+            let mut p = constellation_meta::Position::ZERO;
+            p.streams.raise((7u64 << 32) | (300 + i), 3);
+            h.meta.session().note_frontier(&p);
+        }
+        assert!(crate::replica::Replica::deps(&h.meta).is_none());
+        submit_the_replay(&mut h, rid, &q, deps);
+        let c = &h.core.clients[&rid];
+        assert!(c.wide.is_none(), "a replay holds no snapshot");
+        assert_ne!(c.phase_kind(), ClientPhase::Backoff, "not held");
+        assert_eq!(kept_deps(&h, rid), vec![(4, 7)], "its recorded rows");
+        assert_eq!(h.core.stats.deps_overflow_holds, 0);
+    }
+
+    /// A settle is never held: it has no effect to order.
+    #[test]
+    fn a_settle_under_an_overflow_is_not_held() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        frontier_gens(&h, 9);
+        let rid = h.rid(2);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let mut out = Vec::new();
+        h.core.submit_as(
+            h.clk(),
+            rid,
+            MutateOp::Create {
+                parent: dir,
+                name: "s".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Policy::Client,
+            Default::default(),
+            (crate::core::client::Origin::Client, true),
+            &h.meta,
+            &mut out,
+        );
+        assert!(h.core.clients[&rid].wide.is_none());
+        assert_eq!(h.core.stats.deps_overflow_holds, 0);
+    }
+
+    /// The deadline of a held op that was never sent: nothing of it
+    /// exists anywhere, it is answered never executed.
+    #[test]
+    fn a_held_op_never_sent_is_abandoned_at_its_deadline() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        frontier_gens(&h, 9);
+        let (rid, out) = submit_create(&mut h, dir, "m");
+        assert!(held(&h, rid));
+        assert!(requests(&out).is_empty());
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(!h.core.clients.contains_key(&rid), "answered");
+        assert!(
+            replies(&out).iter().any(|(r, rep)| *r == rid
+                && matches!(rep, ClientReply::Outcome(MutateOutcome::Abandoned))),
+            "never executed: {out:?}"
+        );
+        assert!(h.meta.lookup(dir, "m").unwrap().is_none());
+    }
+
+    /// An op forwarded before and held on a retry may have run there: its
+    /// deadline settles it (in doubt), never the never-executed answer.
+    #[test]
+    fn a_held_op_forwarded_before_settles_at_its_deadline() {
+        let (mut h, dir, _gen) = s3_no_loops::delegated_root();
+        let (rid, out) = submit_create(&mut h, dir, "m");
+        assert_eq!(requests(&out).len(), 1, "forwarded: {out:?}");
+        // The overflow arrives, and the forward is retried from the backoff.
+        frontier_gens(&h, 9);
+        {
+            let c = h.core.clients.get_mut(&rid).unwrap();
+            c.deps_held = true;
+            c.phase = crate::core::client::Phase::Backoff;
+        }
+        let mut out = Vec::new();
+        assert!(h.core.hold_for_lost_deps(h.clk(), rid, &h.meta, &mut out));
+        assert!(held(&h, rid));
+        let mut out = Vec::new();
+        h.core
+            .client_deadline(h.clk(), rid, false, &h.meta, &mut out);
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(_, rep)| matches!(rep, ClientReply::Outcome(MutateOutcome::Abandoned))),
+            "the op was sent once: {out:?}"
+        );
+        let c = h.core.clients.get(&rid).expect("settling");
+        assert!(c.settle && c.wide.is_none());
+    }
+
+    /// The deposed node of the queue tests: its client op `rx` is also a
+    /// queue entry, whose recorded rows name `(4, 7)` of a live generation.
+    fn op_with_a_queue_entry_owing_rows() -> (Harness, Rid) {
+        let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.hold(1, None);
+        let data_rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        assert!(h
+            .meta
+            .apply_delegate_tx(
+                &[
+                    LogRecord::Create {
+                        parent: ROOT_INO,
+                        name: "data".into(),
+                        ino: (2 << 40) | 1,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 5,
+                    },
+                    LogRecord::Completed { rid: data_rid },
+                ],
+                Some(data_rid),
+                4,
+                7,
+                constellation_meta::Position::ZERO
+            )
+            .unwrap());
+        let rx = h.rid(1);
+        let x = h.create("marker");
+        constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
+        h.core.lease.mark_lost(2, 2, 1);
+        h.meta.strand_below_epoch(2).unwrap();
+        h.meta.set_holder_epoch(0);
+        h.core.lease.clear_lost();
+        list_generation(&h, 1 << 40, 4);
+        resubmit_in_doubt(&mut h, rx, &x);
+        h.core.clients.get_mut(&rx).unwrap().deps.streams = constellation_meta::Streams::NONE;
+        (h, rx)
+    }
+
+    /// The queue's rows do not fit beside the op's own eight streams (the
+    /// first `owing` case of `hold_for_lost_deps`): the op is held on all
+    /// nine, not sent without the queue's.
+    #[test]
+    fn queued_rows_that_do_not_fit_beside_the_ops_streams_hold_it() {
+        let (mut h, rx) = op_with_a_queue_entry_owing_rows();
+        let gens = frontier_gens(&h, 8);
+        {
+            let c = h.core.clients.get_mut(&rx).unwrap();
+            for g in &gens {
+                assert!(c.deps.streams.raise(*g, 3));
+            }
+        }
+        let mut out = Vec::new();
+        assert!(h.core.hold_for_lost_deps(h.clk(), rx, &h.meta, &mut out));
+        let wide = h.core.clients[&rx]
+            .wide
+            .clone()
+            .expect("held on a snapshot");
+        assert_eq!(wide.streams.len(), 9);
+        assert_eq!(wide.streams.get(&4), Some(&7));
+        assert_eq!(h.core.stats.deps_overflow_holds, 1);
+        h.meta.session().note_shipped(gens[0], 3);
+        let mut out = Vec::new();
+        assert!(!h.core.hold_for_lost_deps(h.clk(), rx, &h.meta, &mut out));
+        let deps = h.core.clients[&rx].deps;
+        assert_eq!(deps.streams.len(), 8);
+        assert_eq!(
+            deps.streams.get(4),
+            Some(7),
+            "the queue's row is waited for"
+        );
+    }
+
+    /// The same where the op's deps are taken afresh (the second case): its
+    /// session fits, and the queue's rows beside it do not.
+    #[test]
+    fn queued_rows_that_do_not_fit_beside_fresh_deps_hold_the_op() {
+        let (mut h, rx) = op_with_a_queue_entry_owing_rows();
+        let gens = frontier_gens(&h, 8);
+        h.core.clients.get_mut(&rx).unwrap().deps_held = true;
+        let mut out = Vec::new();
+        assert!(h.core.hold_for_lost_deps(h.clk(), rx, &h.meta, &mut out));
+        let c = &h.core.clients[&rx];
+        assert!(!c.deps_held);
+        let wide = c.wide.clone().expect("held on a snapshot");
+        assert_eq!(wide.streams.len(), 9);
+        h.meta.session().note_shipped(gens[7], 3);
+        let mut out = Vec::new();
+        assert!(!h.core.hold_for_lost_deps(h.clk(), rx, &h.meta, &mut out));
+        assert_eq!(h.core.clients[&rx].deps.streams.get(4), Some(7));
+    }
+
+    /// A takeover gate replays the queue locally while the root's session
+    /// holds more unshipped streams than a table: the replay is not held,
+    /// and the gate completes (a held replay would never ship them).
+    #[test]
+    fn a_takeover_gate_replays_under_an_overflow_and_completes() {
+        let _lone = constellation_meta::PendingClass::set(constellation_meta::RowCommit::LONE);
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let rx = h.rid(1);
+        let x = h.create("x");
+        constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
+        h.core.lease.mark_lost(2, 2, 1);
+        recover_deposed_node(&mut h);
+        assert_eq!(queued_rids(&h), vec![rx]);
+        h.hold(3, None);
+        frontier_gens(&h, 9);
+        assert!(crate::replica::Replica::deps(&h.meta).is_none());
+        let mut out = Vec::new();
+        h.core
+            .replay_queue_locally(h.clk(), &h.meta, &mut out)
+            .unwrap();
+        assert!(queued_rids(&h).is_empty(), "replayed");
+        assert_eq!(journaled_outcomes(&h, rx), vec![false]);
+        assert_eq!(h.core.stats.deps_overflow_holds, 0);
+    }
+}

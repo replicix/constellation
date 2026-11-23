@@ -22,7 +22,7 @@ use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
     CompletedOutcome, HintInstall, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome,
-    OwnChunks, Position, Rid, ShadowInstall, Streams, TouchSet,
+    OwnChunks, Position, Rid, ShadowInstall, Streams, TouchSet, WideDeps, WideStep,
 };
 use constellation_types::Code;
 use std::collections::BTreeSet;
@@ -266,6 +266,17 @@ pub(crate) struct ClientOp {
     /// afresh before it proceeds, so they order after the replays it
     /// waited for.
     pub deps_held: bool,
+    /// ADR-69: the op's causal past names more streams than a position
+    /// carries, past what the applied log holds: the whole of it, as it
+    /// was when the op first overflowed (`SessionState::deps_wide`), and the
+    /// op is held (`hold_for_lost_deps`) while `deps` is a placeholder
+    /// that names no stream. The snapshot only shrinks, at each backoff
+    /// tick (`SessionState::compact_wide`), and the op is released once
+    /// what remains fits. Never set for a replay or a settle, which are not
+    /// held for it. An op never leaves this node while it is set.
+    pub wide: Option<WideDeps>,
+    /// ADR-69: the hold of `wide` was counted (`deps_overflow_holds`).
+    pub wide_counted: bool,
     /// Plan 30 §M14 phase 2: the op's fencing token, carried on every
     /// forward and inbox batch and checked by every local execution.
     pub tag: LockTag,
@@ -449,6 +460,9 @@ impl super::Core {
             }
             if c.deps_held {
                 state.push_str("+held-for-replays");
+            }
+            if c.wide.is_some() {
+                state.push_str("+held-for-deps-overflow");
             }
             if c.history.last().is_none_or(|(_, s)| *s != state) && c.history.len() < HISTORY_CAP {
                 c.history.push((now.wait.since(c.submitted), state));
@@ -795,7 +809,7 @@ impl Core {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn submit_as(
+    pub(super) fn submit_as(
         &mut self,
         now: Now,
         rid: Rid,
@@ -837,12 +851,20 @@ impl Core {
         let deadline =
             self.set_timer_wait(now.wait.plus(tries_for), Timer::ClientDeadline(rid), out);
         let keys = conflict_keys(&op, replica);
-        let mut deps = self.fresh_deps(now, replica);
+        let (mut deps, mut wide) = self.fresh_deps(now, replica);
         // Plan 30 §M11: a replay is ordered after this node's session
         // and after the delegate-stream rows its first execution was
-        // (`StrandedOp::deps`). Those are kept when both do not fit.
+        // (`StrandedOp::deps`). Those are kept when both do not fit. A
+        // replay is never held for the session's overflow (ADR-69): a
+        // takeover gate replays while the root's session holds unshipped
+        // tails, and a held replay would never ship them.
         if let Origin::Replay { deps: queued, .. } = origin {
-            deps.streams = queued.join(&deps.streams).unwrap_or(queued);
+            deps.streams = if wide.is_some() {
+                queued
+            } else {
+                queued.join(&deps.streams).unwrap_or(queued)
+            };
+            wide = None;
         }
         // A rid this core already answered `InDoubt` may have taken
         // effect somewhere: its resubmission is in doubt from the start.
@@ -935,6 +957,8 @@ impl Core {
                 deps,
                 also_client: false,
                 deps_held: false,
+                wide: if settle { None } else { wide },
+                wide_counted: false,
                 submitted: now.wait,
                 history: Vec::new(),
                 own_record_timer: None,
@@ -1012,14 +1036,10 @@ impl Core {
                 if let Ownership::Delegated(d) =
                     replica.resolve_ownership(&super::holder::keys_of_op_in(&op_ref, replica))
                 {
-                    if d.node != self.cfg.node_id {
-                        if deps.streams.is_full() && deps.streams.get(d.gen).is_none() {
-                            self.stats.deps_overflow_to_root += 1;
-                        } else if self.reaches(now, d.node) {
-                            self.stats.deleg_forwarded += 1;
-                            self.send_forward(now, rid, d.node, d.gen, replica, out);
-                            return;
-                        }
+                    if d.node != self.cfg.node_id && self.reaches(now, d.node) {
+                        self.stats.deleg_forwarded += 1;
+                        self.send_forward(now, rid, d.node, d.gen, replica, out);
+                        return;
                     }
                 }
             }
@@ -1148,21 +1168,39 @@ impl Core {
 
     /// The `deps` a write submitted now carries: the session's (see
     /// `SessionState::deps`), plus, on the root, its own journal.
-    pub(crate) fn fresh_deps(&mut self, now: Now, replica: &dyn Replica) -> Position {
-        // Plan 30 §M11: `None` (the streams overflow) is a root-only op:
-        // the root orders after everything it appended.
-        let (mut deps, overflow) = match replica.deps() {
-            Some(d) => (d, false),
-            None => (
-                Position {
-                    streams: Default::default(),
-                    ..replica.observed()
-                },
-                true,
-            ),
+    ///
+    /// ADR-69: when the session's streams overflow (past what the applied
+    /// log carries) there are no `deps` to carry: the second part is the
+    /// whole of the causal past (`SessionState::deps_wide`), which the op
+    /// is held on, and the first a placeholder that names no stream
+    /// (its `seq` and `pending` are the session's). Such an op is never
+    /// sent, run or routed: not to the delegate, which would not wait for
+    /// the streams the placeholder left out, and not to the root, which
+    /// orders only after the rows it appended.
+    pub(crate) fn fresh_deps(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+    ) -> (Position, Option<WideDeps>) {
+        let (mut deps, mut wide) = match replica.deps() {
+            Some(d) => (d, None),
+            None => {
+                let w = replica.deps_wide();
+                (
+                    Position {
+                        seq: w.seq,
+                        pending: w.pending,
+                        streams: Streams::NONE,
+                    },
+                    Some(w),
+                )
+            }
         };
-        if overflow {
-            self.stats.deps_overflow_to_root += 1;
+        // (Without delegation no stream is ever named, and nothing holds. The
+        // sims' negative control holds nothing either:
+        // `Config::skip_deps_overflow_hold`.)
+        if !self.cfg.delegation || self.cfg.skip_deps_overflow_hold {
+            wide = None;
         }
         // The root's own journal (its local executions, the streams it
         // appended) is ahead of what it shipped: a delegate orders after
@@ -1171,10 +1209,55 @@ impl Core {
             if let Some(jp) = replica.journal_position(epoch) {
                 if Some(jp) > deps.pending {
                     deps.pending = Some(jp);
+                    if let Some(w) = wide.as_mut() {
+                        w.pending = deps.pending;
+                    }
                 }
             }
         }
-        deps
+        (deps, wide)
+    }
+
+    /// ADR-69: arm the tick at which a held op looks again
+    /// (`delegation_stream_tick_ms`): in `Backoff`, `ForwardBackoff`.
+    fn arm_hold_tick(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
+        let old = self.clients.get_mut(&rid).and_then(|c| c.timer.take());
+        if let Some(t) = old {
+            self.cancel_timer(t, out);
+        }
+        let timer = self.set_timer_wait(
+            now.wait.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+            Timer::ForwardBackoff(rid),
+            out,
+        );
+        let c = self.clients.get_mut(&rid).expect("present");
+        c.phase = Phase::Backoff;
+        c.timer = Some(timer);
+    }
+
+    /// ADR-69: whether this op of this node is held for its `deps`
+    /// overflow (and so must not leave it): the guard of every path that
+    /// sends, routes or runs a client op, in case it was not through
+    /// `hold_for_lost_deps` first. Not a replay or a settle.
+    pub(super) fn held_for_overflow(
+        &mut self,
+        now: Now,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let overflowing = self.clients.get(&rid).is_some_and(|c| {
+            c.wide.is_some() && !c.settle && !matches!(c.origin, Origin::Replay { .. })
+        });
+        let held = overflowing && self.hold_for_lost_deps(now, rid, replica, out);
+        // No op leaves the node with `deps` truncated by an overflow.
+        debug_assert!(
+            held || self.clients.get(&rid).is_none_or(|c| {
+                c.wide.is_none() || c.settle || matches!(c.origin, Origin::Replay { .. })
+            }),
+            "an op of this node leaves with its deps overflow unresolved"
+        );
+        held
     }
 
     /// Causal order across a generation's end. This node's own
@@ -1212,8 +1295,15 @@ impl Core {
         let Some(c) = self.clients.get(&rid) else {
             return false;
         };
-        let lost = replica.deps_lost(&c.deps);
         let replay = matches!(c.origin, Origin::Replay { .. });
+        // A settle is never held for the overflow: its snapshot is let go.
+        if c.settle && c.wide.is_some() {
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.wide = None;
+            }
+            return self.hold_for_lost_deps(now, rid, replica, out);
+        }
+        let lost = replica.deps_lost(&c.deps);
         let first_hold = !c.deps_held;
         let unsettled = !replay && self.own_replays_unsettled_ahead_of(replica, Some(rid));
         // A client op that is also a queue entry (a deposition stranded its
@@ -1225,19 +1315,80 @@ impl Core {
         } else {
             self.queued_rows_owed(rid, replica)
         };
-        let owing = c
-            .deps
-            .streams
-            .join(&queued_owed)
-            .filter(|j| *j != c.deps.streams);
         // A replay's recorded rows (`StrandedOp::deps`) of a generation
         // the log has ended are not waited for either: see below.
         let ended = match &c.origin {
             Origin::Replay { deps, .. } => live_rows(deps, replica) != *deps,
             _ => false,
         };
-        if !lost && !unsettled && !c.deps_held && !ended {
-            if let Some(joined) = owing {
+        let mut owing = None;
+        if !replay && c.wide.is_none() {
+            owing = Some(c.deps.streams.join(&queued_owed));
+        }
+        // ADR-69: the queue's rows do not fit beside the op's own streams:
+        // not dropped (they are what the executor waits for), and not sent
+        // short either: the op is held on the whole of them.
+        if let Some(None) = owing {
+            if !lost && !unsettled && !self.clients[&rid].deps_held && !ended {
+                let c = self.clients.get_mut(&rid).expect("present");
+                let mut w = WideDeps {
+                    seq: c.deps.seq,
+                    pending: c.deps.pending,
+                    streams: Default::default(),
+                };
+                w.raise_all(&c.deps.streams);
+                w.raise_all(&queued_owed);
+                c.wide = Some(w);
+                c.deps.streams = Streams::NONE;
+            }
+        }
+        if self.clients.get(&rid).is_some_and(|c| c.wide.is_some()) {
+            // ADR-69: held for the overflow of its `deps`, on the snapshot
+            // (its causal past is fixed at the submission: taking the
+            // session afresh each tick would chase generations that keep
+            // arriving). Behind this node's replays first, as any op.
+            if unsettled {
+                self.stats.deps_lost_holds += 1;
+                self.arm_hold_tick(now, rid, out);
+                return true;
+            }
+            let c = self.clients.get_mut(&rid).expect("present");
+            let mut w = c.wide.take().expect("checked");
+            w.raise_all(&queued_owed);
+            match replica.compact_wide(&mut w) {
+                WideStep::Fits(p) => {
+                    // (The root's journal moved on meanwhile: a delegate
+                    // orders after all of it, as `fresh_deps` has it.)
+                    c.deps = p;
+                    c.wide_counted = false;
+                    self.stats.deps_refreshed += 1;
+                    if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
+                        if let Some(jp) = replica.journal_position(epoch) {
+                            let c = self.clients.get_mut(&rid).expect("present");
+                            if Some(jp) > c.deps.pending {
+                                c.deps.pending = Some(jp);
+                            }
+                        }
+                    }
+                    return false;
+                }
+                WideStep::Holds => {
+                    c.wide = Some(w);
+                    if !c.wide_counted {
+                        c.wide_counted = true;
+                        self.stats.deps_overflow_holds += 1;
+                    }
+                    self.arm_hold_tick(now, rid, out);
+                    return true;
+                }
+                WideStep::Lost => {
+                    // A generation the snapshot names ended below the row:
+                    // the dependency is lost with it, taken afresh below.
+                    c.wide_counted = false;
+                }
+            }
+        } else if !lost && !unsettled && !self.clients[&rid].deps_held && !ended {
+            if let Some(Some(joined)) = owing {
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.deps.streams = joined;
                 }
@@ -1267,22 +1418,11 @@ impl Core {
                     "an op is held for this node's replays queued ahead of it"
                 );
             }
-            let old = self.clients.get_mut(&rid).and_then(|c| c.timer.take());
-            if let Some(t) = old {
-                self.cancel_timer(t, out);
-            }
-            let timer = self.set_timer_wait(
-                now.wait.plus(self.cfg.delegation_stream_tick_ms.max(10)),
-                Timer::ForwardBackoff(rid),
-                out,
-            );
-            let c = self.clients.get_mut(&rid).expect("present");
-            c.phase = Phase::Backoff;
-            c.timer = Some(timer);
-            c.deps_held = true;
+            self.arm_hold_tick(now, rid, out);
+            self.clients.get_mut(&rid).expect("present").deps_held = true;
             return true;
         }
-        let mut deps = self.fresh_deps(now, replica);
+        let (mut deps, fresh_wide) = self.fresh_deps(now, replica);
         // A replay's recorded rows of the generations that are still live
         // stay owed (the delegate re-streams them to the log's root, and
         // the executor waits for them): only the rows of an ended
@@ -1295,19 +1435,34 @@ impl Core {
         // rows between them present while the executor refuses them as
         // lost (long-delegated-backup seed 3585: `Held`, re-sent, forever).
         let mut owed = None;
+        let mut wide = None;
         if let Some(Origin::Replay { deps: recorded, .. }) =
             self.clients.get(&rid).map(|c| &c.origin)
         {
             let live = live_rows(recorded, replica);
             deps.streams = live.join(&deps.streams).unwrap_or(live);
             owed = Some(live);
+        } else if let Some(mut w) = fresh_wide {
+            // ADR-69: the session overflows again: held on its whole.
+            w.raise_all(&queued_owed);
+            wide = Some(w);
         } else if let Some(joined) = deps.streams.join(&queued_owed) {
             deps.streams = joined;
+        } else {
+            let mut w = WideDeps {
+                seq: deps.seq,
+                pending: deps.pending,
+                streams: Default::default(),
+            };
+            w.raise_all(&deps.streams);
+            w.raise_all(&queued_owed);
+            wide = Some(w);
         }
         tracing::debug!(
             node = self.cfg.node_id,
             ?rid,
             ?deps,
+            overflow = wide.is_some(),
             "an op held for this node's replays (or with deps lost with their generation) proceeds with fresh deps"
         );
         self.stats.deps_refreshed += 1;
@@ -1319,6 +1474,15 @@ impl Core {
             if let (Origin::Replay { deps, .. }, Some(live)) = (&mut c.origin, owed) {
                 *deps = live;
             }
+            if let Some(w) = wide {
+                c.deps.streams = Streams::NONE;
+                c.wide = Some(w);
+                c.wide_counted = false;
+            }
+        }
+        if self.clients.get(&rid).is_some_and(|c| c.wide.is_some()) {
+            // Looked at once, then each tick.
+            return self.hold_for_lost_deps(now, rid, replica, out);
         }
         false
     }
@@ -1465,6 +1629,9 @@ impl Core {
         let Some((policy, settle)) = self.clients.get(&rid).map(|c| (c.policy, c.settle)) else {
             return;
         };
+        if self.held_for_overflow(now, rid, replica, out) {
+            return;
+        }
         // ADR-44: this node is the root in a shippable takeover gate; the
         // generations the op needs ended are recalled now. A settle whose
         // recall is in flight is asked again here (`on_forward_backoff` ->
@@ -1719,6 +1886,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // (Withdrawing from the inbox, `holder == 0`, sends nothing.)
+        if holder != 0 && self.held_for_overflow(now, rid, replica, out) {
+            return;
+        }
         let req = self.op_id();
         let timer = self.set_timer_wait(
             now.wait.plus(self.cfg.forward_timeout_ms),
@@ -2870,6 +3041,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if self.held_for_overflow(now, rid, replica, out) {
+            return;
+        }
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -3482,6 +3656,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
+        if self.held_for_overflow(now, rid, replica, out) {
+            return MutateOutcome::held(0);
+        }
         let Some((op, policy, deps, tag, settle, fence)) = self.clients.get(&rid).map(|c| {
             (
                 c.op.clone(),
@@ -4979,6 +5156,7 @@ impl Core {
         c.settle_until = until;
         c.settle_cap = cap;
         c.settle = true;
+        c.wide = None;
         c.attempts = 0;
         c.fence_bounces = 0;
         c.redirected = 0;

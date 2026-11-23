@@ -637,6 +637,16 @@ pub trait Replica {
     /// plus every delegation stream position this node holds or was
     /// answered with); `None` when they overflow `Streams`.
     fn deps(&self) -> Option<Position>;
+    /// ADR-69: the whole of what [`Self::deps`] depends on, with no cap
+    /// (`SessionState::deps_wide`): the snapshot an op whose `deps` overflow
+    /// is held on.
+    fn deps_wide(&self) -> constellation_meta::WideDeps;
+    /// ADR-69: one look at that snapshot (`Meta::compact_wide_deps`).
+    fn compact_wide(&self, wide: &mut constellation_meta::WideDeps)
+        -> constellation_meta::WideStep;
+    /// ADR-69: the stream index of `gen` the applied log carries
+    /// (`SessionState::shipped_idx`).
+    fn shipped_idx(&self, gen: u64) -> u64;
     /// What a cluster lock's release carries: `deps`, never overflowing
     /// (`SessionState::frontier`).
     fn frontier(&self) -> Position;
@@ -1481,6 +1491,10 @@ impl Replica for Meta {
     }
 
     fn ack_journal(&self, seqs: &[u64], at: Seq, pos: Option<JournalPos>) -> Result<(), MetaError> {
+        // ADR-69: the rows this node shipped are in the log from `at` on;
+        // their origins, read before the acknowledgement retires them,
+        // raise `shipped` once `applied_seq` covers the segment.
+        let origins = Meta::journal_origins(self, seqs).unwrap_or_default();
         Meta::ack_journal_rows_at(self, seqs, at)?;
         if let Some(pos) = pos {
             // Kept across a restart (see `Meta::open`); best effort, the
@@ -1493,6 +1507,9 @@ impl Replica for Meta {
         // claims a later tenure and merges the kept rows of its own
         // (metered-shared+links seed 1781).
         self.session().advance_rows(at, pos, seqs);
+        for (gen, idx) in origins {
+            self.session().note_shipped(gen, idx);
+        }
         Ok(())
     }
 
@@ -1575,6 +1592,14 @@ impl Replica for Meta {
             }),
             rows,
         );
+        // ADR-69: the log this replica applied carries these streams now
+        // (after `advance_rows`: `applied_seq` covers the segment).
+        for (gen, idx) in origins {
+            self.session().note_shipped(*gen, *idx);
+        }
+        for (gen, idx) in records.iter().flat_map(|rec| rec.stream_fills()) {
+            self.session().note_shipped_fill(*gen, *idx);
+        }
         Ok(Applied {
             stranded: applied.stranded,
             skipped: applied.skipped,
@@ -1936,6 +1961,21 @@ impl Replica for Meta {
 
     fn deps(&self) -> Option<Position> {
         self.session().deps()
+    }
+
+    fn deps_wide(&self) -> constellation_meta::WideDeps {
+        self.session().deps_wide()
+    }
+
+    fn compact_wide(
+        &self,
+        wide: &mut constellation_meta::WideDeps,
+    ) -> constellation_meta::WideStep {
+        self.compact_wide_deps(wide)
+    }
+
+    fn shipped_idx(&self, gen: u64) -> u64 {
+        self.session().shipped_idx(gen)
     }
 
     fn frontier(&self) -> Position {

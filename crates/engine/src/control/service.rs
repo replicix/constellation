@@ -620,7 +620,7 @@ impl EngineControl {
                     recalls_expired: stats.deleg_recalls_expired,
                     reclaimed: stats.deleg_reclaimed,
                     ended: stats.deleg_ended,
-                    deps_overflow_to_root: stats.deps_overflow_to_root,
+                    deps_overflow_holds: stats.deps_overflow_holds,
                     exec_parked: stats.deleg_exec_parked,
                     stranded: stats.local_rolled_back,
                     kinds: v.kinds.clone(),
