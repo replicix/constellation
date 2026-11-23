@@ -1284,9 +1284,10 @@ pub struct Stats {
     /// Delegate, WP6.2b: reads of that mark that failed (the stream is not
     /// installed now and the sync retries).
     pub released_mark_read_errors: u64,
-    /// Delegate, WP6.2b: writes of that mark (a recall answered rowless for
-    /// a stream never installed) that failed; the recall is asked again.
-    pub released_mark_write_errors: u64,
+    /// Delegate, WP6.2b: writes or syncs of that mark (a recall answered
+    /// rowless for a stream never installed) that failed; the recall is
+    /// asked again.
+    pub released_mark_failures: u64,
     /// Delegate, WP6.2b, debug builds: a stream with its whole-release row
     /// in the journal and no mark (a bug; the sim asserts zero).
     pub released_mark_missing: u64,

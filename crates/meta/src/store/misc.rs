@@ -307,17 +307,7 @@ impl Meta {
     }
 
     pub(crate) fn take_released_mark_fault(&self) -> Result<(), MetaError> {
-        use std::sync::atomic::Ordering::SeqCst;
-        let took = self
-            .released_mark_faults
-            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-            .is_ok();
-        if took {
-            return Err(MetaError::Io(std::io::Error::other(
-                "injected released-whole read fault (testing only)",
-            )));
-        }
-        Ok(())
+        Self::take_fault(&self.released_mark_faults, "read")
     }
 
     /// The hook's check: consume one injected fault, if any is left.

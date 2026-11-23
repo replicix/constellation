@@ -84055,13 +84055,13 @@ mod step5_sticky_release {
         );
         assert!(h.core.dl.handed_back.is_empty(), "handed back, no mark");
         assert!(!h.meta.released_whole(7).unwrap());
-        assert_eq!(h.core.stats.released_mark_write_errors, 1);
+        assert_eq!(h.core.stats.released_mark_failures, 1);
         // The sync fails: the mark is committed, and still nothing is said.
         h.meta.fail_released_whole_syncs_for_tests(1);
         let out = recall_request(&mut h, dir);
         assert!(note_sent(&out).is_none(), "answered before the sync");
         assert!(h.core.dl.handed_back.is_empty());
-        assert_eq!(h.core.stats.released_mark_write_errors, 2);
+        assert_eq!(h.core.stats.released_mark_failures, 2);
         assert_eq!(h.core.stats.deleg_release_rowless_unseen, 0);
         // The root asks again: the mark is synced, and then the note goes.
         let syncs = h.meta.sync_count();
@@ -84074,7 +84074,7 @@ mod step5_sticky_release {
         assert!(h.meta.released_whole(7).unwrap());
         assert!(h.core.dl.handed_back.contains_key(&7));
         assert_eq!(h.core.stats.deleg_release_rowless_unseen, 1);
-        assert_eq!(h.core.stats.released_mark_write_errors, 2);
+        assert_eq!(h.core.stats.released_mark_failures, 2);
     }
 
     /// WP6.2b (review SHOULD 1, M10): the root is not always known at the
@@ -84107,7 +84107,8 @@ mod step5_sticky_release {
     /// restart installs the stream as a stopped remnant whose pending
     /// release names the last ordinary row (nothing is executed under it,
     /// whatever the sync that follows), and the root, which ended the
-    /// generation at the note, refuses the batch that carries the row.
+    /// generation at the note, accepts the row within the cut and appends
+    /// nothing past it.
     #[test]
     fn a_marked_never_installed_recall_with_unshipped_rows_restarts_as_a_stopped_remnant() {
         let (mut h, dirs) = sticky_holder(&["a"]);

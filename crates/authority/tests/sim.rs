@@ -11275,14 +11275,14 @@ impl OracleTotals {
             for (c, n) in self.relmark.iter_mut().zip([
                 st.deleg_install_released_mark,
                 st.released_mark_read_errors,
-                st.released_mark_write_errors,
+                st.released_mark_failures,
                 st.released_mark_missing,
             ]) {
                 *c += n;
             }
             self.relmark[6] += st.deleg_release_rowless_unseen;
             found += st.deleg_install_released_mark;
-            write_errors += st.released_mark_write_errors;
+            write_errors += st.released_mark_failures;
         }
         self.relmark[4] += u64::from(found > 0);
         self.relmark[5] += u64::from(write_errors > 0);

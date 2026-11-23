@@ -9874,7 +9874,7 @@ impl Core {
             // before the log's end of it. Written before the answer: a
             // failed write answers nothing and the root asks again.
             if let Err(e) = replica.mark_deleg_released_whole(gen) {
-                self.stats.released_mark_write_errors += 1;
+                self.stats.released_mark_failures += 1;
                 tracing::warn!(
                     node = me,
                     gen,
