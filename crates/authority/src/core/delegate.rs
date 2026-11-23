@@ -3839,8 +3839,25 @@ impl Core {
                     continue;
                 }
                 // A stream that released every subtree has none to inherit
-                // (step 10 gives it an end).
-                if d.dirs.is_empty() {
+                // (step 10 gives it an end), unless it is this node's own: the
+                // holder's release row shipped from its own journal (the
+                // log's table lost the subtrees), and the root that held the
+                // lease then never appended it, so no root's step 10 ever
+                // ends the stream (sim `sticky-s4-leave` idle-susp, seed 1578
+                // with re-adoption off: the node's self-leave waited on the
+                // never-ended generation). This node is its holder, and now
+                // the root: it takes the stream on and ends it by the
+                // ADR-55 own-stream path below (`claim_releases`, the cut at
+                // `cursor.max(delegate_idx)`, `claim_end`), which keeps
+                // (1) a stream ends only by its holder's release (root ==
+                // holder here, the row is in the log or this journal),
+                // (2) the end is journaled after the stream's own release
+                // row (`claim_end_of`, `release_row_unshipped`), (3) no
+                // grant or subtree is touched (there is none), and (4) the
+                // release row is journaled once (`release_row_journaled`).
+                // Another node's stream stays skipped: its holder or the
+                // root's step 10 ends it.
+                if d.dirs.is_empty() && d.node != me {
                     continue;
                 }
                 // Plan 46 M0.3 (S5, ADR-42): a gate whose journal work is

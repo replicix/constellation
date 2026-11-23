@@ -83351,6 +83351,69 @@ mod step5_sticky_release {
         );
     }
 
+    /// The root's sync ends a stream of its own whose every subtree was
+    /// released in the holder's own journal (the row shipped to the log, so
+    /// the table lists the stream with no subtree) and that the previous root
+    /// never appended (sim `sticky-s4-leave` idle-susp, seed 1578 with
+    /// re-adoption off): the node claims the lease by takeover and syncs as
+    /// `Usable`. The stream is taken on and ended, and the node's self-leave
+    /// (which needs every kept stream acknowledged and every own generation
+    /// ended) can complete. Fails on the parent: the sync skipped the empty
+    /// stream, `dl.gens` stayed empty, the kept state never got acknowledged.
+    #[test]
+    fn a_root_ends_its_own_stream_that_released_every_subtree_unappended() {
+        let (mut h, dirs) = sticky_holder(&["a"]);
+        // The holder's whole release is journaled in its own journal; the
+        // previous root never appends it.
+        let out = release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h), "{out:?}");
+        // The row ships to the log from this journal (the table loses the
+        // subtree, the stream stays).
+        let seq = Replica::applied_seq(&h.meta).unwrap_or(0) + 1;
+        Replica::apply_segment(
+            &h.meta,
+            seq,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::SubtreeReleased {
+                node: 3,
+                gen: 7,
+                dir: dirs[0],
+                at: 0,
+            }],
+        )
+        .unwrap();
+        {
+            let table = h.meta.delegation_table();
+            let st = table.streams().find(|s| s.gen == 7).expect("stream");
+            assert!(st.subtrees.is_empty(), "the table still lists a subtree");
+        }
+        // The node claims the lease by takeover and syncs as the root.
+        h.hold(3, None);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.gens.get(&7).is_some_and(|g| g.ended),
+            "the own stream was not taken on and ended: {:?}",
+            h.core.dl.gens.keys().collect::<Vec<_>>()
+        );
+        // The release row ships; the kept state goes with it.
+        let tip = h.meta.journal_tip().unwrap();
+        h.core.note_shipped(&[], tip);
+        constellation_meta::MetaStore::ack_journal(&h.meta, tip).unwrap();
+        h.step(Event::Activity {
+            last_write: WaitMs(0),
+            acked_seqs: Vec::new(),
+        });
+        assert!(
+            h.core.dl.mine.values().all(|d| d.release_acked),
+            "a kept stream never acknowledged: the self-leave would wait"
+        );
+        assert!(!h.core.dl.gens.values().any(|g| g.node == 3 && !g.ended));
+    }
+
     /// WP6.2, the restart variant of the test above: the node restarts after
     /// the late grow is applied (its `handed_back`, state and installed set
     /// are gone). The stream is not installed with the grown subtree
