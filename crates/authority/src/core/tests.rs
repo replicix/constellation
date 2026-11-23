@@ -83617,10 +83617,26 @@ mod step5_sticky_release {
             "the own stream was not taken on and ended: {:?}",
             h.core.dl.gens.keys().collect::<Vec<_>>()
         );
-        // The release row ships; the kept state goes with it.
+        // The release row and the end ship, as the shipper acks them.
+        assert!(
+            h.meta.released_whole(7).unwrap(),
+            "the release row wrote no mark"
+        );
         let tip = h.meta.journal_tip().unwrap();
         h.core.note_shipped(&[], tip);
-        constellation_meta::MetaStore::ack_journal(&h.meta, tip).unwrap();
+        let seqs: Vec<u64> = Replica::take_journal(&h.meta, 100)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        Replica::ack_journal(
+            &h.meta,
+            &seqs,
+            &Replica::journal_origins(&h.meta, &seqs),
+            Replica::applied_seq(&h.meta).unwrap_or(0) + 1,
+            None,
+        )
+        .unwrap();
         h.step(Event::Activity {
             last_write: WaitMs(0),
             acked_seqs: Vec::new(),
