@@ -6995,7 +6995,18 @@ and not to the root either.
   tick cannot starve it. It is released when 8 or fewer entries remain, with
   `seq = max(snapshot, applied_seq now)` and `pending = max(snapshot,
   current)`. An entry of a generation that ended below it is lost with the
-  generation (`deps_lost`): the op takes its deps afresh.
+  generation (`deps_lost`): the op takes its deps afresh. An entry of a
+  generation that ended, at or below its cut, is left out with the log's.
+- An op held behind this node's own replays (they land at rows the snapshot
+  cannot name) lets its snapshot go once they have settled and takes the
+  session afresh, which snapshots again if it still overflows. That happens
+  once per replay hold, so the hold stays monotone.
+- The release goes through the backoff (`on_forward_backoff`), as an op held
+  for lost deps does, not back through `submit_as`: the op carries real deps
+  and the root or the lease path checks `reaches_streams`. A never-sent op
+  released there is sent to the cached holder or run at the root after a
+  recall, so each released op may cost a delegation recall. Known follow-up:
+  route it as `submit_as` does (own delegation, forward to the delegate).
 - Every re-entry of a client op passes `hold_for_lost_deps`, which holds it.
   The rows a queue entry recorded for the op (`queued_owed`) are part of the
   snapshot. Replays (`Origin::Replay`) and settles are never held: a takeover
