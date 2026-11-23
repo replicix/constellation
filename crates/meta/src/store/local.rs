@@ -4057,6 +4057,45 @@ mod root_substitution_tests {
         assert!(!root.released_whole(5).unwrap());
     }
 
+    /// WP6.2b: the mark is durable: a store reopened over the same disk
+    /// still reads it (no flag raised in memory gates the read), until the
+    /// log's end clears it.
+    #[test]
+    fn the_mark_survives_a_reopen_until_the_logs_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let meta = Meta::open(&db).unwrap();
+            let d = (3 << 40) | 900;
+            meta.apply_records(&[
+                LogRecord::Mkdir {
+                    parent: constellation_fs_core::types::ROOT_INO,
+                    name: "d".into(),
+                    ino: d,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::delegate_one(1, 5, d, crate::record::SubtreeKind::Sticky),
+            ])
+            .unwrap();
+            meta.delegate_release(&[whole_release(5)], 5, Default::default())
+                .unwrap();
+            assert!(meta.released_whole(5).unwrap());
+        }
+        let meta = Meta::open(&db).unwrap();
+        assert!(meta.released_whole(5).unwrap(), "the mark did not survive");
+        meta.apply_segment(1, 1, &[stream_end(5)], &TouchSet::default())
+            .unwrap();
+        assert!(!meta.released_whole(5).unwrap());
+        let meta = {
+            drop(meta);
+            Meta::open(&db).unwrap()
+        };
+        assert!(!meta.released_whole(5).unwrap(), "the clear was not durable");
+    }
+
     /// WP6.2b (review MUST 1, 2): the mark is cleared where the log's
     /// segment ends the stream, also for an end the root's stream installed
     /// first (its row is skipped by the segment), and never by a journal-time
