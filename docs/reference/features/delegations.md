@@ -746,8 +746,9 @@ the kept cut with the stranded row, since the log never carries that
 record. A holder that released its stream whole keeps a node-local key,
 `deleg_released_whole`, written in the transaction of its own `StreamReleased`
 row (or, for a recall answered rowless for a stream it never installed, in a
-transaction of its own before the answer) and cleared where the log's segment
-ends the generation: a restart that finds it takes the stream up as the
+transaction of its own, synced, before the answer) and cleared where the log's
+segment ends the generation (for a root's own stream, at the ack of its shipped
+end): a restart that finds it takes the stream up as the
 remnant of its release and never with a subtree a later grow added. A delegate
 that applies the record ends the generation here, and the
 acknowledgements it parked for a row past the cut are aborted (`Busy`: the

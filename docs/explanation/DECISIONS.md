@@ -6666,7 +6666,10 @@ executed, so the cut is a row.
     without a restart (the end streamed ahead drops the stream from the
     table, the process forgets its hand-back, the end strands). A recall
     answered rowless for a stream never installed here writes the mark in a
-    local transaction before it answers (its hand-back was memory only; the
+    local transaction, synced, before it answers (its hand-back was memory
+    only, and a commit reaches the OS, not the disk, so a reboot before the
+    log's end would lose it; a failed write or sync answers nothing and the
+    root's repeat tries again; a repeat finds the mark and only syncs; the
     test `a_restart_after_a_never_installed_recall_does_not_take_the_grant_up`
     was red without it). The other rowless releases write none: their causes
     are durable (a generation the takeover gate ended, a reboot, a remnant)
@@ -6679,7 +6682,24 @@ executed, so the cut is a row.
     here) is read only for a stream the table lists and never installs a
     different grant. A deferred remnant (an epoch active, a commit wait) is
     not handed back: the install gate reads `handed_back`, and its release
-    row must still ship. **Follow-up (recorded, not cosmetic):** the holder's
+    row must still ship. The root's own stream (ADR-55) is released by the same journal-time
+    apply and ended by the root's own journal, which ships through the ack
+    of its rows and not through a segment: that ack clears the mark of every
+    generation whose `DelegateNodeEnded` it carries (the shipped rows are
+    read only while a mark exists). **Left behind, by design:** a mark for a
+    generation this node never sees ended (a recall answered for a grant
+    the root never ships, so the log carries no end of it here) stays. There
+    is no open-time collection: at open, a never-installed recall's
+    generation may not be in the table yet, and dropping its mark would
+    reopen the gap. It costs one key, and their number is bounded by the
+    number of such recalls; it is read only for a stream the table lists.
+    **Liveness of a marked stream the log still lists** (the recalling root
+    was deposed before its end shipped, or a rebuild lacked the release
+    row): the holder forwards its own ops, the root treats that as disowned
+    and recalls again, and the rowless answer ends it. That is on demand,
+    not at a lapse: a non-stealable (sticky) stream has no lapse to wait
+    for.
+    **Follow-up (recorded, not cosmetic):** the holder's
     table still diverges from the log's fold until the end; its routing
     (the hand-back above) and the table it carries into a takeover read
     it. The cheaper variant is to skip the table's add of a grow while the
