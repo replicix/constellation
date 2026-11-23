@@ -83668,6 +83668,83 @@ mod step5_sticky_release {
         );
     }
 
+    /// WP6.2b (fail-before, open gap): the restart variant once the log has
+    /// carried the release row but not yet the end. The root's segment
+    /// carries its grant, its grow of the stream by `b` and then the
+    /// holder's `StreamReleased`; `DelegateNodeEnded` rides a later segment
+    /// (or the root dies before it). The holder applied its own release
+    /// row and the streamed grow ahead of the log, in that order, and the
+    /// segment skips both as already applied: its table still lists `b` as
+    /// the stream's. The row is shipped now (`delegate_idx <=
+    /// log_stream_idx`), so the restart guard's journal scan does not look
+    /// at the stream, and the restart lost `handed_back`: the stream must
+    /// still not be taken up with `b` honoured.
+    #[test]
+    #[ignore = "WP6.2b fail-before: red until the released-whole mark lands"]
+    fn a_restart_after_the_release_row_is_logged_does_not_take_the_grown_subtree_up() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let row = whole_release_acked_and_dropped(&mut h);
+        let b = late_grow(&mut h, "b", 3);
+        // The root's segment: its own committed rows (the grant, the grow)
+        // in journal order, then its append of the holder's release row.
+        let mut records = Vec::new();
+        let mut seg_rows = Vec::new();
+        let mut origins = Vec::new();
+        for tx in Replica::kept_streamed(&h.meta, 1, 1).unwrap() {
+            for (i, rec) in tx.records.iter().enumerate() {
+                records.push(rec.clone());
+                seg_rows.push(tx.first + i as u64);
+                origins.push(tx.origin);
+            }
+        }
+        assert_eq!(seg_rows, vec![1, 2, 3, 4], "{records:?}");
+        let rel = rows(&h)
+            .into_iter()
+            .find(|t| t.idx == row)
+            .expect("the release row left the journal");
+        assert!(
+            matches!(rel.records.as_slice(), [LogRecord::StreamReleased { .. }]),
+            "{:?}",
+            rel.records
+        );
+        records.extend(rel.records);
+        seg_rows.push(5);
+        origins.push((7, row));
+        let seq = Replica::applied_seq(&h.meta).unwrap_or(0) + 1;
+        Replica::apply_segment(&h.meta, seq, 1, 5, &seg_rows, &origins, &records).unwrap();
+        assert!(
+            Replica::delegate_idx(&h.meta, 7) <= Replica::log_stream_idx(&h.meta, 7),
+            "the release row is not the log's"
+        );
+        // The gap's precondition: the holder's table still lists the grown
+        // subtree as the stream's (the log order would have released it).
+        assert!(
+            h.meta
+                .delegation_table()
+                .stream(3, 7)
+                .is_some_and(|s| s.subtrees.iter().any(|(d, _)| *d == b)),
+            "the table no longer lists b: {:?}",
+            h.meta.delegation_table().stream(3, 7)
+        );
+        // Restart: the process state is gone, the store stays.
+        h.core.dl.mine.remove(&7);
+        h.core.dl.installed_gens.clear();
+        h.core.dl.sticky_cmds.clear();
+        h.core.dl.handed_back.clear();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.core.dl.mine.get(&7).is_some_and(|d| d.dirs.contains(&b)),
+            "the grown subtree was honoured after the restart: {:?}",
+            h.core.dl.mine.get(&7).map(|d| (d.dirs.clone(), d.stopped))
+        );
+        create_in(&mut h, b, 1);
+        assert!(
+            no_create_journaled(&h),
+            "the op was executed under the stream"
+        );
+    }
+
     /// WP6.2: the restart guard fails closed. A journal that cannot be read
     /// installs nothing for the stream and syncs again; once it reads, the
     /// stream is installed as the remnant of its release.
