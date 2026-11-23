@@ -3143,6 +3143,10 @@ pub struct Core {
     /// won acquisition or a lease held by another); only the first
     /// `CLAIM_LOST_FAST_RETRIES` of them retry at the shortest backoff.
     claims_lost_streak: u32,
+    /// A re-adoption's CAS losses to edits of the lease object that still
+    /// names this node, in the job (bounded by `CLAIM_LOST_FAST_RETRIES`;
+    /// reset when the acquisition finishes).
+    readopt_conflicts: u32,
     acked: client::AckTracker,
     replay: replay::ReplayState,
     /// Chunk metered-own-rows: an observed position's upload, repeated
@@ -3310,6 +3314,7 @@ impl Core {
             acquire_waiters: Vec::new(),
             acquire_retry_hint: None,
             claims_lost_streak: 0,
+            readopt_conflicts: 0,
             acked: client::AckTracker::default(),
             replay: replay::ReplayState::default(),
             observed_upload: Default::default(),

@@ -43662,6 +43662,224 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
     }
 }
 
+fn s3_find(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
+    s3_ops(out)
+        .into_iter()
+        .find(|(_, r)| pred(r))
+        .map(|(op, _)| op)
+        .unwrap_or_else(|| panic!("no matching S3 request in {out:?}"))
+}
+
+/// Two distinct tags of one lease object (a write moved the tag).
+fn two_tags() -> (replicix_objcas::LeaseTag, replicix_objcas::LeaseTag) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let leases = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let lease = Lease::granted("p0", 1, 1, 1000);
+        let t1 = leases.try_create(&lease).await.unwrap();
+        let t2 = leases.try_swap(&lease, &t1).await.unwrap();
+        (t1, t2)
+    })
+}
+
+/// A re-adoption's CAS that loses to another write of the lease object that
+/// leaves the tenure alone (a waiter's `wanted_by` registration) reads the
+/// lease again and writes against the new tag, instead of finishing
+/// unacquired and refusing forwards for a TTL (sim `sticky-s4-root-restart`
+/// seeds 480, 543, 1392; the renewal's "lost the CAS to a `wanted_by`
+/// edit"). Fails on the parent: the job finishes with `readopt_refused_until`
+/// a TTL ahead.
+#[test]
+fn a_readoption_that_loses_its_cas_to_a_wanted_by_edit_reads_and_writes_again() {
+    let (t1, t2) = two_tags();
+    assert_ne!(t1, t2);
+    let mut h = Harness::new(1);
+    let own = lease_of(1, 3, h.now.plus(30_000).0);
+    h.core.lease.note_object(&own);
+    let op = h.create("a");
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateRequest {
+            req: OpId(77),
+            rid: Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            },
+            op,
+            acked_through: 0,
+            deps: constellation_meta::Position::ZERO,
+            applied: 0,
+            tag: Default::default(),
+            settle: false,
+            routed_gen: 0,
+            touched_gen: 0,
+            inbox_ever: false,
+        },
+    });
+    assert_eq!(h.core.job(), Some(JobKind::Acquire));
+    // Answers the job's S3 requests (the takeover's tail to head) until the
+    // claim's CAS goes out.
+    fn to_swap(
+        h: &mut Harness,
+        mut out: Vec<Action>,
+    ) -> (OpId, replicix_objcas::LeaseTag, Vec<Action>) {
+        for _ in 0..8 {
+            if let Some((op, tag)) = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+                S3Op::LeaseSwap { tag, .. } => Some((op, tag.clone())),
+                _ => None,
+            }) {
+                return (op, tag, out);
+            }
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected request {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        panic!("no lease CAS in {out:?}");
+    }
+    let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((own.clone(), t1.clone())))),
+    });
+    let (cas, sent_tag, _) = to_swap(&mut h, out);
+    assert_eq!(sent_tag, t1);
+    // A waiter's `wanted_by` write landed first.
+    let out = h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    assert_eq!(h.core.job(), Some(JobKind::Acquire), "{out:?}");
+    assert!(
+        h.core.readopt_refused_until <= h.clk().wait,
+        "forwards are refused for a TTL"
+    );
+    let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
+    let edited = Lease {
+        wanted_by: vec![2],
+        ..own.clone()
+    };
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((edited, t2.clone())))),
+    });
+    let (cas, sent_tag, _) = to_swap(&mut h, out);
+    assert_eq!(sent_tag, t2, "written against the tag it read, never blind");
+    h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Ok(t2.clone())),
+    });
+    assert!(h.core.readopt_refused_until <= h.clk().wait);
+    assert!(
+        h.core.lease.held.is_some() || h.core.lease.gate.is_some(),
+        "the lease was not re-adopted"
+    );
+}
+
+/// The re-read after a re-adoption's lost CAS that no longer names this node
+/// (or at another epoch, or released) is not re-adopted: unacquired, with the
+/// TTL refusal as before, and no write.
+#[test]
+fn a_readoption_that_lost_its_cas_to_another_holder_is_refused_for_a_ttl() {
+    let (_t1, t2) = two_tags();
+    for theirs in [
+        lease_of(3, 4, i64::MAX),
+        Lease {
+            released: true,
+            ..lease_of(1, 3, 0)
+        },
+        lease_of(1, 4, i64::MAX),
+    ] {
+        let mut h = Harness::new(1);
+        h.core
+            .lease
+            .note_object(&lease_of(1, 3, h.now.plus(30_000).0));
+        let op = h.create("a");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(77),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: false,
+                routed_gen: 0,
+                touched_gen: 0,
+                inbox_ever: false,
+            },
+        });
+        let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
+        let own = lease_of(1, 3, h.now.plus(30_000).0);
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((own, tag())))),
+        });
+        let mut cas = None;
+        for _ in 0..8 {
+            if let Some((op, _)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }))
+            {
+                cas = Some(op);
+                break;
+            }
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected request {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        let out = h.step(Event::S3 {
+            op: cas.expect("the re-adoption CAS"),
+            result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+        });
+        let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((theirs.clone(), t2.clone())))),
+        });
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. })),
+            "{theirs:?}: written blind: {out:?}"
+        );
+        assert_ne!(h.core.job(), Some(JobKind::Acquire), "{theirs:?}");
+        assert!(
+            h.core.readopt_refused_until > h.clk().wait,
+            "{theirs:?}: no TTL refusal"
+        );
+    }
+}
+
 /// A node that released the lease itself (the object read after says so)
 /// answers a stale forward `NotHolder`, never re-adopting.
 #[test]

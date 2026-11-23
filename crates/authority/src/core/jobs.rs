@@ -249,6 +249,10 @@ enum Phase {
     /// Acquire: `LeaseGet` after a CAS that failed without an answer (it
     /// may have landed: `CasFailure::Failed`).
     CasReread { plan: Plan, sent: Box<Lease> },
+    /// Acquire (a re-adoption for a forward): `LeaseGet` after the CAS lost
+    /// to another write of the lease object. `epoch`: the epoch of the own
+    /// lease the lost CAS tried to re-adopt.
+    ReadoptReread { epoch: Epoch },
     /// Acquire: `LeaseRequest` sent to `holder`; waiting for its answer.
     /// `epoch_mode`: a continuation epoch's P2P-only handoff.
     LeaseRequest { req: OpId, epoch_mode: bool },
@@ -5016,6 +5020,7 @@ impl Core {
         let Some(job) = self.job.take() else {
             return;
         };
+        self.readopt_conflicts = 0;
         if let What::Acquire { reason, .. } = job.what {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -5862,6 +5867,9 @@ impl Core {
                 self.acquire_won(now, plan, *sent, tag, replica, out)
             }
             (Phase::Cas { plan, .. }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
+                if self.readopt_conflict_reread(&plan, out) {
+                    return;
+                }
                 self.acquire_claim_lost(now, &plan);
                 self.finish_acquire(now, false, replica, out)
             }
@@ -5873,6 +5881,9 @@ impl Core {
             (Phase::CasReread { plan, sent }, S3Result::LeaseGet(result)) => {
                 self.acquire_cas_reread(now, plan, *sent, result, replica, out)
             }
+            (Phase::ReadoptReread { epoch }, S3Result::LeaseGet(result)) => {
+                self.readopt_reread(now, epoch, result, replica, out)
+            }
             (phase, result) => {
                 tracing::debug!(
                     node = self.cfg.node_id,
@@ -5880,6 +5891,73 @@ impl Core {
                     ?result,
                     "unexpected S3 result for the job phase"
                 );
+            }
+        }
+    }
+
+    /// A re-adoption's CAS lost to another write of the lease object (a
+    /// waiter's `wanted_by` registration changes the tag, not the tenure; the
+    /// renewal path's "lost the CAS to a `wanted_by` edit"). The lease is
+    /// read again and classified again ([`Self::readopt_reread`]) instead of
+    /// refusing forwards for a TTL. Bounded by `CLAIM_LOST_FAST_RETRIES` per
+    /// job (then the refusal stands, as before). Only a claim of this node's
+    /// own unreleased lease: any other plan finishes as before. Returns
+    /// whether the re-read was issued.
+    fn readopt_conflict_reread(&mut self, plan: &Plan, out: &mut Vec<Action>) -> bool {
+        if !matches!(
+            self.job.as_ref().map(|j| &j.what),
+            Some(What::Acquire {
+                reason: READOPT_REASON,
+                ..
+            })
+        ) {
+            return false;
+        }
+        let Plan::Claim { prev, .. } = plan else {
+            return false;
+        };
+        if prev.holder != self.cfg.node_id
+            || prev.released
+            || self.readopt_conflicts >= CLAIM_LOST_FAST_RETRIES
+        {
+            return false;
+        }
+        self.readopt_conflicts += 1;
+        let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
+        self.set_phase(Phase::ReadoptReread { epoch: prev.epoch }, Some(op));
+        true
+    }
+
+    /// The re-read after a re-adoption's lost CAS. The lease still names this
+    /// node at the same epoch, not released (only `wanted_by` changed): it is
+    /// classified again, and the claim written against the new tag (never
+    /// blind). Anything else (another holder or epoch, released, an absent
+    /// object, a failed read): not ours to re-adopt, the acquisition finishes
+    /// unacquired and forwards hear `NotHolder` for a TTL, as today.
+    fn readopt_reread(
+        &mut self,
+        now: Now,
+        epoch: Epoch,
+        result: Result<Option<(Lease, LeaseTag)>, S3Failure>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        match result {
+            Ok(Some((cur, tag)))
+                if cur.holder == self.cfg.node_id && cur.epoch == epoch && !cur.released =>
+            {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    epoch,
+                    "re-adoption lost its CAS to an edit of the lease that still names this node: classifying again"
+                );
+                self.acquire_classified(now, Some((cur, tag)), replica, out);
+            }
+            other => {
+                if let Err(e) = other {
+                    tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed after a re-adoption's lost CAS");
+                }
+                self.finish_acquire(now, false, replica, out);
             }
         }
     }
