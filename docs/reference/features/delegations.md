@@ -816,7 +816,9 @@ and node, and evaluates it every tenth of the window:
   root release the grant as its holder (the core counter `root_own_released_unhonoured`). A
   restarted root that claims its lease
   again ends its own stream at what it assigned (its rows stay in the journal and
-  ship in the new tenure's first segment); a takeover gate that finds a
+  ship in the new tenure's first segment), also a stream of its own with no
+  subtree left (released from its own journal, never appended by the root
+  before); a takeover gate that finds a
   predecessor's backup tail ends the stream at the log and replays the halted
   rows by rid (step 12). The lease is not released over a release row of the
   root's own stream that has not shipped: when S3 is unreachable the flush

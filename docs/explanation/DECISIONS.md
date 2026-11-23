@@ -4928,7 +4928,13 @@ every op; its own subtrees are exactly the ones a sticky grant makes local.
   row), exempt from the fence for ended generations, which the end it
   journaled itself would trip; an end an applied segment carried installs
   nothing. Nothing executes under the kept or re-created state (`finding 996 B`: the new root otherwise waits for the
-  stream's rows for ever, the holder having none left to send). The loop-back is for the delegate family
+  stream's rows for ever, the holder having none left to send). A stream of the node's own that the log lists with no subtree
+  left (its release row shipped from the node's own journal; the root before never appended it, so no root's step 10 ends it)
+  is taken on and ended by the claim as well, at the same cut, after its own release row (`delegation_sync` skips an empty stream of
+  another node only); without it the node's own leave waited for a generation nobody ended. A re-adoption of the node's own lease
+  that loses its CAS to an edit that leaves the tenure alone (a waiter's `wanted_by`) reads the lease again and writes against
+  the new tag, at most `CLAIM_LOST_FAST_RETRIES` times; any other change of the object ends it unacquired with the TTL refusal.
+  The loop-back is for the delegate family
   (stream, acknowledgement, renewal, release request, seal, recall, read-grant
   void); lock messages keep the driver's path.
 - **The root releases its own grant only as its holder** (R-I6): after the long
