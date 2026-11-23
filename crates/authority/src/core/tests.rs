@@ -83835,6 +83835,9 @@ mod step5_sticky_release {
         let (mut h, _dirs) = sticky_holder(&["a"]);
         release(&mut h, 50, Vec::new(), false);
         assert!(last_is_release(&h));
+        // A grow the release did not see: the stream is marked, not
+        // a plain remnant.
+        late_grow(&mut h, "b", 3);
         forget_process_state(&mut h);
         h.core.dl.epoch_active = true;
         let mut out = Vec::new();
@@ -83856,7 +83859,8 @@ mod step5_sticky_release {
         assert!(d.stopped && d.release.is_some());
     }
 
-    /// WP6.2b (review answer 1, no restart): the end streams ahead of the
+    /// WP6.2b (review answer 1, no restart): the release row is the log's;
+    /// the end streams ahead of the
     /// log and drops the stream from the table (the process forgets the
     /// stream and its hand-back); the end strands, the stream is live
     /// again with the grown subtree. The mark, which a streamed end does
@@ -83864,14 +83868,15 @@ mod step5_sticky_release {
     #[test]
     fn a_stranded_streamed_end_does_not_bring_the_grown_subtree_back() {
         let (mut h, _dirs) = sticky_holder(&["a"]);
-        let row = whole_release_acked_and_dropped(&mut h);
-        let b = late_grow(&mut h, "b", 3);
+        // The release row is the log's, the end is not: the guard that
+        // reads the journal for the row has nothing to find.
+        let (row, b) = logged_release_with_late_grow(&mut h);
         Replica::install_streamed(
             &h.meta,
             1,
             1,
-            5,
-            5,
+            6,
+            6,
             &[LogRecord::DelegateNodeEnded {
                 node: 3,
                 gen: 7,
