@@ -80050,24 +80050,125 @@ mod step9_one_stream_per_node {
         let (mut h, req) = leaving_node_told(1);
         assert!(h.core.leave_told_ok(h.clk()));
         let now = h.clk().wait;
-        h.step(Event::OwnLag {
+        let out = h.step(Event::OwnLag {
             from: now,
             until: now.plus(1),
         });
         assert!(!h.core.leave_told_ok(h.clk()), "still told after the lag");
-        let mut again = None;
+        let mut again = leave_note_req(&out, 1);
         for _ in 0..8 {
-            let out = leave_tick(&mut h, 500);
-            if let Some(n) = leave_note_req(&out, 1) {
-                again = Some(n);
+            if again.is_some() {
                 break;
             }
+            again = leave_note_req(&leave_tick(&mut h, 500), 1);
         }
         let (r, leaving) = again.expect("the note was not sent again");
-        assert_eq!((r, leaving), (req, true));
-        assert!(!h.core.leave_told_ok(h.clk()), "told before the ack");
+        // (A new request: the ack of the old note, queued before the lag,
+        // matches nothing.)
+        assert!(leaving && r.0 > req.0, "{r:?} after {req:?}");
+        h.step(leave_note_ack(1, req, false));
+        assert!(!h.core.leave_told_ok(h.clk()), "told by the old note's ack");
         h.step(leave_note_ack(1, r, false));
         assert!(h.core.leave_told_ok(h.clk()));
+    }
+
+    /// SHOULD 1 (residual): the root's acknowledgement of the note, queued
+    /// before the node was suspended, is handled after its `OwnLag`. It must
+    /// not count the leave told again (the root's mark may have lapsed while
+    /// the node was deaf), and the next note carries a new request above the
+    /// old one, so the acknowledgement of the old one matches nothing. Fails
+    /// on b7a371ee: the stale ack sets the node told, and the note resent
+    /// carries the old request.
+    #[test]
+    fn a_stale_ack_after_an_own_lag_does_not_tell_the_leave_again() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::ReleaseGrants,
+        });
+        let (r, _) = leave_note_req(&out, 1).expect("no note");
+        // The root acknowledged R; the node was suspended before handling it.
+        let now = h.clk().wait;
+        let mut notes = Vec::new();
+        notes.extend(leave_note_req(
+            &h.step(Event::OwnLag {
+                from: now,
+                until: now.plus(1),
+            }),
+            1,
+        ));
+        h.step(leave_note_ack(1, r, false));
+        assert!(
+            !h.core.leave_told_ok(h.clk()),
+            "the stale ack told the leave"
+        );
+        for _ in 0..8 {
+            if !notes.is_empty() {
+                break;
+            }
+            notes.extend(leave_note_req(&leave_tick(&mut h, 500), 1));
+        }
+        let (next, leaving) = *notes.first().expect("no note after the lag");
+        assert!(leaving);
+        assert!(next.0 > r.0, "the note kept its request {r:?}: {next:?}");
+        assert!(!h.core.leave_told_ok(h.clk()));
+        // The ack of the new note counts.
+        h.step(leave_note_ack(1, next, false));
+        assert!(h.core.leave_told_ok(h.clk()));
+    }
+
+    /// NIT: the map of the lapse's row reads holds the senders of one resend
+    /// interval, not every node that ever sent a message.
+    #[test]
+    fn the_lapse_row_reads_map_is_bounded() {
+        let (mut r, _d1) = root_with_dir();
+        let resend = r.core.leave_resend_ms() as u64;
+        for node in 3..40 {
+            heard_without_note(&mut r, node);
+        }
+        assert!(r.core.dl.leave_row_looked.len() > 3);
+        r.advance(resend + 1);
+        heard_without_note(&mut r, 3);
+        assert_eq!(
+            r.core
+                .dl
+                .leave_row_looked
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![3],
+            "the entries of the earlier interval stayed"
+        );
+    }
+
+    /// NIT (`Returned`): the mark's own row did not journal, and a
+    /// predecessor's `true(r)` with `r` above the mark's request is the log's
+    /// row. The un-mark under a newer incarnation writes above the row, so
+    /// the row is taken back and the old notes stay stale. Fails on
+    /// b7a371ee: `false(mark.req)` is older than the row and the row stands.
+    #[test]
+    fn an_incarnation_un_mark_writes_above_a_predecessors_row() {
+        let old = |n: u64| (1u64 << 40) | n;
+        let (mut r, d1) = successor_over(&[leave_row(3, old(500), true)]);
+        lock_request_from(&mut r, 3, 1, d1);
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(1_000);
+        r.step(leave_note_from(3, old(100), true));
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(0);
+        assert_eq!(r.core.dl.leaving[&3].req, old(100));
+        lock_request_from(&mut r, 3, 2, d1);
+        assert!(!r.core.is_leaving(3, &r.meta), "the row stood");
+        assert_eq!(
+            r.meta.deleg_leaves().unwrap().get(&3),
+            Some(&LeaveRow {
+                req: old(500),
+                leaving: false
+            })
+        );
+        r.step(leave_note_from(3, old(500), true));
+        assert!(!r.core.is_leaving(3, &r.meta), "an old note marked again");
     }
 
     /// SHOULD 3: the node's own note acknowledged under an operator's mark is

@@ -15950,7 +15950,12 @@ impl Core {
                 .copied()
                 .unwrap_or(0)
                 .min(below),
-            LeaveUnmark::Returned => top,
+            // The dead incarnation's leave ends above every request it
+            // sent, and above the log's row too: when the mark's own row did
+            // not journal, a predecessor's `true(r)` with `r` above the mark's
+            // request is the log's row, and `false(mark.req)` would be older
+            // than it and leave it standing (and old notes marking again).
+            LeaveUnmark::Returned => top.max(row.map_or(0, |r| r.req)),
         };
         if self.root_usable(now)
             && row.is_some_and(|r| r.leaving)
@@ -16151,6 +16156,12 @@ impl Core {
                     if !due {
                         return;
                     }
+                    // (Bounded: an entry older than the interval is due
+                    // anyway, so the map holds the senders of one interval.)
+                    let resend = self.leave_resend_ms();
+                    self.dl
+                        .leave_row_looked
+                        .retain(|_, at| now.wait.since(*at) < resend);
                     self.dl.leave_row_looked.insert(from, now.wait);
                     self.stats.leave_row_scans += 1;
                     if !Self::leave_row(replica, from).is_some_and(|r| r.leaving) {
@@ -16188,9 +16199,19 @@ impl Core {
     /// leaver's replica yet. The leave counts told again once a root
     /// acknowledges the note it sends again, which that root does only when
     /// its mark and row are durable.
+    ///
+    /// The note goes too: the next one carries a fresh request, so an
+    /// acknowledgement of the old note that was queued before the node was
+    /// suspended (and is handled after this) matches nothing and does not
+    /// count the leave told again. The root takes the higher request as a new
+    /// row and holds its answer until the row is durable. (A take-back note
+    /// is kept: it ends a leave, and its acknowledgement is harmless.)
     pub(crate) fn leave_own_lag(&mut self) {
         if self.dl.leave_self {
             self.dl.leave_told = None;
+            if self.dl.leave_tell.is_some_and(|t| t.leaving) {
+                self.dl.leave_tell = None;
+            }
         }
     }
 
