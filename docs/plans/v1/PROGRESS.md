@@ -71946,3 +71946,14 @@ Sweeps, `origin/main` against the fix, 2,000 seeds of each of 62 labels (the `de
 Lock floors: no deferred release was needed. `locks-delegated-writes` passes with the knob at cap 2 (2,000 seeds) and cap 1 (1,000 seeds, 293 ops held), with `frontier()` and `floor_join` cut at the cap.
 
 Open: the hold costs a root with 9 or more busy delegates one ship cadence per op of its own clients; measure `deps_overflow_holds` on a real cluster before raising `STREAMS_CAP`.
+
+Round 2 (review fixes, rebased onto the WP6.3 leave-as-log-row tip):
+
+- `submit_as` takes the op's deps again after the hold: an op released on its first look (the snapshot named generations that ended before the open, so the session was taken afresh and fit) used to run as a delegate on the placeholder that names no stream. Core test `an_overflowing_op_released_on_its_first_look_runs_as_a_delegate_with_its_deps` (red before: executed on a placeholder).
+- A wide op held behind this node's replays notes it (`deps_held`) and, once they settle, drops its snapshot and takes the session afresh (re-snapshotting if it still overflows): the snapshot did not name the row the replays landed at. Once per replay hold, so the hold stays monotone. Core test `a_wide_op_held_behind_replays_names_the_row_they_landed_at` (red before: released deps lack the landing row).
+- The fresh path arms the tick and holds instead of recursing into the hold again (no termination argument if an entry is lost on every look).
+- Voided entries at or below their cut are left out of `deps` (second pass) and `compact_wide`; `raise_observed_excusing` and `join_owed` honour the sim cap, so the cap sims exercise the fold into `frontier`; `streams_of` is two-pass; `ack_journal` takes the origins the ship already read (`Phase::Ship::origins`), and `shipped` is raised under one lock per applied batch (`note_shipped_batch`). `floor_truncated` and `floor_join_truncated` reach the control stats and the `SWEEP-OVF` line.
+- Negative control: `long-delegated-late-answers`, cap 1, hold off, 20 pinned seeds each fail the marker-order oracle and pass with the hold on.
+- Mutations on the rebased tip, each red: `shipped` seeded at the log index, dropping by `streams`, a held op re-taking the session, a held replay, and each of the two fixes above reverted.
+- Sweeps (62 labels, 2,000 seeds; main built from the rebased base): no new failing seed in the plain arm or in the cap-1 arm (1,000 seeds); `deps_overflow_holds` 0 in the plain arm, 26,932 ops held at cap 1 (`locks-delegated-writes` 293). At cap 1 the floors still cut `floor_truncated` 132,531 and `floor_join_truncated` 365,871 entries without a failing seed, so the lock release was not deferred; the plain arm cut 0 and 501.
+- Known follow-up: the release goes through `on_forward_backoff`, so a released never-sent op may cost a delegation recall (ADR-69).
