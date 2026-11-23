@@ -1145,12 +1145,13 @@ impl Meta {
         if batch.is_empty() {
             return Ok(());
         }
-        let r = self.db.read_tx();
-        // (One seek when no delegate row is journaled: the common case.)
-        if r.is_empty(&self.journal_origin)? {
-            return Ok(());
-        }
-        drop(r);
+        // The batch's own origins, from its `journal_tx` heads (a walk of the
+        // heads between its ends, past the acked watermark): the cost is the
+        // batch's. Not an emptiness probe of `journal_origin`: every shipped
+        // delegate row leaves a tombstone there until compaction, and a probe
+        // from the keyspace's start stepped over all of them on every ship (a
+        // root appending a delegate's stream: its segment build grew from
+        // about 70 to 800 us over a run, most of its core step).
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         let mut origins = self.journal_origins(&seqs)?;
         origins.retain(|(g, _)| *g != 0);
