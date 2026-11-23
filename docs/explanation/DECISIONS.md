@@ -6156,7 +6156,9 @@ property is `no_live_grant_off_roster` (`Leave` is enabled only once the root's
   incarnation: a row taken back at one made every later note of the node
   stale on every other root). A leaving node forgets that its leave is told
   when its own lag is seen, so it counts it told again only on the ack of a
-  root that has the mark durable. The node's own note that came under an
+  root that has the mark durable; the note it sends again carries a new
+  request, so an ack of the old note queued before the node was suspended
+  matches nothing. The node's own note that came under an
   operator's mark is kept, and the mark falls back to it when the operator's
   leave fails. A root's abort whose take-back row did not journal keeps it
   and journals it again at its next look. The lapse reads the log's rows for a

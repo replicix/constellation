@@ -1050,9 +1050,13 @@ every grant it holds
   every request the leave can still send (the node's take-back floor, 0 if
   none), so the node's next note of the same request marks it again; the
   incarnation return ends the leave of a dead incarnation and writes
-  `false(mark.req)`, so a delayed note of that incarnation stays stale. The
-  row of a node's own leave as the root carries an `op_id()`, like a note's
-  request, never the driver's control id. A root's abort whose take-back row
+  `false(mark.req)` (or the log's row request, when that is higher), so a
+  delayed note of that incarnation stays stale. The row of a node's own leave
+  as the root carries an `op_id()`, like a note's request, never the driver's
+  control id. A leaving node that sees its own lag forgets that it is told
+  and its note: the next one carries a new request, so a root's ack of the
+  old note, queued before the node was suspended, does not count the leave
+  told again. A root's abort whose take-back row
   did not journal journals it again at the next look, and an operator's
   failed leave falls back to the node's own note when one came under it;
 - a node with no root to tell (the lease it read is released or held by
