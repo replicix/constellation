@@ -828,7 +828,7 @@ and node, and evaluates it every tenth of the window:
   necessarily shipped; no root before appended it), safe from the local view
   because the cut covers every row it assigned; a takeover gate that finds a
   predecessor's backup tail ends the stream at the log and replays the halted
-  rows by rid (step 12). The lease is not released over a release row of the
+  rows by rid (step 12). A stream of another node that the log lists with no subtree left (its holder released them all and the root that appended the release row lost the lease before it ended the stream) is ended by the usable root at the log's index, once the takeover is open (the gate ends nothing); the holder's leave and the operator's leave of the node wait for that end. The lease is not released over a release row of the
   root's own stream that has not shipped: when S3 is unreachable the flush
   before the release fails and the release does not happen, and the subtree
   stays blocked at the successor until the row ships (the cost D3 accepts).
