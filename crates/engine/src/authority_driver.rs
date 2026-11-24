@@ -8616,6 +8616,42 @@ impl Standalone {
 
 #[cfg(test)]
 mod tests {
+    /// A timer the core wants at once (a root's forward waiting on its
+    /// unshipped rows) is on the channel as soon as it is armed, with no
+    /// sleep and no await: the timer wheel's tick made the round start
+    /// about a millisecond late. Any other timer, a zero delay included,
+    /// still goes through a sleep.
+    #[tokio::test]
+    async fn a_timer_wanted_at_once_is_delivered_without_a_sleep() {
+        use super::{deliver_timer, Internal, TimerId, TimerKind};
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let earlier = Internal::Timer {
+            id: TimerId(1),
+            kind: TimerKind::Poll,
+            deferred: false,
+        };
+        tx.send(earlier).unwrap();
+        deliver_timer(&tx, true, Duration::ZERO, TimerId(2), TimerKind::Poll);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Internal::Timer { id: TimerId(1), .. })
+        ));
+        assert!(
+            matches!(rx.try_recv(), Ok(Internal::Timer { id: TimerId(2), .. })),
+            "the timer is queued behind what came before it, at once"
+        );
+        deliver_timer(&tx, false, Duration::ZERO, TimerId(3), TimerKind::Poll);
+        assert!(
+            rx.try_recv().is_err(),
+            "a zero-delay timer not wanted at once still sleeps"
+        );
+        let late = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert!(matches!(
+            late,
+            Ok(Some(Internal::Timer { id: TimerId(3), .. }))
+        ));
+    }
+
     /// A transient read error on the release guard is not "drained": the
     /// guard must not let the release CAS through over rows it could not
     /// see (I1/I5).

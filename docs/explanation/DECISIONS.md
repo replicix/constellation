@@ -6372,6 +6372,17 @@ it, so the transport peer is not its author.
   Mixed-version clusters are not supported (no compatibility shim).
 - **Known and out of scope.** `EpochActivate` is not bound to its proposer,
   on gossip or on a stream; recorded as an open item in PROGRESS.
+- **Latency note.** A forward from the root waits for the root's next ship round
+  (its deps carry its whole journal). A forward that the delegate parks behind
+  unshipped root rows (`send_forward`: `deps.pending` set and a journal position at
+  the ship epoch) asks for that round at once (`Core::ship_wanted_now`): the
+  driver delivers its zero-wait `Poll` straight onto its channel, not through the
+  timer wheel's millisecond tick. Every other nudge keeps the wheel. The immediate
+  round is limited to these forwards because a round started at once for every
+  nudge ran the root's segment build ahead of the op's own backup acknowledgement
+  and reply (topology 3 delegate ops, topology 2 forwards, topology 3 forward
+  write). Scheduling only: the rows shipped, their order and the one-round-in-
+  flight-plus-one rule are unchanged (vfix, 2026-11-24).
 
 **Rejected**: a faster signature backend (about 25-45 us, keeps the cost);
 a per-connection MAC (about 95 us saved, proves nothing the QUIC AEAD does

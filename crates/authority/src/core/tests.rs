@@ -40940,6 +40940,234 @@ mod s3_no_loops {
     }
 }
 
+/// A root's forward that the delegate parks behind the root's unshipped
+/// journal rows asks for the round that ships them at once
+/// (`Core::ship_wanted_now`; nudgediag V); no other nudge does.
+mod ship_for_forward {
+    use super::s3_no_loops::delegated_root;
+    use super::*;
+
+    /// A create of `name` in `dir` from this root's own client.
+    fn submit_in(
+        h: &mut Harness,
+        seq: u64,
+        dir: constellation_fs_core::Ino,
+        name: &str,
+    ) -> Vec<Action> {
+        let ino = h.meta.allocate_ino(dir).unwrap();
+        let rid = h.rid(seq);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: name.into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        })
+    }
+
+    /// The root executed an op of its own that no round has shipped.
+    fn journal_a_root_row(h: &mut Harness) {
+        let op = h.create("root-row");
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        assert!(
+            h.meta.journal_position(ship_epoch(h)).is_some(),
+            "nothing unshipped"
+        );
+    }
+
+    fn zero_polls(out: &[Action]) -> usize {
+        out.iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::SetTimer {
+                        kind: TimerKind::Poll,
+                        after_ms: 0,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// The epoch this root ships its journal at.
+    fn ship_epoch(h: &Harness) -> Epoch {
+        h.core
+            .lease
+            .ship_epoch(h.clk(), &h.core.cfg)
+            .expect("the root ships at an epoch")
+    }
+
+    /// Run rounds until the root has nothing unshipped.
+    fn ship_everything(h: &mut Harness) {
+        for _ in 0..4 {
+            if h.meta.journal_position(ship_epoch(h)).is_none() {
+                return;
+            }
+            let out = h.step(Event::Control {
+                op: OpId(950),
+                req: Control::Nudge,
+            });
+            let poll = timers(&out, TimerKind::Poll)[0];
+            let mut acts = h.step(Event::Timer { id: poll });
+            for _ in 0..20 {
+                if let Some(upload) = acts.iter().find_map(|a| match a {
+                    Action::UploadDirtyChunks { op, .. } => Some(*op),
+                    _ => None,
+                }) {
+                    acts = h.step(Event::UploadsDone {
+                        op: upload,
+                        result: UploadResult::Done { held: 0 },
+                    });
+                    continue;
+                }
+                let Some((op, req)) = s3_ops(&acts)
+                    .into_iter()
+                    .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                    .map(|(o, r)| (o, r.clone()))
+                else {
+                    break;
+                };
+                let result = match req {
+                    S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                    S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                    S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                    S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                    S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                    other => panic!("unexpected S3 op in the round: {other:?}"),
+                };
+                acts = h.step(Event::S3 { op, result });
+            }
+        }
+        assert!(
+            h.meta.journal_position(ship_epoch(h)).is_none(),
+            "still unshipped"
+        );
+    }
+
+    fn forwarded_to_the_delegate(out: &[Action]) -> bool {
+        sends(out)
+            .iter()
+            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::MutateRequest { .. }))
+    }
+
+    /// Fails on the parent: the forward's step arms no poll, so the round
+    /// that ships the rows the delegate waits for starts at the next
+    /// timer tick.
+    #[test]
+    fn a_forward_waiting_on_unshipped_rows_arms_the_round_now() {
+        let (mut h, dir, _gen) = delegated_root();
+        journal_a_root_row(&mut h);
+        let out = submit_in(&mut h, 1, dir, "a");
+        assert!(forwarded_to_the_delegate(&out), "not forwarded: {out:?}");
+        assert_eq!(zero_polls(&out), 1, "no round asked for: {out:?}");
+    }
+
+    #[test]
+    fn that_forward_marks_the_round_as_wanted_at_once() {
+        let (mut h, dir, _gen) = delegated_root();
+        journal_a_root_row(&mut h);
+        assert!(!h.core.ship_wanted_now());
+        submit_in(&mut h, 1, dir, "a");
+        assert!(h.core.ship_wanted_now());
+    }
+
+    #[test]
+    fn a_forward_with_nothing_unshipped_asks_for_no_round() {
+        let (mut h, dir, _gen) = delegated_root();
+        ship_everything(&mut h);
+        let out = submit_in(&mut h, 1, dir, "a");
+        assert!(forwarded_to_the_delegate(&out), "not forwarded: {out:?}");
+        assert_eq!(zero_polls(&out), 0, "a round was asked for: {out:?}");
+        assert!(!h.core.ship_wanted_now());
+    }
+
+    /// The mark follows the op's own deps, not the root's journal alone: a
+    /// resend whose deps name no unshipped row (they are those of its first
+    /// send, which the journal has outgrown) asks for no round.
+    #[test]
+    fn a_resent_forward_whose_deps_name_no_row_asks_for_no_round() {
+        let (mut h, dir, _gen) = delegated_root();
+        ship_everything(&mut h);
+        let rid = h.rid(1);
+        let out = submit_in(&mut h, 1, dir, "a");
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("not forwarded: {out:?}"));
+        h.core.clients.get_mut(&rid).expect("pending").deps.pending = None;
+        journal_a_root_row(&mut h);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Fenced { gen: 7 },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 7,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+                non_stealable: false,
+            },
+        });
+        assert!(forwarded_to_the_delegate(&out), "not resent: {out:?}");
+        assert_eq!(zero_polls(&out), 0, "a round was asked for: {out:?}");
+        assert!(!h.core.ship_wanted_now());
+    }
+
+    #[test]
+    fn a_plain_nudge_does_not_mark_the_round_as_wanted_at_once() {
+        let (mut h, _dir, _gen) = delegated_root();
+        journal_a_root_row(&mut h);
+        let out = h.step(Event::Control {
+            op: OpId(901),
+            req: Control::Nudge,
+        });
+        assert_eq!(zero_polls(&out), 1, "the nudge arms the poll: {out:?}");
+        assert!(!h.core.ship_wanted_now());
+    }
+
+    /// A forward sent while a round runs marks the round that follows it
+    /// (the nudge is held, `nudged`); the mark waits for that round.
+    #[test]
+    fn a_forward_during_a_round_marks_the_round_after_it() {
+        let (mut h, dir, _gen) = delegated_root();
+        journal_a_root_row(&mut h);
+        let out = h.step(Event::Control {
+            op: OpId(901),
+            req: Control::Nudge,
+        });
+        let poll = timers(&out, TimerKind::Poll)[0];
+        h.step(Event::Timer { id: poll });
+        assert!(h.core.job().is_some(), "no round in flight");
+        assert!(!h.core.ship_wanted_now());
+        submit_in(&mut h, 1, dir, "a");
+        assert!(h.core.ship_wanted_now());
+    }
+
+    #[test]
+    fn the_mark_is_cleared_when_the_round_begins() {
+        let (mut h, dir, _gen) = delegated_root();
+        journal_a_root_row(&mut h);
+        let out = submit_in(&mut h, 1, dir, "a");
+        assert!(h.core.ship_wanted_now());
+        let poll = timers(&out, TimerKind::Poll)[0];
+        h.step(Event::Timer { id: poll });
+        assert!(h.core.job().is_some(), "no round began");
+        assert!(!h.core.ship_wanted_now(), "the mark outlived its round");
+    }
+}
+
 /// `fs set epoch-slack` raising `f` from 0 on a mounted node whose
 /// promise TTL exceeds lease TTL / 4 (never validated at mount, since
 /// `f` was 0 then): the core clamps the TTL instead of promising for

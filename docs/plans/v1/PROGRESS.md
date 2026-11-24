@@ -71989,3 +71989,9 @@ A root appending a delegate's stream built its segments slower over a run (the b
   - One LogStream frame in flight per subscriber (coalesce1 F/FS): no merge happens at this op rate; 1.22–1.29x.
 - **Option B rejected:** the root answering a backed delegate's batch at segment landing. It would weaken ADR-41 and ADR-30 for a 1.3x cost in one cell, so it was not adopted.
 - **Open:** `holder_appends(gen)` (from 0) and `deleg_gens_awaiting_end_tx` also walk a generation's `journal_origin` tombstones (the topology-3 DelegateStream step grows 54 to 90 us); not fixed here.
+
+## A forward that waits on unshipped rows starts its round at once (vfix, 2026-11-24)
+
+A forward from the root carries the root's whole journal in its deps, so the delegate parks it until the root's next ship round brings the rows. That round started through the driver's timer wheel, whose tick is a millisecond: on the root the time from nudge to round start was p50 about 1.1 ms, and topology 3 forward rename and unlink paid it on every op. Delivering every zero-wait poll at once (nudgefix) made those forwards fast but ran the root's segment build ahead of the op's own backup acknowledgement and reply: topology 3 delegate ops +10 to 22 %, topology 2 forwards +7 to 10 %, topology 3 forward write +11 % on the disk file systems.
+
+Change (scheduling only): `send_forward` sets `Core::ship_for_forward` and nudges when the forward's `deps.pending` is set and the root has a journal position at its ship epoch; the driver delivers a zero-wait `Poll` at once only while `Core::ship_wanted_now()`; `begin_round` clears the flag. Every other nudge keeps the timer wheel. Which rows ship, their order and the one-in-flight-plus-one rule are unchanged; `fresh_deps` is untouched. ADR-63 carries the latency note. Tests: `ship_for_forward::*` (core), `a_timer_wanted_at_once_is_delivered_without_a_sleep` (driver).
