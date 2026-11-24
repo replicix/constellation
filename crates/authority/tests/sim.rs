@@ -8141,14 +8141,17 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // 1609 sits in the 1.1 to 1.3 s class again (the delegate's answer under
     // the pre-crash grant, not a seal-and-floor failover: so do 1604, 1607,
     // 1610, 1613 and 1614, 1621, 1623, 1627, 1629, 1630, 1650, 1652 and
-    // 1660). 1603 takes 1609's place.)
+    // 1660). 1603 takes 1609's place. A forward of the root that waits on its
+    // unshipped rows now starts its round at once (`Core::ship_wanted_now`,
+    // vfix), which moved 1617 to a 1.06 s failover (the same class): it
+    // leaves, 1621 joins.)
     for seed in (1600..1602)
         .chain(1605..1607)
         .chain(1608..1609)
         .chain(1603..1604)
         .chain(1611..1613)
-        .chain(1616..1619)
-        .chain(1620..1621)
+        .chain(1616..1617)
+        .chain(1618..1622)
     {
         let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
             panic!(
@@ -13423,7 +13426,12 @@ fn the_deleg_append_replay_control_fails_the_sealed_root_seeds() {
         },
         "commit",
     ));
-    let seeds = [182u64, 552, 773, 783, 885, 1_032, 1_098, 1_713, 1_795];
+    // (A forward of the root that waits on its unshipped rows now starts its
+    // round at once (`Core::ship_wanted_now`, vfix): of the witnesses above
+    // only 182, 773 and 783 still fail the control, so the control's own seeds
+    // are 182, 773 and 783 with six of seeds 0..299 that fail it and are clean
+    // without it: 35, 82, 87, 105, 132 and 153.)
+    let seeds = [182u64, 773, 783, 35, 82, 87, 105, 132, 153];
     let failed = seeds
         .iter()
         .filter(|&&seed| run_seed(seed, cfg.clone()).is_err())
@@ -18738,13 +18746,11 @@ fn locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle() {
         },
         ..cfg
     };
-    let seeds: [(u64, bool); 5] = [
-        (1961, false),
-        (2777, false),
-        (2994, false),
-        (627, true),
-        (2000, true),
-    ];
+    // (A forward of the root that waits on its unshipped rows now starts its
+    // round at once (`Core::ship_wanted_now`, vfix): the run of 2994 is clean
+    // without the release settle, so it is no control and leaves; no seed of
+    // 0..2999 other than 1961 and 2777 shows the held write without it.)
+    let seeds: [(u64, bool); 4] = [(1961, false), (2777, false), (627, true), (2000, true)];
     for (seed, slow) in seeds {
         let cfg = |release_settle: bool| {
             let c = SimConfig {
@@ -21945,10 +21951,13 @@ fn c2_a_settled_eio_never_lands_late() {
 /// `+settle` run fails with I4. (Seeds 1694 and 8929 of step 13, re-pinned
 /// for ADR-50, which moved every schedule of a root with peers: with the hold
 /// reverted `long-delegated+settle` fails I4 on 15798, 38574 and 50005 of seeds
-/// 0 to 80 000 and on no other; each is clean with the hold and reaches it.)
+/// 0 to 80 000 and on no other; each is clean with the hold and reaches it.
+/// A forward of the root that waits on its unshipped rows now starts its round
+/// at once (`Core::ship_wanted_now`, vfix), which moved 38574 off the path:
+/// it leaves and is not replaced (no seed of 0 to 299 reaches the hold either).)
 #[test]
 fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
-    for seed in [15798, 38574, 50005] {
+    for seed in [15798, 50005] {
         let r = run_seed(seed, strict(long_delegated_config(), "settle"))
             .unwrap_or_else(|e| panic!("long-delegated+settle seed {seed}: {e}"));
         assert!(
@@ -21990,7 +21999,10 @@ fn a_settle_waiting_for_a_generations_outwait_is_held_and_never_lands_late() {
 /// (`find_settle_not_redirected_unheard_seeds` lists the seeds that reach it.)
 #[test]
 fn long_delegated_settle_is_not_bounced_to_a_silent_inherited_delegate() {
-    for seed in [181, 757, 925] {
+    // (A forward of the root that waits on its unshipped rows now starts its
+    // round at once (`Core::ship_wanted_now`, vfix), which moved 181 off the
+    // path; 126 takes its place, from the finder over seeds 0..999.)
+    for seed in [126, 757, 925] {
         let r = run_seed(seed, strict(long_delegated_config(), "unsettled"))
             .unwrap_or_else(|e| panic!("long-delegated+unsettled seed {seed}: {e}"));
         assert!(
@@ -24867,8 +24879,14 @@ fn the_refusal_bookkeeping_reads_each_journal_row_a_bounded_number_of_times() {
 /// appended the cut row 460 ms before). Needs the counter, too.
 #[test]
 fn s4_merge_seed_73_a_woken_settle_is_answered_by_the_nodes_own_acquisition() {
+    // (A forward of the root that waits on its unshipped rows now starts its
+    // round at once (`Core::ship_wanted_now`, vfix), which moved 73 off the
+    // path: no settle is resolved from `Backoff` in it. Seed 37 reaches it
+    // (of seeds 0..249 the finder also gives 69, 81, 93, 154, 171, 184 and
+    // 237); it was chosen by reaching the path, as 73 was not by the tree it
+    // fails on.)
     let fix = run_seed(
-        73,
+        37,
         SimConfig {
             no_release_cut: false,
             ..sticky_s4_merge_config()
@@ -24987,7 +25005,15 @@ fn s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle() {
     let sum = |r: &Report, f: fn(&constellation_authority::Stats) -> u64| -> u64 {
         r.stats.values().map(f).sum()
     };
-    for seed in [772u64, 95, 980] {
+    // (A forward of the root that waits on its unshipped rows now starts its
+    // round at once (`Core::ship_wanted_now`, vfix), which moved these
+    // schedules: 772 no longer forwards a settle alive and 95's control arm no
+    // longer fails by the tag. Of seeds 0..199 and 700..899 the finder (control
+    // fails by the tag, fix arm clean) gives 720 (a resume and a settle
+    // forwarded alive) for 772's half, and 38 (a resume and a settle woken from
+    // the acquire waits; with 48, 50, 708, 711 and more) for 95's. 980 is
+    // unchanged.)
+    for seed in [720u64, 38, 980] {
         let fix = s4_pin_with(
             "sticky-s4-root-restart",
             sticky_s4_root_restart_config,
@@ -24998,13 +25024,13 @@ fn s4_root_restart_the_returned_root_wakes_the_delegate_and_the_settle() {
         let phase = sum(&fix, |s| s.settles_woken_at_cut_phase);
         let alive = sum(&fix, |s| s.settles_cut_forwarded_alive);
         match seed {
-            772 => assert!(
+            720 => assert!(
                 resumes > 0 && alive > 0,
-                "seed 772: resumes {resumes}, forwarded alive {alive}: the seed no longer exercises the path"
+                "seed 720: resumes {resumes}, forwarded alive {alive}: the seed no longer exercises the path"
             ),
-            95 => assert!(
+            38 => assert!(
                 phase > 0,
-                "seed 95: no settle woken from the acquire waits: the seed no longer exercises the path"
+                "seed 38: no settle woken from the acquire waits: the seed no longer exercises the path"
             ),
             _ => assert!(
                 alive > 0,
