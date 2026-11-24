@@ -703,6 +703,11 @@ pub struct SimConfig {
     /// sets it on every configuration; the sweeps then expect no violation
     /// and `inbox_touched_halts > 0`.
     pub inbox_ignores_touched: bool,
+    /// `Config::readopt_off`: a restarted holder never re-adopts the lease
+    /// that still names it, so the leave meets a root whose own stream
+    /// released every subtree unappended (seed 1578 of `sticky-s4-leave`).
+    /// `AUTHORITY_SIM_READOPT_OFF=1` sets it on every configuration.
+    pub readopt_off: bool,
     /// Slow inbox GETs (the holder's polls and the takeover re-reads), as
     /// `lease_reads`: a read served before a requester's tombstone and
     /// processed after it. `AUTHORITY_SIM_INBOX_READS=lo:hi:lo:hi` sets it.
@@ -1470,6 +1475,7 @@ impl Default for SimConfig {
                 .is_some_and(|v| v == "1"),
             inbox_ignores_touched: std::env::var_os("AUTHORITY_SIM_INBOX_IGNORES_TOUCHED")
                 .is_some_and(|v| v == "1"),
+            readopt_off: std::env::var_os("AUTHORITY_SIM_READOPT_OFF").is_some_and(|v| v == "1"),
             inbox_reads: super::store::SlowReads::default(),
             partial_release_ends_stream: std::env::var_os(
                 "AUTHORITY_SIM_PARTIAL_RELEASE_ENDS_STREAM",
@@ -6278,6 +6284,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         holder_runs_inbox_ever: cfg.holder_runs_inbox_ever,
         root_ignores_touched: cfg.root_ignores_touched,
         inbox_ignores_touched: cfg.inbox_ignores_touched,
+        readopt_off: cfg.readopt_off,
         partial_release_ends_stream: cfg.partial_release_ends_stream,
         abandon_skips_read_recall: cfg.abandon_skips_read_recall,
         roster_faults: cfg.roster_faults,

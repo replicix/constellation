@@ -3880,24 +3880,29 @@ impl Core {
                     continue;
                 }
                 // A stream that released every subtree has none to inherit
-                // (step 10 gives it an end), unless it is this node's own: the
-                // holder's release row shipped from its own journal (the
-                // log's table lost the subtrees), and the root that held the
-                // lease then never appended it, so no root's step 10 ever
-                // ends the stream (sim `sticky-s4-leave` idle-susp, seed 1578
-                // with re-adoption off: the node's self-leave waited on the
-                // never-ended generation). This node is its holder, and now
-                // the root: it takes the stream on and ends it by the
+                // (step 10 gives it an end), unless it is this node's own.
+                // Emptiness is read from the local table (`table`), which
+                // runs ahead of the log through this node's own journal: the
+                // stream's release row is in the log or in this journal, and
+                // need not have shipped. A holder's row that the root which
+                // held the lease then never appended leaves no root's step 10
+                // to end the stream (sim `sticky-s4-leave` idle-susp, seed
+                // 1578 with re-adoption off: the node's self-leave waited on
+                // the never-ended generation). This node is its holder, and
+                // now the root: it takes the stream on and ends it by the
                 // ADR-55 own-stream path below (`claim_releases`, the cut at
-                // `cursor.max(delegate_idx)`, `claim_end`), which keeps
-                // (1) a stream ends only by its holder's release (root ==
-                // holder here, the row is in the log or this journal),
-                // (2) the end is journaled after the stream's own release
-                // row (`claim_end_of`, `release_row_unshipped`), (3) no
-                // grant or subtree is touched (there is none), and (4) the
-                // release row is journaled once (`release_row_journaled`).
-                // Another node's stream stays skipped: its holder or the
-                // root's step 10 ends it.
+                // `cursor.max(delegate_idx)`, `claim_end`). That is safe
+                // from the local view because the cut covers every row this
+                // node assigned in the stream (the log's index or its own
+                // delegate index, whichever is higher), the end is journaled
+                // after the stream's own release row (`claim_end_of`,
+                // `release_row_unshipped`) so nothing ships out of order,
+                // no grant or subtree is touched (there is none), the
+                // release row is journaled once (`release_row_journaled`),
+                // and the path runs only at `Usable`, after the takeover's
+                // tail to head, so no predecessor row is unapplied. Another
+                // node's stream stays skipped: its holder or the root's
+                // step 10 ends it.
                 if d.dirs.is_empty() && d.node != me {
                     continue;
                 }
@@ -3941,6 +3946,9 @@ impl Core {
                 // is what it assigned, not the log's index alone: a lower one
                 // would void answers it gave `Final`.
                 if d.node == me {
+                    if d.dirs.is_empty() {
+                        self.stats.claim_own_empty_streams += 1;
+                    }
                     // Plan 46 M1.3 step 12 (claim = release): a non-stealable
                     // holder's claim is its release, the stream's next row.
                     self.claim_releases(now, d.gen, d.non_stealable(), replica);

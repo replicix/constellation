@@ -24472,6 +24472,32 @@ fn a_suspended_leaver_is_marked_again_after_the_lapse() {
     }
 }
 
+/// Seed 1578 of `sticky-s4-leave` with the idle release and the long leave
+/// suspension, with the re-adoption of a restarted holder's lease off
+/// (`SimConfig::readopt_off`): the node that leaves becomes the root with its
+/// own stream empty (every subtree released in its own journal, the row never
+/// appended by a root). The root's sync ends that stream and the leave
+/// completes. Without the end (`delegation_sync` skipping every empty
+/// stream) the generation is never ended and the run fails at the leave's
+/// deadline (`operator_abandon`); ten of 2,000 seeds of this configuration
+/// failed so on main with the re-adoption off.
+#[test]
+fn a_leave_over_the_roots_own_empty_stream_completes_with_the_readoption_off() {
+    let config = SimConfig {
+        sticky_idle_ms: Some(1_200),
+        leave_suspend_ms: 12_000,
+        readopt_off: true,
+        ..sticky_s4_leave_config()
+    };
+    run_seed(1578, config).unwrap_or_else(|e| {
+        panic!(
+            "sticky-s4-leave seed 1578: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-s4-leave \
+             AUTHORITY_SIM_STICKY_IDLE_MS=1200 AUTHORITY_SIM_LEAVE_SUSPEND_MS=12000 \
+             AUTHORITY_SIM_READOPT_OFF=1 AUTHORITY_SIM_START=1578 AUTHORITY_SIM_SEEDS=1"
+        )
+    });
+}
+
 /// Plan 46 M1.3 step 14 (ADR-61): the operator asks any node to retire the dead
 /// root before a survivor has taken over. A follower that is not the root
 /// answered "holds no delegation of its own" from a table behind the log and

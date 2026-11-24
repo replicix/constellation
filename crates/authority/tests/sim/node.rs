@@ -602,6 +602,8 @@ pub struct NodeEnv {
     pub root_ignores_touched: bool,
     /// See `SimConfig::inbox_ignores_touched`.
     pub inbox_ignores_touched: bool,
+    /// See `SimConfig::readopt_off`.
+    pub readopt_off: bool,
     /// See `SimConfig::partial_release_ends_stream`.
     pub partial_release_ends_stream: bool,
     /// See `SimConfig::abandon_skips_read_recall`.
@@ -970,6 +972,7 @@ impl NodeHandle {
         cfg.holder_runs_inbox_ever = env.holder_runs_inbox_ever;
         cfg.root_ignores_touched = env.root_ignores_touched;
         cfg.inbox_ignores_touched = env.inbox_ignores_touched;
+        cfg.readopt_off = env.readopt_off;
         cfg.partial_release_ends_stream = env.partial_release_ends_stream;
         cfg.abandon_skips_read_recall = env.abandon_skips_read_recall;
         cfg.roster_installs_partial = env.plant_roster_shrink;

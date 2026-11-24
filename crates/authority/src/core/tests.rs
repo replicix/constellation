@@ -43685,17 +43685,11 @@ fn two_tags() -> (replicix_objcas::LeaseTag, replicix_objcas::LeaseTag) {
     })
 }
 
-/// A re-adoption's CAS that loses to another write of the lease object that
-/// leaves the tenure alone (a waiter's `wanted_by` registration) reads the
-/// lease again and writes against the new tag, instead of finishing
-/// unacquired and refusing forwards for a TTL (sim `sticky-s4-root-restart`
-/// seeds 480, 543, 1392; the renewal's "lost the CAS to a `wanted_by`
-/// edit"). Fails on the parent: the job finishes with `readopt_refused_until`
-/// a TTL ahead.
-#[test]
-fn a_readoption_that_loses_its_cas_to_a_wanted_by_edit_reads_and_writes_again() {
-    let (t1, t2) = two_tags();
-    assert_ne!(t1, t2);
+/// A forward of node 2 reaches a node (1) whose lease object still names it:
+/// the node starts the re-adoption. Returns the harness, the lease the
+/// object holds (epoch 3, unreleased) and the forward's actions (the job's
+/// lease read).
+fn readopt_started() -> (Harness, Lease, Vec<Action>) {
     let mut h = Harness::new(1);
     let own = lease_of(1, 3, h.now.plus(30_000).0);
     h.core.lease.note_object(&own);
@@ -43721,41 +43715,73 @@ fn a_readoption_that_loses_its_cas_to_a_wanted_by_edit_reads_and_writes_again() 
         },
     });
     assert_eq!(h.core.job(), Some(JobKind::Acquire));
-    // Answers the job's S3 requests (the takeover's tail to head) until the
-    // claim's CAS goes out.
-    fn to_swap(
-        h: &mut Harness,
-        mut out: Vec<Action>,
-    ) -> (OpId, replicix_objcas::LeaseTag, Vec<Action>) {
-        for _ in 0..8 {
-            if let Some((op, tag)) = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
-                S3Op::LeaseSwap { tag, .. } => Some((op, tag.clone())),
-                _ => None,
-            }) {
-                return (op, tag, out);
-            }
-            let Some((op, req)) = s3_ops(&out)
-                .into_iter()
-                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
-                .map(|(op, r)| (op, r.clone()))
-            else {
-                break;
-            };
-            let result = match req {
-                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
-                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
-                other => panic!("unexpected request {other:?}"),
-            };
-            out = h.step(Event::S3 { op, result });
+    (h, own, out)
+}
+
+/// Answers the job's S3 requests (the takeover's tail to head) until the
+/// claim's CAS goes out: its request and the tag it is written against.
+fn answer_until_swap(
+    h: &mut Harness,
+    mut out: Vec<Action>,
+) -> (OpId, replicix_objcas::LeaseTag, Vec<Action>) {
+    for _ in 0..8 {
+        if let Some((op, tag)) = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+            S3Op::LeaseSwap { tag, .. } => Some((op, tag.clone())),
+            _ => None,
+        }) {
+            return (op, tag, out);
         }
-        panic!("no lease CAS in {out:?}");
+        let Some((op, req)) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+            .map(|(op, r)| (op, r.clone()))
+        else {
+            break;
+        };
+        let result = match req {
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+            other => panic!("unexpected request {other:?}"),
+        };
+        out = h.step(Event::S3 { op, result });
     }
-    let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
+    panic!("no lease CAS in {out:?}");
+}
+
+/// The lease read of the job in `out` is answered with `lease` at `tag`; the
+/// job's S3 requests are answered until its CAS goes out.
+fn read_then_swap(
+    h: &mut Harness,
+    out: &[Action],
+    lease: &Lease,
+    tag: &replicix_objcas::LeaseTag,
+) -> (OpId, replicix_objcas::LeaseTag) {
+    let get = s3_find(out, |r| matches!(r, S3Op::LeaseGet));
     let out = h.step(Event::S3 {
         op: get,
-        result: S3Result::LeaseGet(Ok(Some((own.clone(), t1.clone())))),
+        result: S3Result::LeaseGet(Ok(Some((lease.clone(), tag.clone())))),
     });
-    let (cas, sent_tag, _) = to_swap(&mut h, out);
+    let (cas, sent, _) = answer_until_swap(h, out);
+    (cas, sent)
+}
+
+fn has_lease_get(out: &[Action]) -> bool {
+    s3_ops(out).iter().any(|(_, r)| matches!(r, S3Op::LeaseGet))
+}
+
+/// A re-adoption's CAS that loses to another write of the lease object that
+/// leaves the tenure alone (a waiter's `wanted_by` registration) reads the
+/// lease again and writes against the new tag, instead of finishing
+/// unacquired and refusing forwards for a TTL (sim `sticky-s4-root-restart`
+/// seeds 480, 543, 1392; the renewal's "lost the CAS to a `wanted_by`
+/// edit"). Fails on the parent: the job finishes with `readopt_refused_until`
+/// a TTL ahead.
+#[test]
+fn a_readoption_that_loses_its_cas_to_a_wanted_by_edit_reads_and_writes_again() {
+    let (t1, t2) = two_tags();
+    assert_ne!(t1, t2);
+    let (mut h, own, out) = readopt_started();
+    let (cas, sent_tag) = read_then_swap(&mut h, &out, &own, &t1);
     assert_eq!(sent_tag, t1);
     // A waiter's `wanted_by` write landed first.
     let out = h.step(Event::S3 {
@@ -43767,16 +43793,12 @@ fn a_readoption_that_loses_its_cas_to_a_wanted_by_edit_reads_and_writes_again() 
         h.core.readopt_refused_until <= h.clk().wait,
         "forwards are refused for a TTL"
     );
-    let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
+    assert_eq!(h.core.stats.readopt_rereads, 1);
     let edited = Lease {
         wanted_by: vec![2],
         ..own.clone()
     };
-    let out = h.step(Event::S3 {
-        op: get,
-        result: S3Result::LeaseGet(Ok(Some((edited, t2.clone())))),
-    });
-    let (cas, sent_tag, _) = to_swap(&mut h, out);
+    let (cas, sent_tag) = read_then_swap(&mut h, &out, &edited, &t2);
     assert_eq!(sent_tag, t2, "written against the tag it read, never blind");
     h.step(Event::S3 {
         op: cas,
@@ -43791,10 +43813,12 @@ fn a_readoption_that_loses_its_cas_to_a_wanted_by_edit_reads_and_writes_again() 
 
 /// The re-read after a re-adoption's lost CAS that no longer names this node
 /// (or at another epoch, or released) is not re-adopted: unacquired, with the
-/// TTL refusal as before, and no write.
+/// TTL refusal as before, and no write. The node then knows the lease it
+/// read: `last_seen` names its holder, not this node, so forwards get that
+/// hint.
 #[test]
 fn a_readoption_that_lost_its_cas_to_another_holder_is_refused_for_a_ttl() {
-    let (_t1, t2) = two_tags();
+    let (t1, t2) = two_tags();
     for theirs in [
         lease_of(3, 4, i64::MAX),
         Lease {
@@ -43803,62 +43827,10 @@ fn a_readoption_that_lost_its_cas_to_another_holder_is_refused_for_a_ttl() {
         },
         lease_of(1, 4, i64::MAX),
     ] {
-        let mut h = Harness::new(1);
-        h.core
-            .lease
-            .note_object(&lease_of(1, 3, h.now.plus(30_000).0));
-        let op = h.create("a");
-        let out = h.step(Event::Peer {
-            from: 2,
-            msg: PeerMsg::MutateRequest {
-                req: OpId(77),
-                rid: Rid {
-                    node: 2,
-                    incarnation: 1,
-                    seq: 1,
-                },
-                op,
-                acked_through: 0,
-                deps: constellation_meta::Position::ZERO,
-                applied: 0,
-                tag: Default::default(),
-                settle: false,
-                routed_gen: 0,
-                touched_gen: 0,
-                inbox_ever: false,
-            },
-        });
-        let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
-        let own = lease_of(1, 3, h.now.plus(30_000).0);
-        let mut out = h.step(Event::S3 {
-            op: get,
-            result: S3Result::LeaseGet(Ok(Some((own, tag())))),
-        });
-        let mut cas = None;
-        for _ in 0..8 {
-            if let Some((op, _)) = s3_ops(&out)
-                .into_iter()
-                .find(|(_, r)| matches!(r, S3Op::LeaseSwap { .. }))
-            {
-                cas = Some(op);
-                break;
-            }
-            let Some((op, req)) = s3_ops(&out)
-                .into_iter()
-                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
-                .map(|(op, r)| (op, r.clone()))
-            else {
-                break;
-            };
-            let result = match req {
-                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
-                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
-                other => panic!("unexpected request {other:?}"),
-            };
-            out = h.step(Event::S3 { op, result });
-        }
+        let (mut h, own, out) = readopt_started();
+        let (cas, _) = read_then_swap(&mut h, &out, &own, &t1);
         let out = h.step(Event::S3 {
-            op: cas.expect("the re-adoption CAS"),
+            op: cas,
             result: S3Result::LeasePut(Err(CasFailure::Conflict)),
         });
         let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
@@ -43877,7 +43849,126 @@ fn a_readoption_that_lost_its_cas_to_another_holder_is_refused_for_a_ttl() {
             h.core.readopt_refused_until > h.clk().wait,
             "{theirs:?}: no TTL refusal"
         );
+        assert_eq!(
+            h.core.lease.last_seen.as_ref(),
+            Some(&theirs),
+            "{theirs:?}: last_seen kept naming this node"
+        );
+        assert_eq!(h.core.lease.cached_holder, Some(theirs.holder));
     }
+}
+
+/// The re-read that finds no lease object, or fails, is not re-adopted
+/// either: unacquired, the TTL refusal, no write.
+#[test]
+fn a_readoption_whose_reread_finds_no_lease_or_fails_is_refused_for_a_ttl() {
+    let (t1, _t2) = two_tags();
+    for fails in [false, true] {
+        let result = || {
+            if fails {
+                S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into())))
+            } else {
+                S3Result::LeaseGet(Ok(None))
+            }
+        };
+        let (mut h, own, out) = readopt_started();
+        let (cas, _) = read_then_swap(&mut h, &out, &own, &t1);
+        let out = h.step(Event::S3 {
+            op: cas,
+            result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+        });
+        let get = s3_find(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: result(),
+        });
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. })),
+            "fails {fails}: written blind: {out:?}"
+        );
+        assert_ne!(h.core.job(), Some(JobKind::Acquire), "fails {fails}");
+        assert!(
+            h.core.readopt_refused_until > h.clk().wait,
+            "fails {fails}: no TTL refusal"
+        );
+    }
+}
+
+/// A re-adoption that keeps losing its CAS to edits of the lease reads it at
+/// most `CLAIM_LOST_FAST_RETRIES` (3) times: the fourth lost CAS in a row
+/// ends the job unacquired with the TTL refusal and no fifth read. The count
+/// is the job's: the next job (after the refusal) re-reads again.
+#[test]
+fn a_readoption_that_keeps_losing_its_cas_is_refused_after_the_bound() {
+    let (t1, t2) = two_tags();
+    let (mut h, own, mut out) = readopt_started();
+    let (mut cas, _) = read_then_swap(&mut h, &out, &own, &t1);
+    for round in 1..=3u64 {
+        out = h.step(Event::S3 {
+            op: cas,
+            result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+        });
+        assert!(has_lease_get(&out), "conflict {round}: no re-read");
+        assert_eq!(h.core.stats.readopt_rereads, round);
+        let edited = Lease {
+            wanted_by: vec![2],
+            ..own.clone()
+        };
+        (cas, _) = read_then_swap(&mut h, &out, &edited, &t2);
+    }
+    // The fourth conflict: refused, no fifth read, no write.
+    out = h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    assert!(!has_lease_get(&out), "a fifth read: {out:?}");
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. })),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.readopt_rereads, 3);
+    assert_ne!(h.core.job(), Some(JobKind::Acquire));
+    assert!(
+        h.core.readopt_refused_until > h.clk().wait,
+        "no TTL refusal after the bound"
+    );
+    assert_eq!(h.core.readopt_conflicts, 0, "the count outlived the job");
+    // Across jobs: after the refusal the next forward starts a new job, and
+    // its first lost CAS is read again.
+    h.advance(h.core.cfg.ttl_ms + 1);
+    let op = h.create("b");
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateRequest {
+            req: OpId(78),
+            rid: Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 2,
+            },
+            op,
+            acked_through: 0,
+            deps: constellation_meta::Position::ZERO,
+            applied: 0,
+            tag: Default::default(),
+            settle: false,
+            routed_gen: 0,
+            touched_gen: 0,
+            inbox_ever: false,
+        },
+    });
+    assert_eq!(h.core.job(), Some(JobKind::Acquire), "{out:?}");
+    let (cas, _) = read_then_swap(&mut h, &out, &own, &t1);
+    let out = h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    assert!(has_lease_get(&out), "the count was not reset across jobs");
+    assert_eq!(h.core.stats.readopt_rereads, 4);
 }
 
 /// A node that released the lease itself (the object read after says so)
@@ -83670,59 +83761,59 @@ mod step5_sticky_release {
         );
     }
 
-    /// The root's sync ends a stream of its own whose every subtree was
-    /// released in the holder's own journal (the row shipped to the log, so
-    /// the table lists the stream with no subtree) and that the previous root
-    /// never appended (sim `sticky-s4-leave` idle-susp, seed 1578 with
-    /// re-adoption off): the node claims the lease by takeover and syncs as
-    /// `Usable`. The stream is taken on and ended, and the node's self-leave
-    /// (which needs every kept stream acknowledged and every own generation
-    /// ended) can complete. Fails on the parent: the sync skipped the empty
-    /// stream, `dl.gens` stayed empty, the kept state never got acknowledged.
-    #[test]
-    fn a_root_ends_its_own_stream_that_released_every_subtree_unappended() {
-        let (mut h, dirs) = sticky_holder(&["a"]);
-        // The holder's whole release is journaled in its own journal; the
-        // previous root never appends it.
+    /// The state of sim seed 1578 (`sticky-s4-leave` idle-susp, re-adoption
+    /// off): the holder (node 3) released its whole stream 7 in its own
+    /// journal, and no root has appended the row. The local table (this
+    /// node's own journal applies its release rows at once) lists the stream
+    /// with no subtree; nothing has shipped.
+    fn own_stream_released_unappended() -> Harness {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
         let out = release(&mut h, 50, Vec::new(), false);
         assert!(last_is_release(&h), "{out:?}");
-        // The row ships to the log from this journal (the table loses the
-        // subtree, the stream stays).
-        let seq = Replica::applied_seq(&h.meta).unwrap_or(0) + 1;
-        Replica::apply_segment(
-            &h.meta,
-            seq,
-            1,
-            0,
-            &[],
-            &[],
-            &[LogRecord::SubtreeReleased {
-                node: 3,
-                gen: 7,
-                dir: dirs[0],
-                at: 0,
-            }],
-        )
-        .unwrap();
         {
             let table = h.meta.delegation_table();
-            let st = table.streams().find(|s| s.gen == 7).expect("stream");
-            assert!(st.subtrees.is_empty(), "the table still lists a subtree");
+            let st = table
+                .streams()
+                .find(|s| s.gen == 7)
+                .expect("the release dropped the stream from the table");
+            assert!(
+                st.subtrees.is_empty(),
+                "the table still lists a subtree after the release row"
+            );
         }
-        // The node claims the lease by takeover and syncs as the root.
-        h.hold(3, None);
-        let mut out = Vec::new();
-        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
-        assert!(
-            h.core.dl.gens.get(&7).is_some_and(|g| g.ended),
-            "the own stream was not taken on and ended: {:?}",
-            h.core.dl.gens.keys().collect::<Vec<_>>()
-        );
-        // The release row and the end ship, as the shipper acks them.
         assert!(
             h.meta.released_whole(7).unwrap(),
             "the release row wrote no mark"
         );
+        assert!(h.core.dl.mine.contains_key(&7), "no kept state to leave");
+        h
+    }
+
+    /// The journal's unshipped records of stream 7: its whole release row
+    /// first, then the end this node journaled as the root.
+    fn assert_end_follows_release_row(h: &Harness) {
+        let records: Vec<LogRecord> = Replica::take_journal(&h.meta, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        let release = records
+            .iter()
+            .position(|r| matches!(r, LogRecord::StreamReleased { gen: 7, .. }))
+            .unwrap_or_else(|| panic!("no release row in the journal: {records:?}"));
+        let end = records
+            .iter()
+            .position(|r| matches!(r, LogRecord::DelegateNodeEnded { gen: 7, .. }))
+            .unwrap_or_else(|| panic!("no end in the journal: {records:?}"));
+        assert!(
+            release < end,
+            "the end precedes the release row: {records:?}"
+        );
+    }
+
+    /// The driver's part of a journal that ships and is acknowledged: the
+    /// shipper's ack of every unshipped row.
+    fn ship_journal(h: &mut Harness) -> Vec<Action> {
         let tip = h.meta.journal_tip().unwrap();
         h.core.note_shipped(&[], tip);
         let seqs: Vec<u64> = Replica::take_journal(&h.meta, 100)
@@ -83741,10 +83832,48 @@ mod step5_sticky_release {
         h.step(Event::Activity {
             last_write: WaitMs(0),
             acked_seqs: Vec::new(),
-        });
+        })
+    }
+
+    /// The root's sync ends a stream of its own whose every subtree was
+    /// released in the holder's own journal (the local table lists the stream
+    /// with no subtree; the row has not shipped) and that the previous root
+    /// never appended (sim `sticky-s4-leave` idle-susp, seed 1578 with
+    /// re-adoption off): the node claims the lease by takeover and syncs as
+    /// `Usable`. The stream is taken on and ended, and the node's self-leave
+    /// (which needs every kept stream acknowledged and every own generation
+    /// ended) can complete. Fails on the parent: the sync skipped the empty
+    /// stream, `dl.gens` stayed empty, the kept state never got acknowledged.
+    #[test]
+    fn a_root_ends_its_own_stream_that_released_every_subtree_unappended() {
+        let mut h = own_stream_released_unappended();
+        // The node claims the lease by takeover and syncs as the root.
+        h.hold(3, None);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
         assert!(
-            h.core.dl.mine.values().all(|d| d.release_acked),
-            "a kept stream never acknowledged: the self-leave would wait"
+            h.core.dl.gens.get(&7).is_some_and(|g| g.ended),
+            "the own stream was not taken on and ended: {:?}",
+            h.core.dl.gens.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(h.core.stats.claim_own_empty_streams, 1);
+        assert_end_follows_release_row(&h);
+        // WP6.2b: the release row's mark stays until the end ships.
+        assert!(
+            h.meta.released_whole(7).unwrap(),
+            "the mark went before the end shipped"
+        );
+        assert!(
+            h.core.dl.mine.get(&7).is_some_and(|d| !d.release_acked),
+            "the kept state was acknowledged before anything shipped"
+        );
+        // The release row and the end ship, as the shipper acks them.
+        ship_journal(&mut h);
+        // (The state existed and was unacknowledged above; the shipped row
+        // lets it go, or acknowledges it: the self-leave waits for neither.)
+        assert!(
+            h.core.dl.mine.get(&7).is_none_or(|d| d.release_acked),
+            "the kept stream never acknowledged: the self-leave would wait"
         );
         assert!(!h.core.dl.gens.values().any(|g| g.node == 3 && !g.ended));
         // WP6.2b: the end that shipped is in the log: the generation carries
@@ -83753,6 +83882,109 @@ mod step5_sticky_release {
             !h.meta.released_whole(7).unwrap(),
             "the own end shipped and left the generation's mark"
         );
+    }
+
+    /// The same state after a restart that lost the holder's process state
+    /// (no `dl.mine` entry, nothing installed): the root still ends its own
+    /// empty stream, after the release row the journal still holds.
+    #[test]
+    fn a_root_restarted_without_its_kept_state_ends_its_own_released_stream() {
+        let mut h = own_stream_released_unappended();
+        forget_process_state(&mut h);
+        assert!(!h.core.dl.mine.contains_key(&7));
+        h.hold(3, None);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.gens.get(&7).is_some_and(|g| g.ended),
+            "the own stream was not ended after the restart: {:?}",
+            h.core.dl.gens.keys().collect::<Vec<_>>()
+        );
+        assert_end_follows_release_row(&h);
+        assert!(
+            h.meta.released_whole(7).unwrap(),
+            "the mark went before the end shipped"
+        );
+        ship_journal(&mut h);
+        assert!(
+            !h.meta.released_whole(7).unwrap(),
+            "the shipped end left the mark"
+        );
+    }
+
+    /// The node is deposed between the end it journaled and the end's
+    /// shipping: nothing is lost (the release row and the end stay in the
+    /// journal, in order, with the mark), and nothing executes under the
+    /// released stream, whether the process state is kept or lost.
+    #[test]
+    fn a_root_deposed_before_its_own_end_ships_loses_no_row_and_executes_nothing() {
+        for restart in [false, true] {
+            let (mut h, dirs) = sticky_holder(&["a"]);
+            release(&mut h, 50, Vec::new(), false);
+            h.hold(3, None);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            assert!(h.core.dl.gens.get(&7).is_some_and(|g| g.ended));
+            assert_end_follows_release_row(&h);
+            // Deposed: another node holds the lease, nothing shipped.
+            h.core.lease.held = None;
+            h.core.lease.last_seen = None;
+            h.core.lease.cached_holder = Some(1);
+            assert!(!h.core.root_usable(h.clk()));
+            if restart {
+                forget_process_state(&mut h);
+            }
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+            assert_end_follows_release_row(&h);
+            assert!(
+                h.meta.released_whole(7).unwrap(),
+                "restart {restart}: the mark went with the unshipped end"
+            );
+            assert!(
+                h.core
+                    .dl
+                    .mine
+                    .get(&7)
+                    .is_none_or(|d| d.dirs.is_empty() && !d.release_acked),
+                "restart {restart}: the stream holds subtrees or is acknowledged: {:?}",
+                h.core.dl.mine.get(&7).map(|d| d.dirs.clone())
+            );
+            create_in(&mut h, dirs[0], 1);
+            assert!(
+                no_create_journaled(&h),
+                "restart {restart}: the op was executed under the stream"
+            );
+        }
+    }
+
+    /// The node's own leave, driven to completion from that state: the root
+    /// ends its empty own stream, the release row and the end ship, and the
+    /// leave is answered `Ok`. On the parent it waits for a generation nobody
+    /// ends and fails at its deadline.
+    #[test]
+    fn a_roots_own_leave_completes_over_its_unappended_empty_stream() {
+        let mut h = own_stream_released_unappended();
+        h.hold(3, None);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let mut outs = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        assert!(answer(&outs, 77).is_none(), "answered at once: {outs:?}");
+        for _ in 0..40 {
+            if answer(&outs, 77).is_some() {
+                break;
+            }
+            outs.extend(ship_journal(&mut h));
+            if let Some(id) = h.core.dl.leave_timer {
+                h.advance(600);
+                outs.extend(h.step(Event::Timer { id }));
+            }
+        }
+        let a = answer(&outs, 77).unwrap_or_else(|| panic!("the leave never completed: {outs:?}"));
+        assert!(a.is_ok(), "{a:?}");
     }
 
     /// WP6.2, the restart variant of the test above: the node restarts after

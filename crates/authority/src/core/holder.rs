@@ -1182,6 +1182,7 @@ impl Core {
             || self.retired()
             || self.mode.forwards()
             || now.wait < self.readopt_refused_until
+            || self.cfg.readopt_off
         {
             return false;
         }

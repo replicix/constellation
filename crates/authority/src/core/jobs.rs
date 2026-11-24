@@ -5923,6 +5923,7 @@ impl Core {
             return false;
         }
         self.readopt_conflicts += 1;
+        self.stats.readopt_rereads += 1;
         let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
         self.set_phase(Phase::ReadoptReread { epoch: prev.epoch }, Some(op));
         true
@@ -5954,8 +5955,14 @@ impl Core {
                 self.acquire_classified(now, Some((cur, tag)), replica, out);
             }
             other => {
-                if let Err(e) = other {
-                    tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed after a re-adoption's lost CAS");
+                match other {
+                    // The lease just read is what the node knows of the
+                    // holder now: forwards get that hint, not this node.
+                    Ok(Some((cur, _))) => self.lease.note_object(&cur),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed after a re-adoption's lost CAS");
+                    }
                 }
                 self.finish_acquire(now, false, replica, out);
             }

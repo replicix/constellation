@@ -247,6 +247,13 @@ pub struct Config {
     /// `inbox_ok` hold). The drain alone must then carry safety: the sim
     /// expects no violation and `inbox_touched_halts > 0`.
     pub inbox_ignores_touched: bool,
+    /// Fault injection for the simulation (never set by the engine): the
+    /// re-adoption of a lease that still names this node
+    /// (`readopt_own_lease_for_forward`) never starts, as before it existed.
+    /// Opens the state sim seed 1578 of `sticky-s4-leave` (idle release, long
+    /// leave suspension) reached by a lost re-adoption: a root whose own
+    /// stream released every subtree unappended. Off: no change.
+    pub readopt_off: bool,
     /// Fault injection for the simulation's negative control (never set by
     /// the engine): the operator's abandon of a non-stealable stream ends it
     /// at once, without recalling or waiting out the read delegations its
@@ -795,6 +802,7 @@ impl Config {
             holder_runs_inbox_ever: false,
             root_ignores_touched: false,
             inbox_ignores_touched: false,
+            readopt_off: false,
             abandon_skips_read_recall: false,
             roster_installs_partial: false,
             ttl_ms,
@@ -1574,6 +1582,15 @@ pub struct Stats {
     pub claim_release_rowless: u64,
     pub claim_own_rows_halted_non_stealable: u64,
     pub claim_own_rows_halted_stealable: u64,
+    /// The root took on its own stream that held no subtree in the local
+    /// table (it released them all, its release row not appended by any
+    /// root) and ends it by the own-stream path. Counted here, not in
+    /// `deleg_sticky_ended_released` (an empty stream is not of a sticky
+    /// kind) or `claim_own_rows_halted_non_stealable`.
+    pub claim_own_empty_streams: u64,
+    /// A re-adoption's CAS lost to an edit of the lease that still names this
+    /// node, and the lease was read again (`ReadoptReread`).
+    pub readopt_rereads: u64,
     /// The end of a claimed own stream waited for the stream's rows
     /// (`_waits`), and went ahead of them when `drop_held_await` ran out:
     /// ahead of rows held back from shipping (`_rows_outrun`: counted, sound,
