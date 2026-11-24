@@ -749,6 +749,9 @@ delegations over the one log instead, below.)
   and its `Completed { rid }` always land together. The holder ships
   whatever is journaled every sync round (500 ms, or at once when a
   `close()` or `fsync()` nudges it), in segments of at most 4 MiB.
+  The cost of building a segment is the batch's own: the origin guard reads
+  the batch's `journal_tx` heads, never a keyspace that keeps a tombstone for
+  every shipped delegate row.
 - **Records** are the namespace operations (`mkdir`, `create`, `unlink`,
   `rename`, `link`, `symlink`, `setattr`, `write_manifest`, xattrs,
   `snap_create`, `snap_delete`, `clone`, quota, atime) plus plan 30's
