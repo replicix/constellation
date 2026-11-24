@@ -2305,7 +2305,7 @@ impl MetaStore for Meta {
         let mut tx = self.db.write_tx();
         let applied = crate::store::applied_seq_at(&tx, &self.local)?;
         crate::store::spec::retire_local_tx(&mut tx, self, upto_seq, applied, None)?;
-        journal::ack_upto(&mut tx, &self.journal_ks, &self.local, upto_seq)?;
+        journal::ack_upto(&mut tx, self, upto_seq)?;
         tx.commit()?;
         Ok(())
     }

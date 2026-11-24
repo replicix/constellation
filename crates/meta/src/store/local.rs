@@ -1414,11 +1414,11 @@ impl Meta {
     ///
     /// The shipped rows are read only while a `DelegateNodeEnded` this node
     /// journaled is still unacked (`KV_DELEGATE_ENDS_UNACKED`, raised where
-    /// `journal::append_tx` journals one, lowered here at its ack and where
-    /// a strand takes the row back out): with none (the common ship) the
-    /// ack reads no row. The count is a superset of the marked
-    /// generations' ends (a mark may be written after the end is journaled),
-    /// so it never skips a needed clear. It moves in the transaction of
+    /// `journal::append_tx` journals one, lowered here at its ack, in
+    /// `journal::ack_upto`, and where a strand takes the row back out): with
+    /// none (the common ship) the ack reads no row. The count is a superset
+    /// of the marked generations' ends (a mark may be written after the end
+    /// is journaled), so it never skips a needed clear. It moves in the transaction of
     /// the row it counts, so an aborted one leaves it as it was.
     ///
     /// The marks are scanned only while the flag may be up. A scan that
@@ -4457,6 +4457,100 @@ mod root_substitution_tests {
         assert!(meta.clear_rows_decoded_for_tests() > before);
         assert!(!meta.released_whole(5).unwrap());
         assert_eq!(ends_unacked(&meta), 0);
+    }
+
+    /// WP6.2b: the ack that removes journal rows without a ship
+    /// (`MetaStore::ack_journal`: fsck, a holder draining its journal) takes
+    /// an own `DelegateNodeEnded` out of the count as a shipped ack does,
+    /// and clears its mark. A count left up cost every later ordinary ship
+    /// a read and decode of its rows.
+    #[test]
+    fn an_ack_upto_of_an_own_end_lowers_the_count_and_clears_the_mark() {
+        let (meta, _, _) = cut_fixture();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        meta.apply_records_journaled(&[stream_end(5)]).unwrap();
+        assert_eq!(ends_unacked(&meta), 1);
+        assert!(meta.released_whole(5).unwrap());
+        let tip = meta
+            .peek_journal_after(0)
+            .unwrap()
+            .last()
+            .map(|(s, _)| *s)
+            .unwrap();
+        crate::MetaStore::ack_journal(&meta, tip).unwrap();
+        assert_eq!(ends_unacked(&meta), 0, "the acked end stayed counted");
+        assert!(!meta.released_whole(5).unwrap(), "the mark stayed");
+        // The ordinary ships that follow decode no row.
+        for n in 0..5u64 {
+            execute(
+                &meta,
+                &MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: format!("g{n}"),
+                    ino: (3 << 40) | (3000 + n),
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                Some(Rid {
+                    node: 3,
+                    incarnation: 1,
+                    seq: n + 1,
+                }),
+            )
+            .unwrap();
+        }
+        let seqs: Vec<u64> = meta
+            .peek_journal_after(0)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert!(!seqs.is_empty());
+        let before = meta.clear_rows_decoded_for_tests();
+        meta.ack_journal_rows_at(&seqs, 2).unwrap();
+        assert_eq!(
+            meta.clear_rows_decoded_for_tests(),
+            before,
+            "an ordinary ship decoded rows"
+        );
+    }
+
+    /// WP6.2b: an `ack_upto` below an own end leaves it counted and its
+    /// mark; the one that reaches it lowers the count and clears the mark.
+    #[test]
+    fn an_ack_upto_below_an_own_end_leaves_it_counted() {
+        let (meta, _, _) = cut_fixture();
+        execute(
+            &meta,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: "before".into(),
+                ino: (3 << 40) | 4000,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(Rid {
+                node: 3,
+                incarnation: 1,
+                seq: 1,
+            }),
+        )
+        .unwrap();
+        meta.delegate_release(&[whole_release(5)], 5, Default::default())
+            .unwrap();
+        meta.apply_records_journaled(&[stream_end(5)]).unwrap();
+        let end = journaled_end_seq(&meta, 5);
+        assert_eq!(end.len(), 1);
+        assert!(end[0] > 1, "a row precedes the end");
+        crate::MetaStore::ack_journal(&meta, end[0] - 1).unwrap();
+        assert_eq!(ends_unacked(&meta), 1, "an ack below the end lowered it");
+        assert!(meta.released_whole(5).unwrap());
+        crate::MetaStore::ack_journal(&meta, end[0]).unwrap();
+        assert_eq!(ends_unacked(&meta), 0);
+        assert!(!meta.released_whole(5).unwrap());
     }
 
     /// ADR-64: no cut is journaled on a generation the takeover gate ended

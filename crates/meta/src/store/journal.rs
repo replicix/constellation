@@ -1015,21 +1015,41 @@ thread_local! {
     pub(crate) static ROWS_COUNTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Remove every journal row up to `upto_seq` (the `MetaStore::ack_journal`
+/// path: fsck, tests, a holder draining its journal).
+///
+/// WP6.2b: an own `DelegateNodeEnded` leaving here leaves the count of ends
+/// journaled and not acked (`KV_DELEGATE_ENDS_UNACKED`) and clears its mark,
+/// as the ack of a shipped row does ([`Meta::clear_marks_of_shipped_ends_tx`]):
+/// the rows are read only while the count is above 0, and before they are
+/// removed. Without it the count stayed up for good and every ship decoded
+/// its rows.
 pub(crate) fn ack_upto(
     tx: &mut SingleWriterWriteTx,
-    journal: &SingleWriterTxKeyspace,
-    local: &SingleWriterTxKeyspace,
+    meta: &Meta,
     upto_seq: u64,
 ) -> Result<(), MetaError> {
-    let from = acked_watermark(tx, local)?.saturating_add(1);
+    let from = acked_watermark(tx, &meta.local)?.saturating_add(1);
     let keys: Vec<Vec<u8>> = tx
-        .range(journal, seq_key(from)..=seq_key(upto_seq))
+        .range(&meta.journal_ks, seq_key(from)..=seq_key(upto_seq))
         .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
         .collect::<Result<_, _>>()?;
-    for k in keys {
-        tx.remove(journal, k);
+    if crate::store::counter_get(&*tx, &meta.local, crate::store::KV_DELEGATE_ENDS_UNACKED)? > 0 {
+        let seqs = keys
+            .iter()
+            .map(|k| {
+                k.as_slice()
+                    .try_into()
+                    .map(u64::from_be_bytes)
+                    .map_err(|_| MetaError::Invalid("journal key".into()))
+            })
+            .collect::<Result<Vec<u64>, _>>()?;
+        meta.clear_marks_of_shipped_ends_tx(tx, &seqs)?;
     }
-    note_acked_tx(tx, local, upto_seq)
+    for k in keys {
+        tx.remove(&meta.journal_ks, k);
+    }
+    note_acked_tx(tx, &meta.local, upto_seq)
 }
 
 /// Remove the shipped rows `seqs` and record the segment they shipped in
