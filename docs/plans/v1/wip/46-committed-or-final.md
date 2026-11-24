@@ -1,19 +1,22 @@
 # Plan 46 — Committed or final: one stream per node, the commit rule per configuration, no server-side replay
 
-> **Status (2026-11-22): stage 0, M1.0, M1.1 and M1.2 are closed; M1.3 and M1.4
-> are open; M1.5 and stages 2 and 3 have not started.**
+> **Status (2026-11-24): stage 0, M1.0 and M1.1 are closed; M1.2 is
+> code-complete and waits for its close-commit re-runs; M1.3 and M1.4 are open;
+> M1.5 and stages 2 and 3 have not started.**
 >
 > - **Closed.**
 >   - Stage 0 (M0.1 to M0.4, 2026-11-05). Plan 43 is done and closed into this
 >     plan (D-4, D-5).
 >   - M1.0 (the model, chunks 1 to 14) and M1.1.
->   - M1.2, 2026-11-22 on `060e6fa6`: steps 0 to 16, the review's conditions
->     and the close fixes. PROGRESS, "Plan 46 M1.2 exit", has R1 (every
->     configuration at 2,000 seeds), R2 (the harness catalogue), R3 (plan 45's
->     box gates on four file systems, both `hardlink-burst` scenarios) and the
->     "Deleted" table. The fold, `MutateOp::Records` and `RebuildReplica`'s
->     non-delegation branch moved from M1.2 to M2.x. The Fable check of the exit
->     write-up is pending.
+> - **M1.2**, code-complete on `060e6fa6`: steps 0 to 16, the review's
+>   conditions and the close fixes. PROGRESS, "Plan 46 M1.2 exit", has R1
+>   (every configuration at 2,000 seeds), R2 (the harness catalogue), R3 (plan
+>   45's box gates on four file systems, both `hardlink-burst` scenarios), the
+>   §8 measurements and the "Deleted" table, as of `a70304d7`. Fixes landed
+>   after R1 and R2, so R1 (plain) and R2's delegate scenarios run again on the
+>   close commit, the first `main` with the orphan-nonroot fix; then the Fable
+>   check of the exit write-up. The fold, `MutateOp::Records` and
+>   `RebuildReplica`'s non-delegation branch moved from M1.2 to M2.x.
 > - **M1.3.**
 >   - Landed:
 >     - steps 0 to 15, among them 6 and 12 (ADR-60), 14 (ADR-61), 15 (S4 as
@@ -31,16 +34,12 @@
 >       runs, `ack-latency` topologies 1 to 5 on four file systems, G1 and G2,
 >       and the Fable review.
 >   - The work packages of the 2026-11-22 sweep classification:
->     - landed: WP6.1 (one sequencer per inboxed rid, `00a269fd`) and WP6.4
->       (the release-path settle, `e41e1577`);
->     - in review: WP6.2 (a delegate re-installs the grown subtrees of a
->       generation it ended whole);
->     - in coding: WP6.3 (a successor root grants a sticky generation to a
->       leaving node);
+>     - landed: WP6.1 (one sequencer per inboxed rid, `00a269fd`), WP6.4
+>       (the release-path settle, `e41e1577`), WP6.2 (a delegate re-installs
+>       the grown subtrees of a generation it ended whole, `36db5771`), WP6.3
+>       (the leave is a log row, `b7a371ee` and `9fda6186`) and WP6.2b (the
+>       durable released-whole mark, `a1134ebb`);
 >     - open:
->       - WP6.2b: a whole release whose `StreamReleased` and
->         `DelegateNodeEnded` land in different segments. It is narrow and
->         was already there.
 >       - WP6.5: idle hangs on a stale `last_seen`.
 >       - WP6.6: I4 under slow lease reads and idle release.
 >       - WP6.7: the rest of D3.
@@ -972,19 +971,24 @@ landed on 2026-11-02 as an interim form of C3 item 4's member copy: M1.2's
 member copy closes the window it covers, and M1.2 may revert the rule (it
 deletes `root_committed` with the lone delegate and the per-row classes).
 
-*M1.2 closed (2026-11-22, on `060e6fa6`; PROGRESS, "Plan 46 M1.2 exit").*
+*M1.2 code-complete (2026-11-22, on `060e6fa6`; PROGRESS, "Plan 46 M1.2 exit", brought up to date on `a70304d7`). The exit closes after
+R1 (plain) and R2's delegate scenarios re-run on the close commit, the first `main` with the orphan-nonroot fix, and the Fable check.*
 
 The exit items:
 
 - Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds.
   - R1 ran on `0d157e56`, 293 labels, plain. Its failing labels are negative
     controls and tracked items.
-  - The changes landed after it ran their own sweeps. There was no full
-    re-sweep on the close commit.
+  - An interim re-sweep on `36db5771` (295 labels) found no invariant
+    violation and no product failure.
+  - The changes landed after it ran their own sweeps. The full plain
+    re-sweep on the close commit is still to run.
 - The harness catalogue is green.
   - R2 ran on `6474e424` with 301 passed and 2 failed. Both failures were a
     scenario that mounted without `--fsync-timeout` since ADR-66; `3238bea6`
     fixed it.
+  - R2's delegate and backup-takeover scenarios passed 24 of 24 on
+    `36db5771`; they run again on the close commit.
   - Plan 45's box gates and both `hardlink-burst` scenarios pass on ext4, xfs,
     btrfs and tmpfs (R3, `bench/hardlink/RESULTS.md`).
   - The xfs create-p99 gate passes at 1.19 over 10 rounds, the thinnest margin.
@@ -1295,7 +1299,8 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       re-measured on four file systems; DESIGN, the feature docs and
       ADR-40 updated; the "Deleted" tables complete.
 
-      *M1.2's part, done (2026-11-22; PROGRESS, "Plan 46 M1.2 exit"):*
+      *M1.2's part (PROGRESS, "Plan 46 M1.2 exit"), done except R1 and R2's
+      re-runs on the close commit:*
       - one stream per node with the records of §5.2;
       - no range, generation-set or xgen code left;
       - no lone delegate;

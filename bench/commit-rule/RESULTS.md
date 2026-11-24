@@ -492,3 +492,85 @@ Flags: topology 1 is unresolved at the 3 % gate for the 30 to 100 us ops (noise 
 (+19 %, control-confirmed) and, less, on btrfs and tmpfs is the one consistent slowdown on the LAN; topology 5's archive
 waits and the root `write` +45 % are the documented ADR-50 cost. No tuning, no gate changed. Raw logs, per-run JSON and the
 analysis scripts: the job directory of the run (not in the repository).
+
+## Since the §8 tables: the segland and vfix matrices (2026-11-24)
+
+The §8 tables above compare `060e6fa6` with `5907c65d`; they are the older base. Two later matrices each compare one change with its own
+parent, not with `5907c65d`, so neither updates the §8 ratios. Both ran `ack-latency` on the quiet timing box, release builds, in an A / P /
+A2 rotation (A the parent, P the change, A2 a second copy of A as the control). The cell is the p50 or p90 ratio of the medians over the runs;
+`*` marks a 95 % interval above 1.03, `-` one below 1.00. PROGRESS, "Plan 46 M1.2 exit", reads them.
+
+**segland** (the segment-build fix, "The segment build costs the batch, not the shipped history" in PROGRESS): A = `e4322f84`, P = the fix
+on it (landed as `d6578c51`), topologies 3 and 4, ext4 and xfs, 4 runs per arm. Topology 3: the forward ops are 0.38 to 0.97 and the
+delegate's chmod, rename and unlink 0.56 to 0.85 at p50, every one resolved faster; delegate create and write are neutral. Topology 4 is the
+regression the user accepted on 2026-11-24 (land the fix, record the cost; no ADR changed):
+
+| p50, topology 4 | P/A ext4 | P/A xfs | A2/A ext4 | A2/A xfs |
+|---|---|---|---|---|
+| delegate chmod | 1.11 | 1.20 | 0.97 | 0.96 |
+| delegate create | 0.99 | 1.04 | 1.01 | 1.10 |
+| delegate rename | 0.92 | 1.08 | 0.89 | 1.05 |
+| delegate unlink | 1.00 | 1.19 | 0.91 | 1.02 |
+| delegate write | 1.00 | 1.01 | 0.99 | 1.00 |
+| forward flock | 0.98 | 0.98 | 1.01 | 1.00 |
+
+| p90, topology 4 | P/A ext4 | P/A xfs | A2/A ext4 | A2/A xfs |
+|---|---|---|---|---|
+| delegate chmod | 1.02 | 1.14 | 0.96 | 0.98 |
+| delegate create | 0.93 | 1.05 | 1.10 | 1.10 |
+| delegate rename | 0.96 | 1.07 | 1.00 | 1.02 |
+| delegate unlink | 1.31 | 1.09 | 0.99 | 0.98 |
+| delegate write | 1.00 | 1.01 | 0.99 | 1.01 |
+| forward flock | 0.96- | 0.98 | 1.02 | 1.02 |
+
+In microseconds at p50, A to P: ext4 delegate chmod 291 to 323, unlink 380 to 379; xfs chmod 293 to 350, unlink 334 to 397. No cell's
+interval clears 1.03 at 4 runs (xfs chmod [1.026, 1.425], unlink [1.004, 1.357]). The four-file-system matrix of the fix against the main
+before it, 6 runs per arm, gave delegate chmod 1.25 to 1.30 and unlink 1.16 to 1.20 (PROGRESS, the segbuild entry).
+
+**vfix** (V: a forward that waits on unshipped rows starts its round at once): A = `d6578c51`, P = V on it (landed, rebased, as `35c96eed`,
+`a7b76f1a`, `a70304d7`), topologies 1 to 4, ext4, xfs, btrfs and tmpfs, 6 runs per arm.
+
+| p50 | P/A ext4 | xfs | btrfs | tmpfs | A2/A ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|---|---|---|---|
+| 1 holder chmod | 1.33 | 1.41 | 1.10 | 1.22 | 1.01 | 1.27 | 1.39 | 1.49 |
+| 1 holder create | 1.01 | 1.02 | 1.07 | 1.07 | 0.91 | 1.07 | 1.04 | 1.08 |
+| 1 holder rename | 1.26 | 1.03 | 0.83 | 1.24 | 1.00 | 0.91 | 0.85 | 1.29 |
+| 1 holder unlink | 1.39* | 1.15 | 0.92 | 1.24 | 1.03 | 1.00 | 0.95 | 1.22 |
+| 1 holder write | 1.00 | 1.01 | 0.99 | 1.00 | 1.01 | 1.01 | 0.99 | 1.06 |
+| 3 forward chmod | 0.57- | 0.90- | 0.90- | 0.68- | 0.92 | 1.05 | 0.97 | 0.82 |
+| 3 forward create | 0.72- | 0.90- | 0.94- | 0.76- | 1.07 | 0.99 | 1.03 | 0.95 |
+| 3 forward flock | 1.01 | 1.01 | 1.01 | 1.00 | 1.02 | 1.02 | 1.01 | 1.00 |
+| 3 forward rename | 0.95- | 0.98 | 1.02 | 0.98 | 0.99 | 1.01 | 1.03 | 1.02 |
+| 3 forward unlink | 0.83- | 0.97 | 0.99 | 0.97- | 0.90 | 1.04 | 0.99 | 1.02 |
+| 3 forward write | 1.00 | 0.99 | 1.00 | 0.98 | 0.99 | 1.01 | 1.00 | 1.01 |
+
+| p90 | P/A ext4 | xfs | btrfs | tmpfs | A2/A ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|---|---|---|---|
+| 1 holder chmod | 1.30 | 1.27 | 1.28 | 1.26 | 1.03 | 1.16 | 1.13 | 1.38* |
+| 1 holder create | 0.96 | 0.97 | 1.06 | 1.18 | 0.85 | 1.06 | 0.99 | 1.13 |
+| 1 holder rename | 1.29 | 0.98 | 0.90 | 1.23 | 1.02 | 0.95 | 0.94 | 1.35 |
+| 1 holder unlink | 1.44* | 1.20 | 0.93 | 1.29 | 1.04 | 1.12 | 0.90 | 1.28 |
+| 1 holder write | 1.01 | 1.02 | 1.00 | 1.04 | 1.01 | 1.00 | 1.00 | 1.01 |
+| 3 forward chmod | 0.80- | 0.54- | 0.53- | 0.55- | 0.97 | 1.00 | 1.00 | 1.00 |
+| 3 forward create | 0.69- | 0.53- | 0.54- | 0.54- | 0.94 | 0.98 | 1.00 | 1.00 |
+| 3 forward flock | 1.01 | 1.00 | 1.02 | 0.95- | 1.02 | 1.02 | 1.03 | 0.95- |
+| 3 forward rename | 0.71- | 0.56- | 0.58- | 0.57- | 1.00 | 0.99 | 1.02 | 1.00 |
+| 3 forward unlink | 0.67- | 0.56- | 0.57- | 0.55- | 0.98 | 1.00 | 0.99 | 1.01 |
+| 3 forward write | 0.94 | 0.98- | 1.00 | 0.56- | 0.96 | 1.00 | 1.00 | 1.01 |
+
+Topology 2 (holder and forward) and topology 4 have no cell above 1.03 by its interval at p50 or p90; topology 3's delegate ops are 0.92 to
+1.08 at p90 and 0.96 to 1.03 at p50, none resolved. The forward `flock` p90 on tmpfs, 1.50 in the nudgediag run of V, is 0.95 here.
+
+The one flagged P cell, topology 1 ext4 holder unlink (p50 56 to 78 us), was judged noise: V's code does not run on topology 1 (a lone holder
+sends no forward, so the zero-wait poll keeps the timer wheel), the A2/A control of the same topology moves as far (holder chmod 1.27 to
+1.49 at p50 on xfs, btrfs and tmpfs), and a re-run of topology 1 on ext4 with 8 runs per arm resolved nothing:
+
+| topology 1, ext4, 8 runs | p50 P/A [CI95] | p90 P/A [CI95] |
+|---|---|---|
+| holder chmod | 0.772 [0.651, 1.158] | 0.786 [0.703, 1.176] |
+| holder create | 0.966 [0.789, 1.106] | 0.961 [0.801, 1.221] |
+| holder rename | 0.966 [0.842, 1.333] | 0.912 [0.802, 1.279] |
+| holder unlink | 0.942 [0.778, 1.180] | 0.949 [0.718, 1.168] |
+| holder write | 0.993 [0.987, 0.999] | 1.000 [0.981, 1.013] |
+
+Not measured since the §8 run: the current main against `5907c65d`, and topologies 5 and 9 after these two changes.

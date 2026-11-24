@@ -72024,9 +72024,12 @@ W14 class K (`flex-tight+commit+identity+settle+durability` 460, `flex-tight-lat
 - **Tests** (`hold_ack`): `a_failed_retag_at_the_holds_release_answers_eio_as_uncommitted`, `..._answers_a_remote_requester_eio_uncommitted` (the `Reply` arm), `a_failed_retag_in_a_hold_is_an_error_and_the_retry_answers` (own path), `an_answer_parked_under_the_archive_is_the_holds_when_the_hold_releases_it` (own and remote), `an_answer_parked_in_an_earlier_epochs_hold_is_re_tagged_to_the_current_one`, `an_answer_the_archive_covers_keeps_its_label_in_a_hold`, `a_refused_park_released_by_the_hold_keeps_its_refusal`, `an_own_answer_in_a_hold_re_tags_only_the_rows_weaker_than_the_holds`, `an_answer_that_waited_for_no_copy_is_not_relabelled_by_a_hold`, `an_answer_parked_as_the_current_hold_is_released_as_it_is`, `a_hold_that_ends_before_the_release_leaves_the_answer_as_it_was_given`.
 - **Nits.** `hold_answer_class` asserts `hold_group()`; the `reclass_journal_tx` doc says which targets keep the row's version; the let-chain is not available (edition 2021).
 
-## Plan 46 M1.2 exit (2026-11-22)
+## Plan 46 M1.2 exit (2026-11-22, brought up to date on `a70304d7`, 2026-11-24)
 
-M1.2 (one stream per node, no lone delegate, C3 verbatim) closes on `main` at `060e6fa6`.
+M1.2 (one stream per node, no lone delegate, C3 verbatim) is code-complete on `main` at `060e6fa6`. The exit is not closed yet. The fixes under
+"Landed since `060e6fa6`" changed the authority code after R1 and R2 ran, so R1 (plain) and R2's delegate scenarios run again on the close commit:
+the first `main` with the orphan-nonroot fix (under "Open"). The places for those results are marked `TODO(R1 close)` and `TODO(R2 close)`. Until
+then this entry states the evidence as of `a70304d7`.
 
 M1.2's code is steps 0 to 16, each with its own entry above. The step 16 strict flip and its review fixes are "M1.2 close: B5 and D1 fixes, strict
 defaults", 2026-11-15.
@@ -72034,9 +72037,9 @@ defaults", 2026-11-15.
 The milestone review (Fable, 2026-11-18) ended "close with conditions".
 
 - Its MUSTs:
-  - M1, a stale exit sweep: closed by R1 below.
-  - M2, the harness catalogue and plan 45's gates: closed by R2 and R3 below.
-  - M3, this write-up: closed by this entry.
+  - M1, a stale exit sweep: R1 below, which runs once more on the close commit.
+  - M2, the harness catalogue and plan 45's gates: R2 and R3 below; R2's delegate scenarios run once more on the close commit.
+  - M3, this write-up: this entry, complete once the two close-commit re-runs are in.
   - M4, the L2b pin: closed by the pin's retirement with its unreachability argument ("M4: the L2b orphan-end pin retired with its argument",
     `e64c4ba1`).
 - Its SHOULDs:
@@ -72052,6 +72055,25 @@ The plan's M1.2 header listed three items as open on 2026-11-16. All three are c
 | Topology 2 forward unlink slower than before M1.2 (tmpfs +23 % p50, ext4 +3 %; the B4 A/B/B/A, ext4 and tmpfs, topologies 2 and 4) | `ns::clear_orphan_xattrs` scanned from the orphan's own record key, which every rewind of b's speculative unlinks rewrites | `da2aec2a` (orphanscan, "M1.2 close" above): the scan ranges over the xattr keys only | topology 2, four file systems, 4 A/B/B/A rounds: forward unlink p50 x0.77 (ext4, xfs, btrfs), x0.92 (tmpfs); no cell above x1.02 (`bench/commit-rule/RESULTS.md`, "Orphan xattr span") |
 | `stress-ng-fs` failing, first seen under load | a product regression from ADR-55's root-own sticky grants, failing idle as well: a grant that left the root's own stream took the only lock record with it (writes discarded with `EIO`), and a driver stall | `99dcae9c`, `ba2f7cdd` and `sync::WakeCoalesce` ("Lost locks and a stalled driver under the root's own sticky grant", 2026-11-16) | `stress-ng-fs` passed 5 of 5 with no lost lock at landing, and 3 of 3 again in R2's named extras |
 | The quiet-box `hardlink-burst-single` and `hardlink-burst-two-node` gates | plan 45's burst went from 0.7 s to 7 s: the ADR-50 backup round trip per link (kept, an integrity wait), the btrfs sticky-grant scan, and the btrfs lapse doubt | hlfix C1 to C4 (2026-11-17/18); the scenario split by the user's decision (`6474e424`, "Hard-link burst split"); `060e6fa6` ("A lapse alone asks for a registry read at once") | R3 below: both scenarios and every plan 45 gate pass on ext4, xfs, btrfs and tmpfs |
+
+### Landed since `060e6fa6`
+
+Each change has its own entry above, with its fail-before evidence, gates and sweeps. All of them are on `a70304d7`.
+
+| change | commits | class | entry |
+|---|---|---|---|
+| WP6.2: a holder's whole release, then a late grow (the delegate kept re-installing the grown subtrees of a generation it ended whole) | `a9ee058d`, `a3c40e1f`, `8fdfe744`, `88019e67`, `36db5771` | integrity (I4/I5, idle seed 1264) | "WP6.2: a holder's whole release, then a late grow" |
+| WP6.3: the leave is a log row (a successor root granted a sticky generation to a leaving node) | `80919bb5`, `b8dc2cbb`, `b7a371ee` | liveness, ADR-61 | "The leave is a log row (WP6.3)" |
+| ovfdeps: an op whose deps overflow is held at its requester, ADR-69 | `d0523837`, `7bdf7ca0`, `de3cecfd`, `49ed70f4`, `cdbdf526`, `8fa0e877`, `44108872`, `6da407f7` | integrity (causal order, `marker_order`) | "An op whose deps overflow is held at its requester (ovfdeps)" |
+| readoptfix: a root ends its own empty stream (Bug B); a re-adoption that loses its CAS reads and writes again (Bug A) | `6f7f9dbb`, `f14814d5`, `8229dac5` | liveness | "Two liveness bugs of the leave and the re-adoption (readoptfix)" |
+| WP6.2b: the durable released-whole mark | `aaa3e821`, `3b3c5ca7`, `12e01f72`, `ba27dbdb`, `29b7c767`, `6d15272c`, `b6301ec4`, `a47c5b23`, `5a6720a2`, `1a331eaf`, `e030da16`, `3b30ccc2`, `1993a45e`, `659bcef9`, `a1134ebb` | integrity (restart after a logged whole release) | "WP6.2b: the durable released-whole mark" |
+| wp63tell: a leaver's note after its own lag carries a new request | `fca9e52f`, `9fda6186` | liveness | "The leave is a log row (WP6.3)" |
+| endsctr: `journal::ack_upto` (`MetaStore::ack_journal`: fsck, tests, a holder draining its journal) clears the marks of the ends it removes and lowers the unacked-ends count in the same transaction; before, the count could stay above 0 and every later ship decoded its rows | `e4322f84` | performance (ship path) | none; WP6.2b's entry has the count |
+| segbuild: the segment build costs the batch, not the shipped history | `c2a9fd1d`, `bff69ae3`, `0aa474c1`, `d6578c51` | performance; topology 4 cost accepted (below) | "The segment build costs the batch, not the shipped history (segbuild)" |
+| readopt2: the re-adoption retry tests and the sim pin of seed 1578 | `d7b122bd` | tests | "Two liveness bugs of the leave and the re-adoption (readoptfix)" |
+| vfix: a forward that waits on unshipped rows starts its round at once | `35c96eed`, `a7b76f1a`, `a70304d7` | performance (scheduling only) | "A forward that waits on unshipped rows starts its round at once (vfix)" |
+
+`36db5771` was the first close-commit candidate: the interim R1 and R2 re-runs below ran on it. Everything after it in the table landed later.
 
 ### Exit evidence
 
@@ -72098,6 +72120,25 @@ Nothing in the plain arm is integrity class.
 - `edb21c0e` (refusal scan);
 - `060e6fa6` (singlefix step 1).
 
+*Interim re-sweep on `36db5771` (2026-11-23), plain, 295 labels with seeds 0..1999, against `0d157e56` as the base:*
+
+- I1, I2, I2c, I4, I5, exactly-once and panics are 0 on every label. The `m03` ceilings are green.
+- 21 labels have a failing seed, as on the base: the base's labels less `locks-writer-hold-delegated-unsettled`, plus the WP6.1 control
+  below. Lock mutual exclusion is 104 seeds (106 on the base), all in negative
+  controls and in `locks-writer-hold-delegated-unsettled-own-clock` (14 to 12).
+- `locks-writer-hold-delegated-unsettled` 1961 passes (WP6.4, `e41e1577`). `sticky-handover-busy` 1071 fails as before (WP6.9).
+- Seeds failing only on `36db5771`:
+  - `far-root-writes-shared-designee-runs` 1043 ("refused (Erofs) but completed"). This label is WP6.1's negative control (the
+    `fence_accepts_unrouted` and `holder_runs_inbox_ever` knobs); it is meant to fail and is not a product failure.
+  - Three negative controls moved by a few seeds: `acks3-runtime-lag-unaware` 1,423 to 1,424, `backup-runtime-lag-unaware` 1,956 to
+    1,988 and `locks-core-stall-backup-long-unfresh` 32 to 33.
+
+Every change in "Landed since `060e6fa6`" after `36db5771` ran its own sweeps on the labels it touches; none was a full re-sweep.
+
+`TODO(R1 close)`: the plain arm, every label at 2,000 seeds, on the close commit (after the orphan-nonroot fix), against the `36db5771`
+re-sweep: the commit, the label count, the invariant totals, the failing labels by class, and each seed that fails only on the close commit with
+its verdict.
+
 **R2: the harness catalogue, seed 42.**
 
 The run used `6474e424`, in six shards, plus a root run for the scenarios that need `CAP_SYS_ADMIN`.
@@ -72117,7 +72158,23 @@ The run used `6474e424`, in six shards, plus a root run for the scenarios that n
   - `delegate-partition`, idle and under load;
   - `epoch-holder-retired`;
   - `kernel-race-dir-version`, `-rename-ctime` and `-dir-version-remote` (3 runs each).
-- `e41e1577` (lockfix) landed after R2. It touches the delegate's release cut only, and R2's delegate scenarios were not re-run on it.
+- `e41e1577` (lockfix) landed after R2. It touches the delegate's release cut only.
+
+*Interim re-run on `36db5771` (2026-11-23), which carries `e41e1577` and `3238bea6`:* the delegate and backup-takeover scenarios, seed 42, passed
+24 of 24:
+
+- `backup-takeover-holds-missing-chunks` and `backup-takeover-drops-held-chunks` (the two former hangs);
+- `cto-delegation-recall`, `cto-strict-delegated-read`, `backup-failover-with-delegation`, `delegated-subtrees`, `p2p-off-no-delegation`,
+  `designation-as-delegation`;
+- `delegate-crash`, `-crash-default-ttl`, `-crash-backup`, `-root-loss`, `-root-blackhole`, `-root-loss-ttl`, `-handoff-renewal`,
+  `-store-stall`, `-backup-handoff-failover`, `-paused-across-ttl`;
+- `delegated-op-latency`, `lock-contention-delegated`, `lock-contention-delegated-moves`, `root-failover-with-delegates`;
+- `delegate-partition`, idle and under CPU hogs.
+
+The full catalogue has not run since `6474e424`.
+
+`TODO(R2 close)`: the same delegate and backup-takeover scenarios on the close commit (after the orphan-nonroot fix): the commit, the count
+passed, and each failure with its cause.
 
 **R3: plan 45's box gates and both `hardlink-burst` scenarios, quiet box, four file systems.**
 
@@ -72141,30 +72198,77 @@ The first R3, on `6474e424`, failed two gates:
 The btrfs cause was bisected to `e7c863ec`. A single node doubted that it was a singleton after a long core step, so its root ops waited for the
 archive until the next registry poll. `060e6fa6` fixes it without moving a rule or a margin. The xfs 1.29 did not repeat.
 
+R3 has not been re-run since `060e6fa6`.
+
 Not gates, recorded:
 
 - btrfs's absolute create p99 during a burst is about 2.1 ms. Plan 45 measured 0.4 ms.
 - The share of 0.5 to 2.6 ms creates on btrfs is 3 to 14 % per cell.
 - xfs creates are about 10 to 15 % slower than at plan 45.
 
-**Performance (§8).** The A/B/B/A of `ack-latency` topologies 1 to 5 against the commit before step 1 ran on 2026-11-14, on four file systems. It
-found two regressions:
+**Performance (§8).** Five measurements, each against its own base. All ran `ack-latency` on the quiet timing box, release builds, on the file
+systems named. Ratios are p50 of the new build over its base; `*` marks a cell whose 95 % interval is above 1.03.
 
-- The topology 5 root ops waited one sync interval for the archive. The archive-wait nudge fixed this ("Archive waits nudge a ship", 2026-11-15):
-  202 ms to 1.4 ms at p50.
-- The topology 2 forward unlink regression is the orphanscan row of the first table.
+1. *2026-11-14, A = the commit before step 1, B = the main of that day, topologies 1 to 5, four file systems.* It found two regressions:
+   - The topology 5 root ops waited one sync interval for the archive. The archive-wait nudge fixed this ("Archive waits nudge a ship",
+     2026-11-15): 202 ms to 1.4 ms at p50.
+   - The topology 2 forward unlink regression is the orphanscan row of the first table.
 
-The other LAN cells moved 4 to 15 % at p50 on small ops, with 3 or 4 runs per variant. The B4 re-run judged them noise on ext4 and tmpfs,
-topologies 2 and 4. Topology 3, and xfs and btrfs on topologies 2 to 4, were not re-run after the first comparison. Topology 1's ±3 % is not
-resolvable on 30 to 100 us ops with this harness (the same caveat as the earlier milestones).
+   The other LAN cells moved 4 to 15 % at p50 on small ops, with 3 or 4 runs per variant. The B4 re-run judged them noise on ext4 and tmpfs,
+   topologies 2 and 4.
+2. *2026-11-23, A = `5907c65d` (the parent of step 1), B = `060e6fa6`, topologies 1 to 5 and 9, four file systems, 6 + 6 LAN runs and 4 + 4 WAN
+   runs per file system* (`bench/commit-rule/RESULTS.md`, "Plan 46 §8, after M1.2"). This is the older base for the three matrices below.
+   - B is 5 to 65 % faster than A on the LAN topologies 2 to 4 at p50.
+   - Topology 5's root ops at about 1.4 ms are ADR-50's documented archive wait.
+   - Flags: topology 1 is unresolved at ±3 % for the 30 to 100 us ops (A/A' alone moves 0.68 to 1.53); ext4 unlink pooled 1.37, interval
+     [1.03, 1.59]. Topology 3's forward rename (writer on b) is slower on xfs (1.19, control-confirmed), btrfs 1.06, tmpfs 1.07, ext4 1.04.
+     Topology 2 holder unlink p90 on tmpfs is 1.11.
+3. *2026-11-23, fwdren: the topology 3 forward rename flag, diagnosed (A = `5907c65d`, B = `36db5771` and `060e6fa6`, xfs, bisect).*
+   - The xfs step bisects to `09c1c4f2` (ADR-63, the direct stream unsigned). It adds no work: its faster round trip phase-locks back-to-back
+     ops to the root's ship cadence, so a run sits at about 2.7 ms or at about 1.1 to 1.35 ms for its whole length.
+   - The wait under it predates M1.2. A forward from the root carries the root's journal tip in `deps.pending`, so the delegate parks the op
+     until the root's next ship round, and that round started about 1.1 ms (p50) after the nudge, through the timer wheel.
+   - The cure is vfix (below). Delivering every zero-wait poll at once (nudgefix) slowed topology 3 delegate ops by 10 to 22 % and topology 2
+     forwards by 7 to 10 %, so it did not land. Fix B (under "Open") is the larger, queued change.
+   - Topology 1, 24 runs a side: none of ext4 unlink (1.085, [0.97, 1.37]), ext4 rename (1.085), xfs rename (1.14) or xfs unlink (1.12) is
+     resolved above 1.03. xfs chmod (1.24, [1.027, 1.50]) is a difference in how often runs land in a slow mode, not a shift; not resolved
+     either.
+4. *2026-11-24, segland: A = `e4322f84`, P = the segbuild fix on it, A2 = a copy of A; topologies 3 and 4, ext4 and xfs, 4 runs per arm*
+   (`bench/commit-rule/RESULTS.md`, "Since the §8 tables").
+   - Topology 3 forward ops 0.38 to 0.97, delegate chmod and unlink 0.56 to 0.71.
+   - **Topology 4, accepted by the user (2026-11-24):** delegate chmod 1.11 (ext4) and 1.20 (xfs), delegate unlink 1.00 and 1.19; the other
+     topology 4 cells are neutral. The segbuild entry's four-file-system matrix, against the main before it, has chmod 1.25 to 1.30 and
+     unlink 1.16 to 1.20. The user's decision: land segbuild and record the regression. Main's topology 4 numbers were partly an artefact of
+     the slow build, which batched the delegate's rows into fewer segments. Option B (the root answers a backed delegate's batch at segment
+     landing) was not adopted, because it weakens ADR-41 and ADR-30; no ADR changed. The six cures tried are in the segbuild entry.
+5. *2026-11-24, vfix: A = `d6578c51`, P = V on it, A2 = a copy of A; topologies 1 to 4, four file systems, 6 rounds*
+   (`bench/commit-rule/RESULTS.md`, "Since the §8 tables").
+   - Topology 3 forward chmod 0.57 to 0.90 and create 0.72 to 0.94 at p50, resolved faster on every file system; forward rename, unlink and
+     create p90 0.53 to 0.71; forward `flock` p90 0.95 to 1.02 (nudgediag's tmpfs 1.50 is gone).
+   - Topologies 2 and 4 have no cell resolved above 1.03.
+   - Topology 1 has one flagged cell: ext4 holder unlink, p50 1.39* (56 to 78 us) and p90 1.44*. It was judged noise:
+     - V's code does not run on topology 1. A lone holder sends no forward, so `ship_for_forward` is never set and every poll keeps the
+       timer wheel.
+     - The A2/A control of the topology 1 holder cells swings as far: chmod 1.27 (xfs), 1.39 (btrfs), 1.49 (tmpfs) at p50.
+     - An 8-round re-run of topology 1 on ext4 gave holder unlink p50 0.94 [0.78, 1.18] and p90 0.95 [0.72, 1.17], with no flagged cell.
+
+Not measured: no A/B/B/A of the current main against the §8 base `5907c65d` since `060e6fa6`, so the net of the accepted topology 4 cost
+against that base, and topology 5 and 9 after segbuild and vfix, are not on record. Topology 1's ±3 % is not resolvable on 30 to 100 us ops
+with this harness (the same caveat as the earlier milestones).
 
 ### Exit checklist (plan 46 §6, M1.2 row)
 
-- [x] Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds (R1, plain, `0d157e56`).
-- [x] The harness catalogue green (R2 on `6474e424`, its two failures fixed by `3238bea6`).
+- [ ] Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds: met, plain, on `0d157e56` (R1) and `36db5771` (interim);
+  `TODO(R1 close)` on the close commit.
+- [ ] The harness catalogue green: R2 on `6474e424`, its two failures fixed by `3238bea6`; the delegate scenarios 24 of 24 on `36db5771`;
+  `TODO(R2 close)` on the close commit.
 - [x] Plan 45's box gates and both `hardlink-burst` scenarios on ext4, xfs, btrfs and tmpfs (R3, `060e6fa6`).
 - [x] The "Deleted" table complete (below).
 - [x] The milestone reviewed (Fable, 2026-11-18), with its conditions closed.
+- [x] §8's A/B/B/A after M1.2 run and recorded (measurements 2 to 5 above), with topology 4's delegate chmod and unlink cost accepted by the
+  user (2026-11-24).
+- [ ] Topology 1 within ±3 %: resolved and neutral for `write`; unresolved, neither met nor broken, for the 30 to 100 us ops.
+- [ ] The Fable check of this exit write-up, after the two close-commit re-runs.
 
 ### Deleted
 
@@ -72211,5 +72315,17 @@ These serve the root's own rows and the replay queue.
 - The absolute create-latency signal that plan 45's ratio gate does not see (btrfs about 2.1 ms against 0.4 ms). The unexplained xfs shift of
   about 10 to 15 %.
 - F2: `Meta::outcome_row`'s unbounded reverse seek over retired heads while a release is held (CPU only).
-- R2's delegate scenarios have not been re-run on `e41e1577`.
-- The idle and slow-lease-read arms of the same sweep found WP6.1 (landed, `00a269fd`) and WP6.2 to WP6.8. They are M1.3 exit items.
+- The idle and slow-lease-read arms of the same sweep found WP6.1 (landed, `00a269fd`) and WP6.2 to WP6.8. They are M1.3 exit items. Since
+  landed: WP6.2 (`36db5771`), WP6.3 (`b7a371ee`, with `9fda6186`) and WP6.2b (`a1134ebb`); WP6.5 to WP6.8 are open.
+- The orphan-nonroot fix, in progress; the close commit waits for it. Another node's empty logged stream is skipped by `delegation_sync`
+  ("step 10 gives it an end"), but step 10 lives only in the appending root's memory, so after a deposition or a restart nobody ends it, and
+  the holder's own (non-root) leave waits on it for ever, while an operator's leave of the holder completes with the stream still listed.
+  Liveness only, no integrity impact; two core tests fail on main, and sim seed 2734 of `delegated-root-deposed-delegate-dies` shows a stream left without an end from 20.6 s to 64 s (the run passes only because nobody leaves).
+  The reviewed spec: a usable root takes on such a stream through the inherit path, with its cursor at `log_stream_idx`, and ends it.
+- Fix B (queued after vfix, a reviewed design): when the root forwards into delegate stream g, `deps.pending` walks back from the journal tip
+  past the root's appended rows of g that `deps.streams[g]` already covers, and no others (self-checking; never below the session's own). Its first step measures what is left on top of vfix; it is implemented only
+  if a gain remains. Not an exit blocker.
+- `holder_appends(gen)` (from 0) and `deleg_gens_awaiting_end_tx` walk a generation's `journal_origin` tombstones, as the segment build did
+  before segbuild (the topology 3 `DelegateStream` step grows from 54 to 90 us). Queued, performance only.
+- The re-pin check: vfix moved seven pinned sim seeds off their paths and re-pinned them by reach (`a70304d7`); 38574 and 2994 were dropped
+  without a replacement. Whether each re-pinned seed still fails on its original fix's parent, where that can be built, is not checked yet.
