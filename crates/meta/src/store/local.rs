@@ -1292,6 +1292,8 @@ impl Meta {
     /// Phase 2b: the highest index of `gen` in the log as this replica
     /// holds it (see [`deleg_log_idx_key`]).
     pub fn log_stream_idx(&self, gen: u64) -> Result<u64, MetaError> {
+        #[cfg(any(test, feature = "test-util"))]
+        super::backup::injected_log_stream_idx_fault(gen)?;
         let r = self.db.read_tx();
         Ok(kv_get_tx(&r, &self.local, &deleg_log_idx_key(gen))?
             .and_then(|v| v.parse::<u64>().ok())

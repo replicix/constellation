@@ -1865,7 +1865,7 @@ pub struct Report {
     /// journal, claim ends that waited for the stream's rows, and ends that
     /// went ahead of rows still held when `drop_held_await` ran out (a lost
     /// chunk's row: counted, not a violation).
-    pub claim_core: [u64; 4],
+    pub claim_core: [u64; 7],
     /// ADR-55 coverage: the root's own grants made, answers in its own
     /// stream, holds by its root path, the longest commit wait of a grant
     /// (ms), self-delivered messages, candidates the walk skipped for the
@@ -8663,6 +8663,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.claim_core[2] += s.claim_end_waits;
         claim_halted += s.claim_own_rows_halted_non_stealable;
         report.claim_core[3] += s.claim_end_rows_outrun;
+        report.claim_core[4] += s.deleg_inherited_released;
+        report.claim_core[5] += s.deleg_released_refused;
         claim_drop_cancelled += s.claim_end_drop_cancelled;
         for (t, v) in report.handover_core.iter_mut().zip([
             s.deleg_handovers_requested,
@@ -8750,6 +8752,40 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 }
             }
         }
+    }
+    // A stream the log lists with no subtree left (its holder released them
+    // all) is ended by the root that holds the lease, once it is usable: the
+    // one that appended the release row may be gone, and the gate that
+    // appended it ends nothing (`orphan_empty_stream`). Judged at the end of
+    // the run, from the usable root's own table (which is the log's fold plus
+    // its journal): a retired node's listed stream is one too. A run that
+    // ends with no usable root (a gate still open, the lease lost) judges
+    // nothing: the open ends the stream, and no time constant is involved.
+    {
+        let mut orphans = Vec::new();
+        for id in cluster.ids() {
+            let n = cluster.get(id);
+            if !n.alive() {
+                continue;
+            }
+            let v = n.view();
+            if v.held_epoch.is_none() || v.lost || v.gate_pending || v.release_cas_out {
+                continue;
+            }
+            for st in n.meta.delegation_table().streams() {
+                if st.subtrees.is_empty() {
+                    orphans.push(format!(
+                        "orphan_empty_stream: node {id} ends the run as a usable root with the \
+                         log listing node {}'s stream {} with no subtree left (retired: {})",
+                        st.node,
+                        constellation_meta::delegation::GenLabel::of(st.gen),
+                        retired_nodes.contains(&st.node)
+                    ));
+                }
+            }
+        }
+        report.claim_core[6] = orphans.len() as u64;
+        cluster.leave_violations.lock().unwrap().extend(orphans);
     }
     found
         .sticky

@@ -1007,6 +1007,33 @@ pub(crate) fn injected_journal_fault() -> Result<(), MetaError> {
     })
 }
 
+/// Tests only (`test-util`): fail this thread's next `n` reads of
+/// [`Meta::log_stream_idx`] of generation `gen` with an I/O error.
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_log_stream_idx_reads_on_this_thread_for_tests(gen: u64, n: u32) {
+    LOG_IDX_FAULTS.with(|c| c.set((gen, n)));
+}
+
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    static LOG_IDX_FAULTS: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn injected_log_stream_idx_fault(gen: u64) -> Result<(), MetaError> {
+    LOG_IDX_FAULTS.with(|c| {
+        let (g, n) = c.get();
+        if g == gen && n > 0 {
+            c.set((g, n - 1));
+            Err(MetaError::Io(std::io::Error::other(
+                "injected log index read fault (testing only)",
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
 /// The test hook's check, for the store's other reads it covers.
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) fn injected_read_fault() -> Result<(), MetaError> {

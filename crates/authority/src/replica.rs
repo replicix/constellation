@@ -545,6 +545,10 @@ pub trait Replica {
     /// log* (appended by a root here, applied from a segment), never a
     /// shadow's: a successor's cursor, a delegate's re-stream start.
     fn log_stream_idx(&self, gen: u64) -> u64;
+    /// [`Self::log_stream_idx`] that reports a failed read instead of
+    /// answering 0: a cut that ends a stream for good (the root's end of
+    /// another node's released stream) must never be taken from an error.
+    fn try_log_stream_idx(&self, gen: u64) -> Result<u64, MetaError>;
     /// ADR-59 part B (drop contiguity): `idx` raised over the consecutive
     /// positions of `gen` right above it that a `DropHeld` of the log fills.
     fn stream_fills_past(&self, gen: u64, idx: u64) -> u64;
@@ -1900,6 +1904,10 @@ impl Replica for Meta {
 
     fn log_stream_idx(&self, gen: u64) -> u64 {
         Meta::log_stream_idx(self, gen).unwrap_or(0)
+    }
+
+    fn try_log_stream_idx(&self, gen: u64) -> Result<u64, MetaError> {
+        Meta::log_stream_idx(self, gen)
     }
 
     fn delegate_idx(&self, gen: u64) -> u64 {

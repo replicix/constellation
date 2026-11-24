@@ -87961,6 +87961,199 @@ mod step5_sticky_release {
         create_in(&mut r, dirs[0], 1);
         assert_eq!(r.core.dl.mine[&7].executed, 1);
     }
+
+    /// The holder's whole release is acknowledged and its state dropped, root
+    /// 1 then loses the lease (node 2 is the root), and node 3 leaves with the
+    /// note acknowledged by node 2. `end` is the root's `DelegateNodeEnded`
+    /// that reaches node 3's table as a segment after `end_at` loops of the
+    /// leave; none: nobody writes it. Returns the leave's answer, if given.
+    fn holder_leave_after_release(
+        h: &mut Harness,
+        end: Option<(usize, LogRecord)>,
+    ) -> Option<Result<String, String>> {
+        h.core.lease.cached_holder = Some(2);
+        let mut out = h.step(Event::Control {
+            op: OpId(77),
+            req: Control::ReleaseGrants,
+        });
+        for i in 0..400 {
+            if let Some(r) = answer(&out, 77) {
+                return Some(r);
+            }
+            let notes: Vec<(NodeId, OpId)> = sends(&out)
+                .into_iter()
+                .filter_map(|(n, m)| match m {
+                    PeerMsg::DelegateStream {
+                        req,
+                        gen: 0,
+                        released: Some(_),
+                        ..
+                    } => Some((n, *req)),
+                    _ => None,
+                })
+                .collect();
+            let mut next = Vec::new();
+            for (n, req) in notes {
+                next.extend(h.step(Event::Peer {
+                    from: n,
+                    msg: PeerMsg::DelegateStreamAck {
+                        req,
+                        gen: 0,
+                        round: 0,
+                        through: 0,
+                        committed: 0,
+                        refused: false,
+                        archive_bound: false,
+                    },
+                }));
+            }
+            if let Some((at, rec)) = &end {
+                if i == *at {
+                    Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], std::slice::from_ref(rec))
+                        .unwrap();
+                    let mut o = Vec::new();
+                    h.core.delegation_sync(h.clk(), &h.meta, &mut o);
+                    next.extend(o);
+                }
+            }
+            h.advance(600);
+            if let Some(id) = h.core.dl.leave_timer {
+                next.extend(h.step(Event::Timer { id }));
+            }
+            out = next;
+        }
+        None
+    }
+
+    /// The successor root (node 2, usable) over a log that carries stream 7
+    /// of node 3 with `grown` more subtrees, then the holder's release row
+    /// at index `row`: the `DelegateNodeEnded` it journals.
+    fn successor_end(row: u64, grown: bool) -> LogRecord {
+        let mut r = Harness::new(2);
+        r.core.cfg.delegation = true;
+        r.core.cfg.p2p = true;
+        let (d, rec) = mkdir(&r, "a");
+        let mut records = vec![rec, LogRecord::delegate_one(3, 7, d, SubtreeKind::Sticky)];
+        if grown {
+            let (g, rec) = mkdir(&r, "b");
+            records.push(rec);
+            records.push(LogRecord::delegate_one(3, 7, g, SubtreeKind::Sticky));
+        }
+        // (The release row of the whole stream, the last of the holder's.)
+        records.push(LogRecord::StreamReleased {
+            node: 3,
+            gen: 7,
+            through: row - 1,
+        });
+        Replica::apply_segment(&r.meta, 1, 1, 0, &[], &[(7, row)], &records).unwrap();
+        r.hold(2, None);
+        r.core.roster.mark_seen_for_test(true);
+        let mut out = Vec::new();
+        r.core.delegation_sync(r.clk(), &r.meta, &mut out);
+        let ended = Replica::journal_txs_from(&r.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .find(|rec| matches!(rec, LogRecord::DelegateNodeEnded { gen: 7, .. }))
+            .expect("the successor ended no stream");
+        assert!(
+            matches!(&ended, LogRecord::DelegateNodeEnded { node: 3, through, .. } if *through == row),
+            "{ended:?}"
+        );
+        ended
+    }
+
+    /// A non-root holder whose whole release the root acknowledged waits for
+    /// the end of its stream (the table lists it, and the leave is not
+    /// answered while nobody ends it); the successor root (node 2, usable)
+    /// ends the stream at the log's index from the release row the log
+    /// carries, and that end reaches the holder: the leave completes. Fails
+    /// on the parent: the successor journals no end, and the holder's leave
+    /// waits to its deadline (`orphan-nonroot`).
+    #[test]
+    fn a_non_root_holders_leave_completes_after_the_successor_ends_its_stream() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let row = whole_release_acked_and_dropped(&mut h);
+        assert!(h
+            .meta
+            .delegation_table()
+            .streams()
+            .any(|s| s.gen == 7 && s.node == 3));
+        let ended = successor_end(row, false);
+        // The end reaches the holder after ten loops of the leave: not
+        // answered before.
+        let result = holder_leave_after_release(&mut h, Some((10, ended)));
+        assert!(matches!(result, Some(Ok(_))), "{result:?}");
+        assert!(!h.meta.delegation_table().streams().any(|s| s.gen == 7));
+        assert!(h.core.dl.mine.is_empty());
+    }
+
+    /// The holder journaled its whole release and the root's acknowledgement
+    /// has not come (the row may still be in its journal); the successor root
+    /// ends the stream at the log's index, and that end drops the holder's
+    /// state. Fails on the parent: the successor writes no end.
+    #[test]
+    fn an_unacknowledged_release_is_dropped_when_the_successors_end_applies() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let out = release(&mut h, 50, Vec::new(), false);
+        assert!(last_is_release(&h), "{out:?}");
+        let row = Replica::delegate_idx(&h.meta, 7);
+        let ended = successor_end(row, false);
+        Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], &[ended]).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the state outlived the end"
+        );
+        assert!(!h.meta.delegation_table().streams().any(|s| s.gen == 7));
+    }
+
+    /// The shape of WP6.2b: a late grow (a grow before the release in log
+    /// order, seen by the holder after) is listed at the holder; the
+    /// successor root's end of the stream, written from its log, reaches it as
+    /// a segment. The holder installs nothing before or after, and a later
+    /// grant installs. Fails on the parent: the successor writes no end.
+    #[test]
+    fn a_late_grow_listed_at_the_holder_is_ended_by_the_successors_end() {
+        let (mut h, _dirs) = sticky_holder(&["a"]);
+        let row = whole_release_acked_and_dropped(&mut h);
+        let _b = late_grow(&mut h, "b", 3);
+        assert!(!h.core.dl.mine.contains_key(&7), "taken up");
+        let ended = successor_end(row, true);
+        Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], &[ended]).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.dl.mine.contains_key(&7), "installed after the end");
+        assert!(!h.meta.delegation_table().streams().any(|s| s.gen == 7));
+        // A new generation of the node installs as usual.
+        let (c, rec) = mkdir(&h, "c");
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                rec,
+                LogRecord::DelegateNode {
+                    node: 3,
+                    gen: 8,
+                    dirs: vec![constellation_meta::SubtreeGrant {
+                        dir: c,
+                        kind: SubtreeKind::Sticky,
+                    }],
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        assert!(
+            h.core.dl.mine.contains_key(&8),
+            "the new grant was not installed"
+        );
+    }
 }
 
 /// Plan 46 M1.2 step 14 (L2b, seeds 13907 and 15996): a delegate's rowless
@@ -99404,5 +99597,553 @@ mod deps_overflow {
         assert!(queued_rids(&h).is_empty(), "replayed");
         assert_eq!(journaled_outcomes(&h, rx), vec![false]);
         assert_eq!(h.core.stats.deps_overflow_holds, 0);
+    }
+}
+
+/// The usable root ends the stream of another node that the log lists with no
+/// subtree (its holder released them all): `orphan-nonroot`, sim
+/// `delegated-root-deposed-delegate-dies` seed 2734.
+mod released_stream_end {
+    use super::*;
+    use crate::replica::Replica;
+    use constellation_meta::SubtreeKind;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Rel {
+        /// `StreamReleased`: the holder released every subtree in one row.
+        Whole,
+        /// `SubtreeReleased` of the last subtree.
+        Last,
+    }
+
+    fn mkdir(h: &Harness, name: &str) -> (constellation_fs_core::Ino, LogRecord) {
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        (
+            ino,
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+        )
+    }
+
+    /// A root (node `me`) with delegation on, not yet holding the lease.
+    fn bare_root(me: NodeId) -> Harness {
+        let mut h = Harness::new(me);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h
+    }
+
+    fn usable_root() -> Harness {
+        let mut h = bare_root(1);
+        h.hold(2, None);
+        h.core.roster.mark_seen_for_test(true);
+        h
+    }
+
+    /// The log lists node 3's stream 7 (one subtree of `kind`), then the
+    /// holder's release row at the stream's index `ROW`.
+    const ROW: u64 = 2;
+
+    fn log_released(h: &Harness, kind: SubtreeKind, rel: Rel, origin: bool) {
+        let (d, rec) = mkdir(h, "a");
+        let release = match rel {
+            Rel::Whole => LogRecord::StreamReleased {
+                node: 3,
+                gen: 7,
+                through: ROW - 1,
+            },
+            Rel::Last => LogRecord::SubtreeReleased {
+                node: 3,
+                gen: 7,
+                dir: d,
+                at: 0,
+            },
+        };
+        let records = vec![rec, LogRecord::delegate_one(3, 7, d, kind), release];
+        let origins: &[(u64, u64)] = if origin { &[(7, ROW)] } else { &[] };
+        Replica::apply_segment(&h.meta, 1, 1, 0, &[], origins, &records).unwrap();
+        let table = h.meta.delegation_table();
+        let st = table.streams().find(|s| s.gen == 7).expect("stream");
+        assert!(st.subtrees.is_empty() && st.node == 3, "{st:?}");
+    }
+
+    fn sync(h: &mut Harness) -> Vec<Action> {
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        out
+    }
+
+    /// The `DelegateNodeEnded` records this node journaled: `(node, gen,
+    /// through)`.
+    fn ends(h: &Harness) -> Vec<(u64, u64, u64)> {
+        Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .filter_map(|r| match r {
+                LogRecord::DelegateNodeEnded { node, gen, through } => Some((node, gen, through)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn listed(h: &Harness) -> bool {
+        h.meta.delegation_table().streams().any(|s| s.gen == 7)
+    }
+
+    fn sent_to_holder_or_seal(out: &[Action]) -> bool {
+        sends(out).into_iter().any(|(_, m)| {
+            matches!(
+                m,
+                PeerMsg::DelegateStreamResume { .. } | PeerMsg::DelegSeal { .. }
+            )
+        })
+    }
+
+    /// Port of the diagnosis test: a usable root whose log lists another
+    /// node's stream with every subtree released and no end ends it, however
+    /// long it runs (the root that appended the row was deposed before its
+    /// end shipped). Fails on the parent: `gens` stays empty and the table
+    /// lists the stream for 30 s of ticks.
+    #[test]
+    fn a_root_ends_another_nodes_stream_released_in_the_log() {
+        for kind in [SubtreeKind::Sticky, SubtreeKind::Placed] {
+            let mut h = usable_root();
+            log_released(&h, kind, Rel::Last, true);
+            sync(&mut h);
+            for _ in 0..30 {
+                h.advance(1_000);
+                let end = h.now.plus(10_000);
+                h.set_lease_end(end);
+                poke(&mut h);
+                sync(&mut h);
+            }
+            assert_eq!(ends(&h), vec![(3, 7, ROW)], "kind {kind:?}");
+            assert!(!listed(&h), "kind {kind:?}: the stream is still listed");
+        }
+    }
+
+    /// T1: one sync takes the stream on as a drained recall at the log's
+    /// index and ends it, for every kind and both forms of the release; no
+    /// resume and no previous-root seal is sent, and the root's own table no
+    /// longer lists the stream. Fails on the parent: no end.
+    #[test]
+    fn a_usable_root_ends_another_nodes_stream_the_log_released_whole() {
+        for kind in [
+            SubtreeKind::Sticky,
+            SubtreeKind::Placed,
+            SubtreeKind::Designated,
+        ] {
+            for rel in [Rel::Whole, Rel::Last] {
+                let mut h = usable_root();
+                log_released(&h, kind, rel, true);
+                let out = sync(&mut h);
+                let at = format!("{kind:?} {rel:?}");
+                assert_eq!(ends(&h), vec![(3, 7, ROW)], "{at}: {out:?}");
+                assert!(h.core.dl.gens[&7].ended, "{at}");
+                assert_eq!(h.core.stats.deleg_inherited_released, 1, "{at}");
+                assert_eq!(h.core.stats.deleg_inherited, 1, "{at}");
+                assert_eq!(h.core.stats.deleg_released_refused, 0, "{at}");
+                assert!(!sent_to_holder_or_seal(&out), "{at}: {out:?}");
+                assert_eq!(h.core.stats.deleg_prev_root_seals, 0, "{at}");
+                assert!(!listed(&h), "{at}");
+                // No second end on later syncs.
+                sync(&mut h);
+                poke(&mut h);
+                sync(&mut h);
+                assert_eq!(ends(&h).len(), 1, "{at}");
+            }
+        }
+    }
+
+    /// T1b: a previous holder of the lease that cannot be reached owes no
+    /// seal: the log holds the stream's last row, so the end is journaled in
+    /// the same sync and nothing is sent to it. Fails on the parent: no end.
+    #[test]
+    fn a_released_stream_is_ended_without_sealing_the_previous_root() {
+        let mut h = usable_root();
+        h.core.lease.prev_holder = Some(5);
+        log_released(&h, SubtreeKind::Placed, Rel::Whole, true);
+        let out = sync(&mut h);
+        assert_eq!(ends(&h), vec![(3, 7, ROW)], "{out:?}");
+        assert!(
+            sends(&out).iter().all(|(to, _)| *to != 5),
+            "a message to the previous root: {out:?}"
+        );
+        assert_eq!(h.core.stats.deleg_prev_root_seals, 0);
+        assert!(h.core.dl.gens[&7].prev_roots.is_empty());
+    }
+
+    /// SHOULD 5: a previous-root debt an earlier tenure persisted for the
+    /// stream is cleared by the end (the log holds the stream's last row).
+    #[test]
+    fn a_released_streams_persisted_previous_root_debt_is_cleared() {
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Placed, Rel::Whole, true);
+        assert!(Replica::set_deleg_prev_roots(&h.meta, 7, &[5]));
+        sync(&mut h);
+        assert_eq!(ends(&h).len(), 1);
+        assert_eq!(Replica::deleg_prev_roots(&h.meta, 7), Some(Vec::new()));
+    }
+
+    /// T2: a takeover gate takes nothing on and ends nothing (ADR-42), shippable
+    /// or not; the open's usable sync ends the stream. Fails on the parent
+    /// after the open: no end.
+    #[test]
+    fn a_gate_does_not_end_another_nodes_released_stream() {
+        for shippable in [true, false] {
+            let mut h = bare_root(1);
+            h.hold(
+                2,
+                Some(PendingGate {
+                    epoch: 2,
+                    takeover: true,
+                    marker_shipped: true,
+                    drained: false,
+                    fast_prev: false,
+                    backup_tail_epoch: None,
+                    shippable,
+                }),
+            );
+            h.core.roster.mark_seen_for_test(true);
+            log_released(&h, SubtreeKind::Placed, Rel::Whole, true);
+            sync(&mut h);
+            poke(&mut h);
+            assert!(h.core.dl.gens.is_empty(), "shippable {shippable}");
+            assert_eq!(h.core.stats.deleg_inherited, 0, "shippable {shippable}");
+            assert!(ends(&h).is_empty(), "shippable {shippable}");
+            // The open.
+            h.hold(2, None);
+            sync(&mut h);
+            assert_eq!(ends(&h), vec![(3, 7, ROW)], "shippable {shippable}");
+        }
+    }
+
+    /// T2b, the seed-2734 shape: the gate appended the holder's release row
+    /// to its own journal (the log's index counts it) and ended nothing; the
+    /// process restarts and loses `dl.gens`; once usable again it ends the
+    /// stream at that index. Fails on the parent: no end after the open.
+    #[test]
+    fn a_restarted_gate_root_ends_a_release_it_appended_before_the_restart() {
+        let mut h = bare_root(1);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: false,
+                backup_tail_epoch: None,
+                shippable: true,
+            }),
+        );
+        h.core.roster.mark_seen_for_test(true);
+        let (d, rec) = mkdir(&h, "a");
+        Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[rec, LogRecord::delegate_one(3, 7, d, SubtreeKind::Placed)],
+        )
+        .unwrap();
+        sync(&mut h);
+        assert!(
+            h.core.dl.gens.contains_key(&7),
+            "the gate took no stream on"
+        );
+        // The gate's append of the holder's release row (`on_delegate_stream`).
+        Replica::apply_delegate_tx(
+            &h.meta,
+            &[LogRecord::StreamReleased {
+                node: 3,
+                gen: 7,
+                through: ROW - 1,
+            }],
+            None,
+            7,
+            ROW,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(ends(&h).is_empty());
+        // A new process over the same disk.
+        let mut r = Harness {
+            core: Core::new(h.core.cfg.clone()),
+            meta: h.meta,
+            now: h.now.plus(500),
+            honour_off: 0,
+            wait_off: 0,
+            manual_horizon: false,
+            manual_release_record: false,
+            cold_horizon: false,
+        };
+        let mut out = Vec::new();
+        r.core.start(r.clk(), &r.meta, &mut out);
+        r.hold(3, None);
+        r.core.roster.mark_seen_for_test(true);
+        sync(&mut r);
+        assert_eq!(ends(&r), vec![(3, 7, ROW)]);
+        assert!(!listed(&r));
+    }
+
+    /// T5: a root restarted after it journaled the end ends nothing again.
+    #[test]
+    fn a_root_restarted_after_journaling_the_end_does_not_end_again() {
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+        sync(&mut h);
+        assert_eq!(ends(&h).len(), 1);
+        h.core.dl.gens.clear();
+        sync(&mut h);
+        poke(&mut h);
+        sync(&mut h);
+        assert_eq!(ends(&h).len(), 1);
+    }
+
+    /// T6: a second `DelegateNodeEnded` of an ended generation changes nothing.
+    #[test]
+    fn a_duplicate_end_of_a_released_stream_is_a_no_op() {
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+        sync(&mut h);
+        let before = (
+            h.meta.delegation_table().streams().count(),
+            h.meta.void_cut(7).unwrap(),
+        );
+        Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::DelegateNodeEnded {
+                node: 3,
+                gen: 7,
+                through: ROW,
+            }],
+        )
+        .unwrap();
+        let after = (
+            h.meta.delegation_table().streams().count(),
+            h.meta.void_cut(7).unwrap(),
+        );
+        assert_eq!(before, after);
+        sync(&mut h);
+        assert_eq!(ends(&h).len(), 1);
+    }
+
+    /// Two usable roots over one log end the stream at one cut (a second
+    /// takeover with the first end unshipped).
+    #[test]
+    fn two_roots_end_the_same_released_stream_at_the_same_cut() {
+        let mut cuts = Vec::new();
+        for me in [1, 2] {
+            let mut h = bare_root(me);
+            h.hold(2, None);
+            h.core.roster.mark_seen_for_test(true);
+            log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+            sync(&mut h);
+            cuts.push(ends(&h));
+        }
+        assert_eq!(cuts[0], cuts[1]);
+        assert_eq!(cuts[0], vec![(3, 7, ROW)]);
+    }
+
+    /// MUST 2 (zero): an index of 0 is no cut for a stream that released a
+    /// row (a release row has an index of 1 or more): not ended, counted.
+    /// Fails on the parent's unchecked reading (the end would be journaled
+    /// at 0, below the rows the log holds).
+    #[test]
+    fn a_released_stream_with_no_row_in_the_log_is_not_ended_at_zero() {
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, false);
+        assert_eq!(Replica::log_stream_idx(&h.meta, 7), 0);
+        sync(&mut h);
+        poke(&mut h);
+        sync(&mut h);
+        assert!(ends(&h).is_empty(), "{:?}", ends(&h));
+        assert!(h.core.stats.deleg_released_refused >= 1);
+        assert!(!h.core.dl.gens.contains_key(&7));
+        assert!(listed(&h));
+    }
+
+    /// MUST 2 (read error): the log's index cannot be read at the first
+    /// usable sync: the stream is not taken on, not ended at 0, and the next
+    /// sync that reads it ends it at the row. Fails on `unwrap_or(0)`: an end
+    /// at 0, below the release row.
+    #[test]
+    fn an_unreadable_log_index_leaves_the_released_stream_for_a_later_sync() {
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+        constellation_meta::fail_log_stream_idx_reads_on_this_thread_for_tests(7, 1);
+        sync(&mut h);
+        assert!(ends(&h).is_empty(), "{:?}", ends(&h));
+        assert_eq!(h.core.stats.deleg_released_refused, 1);
+        assert!(!h.core.dl.gens.contains_key(&7));
+        assert!(listed(&h));
+        sync(&mut h);
+        assert_eq!(ends(&h), vec![(3, 7, ROW)]);
+    }
+
+    /// An unreadable group at the first usable sync (the stream is not taken
+    /// on, an empty group would end it without its backup) leaves the stream
+    /// for a later sync; the operator's leave of the holder waits meanwhile
+    /// (MUST 1) and completes after the end. Fails on the parent: the leave
+    /// is answered while the table lists the stream.
+    #[test]
+    fn an_operators_leave_waits_for_the_end_of_a_released_stream() {
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1_000_000);
+        let mut answered = None;
+        let mut out = h.step(Event::Control {
+            op: OpId(910),
+            req: Control::EndGrantsOf { node: 3 },
+        });
+        // (Within the leave's own wait: past it the leave fails, which is no
+        // answer of "ended".)
+        let wait = h.core.leave_wait_ms() as u64;
+        let mut spent = 0;
+        loop {
+            if let Some(r) = control_done(&out, 910) {
+                answered = Some(r);
+                break;
+            }
+            if spent + 600 >= wait / 2 {
+                break;
+            }
+            h.advance(600);
+            spent += 600;
+            out = match h.core.dl.leave_timer {
+                Some(id) => h.step(Event::Timer { id }),
+                None => poke(&mut h),
+            };
+        }
+        assert!(
+            answered.is_none(),
+            "the leave was answered with the stream listed and untaken: {answered:?}"
+        );
+        assert!(listed(&h));
+        assert!(
+            h.core.dl.gens.is_empty(),
+            "taken on with its group unreadable"
+        );
+        assert_eq!(h.core.stats.deleg_inherited_released, 0);
+        // The group reads again: the next sync takes the stream on and ends it.
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
+        // (The node's `NodeLeaving` row is durable once it shipped.)
+        let (_, jseq) = h.core.dl.leaving[&3].journaled.expect("no leave row");
+        h.core.ack.shipped_rows.insert(jseq);
+        out = sync(&mut h);
+        assert_eq!(ends(&h), vec![(3, 7, ROW)]);
+        for _ in 0..8 {
+            if let Some(r) = control_done(&out, 910) {
+                answered = Some(r);
+                break;
+            }
+            h.advance(600);
+            out = match h.core.dl.leave_timer {
+                Some(id) => h.step(Event::Timer { id }),
+                None => poke(&mut h),
+            };
+        }
+        assert!(matches!(answered, Some(Ok(_))), "{answered:?}");
+    }
+
+    fn control_done(out: &[Action], op: u64) -> Option<Result<(), String>> {
+        out.iter().find_map(|a| match a {
+            Action::ControlDone { op: o, result } if *o == OpId(op) => {
+                Some(result.clone().map(|_| ()))
+            }
+            _ => None,
+        })
+    }
+
+    /// SHOULD 3: the end's journal write fails once: the stream waits drained
+    /// and the retry (the expiry's drained branch) ends it, once, without a
+    /// table change. Fails without the retry: nothing ends it.
+    #[test]
+    fn a_failed_end_write_of_a_released_stream_is_retried() {
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(1);
+        sync(&mut h);
+        assert!(ends(&h).is_empty());
+        assert!(!h.core.dl.gens[&7].ended);
+        let timer = h.core.dl.gens[&7].expiry.expect("no retry armed");
+        h.advance(600);
+        h.step(Event::Timer { id: timer });
+        assert_eq!(ends(&h), vec![(3, 7, ROW)]);
+        assert!(h.core.dl.gens[&7].ended);
+        sync(&mut h);
+        assert_eq!(ends(&h).len(), 1);
+    }
+
+    /// A leave note of the holder that arrives while its stream is drained
+    /// and not ended is held back (refused: the holder sends it again), and
+    /// acknowledged once the end is journaled.
+    #[test]
+    fn a_leave_note_is_held_back_while_a_released_stream_is_not_ended() {
+        let note = |req: u64| Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(req),
+                gen: 0,
+                round: 0,
+                txs: Vec::new(),
+                leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
+                released: Some(constellation_meta::locks::ReleaseNote {
+                    leaving: true,
+                    ..Default::default()
+                }),
+            },
+        };
+        let refused = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(n, m)| match m {
+                PeerMsg::DelegateStreamAck {
+                    gen: 0, refused, ..
+                } if n == 3 => Some(*refused),
+                _ => None,
+            })
+        };
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(1);
+        sync(&mut h);
+        assert!(!h.core.dl.gens[&7].ended);
+        let out = h.step(note(100));
+        assert_eq!(refused(&out), Some(true), "{out:?}");
+        assert!(matches!(
+            h.core.dl.gens[&7].recall,
+            crate::core::delegate::RecallPhase::Drained(_)
+        ));
+        let timer = h.core.dl.gens[&7].expiry.expect("no retry armed");
+        h.advance(600);
+        h.step(Event::Timer { id: timer });
+        assert_eq!(ends(&h).len(), 1);
+        // (The node's `NodeLeaving` row is durable once it shipped.)
+        let (_, jseq) = h.core.dl.leaving[&3].journaled.expect("no leave row");
+        h.core.ack.shipped_rows.insert(jseq);
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            out = h.step(note(100));
+            if refused(&out) == Some(false) {
+                break;
+            }
+            h.advance(600);
+        }
+        assert_eq!(refused(&out), Some(false), "{out:?}");
     }
 }

@@ -1497,6 +1497,14 @@ pub struct Stats {
     /// cross-subtree op, seals asked of a dead delegate's backup and the
     /// transactions drained from it.
     pub deleg_inherited: u64,
+    /// Root: another node's stream the log lists with no subtree (its holder
+    /// released them all) taken on at a usable sync, drained at the log's
+    /// index, and ended by `root_progress` (also counted in
+    /// `deleg_inherited`).
+    pub deleg_inherited_released: u64,
+    /// Root: such a stream left for a later sync, as the log's index could
+    /// not be read or was 0.
+    pub deleg_released_refused: u64,
     pub deleg_refused_designated: u64,
     /// A designation's refusal of an op this node had sent to the
     /// designee, asked again instead of answered (the op was sent to the designee, it may have run).

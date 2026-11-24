@@ -10828,7 +10828,7 @@ struct OracleTotals {
     /// reason: released, abandoned, other).
     sticky: [u64; 4],
     sticky_core: [u64; 16],
-    claim_core: [u64; 4],
+    claim_core: [u64; 7],
     root_own_core: [u64; 15],
     /// `Report::observed_tentative` and `own_stream_observed_rolled_back`, summed over the seeds that passed (the
     /// second is always 0 there: under strict gating a non-zero count fails the seed).
@@ -11646,6 +11646,10 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-CLAIM-RELEASE-TOTALS {label} seeds {}/{seeds}: claims that journaled the stream's release {}, with no row to journal {}, ends that waited for the stream's rows {}, ended ahead of held rows when the wait ran out {}",
             self.seeds, self.claim_core[0], self.claim_core[1], self.claim_core[2], self.claim_core[3]
+        );
+        eprintln!(
+            "SWEEP-RELEASED-STREAM-TOTALS {label} seeds {}/{seeds}: another node's released streams a usable root took on and ended {}, left for a later sync (index unreadable or 0) {}, empty streams the log still listed at the end of a run {}",
+            self.seeds, self.claim_core[4], self.claim_core[5], self.claim_core[6]
         );
         eprintln!(
             "SWEEP-ABANDON-TOTALS {label} seeds {}/{seeds}: repair abandon commands {}, with a read wait {}, \
@@ -12960,6 +12964,25 @@ fn regression_a_streamed_install_supersedes_a_past_roots_append_seed_1678() {
             "delegated-root-deposed-delegate-dies seed 1678: {e}\n  replay with \
              AUTHORITY_SIM_CONFIG=delegated-root-deposed-delegate-dies \
              AUTHORITY_SIM_LEASE_READS=0:0:800:1000"
+        )
+    });
+}
+
+/// Seed 2734 of `delegated-root-deposed-delegate-dies` (plain). Root 1
+/// journaled the end of node 3's whole release, which never shipped; node 2
+/// took the lease over as a gate, appended the release row and ended nothing
+/// (ADR-42), restarted, and as a usable root skipped node 3's empty stream for
+/// the rest of the run: the log kept listing a stream with no subtree. The
+/// usable root takes it on and ends it at the log's index
+/// (`deleg_inherited_released`); the end-of-run checker
+/// (`orphan_empty_stream`) fails the seed without it.
+#[test]
+fn regression_a_usable_root_ends_the_released_stream_a_gate_appended_seed_2734() {
+    run_seed(2734, delegated_root_deposed_delegate_dies_config()).unwrap_or_else(|e| {
+        panic!(
+            "delegated-root-deposed-delegate-dies seed 2734: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=delegated-root-deposed-delegate-dies \
+             AUTHORITY_SIM_START=2734 AUTHORITY_SIM_SEEDS=1"
         )
     });
 }

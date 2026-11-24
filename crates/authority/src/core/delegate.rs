@@ -3879,31 +3879,56 @@ impl Core {
                     }
                     continue;
                 }
-                // A stream that released every subtree has none to inherit
-                // (step 10 gives it an end), unless it is this node's own.
-                // Emptiness is read from the local table (`table`), which
-                // runs ahead of the log through this node's own journal: the
-                // stream's release row is in the log or in this journal, and
-                // need not have shipped. A holder's row that the root which
-                // held the lease then never appended leaves no root's step 10
-                // to end the stream (sim `sticky-s4-leave` idle-susp, seed
-                // 1578 with re-adoption off: the node's self-leave waited on
-                // the never-ended generation). This node is its holder, and
-                // now the root: it takes the stream on and ends it by the
-                // ADR-55 own-stream path below (`claim_releases`, the cut at
-                // `cursor.max(delegate_idx)`, `claim_end`). That is safe
-                // from the local view because the cut covers every row this
-                // node assigned in the stream (the log's index or its own
-                // delegate index, whichever is higher), the end is journaled
-                // after the stream's own release row (`claim_end_of`,
-                // `release_row_unshipped`) so nothing ships out of order,
-                // no grant or subtree is touched (there is none), the
-                // release row is journaled once (`release_row_journaled`),
-                // and the path runs only at `Usable`, after the takeover's
-                // tail to head, so no predecessor row is unapplied. Another
-                // node's stream stays skipped: its holder or the root's
-                // step 10 ends it.
-                if d.dirs.is_empty() && d.node != me {
+                // A stream that released every subtree has none to inherit.
+                // Its holder's release row is in the log or in this node's
+                // journal; the stream is listed until a `DelegateNodeEnded`
+                // applies, and the root that appended the row ends it
+                // (step 10) only while it keeps the `GenState` it made
+                // then. A root that never had one (deposed, restarted, or
+                // the gate that appended the row and ended nothing) leaves
+                // the stream listed for good (sim
+                // `delegated-root-deposed-delegate-dies`, seed 2734): the
+                // holder's own leave and the operator's wait for an end
+                // nobody writes.
+                //
+                // * This node's own stream: its release row shipped from its
+                //   own journal (the log's table lost the subtrees) and the
+                //   root that held the lease then never appended it (sim
+                //   `sticky-s4-leave` idle-susp, seed 1578 with re-adoption
+                //   off). This node is its holder, and now the root: it ends
+                //   it by the ADR-55 own-stream path below
+                //   (`claim_releases`, the cut at `cursor.max(delegate_idx)`,
+                //   `claim_end`), which keeps (1) a stream ends only by its
+                //   holder's release, (2) the end is journaled after the
+                //   stream's own release row (`claim_end_of`,
+                //   `release_row_unshipped`), (3) no grant or subtree is
+                //   touched, (4) the release row is journaled once
+                //   (`release_row_journaled`).
+                // * Another node's stream, at `Usable` only: taken on as a
+                //   recall that has already drained at the log's index
+                //   (`released_empty`), ended by `root_progress` in this
+                //   sync. The log's word is enough: this table is the log's
+                //   fold plus this root's own journal, another node's rows
+                //   enter that journal only through this root's own appends
+                //   (which put the stream in `dl.gens` first), and the
+                //   takeover's tail to head has run, so an end a
+                //   predecessor's tail carried is applied already. The
+                //   holder's release is its stream's last row, so the log's
+                //   index is at or above it and the cut voids nothing; no
+                //   previous root's copy can hold a row the log lacks (the
+                //   proof `root_progress` accepts of a drained recall), so no
+                //   seal is owed. Another node's table row is emptied only by
+                //   its holder's `StreamReleased` / `SubtreeReleased` rows
+                //   (an ADR-64 cut is a mark, not a release). The gate takes
+                //   nothing on (ADR-42): the open syncs again as `Usable`.
+                //   Locks: the takeover's lock quarantine
+                //   (`note_marker_landed`) is table-wide and is set because
+                //   the table lists a delegation, so it covers a lock the
+                //   holder granted under the stream before its release row;
+                //   the stream has no subtree to set a per-subtree grace on,
+                //   and the end needs none.
+                let released_empty = d.dirs.is_empty() && d.node != me;
+                if released_empty && level != RootSync::Usable {
                     continue;
                 }
                 // Plan 46 M0.3 (S5, ADR-42): a gate whose journal work is
@@ -3938,7 +3963,37 @@ impl Core {
                 // forwarded op's reply raised `stream_applied` past what
                 // the predecessor appended; the delegate re-streams the
                 // rest from here).
-                let mut cursor = replica.log_stream_idx(d.gen);
+                let mut cursor = if released_empty {
+                    // The cut ends the stream for good: it is read fallibly
+                    // and never taken from an error or from 0 (a release row
+                    // has an index of 1 or more). Skipped until a later sync.
+                    match replica.try_log_stream_idx(d.gen) {
+                        Ok(0) => {
+                            self.stats.deleg_released_refused += 1;
+                            tracing::warn!(
+                                node = me,
+                                gen = %constellation_meta::delegation::GenLabel::of(d.gen),
+                                delegate = d.node,
+                                "a released stream the log holds no row of: not ended"
+                            );
+                            continue;
+                        }
+                        Ok(idx) => idx,
+                        Err(error) => {
+                            self.stats.deleg_released_refused += 1;
+                            tracing::warn!(
+                                node = me,
+                                gen = %constellation_meta::delegation::GenLabel::of(d.gen),
+                                delegate = d.node,
+                                %error,
+                                "the log's index of a released stream could not be read: not ended yet"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    replica.log_stream_idx(d.gen)
+                };
                 // ADR-55: a stream this node holds itself (it was the root and
                 // its own holder, and claims the lease again): every row it
                 // assigned is in its own journal, which is the root's, and
@@ -4027,6 +4082,27 @@ impl Core {
                 self.stats.deleg_inherited += 1;
                 if level == RootSync::Gated {
                     self.stats.deleg_gated_inherited += 1;
+                }
+                if released_empty {
+                    // A drained recall at the log's index: `root_progress`
+                    // ends it below. Nothing renews it, no previous root is
+                    // sealed (the log holds the stream's last row), no TTL
+                    // is armed and the holder is not asked to stream (it
+                    // holds nothing). What an earlier tenure of this node
+                    // still owed of the stream is settled by the same proof.
+                    self.stats.deleg_inherited_released += 1;
+                    if let Some(g) = self.dl.gens.get_mut(&d.gen) {
+                        g.recall = RecallPhase::Drained(cursor);
+                        g.recall_cause = None;
+                    }
+                    self.dw.close_for_recall(d.gen);
+                    if replica
+                        .deleg_prev_roots(d.gen)
+                        .is_some_and(|owed| !owed.is_empty())
+                    {
+                        self.persist_prev_roots(d.gen, &[], replica);
+                    }
+                    continue;
                 }
                 if d.node != me {
                     self.deleg_inherit_prev_roots(now, d.gen, replica, out);
@@ -13037,6 +13113,21 @@ impl Core {
             self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
             return;
         }
+        // A drained recall whose end could not be journaled
+        // (`end_generation` arms this expiry again): ends now, whatever is
+        // left of its window (nothing streams under a drained recall).
+        // Without it the end waited for the next table change, which an
+        // idle cluster never brings (a released stream of another node has
+        // no delegate to say anything).
+        if self
+            .dl
+            .gens
+            .get(&gen)
+            .is_some_and(|g| matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th))
+        {
+            self.root_progress(now, replica, out);
+            return;
+        }
         // One critical section on the window table's own clock (plan 41 R1):
         // a window extended since this step took its `now` is re-armed, and
         // one that has run out is closed in the same section, so nothing
@@ -13046,10 +13137,6 @@ impl Core {
             return;
         }
         let g = self.dl.gens.get(&gen).expect("present").clone();
-        let done = matches!(g.recall, RecallPhase::Drained(th) if g.cursor >= th);
-        if done {
-            return;
-        }
         // Plan 30 §M14: an outwaited delegate — the lock grants moved to
         // it may still be honoured with this root's windows: a grace on
         // the subtree (the seal path re-delegates; the grace stands).
@@ -14004,7 +14091,21 @@ impl Core {
         }
         if let Err(error) = replica.apply_records_journaled(&records, None) {
             tracing::warn!(node = self.me(), gen = %constellation_meta::delegation::GenLabel::of(gen), %error, "could not journal the recall record");
-            self.arm_gen_expiry(now.plus(500), gen, out);
+            if drained {
+                // The retry is the expiry's drained branch, shortly: not at
+                // the window's end (a stream with no subtree has no use for
+                // it) and not never (`arm_gen_expiry` arms nothing for a
+                // non-stealable grant).
+                if let Some(t) = self.dl.gens.get_mut(&gen).and_then(|g| g.expiry.take()) {
+                    self.cancel_timer(t, out);
+                }
+                let t = self.set_timer_wait(now.wait.plus(500), Timer::DelegExpiry(gen), out);
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    g.expiry = Some(t);
+                }
+            } else {
+                self.arm_gen_expiry(now.plus(500), gen, out);
+            }
             return;
         }
         if let Some(why) = sticky_why {
@@ -17834,8 +17935,19 @@ impl Core {
                 // answer waits for it. A row that could not be journaled is
                 // tried again.)
                 self.leave_operator_row_retry(now, w.who, replica);
+                // (And no stream of the node is listed, one with no subtree
+                // left too: `streams` counts subtrees, and `dl.gens` has no
+                // entry for a released stream this root has not taken on
+                // yet (before its first usable sync, while the group or the
+                // log's index cannot be read), which the node's retirement
+                // would leave listed (`no_live_grant_off_roster`). Once the
+                // root takes it on, `dl.gens` holds it until its end.)
                 streams.is_empty()
                     && !self.dl.gens.values().any(|g| g.node == w.who && !g.ended)
+                    && !replica
+                        .delegation_table()
+                        .streams()
+                        .any(|st| st.node == w.who)
                     && self
                         .dl
                         .leaving
