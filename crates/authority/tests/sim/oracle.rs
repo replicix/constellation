@@ -294,9 +294,12 @@ pub struct Oracles {
     pub cut_repeated: std::sync::atomic::AtomicU64,
     pub cut_absorbed: std::sync::atomic::AtomicU64,
     /// ADR-56: the root's handover requests and grants, stamped with the
-    /// run's clock (`Core::take_hand_events`): `handover_tenure` and
-    /// `one_off_no_handover` judge them.
-    pub hand_events: Mutex<Vec<(u64, u64, constellation_authority::HandEvent)>>,
+    /// run's clock and with the stamping node's own wait clock
+    /// (`Core::take_hand_events`): `handover_tenure` and `one_off_no_handover`
+    /// judge them by the run's, `handover_inflight` by the node's wait clock
+    /// (the one the core times an op's flight on): `(run ms, node wait ms,
+    /// node, event)`.
+    pub hand_events: Mutex<Vec<(u64, i64, u64, constellation_authority::HandEvent)>>,
     /// The delegation table as the lease holder had it, each time it changed
     /// (`(at_ms, holder, table)`): the generation history (install, recall,
     /// end) that decides who owns an op's keys at each instant.

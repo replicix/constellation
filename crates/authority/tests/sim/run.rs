@@ -9754,7 +9754,14 @@ pub struct HandoverFindings {
     pub inflight: Vec<String>,
 }
 
-/// Judge the root's handover record, `(run ms, node, event)` in order.
+/// Judge the root's handover record, `(run ms, node wait ms, node, event)` in
+/// order.
+///
+/// `handover_inflight` (H-I5) is measured on the node's own wait clock, the
+/// clock the core times an op's flight on (`Config::emulated_inflight_ms`),
+/// for both instants; the run's milliseconds differ from it by the node's
+/// clock rate, which made an exact release look one ms short. The bound is
+/// otherwise exact.
 ///
 /// `handover_tenure` (H-I3): the grants of one directory; a grant that follows
 /// its holder's release row (`handover`) comes at least the minimum tenure
@@ -9763,7 +9770,7 @@ pub struct HandoverFindings {
 /// two grants), so the bound is the tenure less that error; the request the
 /// grant answers was itself a round trip later.
 pub fn judge_handover(
-    events: &[(u64, NodeId, constellation_authority::HandEvent)],
+    events: &[(u64, i64, NodeId, constellation_authority::HandEvent)],
     tenure_ms: u64,
     one_off: &[NodeId],
     inflight_ms: u64,
@@ -9772,21 +9779,21 @@ pub fn judge_handover(
     let mut f = HandoverFindings::default();
     let bound = tenure_ms.saturating_sub(tenure_ms / 250);
     let mut last: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut own_op: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
+    let mut own_op: BTreeMap<(NodeId, u64), i64> = BTreeMap::new();
     let mut min_gap: Option<u64> = None;
-    for (ms, node, e) in events {
+    for (ms, wait, node, e) in events {
         match *e {
             HandEvent::OwnOp { dir } => {
-                own_op.insert((*node, dir), *ms);
+                own_op.insert((*node, dir), *wait);
             }
             HandEvent::HandoverReleased { dir } => {
                 if let Some(at) = own_op.get(&(*node, dir)) {
-                    if *ms < at + inflight_ms {
+                    let flown = *wait - *at;
+                    if flown < inflight_ms as i64 {
                         f.inflight.push(format!(
                             "handover_inflight: node {node} released directory {dir} for a \
-                             handover at t={ms} ms, {} ms after an op of its own in it \
-                             (in flight for {inflight_ms} ms)",
-                            ms - at
+                             handover at t={ms} ms, {flown} ms after an op of its own in it \
+                             (in flight for {inflight_ms} ms, on the node's wait clock)"
                         ));
                     }
                 }

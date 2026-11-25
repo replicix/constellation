@@ -4482,8 +4482,11 @@ impl Driver {
         let hand = self.core.take_hand_events();
         if !hand.is_empty() {
             let at_ms = self.clock.elapsed_ms();
+            // The step's own wait reading: the stamp the core put on the
+            // event (an op's flight and a release are timed on it).
+            let wait_ms = self.step_now.wait.0;
             let mut events = self.oracles.hand_events.lock().unwrap();
-            events.extend(hand.into_iter().map(|e| (at_ms, self.id, e)));
+            events.extend(hand.into_iter().map(|e| (at_ms, wait_ms, self.id, e)));
         }
         for (gen, whole, dirs) in self.core.take_self_releases() {
             let mut sent = self.oracles.sticky_released.lock().unwrap();

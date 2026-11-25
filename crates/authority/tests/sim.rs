@@ -24405,6 +24405,50 @@ fn a_roots_own_leave_ends_its_own_sticky_stream() {
     }
 }
 
+/// WP6.9: `handover_inflight` is judged on the node's own wait clock, the one
+/// the core times an op's flight on, for both instants. Seed 1071 of
+/// `sticky-handover-busy` released exactly when the 800 ms flight ended on the
+/// node's clock and read 799 ms on the run's clock (the node's clock runs
+/// within the rate budget of the run's). Plain and with the idle release on.
+/// The control `handover_ignores_inflight` on this very configuration still
+/// fails `handover_inflight` (a release well inside the flight).
+#[test]
+fn the_handover_inflight_oracle_reads_the_nodes_wait_clock() {
+    let idle = SimConfig {
+        sticky_idle_ms: Some(1_200),
+        ..sticky_handover_busy_config()
+    };
+    run_seed(1071, sticky_handover_busy_config()).unwrap_or_else(|e| {
+        panic!("seed 1071 plain: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-handover-busy")
+    });
+    run_seed(1071, idle).unwrap_or_else(|e| {
+        panic!(
+            "seed 1071 idle: {e}\n  replay with AUTHORITY_SIM_CONFIG=sticky-handover-busy \
+             AUTHORITY_SIM_STICKY_IDLE_MS=1200"
+        )
+    });
+    // The control: released at once, 800 ms flight, the busy configuration.
+    let (mut failed, mut named) = (0, 0);
+    for seed in 0..40u64 {
+        let Err(e) = run_seed(
+            seed,
+            SimConfig {
+                handover_ignores_inflight: true,
+                ..sticky_handover_busy_config()
+            },
+        ) else {
+            continue;
+        };
+        failed += 1;
+        named += usize::from(e.contains("handover_inflight"));
+    }
+    assert!(failed > 0, "the control never failed an oracle");
+    assert!(
+        named > 0,
+        "the control never failed handover_inflight ({failed} failed)"
+    );
+}
+
 /// WP6.3 (ADR-61): a successor root granted a sticky subtree to a node that
 /// was leaving. The leaving node answered its own leave from a released
 /// lease while no root had acknowledged its note (the root that refused the
