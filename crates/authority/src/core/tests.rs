@@ -100158,8 +100158,12 @@ mod released_stream_end {
 
     fn fail_once(kind: Refusal) {
         match kind {
-            Refusal::Index => constellation_meta::fail_log_stream_idx_reads_on_this_thread_for_tests(7, 1),
-            Refusal::Group => constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1),
+            Refusal::Index => {
+                constellation_meta::fail_log_stream_idx_reads_on_this_thread_for_tests(7, 1)
+            }
+            Refusal::Group => {
+                constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1)
+            }
         }
     }
 
