@@ -100161,10 +100161,16 @@ mod released_stream_end {
             Refusal::Index => {
                 constellation_meta::fail_log_stream_idx_reads_on_this_thread_for_tests(7, 1)
             }
+            // (Other reads of the sync draw on the count too: all of this
+            // sync's group reads fail, and `heal` ends the fault.)
             Refusal::Group => {
-                constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1)
+                constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1_000_000)
             }
         }
+    }
+
+    fn heal() {
+        constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(0);
     }
 
     /// SHOULD 1: a transient refusal at the first usable sync of an idle
@@ -100182,7 +100188,8 @@ mod released_stream_end {
             assert!(ends(&h).is_empty(), "{at}");
             assert!(!h.core.dl.gens.contains_key(&7), "{at}: taken on");
             assert!(listed(&h), "{at}");
-            assert_eq!(h.core.stats.deleg_released_refused, 1, "{at}");
+            assert!(h.core.stats.deleg_released_refused >= 1, "{at}");
+            heal();
             let retry = h
                 .core
                 .dl
@@ -100206,6 +100213,7 @@ mod released_stream_end {
             fail_once(kind);
             sync(&mut h);
             assert!(listed(&h), "{kind:?}");
+            heal();
             let mut answered = None;
             let mut out = h.step(Event::Control {
                 op: OpId(912),
@@ -100259,22 +100267,26 @@ mod released_stream_end {
                 _ => None,
             })
         };
+        // The records journaled other than the stream's end.
         let journal_rows = |h: &Harness| {
             Replica::journal_txs_from(&h.meta, 0, usize::MAX)
                 .into_iter()
-                .map(|tx| tx.records.len())
-                .sum::<usize>()
+                .flat_map(|tx| tx.records)
+                .filter(|r| !matches!(r, LogRecord::DelegateNodeEnded { .. }))
+                .count()
         };
         let mut h = usable_root();
         log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
-        // The window: the end's write failed, the stream waits drained.
-        constellation_meta::fail_journal_writes_on_this_thread_for_tests(1);
+        // The window: the end's write fails (at the sync and at the batch's
+        // own `root_progress`), the stream waits drained.
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(2);
         sync(&mut h);
         assert!(!h.core.dl.gens[&7].ended);
         let before = journal_rows(&h);
         let out = deliver_stream(&mut h, 3, 7, rows(), None);
         assert_eq!(ack(&out), Some((ROW, false)), "{out:?}");
         assert_eq!(journal_rows(&h), before);
+        assert!(ends(&h).is_empty() && !h.core.dl.gens[&7].ended);
         // After the end.
         let timer = h.core.dl.gens[&7].expiry.expect("no retry armed");
         h.advance(600);
