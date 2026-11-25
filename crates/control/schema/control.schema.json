@@ -2124,6 +2124,7 @@
           "type": "integer"
         },
         "released_no_row": {
+          "description": "As the root: syncs that left another node's released stream\nunended because the log holds no row of it (index 0). Should stay 0;\nnonzero means a stream no end can cover.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
