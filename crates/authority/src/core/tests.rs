@@ -73189,6 +73189,117 @@ mod hold_ack {
         assert!(h.core.stats.hold_acks >= 2);
     }
 
+    /// FX-1 (class K), the answer given in the hold: a row journaled before
+    /// the epoch formed, `Singleton` or under a root group that lists no
+    /// member, is answered to this node's own client as the hold's, its row
+    /// re-tagged so before the answer claims the class, as another node's
+    /// answer is (`journaled_answer_class_for`). Fails on the parent: the
+    /// `Singleton` row answered `Singleton`, the root group's row `Root`,
+    /// each row left as it was.
+    #[test]
+    fn an_own_answer_in_a_hold_group_retags_a_row_journaled_before_the_epoch() {
+        use constellation_meta::{GroupOn, RowCommit};
+        for (n, before) in [
+            RowCommit::Singleton { config_version: 3 },
+            RowCommit::group(3, GroupOn::Root),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut h = owner(0);
+            h.core.pr.epoch_members = vec![1, 2];
+            assert!(h.core.hold_group());
+            let rid = h.rid(n as u64 + 1);
+            {
+                let _class = constellation_meta::PendingClass::set(before);
+                constellation_meta::execute_mutate(
+                    &h.meta,
+                    &h.create(&format!("pre{n}")),
+                    Some(rid),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c),
+                Some(before),
+                "the row is journaled before the hold's rule"
+            );
+            let want = RowCommit::group(1, GroupOn::Hold);
+            assert_eq!(
+                h.core.journaled_answer_class(&h.meta, rid).unwrap(),
+                want,
+                "{before:?}"
+            );
+            assert_eq!(
+                Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c),
+                Some(want),
+                "the row is re-tagged before the claim: {before:?}"
+            );
+        }
+    }
+
+    /// FX-1 (class K, `flex-tight` seed 460), the answer parked before the
+    /// hold and released by it: an own answer parked under a root group (the
+    /// rule its row was journaled under) and released by a member's copy in
+    /// the hold that formed since leaves as the hold's, its row re-tagged
+    /// so; it never names the root group for a row whose configuration
+    /// lists no member. Fails on the parent: the answer's source stays the
+    /// root group's and the row's tag is left as it was.
+    #[test]
+    fn an_own_answer_parked_under_a_root_group_is_the_holds_when_the_hold_releases_it() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        {
+            let held = &mut h.core.lease.held.as_mut().unwrap().0;
+            held.config_version = 3;
+            held.singleton = false;
+            held.backups = vec![2];
+            held.ack_policy = replicix_objcas::AckPolicy::Backup;
+        }
+        let (rid, out) = create_nowait(&mut h, 1, "parked");
+        assert!(
+            !accepted_to_client(&out, rid),
+            "waits for the group: {out:?}"
+        );
+        assert_eq!(
+            Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c),
+            Some(RowCommit::group(3, GroupOn::Root))
+        );
+        // The epoch forms: a hold group of the owner and node 2.
+        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.core.pr.epoch_members = vec![1, 2];
+        h.core.epoch = EpochState {
+            open: true,
+            active: true,
+            ..Default::default()
+        };
+        assert!(h.core.hold_group());
+        let tip = tip(&h);
+        let out = ack(&mut h, 2, 1, tip);
+        let sources: Vec<_> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Reply {
+                    rid: r,
+                    reply: ClientReply::Outcome(MutateOutcome::Accepted { .. }),
+                    source,
+                } if *r == rid => Some(*source),
+                _ => None,
+            })
+            .collect();
+        let want = RowCommit::group(1, GroupOn::Hold);
+        assert_eq!(
+            sources,
+            vec![crate::AnswerSource::Sequenced(want)],
+            "released by the member's copy: {out:?}"
+        );
+        assert_eq!(
+            Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c),
+            Some(want)
+        );
+    }
+
     #[test]
     fn a_one_member_hold_answers_at_once() {
         use constellation_meta::RowCommit;

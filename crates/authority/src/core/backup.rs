@@ -2364,6 +2364,11 @@ impl Core {
         replica: &dyn Replica,
         rid: Rid,
     ) -> Result<constellation_meta::RowCommit, constellation_meta::MetaError> {
+        // One rule for both askers (FX-1): in a hold group the answer is the
+        // hold's, the row re-tagged so.
+        if self.hold_group() {
+            return self.hold_answer_class(replica, rid);
+        }
         Ok(match replica.journal_class_of_rid(rid) {
             // Plan 46 M1.1 step 5: a row keeps the rule it was journaled
             // under. A gated row whose group is gone is not re-tagged
@@ -2526,19 +2531,7 @@ impl Core {
         // journaled with before the hold, and the row re-tagged so (what a
         // deposition or `repair drop-held` does with it follows the answer).
         if self.hold_group() {
-            // Plan 46 M1.4 step 2: the answer waits for a member's copy
-            // (`park_durable`); the row is the hold group's, tagged so (what
-            // a deposition does with it follows the answer). A row of an
-            // earlier configuration answered here is re-tagged to the hold's.
-            let want: constellation_meta::RowCommit = self.root_rule(asker).into();
-            if let Some((first, class)) = replica.journal_class_of_rid(rid) {
-                if class != want {
-                    replica.reclass_journal_tx(first, want).inspect_err(|error| {
-                        tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered in a hold: EIO");
-                    })?;
-                }
-            }
-            return Ok(want);
+            return self.hold_answer_class(replica, rid);
         }
         if self.lease.epoch_held() {
             if let Some((first, class)) = replica.journal_class_of_rid(rid) {
@@ -2599,6 +2592,33 @@ impl Core {
                 },
             )) => self.root_commit(asker),
         })
+    }
+
+    /// Plan 46 M1.4 step 6 (FX-1, class K): the class of an answer to `rid`
+    /// given while this node owns a hold group ([`Self::hold_group`]), to
+    /// either asker: the hold's. The answer waits for a member's copy
+    /// (`park_durable`), so the hold's group is what commits it, and the row
+    /// is the hold group's, tagged so (what a deposition does with it
+    /// follows the answer). A row of an earlier configuration, journaled
+    /// `Singleton` or under a root group that has since listed no member,
+    /// is re-tagged to the hold's before the answer claims that class: an
+    /// answer never names a class stronger than its row's tag
+    /// (`row_version_matches_config` and the class-claim oracle).
+    /// `Err`: the store failed the re-tag; the caller answers `EIO`.
+    pub(crate) fn hold_answer_class(
+        &self,
+        replica: &dyn Replica,
+        rid: Rid,
+    ) -> Result<constellation_meta::RowCommit, constellation_meta::MetaError> {
+        let want: constellation_meta::RowCommit = self.root_rule(Asker::Own).into();
+        if let Some((first, class)) = replica.journal_class_of_rid(rid) {
+            if class != want {
+                replica.reclass_journal_tx(first, want).inspect_err(|error| {
+                    tracing::warn!(node = self.cfg.node_id, ?rid, %error, "could not re-tag a row answered in a hold: EIO");
+                })?;
+            }
+        }
+        Ok(want)
     }
 
     /// The answer to give when its class is `class`: `outcome` under it,

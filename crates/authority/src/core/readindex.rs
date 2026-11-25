@@ -3028,6 +3028,37 @@ impl Core {
                     }
                 }
             }
+            // FX-1 (class K): an answer parked under a root group (the
+            // rule its row was journaled under) and released by a hold
+            // group's member copy is the hold's, as an answer given in the
+            // hold is ([`Core::hold_answer_class`]): the row re-tagged so
+            // before the answer claims the class. Never the parked group's
+            // claim for a row whose configuration lists no member.
+            let held_by_hold_group = p.durable.is_some()
+                && self.hold_group()
+                && match &p.what {
+                    ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => {
+                        matches!(
+                            class,
+                            constellation_meta::RowCommit::Group {
+                                on: constellation_meta::GroupOn::Root,
+                                ..
+                            }
+                        )
+                    }
+                    _ => false,
+                };
+            let mut hold_label = None;
+            if held_by_hold_group {
+                if let ParkedWhat::Reply { rid, outcome, .. }
+                | ParkedWhat::Finish { rid, outcome, .. } = &mut p.what
+                {
+                    match self.hold_answer_class(replica, *rid) {
+                        Ok(label) => hold_label = Some(label),
+                        Err(_) => *outcome = MutateOutcome::Errno(Code::Io),
+                    }
+                }
+            }
             if downgraded {
                 if let Some(j) = row {
                     if let Err(error) = replica.reclass_journal_tx(
@@ -3082,6 +3113,8 @@ impl Core {
                 } => {
                     let class = if by_archive {
                         constellation_meta::RowCommit::ARCHIVE
+                    } else if let Some(label) = hold_label {
+                        label
                     } else if downgraded {
                         // The row's own version (never the placeholder 0).
                         class.as_singleton(self.root_config_version())
@@ -3134,6 +3167,8 @@ impl Core {
                     outcome,
                     AnswerSource::Sequenced(if by_archive {
                         constellation_meta::RowCommit::ARCHIVE
+                    } else if let Some(label) = hold_label {
+                        label
                     } else if downgraded {
                         class.as_singleton(self.root_config_version())
                     } else if p.durable.is_some() {

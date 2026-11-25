@@ -7217,6 +7217,38 @@ fn a_resumed_tenure_keeps_the_rule_of_its_earlier_rows() {
     }
 }
 
+/// Plan 46 M1.4 step 6, FX-1 (W14 class K): an answer to a node's own client
+/// that waited under a root group for the row it was journaled under, and
+/// left once a continuation epoch's hold group formed and a member held the
+/// row, claimed the root group for a row whose configuration lists no member
+/// (`class claim: ... the answer says group but the journal row of the rid
+/// is tagged [Singleton]`). It is the hold's now, the row re-tagged so, as
+/// an answer given inside the hold is (`Core::hold_answer_class`). Fail on
+/// 4e44fd24: `flex-tight` 460, and 1526 of both late-applied variants, with
+/// `+commit+identity+settle+durability`.
+#[test]
+fn an_own_answer_released_by_a_hold_group_claims_the_holds_class() {
+    let mut failed = Vec::new();
+    for (label, seed) in [
+        ("flex-tight+commit+identity+settle+durability", 460),
+        (
+            "flex-tight-late-applied-nocut+commit+identity+settle+durability",
+            1526,
+        ),
+        (
+            "flex-tight-late-applied-shortcut+commit+identity+settle+durability",
+            1526,
+        ),
+    ] {
+        if let Err(e) = run_seed(seed, label_config(label)) {
+            failed.push(format!(
+                "{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// Plan 46 M1.4 step 6a's negative control: with the resumed tenure's span
 /// dropped (`Config::resumed_span_dropped`, as before ADR-53) the class-claim
 /// seeds of shape (a) fail again.
