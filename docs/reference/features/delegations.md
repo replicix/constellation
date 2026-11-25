@@ -1495,7 +1495,7 @@ root's own answers off its stuck core, and why it declined), `off_core_answers_a
 node's whole process was frozen) and `lapses_root_silent` with
 `last_silent_gen` (a renewal sent in time was never answered by the root)
 are classified: see "Grants, renewal and expiry",
-`redelegated`, `deps_overflow_holds` (ops held for their deps overflow, ADR-69; 0 unless more than 8 unshipped streams are named), `refused_designated`, `root_own`
+`redelegated`, `deps_overflow_holds` (ops held for their deps overflow, ADR-69; 0 unless more than 8 unshipped streams are named), `refused_designated`, `released_no_row` (syncs that left another node's released stream unended because the log holds no row of it; 0 in a healthy cluster), `root_own`
 (the root's own sticky grants, ADR-55: `granted`, `released_by_dwell`,
 `released_for_cross_own` and `released_for_cross_forwarded` (ops across a
 boundary that released the grant, by the root's own client or another node),

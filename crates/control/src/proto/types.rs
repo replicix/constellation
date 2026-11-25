@@ -563,6 +563,10 @@ pub struct DelegationReport {
     /// subtree_ops)` over the window (M12's input).
     pub placement: Vec<(u64, u64, u64, u64)>,
     pub inherited: u64,
+    /// As the root: syncs that left another node's released stream
+    /// unended because the log holds no row of it (index 0). Should stay 0;
+    /// nonzero means a stream no end can cover.
+    pub released_no_row: u64,
     pub refused_designated: u64,
     pub designated: u64,
     pub redelegated: u64,

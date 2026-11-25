@@ -99973,7 +99973,9 @@ mod released_stream_end {
         poke(&mut h);
         sync(&mut h);
         assert!(ends(&h).is_empty(), "{:?}", ends(&h));
-        assert!(h.core.stats.deleg_released_refused >= 1);
+        assert!(h.core.stats.deleg_released_no_row >= 1);
+        assert_eq!(h.core.stats.deleg_released_refused, 0);
+        assert!(h.core.dl.install_retry.is_none());
         assert!(!h.core.dl.gens.contains_key(&7));
         assert!(listed(&h));
     }
@@ -100145,5 +100147,138 @@ mod released_stream_end {
             h.advance(600);
         }
         assert_eq!(refused(&out), Some(false), "{out:?}");
+    }
+
+    /// How the first usable sync's read of the released stream fails once.
+    #[derive(Clone, Copy, Debug)]
+    enum Refusal {
+        Index,
+        Group,
+    }
+
+    fn fail_once(kind: Refusal) {
+        match kind {
+            Refusal::Index => constellation_meta::fail_log_stream_idx_reads_on_this_thread_for_tests(7, 1),
+            Refusal::Group => constellation_meta::fail_deleg_backup_reads_on_this_thread_for_tests(1),
+        }
+    }
+
+    /// SHOULD 1: a transient refusal at the first usable sync of an idle
+    /// cluster (no event follows: a root syncs on events only) arms the
+    /// retry timer, and the timer alone ends the stream. Fails without the
+    /// retry: nothing arms a later sync and the stream stays listed.
+    #[test]
+    fn a_refused_released_stream_is_retried_by_its_timer_alone() {
+        for kind in [Refusal::Index, Refusal::Group] {
+            let mut h = usable_root();
+            log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+            fail_once(kind);
+            sync(&mut h);
+            let at = format!("{kind:?}");
+            assert!(ends(&h).is_empty(), "{at}");
+            assert!(!h.core.dl.gens.contains_key(&7), "{at}: taken on");
+            assert!(listed(&h), "{at}");
+            assert_eq!(h.core.stats.deleg_released_refused, 1, "{at}");
+            let retry = h
+                .core
+                .dl
+                .install_retry
+                .unwrap_or_else(|| panic!("{at}: no retry armed"));
+            h.advance(1_001);
+            h.step(Event::Timer { id: retry });
+            assert_eq!(ends(&h), vec![(3, 7, ROW)], "{at}");
+            assert!(!listed(&h), "{at}");
+            assert!(h.core.dl.install_retry.is_none(), "{at}: re-armed");
+        }
+    }
+
+    /// SHOULD 1, with the operator's leave: the holder's leave is answered
+    /// after the end that the retry timer brings, with no other event.
+    #[test]
+    fn an_operators_leave_completes_after_a_retried_refusal() {
+        for kind in [Refusal::Index, Refusal::Group] {
+            let mut h = usable_root();
+            log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+            fail_once(kind);
+            sync(&mut h);
+            assert!(listed(&h), "{kind:?}");
+            let mut answered = None;
+            let mut out = h.step(Event::Control {
+                op: OpId(912),
+                req: Control::EndGrantsOf { node: 3 },
+            });
+            for _ in 0..12 {
+                if let Some(r) = control_done(&out, 912) {
+                    answered = Some(r);
+                    break;
+                }
+                if let Some((_, jseq)) = h.core.dl.leaving.get(&3).and_then(|l| l.journaled) {
+                    h.core.ack.shipped_rows.insert(jseq);
+                }
+                h.advance(1_001);
+                let id = h.core.dl.install_retry.or(h.core.dl.leave_timer);
+                out = match id {
+                    Some(id) => h.step(Event::Timer { id }),
+                    None => break,
+                };
+            }
+            assert!(matches!(answered, Some(Ok(_))), "{kind:?}: {answered:?}");
+            assert_eq!(ends(&h), vec![(3, 7, ROW)], "{kind:?}");
+            assert!(!listed(&h), "{kind:?}");
+        }
+    }
+
+    /// SHOULD 4: the holder's re-streamed batch (rows at or below the
+    /// cursor) after the end is refused at the cursor, and in the window
+    /// of a failed end write it is acknowledged at the cursor with nothing
+    /// appended.
+    #[test]
+    fn a_restreamed_batch_of_a_released_stream_appends_nothing() {
+        let rows = || {
+            (1..=ROW)
+                .map(|idx| constellation_meta::DelegateTx {
+                    idx,
+                    rid: None,
+                    records: Vec::new(),
+                    deps: constellation_meta::Position::ZERO,
+                })
+                .collect::<Vec<_>>()
+        };
+        let ack = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(n, m)| match m {
+                PeerMsg::DelegateStreamAck {
+                    gen: 7,
+                    through,
+                    refused,
+                    ..
+                } if n == 3 => Some((*through, *refused)),
+                _ => None,
+            })
+        };
+        let journal_rows = |h: &Harness| {
+            Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+                .into_iter()
+                .map(|tx| tx.records.len())
+                .sum::<usize>()
+        };
+        let mut h = usable_root();
+        log_released(&h, SubtreeKind::Sticky, Rel::Whole, true);
+        // The window: the end's write failed, the stream waits drained.
+        constellation_meta::fail_journal_writes_on_this_thread_for_tests(1);
+        sync(&mut h);
+        assert!(!h.core.dl.gens[&7].ended);
+        let before = journal_rows(&h);
+        let out = deliver_stream(&mut h, 3, 7, rows(), None);
+        assert_eq!(ack(&out), Some((ROW, false)), "{out:?}");
+        assert_eq!(journal_rows(&h), before);
+        // After the end.
+        let timer = h.core.dl.gens[&7].expiry.expect("no retry armed");
+        h.advance(600);
+        h.step(Event::Timer { id: timer });
+        assert!(h.core.dl.gens[&7].ended);
+        let before = journal_rows(&h);
+        let out = deliver_stream(&mut h, 3, 7, rows(), None);
+        assert_eq!(ack(&out), Some((ROW, true)), "{out:?}");
+        assert_eq!(journal_rows(&h), before);
     }
 }

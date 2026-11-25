@@ -2123,6 +2123,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "released_no_row": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "renewals": {
           "format": "uint64",
           "minimum": 0,
@@ -2324,6 +2329,7 @@
         "backups",
         "placement",
         "inherited",
+        "released_no_row",
         "refused_designated",
         "designated",
         "redelegated",

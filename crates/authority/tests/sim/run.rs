@@ -8664,7 +8664,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         claim_halted += s.claim_own_rows_halted_non_stealable;
         report.claim_core[3] += s.claim_end_rows_outrun;
         report.claim_core[4] += s.deleg_inherited_released;
-        report.claim_core[5] += s.deleg_released_refused;
+        report.claim_core[5] += s.deleg_released_refused + s.deleg_released_no_row;
         claim_drop_cancelled += s.claim_end_drop_cancelled;
         for (t, v) in report.handover_core.iter_mut().zip([
             s.deleg_handovers_requested,

@@ -1502,9 +1502,12 @@ pub struct Stats {
     /// index, and ended by `root_progress` (also counted in
     /// `deleg_inherited`).
     pub deleg_inherited_released: u64,
-    /// Root: such a stream left for a later sync, as the log's index could
-    /// not be read or was 0.
+    /// Root: such a stream left for a later sync (the retry timer brings
+    /// it), as the log's index, or its group, could not be read.
     pub deleg_released_refused: u64,
+    /// Root: such a stream the log holds no row of (index 0): never ended,
+    /// counted at each sync (`status`: `released_no_row`).
+    pub deleg_released_no_row: u64,
     pub deleg_refused_designated: u64,
     /// A designation's refusal of an op this node had sent to the
     /// designee, asked again instead of answered (the op was sent to the designee, it may have run).

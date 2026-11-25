@@ -629,6 +629,7 @@ impl EngineControl {
                     backups: v.backups.clone(),
                     placement: core.placement_top.clone(),
                     inherited: stats.deleg_inherited,
+                    released_no_row: stats.deleg_released_no_row,
                     refused_designated: stats.deleg_refused_designated,
                     designated: stats.deleg_designated,
                     redelegated: stats.deleg_redelegated,

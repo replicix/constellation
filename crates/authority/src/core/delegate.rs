@@ -3838,13 +3838,8 @@ impl Core {
                 }
             }
         }
-        if retry && self.dl.install_retry.is_none() {
-            let t = self.set_timer_wait(
-                now.wait.plus(INSTALL_RETRY_MS),
-                Timer::DelegInstallRetry,
-                out,
-            );
-            self.dl.install_retry = Some(t);
+        if retry {
+            self.arm_install_retry(now, out);
         }
         // Plan 43 C2 (D4): the group each held generation's table records.
         self.deleg_group_refresh(replica);
@@ -3942,6 +3937,11 @@ impl Core {
                 // Its group unreadable: inherited at a later sync (an empty
                 // group would end it at the cursor without its backup).
                 let Ok(group_row) = replica.deleg_group(d.gen) else {
+                    if released_empty {
+                        // At a usable root no event brings another sync.
+                        self.stats.deleg_released_refused += 1;
+                        self.arm_install_retry(now, out);
+                    }
                     continue;
                 };
                 // Inherited from a predecessor root. Its grant was capped
@@ -3966,10 +3966,16 @@ impl Core {
                 let mut cursor = if released_empty {
                     // The cut ends the stream for good: it is read fallibly
                     // and never taken from an error or from 0 (a release row
-                    // has an index of 1 or more). Skipped until a later sync.
+                    // has an index of 1 or more). A read error is transient:
+                    // the retry timer brings the later sync (at a usable root
+                    // no other event does). 0 is permanent (no row of the
+                    // stream in the log: unreachable but for a corrupt stored
+                    // index, as bootstrap and rebuild carry it): counted
+                    // apart, listed by `status` (`released_no_row`), and
+                    // warned at each sync.
                     match replica.try_log_stream_idx(d.gen) {
                         Ok(0) => {
-                            self.stats.deleg_released_refused += 1;
+                            self.stats.deleg_released_no_row += 1;
                             tracing::warn!(
                                 node = me,
                                 gen = %constellation_meta::delegation::GenLabel::of(d.gen),
@@ -3981,6 +3987,7 @@ impl Core {
                         Ok(idx) => idx,
                         Err(error) => {
                             self.stats.deleg_released_refused += 1;
+                            self.arm_install_retry(now, out);
                             tracing::warn!(
                                 node = me,
                                 gen = %constellation_meta::delegation::GenLabel::of(d.gen),
@@ -4223,6 +4230,21 @@ impl Core {
                 self.stats.deleg_install_wait_ms += ms;
                 self.stats.deleg_install_wait_max_ms = self.stats.deleg_install_wait_max_ms.max(ms);
             }
+        }
+    }
+
+    /// Syncs again after [`INSTALL_RETRY_MS`] (one timer at a time). A root
+    /// syncs on events only, so a refusal at an already-usable root (a
+    /// transient read error) has no later sync to wait for unless this
+    /// brings it.
+    fn arm_install_retry(&mut self, now: Now, out: &mut Vec<Action>) {
+        if self.dl.install_retry.is_none() {
+            let t = self.set_timer_wait(
+                now.wait.plus(INSTALL_RETRY_MS),
+                Timer::DelegInstallRetry,
+                out,
+            );
+            self.dl.install_retry = Some(t);
         }
     }
 
