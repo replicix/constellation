@@ -218,9 +218,11 @@ pub(crate) struct PromiseState {
     /// holds nothing: a restarted hold owner re-adopts it when its epoch is
     /// reported open (`restore_epoch_hold`), and not meanwhile.
     pub restore_pending: bool,
-    /// A carrier's adoption of the hold failed to write its record: the
-    /// late path tries again at the next round.
-    pub adopt_retry: bool,
+    /// A carrier's adoption of the hold failed to write its record: tried
+    /// again at the next round and report, the way it was first tried (a
+    /// closed-carried re-hold stays one). Cleared at an activation and when
+    /// the epoch is no longer open.
+    pub adopt_retry: Option<Adopt>,
     /// The carried lease (epoch, expiry), this node's own, whose epoch
     /// it acked and then did not hold, because it was releasing that
     /// lease (or had released it, `released`) when the activation came

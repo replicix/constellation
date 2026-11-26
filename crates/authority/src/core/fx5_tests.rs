@@ -4,6 +4,7 @@
 //! A child of `tests` (it uses its `Harness` and helpers).
 
 use super::*;
+use crate::core::hold::Adopt;
 use crate::core::{HoldRecord, Reclaim};
 use crate::event::{Carrier, HoldOffer, OfferKind, XferNo};
 use crate::replica::hold_faults;
@@ -1104,6 +1105,136 @@ fn a_closed_carried_rehold_keeps_its_number_and_refuses_a_stale_offer() {
     assert_eq!(c.node(1).core.stats.epoch_hold_offers_refused_stale, 1);
 }
 
+/// `close_the_epoch`, then the store says `rec` and the epoch closes for
+/// the next activation (not yet reported).
+fn close_the_epoch_with(c: &mut Cluster, rec: HoldRecord) {
+    close_the_epoch(c, 1);
+    c.node(1)
+        .meta
+        .persist_epoch_hold_record(Some(&rec))
+        .unwrap();
+    c.node(1).core.pr.hold_rec = HoldRecState::Known(Some(rec));
+    c.report(1, false, false, false);
+}
+
+/// The node closed its epoch and its store says `rec`; then another
+/// activation carries the same lease.
+fn closed_carried_activation(c: &mut Cluster, rec: HoldRecord) {
+    close_the_epoch_with(c, rec);
+    assert!(c.node(1).core.lease.held.is_none(), "the close let go");
+    c.report(1, true, true, false);
+}
+
+/// MUST 1 (a): a `Given` record of the carried lease forbids the re-hold
+/// before the lease is touched: neither the hold nor the lease, and the
+/// recipient's re-offer still works.
+#[test]
+fn a_closed_carried_activation_over_a_given_record_holds_nothing() {
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.given(4, 2);
+    closed_carried_activation(&mut c, rec);
+    assert!(!c.node(1).core.lease.epoch_held(), "the hold is held again");
+    assert!(
+        c.node(1).core.lease.held.is_none(),
+        "the lease is held again"
+    );
+    assert_eq!(c.rec(1), Some(c.given(4, 2)));
+    assert_eq!(c.node(1).core.stats.epoch_closed_leases_reheld, 0);
+    assert!(c.node(1).core.pr.adopt_retry.is_none());
+    // The recipient's later request is still re-offered the same number.
+    let (_, req) = c.ask(2);
+    let out = c.serve(1, 2, req);
+    let answer = answer_to(&out, 2).unwrap();
+    assert!(is_hold(&answer, 4, OfferKind::Reoffer), "{out:?}");
+    assert_eq!(c.rec(1), Some(c.given(4, 2)));
+}
+
+/// MUST 1 (b): the `Held` write of the closed-carried re-hold fails: no
+/// hold; the next poll (or the next report), with the store back, holds
+/// again at the same number (not through the fresh path, which the `Ended`
+/// record refuses).
+#[test]
+fn a_closed_carried_rehold_whose_write_fails_is_retried_at_the_same_number() {
+    let _faults = Faults;
+    for by_poll in [true, false] {
+        let mut c = Cluster::new(&[1, 2]);
+        let rec = c.ended(3, Reclaim::Owed);
+        close_the_epoch_with(&mut c, rec);
+        Faults::write(true);
+        c.report(1, true, true, false);
+        assert!(!c.node(1).core.lease.epoch_held(), "held without a record");
+        assert_eq!(c.rec(1), Some(c.ended(3, Reclaim::Owed)));
+        assert!(c.node(1).core.stats.epoch_hold_adopt_persist_failed >= 1);
+        assert_eq!(c.node(1).core.pr.adopt_retry, Some(Adopt::ClosedCarried));
+        Faults::write(false);
+        if by_poll {
+            let h = c.node(1);
+            let (now, mut out) = (h.clk(), Vec::new());
+            h.core.arm_poll(now, 0, &mut out);
+            poll(h);
+        } else {
+            c.report(1, true, true, false);
+        }
+        assert!(
+            c.node(1).core.lease.epoch_held(),
+            "not re-held (poll {by_poll})"
+        );
+        assert_eq!(c.rec(1), Some(c.held(3, 1)), "at the same number");
+        assert!(c.node(1).core.pr.adopt_retry.is_none());
+    }
+    // A pending retry does not outlive the epoch.
+    let mut c = Cluster::new(&[1, 2]);
+    c.node(1).core.pr.adopt_retry = Some(Adopt::ClosedCarried);
+    c.report(1, false, false, false);
+    assert!(
+        c.node(1).core.pr.adopt_retry.is_none(),
+        "cleared at the close"
+    );
+    // Nor an activation's (a `Given` record refuses every adoption, so
+    // nothing but the activation itself clears it).
+    c.node(1).core.pr.hold_rec = HoldRecState::Known(Some(c.given(4, 2)));
+    c.node(1).core.pr.adopt_retry = Some(Adopt::ClosedCarried);
+    assert!(!c.node(1).core.epoch.active);
+    c.report(1, true, true, false);
+    assert!(c.node(1).core.epoch.active);
+    assert!(
+        c.node(1).core.pr.adopt_retry.is_none(),
+        "cleared at the activation"
+    );
+}
+
+/// MUST 1: an unreadable record at the closed-carried activation fails
+/// closed: neither hold nor lease, the epoch's move is owed.
+#[test]
+fn a_closed_carried_activation_over_an_unreadable_record_owes_its_move() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.ended(3, Reclaim::Owed);
+    close_the_epoch_with(&mut c, rec);
+    assert!(c.node(1).core.lease.held.is_none(), "the close let go");
+    c.node(1).core.pr.hold_rec = HoldRecState::Unreadable;
+    Faults::read(true);
+    c.report(1, true, true, false);
+    assert!(!c.node(1).core.lease.epoch_held());
+    assert!(
+        c.node(1).core.lease.held.is_none(),
+        "the lease is held again"
+    );
+    assert!(c.node(1).core.pr.owes_move.is_some(), "the move is owed");
+}
+
+/// SHOULD 2 (deviation 3): an `Ended { Settled }` record re-holds too, at
+/// its number.
+#[test]
+fn a_closed_carried_rehold_after_a_settled_end_keeps_its_number() {
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.ended(3, Reclaim::Settled);
+    closed_carried_activation(&mut c, rec);
+    assert!(c.node(1).core.lease.epoch_held(), "not held again");
+    assert_eq!(c.rec(1), Some(c.held(3, 1)), "the same number");
+    assert_eq!(c.node(1).core.stats.epoch_closed_leases_reheld, 1);
+}
+
 /// MUST 1: a crash between the `Ended { Owed }` write and the close's
 /// effect: the restart does not re-hold, for the carrier and for a transferee.
 #[test]
@@ -1398,6 +1529,78 @@ fn a_holder_and_a_non_member_are_not_nudged() {
     assert_eq!(c.poll_nudge(1, 2), None, "N6");
 }
 
+/// A5, the unwritten end: a node whose record still says it holds, while
+/// memory holds nothing, ignores a nudge.
+#[test]
+fn a_node_with_an_unwritten_end_ignores_a_nudge() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, false);
+    Faults::write(true);
+    c.node(2).core.lease.release_local();
+    c.node(2).step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::SegmentPublished { seq: 0, epoch: 0 },
+    });
+    assert!(c.node(2).core.hold_rec_dirty());
+    Faults::write(false);
+    let key = c.key;
+    let out = c.hear_nudge(2, 1, key, XferNo(2));
+    assert!(lease_request(&out).is_none(), "asked: {out:?}");
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_state, 1);
+}
+
+/// The restore gate on the key: the record of another lease's hold is not
+/// restored when the epoch carries a lease of someone else.
+#[test]
+fn a_hold_record_of_another_lease_is_not_restored() {
+    let mut c = Cluster::new(&[1, 2]);
+    assert_eq!(c.rec(1), Some(c.held(0, 1)));
+    c.restart(1);
+    let other = Carrier {
+        node: 2,
+        epoch: c.key.epoch + 1,
+        expires_unix_ms: c.key.expires_unix_ms + 1,
+    };
+    let ev = c.report_event(Some(other), true, true, false);
+    c.node(1).step(ev);
+    assert!(
+        !c.node(1).core.lease.epoch_held(),
+        "restored for another lease"
+    );
+}
+
+/// Closing with a `Given` record of the carried lease ends nothing: that
+/// node's hold is another's (a direct call of `end_epoch_hold`).
+#[test]
+fn a_close_with_a_given_record_writes_no_end() {
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, false);
+    assert_eq!(c.rec(1), Some(c.given(1, 2)));
+    let h1 = c.node(1);
+    assert!(!h1.core.end_epoch_hold(&h1.meta, true));
+    assert_eq!(c.rec(1), Some(c.given(1, 2)), "a close over a give");
+}
+
+/// The closed-carried number belongs to the carrier's own lease only
+/// (`adoption_number`, called directly: the one caller passes the carried
+/// key, so the guard is defensive).
+#[test]
+fn the_closed_carried_number_is_for_the_nodes_own_lease() {
+    let mut c = Cluster::new(&[1, 2]);
+    let (own, other) = (c.key, Carrier { node: 2, ..c.key });
+    for key in [own, other] {
+        c.node(1).core.pr.hold_rec = HoldRecState::Known(Some(HoldRecord::Ended {
+            key,
+            n: XferNo(3),
+            reclaim: Reclaim::Owed,
+        }));
+        let number = c.node(1).core.adoption_number(key, Adopt::ClosedCarried);
+        assert_eq!(number, (key == own).then_some(XferNo(3)));
+        assert_eq!(c.node(1).core.adoption_number(key, Adopt::Fresh), None);
+    }
+}
+
 // ---- the ask rotation ----
 
 /// T16: an epoch-mode acquisition moves on past a member that declined or
@@ -1562,6 +1765,19 @@ fn an_offer_is_refused_by_a_node_that_cannot_take_it() {
     let mut c = Cluster::new(&[1, 2]);
     let req = waiting(&mut c, 2, 1);
     c.node(2).core.lease.force_lost();
+    c.hear(
+        2,
+        1,
+        req,
+        HandoffAnswer::Hold(c.offer(1, OfferKind::Transfer)),
+    );
+    assert!(!c.node(2).core.lease.epoch_held(), "a deposed node took it");
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_closed, 1);
+    // Deposed before a restart: only the persisted flag says so.
+    let mut c = Cluster::new(&[1, 2]);
+    let req = waiting(&mut c, 2, 1);
+    c.node(2).meta.persist_lost(true).unwrap();
+    assert!(!c.node(2).core.lease.lost);
     c.hear(
         2,
         1,

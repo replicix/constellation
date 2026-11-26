@@ -5120,7 +5120,25 @@ impl Core {
         }
         if state.active && !before.active {
             let mut adopt_via = Adopt::Fresh;
-            let closed_carried = self.epoch_closed_carried();
+            // A retry of an earlier activation's adoption is moot.
+            self.pr.adopt_retry = None;
+            let mut closed_carried = self.epoch_closed_carried();
+            // FX-5: the record decides before the lease is touched. A
+            // record that forbids the re-hold (a `Given` of the carried
+            // lease: a peer may hold a later number; an unreadable one)
+            // leaves neither the hold nor the lease: the branch below
+            // falls through as for no closed claim.
+            let mut record_unreadable = false;
+            if closed_carried.is_some() {
+                let allowed = self
+                    .my_carried_key()
+                    .and_then(|key| self.adoption_number(key, Adopt::ClosedCarried))
+                    .is_some();
+                if !allowed {
+                    record_unreadable = matches!(self.pr.hold_rec, HoldRecState::Unreadable);
+                    closed_carried = None;
+                }
+            }
             let alone = members.iter().all(|m| *m == self.cfg.node_id);
             if closed_carried.is_some() && !alone && self.epoch_closed_claim_in_doubt() {
                 // The activation carries the lease this node's close let
@@ -5135,6 +5153,11 @@ impl Core {
                 // persisted hold). No hold: this node owes the epoch's
                 // close and the lease's re-claim instead (`owes_move`),
                 // as for a lease it was releasing at the activation.
+                self.owe_epoch_move(replica);
+            } else if record_unreadable {
+                // The record cannot be read: fail closed. No hold and no
+                // lease; this node owes the epoch's close and the lease's
+                // re-claim, as in the doubt above.
                 self.owe_epoch_move(replica);
             } else if let Some((lease, tag)) = closed_carried {
                 // The activation carries the lease this node's last
@@ -5218,11 +5241,14 @@ impl Core {
                 self.epoch_tenure_resumed(None, false, replica);
             }
         } else if state.active {
-            self.adopt_reaffirm(now, replica);
+            let via = self.pr.adopt_retry.unwrap_or(Adopt::Fresh);
+            self.adopt_reaffirm(now, replica, via);
         }
         self.adopt_late(now, replica);
         self.restore_epoch_hold(now, replica);
         if !state.open {
+            // No adoption is pending in a closed epoch.
+            self.pr.adopt_retry = None;
             // The epoch closed: no move is owed any more (this node's own
             // close made it a re-claim, `end_epoch_hold`; anyone else's
             // means the carried lease moved).
@@ -5319,7 +5345,7 @@ impl Core {
     /// Re-affirming (a holder carrying S3 authority through an epoch that
     /// was already active when it acquired), at every report and again at
     /// every round while an adoption's write failed.
-    fn adopt_reaffirm(&mut self, now: Now, replica: &dyn Replica) {
+    fn adopt_reaffirm(&mut self, now: Now, replica: &dyn Replica, via: Adopt) {
         let members = self.pr.epoch_members.clone();
         if self.epoch.active
             && self.lease.usable(now, &self.cfg)
@@ -5329,7 +5355,7 @@ impl Core {
             && self.epoch_may_carry(&members)
         {
             let epoch = self.lease.epoch().unwrap_or(1);
-            self.adopt_epoch_hold(now, epoch, Adopt::Fresh, replica);
+            self.adopt_epoch_hold(now, epoch, via, replica);
         }
     }
 
@@ -5445,9 +5471,10 @@ impl Core {
         self.retry_owed_strand(self.ship.next_seq, self.ship.max_epoch, replica);
         // FX-5: before the busy check, whatever this node's job is.
         self.nudge_hold_recipient(out);
-        if self.pr.adopt_retry {
-            // An adoption's record write failed: try again each round.
-            self.adopt_reaffirm(now, replica);
+        if let Some(via) = self.pr.adopt_retry {
+            // An adoption's record write failed: try again each round,
+            // by the way it was first tried.
+            self.adopt_reaffirm(now, replica, via);
             self.adopt_late(now, replica);
         }
         if self.job.is_some() {

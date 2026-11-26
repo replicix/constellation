@@ -674,7 +674,9 @@ only by its recipient and only until that node passes it, and at most one
 node holds. The record replaces the earlier ended-hold records: `Ended`
 (closed, owing the re-claim or not) and `Given` refuse a second adoption of
 the same lease, and the one edge back to `Held` is the closed-carried
-activation, at the number it closed at. A lost answer recovers from
+activation, at the number it closed at; the record is consulted before the
+lease is held again, so a `Given` leaves neither hold nor lease, and a failed
+`Held` write is retried the same way at the next report or round. A lost answer recovers from
 persisted state alone: a giver that holds nothing re-offers its number to
 its recipient when asked, and nudges it at its ordinary round
 (`EpochHoldNudge`, no state, no timer), the recipient answering the nudge

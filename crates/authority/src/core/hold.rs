@@ -18,8 +18,8 @@
 //!
 //! The record is the hold: in memory the node never holds without a
 //! `Held` record of it, and a restart re-adopts exactly the record.
-//! Uniqueness of the hold follows from the numbers (ADR text of
-//! FX-5): gives are totally ordered by `n`, an offer of `n` is takeable
+//! Uniqueness of the hold follows from the numbers (plan 46
+//! §5.7): gives are totally ordered by `n`, an offer of `n` is takeable
 //! only by its recipient, and only until that node has passed `n`.
 //!
 //! The record is read once per process (`HoldRecState`); a value that
@@ -475,7 +475,7 @@ impl Core {
     /// or `None` when the record forbids the adoption (a record of `key`
     /// of any kind but the closed-carried re-hold of an `Ended`, one this
     /// node cannot read).
-    fn adoption_number(&self, key: HoldKey, via: Adopt) -> Option<XferNo> {
+    pub(super) fn adoption_number(&self, key: HoldKey, via: Adopt) -> Option<XferNo> {
         match (&self.pr.hold_rec, via) {
             (HoldRecState::Unreadable, _) => None,
             (HoldRecState::Known(None), _) => Some(XferNo(0)),
@@ -496,7 +496,8 @@ impl Core {
     /// `Held { key, n, at }` is written durably first: no in-memory hold
     /// without a durable record of it. `false`: no hold (the record forbids
     /// it, or it could not be written); the caller's event does not adopt,
-    /// and `adopt_retry` has the late path try again at the next round.
+    /// and a failed write sets `adopt_retry` to `via`: the next report and
+    /// round try again the same way.
     pub(crate) fn adopt_epoch_hold(
         &mut self,
         now: Now,
@@ -512,10 +513,10 @@ impl Core {
         };
         if !self.persist_hold_rec(replica, HoldRecord::Held { key, n, at: epoch }) {
             self.stats.epoch_hold_adopt_persist_failed += 1;
-            self.pr.adopt_retry = true;
+            self.pr.adopt_retry = Some(via);
             return false;
         }
-        self.pr.adopt_retry = false;
+        self.pr.adopt_retry = None;
         self.adopt_epoch_hold_in_memory(now, epoch, replica);
         true
     }
