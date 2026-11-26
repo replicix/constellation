@@ -872,12 +872,15 @@ fn fx5_two_members_clean() {
 }
 
 /// `N = 3`, `f = 1`: G→R→Q chains and stale records at former holders.
-/// No rows (they only block gives: the journal rule) and two transfers,
-/// to stay in memory; the two-member run has three and a row.
+/// No rows (they only block gives: the journal rule), two transfers and
+/// three asks not prompted by a nudge (G→R's, R→Q's, and a stale one), to
+/// stay in memory; the two-member run has three transfers, a row and
+/// unbounded asks.
 #[test]
 fn fx5_three_members_clean() {
     let m = FlexEpochs {
         max_transfers: 2,
+        free_asks: Some(3),
         ops: vec![],
         ..xfer(full())
     };
