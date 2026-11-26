@@ -14161,6 +14161,52 @@ fn flex_seed_797_passes_on_flex_crash_and_flex_tight() {
     }
 }
 
+/// FX-5, S1 (option B): the lost answer of class S through the sim's own
+/// wiring. `+holdloss` loses the first answer that hands an epoch hold over
+/// (the giver has recorded the give; the requester never hears of it), on
+/// seeds of `flex-tight` where a hold is transferred. Every check passes
+/// (`+commit+identity+settle+durability+unsettled`), the answer was lost,
+/// the giver nudged, and its re-offer was taken: the hold found its way back.
+/// Without the nudge or the re-offer, or before the transfer numbers
+/// (nobody holds the epoch for good: the unsettled `EIO`s of seed 797's
+/// class), it fails.
+#[test]
+fn epoch_hold_answer_lost_in_flight_finds_its_way_back() {
+    for &seed in HOLD_LOSS_SEEDS {
+        let cfg = [
+            "commit",
+            "identity",
+            "settle",
+            "durability",
+            "unsettled",
+            "holdloss",
+        ]
+        .into_iter()
+        .fold(base_config("flex-tight"), config_variant);
+        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("flex-tight+commit+identity+settle+durability+unsettled+holdloss {seed}: {e}")
+        });
+        assert_eq!(
+            report.hold_answers_lost, 1,
+            "seed {seed}: no answer was lost, the scenario is vacuous"
+        );
+        let (mut nudges, mut reoffers_taken) = (0u64, 0u64);
+        for s in report.stats.values() {
+            nudges += s.epoch_hold_nudges;
+            reoffers_taken += s.epoch_hold_reoffers_taken;
+        }
+        assert!(nudges > 0, "seed {seed}: no nudge was sent");
+        assert!(reoffers_taken > 0, "seed {seed}: no re-offer was taken");
+    }
+}
+
+/// The seeds of `epoch_hold_answer_lost_in_flight_finds_its_way_back`: seeds
+/// of `flex-tight` where the first hold transfer happens and every check
+/// passes with the lost answer (chosen by a scan of 0..1600; the seeds that
+/// fail there fail the unsettled-`EIO` ceiling of the label with or without
+/// the fault).
+const HOLD_LOSS_SEEDS: &[u64] = &[231, 289, 360, 364, 455, 533, 556, 592, 657, 675];
+
 /// Plan 30 §M11 phase 2b round 2: the seed whose successor root replayed
 /// a delegate-accepted shadow ahead of the delegate's earlier
 /// transactions (a per-directory linearizability violation); now the
@@ -16230,6 +16276,12 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
             }
         }
         "unclocked" => unclocked(cfg),
+        // FX-5: the first answer that hands an epoch hold over is lost in
+        // flight (`SimConfig::epoch_hold_answer_lost`).
+        "holdloss" => SimConfig {
+            epoch_hold_answer_lost: true,
+            ..cfg
+        },
         // Plan 45 §12 O1: a requester installs an accepted reply even
         // when the sequencer evaluated it on state it has not applied
         // (M5's `speculate_on_stale_base`). A delegate's reply base

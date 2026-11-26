@@ -459,6 +459,10 @@ pub struct SimConfig {
     pub lock_mirror_drop: f64,
     /// ... from this many ms into the run on (the mirrors before arrive).
     pub lock_mirror_drop_from_ms: u64,
+    /// FX-5: the first answer that hands an epoch hold over is lost in
+    /// flight (`Bus::set_hold_answer_loss`): the lost answer of class S, the
+    /// giver recorded the give and the requester never hears of it.
+    pub epoch_hold_answer_lost: bool,
     /// Random faults drawn from the seed, in addition to `faults`.
     pub random_faults: usize,
     pub faults: Vec<ScheduledFault>,
@@ -1362,6 +1366,7 @@ impl Default for SimConfig {
             p2p_drop: 0.0,
             lock_mirror_drop: 0.0,
             lock_mirror_drop_from_ms: 0,
+            epoch_hold_answer_lost: false,
             random_faults: 2,
             faults: Vec::new(),
             settle_ms: 90_000,
@@ -1620,6 +1625,8 @@ pub struct Report {
     pub probe_races: u64,
     pub s3_gets: u64,
     pub p2p_sent: u64,
+    /// FX-5: epoch-hold answers the bus lost (`SimConfig::epoch_hold_answer_lost`).
+    pub hold_answers_lost: u64,
     pub converged_checked: bool,
     /// M12 round 2: ops the modelled FUSE fast path executed
     /// (`SimConfig::fast_path`).
@@ -6191,6 +6198,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_stream_faults(cfg.stream_faults.clone());
     bus.set_beats_lost(cfg.beats_lost);
     bus.set_mirror_drop(cfg.lock_mirror_drop, cfg.lock_mirror_drop_from_ms);
+    bus.set_hold_answer_loss(cfg.epoch_hold_answer_lost);
     bus.set_deleg_answer_delay(cfg.deleg_answer_delay);
     bus.set_seal_tail_delay_ms(match cfg.seal_after_read_ms {
         0 => std::env::var("AUTHORITY_SIM_SEAL_AFTER_READ_MS")
@@ -8147,6 +8155,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         .load(std::sync::atomic::Ordering::Relaxed);
     report.s3_gets = counts.gets;
     report.p2p_sent = *bus.sent.lock().unwrap();
+    report.hold_answers_lost = *bus.hold_answers_lost.lock().unwrap();
     let context = format!(
         "\n  faults: {:?}\n  log: {:#?}\n  stats: {:#?}",
         report.faults, oracle.describe, report.stats

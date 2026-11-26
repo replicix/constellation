@@ -100,6 +100,34 @@ pub struct Bus {
     /// Plan 46 M0.3: where partitions and the attach and detach of nodes
     /// are recorded (`SimConfig` runs set it; a bare bus records nothing).
     reach: Mutex<Option<Arc<super::reach::Reach>>>,
+    /// FX-5 (`SimConfig::epoch_hold_answer_lost`): the first answer that
+    /// hands an epoch hold over is lost in flight.
+    hold_loss: Mutex<HoldLoss>,
+    /// Answers lost by that fault (0 or 1 a run).
+    pub hold_answers_lost: Mutex<u64>,
+}
+
+/// The scripted loss of one epoch-hold answer: armed by the knob, it
+/// remembers the epoch-mode requests (`LeaseRequest` with
+/// `epoch_applied`) in flight and takes the first answer to one of them that
+/// carries a hold. No random draw, so no other configuration's stream moves.
+#[derive(Debug, Default)]
+struct HoldLoss {
+    armed: bool,
+    /// `(answerer, requester, request)` of the epoch-mode requests seen.
+    epoch_requests: HashSet<(NodeId, NodeId, OpId)>,
+}
+
+/// Whether `msg` is an answer that hands an epoch hold over. The one line
+/// that depends on the answer's wire shape.
+fn carries_hold(msg: &PeerMsg) -> bool {
+    matches!(
+        msg,
+        PeerMsg::LeaseHandoff {
+            answer: constellation_authority::HandoffAnswer::Hold(_),
+            ..
+        }
+    )
 }
 
 /// M7: the stream faults (probabilities per frame).
@@ -146,6 +174,8 @@ impl Bus {
             rtts: Mutex::new(HashMap::new()),
             beats_lost: std::sync::atomic::AtomicBool::new(false),
             mirror_drop: Mutex::new((0.0, None)),
+            hold_loss: Mutex::new(HoldLoss::default()),
+            hold_answers_lost: Mutex::new(0),
             reach: Mutex::new(None),
         })
     }
@@ -177,6 +207,37 @@ impl Bus {
             && matches!(msg, PeerMsg::LockMirror { .. })
             && from.is_some_and(|f| tokio::time::Instant::now() >= f)
             && self.rng.lock().unwrap().random_bool(p)
+    }
+
+    /// Arm (or disarm) the loss of the first epoch-hold answer.
+    pub fn set_hold_answer_loss(&self, on: bool) {
+        self.hold_loss.lock().unwrap().armed = on;
+    }
+
+    /// Whether the scripted loss takes this message (see [`HoldLoss`]).
+    fn hold_answer_lost(&self, from: NodeId, to: NodeId, msg: &PeerMsg) -> bool {
+        let mut loss = self.hold_loss.lock().unwrap();
+        if !loss.armed {
+            return false;
+        }
+        match msg {
+            PeerMsg::LeaseRequest {
+                req,
+                epoch_applied: Some(_),
+            } => {
+                loss.epoch_requests.insert((to, from, *req));
+                false
+            }
+            PeerMsg::LeaseHandoff { req, .. }
+                if carries_hold(msg) && loss.epoch_requests.contains(&(from, to, *req)) =>
+            {
+                loss.armed = false;
+                drop(loss);
+                *self.hold_answers_lost.lock().unwrap() += 1;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Plan 30 §M9: what the directory reports as the RTT from `a` to
@@ -324,6 +385,10 @@ impl Bus {
             return;
         }
         *self.sent.lock().unwrap() += 1;
+        if self.hold_answer_lost(from, to, &msg) {
+            *self.dropped.lock().unwrap() += 1;
+            return;
+        }
         let mut delay = self.delay();
         if matches!(msg, PeerMsg::MutateReply { .. }) {
             if let Some(extra) = self.reply_delay.lock().unwrap().get(&from) {
