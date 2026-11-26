@@ -71980,6 +71980,7 @@ A root appending a delegate's stream built its segments slower over a run (the b
 - **Test.** `ship_origin_check_cost_tests::the_ship_origin_guard_costs_the_batch_not_the_shipped_history` (timing-based, medians, about 10x margin): the guard's median after 20,500 shipped delegate rows is at most 4x its cost after 500, plus 300 us. Red before (release 69 us to 2.91 ms, debug 0.66 to 26.7 ms), green after.
 - **Matrix** (p50, fix against main, 6 runs per arm, A/P/A2 rotation, ext4 / xfs / btrfs / tmpfs): topology 3 forward rename 0.42 / 0.37 / 0.38 / 0.40, forward unlink 0.52 / 0.40 / 0.48 / 0.40, forward create 0.72 / 0.53 / 0.51 / 0.83, delegate chmod 0.52 to 0.54, delegate unlink 0.65 to 0.69, forward flock p90 0.42 to 0.61 (2 to 2.5x faster). Topologies 1 and 2: no resolved cell.
 - **Accepted regression (topology 4, user decision 2026-11-24).** Delegate chmod 1.25 to 1.30x and unlink 1.16 to 1.20x p50 on all four file systems; other topology-4 cells neutral. The root's ship rate is no longer throttled by its growing build, so it issues about 28 % more, smaller segments (about 2,500 to about 3,200 SegmentPuts), and the delegate tails each as a LogStream step of about 100 us on its own core. The delegate's journal-to-backup-ack time is unchanged. Main's topology-4 numbers were partly an artefact of the slow build, which batched the delegate's rows into fewer segments.
+- **Accepted regression (topology 9, the same cost; user decision 2026-11-25).** A bisect of topology 9 from `060e6fa6` to `a70304d7` (A/B/B/A, 12 runs per arm, xfs and ext4) puts its slowdown on `bff69ae3` alone; every other landing in the range is neutral. At p50, `060e6fa6` against `a70304d7`: delegate rename-across xfs 347 to 429 us (1.24, interval [1.06, 1.34]) and ext4 360 to 426 us (1.19, [1.06, 1.26]); 4 writers in one subtree, create, xfs 1,433 to 1,605 us (1.12, [1.00, 1.22]), ext4 1.01 (noisy); 4 writers in two subtrees 1.00 to 1.04, unresolved. At p90: rename-across +13 to +29 %, one subtree +5 to +14 %, two subtrees +1 to +5 %. The mechanism is topology 4's: the faster build raises the segments per op in the one-subtree and rename phases from about 0.45 to about 0.75 to 0.85, and the delegate (the root's backup too) pays a LogStream step, a BackupAppend and a stream acknowledgement per segment on its own core, about +50 to +100 us per op. The two-subtree phase barely changes its segment rate (0.35 to 0.41) and its latency. btrfs and tmpfs were not bisected; their `a70304d7` levels match (rename-across 429 to 448 us). The fix that would recover topologies 4 and 9 is the same design item (fewer segments per op, or the tail work off the delegate core).
 - **Cures tried for the tail cost, all failed:**
   - Cheaper delegate tail apply (tailapply): no from-start scan on the delegate; its per-segment apply is ~60–75 us and batch-bounded; a cost fix saves only 10–15 us.
   - Driver priority lane (drvprio): client events taken ahead of tail work. t4 chmod still 1.22x; the core is non-preemptive, so the tail work only moves.
@@ -72024,12 +72025,16 @@ W14 class K (`flex-tight+commit+identity+settle+durability` 460, `flex-tight-lat
 - **Tests** (`hold_ack`): `a_failed_retag_at_the_holds_release_answers_eio_as_uncommitted`, `..._answers_a_remote_requester_eio_uncommitted` (the `Reply` arm), `a_failed_retag_in_a_hold_is_an_error_and_the_retry_answers` (own path), `an_answer_parked_under_the_archive_is_the_holds_when_the_hold_releases_it` (own and remote), `an_answer_parked_in_an_earlier_epochs_hold_is_re_tagged_to_the_current_one`, `an_answer_the_archive_covers_keeps_its_label_in_a_hold`, `a_refused_park_released_by_the_hold_keeps_its_refusal`, `an_own_answer_in_a_hold_re_tags_only_the_rows_weaker_than_the_holds`, `an_answer_that_waited_for_no_copy_is_not_relabelled_by_a_hold`, `an_answer_parked_as_the_current_hold_is_released_as_it_is`, `a_hold_that_ends_before_the_release_leaves_the_answer_as_it_was_given`.
 - **Nits.** `hold_answer_class` asserts `hold_group()`; the `reclass_journal_tx` doc says which targets keep the row's version; the let-chain is not available (edition 2021).
 
-## Plan 46 M1.2 exit (2026-11-22, brought up to date on `a70304d7`, 2026-11-24)
+## Plan 46 M1.2 exit (2026-11-22; closed at `4e44fd24`, 2026-11-26)
 
-M1.2 (one stream per node, no lone delegate, C3 verbatim) is code-complete on `main` at `060e6fa6`. The exit is not closed yet. The fixes under
-"Landed since `060e6fa6`" changed the authority code after R1 and R2 ran, so R1 (plain) and R2's delegate scenarios run again on the close commit:
-the first `main` with the orphan-nonroot fix (under "Open"). The places for those results are marked `TODO(R1 close)` and `TODO(R2 close)`. Until
-then this entry states the evidence as of `a70304d7`.
+M1.2 (one stream per node, no lone delegate, C3 verbatim) was code-complete on `main` at `060e6fa6`. It closes at `4e44fd24`, pending the Fable
+check of this write-up. The fixes under "Landed since `060e6fa6`" changed the authority code after R1 and R2 first ran, so both ran again on the
+close commit `4e44fd24` (orphanfix), the first `main` with the orphan-nonroot fix: R1 in the plain, idle-release and slow-lease-read arms, and R2
+as the full harness catalogue. The performance evidence (§8 against `5907c65d`, topologies 1 to 5 and 9) and R3 ran on `a70304d7`: orphanfix adds
+only a liveness branch (a usable root ending another node's released stream) that steady-state runs never take, so `a70304d7` stands as the
+performance base.
+
+`af161727` (WP6.9, test-only) and `30a4b497` (FX-1, M1.4 work) landed after the close commit and are not part of this exit.
 
 M1.2's code is steps 0 to 16, each with its own entry above. The step 16 strict flip and its review fixes are "M1.2 close: B5 and D1 fixes, strict
 defaults", 2026-11-15.
@@ -72037,9 +72042,9 @@ defaults", 2026-11-15.
 The milestone review (Fable, 2026-11-18) ended "close with conditions".
 
 - Its MUSTs:
-  - M1, a stale exit sweep: R1 below, which runs once more on the close commit.
-  - M2, the harness catalogue and plan 45's gates: R2 and R3 below; R2's delegate scenarios run once more on the close commit.
-  - M3, this write-up: this entry, complete once the two close-commit re-runs are in.
+  - M1, a stale exit sweep: R1 below, re-run on the close commit `4e44fd24`.
+  - M2, the harness catalogue and plan 45's gates: R2 (the full catalogue, on `4e44fd24`) and R3 (on `a70304d7`) below.
+  - M3, this write-up: this entry, with the close-commit re-runs in.
   - M4, the L2b pin: closed by the pin's retirement with its unreachability argument ("M4: the L2b orphan-end pin retired with its argument",
     `e64c4ba1`).
 - Its SHOULDs:
@@ -72058,7 +72063,7 @@ The plan's M1.2 header listed three items as open on 2026-11-16. All three are c
 
 ### Landed since `060e6fa6`
 
-Each change has its own entry above, with its fail-before evidence, gates and sweeps. All of them are on `a70304d7`.
+Each change has its own entry above, with its fail-before evidence, gates and sweeps. All of them are on the close commit `4e44fd24`.
 
 | change | commits | class | entry |
 |---|---|---|---|
@@ -72072,6 +72077,7 @@ Each change has its own entry above, with its fail-before evidence, gates and sw
 | segbuild: the segment build costs the batch, not the shipped history | `c2a9fd1d`, `bff69ae3`, `0aa474c1`, `d6578c51` | performance; topology 4 cost accepted (below) | "The segment build costs the batch, not the shipped history (segbuild)" |
 | readopt2: the re-adoption retry tests and the sim pin of seed 1578 | `d7b122bd` | tests | "Two liveness bugs of the leave and the re-adoption (readoptfix)" |
 | vfix: a forward that waits on unshipped rows starts its round at once | `35c96eed`, `a7b76f1a`, `a70304d7` | performance (scheduling only) | "A forward that waits on unshipped rows starts its round at once (vfix)" |
+| orphanfix: a usable root ends another node's released stream; an operator's leave waits for it; the failed end write retries; sim checker C5 (`orphan_empty_stream`) | `7b2c2b36`, `8339c737`, `7a2079b9`, `3cd45a8f`, `d9e41276`, `7012ccd1`, `4e44fd24` | liveness (the close commit) | "A usable root ends another node's released stream (orphanfix)" |
 
 `36db5771` was the first close-commit candidate: the interim R1 and R2 re-runs below ran on it. Everything after it in the table landed later.
 
@@ -72135,9 +72141,48 @@ Nothing in the plain arm is integrity class.
 
 Every change in "Landed since `060e6fa6`" after `36db5771` ran its own sweeps on the labels it touches; none was a full re-sweep.
 
-`TODO(R1 close)`: the plain arm, every label at 2,000 seeds, on the close commit (after the orphan-nonroot fix), against the `36db5771`
-re-sweep: the commit, the label count, the invariant totals, the failing labels by class, and each seed that fails only on the close commit with
-its verdict.
+*On the close commit `4e44fd24` (2026-11-25), against the `36db5771` re-sweep.* Both trees were built fresh from their own archives, and each
+sweep ran with its own tree's simulator and labels.
+
+- **Plain arm** (M1.2's criterion; §12: "plain, the flex strict flags stay with M1.4"): 295 labels with seeds 0..1999, 590,000 runs.
+  - I1, I2, I2c, I4, I5, exactly-once and panics are 0 on every label. The `m03` ceilings are green.
+  - 21 labels have a failing seed, the same 21 as on `36db5771`; 10,322 failing seeds in all (10,330 on the base). By class:
+    - 15 negative controls, meant to fail: `acks3-runtime-lag-unaware` 1,424; `backup-lag-in-margin-unaware` 736 (737);
+      `backup-runtime-lag-unaware` 1,980 (1,988); `delegated-core-stall-unlaned`, `-root-unlaned` and `-root-backup-unprobed` 2,000 each;
+      `fast-takeover-skewed-successor-credited` 1; `locks-core-stall-backup-long-blind` 22, `-unfresh` 33, `-dated-at-return` 3,
+      `-beats-unprobed` 2; `locks-late-stale-mirror-naive` 40; `locks-writer-hold-delegated-unsettled-own-clock` 13 (12);
+      `strict-isolated-reader-skewed-credited` 52; `far-root-writes-shared-designee-runs` 1 (WP6.1's control).
+    - 6 tracked items, as on the base: `locks-core-stall-backup-long`, `-beats` and `-slow-lease`, 2 each (946, 1838: `LockIdle` unanswered,
+      plan 41 L5/L6); `double-seal-after-the-grace` 5 (vacuous under that clock mix); `backup-lag-keeps-its-backup` 3 (362, 1045, 1552, a
+      spurious backup drop); `sticky-handover-busy` 1 (1071, WP6.9: the handover oracle's clock slack, fixed after the close by `af161727`,
+      test-only).
+  - Lock mutual exclusion: 105 seeds (104 on the base), all in negative controls (`fast-takeover-skewed-successor-credited` 1, `-blind` 20,
+    `-unfresh` 31, `-naive` 40, `-own-clock` 13).
+  - Seeds failing only on the close commit: `locks-writer-hold-delegated-unsettled-own-clock` 1176 and 1455 (lock mutual exclusion); 1525
+    of the same label fails only on the base. Each replayed 5 times on both trees: 1176 and 1455 fail 5 of 5 on `4e44fd24` and pass 5 of 5
+    on `36db5771`, 1525 the reverse. The label is a negative control (the own-clock knob); this is a seed shift of the control, not a product
+    failure. The other base-only seeds are in negative controls (`backup-lag-in-margin-unaware` 582; `backup-runtime-lag-unaware` 8 seeds).
+- **Idle-release arm** (`AUTHORITY_SIM_STICKY_IDLE_MS=1200`), the 27 `sticky-*` labels at 2,000 seeds. This arm and the next belong to M1.3's
+  exit; they ran here because the root's own sticky stream is what orphanfix touches.
+  - I1, I2, I2c, I4 and I5 are 0. 8 failing seeds in 6 labels (26 seeds in 7 labels on the base).
+  - Gone against the base: every `no_live_grant_off_roster` seed (`sticky-leave` 208 and 15 of `sticky-s4-leave`), and every base seed of
+    `sticky-s4-merge` (150, 1235, 1580, 1685, 1710; four of them I4) and of `sticky-s4-root-restart` (163, 1235; one I4).
+  - Failing on both: `sticky-handover-busy` 1071 (WP6.9, above); `sticky-root-designee-inbox` and `-skew` 1096 (never answered).
+  - Failing only on the close commit, each with its verdict:
+    - `sticky-holder-restarts-placed` 487, 678 and 839, `orphan_empty_stream` on the root's own stream. An oracle artefact, not a product
+      bug (2026-11-26 diagnosis). The root grants itself a placed sticky subtree; the idle release journals `StreamReleased`, and the release
+      is held for the read delegations the root granted under it to a peer that is rebooting, so the recall fails at the transport and the
+      root waits out each grant (the read TTL, 1.8 to 5.2 s). The run's quiescence predicate has no term for that held release, so the C5
+      checker, new in orphanfix (the base cannot fail it), judges the stream mid-release. With 30 s more settle each seed ends the stream at
+      the grant's expiry (487 at 1,849 ms, 678 at 2,886 ms, 839 at 5,231 ms after the release). Of 54,000 idle `sticky-*` seeds only these
+      three show it. A sim-only fix (quiescence waits while a usable root lists an empty stream, bounded by the settle, the checker unchanged)
+      is in progress. Replays: 5 of 5 fail on `4e44fd24` idle; 5 of 5 pass on the base and on `4e44fd24` plain.
+    - `sticky-s4-merge` 75 and `sticky-s4-root-restart` 1144: a client op never answered within 540 s, `waiting: None`. The known
+      never-answered class (with 1096 above) of M1.3's WP6.5 and WP6.7. 75 fails 5 of 5 on the close commit and passes on the base; 1144
+      also failed on orphanfix's own base `a70304d7` in its landing sweep.
+- **Slow-lease-read arm**, the 3 `long-delegated*` labels at 2,000 seeds: 0 failing seeds, as on the base.
+
+Against the plan's row this is zero I1, I2, I2c and I5 in all three arms, and no product failure in the plain arm.
 
 **R2: the harness catalogue, seed 42.**
 
@@ -72171,10 +72216,31 @@ The run used `6474e424`, in six shards, plus a root run for the scenarios that n
 - `delegated-op-latency`, `lock-contention-delegated`, `lock-contention-delegated-moves`, `root-failover-with-delegates`;
 - `delegate-partition`, idle and under CPU hogs.
 
-The full catalogue has not run since `6474e424`.
+Between `6474e424` and the close commit the full catalogue did not run.
 
-`TODO(R2 close)`: the same delegate and backup-takeover scenarios on the close commit (after the orphan-nonroot fix): the commit, the count
-passed, and each failure with its cause.
+*On the close commit `4e44fd24` (2026-11-25): the full catalogue, seed 42, not only the delegate scenarios.* 333 scenarios. The first pass was
+disturbed by a full tmpfs scratch quota and an overlapping script; every row that failed in it was discarded and re-run one at a time with the
+scratch directory on xfs (the `CAP_SYS_ADMIN` scenarios as root).
+
+- 327 passed outright. Among them: every delegate and backup-takeover scenario of the interim set (including the two former hangs);
+  `stress-ng-fs`, `-faults`, `-flap` and `-nodes`; `singleton-peer-join`, `-nobackup` and `-backup`; `two-subtrees-one-stream-rename`;
+  `epoch-holder-retired`; `delegate-partition`; plan 41's `lock-contention-*` scenarios; plan 40's `readdirplus-*` and `readdir-*` rows; plan
+  42's `kernel-race-*` rows (both transports); `hardlink-burst-single` and `-two-node`; 10 of the 11 passthrough and zero-copy scenarios that
+  need `CAP_SYS_ADMIN` (the eleventh is below).
+- 2 flaky, neither a close-commit regression:
+  - `endpoint-wedge-probe` failed 3 of 5 on `4e44fd24` and 3 of 5 on `36db5771`: one FUSE request completed past the 18 s stall threshold
+    across the freezes (`stalled_completed` 1, nothing left in flight). Pre-existing.
+  - `passthrough-local-writer` (root) failed once with `ETXTBSY` on "a read-write open once nothing is open" and passed the next 2 of 2.
+- 2 skipped: `sqlite-first-touch-latency` and `sqlite-two-nodes`, because `sqlite3` is not installed on the run host.
+- 2 not run for want of set-up: `lock-device-stall-lone-node` (needs `CONSTELLATION_HARNESS_STALL_DM`, a device-mapper device to freeze) and
+  `lock-xcheckfs-cell` (needs `CONSTELLATION_HARNESS_XC_SCRIPT`, the xcheckfs cell). Both stop in their first millisecond, before any mount.
+
+No scenario fails on the close commit for a product reason. `placement-hot` and `delegated-group-switch`, named in the §6 row, are simulator
+labels; both are clean in R1's plain arm.
+
+**Gates on the close commit.** orphanfix's landing gate ran on `4e44fd24` (tree `3a45ecb1`): every test log verified, with no failure and no
+panic; the simulator suite (625 tests), the determinism gate and the gate's harness scenarios passed. Each change in "Landed since `060e6fa6`"
+has its own gates in its entry.
 
 **R3: plan 45's box gates and both `hardlink-burst` scenarios, quiet box, four file systems.**
 
@@ -72198,7 +72264,27 @@ The first R3, on `6474e424`, failed two gates:
 The btrfs cause was bisected to `e7c863ec`. A single node doubted that it was a singleton after a long core step, so its root ops waited for the
 archive until the next registry poll. `060e6fa6` fixes it without moving a rule or a margin. The xfs 1.29 did not repeat.
 
-R3 has not been re-run since `060e6fa6`.
+*Re-run on `a70304d7` (2026-11-25), the performance base of the close (above).* The same method: 5 interleaved rounds per file system, and
+xfs 10 more rounds of the links cell (`PHASES=link,burst,control`) because its last-100 gate sat at the line. Every gate holds
+(`bench/hardlink/RESULTS.md`, "Re-run on `a70304d7`").
+
+| gate, median over 5 cells (max) | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| one bogo-op <= 5 s (s) | 1.52 (2.11) | 1.15 (1.42) | 2.25 (2.43) | 1.17 (1.52) |
+| `meta.db` <= 64 MB, max (MB) | 30.3 | 29.5 | 30.5 | 29.3 |
+| remount after `kill -9` <= 2 s (s) | 0.554 (0.605) | 0.544 (0.574) | 0.584 (0.594) | 0.504 (0.544) |
+| link p50 at 2,000 / first 100 <= 1.5 | 0.84 | 1.17; 15 rounds: 1.20 | 1.36 | 1.00 |
+| link p50 last 100 / first 100 <= 1.5 | 1.01 | 1.51; 15 rounds: 1.20 | 1.14 | 1.38 |
+| create p99 during the links / control <= 1.2 | 0.89 | 1.13; 15 rounds: 1.179 (322 / 273 us) | 1.00 | 0.97 |
+| create p99 during the unlinks / control <= 1.2 | 0.97 | 0.57; 15 rounds: 0.70 | 1.01 | 0.56 |
+| `hardlink-burst-single` median (ceiling 2.5 s) | 0.674 | 0.590 | 0.676 | 0.635 |
+| `hardlink-burst-two-node` median (ceiling 10 s) | 2.783 | 2.679 | 2.690 | 2.650 |
+
+- Both `hardlink-burst` scenarios passed 5 of 5 on every file system.
+- xfs last-100 / first-100: 1.51 at 5 rounds, over the 1.5 gate by 0.01; at 15 rounds 1.20. The 100-link p50 of a single cell is noisy
+  (per-run 0.78 to 1.62), so the 15-round median is the reading. Accepted as a pass (2026-11-25).
+- xfs create p99 during the links: 1.179 at 15 rounds, 6 of the 15 per-run ratios above 1.2 (1.13 at 5 rounds). It passes, thinly, as on
+  `060e6fa6` (1.187 at 10 rounds); a regression of a few percent would flip it.
 
 Not gates, recorded:
 
@@ -72206,7 +72292,7 @@ Not gates, recorded:
 - The share of 0.5 to 2.6 ms creates on btrfs is 3 to 14 % per cell.
 - xfs creates are about 10 to 15 % slower than at plan 45.
 
-**Performance (§8).** Five measurements, each against its own base. All ran `ack-latency` on the quiet timing box, release builds, on the file
+**Performance (§8).** Six measurements, each against its own base. All ran `ack-latency` on the quiet timing box, release builds, on the file
 systems named. Ratios are p50 of the new build over its base; `*` marks a cell whose 95 % interval is above 1.03.
 
 1. *2026-11-14, A = the commit before step 1, B = the main of that day, topologies 1 to 5, four file systems.* It found two regressions:
@@ -72217,7 +72303,7 @@ systems named. Ratios are p50 of the new build over its base; `*` marks a cell w
    The other LAN cells moved 4 to 15 % at p50 on small ops, with 3 or 4 runs per variant. The B4 re-run judged them noise on ext4 and tmpfs,
    topologies 2 and 4.
 2. *2026-11-23, A = `5907c65d` (the parent of step 1), B = `060e6fa6`, topologies 1 to 5 and 9, four file systems, 6 + 6 LAN runs and 4 + 4 WAN
-   runs per file system* (`bench/commit-rule/RESULTS.md`, "Plan 46 §8, after M1.2"). This is the older base for the three matrices below.
+   runs per file system* (`bench/commit-rule/RESULTS.md`, "Plan 46 §8, after M1.2"). Measurements 3 to 5 below each have their own base; measurement 6 is again against `5907c65d`.
    - B is 5 to 65 % faster than A on the LAN topologies 2 to 4 at p50.
    - Topology 5's root ops at about 1.4 ms are ADR-50's documented archive wait.
    - Flags: topology 1 is unresolved at ±3 % for the 30 to 100 us ops (A/A' alone moves 0.68 to 1.53); ext4 unlink pooled 1.37, interval
@@ -72252,23 +72338,97 @@ systems named. Ratios are p50 of the new build over its base; `*` marks a cell w
      - The A2/A control of the topology 1 holder cells swings as far: chmod 1.27 (xfs), 1.39 (btrfs), 1.49 (tmpfs) at p50.
      - An 8-round re-run of topology 1 on ext4 gave holder unlink p50 0.94 [0.78, 1.18] and p90 0.95 [0.72, 1.17], with no flagged cell.
 
-Not measured: no A/B/B/A of the current main against the §8 base `5907c65d` since `060e6fa6`, so the net of the accepted topology 4 cost
-against that base, and topology 5 and 9 after segbuild and vfix, are not on record. Topology 1's ±3 % is not resolvable on 30 to 100 us ops
-with this harness (the same caveat as the earlier milestones).
+6. *2026-11-25, m12perf2: A = `5907c65d` (the §8 base), B = `a70304d7` (the close commit's performance base), topologies 1 to 5 and 9,
+   four file systems. A/B/B/A blocks: 6 + 6 LAN runs per file system, topology 1 at 12 + 12, topology 5 (`net-wan`) at 4 + 4.* Ratio = median
+   of the B runs over median of the A runs, 95 % bootstrap interval over runs; "better" = interval below 1.00, "worse" = interval above 1.03.
+   This is the net of M1.2 and everything landed since against the plan's base (`bench/commit-rule/RESULTS.md`, "Plan 46 M1.2 close").
+
+   *Topologies 2 to 4, p50 B/A, the range over ops:*
+
+   | topology | ext4 | xfs | btrfs | tmpfs |
+   |---|---|---|---|---|
+   | 2 holder | 0.63 to 0.97 | 0.62 to 0.96 | 0.74 to 0.97 | 0.60 to 0.83 |
+   | 2 forward | 0.61 to 0.95 | 0.62 to 0.92 | 0.60 to 0.95 | 0.63 to 0.76 |
+   | 3 delegate | 0.52 to 0.94 | 0.50 to 0.92 | 0.49 to 0.95 | 0.51 to 0.71 |
+   | 3 forward | 0.31 to 0.91 | 0.32 to 0.84 | 0.31 to 0.91 | 0.33 to 0.50 |
+   | 4 delegate | 0.81 to 0.97 | 0.76 to 0.94 | 0.79 to 0.97 | 0.80 to 0.87 |
+   | 4 forward (`flock`) | 0.82 | 0.82 | 0.88 | 0.81 |
+
+   - No cell of topologies 2 to 4 is worse, at p50 or p90: 199 of the 224 cells are better and 25 unresolved (p90 0.34 to 1.08).
+   - Topology 3's forward rename is 0.41 to 0.46 at p50; measurement 2's 1.19 on xfs is gone (vfix).
+   - Topology 4's delegate chmod is 0.85 / 0.87 / 0.83 / 0.87 and unlink 0.83 / 0.78 / 0.83 / 0.80 (ext4 / xfs / btrfs / tmpfs): the accepted
+     segbuild cost (measurement 4) leaves the net against `5907c65d` faster.
+
+   *Topology 1, p50 B/A [95 % interval], 12 runs per arm:*
+
+   | op | ext4 | xfs | btrfs | tmpfs |
+   |---|---|---|---|---|
+   | chmod | 1.04 [0.76, 1.38] | 1.07 [0.83, 1.44] | 1.24 [0.84, 1.59] | 0.98 [0.74, 1.30] |
+   | create | 0.93 [0.75, 1.08] | 1.01 [0.93, 1.06] | 1.01 [0.82, 1.13] | 1.06 [0.95, 1.13] |
+   | rename | 0.81 [0.72, 1.26] | 0.99 [0.79, 1.37] | 1.10 [0.83, 1.40] | 1.06 [0.86, 1.32] |
+   | unlink | 0.97 [0.73, 1.27] | 1.09 [0.77, 1.44] | 1.20 [1.01, 1.32] | 0.92 [0.77, 1.32] |
+   | write | 0.998 [0.992, 1.011] | 0.999 [0.988, 1.007] | 1.001 [0.993, 1.007] | 1.06 [0.96, 1.18] |
+
+   - Five `write` cells are inside ±3 % by their interval (p50 on ext4, xfs and btrfs, p90 on xfs and btrfs). The 30 to 100 us ops are
+     unresolved: their intervals are ±25 to 45 %. No cell is resolved worse; btrfs chmod and unlink point up 20 to 24 % (btrfs unlink's
+     interval starts at 1.007, inside the 1.03 bar).
+   - **Verdict, user decision (2026-11-25):** "Accept: none resolved worse". The topology 1 criterion closes as "no detectable regression":
+     ±3 % is below this host's resolution for the 30 to 100 us ops, no cell is resolved worse, and the five `write` cells are confirmed
+     inside ±3 %.
+
+   *Topology 5 (`net-wan`, 100 samples), p50 A to B in us:*
+
+   | op | ext4 | xfs | btrfs | tmpfs |
+   |---|---|---|---|---|
+   | root create | 94 to 1,472 | 95 to 1,438 | 88 to 1,440 | 87 to 1,472 |
+   | root rename | 88 to 1,482 | 86 to 1,444 | 100 to 1,454 | 70 to 1,439 |
+   | root unlink | 84 to 1,489 | 82 to 1,457 | 66 to 1,436 | 64 to 1,422 |
+   | root chmod | 56 to 1,449 | 38 to 1,466 | 43 to 1,427 | 36 to 1,434 |
+   | root write | 3,153 to 4,579 | 1,966 to 3,422 | 3,118 to 4,470 | 146 to 1,404 |
+   | forward chmod | 34 to 1,438 | 41 to 1,332 | 50 to 1,382 | 33 to 1,424 |
+   | forward unlink | 69 to 1,457 | 80 to 1,440 | 66 to 1,343 | 68 to 1,431 |
+
+   - The about 1.4 ms on the ops the lone root answers is ADR-50's archive wait, the documented interim cost, unchanged from measurement 2
+     (ext4 root create 1,479, rename 1,466, unlink 1,478, chmod 1,460, forward unlink 1,448 us on `060e6fa6`).
+   - The forwarded create, write, rename and `flock` (a WAN round trip) are 0.89 to 1.05, none worse; forward rename is better (0.92 to 0.94).
+
+   *Topology 9 (B only; the topology has no A), median over 6 runs of p50 / p90 / largest p99 in us:*
+
+   | file system | 4 writers, two subtrees, create | 4 writers, one subtree, create | delegate rename-across |
+   |---|---|---|---|
+   | ext4 | 1,048 / 2,060 / 2,956 | 2,103 / 2,886 / 4,594 | 448 / 1,150 / 1,961 |
+   | xfs | 952 / 1,220 / 1,787 | 1,648 / 1,922 / 2,399 | 444 / 567 / 759 |
+   | btrfs | 970 / 1,245 / 1,937 | 1,648 / 1,903 / 2,546 | 448 / 568 / 743 |
+   | tmpfs | 956 / 1,215 / 1,877 | 1,640 / 1,907 / 2,436 | 429 / 554 / 744 |
+
+   - Against measurement 2 (`060e6fa6`): two subtrees 0.80 to 0.93 ms to 0.95 to 1.05 ms; one subtree 1.3 to 1.8 to 1.6 to 2.1 ms;
+     rename-across 0.33 to 0.37 to 0.43 to 0.45 ms.
+   - A bisect (A/B/B/A, 12 runs per arm, xfs and ext4) puts it on segbuild's `bff69ae3` alone, with the mechanism of topology 4's cost; at
+     p50 rename-across +24 % on xfs and +19 % on ext4 (both resolved), one subtree +12 % on xfs (interval 1.00 to 1.22), two subtrees 0 to
+     +4 %. The numbers are in the segbuild entry.
+   - **Accepted by the user (2026-11-25):** the segbuild acceptance of topology 4 extends to topology 9's rename-across and
+     one-subtree rows, as the same cost; no ADR changed.
+
+Topology 1's ±3 % stays below this host's resolution for the 30 to 100 us ops, as at the earlier milestones; the user's decision above closes
+it for M1.2.
 
 ### Exit checklist (plan 46 §6, M1.2 row)
 
-- [ ] Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds: met, plain, on `0d157e56` (R1) and `36db5771` (interim);
-  `TODO(R1 close)` on the close commit.
-- [ ] The harness catalogue green: R2 on `6474e424`, its two failures fixed by `3238bea6`; the delegate scenarios 24 of 24 on `36db5771`;
-  `TODO(R2 close)` on the close commit.
-- [x] Plan 45's box gates and both `hardlink-burst` scenarios on ext4, xfs, btrfs and tmpfs (R3, `060e6fa6`).
+- [x] Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds: met on the close commit `4e44fd24`, plain arm, 295 labels (R1, as
+  decided: the plain arm is M1.2's criterion, the flex strict flags stay with M1.4); the idle-release and slow-lease-read arms, run on the same
+  commit, have none either. Earlier: `0d157e56` and `36db5771` (interim).
+- [x] The harness catalogue green: R2 on `4e44fd24`, the full catalogue, 333 scenarios; 327 pass, and no failure has a product cause (2
+  flaky, one of them pre-existing on `36db5771`; 2 skipped for a missing `sqlite3`; 2 that need a device-mapper or xcheckfs set-up).
+- [x] Plan 45's box gates and both `hardlink-burst` scenarios on ext4, xfs, btrfs and tmpfs (R3, `060e6fa6`, and again on `a70304d7`; xfs
+  last-100 / first-100 read at 15 rounds, 1.20, accepted as a pass).
 - [x] The "Deleted" table complete (below).
 - [x] The milestone reviewed (Fable, 2026-11-18), with its conditions closed.
-- [x] §8's A/B/B/A after M1.2 run and recorded (measurements 2 to 5 above), with topology 4's delegate chmod and unlink cost accepted by the
-  user (2026-11-24).
-- [ ] Topology 1 within ±3 %: resolved and neutral for `write`; unresolved, neither met nor broken, for the 30 to 100 us ops.
-- [ ] The Fable check of this exit write-up, after the two close-commit re-runs.
+- [x] §8's A/B/B/A after M1.2 run and recorded: measurement 6 (`a70304d7` against `5907c65d`, topologies 1 to 5 and 9, four file systems),
+  with measurements 2 to 5. Topology 4's delegate chmod and unlink cost (user, 2026-11-24) and topology 9's rename-across and one-subtree
+  cost (user, 2026-11-25) are accepted as segbuild's; topology 5 is ADR-50's documented wait.
+- [x] Topology 1 within ±3 %: decided by the user (2026-11-25), "no detectable regression": no cell resolved worse, the five `write` cells
+  inside ±3 %, the 30 to 100 us ops below the host's resolution.
+- [ ] The Fable check of this exit write-up.
 
 ### Deleted
 
@@ -72309,7 +72469,8 @@ These serve the root's own rows and the replay queue.
 
 ### Open, not part of M1.2's exit (carried)
 
-- WP6.9: `sticky-handover-busy` seed 1071. This is the oracle's clock slack (above).
+- WP6.9: `sticky-handover-busy` seed 1071, the oracle's clock slack (above). Since landed after the close commit, `af161727` (test-only:
+  the oracle judges `handover_inflight` on the node's wait clock, as the core times it).
 - singlefix step 2: defer the singleton-to-non-singleton bump during a lapse-only doubt. This needs a Fable review first. It is the rest of btrfs's
   slow share.
 - The absolute create-latency signal that plan 45's ratio gate does not see (btrfs about 2.1 ms against 0.4 ms). The unexplained xfs shift of
@@ -72317,11 +72478,12 @@ These serve the root's own rows and the replay queue.
 - F2: `Meta::outcome_row`'s unbounded reverse seek over retired heads while a release is held (CPU only).
 - The idle and slow-lease-read arms of the same sweep found WP6.1 (landed, `00a269fd`) and WP6.2 to WP6.8. They are M1.3 exit items. Since
   landed: WP6.2 (`36db5771`), WP6.3 (`b7a371ee`, with `9fda6186`) and WP6.2b (`a1134ebb`); WP6.5 to WP6.8 are open.
-- The orphan-nonroot fix, in progress; the close commit waits for it. Another node's empty logged stream is skipped by `delegation_sync`
-  ("step 10 gives it an end"), but step 10 lives only in the appending root's memory, so after a deposition or a restart nobody ends it, and
-  the holder's own (non-root) leave waits on it for ever, while an operator's leave of the holder completes with the stream still listed.
-  Liveness only, no integrity impact; two core tests fail on main, and sim seed 2734 of `delegated-root-deposed-delegate-dies` shows a stream left without an end from 20.6 s to 64 s (the run passes only because nobody leaves).
-  The reviewed spec: a usable root takes on such a stream through the inherit path, with its cursor at `log_stream_idx`, and ends it.
+- The orphan-nonroot fix landed as the close commit (orphanfix, `4e44fd24`). Its new checker C5 then showed three idle seeds on the root's
+  own stream (`sticky-holder-restarts-placed` 487, 678, 839; R1 above): an oracle artefact, the run's quiescence declared before a held
+  release ends at its read grants' expiry. A sim-only fix (quiescence waits while a usable root lists an empty stream) is in progress, with
+  a check that it masks no real never-ended stream.
+- The never-answered class of the idle arm: `sticky-s4-merge` 75, `sticky-s4-root-restart` 1144, `sticky-root-designee-inbox` and `-skew`
+  1096 (M1.3, WP6.5 and WP6.7).
 - Fix B (queued after vfix, a reviewed design): when the root forwards into delegate stream g, `deps.pending` walks back from the journal tip
   past the root's appended rows of g that `deps.streams[g]` already covers, and no others (self-checking; never below the session's own). Its first step measures what is left on top of vfix; it is implemented only
   if a gain remains. Not an exit blocker.
@@ -72329,3 +72491,16 @@ These serve the root's own rows and the replay queue.
   before segbuild (the topology 3 `DelegateStream` step grows from 54 to 90 us). Queued, performance only.
 - The re-pin check: vfix moved seven pinned sim seeds off their paths and re-pinned them by reach (`a70304d7`); 38574 and 2994 were dropped
   without a replacement. Whether each re-pinned seed still fails on its original fix's parent, where that can be built, is not checked yet.
+- Segbuild's accepted cost on topologies 4 and 9 (the delegate's per-segment tail work on its own core): the design item that would recover
+  it (fewer segments per op, or the tail work off the delegate core) is open.
+- R3's thin margins: xfs create p99 during the links is 1.179 at 15 rounds (6 of 15 runs above 1.2), so a regression of a few percent would
+  flip it; xfs last-100 / first-100 needs more than 5 rounds to read.
+- Harness rows that the exit runs did not exercise or that are flaky: `lock-device-stall-lone-node` and `lock-xcheckfs-cell` need a set-up
+  the catalogue run lacks; the two `sqlite-*` scenarios need `sqlite3` on the run host; `endpoint-wedge-probe` fails about 3 runs in 5 on
+  the close commit and on `36db5771` alike (one FUSE request completes past the stall threshold); `passthrough-local-writer` saw one
+  `ETXTBSY`.
+- The slow-lease-read arm ran only the `long-delegated*` labels at the close; `placement-hot` seed 593 under slow lease reads is not shown
+  separately here (the label is clean in the plain arm).
+- Topology 1's ±3 % at later gates: the user's 2026-11-25 decision closes it for M1.2; whether it carries to M1.3's and the stage-1 gates is
+  their decision to take.
+- Procedural: M1.3 work went ahead before M1.2's exit closed (§12 asks for each milestone's review before the next starts).

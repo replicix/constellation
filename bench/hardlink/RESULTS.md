@@ -271,3 +271,27 @@ values in brackets.
     one, and the ratio was 1.10 against 1.00.
   - It is not bisected. The 1.29 of the first run did not repeat (1.19 at 5
     rounds, 1.187 at 10).
+
+### Re-run on `a70304d7` (2026-11-25)
+
+The same method on `a70304d7`, the performance base of the M1.2 close commit `4e44fd24` (which adds only a liveness branch these runs never
+take). 5 interleaved rounds per file system; the xfs links cell got 10 more rounds (`PHASES=link,burst,control`), because its last-100 gate
+read 1.51 at 5 rounds. Every gate holds.
+
+| gate, median over 5 cells (max) | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| one `stress-ng link` bogo-op <= 5 s (s) | 1.52 (2.11) | 1.15 (1.42) | 2.25 (2.43) | 1.17 (1.52) |
+| `meta.db` after it <= 64 MB: max (MB) | 30.3 | 29.5 | 30.5 | 29.3 |
+| remount after `kill -9` <= 2 s (s) | 0.554 (0.605) | 0.544 (0.574) | 0.584 (0.594) | 0.504 (0.544) |
+| `link` p50 at 2,000 names / first 100 <= 1.5 | 0.84 (1.29) | 1.17 (1.75); 15: 1.20 | 1.36 (1.57) | 1.00 (1.66) |
+| `link` p50 last 100 / first 100 <= 1.5 | 1.01 (1.97) | 1.51 (1.62); 15: 1.20 | 1.14 (1.74) | 1.38 (1.61) |
+| concurrent `create` p99 during the links / control <= 1.2 (ratio of medians; us) | 0.89 (2328 / 2616) | 1.13 (319 / 281); 15: 1.179 (322 / 273) | 1.00 (2118 / 2117) | 0.97 (672 / 691) |
+| concurrent `create` p99 during the unlinks / control <= 1.2 | 0.97 | 0.57; 15: 0.70 | 1.01 | 0.56 |
+
+- xfs last 100 / first 100: the per-run values over 15 rounds are 0.78 to 1.62, so 5 rounds do not read it; the 15-round median, 1.20, is
+  the reading (accepted as a pass, 2026-11-25).
+- xfs create p99 during the links: 1.179 at 15 rounds, 6 of the 15 per-run ratios above 1.2 (1.13 at 5 rounds). The margin is as thin as on
+  `060e6fa6` (1.187 at 10).
+- `hardlink-burst-single` medians 0.590 to 0.676 s (ceiling 2.5 s) and `hardlink-burst-two-node` 2.650 to 2.783 s (ceiling 10 s); every run
+  passed, 40 of 40.
+- btrfs's concurrent create p99 during the links is still about 2.1 ms, with the control as slow (not a gate; above).

@@ -573,4 +573,72 @@ sends no forward, so the zero-wait poll keeps the timer wheel), the A2/A control
 | holder unlink | 0.942 [0.778, 1.180] | 0.949 [0.718, 1.168] |
 | holder write | 0.993 [0.987, 0.999] | 1.000 [0.981, 1.013] |
 
-Not measured since the §8 run: the current main against `5907c65d`, and topologies 5 and 9 after these two changes.
+Neither matrix compares the current main with `5907c65d`, or measures topologies 5 and 9 after these two changes; the next section does.
+
+## Plan 46 M1.2 close: `a70304d7` against `5907c65d` (2026-11-25)
+
+A = `5907c65d` (the parent of M1.2 step 1, the §8 base), B = `a70304d7` (the performance base of the M1.2 close commit `4e44fd24`, which adds
+only a liveness branch that these runs never take). Release builds, each from its own `git archive`, a fresh target dir, on the quiet timing
+host, nothing else running. sha256 of the daemon / harness: A `761a2ea5...c2d7bb` / `32535b6a...d3ddfa6` (the §8 run's A harness),
+B `2e89d980...62dd4d` / `7a5066b6...6f5876`. Each arm runs its own harness and daemon. LAN: `ACK_LATENCY_SAMPLES=300
+ACK_LATENCY_TOPOLOGIES=1,2,3,4,9`, 3 A/B/B/A blocks (6 runs per arm), topology 1 with 3 more blocks of topology 1 alone (12 runs per arm);
+WAN: topology 5 under `net-wan`, 100 samples, 4 runs per arm. Every file system is the run's `TMPDIR`. Ratio = median of the B runs over the
+median of the A runs, 95 % bootstrap interval over runs (10,000 resamples); "better" = interval below 1.00, "worse" = interval above 1.03;
+topology 1 also "in" when the interval lies within [0.97, 1.03].
+
+p50 B/A, the range over the ops:
+
+| topology | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| 2 holder | 0.63 to 0.97 | 0.62 to 0.96 | 0.74 to 0.97 | 0.60 to 0.83 |
+| 2 forward | 0.61 to 0.95 | 0.62 to 0.92 | 0.60 to 0.95 | 0.63 to 0.76 |
+| 3 delegate | 0.52 to 0.94 | 0.50 to 0.92 | 0.49 to 0.95 | 0.51 to 0.71 |
+| 3 forward | 0.31 to 0.91 | 0.32 to 0.84 | 0.31 to 0.91 | 0.33 to 0.50 |
+| 4 delegate | 0.81 to 0.97 | 0.76 to 0.94 | 0.79 to 0.97 | 0.80 to 0.87 |
+| 4 forward (`flock`) | 0.82 | 0.82 | 0.88 | 0.81 |
+
+Of the 224 cells of topologies 2 to 4 (p50 and p90), 199 are better and 25 unresolved; none is worse. p90 is 0.34 to 1.08. Topology 3's forward
+`rename` is 0.41 to 0.46 at p50: the §8 run's 1.19 on xfs is gone (vfix). Topology 4's delegate `chmod` is 0.83 to 0.87 and `unlink` 0.78 to
+0.83, so segbuild's accepted cost (segland, above) leaves the net against `5907c65d` faster.
+
+Topology 1, p50 B/A [95 % interval], 12 runs per arm:
+
+| op | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| chmod | 1.04 [0.76, 1.38] | 1.07 [0.83, 1.44] | 1.24 [0.84, 1.59] | 0.98 [0.74, 1.30] |
+| create | 0.93 [0.75, 1.08] | 1.01 [0.93, 1.06] | 1.01 [0.82, 1.13] | 1.06 [0.95, 1.13] |
+| rename | 0.81 [0.72, 1.26] | 0.99 [0.79, 1.37] | 1.10 [0.83, 1.40] | 1.06 [0.86, 1.32] |
+| unlink | 0.97 [0.73, 1.27] | 1.09 [0.77, 1.44] | 1.20 [1.01, 1.32] | 0.92 [0.77, 1.32] |
+| write | 0.998 [0.992, 1.011] | 0.999 [0.988, 1.007] | 1.001 [0.993, 1.007] | 1.06 [0.96, 1.18] |
+
+Five `write` cells are in (p50 ext4, xfs, btrfs; p90 xfs, btrfs). The 30 to 100 us ops are unresolved, their intervals ±25 to 45 %; none is
+worse. The user closed topology 1's ±3 % for M1.2 on 2026-11-25 as "no detectable regression" (PROGRESS, "Plan 46 M1.2 exit").
+
+Topology 5 (`net-wan`), p50 A -> B in us:
+
+| op | ext4 | xfs | btrfs | tmpfs |
+|---|---|---|---|---|
+| root create | 94 -> 1,472 | 95 -> 1,438 | 88 -> 1,440 | 87 -> 1,472 |
+| root rename | 88 -> 1,482 | 86 -> 1,444 | 100 -> 1,454 | 70 -> 1,439 |
+| root unlink | 84 -> 1,489 | 82 -> 1,457 | 66 -> 1,436 | 64 -> 1,422 |
+| root chmod | 56 -> 1,449 | 38 -> 1,466 | 43 -> 1,427 | 36 -> 1,434 |
+| root write | 3,153 -> 4,579 | 1,966 -> 3,422 | 3,118 -> 4,470 | 146 -> 1,404 |
+| forward chmod | 34 -> 1,438 | 41 -> 1,332 | 50 -> 1,382 | 33 -> 1,424 |
+| forward unlink | 69 -> 1,457 | 80 -> 1,440 | 66 -> 1,343 | 68 -> 1,431 |
+
+ADR-50's archive wait, as in the §8 run (ext4 root create 1,479 us on `060e6fa6`); the forwarded `create`, `write`, `rename` and `flock` (a WAN
+round trip) are 0.89 to 1.05, none worse.
+
+Topology 9 (B only), median over six runs of p50 / p90 / largest p99 (us):
+
+| file system | 4 writers, two subtrees, create | 4 writers, one subtree, create | delegate rename-across |
+|---|---|---|---|
+| ext4 | 1,048 / 2,060 / 2,956 | 2,103 / 2,886 / 4,594 | 448 / 1,150 / 1,961 |
+| xfs | 952 / 1,220 / 1,787 | 1,648 / 1,922 / 2,399 | 444 / 567 / 759 |
+| btrfs | 970 / 1,245 / 1,937 | 1,648 / 1,903 / 2,546 | 448 / 568 / 743 |
+| tmpfs | 956 / 1,215 / 1,877 | 1,640 / 1,907 / 2,436 | 429 / 554 / 744 |
+
+Slower than on `060e6fa6` (the §8 table): rename-across 0.33 to 0.37 -> 0.43 to 0.45 ms, one subtree 1.3 to 1.8 -> 1.6 to 2.1 ms, two subtrees
+0.80 to 0.93 -> 0.95 to 1.05 ms. A bisect of `060e6fa6..a70304d7` on xfs and ext4 (A/B/B/A, 12 runs per arm) puts it on segbuild's `bff69ae3`
+alone, the mechanism of topology 4's cost: rename-across p50 +24 % (xfs) and +19 % (ext4), both resolved; one subtree +12 % on xfs, interval
+1.00 to 1.22; two subtrees 0 to +4 %. The user extended segbuild's acceptance to these rows on 2026-11-25 (PROGRESS, the segbuild entry).
