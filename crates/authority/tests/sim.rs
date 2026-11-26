@@ -14131,38 +14131,34 @@ fn flex_crash_seed_30702_an_epoch_hold_goes_only_to_a_caught_up_member() {
     );
 }
 
-/// FX-5 (class S, flex-crash and flex-tight seed 797), S1: the lease holder is
-/// stopped for 5 s from 0.6 s, a two-member epoch carrying its lease forms
-/// meanwhile, and the other member's request for the hold queues at the
-/// stopped holder and times out. The holder, resumed, adopts the hold and
-/// serves the request to a requester that has stopped waiting: the answer
-/// is dropped, and before the fix nobody held the epoch for good (130
-/// unsettled `EIO`s, the epoch never closing). Now every check passes
-/// (`+commit+identity+settle+durability+unsettled`), the lost answer was
-/// seen, and the hold found its way back: the giver's nudge made the
-/// requester ask again, and it took the re-offer. Fails before the fix.
+/// FX-5 (class S, flex-crash and flex-tight seed 797), S1: the schedule that
+/// lost an epoch hold. The lease holder is stopped for 5 s from 0.6 s with a
+/// suspend inside the pause; a two-member epoch carrying its lease formed
+/// meanwhile, because the harness took the stopped holder for a member that
+/// acked (`pause_until` restarted `paused_since` inside a pause, which
+/// `try_form` reads as "paused for under 100 ms"). The other member's
+/// request for the hold queued at the stopped holder and timed out; the
+/// resumed holder handed the hold to a requester that had stopped waiting,
+/// and nobody held the epoch for good (130 unsettled `EIO`s, the epoch
+/// never closing). Every check passes now.
+///
+/// The harness keeps the pause going now (a stopped node acks nothing), so
+/// this schedule no longer forms that epoch and the seed no longer loses a
+/// hold: the directed tests of `core/fx5_tests.rs` are the regression tests
+/// of the transfer, and this seed stays as a run of the same labels. (Before
+/// the harness change the test also asserted that a transfer answer was
+/// dropped, that the giver nudged and that a re-offer was taken; it failed
+/// before the product change.)
 #[test]
-fn epoch_hold_lost_in_flight_seed_797_finds_its_way_back() {
-    let (mut dropped, mut reoffers_taken, mut nudges) = (0u64, 0u64, 0u64);
+fn flex_seed_797_passes_on_flex_crash_and_flex_tight() {
     for label in ["flex-crash", "flex-tight"] {
         let cfg = ["commit", "identity", "settle", "durability", "unsettled"]
             .into_iter()
             .fold(base_config(label), config_variant);
-        let report = run_seed(797, cfg).unwrap_or_else(|e| {
+        run_seed(797, cfg).unwrap_or_else(|e| {
             panic!("{label}+commit+identity+settle+durability+unsettled 797: {e}")
         });
-        for s in report.stats.values() {
-            dropped += s.epoch_hold_answers_dropped;
-            reoffers_taken += s.epoch_hold_reoffers_taken;
-            nudges += s.epoch_hold_nudges;
-        }
     }
-    assert!(
-        dropped > 0,
-        "no transfer answer was lost: the scenario is vacuous"
-    );
-    assert!(reoffers_taken > 0, "no re-offer was taken");
-    assert!(nudges > 0, "no nudge was sent");
 }
 
 /// Plan 30 §M11 phase 2b round 2: the seed whose successor root replayed

@@ -1233,8 +1233,21 @@ impl NodeHandle {
                 .saturating_duration_since(tokio::time::Instant::now())
                 .as_millis() as u64,
         );
-        *self.shared.paused_until.lock().unwrap() = Some(until);
-        *self.shared.paused_since.lock().unwrap() = Some(tokio::time::Instant::now());
+        // A pause in progress goes on from where it began and ends at the
+        // later of the two ends (a suspend or a second pause inside it does
+        // not restart it): a stopped process cannot ack an epoch proposal
+        // (`epochs::try_form` takes a node paused for more than 100 ms to
+        // ack nothing), which a reset `paused_since` made it do.
+        let now = tokio::time::Instant::now();
+        let mut paused_until = self.shared.paused_until.lock().unwrap();
+        let in_progress = paused_until.is_some_and(|old| now < old);
+        *paused_until = Some(match *paused_until {
+            Some(old) if in_progress => old.max(until),
+            _ => until,
+        });
+        if !in_progress {
+            *self.shared.paused_since.lock().unwrap() = Some(now);
+        }
     }
 
     /// Plan 43 C7b (review of spec commit 7): a suspended host. As a pause
