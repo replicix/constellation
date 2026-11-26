@@ -3043,7 +3043,8 @@ impl Core {
             // a refusal the store holds (the refusal is the answer, no
             // class is claimed for it).
             let released_by_refusal = refused.iter().any(|(i, _)| *i == id);
-            let want_hold: constellation_meta::RowCommit = self.root_rule(crate::core::Asker::Own).into();
+            let want_hold: constellation_meta::RowCommit =
+                self.root_rule(crate::core::Asker::Own).into();
             let hold_relabel = p.durable.is_some_and(|j| !self.archive_covers(j, shipped))
                 && !released_by_refusal
                 && self.hold_group()

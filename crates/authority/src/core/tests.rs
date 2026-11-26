@@ -73447,7 +73447,7 @@ mod hold_ack {
     #[test]
     fn a_failed_retag_in_a_hold_is_an_error_and_the_retry_answers() {
         use constellation_meta::{GroupOn, RowCommit};
-        let mut h = owner(0);
+        let h = owner(0);
         let rid = h.rid(1);
         journal_tagged(&h, rid, "pre", RowCommit::Singleton { config_version: 3 });
         constellation_meta::fail_reclass_on_this_thread_for_tests(1);
@@ -73458,11 +73458,8 @@ mod hold_ack {
             tag_of(&h, rid),
             Some(RowCommit::Singleton { config_version: 3 })
         );
-        let (outcome, source) = Core::eio_unless_recorded(
-            MutateOutcome::Abandoned,
-            failed,
-            RowCommit::LONE,
-        );
+        let (outcome, source) =
+            Core::eio_unless_recorded(MutateOutcome::Abandoned, failed, RowCommit::LONE);
         assert_eq!(outcome, MutateOutcome::Errno(Code::Io));
         assert_eq!(source, RowCommit::LONE);
         let want = RowCommit::group(1, GroupOn::Hold);
@@ -73503,7 +73500,10 @@ mod hold_ack {
         );
         assert_eq!(tag_of(&h, rid), Some(want));
         assert!(
-            matches!(peer_replies(&out, 3).as_slice(), [(MutateOutcome::Accepted { .. }, true)]),
+            matches!(
+                peer_replies(&out, 3).as_slice(),
+                [(MutateOutcome::Accepted { .. }, true)]
+            ),
             "{out:?}"
         );
         assert_eq!(tag_of(&h, rrid), Some(want), "the Reply arm re-tags too");
@@ -73561,7 +73561,10 @@ mod hold_ack {
             "released by the log: {out:?}"
         );
         assert!(
-            matches!(peer_replies(&out, 3).as_slice(), [(MutateOutcome::Accepted { .. }, true)]),
+            matches!(
+                peer_replies(&out, 3).as_slice(),
+                [(MutateOutcome::Accepted { .. }, true)]
+            ),
             "{out:?}"
         );
         for r in [rid, rrid] {
@@ -73587,9 +73590,7 @@ mod hold_ack {
         {
             // (The refusal's row is the rid's last, tagged as the create was.)
             let _class = constellation_meta::PendingClass::set(RowCommit::group(3, GroupOn::Root));
-            h.meta
-                .journal_refusal(rid, Code::Stale, None)
-                .unwrap();
+            h.meta.journal_refusal(rid, Code::Stale, None).unwrap();
         }
         assert_eq!(tag_of(&h, rid), Some(RowCommit::group(3, GroupOn::Root)));
         form_epoch(&mut h, 1);
@@ -73735,7 +73736,10 @@ mod hold_ack {
         // `an_own_answer_in_a_hold_re_tags_only_the_rows_weaker_than_the_holds`
         // has the re-tag itself.)
         let (rid, out) = create_nowait(&mut h, 1, "pre");
-        assert!(own_sources(&out, rid).is_empty(), "waits for a member: {out:?}");
+        assert!(
+            own_sources(&out, rid).is_empty(),
+            "waits for a member: {out:?}"
+        );
         assert_eq!(tag_of(&h, rid), Some(want));
         // The epoch closes (deposed or ended): no hold group any more.
         h.core.lease.release_local();
@@ -73750,7 +73754,11 @@ mod hold_ack {
             vec![crate::AnswerSource::Sequenced(want)],
             "released by the log with the label it was given: {out:?}"
         );
-        assert!(tag_of(&h, rid).is_none_or(|c| c == want), "{:?}", tag_of(&h, rid));
+        assert!(
+            tag_of(&h, rid).is_none_or(|c| c == want),
+            "{:?}",
+            tag_of(&h, rid)
+        );
     }
 
     #[test]
