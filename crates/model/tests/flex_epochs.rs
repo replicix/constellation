@@ -922,6 +922,8 @@ fn fx5_duplicates_clean() {
 fn fx5_retire_in_flight_clean() {
     let m = FlexEpochs {
         max_retires: 1,
+        // No rows: what a retire loses is `m14_*`'s subject.
+        ops: vec![],
         ..xfer(full())
     };
     assert_clean_checking(
@@ -1012,6 +1014,8 @@ fn fx5_knob_take_after_close_is_found() {
     let m = FlexEpochs {
         take_after_close: true,
         max_retires: 1,
+        // No rows: what a retire loses is `m14_*`'s subject.
+        ops: vec![],
         ..xfer(full())
     };
     let n = fx5_violates("fx5-after-close", &m, "single_authority");
