@@ -872,12 +872,19 @@ fn fx5_two_members_clean() {
 }
 
 /// `N = 3`, `f = 1`: G→R→Q chains and stale records at former holders.
+/// No rows (they only block gives: the journal rule) and two transfers,
+/// to stay in memory; the two-member run has three and a row.
 #[test]
 fn fx5_three_members_clean() {
+    let m = FlexEpochs {
+        max_transfers: 2,
+        ops: vec![],
+        ..xfer(full())
+    };
     assert_clean_checking(
         "fx5-three",
-        &xfer(full()),
-        &["transfer_taken", "reoffer_taken", "transferee_flush", "nudge_ask"],
+        &m,
+        &["transfer_taken", "reoffer_taken", "nudge_ask"],
         fx5_cap(),
         &[RECOVER, OWNER],
     );
@@ -922,6 +929,7 @@ fn fx5_duplicates_clean() {
 fn fx5_retire_in_flight_clean() {
     let m = FlexEpochs {
         max_retires: 1,
+        max_transfers: 1,
         // No rows: what a retire loses is `m14_*`'s subject.
         ops: vec![],
         ..xfer(full())
