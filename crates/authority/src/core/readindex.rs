@@ -3028,35 +3028,50 @@ impl Core {
                     }
                 }
             }
-            // FX-1 (class K): an answer parked under a root group (the
-            // rule its row was journaled under) and released by a hold
-            // group's member copy is the hold's, as an answer given in the
-            // hold is ([`Core::hold_answer_class`]): the row re-tagged so
-            // before the answer claims the class. Never the parked group's
-            // claim for a row whose configuration lists no member.
-            let held_by_hold_group = p.durable.is_some()
+            // FX-1 (class K): an answer parked under a class other than the
+            // hold's (a root group whose configuration lists no member, the
+            // archive, a singleton's, an earlier epoch's hold) and released
+            // while this node owns a hold group leaves as the hold's, as an
+            // answer given in the hold is ([`Core::hold_answer_class`]): the
+            // row re-tagged so before the answer claims the class. What
+            // released it is a member's copy (`park_released` reads the hold's
+            // acknowledgements in a hold group; the code does not check which
+            // member), so the hold's class is what committed the row, never
+            // the parked class's claim. Left alone: a `Final` class (it
+            // never waits); a row the archive covers (the archive released
+            // it, its label stays, and no unshipped row is left to re-tag);
+            // a refusal the store holds (the refusal is the answer, no
+            // class is claimed for it).
+            let released_by_refusal = refused.iter().any(|(i, _)| *i == id);
+            let want_hold: constellation_meta::RowCommit = self.root_rule(crate::core::Asker::Own).into();
+            let hold_relabel = p.durable.is_some_and(|j| !self.archive_covers(j, shipped))
+                && !released_by_refusal
                 && self.hold_group()
                 && match &p.what {
                     ParkedWhat::Reply { class, .. } | ParkedWhat::Finish { class, .. } => {
-                        matches!(
-                            class,
-                            constellation_meta::RowCommit::Group {
-                                on: constellation_meta::GroupOn::Root,
-                                ..
-                            }
-                        )
+                        !class.is_final() && *class != want_hold
                     }
                     _ => false,
                 };
             let mut hold_label = None;
-            if held_by_hold_group {
+            if hold_relabel {
                 if let ParkedWhat::Reply { rid, outcome, .. }
                 | ParkedWhat::Finish { rid, outcome, .. } = &mut p.what
                 {
-                    match self.hold_answer_class(replica, *rid) {
-                        Ok(label) => hold_label = Some(label),
-                        Err(_) => *outcome = MutateOutcome::Errno(Code::Io),
-                    }
+                    hold_label = Some(match self.hold_answer_class(replica, *rid) {
+                        Ok(label) => label,
+                        // The store failed the re-tag: the row keeps its
+                        // old tag, so the answer claims no group (the
+                        // parked class's claim is the K bug), and no
+                        // record of it either. `EIO`, sourced as this
+                        // node's uncommitted answer as
+                        // `eio_unless_recorded` does; the requester's retry
+                        // by rid re-tags and answers.
+                        Err(_) => {
+                            *outcome = MutateOutcome::Errno(Code::Io);
+                            constellation_meta::RowCommit::LONE
+                        }
+                    });
                 }
             }
             if downgraded {

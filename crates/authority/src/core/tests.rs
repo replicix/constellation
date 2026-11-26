@@ -73300,6 +73300,459 @@ mod hold_ack {
         );
     }
 
+    // ---- FX-1 round 2: the class of an answer a hold group releases ----
+
+    /// A node 1 owner of configuration version 3 under `policy`, listing
+    /// `backups`, before any epoch: the rule its answers park under.
+    fn pre_epoch(policy: replicix_objcas::AckPolicy, backups: Vec<NodeId>) -> Harness {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        {
+            let held = &mut h.core.lease.held.as_mut().unwrap().0;
+            held.config_version = 3;
+            held.singleton = false;
+            held.backups = backups;
+            held.ack_policy = policy;
+        }
+        h
+    }
+
+    /// The epoch forms: a hold group of node 1 and node 2.
+    fn form_epoch(h: &mut Harness, epoch: Epoch) {
+        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.core.pr.epoch_members = vec![1, 2];
+        h.core.epoch = EpochState {
+            open: true,
+            active: true,
+            ..Default::default()
+        };
+        assert!(h.core.hold_group());
+    }
+
+    fn own_sources(out: &[Action], rid: Rid) -> Vec<crate::AnswerSource> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::Reply {
+                    rid: r,
+                    reply: ClientReply::Outcome(_),
+                    source,
+                } if *r == rid => Some(*source),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn own_outcomes(out: &[Action], rid: Rid) -> Vec<MutateOutcome> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::Reply {
+                    rid: r,
+                    reply: ClientReply::Outcome(o),
+                    ..
+                } if *r == rid => Some(o.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The replies node 1 sent to `to`: (outcome, committed).
+    fn peer_replies(out: &[Action], to: NodeId) -> Vec<(MutateOutcome, bool)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(n, m)| match m {
+                PeerMsg::MutateReply {
+                    outcome, committed, ..
+                } if n == to => Some((outcome.clone(), *committed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tag_of(h: &Harness, rid: Rid) -> Option<constellation_meta::RowCommit> {
+        Replica::journal_class_of_rid(&h.meta, rid).map(|(_, c)| c)
+    }
+
+    /// Journal a row for `rid` tagged `tag` (a row of an earlier rule).
+    fn journal_tagged(h: &Harness, rid: Rid, name: &str, tag: constellation_meta::RowCommit) {
+        let _class = constellation_meta::PendingClass::set(tag);
+        constellation_meta::execute_mutate(&h.meta, &h.create(name), Some(rid)).unwrap();
+        assert_eq!(tag_of(h, rid), Some(tag));
+    }
+
+    /// FX-1 round 2, MUST 1, the release path: an own answer parked under
+    /// a root group and released by a member's copy in the hold whose
+    /// re-tag the store fails is `EIO`, sourced as this node's uncommitted
+    /// answer (`Lone`), never the parked root group's claim for a row the
+    /// store still tags so. The retry by rid re-tags and answers.
+    #[test]
+    fn a_failed_retag_at_the_holds_release_answers_eio_as_uncommitted() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = pre_epoch(replicix_objcas::AckPolicy::Backup, vec![2]);
+        let (rid, out) = create_nowait(&mut h, 1, "parked");
+        assert!(!accepted_to_client(&out, rid), "waits for the group");
+        form_epoch(&mut h, 1);
+        let tip = tip(&h);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+        let out = ack(&mut h, 2, 1, tip);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+        assert_eq!(
+            own_outcomes(&out, rid),
+            vec![MutateOutcome::Errno(Code::Io)],
+            "{out:?}"
+        );
+        assert_eq!(
+            own_sources(&out, rid),
+            vec![crate::AnswerSource::Sequenced(RowCommit::LONE)],
+            "uncommitted, not the root group's: {out:?}"
+        );
+        assert_eq!(
+            tag_of(&h, rid),
+            Some(RowCommit::group(3, GroupOn::Root)),
+            "the failed re-tag changed nothing"
+        );
+    }
+
+    /// The same for a remote requester (the `Reply` arm): `EIO`, not
+    /// committed, counted as the uncommitted answer it is.
+    #[test]
+    fn a_failed_retag_at_the_holds_release_answers_a_remote_requester_eio_uncommitted() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = pre_epoch(replicix_objcas::AckPolicy::Backup, vec![2]);
+        let (rid, out) = remote_create(&mut h, 3, 1, "parked");
+        assert!(peer_replies(&out, 3).is_empty(), "waits for the group");
+        form_epoch(&mut h, 1);
+        let tip = tip(&h);
+        let before = h.core.stats.ack_classes;
+        constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+        let out = ack(&mut h, 2, 1, tip);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+        assert_eq!(
+            peer_replies(&out, 3),
+            vec![(MutateOutcome::Errno(Code::Io), false)],
+            "{out:?}"
+        );
+        let after = h.core.stats.ack_classes;
+        assert_eq!(
+            (after[0] - before[0], after[2] - before[2]),
+            (0, 1),
+            "counted as an uncommitted (lone) answer"
+        );
+        assert_eq!(tag_of(&h, rid), Some(RowCommit::group(3, GroupOn::Root)));
+    }
+
+    /// The own path (`journaled_answer_class`): the store failing the
+    /// re-tag is an `Err` the caller answers `EIO` for (sourced
+    /// uncommitted by `eio_unless_recorded`), the row left as it was; the
+    /// retry then re-tags and answers the hold's class.
+    #[test]
+    fn a_failed_retag_in_a_hold_is_an_error_and_the_retry_answers() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = owner(0);
+        let rid = h.rid(1);
+        journal_tagged(&h, rid, "pre", RowCommit::Singleton { config_version: 3 });
+        constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+        let failed = h.core.journaled_answer_class(&h.meta, rid);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+        assert!(failed.is_err());
+        assert_eq!(
+            tag_of(&h, rid),
+            Some(RowCommit::Singleton { config_version: 3 })
+        );
+        let (outcome, source) = Core::eio_unless_recorded(
+            MutateOutcome::Abandoned,
+            failed,
+            RowCommit::LONE,
+        );
+        assert_eq!(outcome, MutateOutcome::Errno(Code::Io));
+        assert_eq!(source, RowCommit::LONE);
+        let want = RowCommit::group(1, GroupOn::Hold);
+        assert_eq!(h.core.journaled_answer_class(&h.meta, rid).unwrap(), want);
+        assert_eq!(tag_of(&h, rid), Some(want));
+    }
+
+    /// FX-1 round 2, MUST 2: an answer parked under the archive (no backup
+    /// listed, the root committing by the log) and released by a member's
+    /// copy once a hold group formed is the hold's, its row re-tagged so:
+    /// never `Archive` for a row only the owner and a member hold (a
+    /// deposition would drop an `Archive` row as carried by the log and
+    /// leave the member's copy the only one). Fails on the parent: the
+    /// answer keeps the archive's label and the row its tag.
+    #[test]
+    fn an_answer_parked_under_the_archive_is_the_holds_when_the_hold_releases_it() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = pre_epoch(replicix_objcas::AckPolicy::S3, vec![]);
+        let (rid, out) = create_nowait(&mut h, 1, "parked");
+        assert!(!accepted_to_client(&out, rid), "waits for the log: {out:?}");
+        assert!(
+            tag_of(&h, rid).is_some_and(RowCommit::is_archive),
+            "{:?}",
+            tag_of(&h, rid)
+        );
+        // A remote requester's answer parks the same way.
+        let (rrid, out) = remote_create(&mut h, 3, 2, "remote");
+        assert!(peer_replies(&out, 3).is_empty(), "{out:?}");
+        form_epoch(&mut h, 1);
+        let want = RowCommit::group(1, GroupOn::Hold);
+        let tip = tip(&h);
+        let before = h.core.stats.ack_classes;
+        let out = ack(&mut h, 2, 1, tip);
+        assert_eq!(
+            own_sources(&out, rid),
+            vec![crate::AnswerSource::Sequenced(want)],
+            "{out:?}"
+        );
+        assert_eq!(tag_of(&h, rid), Some(want));
+        assert!(
+            matches!(peer_replies(&out, 3).as_slice(), [(MutateOutcome::Accepted { .. }, true)]),
+            "{out:?}"
+        );
+        assert_eq!(tag_of(&h, rrid), Some(want), "the Reply arm re-tags too");
+        let after = h.core.stats.ack_classes;
+        assert_eq!(
+            (after[3] - before[3], after[0] - before[0]),
+            (0, 2),
+            "neither answer counted as the archive's"
+        );
+    }
+
+    /// FX-1 round 2, SHOULD 3: an answer parked as the hold of epoch 1 and
+    /// released in epoch 2 is epoch 2's, as a fresh answer would be; the
+    /// row follows. Fails on the parent: epoch 1's label and tag stay.
+    #[test]
+    fn an_answer_parked_in_an_earlier_epochs_hold_is_re_tagged_to_the_current_one() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = owner(0);
+        let (rid, out) = create_nowait(&mut h, 1, "parked");
+        assert!(!accepted_to_client(&out, rid), "{out:?}");
+        assert_eq!(tag_of(&h, rid), Some(RowCommit::group(1, GroupOn::Hold)));
+        // The next epoch: another hold group of nodes 1 and 2.
+        form_epoch(&mut h, 2);
+        let want = RowCommit::group(2, GroupOn::Hold);
+        let tip = tip(&h);
+        let out = ack(&mut h, 2, 2, tip);
+        assert_eq!(
+            own_sources(&out, rid),
+            vec![crate::AnswerSource::Sequenced(want)],
+            "{out:?}"
+        );
+        assert_eq!(tag_of(&h, rid), Some(want));
+    }
+
+    /// FX-1 round 2, SHOULD 1: released while the archive covers the row (a
+    /// segment carrying it landed), the answer was not released by the
+    /// hold: it keeps the label it parked with and no (gone) row is
+    /// re-tagged. Fails with the check removed: the answer names the hold.
+    #[test]
+    fn an_answer_the_archive_covers_keeps_its_label_in_a_hold() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = pre_epoch(replicix_objcas::AckPolicy::Backup, vec![2]);
+        let (rid, out) = create_nowait(&mut h, 1, "parked");
+        assert!(!accepted_to_client(&out, rid), "{out:?}");
+        let (rrid, _) = remote_create(&mut h, 3, 2, "remote");
+        form_epoch(&mut h, 1);
+        let tip = tip(&h);
+        h.core.note_shipped(&[], tip);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        let parked = RowCommit::group(3, GroupOn::Root);
+        assert_eq!(
+            own_sources(&out, rid),
+            vec![crate::AnswerSource::Sequenced(parked)],
+            "released by the log: {out:?}"
+        );
+        assert!(
+            matches!(peer_replies(&out, 3).as_slice(), [(MutateOutcome::Accepted { .. }, true)]),
+            "{out:?}"
+        );
+        for r in [rid, rrid] {
+            assert_ne!(
+                tag_of(&h, r),
+                Some(RowCommit::group(1, GroupOn::Hold)),
+                "no row of the log's is re-tagged to the hold"
+            );
+        }
+    }
+
+    /// FX-1 round 2, SHOULD 4: a park the store refused while it waited
+    /// (a drop wrote the rid's refusal) is answered the refusal, its
+    /// re-tag not attempted: a store that fails the re-tag changes nothing
+    /// for it, and never overwrites the refusal with `EIO`. Fails with the
+    /// skip removed: the answer is `EIO`.
+    #[test]
+    fn a_refused_park_released_by_the_hold_keeps_its_refusal() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = pre_epoch(replicix_objcas::AckPolicy::Backup, vec![2]);
+        let (rid, out) = create_nowait(&mut h, 1, "parked");
+        assert!(!accepted_to_client(&out, rid), "{out:?}");
+        {
+            // (The refusal's row is the rid's last, tagged as the create was.)
+            let _class = constellation_meta::PendingClass::set(RowCommit::group(3, GroupOn::Root));
+            h.meta
+                .journal_refusal(rid, Code::Stale, None)
+                .unwrap();
+        }
+        assert_eq!(tag_of(&h, rid), Some(RowCommit::group(3, GroupOn::Root)));
+        form_epoch(&mut h, 1);
+        let tip = tip(&h);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(1);
+        let out = ack(&mut h, 2, 1, tip);
+        constellation_meta::fail_reclass_on_this_thread_for_tests(0);
+        assert_eq!(h.core.stats.answers_refused_at_release, 1, "{out:?}");
+        assert_eq!(
+            own_outcomes(&out, rid),
+            vec![MutateOutcome::Errno(Code::Stale)],
+            "{out:?}"
+        );
+        assert_eq!(
+            tag_of(&h, rid),
+            Some(RowCommit::group(3, GroupOn::Root)),
+            "the refused park's row is not re-tagged"
+        );
+    }
+
+    /// FX-1 round 2, SHOULD 2, the own path: only a row weaker than, or
+    /// another's than, the hold's is re-tagged when answered in a hold: a
+    /// singleton's, a root group's, the archive's, an earlier epoch's
+    /// hold. A `Final` row and a delegate-group row (its version a
+    /// delegation's generation) keep their tags. Fails with the narrowing
+    /// removed: the `Final` and the delegate row are re-tagged.
+    #[test]
+    fn an_own_answer_in_a_hold_re_tags_only_the_rows_weaker_than_the_holds() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let hold = RowCommit::group(1, GroupOn::Hold);
+        let cases = [
+            (RowCommit::Singleton { config_version: 3 }, true),
+            (RowCommit::group(3, GroupOn::Root), true),
+            (RowCommit::group(3, GroupOn::Archive), true),
+            (RowCommit::group(9, GroupOn::Hold), true),
+            (hold, false),
+            (RowCommit::Final, false),
+            (RowCommit::group(5, GroupOn::Delegate), false),
+        ];
+        for (n, (before, retagged)) in cases.into_iter().enumerate() {
+            let h = owner(0);
+            let rid = h.rid(n as u64 + 1);
+            journal_tagged(&h, rid, &format!("r{n}"), before);
+            let answer = h.core.journaled_answer_class(&h.meta, rid).unwrap();
+            if retagged {
+                assert_eq!(answer, hold, "{before:?}");
+                assert_eq!(tag_of(&h, rid), Some(hold), "{before:?}");
+            } else {
+                assert_eq!(tag_of(&h, rid), Some(before), "left alone: {before:?}");
+            }
+        }
+    }
+
+    /// FX-1 round 2: a parked answer that waits for nothing durable
+    /// (`p.durable` is `None`: a recall, not the group) leaves as it
+    /// parked, its row untouched, in a hold group too: only an answer a
+    /// member's copy released is the hold's. Fails with the condition
+    /// removed: the answer names the hold and the row is re-tagged.
+    #[test]
+    fn an_answer_that_waited_for_no_copy_is_not_relabelled_by_a_hold() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = owner(0);
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        let parked = RowCommit::group(3, GroupOn::Root);
+        journal_tagged(&h, rid, "pre", parked);
+        let mut out = Vec::new();
+        h.core.park_reply(
+            h.clk(),
+            Default::default(),
+            None,
+            3,
+            OpId(77),
+            rid,
+            MutateOutcome::Abandoned,
+            None,
+            Default::default(),
+            0,
+            parked,
+            &mut out,
+        );
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(peer_replies(&out, 3).len(), 1, "released: {out:?}");
+        assert_eq!(tag_of(&h, rid), Some(parked), "no re-tag");
+    }
+
+    /// FX-1 round 2: an answer parked with the hold's own class is
+    /// released as it is: the check is the parked class against the
+    /// hold's, not the row's tag. Fails with the check removed: the row
+    /// (tagged otherwise here) is re-tagged.
+    #[test]
+    fn an_answer_parked_as_the_current_hold_is_released_as_it_is() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = owner(0);
+        let hold = RowCommit::group(1, GroupOn::Hold);
+        let rid = Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        let tag = RowCommit::group(3, GroupOn::Root);
+        journal_tagged(&h, rid, "pre", tag);
+        let seq = Replica::journal_class_of_rid(&h.meta, rid).unwrap().0;
+        let mut out = Vec::new();
+        h.core.park_reply(
+            h.clk(),
+            Default::default(),
+            Some(seq),
+            3,
+            OpId(78),
+            rid,
+            MutateOutcome::Abandoned,
+            None,
+            Default::default(),
+            0,
+            hold,
+            &mut out,
+        );
+        let tip = tip(&h);
+        let out = ack(&mut h, 2, 1, tip);
+        assert_eq!(peer_replies(&out, 3).len(), 1, "released: {out:?}");
+        assert_eq!(tag_of(&h, rid), Some(tag), "released as it parked");
+    }
+
+    /// FX-1 round 2: the hold ends between the own-path re-tag and the
+    /// release. The answer was given in the hold (the row re-tagged, the
+    /// answer parked as the hold's); the epoch closes before a member
+    /// acknowledges; the log then carries the row and the answer is
+    /// released with no hold group to relabel it: it leaves as the hold's,
+    /// the class its row was tagged with, and nothing panics (the hold's
+    /// class is asked of a hold group only).
+    #[test]
+    fn a_hold_that_ends_before_the_release_leaves_the_answer_as_it_was_given() {
+        use constellation_meta::{GroupOn, RowCommit};
+        let mut h = owner(0);
+        let want = RowCommit::group(1, GroupOn::Hold);
+        // (The answer is decided in the hold: the row is journaled by the
+        // hold's rule here, where the re-tag of an earlier row is a no-op;
+        // `an_own_answer_in_a_hold_re_tags_only_the_rows_weaker_than_the_holds`
+        // has the re-tag itself.)
+        let (rid, out) = create_nowait(&mut h, 1, "pre");
+        assert!(own_sources(&out, rid).is_empty(), "waits for a member: {out:?}");
+        assert_eq!(tag_of(&h, rid), Some(want));
+        // The epoch closes (deposed or ended): no hold group any more.
+        h.core.lease.release_local();
+        h.core.pr.epoch_members.clear();
+        assert!(!h.core.hold_group());
+        let tip = tip(&h);
+        h.core.note_shipped(&[], tip);
+        let mut out = Vec::new();
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        assert_eq!(
+            own_sources(&out, rid),
+            vec![crate::AnswerSource::Sequenced(want)],
+            "released by the log with the label it was given: {out:?}"
+        );
+        assert!(tag_of(&h, rid).is_none_or(|c| c == want), "{:?}", tag_of(&h, rid));
+    }
+
     #[test]
     fn a_one_member_hold_answers_at_once() {
         use constellation_meta::RowCommit;

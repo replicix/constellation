@@ -982,9 +982,10 @@ impl Meta {
     /// transaction: a row whose own client was answered with the gate off
     /// (`Lone`) must strand as the answer said. A row that is gone (shipped
     /// rows are durable anyway) or already of that class is left alone.
-    /// `to` names the rule to re-tag to: the row keeps the configuration
-    /// version it carries (`to`'s version applies only to a `Final` row,
-    /// which has none). Returns whether a row changed.
+    /// `to` names the rule to re-tag to: a `Singleton` or `Archive` target
+    /// keeps the configuration version the row carries; any other target
+    /// (`Final`, a `Hold` group, a root or delegate group) is taken as it
+    /// stands, its own version replacing the row's. Returns whether a row changed.
     pub fn reclass_journal_tx(&self, seq: u64, to: RowCommit) -> Result<bool, MetaError> {
         #[cfg(any(test, feature = "test-util"))]
         if reclass_fault::take() {

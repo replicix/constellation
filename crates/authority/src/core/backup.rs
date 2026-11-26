@@ -2365,8 +2365,26 @@ impl Core {
         rid: Rid,
     ) -> Result<constellation_meta::RowCommit, constellation_meta::MetaError> {
         // One rule for both askers (FX-1): in a hold group the answer is the
-        // hold's, the row re-tagged so.
-        if self.hold_group() {
+        // hold's, the row re-tagged so. Only a row whose tag is weaker than,
+        // or another's than, the hold's: a singleton's, a root group's (no
+        // member listed), the archive's, an earlier epoch's hold. Left as
+        // the arms below have them: a `Final` row (the hold's own, never
+        // weaker) and a delegate-group row (named for the root's rule, its
+        // version a delegation's generation, not a configuration's).
+        if self.hold_group()
+            && replica.journal_class_of_rid(rid).is_some_and(|(_, class)| {
+                class.is_singleton()
+                    || class.is_archive()
+                    || class.is_hold()
+                    || matches!(
+                        class,
+                        constellation_meta::RowCommit::Group {
+                            on: GroupOn::Root,
+                            ..
+                        }
+                    )
+            })
+        {
             return self.hold_answer_class(replica, rid);
         }
         Ok(match replica.journal_class_of_rid(rid) {
@@ -2610,6 +2628,7 @@ impl Core {
         replica: &dyn Replica,
         rid: Rid,
     ) -> Result<constellation_meta::RowCommit, constellation_meta::MetaError> {
+        debug_assert!(self.hold_group(), "the hold's class outside a hold group");
         let want: constellation_meta::RowCommit = self.root_rule(Asker::Own).into();
         if let Some((first, class)) = replica.journal_class_of_rid(rid) {
             if class != want {
