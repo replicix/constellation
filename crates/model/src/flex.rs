@@ -163,8 +163,13 @@
 //!    runs on the authority's own node (invocation and return in one
 //!    step), which is all a split brain needs to show up as two `Ok`
 //!    creates.
-//! 2. No P2P handoff inside an epoch: it moves the hold between members
-//!    of the same epoch, never outside it.
+//! 2. The P2P handoff inside an epoch is modelled by transfer numbers
+//!    (`Msg`, `HoldRec`): a node that holds gives as transfer `n + 1`
+//!    (persisting `Given` first), the giver re-offers `n` to its recipient
+//!    when asked and nudges it every round, and a node takes only an `n`
+//!    above the highest it ever took or gave, inside its own open epoch.
+//!    It moves the hold between members of the same epoch, never outside
+//!    it. The `FlexEpochs` knobs switch each guard off in turn.
 //! 3. Only epochs that claim the lease are formed: an epoch holding
 //!    nothing only silences its members (fewer promises, fewer
 //!    acquisitions), which can only make takeovers rarer.
@@ -538,7 +543,13 @@ pub enum Msg {
     Request { from: u8, to: u8 },
     /// A `LeaseHandoff` carrying transfer `n` of epoch `key`'s hold
     /// (`re`: a re-offer).
-    Offer { from: u8, to: u8, key: u8, n: u8, re: bool },
+    Offer {
+        from: u8,
+        to: u8,
+        key: u8,
+        n: u8,
+        re: bool,
+    },
     /// The giver's nudge (carries `n` as a filter only).
     Nudge { from: u8, to: u8, key: u8, n: u8 },
 }
@@ -1137,7 +1148,12 @@ impl FlexEpochs {
             }
         }
         if let Some((key, r, n)) = s.nudge_guard(self, i) {
-            let msg = Msg::Nudge { from: iu, to: r, key, n };
+            let msg = Msg::Nudge {
+                from: iu,
+                to: r,
+                key,
+                n,
+            };
             if s.msgs.binary_search(&msg).is_err() {
                 actions.push(Action::Nudge(iu));
             }
@@ -1332,9 +1348,7 @@ impl Model for FlexEpochs {
                 if self.hold_waits()
                     && !holds
                     && !r.closed
-                    && owner.is_some_and(|h| {
-                        s.nodes[h].alive && node.copy != s.nodes[h].journal
-                    })
+                    && owner.is_some_and(|h| s.nodes[h].alive && node.copy != s.nodes[h].journal)
                 {
                     actions.push(Action::StreamAhead(iu));
                 }
@@ -1710,7 +1724,12 @@ impl Model for FlexEpochs {
             }
             Action::Nudge(g) => {
                 let (key, to, n) = s.nudge_guard(self, g as usize)?;
-                s.send(Msg::Nudge { from: g, to, key, n });
+                s.send(Msg::Nudge {
+                    from: g,
+                    to,
+                    key,
+                    n,
+                });
             }
             Action::Deliver(k, keep) => {
                 let msg = *s.msgs.get(k as usize)?;
@@ -1811,9 +1830,10 @@ impl Model for FlexEpochs {
         }
         // FX-5: a hold in flight is recoverable from persisted state alone.
         if self.max_transfers > 0 {
-            props.push(Property::always("hold_recoverable", |m: &FlexEpochs, s: &State| {
-                s.hold_recoverable(m)
-            }));
+            props.push(Property::always(
+                "hold_recoverable",
+                |m: &FlexEpochs, s: &State| s.hold_recoverable(m),
+            ));
             props.push(Property::sometimes("transfer_taken", |_, s: &State| {
                 s.saw & SAW_TRANSFER_TAKEN != 0
             }));
@@ -1874,14 +1894,32 @@ impl FlexEpochs {
                     } else {
                         s.nodes[gu].rec = given;
                     }
-                    s.send(Msg::Offer { from: g, to: r, key, n, re: false });
+                    s.send(Msg::Offer {
+                        from: g,
+                        to: r,
+                        key,
+                        n,
+                        re: false,
+                    });
                 } else if let Some((key, n)) = s.reoffer_guard(self, gu, r) {
-                    s.send(Msg::Offer { from: g, to: r, key, n, re: true });
+                    s.send(Msg::Offer {
+                        from: g,
+                        to: r,
+                        key,
+                        n,
+                        re: true,
+                    });
                 }
                 // Otherwise a decline: the asker's phase ends by its
                 // timeout (`AskTimeout`), the same in the model.
             }
-            Msg::Offer { from: g, to: r, key, n, re } => {
+            Msg::Offer {
+                from: g,
+                to: r,
+                key,
+                n,
+                re,
+            } => {
                 let ru = r as usize;
                 if s.nodes[ru].ask != Some(g) {
                     // No live phase: the answer is dropped (today's 797).
@@ -1892,10 +1930,19 @@ impl FlexEpochs {
                     // Persisted before the hold is used (durable before act).
                     s.nodes[ru].rec = Some((key, HoldRec::Held { n }));
                     s.nodes[ru].mem_rec = None;
-                    s.saw |= if re { SAW_REOFFER_TAKEN } else { SAW_TRANSFER_TAKEN };
+                    s.saw |= if re {
+                        SAW_REOFFER_TAKEN
+                    } else {
+                        SAW_TRANSFER_TAKEN
+                    };
                 }
             }
-            Msg::Nudge { from: g, to: r, key, n } => {
+            Msg::Nudge {
+                from: g,
+                to: r,
+                key,
+                n,
+            } => {
                 let ru = r as usize;
                 // Stateless: an idle member of the open epoch, past nothing,
                 // starts an acquisition aimed at the giver.
