@@ -809,3 +809,192 @@ fn anchored_promises_are_clean_beyond_the_margin() {
         ],
     );
 }
+
+// ---- FX-5: the hold moves between members by transfer numbers ----
+//
+// Each give persists (key, n + 1, to) with its let-go and sends n + 1; a node
+// takes a transfer answer only above its own highest n of the key, in its
+// open epoch, from a member; the giver re-offers its record's n to its `to`
+// only and nudges it at its round. `hold_recoverable` (always): an open
+// epoch's hold is held, or a giver's record enables nudge, re-offer and take
+// under the same guard functions as the actions.
+
+const RECOVER: &str = "hold_recoverable";
+const OWNER: &str = "hold_owner_never_deposed_except_by_retire";
+
+fn xfer(m: FlexEpochs) -> FlexEpochs {
+    FlexEpochs {
+        max_transfers: 3,
+        check_hold_owner: true,
+        ops: vec![NsOp::CreateExcl(0)],
+        ..m
+    }
+}
+
+fn fx5_cap() -> (usize, Duration) {
+    let secs = std::env::var("FX5_MODEL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(55);
+    (400_000_000, Duration::from_secs(secs))
+}
+
+/// `N = 2`, `f = 1`: hand-backs, lost and late answers, crossing
+/// re-offers, a crash at either end.
+#[test]
+fn fx5_two_members_clean() {
+    assert_clean_checking(
+        "fx5-two",
+        &xfer(FlexEpochs::new(2, 1)),
+        &["transfer_taken", "reoffer_taken", "transferee_flush", "nudge_ask"],
+        fx5_cap(),
+        &[RECOVER, OWNER],
+    );
+}
+
+/// `N = 3`, `f = 1`: G→R→Q chains and stale records at former holders.
+#[test]
+fn fx5_three_members_clean() {
+    assert_clean_checking(
+        "fx5-three",
+        &xfer(full()),
+        &["transfer_taken", "reoffer_taken", "transferee_flush", "nudge_ask"],
+        fx5_cap(),
+        &[RECOVER, OWNER],
+    );
+}
+
+/// An idle recipient (M2): members ask only when nudged.
+#[test]
+fn fx5_idle_recipient_clean() {
+    let m = FlexEpochs {
+        idle_asks: false,
+        ..xfer(full())
+    };
+    assert_clean_checking(
+        "fx5-idle",
+        &m,
+        &["transfer_taken", "reoffer_taken", "nudge_ask"],
+        fx5_cap(),
+        &[RECOVER, OWNER],
+    );
+}
+
+/// Duplicated messages (late duplicates of offers and requests).
+#[test]
+fn fx5_duplicates_clean() {
+    let m = FlexEpochs {
+        dup_msgs: true,
+        max_transfers: 2,
+        ..xfer(FlexEpochs::new(2, 1))
+    };
+    assert_clean_checking(
+        "fx5-dup",
+        &m,
+        &["transfer_taken", "reoffer_taken"],
+        fx5_cap(),
+        &[RECOVER, OWNER],
+    );
+}
+
+/// The carrier's retire while the hold is in flight: the members abandon,
+/// no late answer is taken.
+#[test]
+fn fx5_retire_in_flight_clean() {
+    let m = FlexEpochs {
+        max_retires: 1,
+        ..xfer(full())
+    };
+    assert_clean_checking(
+        "fx5-retire",
+        &m,
+        &["transfer_taken", "retire_happens"],
+        fx5_cap(),
+        &[RECOVER],
+    );
+}
+
+#[test]
+fn fx5_knob_no_reoffer_is_found() {
+    let m = FlexEpochs {
+        no_reoffer: true,
+        ..xfer(FlexEpochs::new(2, 1))
+    };
+    let n = assert_violates("fx5-no-reoffer", &m, RECOVER);
+    println!("found in {n} actions");
+}
+
+#[test]
+fn fx5_knob_no_nudge_is_found() {
+    let m = FlexEpochs {
+        no_nudge: true,
+        idle_asks: false,
+        ..xfer(FlexEpochs::new(2, 1))
+    };
+    let n = assert_violates("fx5-no-nudge", &m, RECOVER);
+    println!("found in {n} actions");
+}
+
+#[test]
+fn fx5_knob_v1_guard_is_found() {
+    let m = FlexEpochs {
+        v1_guard: true,
+        ..xfer(FlexEpochs::new(2, 1))
+    };
+    let n = assert_violates("fx5-v1-guard", &m, RECOVER);
+    println!("found in {n} actions");
+}
+
+#[test]
+fn fx5_knob_reoffer_ignores_held_is_found() {
+    let m = FlexEpochs {
+        reoffer_ignores_held: true,
+        ..xfer(full())
+    };
+    let n = assert_violates("fx5-ignores-held", &m, "single_authority");
+    println!("found in {n} actions");
+}
+
+/// Two members cannot reach it: the only stale record names the node that
+/// gave the hold back, which is then above the stale n.
+#[test]
+fn fx5_knob_reoffer_ignores_held_needs_three_members() {
+    let m = FlexEpochs {
+        reoffer_ignores_held: true,
+        ..xfer(FlexEpochs::new(2, 1))
+    };
+    let checker = run_capped("fx5-ignores-held-two", &m, false, fx5_cap());
+    assert!(checker.is_done());
+    assert!(checker.discovery("single_authority").is_none());
+}
+
+#[test]
+fn fx5_knob_reoffer_to_anyone_is_found() {
+    let m = FlexEpochs {
+        reoffer_to_anyone: true,
+        ..xfer(full())
+    };
+    let n = assert_violates("fx5-to-anyone", &m, "single_authority");
+    println!("found in {n} actions");
+}
+
+#[test]
+fn fx5_knob_record_not_persisted_is_found() {
+    let m = FlexEpochs {
+        record_not_persisted: true,
+        ..xfer(FlexEpochs::new(2, 1))
+    };
+    let n = assert_violates("fx5-not-persisted", &m, "single_authority");
+    println!("found in {n} actions");
+}
+
+#[test]
+fn fx5_knob_take_after_close_is_found() {
+    let m = FlexEpochs {
+        take_after_close: true,
+        max_retires: 1,
+        ..xfer(full())
+    };
+    let n = assert_violates("fx5-after-close", &m, "single_authority");
+    println!("found in {n} actions");
+}

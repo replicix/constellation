@@ -317,6 +317,35 @@ pub struct FlexEpochs {
     /// version (`Observed`; a node's clock then only measures a duration).
     /// (Not `claim_rule`, which is the formation's.)
     pub lease_claim: crate::clk::ClaimRule,
+    // ---- FX-5: the hold moves between members (transfer numbers) ----
+    /// Bound on transfer numbers: a hold at `n` gives only while
+    /// `n < max_transfers`. 0: no transfer actions (the older runs' state
+    /// space).
+    pub max_transfers: u8,
+    /// A member asks for the hold whenever it holds nothing (ops waiting).
+    /// Off: it asks only when a giver nudges it (the idle recipient, M2).
+    pub idle_asks: bool,
+    /// A message may be delivered and stay in flight (a duplicate).
+    pub dup_msgs: bool,
+    /// Knob: the giver never re-offers (today's code).
+    pub no_reoffer: bool,
+    /// Knob: the giver never nudges an idle recipient.
+    pub no_nudge: bool,
+    /// Knob: the taker drops `n > highest` (takes any offer while it holds
+    /// nothing).
+    pub reoffer_ignores_held: bool,
+    /// Knob: the giver re-offers to any member that asks, not only `to`.
+    pub reoffer_to_anyone: bool,
+    /// Knob: the give's record is in memory only (persisted after the
+    /// reply, lost by a crash before that).
+    pub record_not_persisted: bool,
+    /// Knob: the taker does not check that its epoch is open and the
+    /// sender a member.
+    pub take_after_close: bool,
+    /// Knob: spec v1's guard: an original transfer answer is taken
+    /// whenever it answers the live ask; a re-offer only by a node with no
+    /// record of the key (it never held or gave).
+    pub v1_guard: bool,
 }
 
 impl FlexEpochs {
@@ -358,6 +387,16 @@ impl FlexEpochs {
             retire_drops_acked: false,
             promise_rule: PromiseRule::Expiry,
             lease_claim: crate::clk::ClaimRule::Wall,
+            max_transfers: 0,
+            idle_asks: true,
+            dup_msgs: false,
+            no_reoffer: false,
+            no_nudge: false,
+            reoffer_ignores_held: false,
+            reoffer_to_anyone: false,
+            record_not_persisted: false,
+            take_after_close: false,
+            v1_guard: false,
         }
     }
 
@@ -458,12 +497,63 @@ pub struct Node {
     pub obs: Option<(u8, i16)>,
     /// A heartbeat PUT in flight names this register version (`Anchored`).
     pub pending_key: Option<u8>,
+    /// FX-5: this node's persisted record of the hold of an epoch (by
+    /// index; the model's key of the carried lease). `Held` is the hold:
+    /// a node acknowledges under an epoch hold iff its record says it
+    /// holds it (persisted before it acts, M4).
+    pub rec: Option<(u8, HoldRec)>,
+    /// `record_not_persisted` only: the record as this process believes
+    /// it, ahead of the persisted one; dropped by a crash.
+    pub mem_rec: Option<(u8, HoldRec)>,
+    /// FX-5: the member this node's live epoch acquisition asked
+    /// (volatile: the phase `LeaseRequest { epoch_mode }`).
+    pub ask: Option<u8>,
+}
+
+/// FX-5: a node's persisted record of one carried key's hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HoldRec {
+    /// Holds it, taken as transfer `n` (0: adopted at formation).
+    Held { n: u8 },
+    /// Gave it as transfer `n` to `to`.
+    Given { n: u8, to: u8 },
+    /// Let it go without a transfer (the close, a retire).
+    Ended { n: u8 },
+}
+
+impl HoldRec {
+    pub fn n(self) -> u8 {
+        match self {
+            HoldRec::Held { n } | HoldRec::Given { n, .. } | HoldRec::Ended { n } => n,
+        }
+    }
+}
+
+/// FX-5: a P2P message of the hold transfer, in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Msg {
+    /// An epoch `LeaseRequest`.
+    Request { from: u8, to: u8 },
+    /// A `LeaseHandoff` carrying transfer `n` of epoch `key`'s hold
+    /// (`re`: a re-offer).
+    Offer { from: u8, to: u8, key: u8, n: u8, re: bool },
+    /// The giver's nudge (carries `n` as a filter only).
+    Nudge { from: u8, to: u8, key: u8, n: u8 },
+}
+
+impl Msg {
+    fn to(self) -> u8 {
+        match self {
+            Msg::Request { to, .. } | Msg::Offer { to, .. } | Msg::Nudge { to, .. } => to,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EpochRec {
     pub members: u8,
-    pub holder: u8,
+    /// The member whose lease the epoch carries (its hold at formation).
+    pub carrier: u8,
     /// The register version and epoch the holder's lease had.
     pub version: u8,
     pub reg_epoch: u8,
@@ -490,6 +580,14 @@ pub const SAW_RETIRE: u16 = 512;
 pub const SAW_RETIRE_FINAL_LOSS: u16 = 1024;
 /// Plan 46 M1.4 step 4: a claim shipped rows a member kept at a retire.
 pub const SAW_RETIRE_CARRIED: u16 = 2048;
+/// FX-5: a transfer's first answer was taken.
+pub const SAW_TRANSFER_TAKEN: u16 = 4096;
+/// FX-5: a re-offer was taken.
+pub const SAW_REOFFER_TAKEN: u16 = 8192;
+/// FX-5: a node that took the hold over P2P flushed it at the close.
+pub const SAW_TRANSFEREE_FLUSH: u16 = 16384;
+/// FX-5: a nudge started an acquisition.
+pub const SAW_NUDGE_ASK: u16 = 32768;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -520,6 +618,8 @@ pub struct State {
     /// Rows a retire dropped although the client was answered and a member
     /// held them (only with the `retire_drops_acked` knob).
     pub dropped: u16,
+    /// FX-5: transfer messages in flight (a set: sorted, deduplicated).
+    pub msgs: Vec<Msg>,
 }
 
 impl State {
@@ -538,10 +638,133 @@ impl State {
         self.nodes[i].epoch.map(|k| &self.epochs[k as usize])
     }
 
-    /// The node is the holder of an epoch that has not closed.
-    fn epoch_holder(&self, i: usize) -> bool {
-        self.open_epoch_of(i)
-            .is_some_and(|r| r.holder == i as u8 && !r.closed)
+    /// FX-5: the node's record as its process sees it (the persisted one,
+    /// or under `record_not_persisted` the one ahead of it).
+    pub fn eff_rec(&self, i: usize) -> Option<(u8, HoldRec)> {
+        self.nodes[i].mem_rec.or(self.nodes[i].rec)
+    }
+
+    /// The node holds an epoch hold: its own record says so (M4).
+    pub fn epoch_holder(&self, i: usize) -> bool {
+        matches!(self.eff_rec(i), Some((_, HoldRec::Held { .. })))
+    }
+
+    /// FX-5: the node that holds epoch `idx`'s hold (the first, if the
+    /// property is broken).
+    pub fn hold_owner(&self, idx: u8) -> Option<usize> {
+        (0..self.nodes.len())
+            .find(|j| matches!(self.eff_rec(*j), Some((k, HoldRec::Held { .. })) if k == idx))
+    }
+
+    /// FX-5: the node is a member of epoch `idx` and has not learned it
+    /// ended (persisted membership).
+    fn in_open_epoch(&self, i: usize, idx: u8) -> bool {
+        self.nodes[i].epoch == Some(idx) && !self.epochs[idx as usize].closed
+    }
+
+    fn member(&self, idx: u8, j: u8) -> bool {
+        self.epochs[idx as usize].members & (1 << j) != 0
+    }
+
+    /// FX-5: the highest transfer number of key `idx` this node took or
+    /// gave (0 without a record of the key).
+    fn highest(&self, i: usize, idx: u8) -> u8 {
+        match self.eff_rec(i) {
+            Some((k, r)) if k == idx => r.n(),
+            _ => 0,
+        }
+    }
+
+    /// FX-5 give guard: `g` holds at `n`, in its open epoch, journal
+    /// empty, the asker a member. The transfer number to send.
+    pub fn give_guard(&self, m: &FlexEpochs, g: usize, r: u8) -> Option<(u8, u8)> {
+        let Some((idx, HoldRec::Held { n })) = self.eff_rec(g) else {
+            return None;
+        };
+        (self.in_open_epoch(g, idx)
+            && self.member(idx, r)
+            && r as usize != g
+            && self.nodes[g].journal.is_empty()
+            && n < m.max_transfers)
+            .then_some((idx, n + 1))
+    }
+
+    /// FX-5 re-offer guard: `g`'s record says it gave transfer `n` to
+    /// `r` and it holds nothing since, in its open epoch, `r` a member.
+    pub fn reoffer_guard(&self, m: &FlexEpochs, g: usize, r: u8) -> Option<(u8, u8)> {
+        if m.no_reoffer {
+            return None;
+        }
+        let Some((idx, HoldRec::Given { n, to })) = self.eff_rec(g) else {
+            return None;
+        };
+        ((to == r || m.reoffer_to_anyone)
+            && r as usize != g
+            && self.in_open_epoch(g, idx)
+            && self.member(idx, r)
+            && self.nodes[g].journal.is_empty())
+        .then_some((idx, n))
+    }
+
+    /// FX-5 nudge guard: `g`'s record names an outstanding recipient.
+    pub fn nudge_guard(&self, m: &FlexEpochs, g: usize) -> Option<(u8, u8, u8)> {
+        if m.no_nudge {
+            return None;
+        }
+        let Some((idx, HoldRec::Given { n, to })) = self.eff_rec(g) else {
+            return None;
+        };
+        (self.in_open_epoch(g, idx) && self.member(idx, to)).then_some((idx, to, n))
+    }
+
+    /// FX-5 take guard (M1, M3), over the node's record and membership:
+    /// its epoch open, the sender a member, transfer `n` above its
+    /// highest of the key, and it holds nothing.
+    pub fn take_guard(&self, m: &FlexEpochs, r: usize, from: u8, key: u8, n: u8, re: bool) -> bool {
+        if self.epoch_holder(r) {
+            return false;
+        }
+        if !m.take_after_close && !(self.in_open_epoch(r, key) && self.member(key, from)) {
+            return false;
+        }
+        if m.v1_guard {
+            let never = !matches!(self.eff_rec(r), Some((k, _)) if k == key);
+            return !re || never;
+        }
+        m.reoffer_ignores_held || n > self.highest(r, key)
+    }
+
+    /// FX-5 `hold_recoverable`: every open epoch's hold is held (a
+    /// non-retired node's record says so: a crashed holder restores it),
+    /// or some non-retired giver's record lets it nudge, re-offer and have
+    /// the re-offer taken (the guards the actions use, over records and
+    /// membership only).
+    pub fn hold_recoverable(&self, m: &FlexEpochs) -> bool {
+        (0..self.epochs.len()).all(|idx| {
+            let idx = idx as u8;
+            if self.epochs[idx as usize].closed {
+                return true;
+            }
+            let live = |j: usize| !self.nodes[j].retired;
+            let held = (0..self.nodes.len()).any(|j| {
+                live(j) && matches!(self.eff_rec(j), Some((k, HoldRec::Held { .. })) if k == idx)
+            });
+            held || (0..self.nodes.len()).any(|g| {
+                live(g)
+                    && self.nudge_guard(m, g).is_some_and(|(k, r, n)| {
+                        k == idx
+                            && live(r as usize)
+                            && self.reoffer_guard(m, g, r) == Some((k, n))
+                            && self.take_guard(m, r as usize, g as u8, k, n, true)
+                    })
+            })
+        })
+    }
+
+    fn send(&mut self, msg: Msg) {
+        if let Err(at) = self.msgs.binary_search(&msg) {
+            self.msgs.insert(at, msg);
+        }
     }
 
     /// Plan 46 C10: the one-member epoch of node `i`'s hold is `Final`.
@@ -588,9 +811,13 @@ impl State {
         if !n.alive {
             return false;
         }
+        // FX-5 (M4): the node's own record of the hold is its authority.
+        if self.epoch_holder(i) {
+            return true;
+        }
         if n.epoch.is_some() {
-            // A member: only the holder of an open epoch has authority.
-            return self.epoch_holder(i);
+            // A member that holds nothing has no authority.
+            return false;
         }
         let Some(l) = self.s3_usable(m, i) else {
             return false;
@@ -873,6 +1100,45 @@ pub enum Action {
     Tail(u8),
     Crash(u8),
     Restart(u8),
+    /// FX-5: this member's epoch acquisition asks that member.
+    Ask(u8, u8),
+    /// FX-5: the acquisition's request times out (its phase ends).
+    AskTimeout(u8),
+    /// FX-5: a giver whose record names an outstanding recipient nudges it
+    /// (its ordinary round).
+    Nudge(u8),
+    /// FX-5: deliver `msgs[k]`; `true`: it stays in flight (a duplicate).
+    Deliver(u8, bool),
+}
+
+impl FlexEpochs {
+    /// FX-5: the transfer actions of live node `i`.
+    fn transfer_actions(&self, s: &State, i: usize, actions: &mut Vec<Action>) {
+        let iu = i as u8;
+        let node = &s.nodes[i];
+        if node.ask.is_some() {
+            actions.push(Action::AskTimeout(iu));
+        }
+        if let Some(idx) = node.epoch {
+            if self.idle_asks
+                && node.ask.is_none()
+                && !s.epoch_holder(i)
+                && s.in_open_epoch(i, idx)
+            {
+                for g in 0..self.nodes {
+                    if g != iu && s.member(idx, g) {
+                        actions.push(Action::Ask(iu, g));
+                    }
+                }
+            }
+        }
+        if let Some((key, r, n)) = s.nudge_guard(self, i) {
+            let msg = Msg::Nudge { from: iu, to: r, key, n };
+            if s.msgs.binary_search(&msg).is_err() {
+                actions.push(Action::Nudge(iu));
+            }
+        }
+    }
 }
 
 impl Model for FlexEpochs {
@@ -943,6 +1209,9 @@ impl Model for FlexEpochs {
                     seen: expires,
                     obs: None,
                     pending_key: None,
+                    rec: None,
+                    mem_rec: None,
+                    ask: None,
                 })
                 .collect();
             out.push(State {
@@ -961,6 +1230,7 @@ impl Model for FlexEpochs {
                 retires: 0,
                 lost: 0,
                 dropped: 0,
+                msgs: Vec::new(),
             });
         }
         out
@@ -1028,24 +1298,38 @@ impl Model for FlexEpochs {
                     actions.push(Action::Op(iu));
                 }
             }
+            if self.max_transfers > 0 {
+                self.transfer_actions(s, i, actions);
+            }
             if let Some(r) = s.open_epoch_of(i) {
-                if r.closed && r.holder != iu {
+                let idx = node.epoch.unwrap_or(0);
+                let holds = s.epoch_holder(i);
+                if r.closed && !holds {
                     actions.push(Action::Learn(iu));
                 }
-                if r.holder == iu && !r.closed {
+                if holds && !r.closed {
                     actions.push(Action::Close(iu));
-                    if s.retires < self.max_retires {
-                        actions.push(Action::Retire(iu));
-                    }
                     if self.hold_waits() && s.hold_answerable(i) {
                         actions.push(Action::AnswerHold(iu));
                     }
                 }
-                if self.hold_waits()
-                    && r.holder != iu
+                // The operator retires the epoch's carrier (FX-5 decision:
+                // the carrier's retire is the one the members abandon on),
+                // while it holds the hold or nobody does.
+                if r.carrier == iu
                     && !r.closed
-                    && s.nodes[r.holder as usize].alive
-                    && node.copy != s.nodes[r.holder as usize].journal
+                    && s.retires < self.max_retires
+                    && (holds || s.hold_owner(idx).is_none())
+                {
+                    actions.push(Action::Retire(iu));
+                }
+                let owner = s.hold_owner(idx);
+                if self.hold_waits()
+                    && !holds
+                    && !r.closed
+                    && owner.is_some_and(|h| {
+                        s.nodes[h].alive && node.copy != s.nodes[h].journal
+                    })
                 {
                     actions.push(Action::StreamAhead(iu));
                 }
@@ -1083,6 +1367,15 @@ impl Model for FlexEpochs {
                         Policy::S3 => actions.push(Action::FastS3(iu)),
                         _ => {}
                     }
+                }
+            }
+        }
+        // FX-5: deliveries (any order; a dead recipient's wait: a pause).
+        for (k, msg) in s.msgs.iter().enumerate() {
+            if s.nodes[msg.to() as usize].alive {
+                actions.push(Action::Deliver(k as u8, false));
+                if self.dup_msgs {
+                    actions.push(Action::Deliver(k as u8, true));
                 }
             }
         }
@@ -1159,7 +1452,7 @@ impl Model for FlexEpochs {
                 let idx = s.epochs.len() as u8;
                 s.epochs.push(EpochRec {
                     members: mask,
-                    holder: h as u8,
+                    carrier: h as u8,
                     version: l.version,
                     reg_epoch: l.epoch,
                     closed: false,
@@ -1171,6 +1464,9 @@ impl Model for FlexEpochs {
                         s.nodes[j].snap = None;
                     }
                 }
+                // The carrier's hold at transfer 0 (persisted at the
+                // adoption; a restart re-adopts it).
+                s.nodes[h].rec = Some((idx, HoldRec::Held { n: 0 }));
                 if mask.count_ones() < self.nodes as u32 {
                     s.saw |= SAW_MISSING_EPOCH;
                 }
@@ -1182,7 +1478,41 @@ impl Model for FlexEpochs {
                 let journal = std::mem::take(&mut s.nodes[h].journal);
                 s.epochs[idx].closed = true;
                 s.nodes[h].epoch = None;
-                if s.reg.version == rec.version && s.reg.holder == h as u8 {
+                let n = s.highest(h, idx as u8);
+                s.nodes[h].rec = Some((idx as u8, HoldRec::Ended { n }));
+                s.nodes[h].mem_rec = None;
+                if h != rec.carrier as usize
+                    && s.reg.version == rec.version
+                    && s.reg.holder == rec.carrier
+                {
+                    // FX-5: a transferee's flush CASes the carried object
+                    // (exempt from the promise check: it is exactly the
+                    // carried one) and takes it over at the next epoch.
+                    s.saw |= SAW_TRANSFEREE_FLUSH;
+                    let epoch = s.reg.epoch + 1;
+                    s.log.push(Entry::Marker(epoch));
+                    for k in journal {
+                        s.log.push(Entry::Op(k));
+                        s.answered |= 1 << k;
+                        s.saw |= SAW_FLUSH;
+                    }
+                    let expires = s.local(h) + self.lease_ttl;
+                    s.reg = Reg {
+                        holder: h as u8,
+                        epoch,
+                        expires,
+                        version: s.reg.version + 1,
+                        policy: Policy::Local,
+                    };
+                    s.nodes[h].applied = s.log.len() as u8;
+                    s.nodes[h].known = epoch;
+                    s.nodes[h].lease = Some(LeaseView {
+                        epoch,
+                        expires,
+                        version: s.reg.version,
+                        policy: Policy::Local,
+                    });
+                } else if s.reg.version == rec.version && s.reg.holder == h as u8 {
                     // Re-claim the own register (no promise check: it
                     // names this node) and ship the journal.
                     s.nodes[h].applied = s.log.len() as u8;
@@ -1245,6 +1575,10 @@ impl Model for FlexEpochs {
                     }
                     s.nodes[j].epoch = None;
                     if j == h {
+                        let n = s.highest(j, idx as u8);
+                        s.nodes[j].rec = Some((idx as u8, HoldRec::Ended { n }));
+                        s.nodes[j].mem_rec = None;
+                        s.nodes[j].ask = None;
                         s.nodes[j].journal.clear();
                         s.nodes[j].alive = false;
                         s.nodes[j].retired = true;
@@ -1316,7 +1650,7 @@ impl Model for FlexEpochs {
             }
             Action::StreamAhead(m) => {
                 let m = m as usize;
-                let h = s.open_epoch_of(m)?.holder as usize;
+                let h = s.hold_owner(s.nodes[m].epoch?)?;
                 s.nodes[m].copy = s.nodes[h].journal.clone();
             }
             Action::AnswerHold(h) => {
@@ -1354,7 +1688,28 @@ impl Model for FlexEpochs {
                 // An observation is volatile: a restarted process is a cold
                 // claimant.
                 s.nodes[i].obs = None;
+                // FX-5: the acquisition and an unpersisted record go too.
+                s.nodes[i].ask = None;
+                s.nodes[i].mem_rec = None;
                 s.crashes += 1;
+            }
+            Action::Ask(r, g) => {
+                s.nodes[r as usize].ask = Some(g);
+                s.send(Msg::Request { from: r, to: g });
+            }
+            Action::AskTimeout(r) => {
+                s.nodes[r as usize].ask = None;
+            }
+            Action::Nudge(g) => {
+                let (key, to, n) = s.nudge_guard(self, g as usize)?;
+                s.send(Msg::Nudge { from: g, to, key, n });
+            }
+            Action::Deliver(k, keep) => {
+                let msg = *s.msgs.get(k as usize)?;
+                if !keep {
+                    s.msgs.remove(k as usize);
+                }
+                self.deliver(&mut s, msg);
             }
             Action::Restart(i) => {
                 s.nodes[i as usize].alive = true;
@@ -1446,6 +1801,24 @@ impl Model for FlexEpochs {
                 |_, s: &State| s.saw & SAW_RETIRE_CARRIED != 0,
             ));
         }
+        // FX-5: a hold in flight is recoverable from persisted state alone.
+        if self.max_transfers > 0 {
+            props.push(Property::always("hold_recoverable", |m: &FlexEpochs, s: &State| {
+                s.hold_recoverable(m)
+            }));
+            props.push(Property::sometimes("transfer_taken", |_, s: &State| {
+                s.saw & SAW_TRANSFER_TAKEN != 0
+            }));
+            props.push(Property::sometimes("reoffer_taken", |_, s: &State| {
+                s.saw & SAW_REOFFER_TAKEN != 0
+            }));
+            props.push(Property::sometimes("transferee_flush", |_, s: &State| {
+                s.saw & SAW_TRANSFEREE_FLUSH != 0
+            }));
+            props.push(Property::sometimes("nudge_ask", |_, s: &State| {
+                s.saw & SAW_NUDGE_ASK != 0
+            }));
+        }
         if self.min_members < self.nodes {
             props.push(Property::sometimes(
                 "epoch_with_missing_node",
@@ -1479,6 +1852,58 @@ impl Model for FlexEpochs {
 }
 
 impl FlexEpochs {
+    /// FX-5: `msg` reaches its (live) recipient.
+    fn deliver(&self, s: &mut State, msg: Msg) {
+        match msg {
+            Msg::Request { from: r, to: g } => {
+                let gu = g as usize;
+                if let Some((key, n)) = s.give_guard(self, gu, r) {
+                    // The give: the record is durable before the answer
+                    // leaves (unless the knob), the hold let go with it.
+                    let given = Some((key, HoldRec::Given { n, to: r }));
+                    if self.record_not_persisted {
+                        s.nodes[gu].mem_rec = given;
+                    } else {
+                        s.nodes[gu].rec = given;
+                    }
+                    s.send(Msg::Offer { from: g, to: r, key, n, re: false });
+                } else if let Some((key, n)) = s.reoffer_guard(self, gu, r) {
+                    s.send(Msg::Offer { from: g, to: r, key, n, re: true });
+                }
+                // Otherwise a decline: the asker's phase ends by its
+                // timeout (`AskTimeout`), the same in the model.
+            }
+            Msg::Offer { from: g, to: r, key, n, re } => {
+                let ru = r as usize;
+                if s.nodes[ru].ask != Some(g) {
+                    // No live phase: the answer is dropped (today's 797).
+                    return;
+                }
+                s.nodes[ru].ask = None;
+                if s.take_guard(self, ru, g, key, n, re) {
+                    // Persisted before the hold is used (durable before act).
+                    s.nodes[ru].rec = Some((key, HoldRec::Held { n }));
+                    s.nodes[ru].mem_rec = None;
+                    s.saw |= if re { SAW_REOFFER_TAKEN } else { SAW_TRANSFER_TAKEN };
+                }
+            }
+            Msg::Nudge { from: g, to: r, key, n } => {
+                let ru = r as usize;
+                // Stateless: an idle member of the open epoch, past nothing,
+                // starts an acquisition aimed at the giver.
+                if s.nodes[ru].ask.is_none()
+                    && !s.epoch_holder(ru)
+                    && s.in_open_epoch(ru, key)
+                    && n > s.highest(ru, key)
+                {
+                    s.nodes[ru].ask = Some(g);
+                    s.send(Msg::Request { from: r, to: g });
+                    s.saw |= SAW_NUDGE_ASK;
+                }
+            }
+        }
+    }
+
     /// Whether `mask` may form an epoch now; the member whose lease it
     /// would hold.
     fn formable(&self, s: &State, mask: u8) -> Option<usize> {
