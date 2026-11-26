@@ -1,7 +1,8 @@
 # Plan 46 — Committed or final: one stream per node, the commit rule per configuration, no server-side replay
 
 > **Status (2026-11-26): stage 0, M1.0 and M1.1 are closed; M1.2 closed at
-> `4e44fd24` pending the Fable exit check; M1.3 and M1.4 are open; M1.5 and
+> `4e44fd24` pending the Fable exit check and the attribution of
+> `endpoint-wedge-probe` (below); M1.3 and M1.4 are open; M1.5 and
 > stages 2 and 3 have not started.**
 >
 > - **Closed.**
@@ -11,8 +12,11 @@
 > - **M1.2**, closed at `4e44fd24` (orphanfix, the first `main` with the
 >   orphan-nonroot fix) pending the Fable exit check: steps 0 to 16, the
 >   review's conditions and the close fixes. PROGRESS, "Plan 46 M1.2 exit",
->   has R1 (every configuration at 2,000 seeds; plain, idle-release and
->   slow-lease-read arms) and R2 (the full harness catalogue) on `4e44fd24`;
+>   has R1 (every configuration at 2,000 seeds in the plain arm, 295 labels;
+>   the idle-release arm ran only the 27 `sticky-*` labels and the
+>   slow-lease-read arm only the 3 `long-delegated*` labels, the criterion
+>   being read on the plain arm per D-1, §12 stage 0) and R2 (the full
+>   harness catalogue) on `4e44fd24`;
 >   R3 (plan 45's box gates on four file systems, both `hardlink-burst`
 >   scenarios) and §8 against `5907c65d` (topologies 1 to 5 and 9) on
 >   `a70304d7`; the user's decisions on topology 1 (no detectable regression)
@@ -991,11 +995,19 @@ The exit items:
   - R1 ran on `0d157e56`, 293 labels, plain. Its failing labels are negative
     controls and tracked items.
   - An interim re-sweep on `36db5771` (295 labels) found no invariant
-    violation and no product failure.
+    violation and no new failure.
   - On the close commit `4e44fd24`: 295 labels plain, the same 21 failing
     labels as `36db5771` (negative controls and tracked items), I1, I2,
-    I2c, I4 and I5 at 0; the idle-release and slow-lease-read arms have
-    none either.
+    I2c, I4 and I5 at 0; the idle-release arm (the 27 `sticky-*` labels
+    only) and the slow-lease-read arm (the 3 `long-delegated*` labels
+    only) have none either. These are not the full arms: the criterion is
+    read on the plain arm, as the supervisor's reading of the row from D-1
+    (§12 stage 0), accepted by the Fable exit check. The full arms on
+    `0d157e56` did show criterion-class hits, both since fixed: lr
+    `far-root-writes-shared` 1621 (I1; WP6.1, `00a269fd`, pinned, the lr
+    sweep clean after; not re-run under lr at the close) and idle 1264
+    `acked_at_or_below_cut` (WP6.2). The full lr arm runs in M1.3's
+    re-baseline.
 - The harness catalogue is green.
   - R2 ran on `6474e424` with 301 passed and 2 failed. Both failures were a
     scenario that mounted without `--fsync-timeout` since ADR-66; `3238bea6`
@@ -1003,8 +1015,12 @@ The exit items:
   - R2's delegate and backup-takeover scenarios passed 24 of 24 on
     `36db5771`.
   - On the close commit `4e44fd24`, the full catalogue: 333 scenarios, 327
-    pass, none fails for a product reason (2 flaky, 2 skipped for a missing
-    `sqlite3`, 2 that need a set-up the run lacks).
+    pass; 2 flaky, 2 skipped for a missing `sqlite3`, 2 that needed a
+    set-up the run lacked. The sqlite and plan 41 lock scenarios
+    (`lock-device-stall-lone-node`, `lock-xcheckfs-cell`) passed in
+    follow-up runs. `endpoint-wedge-probe` fails 4 of 5 on `4e44fd24` and
+    1 of 5 on the pre-M1.2 base `5907c65d` (undiagnosed): M1.2 exit pending
+    attribution, so this item is not ticked.
   - Plan 45's box gates and both `hardlink-burst` scenarios pass on ext4, xfs,
     btrfs and tmpfs (R3 on `060e6fa6` and on `a70304d7`,
     `bench/hardlink/RESULTS.md`).
@@ -1328,8 +1344,13 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       - no range, generation-set or xgen code left;
       - no lone delegate;
       - I1, I2, I2c and I5 at zero on every configuration at 2,000 seeds,
-        plain (the flex strict flags stay with M1.4);
-      - the harness catalogue green, with the retired split scenarios
+        plain (the supervisor's reading of the row from D-1, §12 stage 0,
+        accepted by the Fable exit check; the idle and lr arms ran only the 27
+        `sticky-*` and the 3 `long-delegated*` labels; the flex strict flags
+        stay with M1.4);
+      - the harness catalogue green (`endpoint-wedge-probe`: exit pending
+        attribution, 4 of 5 fail on `4e44fd24`, 1 of 5 on `5907c65d`),
+        with the retired split scenarios
         removed;
       - plan 45's rows, the `hardlink-burst-single` and `-two-node` box gates
         on four file systems, re-run at M1.2's exit;

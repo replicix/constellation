@@ -72028,9 +72028,9 @@ W14 class K (`flex-tight+commit+identity+settle+durability` 460, `flex-tight-lat
 ## Plan 46 M1.2 exit (2026-11-22; closed at `4e44fd24`, 2026-11-26)
 
 M1.2 (one stream per node, no lone delegate, C3 verbatim) was code-complete on `main` at `060e6fa6`. It closes at `4e44fd24`, pending the Fable
-check of this write-up. The fixes under "Landed since `060e6fa6`" changed the authority code after R1 and R2 first ran, so both ran again on the
-close commit `4e44fd24` (orphanfix), the first `main` with the orphan-nonroot fix: R1 in the plain, idle-release and slow-lease-read arms, and R2
-as the full harness catalogue. The performance evidence (§8 against `5907c65d`, topologies 1 to 5 and 9) and R3 ran on `a70304d7`: orphanfix adds
+check of this write-up and the attribution of `endpoint-wedge-probe` (R2). The fixes under "Landed since `060e6fa6`" changed the authority code after R1 and R2 first ran, so both ran again on the
+close commit `4e44fd24` (orphanfix), the first `main` with the orphan-nonroot fix: R1 in the plain arm (295 labels), with the idle-release arm limited to the 27 `sticky-*` labels and the slow-lease-read arm to the 3 `long-delegated*`
+labels, and R2 as the full harness catalogue. The performance evidence (§8 against `5907c65d`, topologies 1 to 5 and 9) and R3 ran on `a70304d7`: orphanfix adds
 only a liveness branch (a usable root ending another node's released stream) that steady-state runs never take, so `a70304d7` stands as the
 performance base.
 
@@ -72177,12 +72177,25 @@ sweep ran with its own tree's simulator and labels.
       the grant's expiry (487 at 1,849 ms, 678 at 2,886 ms, 839 at 5,231 ms after the release). Of 54,000 idle `sticky-*` seeds only these
       three show it. A sim-only fix (quiescence waits while a usable root lists an empty stream, bounded by the settle, the checker unchanged)
       is in progress. Replays: 5 of 5 fail on `4e44fd24` idle; 5 of 5 pass on the base and on `4e44fd24` plain.
-    - `sticky-s4-merge` 75 and `sticky-s4-root-restart` 1144: a client op never answered within 540 s, `waiting: None`. The known
-      never-answered class (with 1096 above) of M1.3's WP6.5 and WP6.7. 75 fails 5 of 5 on the close commit and passes on the base; 1144
-      also failed on orphanfix's own base `a70304d7` in its landing sweep.
+    - `sticky-s4-root-restart` 1144: a client op never answered within 540 s, `waiting: None`. The known never-answered class (with 1096
+      above) of M1.3's WP6.5 and WP6.7. It also failed on orphanfix's own base `a70304d7` in its landing sweep.
+    - `sticky-s4-merge` 75: the same message, so it is classed with that never-answered class by its message, not diagnosed. It is new at the
+      close: it fails 5 of 5 on the close commit and passes on the base. It is on M1.3's list by name.
 - **Slow-lease-read arm**, the 3 `long-delegated*` labels at 2,000 seeds: 0 failing seeds, as on the base.
 
-Against the plan's row this is zero I1, I2, I2c and I5 in all three arms, and no product failure in the plain arm.
+Against the plan's row this is zero I1, I2, I2c and I5 in the plain arm (295 labels) and in the two reduced arms, and no new failure in the plain arm
+(6 tracked items, none an integrity item).
+
+*Scope of the idle and lr arms.* The idle arm of this section is the 27 `sticky-*` labels and the lr arm the 3 `long-delegated*` labels: they are
+not the full arms. The criterion is read on the plain arm, as the supervisor read the plan's row from D-1 (§12 stage 0: the I4 ceilings and the
+flex strict flags are carried to named stage-1 milestones, idle release being M1.3's feature); the Fable exit check accepted that reading. The
+full arms last ran on `0d157e56` (idle: all 293 labels; lr: 118 labels), and they showed criterion-class hits that were then fixed:
+
+- lr `far-root-writes-shared` seed 1621: I1. Fixed by WP6.1 (`00a269fd`, one sequencer per inboxed rid) and pinned; the lr sweep was clean after.
+  `far-root-writes-shared` was not re-run under lr on the close commit.
+- idle seed 1264 of `sticky-s4-merge` and `sticky-s4-root-restart`: `acked_at_or_below_cut`. Fixed by WP6.2.
+
+The full lr arm (118 labels) has not run on the close commit; M1.3's re-baseline runs it.
 
 **R2: the harness catalogue, seed 42.**
 
@@ -72227,20 +72240,40 @@ scratch directory on xfs (the `CAP_SYS_ADMIN` scenarios as root).
   `epoch-holder-retired`; `delegate-partition`; plan 41's `lock-contention-*` scenarios; plan 40's `readdirplus-*` and `readdir-*` rows; plan
   42's `kernel-race-*` rows (both transports); `hardlink-burst-single` and `-two-node`; 10 of the 11 passthrough and zero-copy scenarios that
   need `CAP_SYS_ADMIN` (the eleventh is below).
+  `dirsplit-bench` passed only with `--s3-backend process` (the re-run); its one default-backend run failed in the discarded first pass.
 - 2 flaky, neither a close-commit regression:
   - `endpoint-wedge-probe` failed 3 of 5 on `4e44fd24` and 3 of 5 on `36db5771`: one FUSE request completed past the 18 s stall threshold
-    across the freezes (`stalled_completed` 1, nothing left in flight). Pre-existing.
+    across the freezes (`stalled_completed` 1, nothing left in flight). **Attribution pending.** The Fable exit check asked for 5 runs on
+    the pre-M1.2 base `5907c65d`; they ran on 2026-11-26 (seed 42, fresh release builds of each tree, alternated, box load 4.2 to 6.7, another
+    job running): `5907c65d` failed 1 of 5 (run 1, node a, the same message), `4e44fd24` failed 4 of 5 (runs 1, 2, 3 and 5, node b every time).
+    So the base is not clean, and the close commit fails more often (4 of 5 here, 3 of 5 before, 7 of 10 together, against 1 of 5), but 5 runs
+    per tree do not separate 1 of 5 from 4 of 5 (Fisher's exact p about 0.2). Not diagnosed. The item is not closed: M1.2's exit is pending its
+    attribution (M1.2 or M1.3) or the user's acceptance.
   - `passthrough-local-writer` (root) failed once with `ETXTBSY` on "a read-write open once nothing is open" and passed the next 2 of 2.
-- 2 skipped: `sqlite-first-touch-latency` and `sqlite-two-nodes`, because `sqlite3` is not installed on the run host.
-- 2 not run for want of set-up: `lock-device-stall-lone-node` (needs `CONSTELLATION_HARNESS_STALL_DM`, a device-mapper device to freeze) and
-  `lock-xcheckfs-cell` (needs `CONSTELLATION_HARNESS_XC_SCRIPT`, the xcheckfs cell). Both stop in their first millisecond, before any mount.
+- 2 skipped in the catalogue run: `sqlite-first-touch-latency` and `sqlite-two-nodes`, because `sqlite3` was not installed on the run host.
+- 2 not run in the catalogue run for want of set-up: `lock-device-stall-lone-node` (needs `CONSTELLATION_HARNESS_STALL_DM`) and
+  `lock-xcheckfs-cell` (needs `CONSTELLATION_HARNESS_XC_SCRIPT`). Both stop in their first millisecond, before any mount.
+- **Follow-up runs on `4e44fd24` (2026-11-26, seed 42, once each, release build, box load 4.6 to 8.2 with another job running).** They close the
+  four rows above, and plan 41's Dependencies section asks for the two lock scenarios at M1.2's exit:
+  - `sqlite-first-touch-latency` passed (123 s) and `sqlite-two-nodes` passed (12 s), with `sqlite3` installed.
+  - `lock-device-stall-lone-node` passed (40 s). The state dir was an ext4 on a dm-delay device over a loop file on xfs (the bench's set-up: the
+    delayed table swapped in for the workload, 15 s `dmsetup suspend`): lane on, 0 `EIO`, 0 fenced ops and owners, 0 lost, 0 lapse parks, 19 own
+    renewals; the tree and the file held what answered OK, also after a remount.
+  - `lock-xcheckfs-cell` passed (454 s) with one node, lane on, the xcheckfs stress lane (`tests/external/run-stress.sh`, 10.2 million
+    operations, 0 mismatches, `verify` exit 0) with node A's mount as the secondary and an ext4 tree as the primary: `locks.lost`,
+    `owners_fenced`, `owner_fenced_ops` and `fenced_io` 0. The two-node cell, the dm-delay cells and the freeze cells of plan 41's
+    `bench/lock-lane/RESULTS.md` (up to 24 minutes each) were not re-run.
 
-No scenario fails on the close commit for a product reason. `placement-hot` and `delegated-group-switch`, named in the §6 row, are simulator
+No scenario fails on the close commit for a known product reason (`endpoint-wedge-probe` is undiagnosed, above). `placement-hot` and `delegated-group-switch`, named in the §6 row, are simulator
 labels; both are clean in R1's plain arm.
 
 **Gates on the close commit.** orphanfix's landing gate ran on `4e44fd24` (tree `3a45ecb1`): every test log verified, with no failure and no
 panic; the simulator suite (625 tests), the determinism gate and the gate's harness scenarios passed. Each change in "Landed since `060e6fa6`"
 has its own gates in its entry.
+
+Host for the close-commit evidence runs of 2026-11-26 (the endpoint-wedge, sqlite and lock-scenario runs below): Linux 7.3.0-0.rc4, x86_64, 16 CPUs;
+build and scratch directories on xfs, xcheckfs's primary tree on ext4, and a loop-backed ext4 under `dm-delay` for the device-stall run. R2 ran with
+scratch on xfs (the `CAP_SYS_ADMIN` rows as root) and R3 on ext4, xfs, btrfs and tmpfs. The kernel of the R1, R2 and R3 runs was not recorded.
 
 **R3: plan 45's box gates and both `hardlink-burst` scenarios, quiet box, four file systems.**
 
@@ -72282,7 +72315,8 @@ xfs 10 more rounds of the links cell (`PHASES=link,burst,control`) because its l
 
 - Both `hardlink-burst` scenarios passed 5 of 5 on every file system.
 - xfs last-100 / first-100: 1.51 at 5 rounds, over the 1.5 gate by 0.01; at 15 rounds 1.20. The 100-link p50 of a single cell is noisy
-  (per-run 0.78 to 1.62), so the 15-round median is the reading. Accepted as a pass (2026-11-25).
+  (per-run 0.78 to 1.62), so the 15-round median is the reading. Accepted as a pass by the supervisor (2026-11-25), not the user. M1.3's R3
+  pre-registers 15 rounds for xfs from the start.
 - xfs create p99 during the links: 1.179 at 15 rounds, 6 of the 15 per-run ratios above 1.2 (1.13 at 5 rounds). It passes, thinly, as on
   `060e6fa6` (1.187 at 10 rounds); a regression of a few percent would flip it.
 
@@ -72371,7 +72405,7 @@ systems named. Ratios are p50 of the new build over its base; `*` marks a cell w
 
    - Five `write` cells are inside ±3 % by their interval (p50 on ext4, xfs and btrfs, p90 on xfs and btrfs). The 30 to 100 us ops are
      unresolved: their intervals are ±25 to 45 %. No cell is resolved worse; btrfs chmod and unlink point up 20 to 24 % (btrfs unlink's
-     interval starts at 1.007, inside the 1.03 bar).
+     interval [1.007, 1.32] excludes 1.00 but not 1.03, so it is not resolved above the 1.03 bar).
    - **Verdict, user decision (2026-11-25):** "Accept: none resolved worse". The topology 1 criterion closes as "no detectable regression":
      ±3 % is below this host's resolution for the 30 to 100 us ops, no cell is resolved worse, and the five `write` cells are confirmed
      inside ±3 %.
@@ -72414,11 +72448,15 @@ it for M1.2.
 
 ### Exit checklist (plan 46 §6, M1.2 row)
 
-- [x] Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds: met on the close commit `4e44fd24`, plain arm, 295 labels (R1, as
-  decided: the plain arm is M1.2's criterion, the flex strict flags stay with M1.4); the idle-release and slow-lease-read arms, run on the same
-  commit, have none either. Earlier: `0d157e56` and `36db5771` (interim).
-- [x] The harness catalogue green: R2 on `4e44fd24`, the full catalogue, 333 scenarios; 327 pass, and no failure has a product cause (2
-  flaky, one of them pre-existing on `36db5771`; 2 skipped for a missing `sqlite3`; 2 that need a device-mapper or xcheckfs set-up).
+- [x] Zero I1, I2, I2c and I5 on every configuration at 2,000 seeds: met on the close commit `4e44fd24`, plain arm, 295 labels (R1). The plain arm is M1.2's
+  criterion by the supervisor's reading of the row from D-1 (§12 stage 0), accepted by the Fable exit check; the flex strict flags stay with
+  M1.4. The idle arm (27 `sticky-*` labels only) and the lr arm (3 `long-delegated*` labels only) ran on the same commit and have none either;
+  they are not the full arms. The full arms on `0d157e56` hit lr `far-root-writes-shared` 1621 (I1; WP6.1, `00a269fd`, pinned, lr sweep clean
+  after; not re-run under lr at the close) and idle 1264 `acked_at_or_below_cut` (WP6.2). The full lr arm runs in M1.3's re-baseline. Earlier:
+  `0d157e56` and `36db5771` (interim).
+- [ ] The harness catalogue green: R2 on `4e44fd24`, the full catalogue, 333 scenarios; 327 pass, and the 4 sqlite and lock rows that the catalogue
+  run skipped or lacked a set-up for passed in follow-up runs (below). **Not ticked: `endpoint-wedge-probe`, M1.2 exit pending attribution.** It
+  fails 4 of 5 on `4e44fd24` and 1 of 5 on the pre-M1.2 base `5907c65d`, undiagnosed. `passthrough-local-writer` saw one `ETXTBSY`.
 - [x] Plan 45's box gates and both `hardlink-burst` scenarios on ext4, xfs, btrfs and tmpfs (R3, `060e6fa6`, and again on `a70304d7`; xfs
   last-100 / first-100 read at 15 rounds, 1.20, accepted as a pass).
 - [x] The "Deleted" table complete (below).
@@ -72495,11 +72533,14 @@ These serve the root's own rows and the replay queue.
   it (fewer segments per op, or the tail work off the delegate core) is open.
 - R3's thin margins: xfs create p99 during the links is 1.179 at 15 rounds (6 of 15 runs above 1.2), so a regression of a few percent would
   flip it; xfs last-100 / first-100 needs more than 5 rounds to read.
-- Harness rows that the exit runs did not exercise or that are flaky: `lock-device-stall-lone-node` and `lock-xcheckfs-cell` need a set-up
-  the catalogue run lacks; the two `sqlite-*` scenarios need `sqlite3` on the run host; `endpoint-wedge-probe` fails about 3 runs in 5 on
-  the close commit and on `36db5771` alike (one FUSE request completes past the stall threshold); `passthrough-local-writer` saw one
-  `ETXTBSY`.
-- The slow-lease-read arm ran only the `long-delegated*` labels at the close; `placement-hot` seed 593 under slow lease reads is not shown
+- **`endpoint-wedge-probe`: M1.2 exit pending attribution.** It fails 4 of 5 on `4e44fd24` and 1 of 5 on the pre-M1.2 base `5907c65d` (same
+  message, one FUSE request past 18 s across the freezes; node b on the close commit, node a on the base); undiagnosed. The supervisor decides
+  whether it is a plan 46 liveness regression to attribute or a pre-existing flake to track.
+- Harness rows that the exit runs did not exercise or that are flaky: the two `sqlite-*` and the two plan 41 lock scenarios were run once each
+  afterwards and passed (R2, follow-up runs); the two-node and freeze cells of the lock-lane bench were not re-run. `passthrough-local-writer`
+  saw one `ETXTBSY`.
+- The idle and slow-lease-read arms ran only the 27 `sticky-*` and the 3 `long-delegated*` labels at the close (not the full arms; M1.3's
+  re-baseline runs the full lr arm, 118 labels, and `far-root-writes-shared` under lr, which was not re-run at the close); `placement-hot` seed 593 under slow lease reads is not shown
   separately here (the label is clean in the plain arm).
 - Topology 1's ±3 % at later gates: the user's 2026-11-25 decision closes it for M1.2; whether it carries to M1.3's and the stage-1 gates is
   their decision to take.
