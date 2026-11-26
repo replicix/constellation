@@ -29,7 +29,7 @@
 use super::Core;
 use crate::action::Action;
 use crate::event::{Carrier, HoldOffer, PeerMsg, XferNo};
-use crate::ids::{Epoch, NodeId, Now};
+use crate::ids::{Epoch, NodeId, Now, OpId};
 use crate::replica::Replica;
 use std::fmt;
 use std::str::FromStr;
@@ -222,6 +222,15 @@ pub(crate) enum Adopt {
 pub(crate) struct EpochAsk {
     /// The giver a nudge named, asked once, first (`on_epoch_hold_nudge`).
     pub target: Option<NodeId>,
+    /// The member the last epoch-mode request that failed went to: the
+    /// rotation goes on with the next one.
+    pub last: Option<NodeId>,
+    /// The cached holder an epoch-mode request failed against (declined, or
+    /// silent): skipped while it stays the cached holder, so that a stale
+    /// cache or a paused member does not absorb every attempt.
+    pub skip_cached: Option<NodeId>,
+    /// The epoch-mode request in flight, and whom it went to.
+    pub asked: Option<(OpId, NodeId)>,
 }
 
 /// What a request for the hold finds in the record of a node that holds
@@ -237,6 +246,80 @@ pub(crate) enum Reoffer {
 }
 
 impl Core {
+    /// Whom an epoch-mode acquisition asks for the hold (FX-5, rotation).
+    /// First match: the giver a nudge named (once); the cached holder, if it
+    /// is a member and no request to it failed since it became the cached
+    /// holder; the next member after the last one asked, in id order,
+    /// wrapping. Non-members are never asked while the members are known.
+    /// With no members known: the first connected link, as before.
+    pub(crate) fn epoch_ask_target(&mut self) -> Option<NodeId> {
+        let me = self.cfg.node_id;
+        if let Some(t) = self.epoch_ask.target.take() {
+            if t != me && self.pr.epoch_members.contains(&t) {
+                return Some(t);
+            }
+        }
+        if self.epoch_ask.skip_cached.is_some()
+            && self.lease.cached_holder != self.epoch_ask.skip_cached
+        {
+            self.epoch_ask.skip_cached = None;
+        }
+        if let Some(h) = self
+            .lease
+            .cached_holder
+            .filter(|h| *h != me && self.pr.epoch_members.contains(h))
+            .filter(|h| Some(*h) != self.epoch_ask.skip_cached)
+        {
+            return Some(h);
+        }
+        let mut others: Vec<NodeId> = self
+            .pr
+            .epoch_members
+            .iter()
+            .copied()
+            .filter(|m| *m != me)
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        if !others.is_empty() {
+            let next = self
+                .epoch_ask
+                .last
+                .and_then(|l| others.iter().copied().find(|m| *m > l))
+                .unwrap_or(others[0]);
+            return Some(next);
+        }
+        // The members are not known: today's fallback.
+        self.lease.cached_holder.filter(|h| *h != me).or_else(|| {
+            self.roster
+                .links()
+                .values()
+                .find(|l| l.connected && l.node != me)
+                .or_else(|| self.roster.links().values().find(|l| l.node != me))
+                .map(|l| l.node)
+        })
+    }
+
+    /// An epoch-mode request to `x` ended without the hold (declined, a
+    /// refused offer, or no answer): the rotation moves on, and a cached
+    /// holder that failed is skipped while it stays the cached holder.
+    pub(crate) fn epoch_ask_advance(&mut self, x: NodeId) {
+        self.epoch_ask.last = Some(x);
+        if self.lease.cached_holder == Some(x) {
+            self.epoch_ask.skip_cached = Some(x);
+        }
+        self.epoch_ask.asked = None;
+    }
+
+    /// The request `req` got no answer in time (or its peer failed).
+    pub(crate) fn epoch_ask_silent(&mut self, req: OpId) {
+        if let Some((r, to)) = self.epoch_ask.asked {
+            if r == req {
+                self.epoch_ask_advance(to);
+            }
+        }
+    }
+
     /// The nudge (FX-5, rules N1 to N6), at the ordinary round: a node whose
     /// record says it gave the hold to `to`, and which holds nothing, asks
     /// `to` to ask for it again. Level-triggered and stateless: the message

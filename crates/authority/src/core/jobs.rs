@@ -3926,29 +3926,13 @@ impl Core {
                 self.acquire_gate(now, replica, out);
                 return;
             }
-            // FX-5: the giver a nudge named is asked first, once.
-            let target = self
-                .epoch_ask
-                .target
-                .take()
-                .filter(|h| *h != self.cfg.node_id && self.pr.epoch_members.contains(h))
-                .or(self.lease.cached_holder.filter(|h| *h != self.cfg.node_id))
-                .or_else(|| {
-                    self.roster
-                        .links()
-                        .values()
-                        .find(|l| l.connected && l.node != self.cfg.node_id)
-                        .or_else(|| {
-                            self.roster
-                                .links()
-                                .values()
-                                .find(|l| l.node != self.cfg.node_id)
-                        })
-                        .map(|l| l.node)
-                });
+            // FX-5: the giver a nudge named is asked first, once; then the
+            // rotation (`epoch_ask_target`).
+            let target = self.epoch_ask_target();
             match target {
                 Some(holder) if self.cfg.p2p => {
                     let req = self.op_id();
+                    self.epoch_ask.asked = Some((req, holder));
                     self.set_phase(
                         Phase::LeaseRequest {
                             req,
@@ -6491,6 +6475,9 @@ impl Core {
         };
         let (epoch, head_seq) = match answer {
             HandoffAnswer::Declined { .. } => {
+                if epoch_mode {
+                    self.epoch_ask_advance(from);
+                }
                 self.finish_acquire(now, false, replica, out);
                 return;
             }
@@ -6509,6 +6496,7 @@ impl Core {
                     // The S3 handoff's answer carries no hold: refused
                     // (main adopted one on it).
                     self.stats.epoch_hold_released_refused += 1;
+                    self.epoch_ask_advance(from);
                     self.finish_acquire(now, false, replica, out);
                     return;
                 }
@@ -6617,6 +6605,7 @@ impl Core {
     ) {
         let refuse = |core: &mut Self, out: &mut Vec<Action>, counter: fn(&mut Stats)| {
             counter(&mut core.stats);
+            core.epoch_ask_advance(from);
             core.finish_acquire(now, false, replica, out);
         };
         // T2: only inside this node's own active, unfrozen epoch (M3).
@@ -6683,6 +6672,8 @@ impl Core {
             OfferKind::Transfer => self.stats.epoch_hold_transfers_taken += 1,
             OfferKind::Reoffer => self.stats.epoch_hold_reoffers_taken += 1,
         }
+        self.epoch_ask.skip_cached = None;
+        self.epoch_ask.asked = None;
         // A continuation epoch's P2P-only handoff: local authority, gated
         // like a takeover (no marker: nothing ships). Plan 30 §M10: the
         // predecessor hands over only with an empty journal
@@ -6713,6 +6704,9 @@ impl Core {
             return;
         };
         if matches!(job.phase, Phase::LeaseRequest { req: r, .. } if r == req) {
+            // (An epoch-mode request that got no answer in time or failed:
+            // the rotation moves on.)
+            self.epoch_ask_silent(req);
             self.finish_acquire(now, false, replica, out);
         }
     }

@@ -336,7 +336,9 @@ fn three_members_a_stale_reoffer_is_refused() {
     let answer = c.exchange(2, 3, true);
     assert!(is_hold(&answer, 3, OfferKind::Transfer));
     assert_eq!(c.holders(), Vec::<NodeId>::new());
-    let answer = c.exchange(2, 3, false);
+    // (The request that got no answer moved the rotation on; the giver's
+    // nudge names the giver again.)
+    let answer = c.recover(3, 2);
     assert!(is_hold(&answer, 3, OfferKind::Reoffer));
     assert_eq!(c.holders(), vec![2]);
     assert_eq!(c.rec(2), Some(c.held(3, 2)));
@@ -1368,4 +1370,93 @@ fn a_holder_and_a_non_member_are_not_nudged() {
     c.exchange(2, 1, true);
     c.node(1).core.pr.retired = true;
     assert_eq!(c.poll_nudge(1, 2), None, "N6");
+}
+
+// ---- the ask rotation ----
+
+/// T16: an epoch-mode acquisition moves on past a member that declined or
+/// stayed silent, never asks a non-member while the members are known, and
+/// asks a nudge's giver first.
+#[test]
+fn the_epoch_ask_rotates_past_a_declining_or_silent_cached_holder() {
+    // A cached holder that declines: the next attempt asks the next member
+    // (past it, in id order, wrapping).
+    let mut c = Cluster::new(&[1, 2, 3, 4]);
+    c.node(4).core.lease.cached_holder = Some(2);
+    let (to, req) = c.ask(4);
+    assert_eq!(to, 2);
+    let out = c.serve(2, 4, req);
+    let answer = answer_to(&out, 4).unwrap();
+    assert!(declined(&answer), "a non-holder declines");
+    c.hear(4, 2, req, answer);
+    let (to, req) = c.ask(4);
+    assert_eq!(to, 3, "past the cached holder that declined");
+    // ... and a silent one likewise: the request times out.
+    c.node(4).step(Event::PeerFailed {
+        req,
+        to: 3,
+        outage: false,
+    });
+    let (to, req) = c.ask(4);
+    assert_eq!(to, 1, "wrapping");
+    c.node(4).step(Event::PeerFailed {
+        req,
+        to: 1,
+        outage: false,
+    });
+    let (to, _) = c.ask(4);
+    assert_eq!(
+        to, 2,
+        "the rotation visits every member, the skipped one too"
+    );
+    // The cached holder changes: it is asked again.
+    let mut c = Cluster::new(&[1, 2, 3]);
+    c.node(3).core.lease.cached_holder = Some(2);
+    let (_, req) = c.ask(3);
+    c.node(3).step(Event::PeerFailed {
+        req,
+        to: 2,
+        outage: false,
+    });
+    c.node(3).core.lease.cached_holder = Some(1);
+    let (to, _) = c.ask(3);
+    assert_eq!(to, 1, "a cached holder that changed is asked first");
+
+    // A connected link of a non-member with a lower id is never asked.
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let ev = Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Epoch {
+            open: true,
+            active: true,
+            frozen: false,
+            flushing: false,
+            base: 0,
+            members: vec![2, 3],
+            carrier: Some(c.key),
+            stale_below: 1,
+        },
+    };
+    c.node(3).step(ev);
+    c.node(3).core.lease.cached_holder = None;
+    c.node(3).step(Event::Peers {
+        registry_complete: true,
+        links: vec![crate::event::PeerLink {
+            node: 1,
+            connected: true,
+            last_seen: None,
+            rtt_ms: None,
+            since: None,
+        }],
+        lapses: 0,
+    });
+    let (to, _) = c.ask(3);
+    assert_eq!(to, 2, "a non-member link absorbed the attempt");
+
+    // A nudge's giver is asked first, whatever the cache says.
+    let mut c = Cluster::new(&[1, 2, 3]);
+    c.exchange(2, 1, true);
+    c.node(2).core.lease.cached_holder = Some(3);
+    let answer = c.recover(1, 2);
+    assert!(is_hold(&answer, 1, OfferKind::Reoffer));
 }
