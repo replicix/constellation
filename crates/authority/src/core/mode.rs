@@ -20,11 +20,13 @@
 //!   all and every write of this node failing, which a desktop that
 //!   happens to be off must not do to a phone.
 //! - **suspended** (`Suspending` until `Resumed`): forward-only, and no
-//!   acquisition at all except the two that are the protocol's own safety
+//!   acquisition at all except the three that are the protocol's own safety
 //!   duties — a sealed backup's takeover (it alone may hold an
-//!   acknowledged tail the log does not have yet, plan 30 §M9) and a
+//!   acknowledged tail the log does not have yet, plan 30 §M9), a
 //!   continuation epoch's flush re-claim (its journal must reach S3 under
-//!   the lease it carried, §M10). Ops that need a holder while suspended
+//!   the lease it carried, §M10), and taking the epoch hold a peer gave
+//!   this node (FX-5: only this node can take transfer `n`, and an epoch
+//!   whose hold is lost in flight never closes otherwise). Ops that need a holder while suspended
 //!   wait for another node to take the lease, then forward to it, exactly
 //!   as a non-holder's would; one still waiting at its deadline ends as
 //!   every such op does (`InDoubt`).
@@ -63,7 +65,12 @@ impl AuthorityMode {
     pub fn admit_acquire(&self, reason: &'static str, ask_handoff: bool) -> Option<bool> {
         // The safety duties (see the module docs): always admitted, and
         // never an ask of a live holder anyway.
-        const DUTIES: [&str; 2] = ["backup-takeover", "epoch-close-reclaim"];
+        // ("epoch-hold-owed": the hold a peer gave this node, FX-5. The ask
+        // goes to the member that gave it, whatever the mode: the epoch hold
+        // is not a lease taken from a live holder, it is a transfer this
+        // node is owed. The handoff pause, `is_paused_for_handoff`, is the
+        // S3 handoff's: an epoch give never sets it.)
+        const DUTIES: [&str; 3] = ["backup-takeover", "epoch-close-reclaim", "epoch-hold-owed"];
         if DUTIES.contains(&reason) {
             return Some(ask_handoff);
         }
@@ -146,6 +153,16 @@ mod tests {
         assert_eq!(mode.admit_acquire("backup-takeover", false), Some(false));
         assert_eq!(
             mode.admit_acquire("epoch-close-reclaim", false),
+            Some(false)
+        );
+        // FX-5: the hold a peer gave this node is taken whatever the mode.
+        assert_eq!(mode.admit_acquire("epoch-hold-owed", false), Some(false));
+        let forward_only = AuthorityMode {
+            forward_only: true,
+            suspended: false,
+        };
+        assert_eq!(
+            forward_only.admit_acquire("epoch-hold-owed", false),
             Some(false)
         );
     }

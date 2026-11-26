@@ -1133,3 +1133,239 @@ fn the_old_keys_are_ignored() {
     assert!(h.core.lease.epoch_held(), "adopted: not stalled");
     assert_eq!(h.core.stats.epoch_hold_record_unreadable, 0);
 }
+
+// ---- the nudge ----
+
+fn nudge_to(out: &[Action], to: NodeId) -> Option<(Carrier, XferNo)> {
+    sends(out).into_iter().find_map(|(n, m)| match m {
+        PeerMsg::EpochHoldNudge { key, n: no } if n == to => Some((*key, *no)),
+        _ => None,
+    })
+}
+
+impl Cluster {
+    /// `giver` polls (its ordinary round): the nudge it sent to `to`, if any.
+    fn poll_nudge(&mut self, giver: NodeId, to: NodeId) -> Option<(Carrier, XferNo)> {
+        let h = self.node(giver);
+        let mut out = Vec::new();
+        // (The poll's handler itself: a round in flight leaves no timer.)
+        h.core.on_poll(h.clk(), &h.meta, &mut out);
+        nudge_to(&out, to)
+    }
+
+    /// `to` hears `giver`'s nudge: what it sends.
+    fn hear_nudge(&mut self, to: NodeId, giver: NodeId, key: Carrier, n: XferNo) -> Vec<Action> {
+        self.node(to).step(Event::Peer {
+            from: giver,
+            msg: PeerMsg::EpochHoldNudge { key, n },
+        })
+    }
+
+    /// The whole recovery of a lost answer: `giver` polls, `to` asks, the
+    /// giver re-offers, `to` hears it.
+    fn recover(&mut self, giver: NodeId, to: NodeId) -> HandoffAnswer {
+        let (key, n) = self
+            .poll_nudge(giver, to)
+            .unwrap_or_else(|| panic!("node {giver} sent no nudge"));
+        let out = self.hear_nudge(to, giver, key, n);
+        let (target, req) = lease_request(&out).unwrap_or_else(|| panic!("no ask: {out:?}"));
+        assert_eq!(target, giver, "the nudge's giver is asked");
+        let out = self.serve(giver, to, req);
+        let answer = answer_to(&out, to).unwrap();
+        self.hear(to, giver, req, answer);
+        answer
+    }
+}
+
+/// T6 (M2, shape 3): the answer is lost and nobody asks again (the
+/// recipient is idle): the giver's round nudges it, its duty acquisition
+/// asks the giver and takes the hold, and the epoch closes from there.
+#[test]
+fn an_idle_recipient_is_nudged_and_the_epoch_closes() {
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, true);
+    assert!(c.holders().is_empty());
+    assert!(c.node(2).core.job().is_none(), "the recipient is idle");
+    let answer = c.recover(1, 2);
+    assert!(is_hold(&answer, 1, OfferKind::Reoffer), "{answer:?}");
+    assert_eq!(c.holders(), vec![2]);
+    assert_eq!(c.rec(2), Some(c.held(1, 2)));
+    assert_eq!(c.node(1).core.stats.epoch_hold_nudges, 1);
+    // S3 is back: the new owner flushes and closes the epoch.
+    let carrier = c.key;
+    let mut object = lease_of(carrier.node, carrier.epoch, carrier.expires_unix_ms);
+    object.holder = carrier.node;
+    let closed = drive_until(c.node(2), carrier, object, &|h| {
+        matches!(h.core.hold_record(), Some(HoldRecord::Ended { .. })) && !h.core.epoch.open
+    });
+    assert!(closed, "the epoch did not close");
+    assert_eq!(c.rec(2), Some(c.ended(1, Reclaim::Owed)));
+}
+
+/// T3 (shape 2): a request that sat queued at the holder past its
+/// requester's timeout is served late; the answer finds nobody; the
+/// giver's round nudges, and the recovery is the same.
+#[test]
+fn a_stale_request_served_late_is_recovered_by_the_nudge() {
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, false);
+    // 1 asks 2 for the hold back; 2 is paused; 1's request times out.
+    c.node(1).core.lease.cached_holder = Some(2);
+    let (_, req) = c.ask(1);
+    c.node(1).step(Event::PeerFailed {
+        req,
+        to: 2,
+        outage: false,
+    });
+    assert!(c.node(1).core.job().is_none());
+    // 2 serves it later: it gives n = 2; the answer reaches a node with no
+    // acquisition waiting for it.
+    let out = c.serve(2, 1, req);
+    let answer = answer_to(&out, 1).unwrap();
+    assert!(is_hold(&answer, 2, OfferKind::Transfer));
+    c.hear(1, 2, req, answer);
+    assert_eq!(c.node(1).core.stats.epoch_hold_answers_dropped, 1);
+    assert!(c.holders().is_empty());
+    // 2's round nudges 1; 1 asks 2 and takes.
+    let answer = c.recover(2, 1);
+    assert!(is_hold(&answer, 2, OfferKind::Reoffer), "{answer:?}");
+    assert_eq!(c.holders(), vec![1]);
+    assert_eq!(c.rec(1), Some(c.held(2, 1)));
+}
+
+/// T8: a frozen giver re-offers nothing and nudges nothing; after the
+/// unfreeze the next round nudges and the re-offer is taken.
+#[test]
+fn a_frozen_giver_reoffers_after_the_unfreeze() {
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, true);
+    c.report(1, true, false, true);
+    assert_eq!(c.poll_nudge(1, 2), None, "N2: a frozen giver nudges nobody");
+    let (_, req) = c.ask(2);
+    let out = c.serve(1, 2, req);
+    assert!(declined(&answer_to(&out, 2).unwrap()), "R2: {out:?}");
+    c.node(2).step(Event::PeerFailed {
+        req,
+        to: 1,
+        outage: false,
+    });
+    c.report(1, true, true, false);
+    let answer = c.recover(1, 2);
+    assert!(is_hold(&answer, 1, OfferKind::Reoffer), "{answer:?}");
+    assert_eq!(c.holders(), vec![2]);
+}
+
+/// T9: the giver crashes after its record and before its answer left: after
+/// the restart its round nudges from the record alone.
+#[test]
+fn a_giver_crashed_after_its_record_nudges_after_the_restart() {
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, true);
+    c.restart(1);
+    assert_eq!(c.rec(1), Some(c.given(1, 2)), "the record survived");
+    // Not before it knows its epoch: nothing to nudge in.
+    assert_eq!(c.poll_nudge(1, 2), None);
+    c.report(1, true, true, false);
+    let answer = c.recover(1, 2);
+    assert!(is_hold(&answer, 1, OfferKind::Reoffer), "{answer:?}");
+    assert_eq!(c.holders(), vec![2]);
+}
+
+/// T17: the nudge is filtered, and its acquisition is a duty.
+#[test]
+fn the_nudge_is_filtered_and_its_acquisition_is_a_duty() {
+    // A stale nudge (the recipient has passed n) is ignored.
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, false);
+    let key = c.key;
+    let out = c.hear_nudge(2, 1, key, XferNo(1));
+    assert!(lease_request(&out).is_none(), "{out:?}");
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_stale, 1);
+    // A nudge from a non-member, for another key, or to a holder: ignored.
+    let out = c.hear_nudge(2, 3, key, XferNo(9));
+    assert!(lease_request(&out).is_none());
+    let other = Carrier {
+        expires_unix_ms: key.expires_unix_ms + 1,
+        ..key
+    };
+    let out = c.hear_nudge(2, 1, other, XferNo(9));
+    assert!(lease_request(&out).is_none());
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_state, 2);
+    let out = c.hear_nudge(2, 1, key, XferNo(9));
+    assert!(lease_request(&out).is_none(), "A5: it holds");
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_state, 3);
+
+    // A nudge during a running acquisition is ignored; honoured at the next round.
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, true);
+    let (_, req) = c.ask(2);
+    let (key, n) = c.poll_nudge(1, 2).unwrap();
+    let out = c.hear_nudge(2, 1, key, n);
+    assert!(lease_request(&out).is_none(), "{out:?}");
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_busy, 1);
+    c.node(2).step(Event::PeerFailed {
+        req,
+        to: 1,
+        outage: false,
+    });
+    let (key, n) = c.poll_nudge(1, 2).unwrap();
+    let out = c.hear_nudge(2, 1, key, n);
+    assert!(
+        lease_request(&out).is_some(),
+        "the next round's nudge: {out:?}"
+    );
+
+    // A forward-only node and a suspended node take a hold given to them.
+    for mode in [
+        AuthorityMode {
+            forward_only: true,
+            suspended: false,
+        },
+        AuthorityMode {
+            forward_only: false,
+            suspended: true,
+        },
+    ] {
+        let mut c = Cluster::new(&[1, 2]);
+        c.exchange(2, 1, true);
+        c.node(2).core.mode = mode;
+        let answer = c.recover(1, 2);
+        assert!(is_hold(&answer, 1, OfferKind::Reoffer), "{mode:?}");
+        assert_eq!(c.holders(), vec![2], "{mode:?}");
+    }
+}
+
+/// N4 and N5, named assertions: a node that holds nudges nobody, and nobody
+/// is nudged who is no member of the epoch.
+#[test]
+fn a_holder_and_a_non_member_are_not_nudged() {
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.given(1, 2);
+    let h1 = c.node(1);
+    h1.core.pr.hold_rec = HoldRecState::Known(Some(rec));
+    let mut out = Vec::new();
+    h1.core.nudge_hold_recipient(&mut out);
+    assert!(out.is_empty(), "N4: a holder nudged: {out:?}");
+    let mut c = Cluster::new(&[1, 2, 3]);
+    c.exchange(2, 1, true);
+    let ev = Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Epoch {
+            open: true,
+            active: true,
+            frozen: false,
+            flushing: false,
+            base: 0,
+            members: vec![1, 3],
+            carrier: Some(c.key),
+            stale_below: 1,
+        },
+    };
+    c.node(1).step(ev);
+    assert_eq!(c.poll_nudge(1, 2), None, "N5: a non-member was nudged");
+    // And a retired giver nudges nobody (N6).
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, true);
+    c.node(1).core.pr.retired = true;
+    assert_eq!(c.poll_nudge(1, 2), None, "N6");
+}

@@ -27,7 +27,8 @@
 //! every transition (fail closed), never "no record".
 
 use super::Core;
-use crate::event::{Carrier, HoldOffer, XferNo};
+use crate::action::Action;
+use crate::event::{Carrier, HoldOffer, PeerMsg, XferNo};
 use crate::ids::{Epoch, NodeId, Now};
 use crate::replica::Replica;
 use std::fmt;
@@ -215,6 +216,14 @@ pub(crate) enum Adopt {
     ClosedCarried,
 }
 
+/// Which member an epoch-mode acquisition asks for the hold next (memory
+/// only: reset at every activation and when the epoch ends).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EpochAsk {
+    /// The giver a nudge named, asked once, first (`on_epoch_hold_nudge`).
+    pub target: Option<NodeId>,
+}
+
 /// What a request for the hold finds in the record of a node that holds
 /// nothing (rules R1 to R9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +237,88 @@ pub(crate) enum Reoffer {
 }
 
 impl Core {
+    /// The nudge (FX-5, rules N1 to N6), at the ordinary round: a node whose
+    /// record says it gave the hold to `to`, and which holds nothing, asks
+    /// `to` to ask for it again. Level-triggered and stateless: the message
+    /// carries no state, the recipient filters it (`on_epoch_hold_nudge`),
+    /// and the next round sends it again until the epoch ends or `to` has
+    /// passed that number. No timer, no constant: the poll is the round
+    /// (the sync interval, up to four times it while the epoch is open).
+    pub(crate) fn nudge_hold_recipient(&mut self, out: &mut Vec<Action>) {
+        let Some(HoldRecord::Given { key, n, to }) = self.hold_record().copied() else {
+            return;
+        };
+        if !self.epoch.active
+            || self.epoch.frozen
+            || self.pr.carried != Some(key)
+            || self.lease.epoch_held()
+            || to == self.cfg.node_id
+            || !self.pr.epoch_members.contains(&to)
+            || self.pr.retired
+        {
+            return;
+        }
+        self.stats.epoch_hold_nudges += 1;
+        out.push(Action::Send {
+            to,
+            msg: PeerMsg::EpochHoldNudge { key, n },
+        });
+    }
+
+    /// A nudge (rules A1 to A6): `from` says it gave this node transfer `n`
+    /// of the hold of `key`. If this node has not passed `n`, and is idle
+    /// in the epoch, it asks `from` for it through an ordinary epoch
+    /// acquisition (the one guarded path to a take). Ignored otherwise,
+    /// counted by cause; the next round's nudge tries again.
+    pub(crate) fn on_epoch_hold_nudge(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        key: HoldKey,
+        n: XferNo,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        // A1, A2, A3.
+        if !self.epoch.active
+            || self.epoch.frozen
+            || !self.pr.epoch_members.contains(&from)
+            || self.pr.carried != Some(key)
+        {
+            self.stats.epoch_hold_nudges_ignored_state += 1;
+            return;
+        }
+        // A4: only a number above the highest of this key taken or given
+        // here. (A node that restarted and has not read its record, or
+        // cannot, ignores it: it passes nothing it cannot see.)
+        if !self.pr.hold_rec.highest(key).is_some_and(|h| n > h) {
+            self.stats.epoch_hold_nudges_ignored_stale += 1;
+            return;
+        }
+        // A5: it holds nothing and is not retired (nor with an unwritten
+        // end of a hold of its own).
+        if self.lease.epoch_held() || self.pr.retired || self.hold_rec_dirty() {
+            self.stats.epoch_hold_nudges_ignored_state += 1;
+            return;
+        }
+        // A6: no acquisition running or queued (the next round's nudge
+        // finds it done).
+        if self.acquisition_pending() {
+            self.stats.epoch_hold_nudges_ignored_busy += 1;
+            return;
+        }
+        self.epoch_ask.target = Some(from);
+        self.enqueue_job(
+            now,
+            super::jobs::JobReq::Acquire {
+                reason: "epoch-hold-owed",
+                ask_handoff: false,
+            },
+            replica,
+            out,
+        );
+    }
+
     /// Read the record when this process has none: at start, and at every
     /// event while the last read failed (a later read resumes every
     /// transition). A hold the record names but memory does not have is

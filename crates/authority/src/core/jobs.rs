@@ -3818,6 +3818,17 @@ impl Core {
         self.lease.pause_until = now.wait.plus(ms);
     }
 
+    /// An acquisition is running or queued.
+    pub(super) fn acquisition_pending(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.kind() == JobKind::Acquire)
+            || self
+                .queued_jobs
+                .iter()
+                .any(|j| matches!(j, JobReq::Acquire { .. }))
+    }
+
     fn begin_acquire(
         &mut self,
         now: Now,
@@ -3915,10 +3926,13 @@ impl Core {
                 self.acquire_gate(now, replica, out);
                 return;
             }
+            // FX-5: the giver a nudge named is asked first, once.
             let target = self
-                .lease
-                .cached_holder
-                .filter(|h| *h != self.cfg.node_id)
+                .epoch_ask
+                .target
+                .take()
+                .filter(|h| *h != self.cfg.node_id && self.pr.epoch_members.contains(h))
+                .or(self.lease.cached_holder.filter(|h| *h != self.cfg.node_id))
                 .or_else(|| {
                     self.roster
                         .links()

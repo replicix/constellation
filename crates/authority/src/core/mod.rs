@@ -92,7 +92,7 @@ pub(crate) use delegate::STICKY_HOLD_MAX_MS;
 pub use delegate::{
     DelegKind, DelegRenewCert, DelegView, RecallPhase, StickyEnd, StickyStreamView,
 };
-use hold::{Adopt, HoldRecState};
+use hold::{Adopt, EpochAsk, HoldRecState};
 pub use hold::{HoldKey, HoldRecord, Reclaim};
 pub use roster::RosterView;
 pub use seal_tail::WaitingForGroup;
@@ -3321,6 +3321,8 @@ pub struct Core {
     pub(crate) bk: backup::BackupState,
     /// M10: heartbeat promises, the takeover check, the carried lease.
     pub(crate) pr: promise::PromiseState,
+    /// FX-5: whom an epoch-mode acquisition asks for the hold next.
+    epoch_ask: EpochAsk,
     /// M11: delegations held here and, as the root, the generations.
     pub(crate) dl: delegate::DelegationState,
     /// Plan 41 R1: the root's delegation windows (`GenState`'s `until`),
@@ -3450,6 +3452,7 @@ impl Core {
             ack: backup::AckState::default(),
             bk: backup::BackupState::default(),
             pr: promise::PromiseState::default(),
+            epoch_ask: EpochAsk::default(),
             dl: delegate::DelegationState::default(),
             dw: DelegWindows::new(),
             lane_cell: crate::lane::LaneCell::new(),
@@ -4169,8 +4172,9 @@ impl Core {
             PeerMsg::LeaseHandoff { req, answer } => {
                 self.on_lease_handoff(now, from, req, answer, replica, out)
             }
-            // FX-5: the nudge is handled by the nudge commit.
-            PeerMsg::EpochHoldNudge { .. } => {}
+            PeerMsg::EpochHoldNudge { key, n } => {
+                self.on_epoch_hold_nudge(now, from, key, n, replica, out)
+            }
             PeerMsg::SegmentPublished { seq, epoch } => {
                 self.on_segment_pushed(now, from, seq, epoch, out)
             }
@@ -5111,6 +5115,9 @@ impl Core {
             // frees the job slot.
             self.end_epoch_request(now, replica, out);
         }
+        if (state.active && !before.active) || !state.open {
+            self.epoch_ask = EpochAsk::default();
+        }
         if state.active && !before.active {
             let mut adopt_via = Adopt::Fresh;
             let closed_carried = self.epoch_closed_carried();
@@ -5436,6 +5443,8 @@ impl Core {
             self.epoch_probes = self.epoch_probes.saturating_add(1);
         }
         self.retry_owed_strand(self.ship.next_seq, self.ship.max_epoch, replica);
+        // FX-5: before the busy check, whatever this node's job is.
+        self.nudge_hold_recipient(out);
         if self.pr.adopt_retry {
             // An adoption's record write failed: try again each round.
             self.adopt_reaffirm(now, replica);
