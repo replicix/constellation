@@ -10866,6 +10866,7 @@ struct OracleTotals {
     /// second is always 0 there: under strict gating a non-zero count fails the seed).
     observed_own: (usize, usize),
     ll_core: [u64; 11],
+    hold_core: [u64; 12],
     quarantine_core: [u64; 6],
     unapplied_core: [u64; 3],
     release_wait: [u64; 8],
@@ -11384,6 +11385,9 @@ impl OracleTotals {
         for (t, c) in self.ll_core.iter_mut().zip(r.ll_core) {
             *t += c;
         }
+        for (t, c) in self.hold_core.iter_mut().zip(r.hold_core) {
+            *t += c;
+        }
         for (t, c) in self.sticky_core.iter_mut().zip(r.sticky_core) {
             *t += c;
         }
@@ -11618,6 +11622,10 @@ impl OracleTotals {
         eprintln!(
             "SWEEP-LL-STATS {label} seeds {}/{seeds}: [withdrawn-first, resubmitted-ops, stale-reads, stale-relists, stale-parks, unacked-settles, foreign-deferred, withdraw-failed, bg-dropped, multi-batch, withdrawn-ops] {:?}",
             self.seeds, self.ll_core
+        );
+        eprintln!(
+            "SWEEP-HOLD-STATS {label} seeds {}/{seeds}: [gives, reoffers, transfers-taken, reoffers-taken, answers-dropped, offers-refused, nudges, nudges-ignored, write-failures, unreadable, gives-declined, reoffers-declined] {:?}",
+            self.seeds, self.hold_core
         );
         eprintln!(
             "SWEEP-HELD-LOST-CHUNK {label} seeds {}/{seeds}: held-behind-lost-chunk unsettled EIOs (allowed: the row waits behind a chunk that exists nowhere; checked against the chunk ledger) {} (in {} seeds)",

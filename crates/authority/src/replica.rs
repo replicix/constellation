@@ -1061,17 +1061,6 @@ pub trait Replica {
     /// clock (plan 43 C7b: a duration, never a wall instant). `false` while
     /// a continuation-epoch join holds the gate (nothing written).
     fn issue_promise(&self, span_ms: u64, now: Now) -> Result<bool, MetaError>;
-    /// The continuation-epoch hold this node owns (`local["epoch_hold"]`),
-    /// so a restarted hold owner re-adopts it and can flush its journal.
-    fn epoch_hold_persisted(&self) -> Option<Epoch>;
-    fn persist_epoch_hold(&self, hold: Option<Epoch>) -> Result<(), MetaError>;
-    /// The carried lease (`epoch`, `expires_unix_ms`) whose epoch hold
-    /// this node owned and let go — handed to a peer, or closed with its
-    /// epoch (`local["epoch_hold_ended"]`): it never re-adopts that hold,
-    /// even after a restart. The flag: it closed the epoch itself and
-    /// still owes the re-claim of that lease (`Core::epoch_reclaim_due`).
-    fn epoch_hold_ended(&self) -> Option<(Epoch, i64, bool)>;
-    fn persist_epoch_hold_ended(&self, ended: Option<(Epoch, i64, bool)>) -> Result<(), MetaError>;
     /// FX-5: the node's one record of an epoch hold
     /// (`local["epoch_hold_rec"]`, [`HoldRecord`]). A kv read error or a
     /// value that does not parse is `Err`, never `Ok(None)`: the core
@@ -2588,42 +2577,12 @@ impl Replica for Meta {
         Meta::kv_set_durable(self, EPOCH_HOLD_RECORD_KEY, &v)
     }
 
-    fn epoch_hold_persisted(&self) -> Option<Epoch> {
-        Meta::kv_get(self, "epoch_hold")
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok())
-            .filter(|e| *e > 0)
-    }
-
     fn epochs_possibly_carrying(
         &self,
         holder: NodeId,
         lease_epoch: Epoch,
     ) -> Result<Vec<Vec<NodeId>>, MetaError> {
         Meta::epochs_possibly_carrying(self, holder, lease_epoch)
-    }
-
-    fn persist_epoch_hold(&self, hold: Option<Epoch>) -> Result<(), MetaError> {
-        // (Written only when it changes; synced like the epoch's other
-        // persisted state, M16.)
-        Meta::kv_set_durable(self, "epoch_hold", &hold.unwrap_or(0).to_string())
-    }
-
-    fn epoch_hold_ended(&self) -> Option<(Epoch, i64, bool)> {
-        let v = Meta::kv_get(self, "epoch_hold_ended").ok().flatten()?;
-        let mut parts = v.split(':');
-        let epoch = parts.next()?.parse().ok()?;
-        let expires = parts.next()?.parse().ok()?;
-        let reclaim = parts.next() == Some("1");
-        Some((epoch, expires, reclaim))
-    }
-
-    fn persist_epoch_hold_ended(&self, ended: Option<(Epoch, i64, bool)>) -> Result<(), MetaError> {
-        let v = ended
-            .map(|(e, x, r)| format!("{e}:{x}:{}", u8::from(r)))
-            .unwrap_or_default();
-        Meta::kv_set_durable(self, "epoch_hold_ended", &v)
     }
 
     fn epoch_owes_move(&self) -> Option<(Epoch, i64)> {

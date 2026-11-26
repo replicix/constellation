@@ -146,13 +146,27 @@ impl Core {
             && self.bk.kept_ready != Some(prev.renewal_key())
     }
 
-    /// This node holds the lease `prev` and handed the hold of the epoch
-    /// that carried it to a peer (`hold_ended`'s flag is false): the peer's
-    /// rows at the next epoch are on the epoch's members, not in this node's
+    /// This node holds the lease `prev` and let the hold of the epoch that
+    /// carried it go without closing (a give to a peer, or an involuntary
+    /// end: the record is `Given` or `Ended` and settled): the peer's rows
+    /// at the next epoch are on the epoch's members, not in this node's
     /// journal.
     fn carrier_handed_over(&self, prev: &Lease) -> bool {
+        let key = crate::event::Carrier {
+            node: prev.holder,
+            epoch: prev.epoch,
+            expires_unix_ms: prev.expires_unix_ms,
+        };
         prev.holder == self.cfg.node_id
-            && self.pr.hold_ended == Some((prev.epoch, prev.expires_unix_ms, false))
+            && match self.hold_record() {
+                Some(super::HoldRecord::Given { key: k, .. }) => *k == key,
+                Some(super::HoldRecord::Ended {
+                    key: k,
+                    reclaim: super::Reclaim::Settled,
+                    ..
+                }) => *k == key,
+                _ => false,
+            }
     }
 
     /// The targets of a claim of `prev`: the hold streams of its own tenure

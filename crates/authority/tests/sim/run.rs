@@ -1877,6 +1877,13 @@ pub struct Report {
     /// foreign settles deferred, settles whose tombstone failed, background
     /// tombstones dropped, multi-batch withdrawals, ops withdrawn.
     pub ll_core: [u64; 11],
+    /// FX-5, the epoch hold's transfer numbers, summed over the nodes
+    /// (`SWEEP-HOLD-STATS`): gives, re-offers, transfers taken, re-offers
+    /// taken, answers dropped (class S's signature), offers refused (every
+    /// cause), nudges sent, nudges ignored (every cause), record writes
+    /// that failed (give, take, end, adoption), unreadable records,
+    /// declined gives and re-offers (every cause).
+    pub hold_core: [u64; 12],
     /// Core counters, summed over the nodes, of the restart write
     /// quarantine (ADR-46): generations quarantined, own writes parked,
     /// forwards answered `Held`, quarantines waited out, read grants
@@ -8605,6 +8612,40 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             s.bg_tombstones_dropped,
             s.inbox_multi_batch_withdrawals,
             s.inbox_withdrawn_ops,
+        ]) {
+            *t += v;
+        }
+        for (t, v) in report.hold_core.iter_mut().zip([
+            s.epoch_hold_gives,
+            s.epoch_hold_reoffers,
+            s.epoch_hold_transfers_taken,
+            s.epoch_hold_reoffers_taken,
+            s.epoch_hold_answers_dropped,
+            s.epoch_hold_offers_refused_closed
+                + s.epoch_hold_offers_refused_not_member
+                + s.epoch_hold_offers_refused_key
+                + s.epoch_hold_offers_refused_stale
+                + s.epoch_hold_offers_refused_held
+                + s.epoch_hold_offers_refused_record
+                + s.epoch_hold_offers_refused_mode
+                + s.epoch_hold_released_refused,
+            s.epoch_hold_nudges,
+            s.epoch_hold_nudges_ignored_stale
+                + s.epoch_hold_nudges_ignored_busy
+                + s.epoch_hold_nudges_ignored_state,
+            s.epoch_hold_give_persist_failed
+                + s.epoch_hold_take_persist_failed
+                + s.epoch_hold_end_persist_failed
+                + s.epoch_hold_adopt_persist_failed,
+            s.epoch_hold_record_unreadable,
+            s.epoch_gives_declined_record
+                + s.epoch_gives_declined_not_member
+                + s.epoch_gives_declined_journal
+                + s.epoch_gives_declined_journal_err,
+            s.epoch_hold_reoffers_declined_state
+                + s.epoch_hold_reoffers_declined_behind
+                + s.epoch_hold_reoffers_declined_journal
+                + s.epoch_hold_reoffers_declined_journal_err,
         ]) {
             *t += v;
         }

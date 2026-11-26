@@ -14,10 +14,11 @@
 
 use super::lease::{honour_end_of, wait_end_of, PendingGate, Plan};
 use super::promise::ReleaseRecord;
-use super::{Core, S3For};
+use super::{Core, HoldRecord, S3For, Stats};
 use crate::action::{Action, ControlOk, S3Op};
 use crate::event::{
-    CasFailure, Control, HandoffAnswer, PeerMsg, S3Failure, S3Result, UploadResult,
+    CasFailure, Control, HandoffAnswer, HoldOffer, OfferKind, PeerMsg, S3Failure, S3Result,
+    UploadResult,
 };
 use crate::ids::{Epoch, NodeId, Now, OpId, Seq, WaitMs};
 use crate::replica::Replica;
@@ -2493,17 +2494,27 @@ impl Core {
                         // epoch; the journal ships under an ordinary S3
                         // lease from here.
                         if self.lease.epoch_held() {
-                            // Plan 30 §M10: silent until the journal is in.
-                            self.pr.flush_pending = true;
                             // And the carried lease is re-claimed, whether
                             // or not anything waits to ship: members close
                             // only once it has moved (`epoch_reclaim_due`).
-                            self.end_epoch_hold(replica, true);
+                            // FX-5: the `Ended { Owed }` record first; if it
+                            // cannot be written there is no close this round
+                            // (the next probed round retries), and this node
+                            // stays the hold owner, not silent for nothing.
+                            if !self.end_epoch_hold(replica, true) {
+                                self.finish_round(now, None, replica, out);
+                                return;
+                            }
+                            // Plan 30 §M10: silent until the journal is in.
+                            self.pr.flush_pending = true;
                         } else if self.owes_carried_move() {
                             // The owed close (`owes_move`): it owes the
                             // carried lease's re-claim as a hold owner
                             // would, should the release not have landed.
-                            self.end_epoch_hold(replica, true);
+                            if !self.end_epoch_hold(replica, true) {
+                                self.finish_round(now, None, replica, out);
+                                return;
+                            }
                         }
                         out.push(Action::EpochClose);
                         self.skip_ship = false;
@@ -6442,7 +6453,6 @@ impl Core {
     }
 
     /// A peer answered the acquisition's `LeaseRequest`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lease_handoff(
         &mut self,
         now: Now,
@@ -6452,57 +6462,45 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        // (FX-5: a hold offer is refused until the take rules exist.)
-        let (released, epoch, head_seq) = match answer {
-            HandoffAnswer::Released { epoch, head_seq } => (true, epoch, head_seq),
-            HandoffAnswer::Declined { .. } | HandoffAnswer::Hold(_) => (false, 0, None),
-        };
-        let Some(job) = self.job.as_ref() else {
-            return;
-        };
-        let Phase::LeaseRequest { req: r, epoch_mode } = job.phase else {
-            return;
-        };
-        if r != req {
-            return;
-        }
-        if !released {
-            self.finish_acquire(now, false, replica, out);
-            return;
-        }
-        if epoch_mode {
-            // A continuation epoch's P2P-only handoff: local authority,
-            // gated like a takeover (no marker: nothing ships). Plan 30
-            // §M10: the predecessor hands over only with an empty journal
-            // (`on_lease_request`). The hold's epoch is the one this
-            // node's flush will ship under (`epoch_hold_epoch_for`): the
-            // carried lease's for the carrier, the next for anyone else,
-            // so what it journals and captures under the hold is not
-            // stranded by its own flush gate, and the positions it
-            // answers with are reached only by the flush's segments.
-            let mine = self.epoch_hold_epoch_for(epoch);
-            if self
-                .pr
-                .carried
-                .is_some_and(|c| self.hold_ended_is(c.epoch, c.expires_unix_ms))
-                && replica.persist_epoch_hold_ended(None).is_ok()
-            {
-                // Handed back to this node: its own again.
-                self.pr.hold_ended = None;
+        let waiting = self.job.as_ref().and_then(|job| match job.phase {
+            Phase::LeaseRequest { req: r, epoch_mode } if r == req => Some(epoch_mode),
+            _ => None,
+        });
+        let Some(epoch_mode) = waiting else {
+            // No acquisition waits for this answer (it timed out, or ended
+            // some other way). A hold answer lost this way is the signature
+            // of class S: the giver's record re-offers it.
+            if matches!(answer, HandoffAnswer::Hold(_)) {
+                self.stats.epoch_hold_answers_dropped += 1;
             }
-            self.adopt_epoch_hold(now, mine, replica);
-            self.lease.gate = Some(PendingGate {
-                epoch: mine,
-                takeover: false,
-                marker_shipped: true,
-                drained: true,
-                fast_prev: false,
-                backup_tail_epoch: None,
-                shippable: false,
-            });
-            self.acquire_gate(now, replica, out);
             return;
-        }
+        };
+        let (epoch, head_seq) = match answer {
+            HandoffAnswer::Declined { .. } => {
+                self.finish_acquire(now, false, replica, out);
+                return;
+            }
+            HandoffAnswer::Hold(offer) => {
+                if !epoch_mode {
+                    // A hold answer to an S3 request declines.
+                    self.stats.epoch_hold_offers_refused_mode += 1;
+                    self.finish_acquire(now, false, replica, out);
+                    return;
+                }
+                self.take_epoch_hold(now, from, offer, replica, out);
+                return;
+            }
+            HandoffAnswer::Released { epoch, head_seq } => {
+                if epoch_mode {
+                    // The S3 handoff's answer carries no hold: refused
+                    // (main adopted one on it).
+                    self.stats.epoch_hold_released_refused += 1;
+                    self.finish_acquire(now, false, replica, out);
+                    return;
+                }
+                (epoch, head_seq)
+            }
+        };
         // This node backed the holder that just handed it the lease: the
         // holder flushed its whole journal to the log before releasing,
         // so the backup tail is void, and its silence from now on is the
@@ -6567,6 +6565,125 @@ impl Core {
         }
         let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
         self.set_phase(Phase::Get, Some(op));
+    }
+
+    /// FX-5 (M3, defence): the epoch is not active and unfrozen any more, so
+    /// an acquisition that waits for the epoch's hold ends. (The take
+    /// refuses a late answer anyway; this frees the job slot.)
+    pub(super) fn end_epoch_request(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.job.as_ref().is_some_and(|job| {
+            matches!(
+                job.phase,
+                Phase::LeaseRequest {
+                    epoch_mode: true,
+                    ..
+                }
+            )
+        }) {
+            self.finish_acquire(now, false, replica, out);
+        }
+    }
+
+    /// Take an offered transfer of the epoch hold (FX-5, rules T1 to T6; T1
+    /// is the caller's). A first answer and a re-offer alike: the guard is
+    /// the same, because it decides on the records, not on who sent what. A
+    /// refusal ends the acquisition; the giver's record re-offers later.
+    fn take_epoch_hold(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        offer: HoldOffer,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let refuse = |core: &mut Self, out: &mut Vec<Action>, counter: fn(&mut Stats)| {
+            counter(&mut core.stats);
+            core.finish_acquire(now, false, replica, out);
+        };
+        // T2: only inside this node's own active, unfrozen epoch (M3).
+        if !self.epoch.active || self.epoch.frozen {
+            refuse(self, out, |s| s.epoch_hold_offers_refused_closed += 1);
+            return;
+        }
+        // T3: only from a member of it.
+        if !self.pr.epoch_members.contains(&from) {
+            refuse(self, out, |s| s.epoch_hold_offers_refused_not_member += 1);
+            return;
+        }
+        // T4: only the hold of the lease this epoch carries.
+        if self.pr.carried != Some(offer.key) {
+            refuse(self, out, |s| s.epoch_hold_offers_refused_key += 1);
+            return;
+        }
+        // T5: only a number above the highest of this key ever taken or
+        // given here. Unreadable record: declined.
+        match self.pr.hold_rec.highest(offer.key) {
+            None => {
+                refuse(self, out, |s| s.epoch_hold_offers_refused_record += 1);
+                return;
+            }
+            Some(highest) if offer.n <= highest => {
+                refuse(self, out, |s| s.epoch_hold_offers_refused_stale += 1);
+                return;
+            }
+            Some(_) => {}
+        }
+        // T6: holds nothing, can hold (not deposed, not retired), and its
+        // record agrees (no involuntary end left unwritten).
+        if self.lease.epoch_held() {
+            refuse(self, out, |s| s.epoch_hold_offers_refused_held += 1);
+            return;
+        }
+        if self.lease.lost || replica.lost_persisted() || self.pr.retired {
+            refuse(self, out, |s| s.epoch_hold_offers_refused_closed += 1);
+            return;
+        }
+        if self.hold_rec_dirty() {
+            refuse(self, out, |s| s.epoch_hold_offers_refused_record += 1);
+            return;
+        }
+        // The hold's epoch is the one this node's flush will ship under
+        // (`epoch_hold_epoch_for`): the carried lease's for the carrier, the
+        // next for anyone else, so what it journals and captures under the
+        // hold is not stranded by its own flush gate, and the positions it
+        // answers with are reached only by the flush's segments. The record
+        // is written (durably) before the hold is used.
+        let mine = self.epoch_hold_epoch_for(0);
+        if !self.persist_hold_rec(
+            replica,
+            HoldRecord::Held {
+                key: offer.key,
+                n: offer.n,
+                at: mine,
+            },
+        ) {
+            refuse(self, out, |s| s.epoch_hold_take_persist_failed += 1);
+            return;
+        }
+        match offer.kind {
+            OfferKind::Transfer => self.stats.epoch_hold_transfers_taken += 1,
+            OfferKind::Reoffer => self.stats.epoch_hold_reoffers_taken += 1,
+        }
+        // A continuation epoch's P2P-only handoff: local authority, gated
+        // like a takeover (no marker: nothing ships). Plan 30 §M10: the
+        // predecessor hands over only with an empty journal
+        // (`give_epoch_hold`).
+        self.adopt_epoch_hold_in_memory(now, mine, replica);
+        self.lease.gate = Some(PendingGate {
+            epoch: mine,
+            takeover: false,
+            marker_shipped: true,
+            drained: true,
+            fast_prev: false,
+            backup_tail_epoch: None,
+            shippable: false,
+        });
+        self.acquire_gate(now, replica, out);
     }
 
     pub(crate) fn on_job_peer_failed(

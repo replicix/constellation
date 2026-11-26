@@ -444,6 +444,23 @@ impl Harness {
         }
     }
 
+    /// FX-5: adopt an epoch hold on the lease state (as a fixture does)
+    /// with the record every hold has (`Held` at transfer 0).
+    fn adopt_hold_at(&mut self, now: Now, epoch: Epoch) {
+        self.core.lease.adopt_epoch_hold(now, epoch);
+        let key = self.core.pr.carried.unwrap_or(crate::event::Carrier {
+            node: self.core.node_id(),
+            epoch,
+            expires_unix_ms: 0,
+        });
+        let rec = HoldRecord::Held {
+            key,
+            n: crate::event::XferNo(0),
+            at: epoch,
+        };
+        assert!(self.core.persist_hold_rec(&self.meta, rec));
+    }
+
     /// Make this node the holder at `epoch`, view open, as an acquisition
     /// that completed would.
     fn hold(&mut self, epoch: Epoch, gate: Option<PendingGate>) {
@@ -8496,7 +8513,7 @@ fn an_awaiting_log_forward_under_the_held_epoch_or_a_continuation_hold_keeps_wai
     );
 
     let (mut requester, rid, _) = awaiting_log_forward("d");
-    requester.core.lease.adopt_epoch_hold(requester.clk(), 5);
+    requester.adopt_hold_at(requester.clk(), 5);
     let out = activity(&mut requester);
     assert!(replies(&out).is_empty());
     assert_eq!(
@@ -16945,7 +16962,7 @@ mod m10 {
             epoch: 3,
             expires_unix_ms: carried.expires_unix_ms,
         });
-        h.core.pr.hold_ended = Some((3, carried.expires_unix_ms, true));
+        poke_ended(&mut h, Reclaim::Owed);
         let out = acquire_against(&mut h, carried.clone());
         assert_eq!(tails(&out), 0, "no tail before the check: {out:?}");
         assert_eq!(h.core.stats.promise_checks, 1);
@@ -16960,7 +16977,7 @@ mod m10 {
             epoch: 3,
             expires_unix_ms: carried.expires_unix_ms,
         });
-        h.core.pr.hold_ended = Some((3, carried.expires_unix_ms, true));
+        poke_ended(&mut h, Reclaim::Owed);
         let out = acquire_against(&mut h, carried.clone());
         assert_eq!(tails(&out), 1, "straight to the takeover tail: {out:?}");
         assert_eq!(h.core.stats.promise_flush_exempt, 1);
@@ -17065,7 +17082,7 @@ mod m10 {
             });
             match &sends(&out)[0].1 {
                 PeerMsg::LeaseHandoff { answer, .. } => {
-                    matches!(answer, HandoffAnswer::Released { .. })
+                    matches!(answer, HandoffAnswer::Hold(_))
                 }
                 other => panic!("{other:?}"),
             }
@@ -17160,10 +17177,15 @@ mod m10 {
             from: 1,
             msg: PeerMsg::LeaseHandoff {
                 req,
-                answer: HandoffAnswer::Released {
-                    epoch: 4,
-                    head_seq: Some(0),
-                },
+                answer: HandoffAnswer::Hold(crate::event::HoldOffer {
+                    key: Carrier {
+                        node: 1,
+                        epoch: 4,
+                        expires_unix_ms: expires,
+                    },
+                    n: crate::event::XferNo(1),
+                    kind: crate::event::OfferKind::Transfer,
+                }),
             },
         });
         assert_eq!(h.core.lease.epoch_hold(), Some(5));
@@ -42288,6 +42310,16 @@ fn epoch_probe_until_close(
     (closed, reclaimed)
 }
 
+/// Poke the in-memory hold record: `Ended` for the carried lease.
+fn poke_ended(h: &mut Harness, reclaim: Reclaim) {
+    let key = h.core.pr.carried.expect("a carried lease");
+    h.core.pr.hold_rec = HoldRecState::Known(Some(HoldRecord::Ended {
+        key,
+        n: crate::event::XferNo(0),
+        reclaim,
+    }));
+}
+
 fn carrier_of(lease: &Lease) -> crate::event::Carrier {
     crate::event::Carrier {
         node: lease.holder,
@@ -42350,15 +42382,19 @@ fn an_owed_epoch_move_is_dropped_once_the_hold_is_adopted_and_handed_off() {
             sends(&out)[0].1,
             PeerMsg::LeaseHandoff {
                 req: OpId(6),
-                answer: HandoffAnswer::Released { .. },
+                answer: HandoffAnswer::Hold(_),
             }
         ),
         "{out:?}"
     );
     assert!(!h.core.lease.epoch_held());
-    assert_eq!(
-        h.core.pr.hold_ended,
-        Some((carried.epoch, carried.expires_unix_ms, false))
+    assert!(
+        matches!(
+            h.core.hold_record(),
+            Some(HoldRecord::Given { key, to: 2, .. }) if *key == carrier
+        ),
+        "{:?}",
+        h.core.hold_record()
     );
     // The heal: the carried lease stands (node 2's flush re-claims it);
     // node 1 must not close the epoch, nor re-claim.
@@ -51341,7 +51377,7 @@ mod beat_cap {
         assert!(h.core.lock_cap_ms(h.clk()) <= 10_000);
         assert_eq!(h.core.beat_guard_wait_ms(&h.meta), 0, "capped by the lease");
         let now = h.now;
-        h.core.lease.adopt_epoch_hold(Now::same(now.0), 2);
+        h.adopt_hold_at(Now::same(now.0), 2);
         assert_eq!(h.core.lock_cap_ms(h.clk()), 30_000, "the ttl alone");
         assert_eq!(h.core.beat_guard_wait_ms(&h.meta), t0 + 30_000);
         h.advance(1_000);
@@ -62742,7 +62778,7 @@ mod c1_class {
             tag: Default::default(),
         });
         let epoch = h.core.lease.epoch().unwrap();
-        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.adopt_hold_at(h.clk(), epoch);
         h.core.lease.held.as_mut().unwrap().0.config_version += 1;
         let mut out = Vec::new();
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
@@ -64256,7 +64292,7 @@ mod c2f_lone_root {
     fn a_hold_row_answered_after_the_hold_waits_for_the_archive() {
         let (mut h, _) = listed_holder();
         let epoch = h.core.lease.epoch().unwrap();
-        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.adopt_hold_at(h.clk(), epoch);
         {
             let _class = constellation_meta::PendingClass::set(RowCommit::FINAL);
             constellation_meta::execute_mutate(&h.meta, &h.create("f"), Some(forwarded(1)))
@@ -64286,7 +64322,7 @@ mod c2f_lone_root {
         let out = h.step(forward(&h, 71, 1, "f"));
         assert!(answers(&out).is_empty(), "waits for the archive: {out:?}");
         let epoch = h.core.lease.epoch().unwrap();
-        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.adopt_hold_at(h.clk(), epoch);
         let before = h.core.stats.ack_classes;
         let out = release(&mut h);
         assert!(
@@ -64313,7 +64349,7 @@ mod c2f_lone_root {
         let mut out = Vec::new();
         h.core.abort_durable_parks(h.clk(), &h.meta, &mut out);
         let epoch = h.core.lease.epoch().unwrap();
-        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.adopt_hold_at(h.clk(), epoch);
         let before = h.core.stats.ack_classes;
         let out = h.step(forward(&h, 72, 1, "f"));
         assert!(
@@ -64613,7 +64649,7 @@ mod c2f_lone_root {
         let (mut h, _) = listed_holder();
         let started = std::time::Instant::now();
         let epoch = h.core.lease.epoch().unwrap();
-        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.adopt_hold_at(h.clk(), epoch);
         after_event(&mut h);
         assert_eq!(wait(&h), constellation_meta::DurableWait::Ungated);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -70609,7 +70645,7 @@ mod await_retry {
         let req = *req;
         // (The operator's drop runs where the lease is held: the op stays
         // forwarded, as a handoff pause leaves one.)
-        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.adopt_hold_at(h.clk(), 1);
         assert!(h.core.lease.epoch_held());
         (h, file, lost, rid, manifest, req)
     }
@@ -71219,7 +71255,7 @@ mod await_retry {
             .into_iter()
             .find(|q| q.refused.is_some())
             .unwrap();
-        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.adopt_hold_at(h.clk(), 1);
         assert!(h.core.lease.epoch_held());
         for _ in 0..3 {
             h.advance(250);
@@ -72675,7 +72711,7 @@ mod hold_ack {
     fn owner(rows: u64) -> Harness {
         let mut h = Harness::with(1, true);
         h.hold(1, None);
-        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.adopt_hold_at(h.clk(), 1);
         h.core.pr.epoch_members = vec![1, 2, 3];
         h.core.epoch = EpochState {
             open: true,
@@ -73277,7 +73313,7 @@ mod hold_ack {
             Some(RowCommit::group(3, GroupOn::Root))
         );
         // The epoch forms: a hold group of the owner and node 2.
-        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.adopt_hold_at(h.clk(), 1);
         h.core.pr.epoch_members = vec![1, 2];
         h.core.epoch = EpochState {
             open: true,
@@ -73329,7 +73365,7 @@ mod hold_ack {
 
     /// The epoch forms: a hold group of node 1 and node 2.
     fn form_epoch(h: &mut Harness, epoch: Epoch) {
-        h.core.lease.adopt_epoch_hold(h.clk(), epoch);
+        h.adopt_hold_at(h.clk(), epoch);
         h.core.pr.epoch_members = vec![1, 2];
         h.core.epoch = EpochState {
             open: true,
@@ -73857,7 +73893,7 @@ mod hold_ack {
             from: 1,
             msg: segment_frame(req, 1, 1, p1),
         });
-        holder.core.lease.adopt_epoch_hold(holder.clk(), 1);
+        holder.adopt_hold_at(holder.clk(), 1);
         holder.core.pr.epoch_members = vec![1, 2];
         holder.core.epoch = EpochState {
             open: true,
@@ -75060,7 +75096,7 @@ mod kept_fetch {
             epoch: 1,
             expires_unix_ms: expires,
         });
-        h.core.pr.hold_ended = Some((1, expires, true));
+        poke_ended(&mut h, Reclaim::Owed);
         carrying_row(&h);
         let out = acquire(&mut h, &lease);
         let Some(hb) = s3_ops(&out)
@@ -75120,7 +75156,14 @@ mod kept_fetch {
             epoch: 1,
             expires_unix_ms: expires,
         });
-        h.core.pr.hold_ended = Some((1, expires, !handed));
+        poke_ended(
+            &mut h,
+            if handed {
+                Reclaim::Settled
+            } else {
+                Reclaim::Owed
+            },
+        );
         carrying_row(&h);
         let out = acquire(&mut h, &lease);
         let mut epochs: Vec<Epoch> = asks(&out).into_iter().map(|a| a.2).collect();
@@ -76963,9 +77006,9 @@ mod kept_member {
             expires_unix_ms: 7_000,
         });
         assert!(!h.core.owner_closed(&prev));
-        h.core.pr.hold_ended = Some((2, 7_000, false));
+        poke_ended(&mut h, Reclaim::Settled);
         assert!(!h.core.owner_closed(&prev), "handed on, not closed");
-        h.core.pr.hold_ended = Some((2, 7_000, true));
+        poke_ended(&mut h, Reclaim::Owed);
         assert!(h.core.owner_closed(&prev));
         assert!(
             !h.core.owner_closed(&lease_of(1, 2, 8_000)),
@@ -76986,7 +77029,9 @@ mod kept_member {
         h.core.lease.note_object(&prev);
         let mut out = Vec::new();
         h.core.promise_after_event(h.clk(), &h.meta, &mut out);
-        assert_eq!(h.core.pr.hold_ended, Some((2, 7_000, true)));
+        assert!(h
+            .core
+            .hold_ended_is(h.core.pr.carried.unwrap(), Reclaim::Owed));
         assert!(h.core.owner_closed(&prev));
         // The carrier's own re-claim that moved on is settled.
         let mut h = Harness::new(1);
@@ -76995,10 +77040,12 @@ mod kept_member {
             epoch: 2,
             expires_unix_ms: 7_000,
         });
-        h.core.pr.hold_ended = Some((2, 7_000, true));
+        poke_ended(&mut h, Reclaim::Owed);
         h.core.lease.note_object(&lease_of(1, 3, 9_000));
         h.core.promise_after_event(h.clk(), &h.meta, &mut out);
-        assert_eq!(h.core.pr.hold_ended, Some((2, 7_000, false)));
+        assert!(h
+            .core
+            .hold_ended_is(h.core.pr.carried.unwrap(), Reclaim::Settled));
     }
 
     /// M1 (stale key): a member that saw a renewal of the tenure's lease newer
@@ -77094,7 +77141,7 @@ mod kept_member {
     fn a_hold_owner_ends_its_hold_when_the_members_that_did_not_seal_are_unreachable() {
         let mut h = Harness::with(1, true);
         h.hold(1, None);
-        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.adopt_hold_at(h.clk(), 1);
         h.core.pr.epoch_members = vec![1, 2, 3];
         h.core.epoch = EpochState {
             open: true,
@@ -77121,7 +77168,7 @@ mod kept_member {
     fn a_hold_owner_hears_a_sealed_member_and_ends_its_hold() {
         let mut h = Harness::with(1, true);
         h.hold(1, None);
-        h.core.lease.adopt_epoch_hold(h.clk(), 1);
+        h.adopt_hold_at(h.clk(), 1);
         h.core.pr.epoch_members = vec![1, 2, 3];
         h.core.epoch = EpochState {
             open: true,
@@ -97837,7 +97884,7 @@ mod root_own_sticky {
         let (a_rid, out) = submit_in(&mut h, 2, dirs[0], "a");
         assert!(!accepted(&out, a_rid), "{out:?}");
         let now = h.clk();
-        h.core.lease.adopt_epoch_hold(now, 2);
+        h.adopt_hold_at(now, 2);
         let out = activity(&mut h);
         assert!(
             !accepted(&out, a_rid),

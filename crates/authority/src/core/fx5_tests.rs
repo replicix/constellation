@@ -1000,3 +1000,136 @@ fn an_involuntary_end_whose_record_fails_is_not_restored() {
     assert!(!c.node(1).core.lease.epoch_held(), "vanish: restored");
 }
 
+/// The node closes its epoch as the hold owner (the `Ended { Owed }` record
+/// written, `EpochClose` sent), stopped before the re-claim lands.
+fn close_the_epoch(c: &mut Cluster, id: NodeId) {
+    let object = c.node(1).core.lease.held.as_ref().map(|(l, _)| l.clone());
+    let object = object.unwrap_or_else(|| {
+        // (The carried lease as S3 shows it.)
+        let k = c.key;
+        let mut l = lease_of(k.node, k.epoch, k.expires_unix_ms);
+        l.holder = k.node;
+        l
+    });
+    let carrier = c.key;
+    let closed = drive_until(c.node(id), carrier, object, &|h| {
+        matches!(h.core.hold_record(), Some(HoldRecord::Ended { .. })) && !h.core.epoch.open
+    });
+    assert!(closed, "node {id} did not close");
+}
+
+/// MUST 1 (seeds 166, 2236): after the node's own close, a report with the
+/// epoch still open (no activation) does not hold it again.
+#[test]
+fn a_late_report_after_its_own_close_stays_not_held() {
+    let mut c = Cluster::new(&[1, 2]);
+    close_the_epoch(&mut c, 1);
+    assert_eq!(c.rec(1), Some(c.ended(0, Reclaim::Owed)));
+    assert!(!c.node(1).core.lease.epoch_held());
+    c.report(1, true, false, false);
+    c.report(1, true, false, true);
+    assert!(
+        !c.node(1).core.lease.epoch_held(),
+        "held again beside the next holder"
+    );
+    assert_eq!(c.rec(1), Some(c.ended(0, Reclaim::Owed)));
+    assert_eq!(c.node(1).core.stats.epoch_holds_adopted_late, 0);
+}
+
+/// MUST 1: the closed-carried activation re-holds at the same number, and
+/// an offer at or below it is refused.
+#[test]
+fn a_closed_carried_rehold_keeps_its_number_and_refuses_a_stale_offer() {
+    let mut c = Cluster::new(&[1, 2]);
+    close_the_epoch(&mut c, 1);
+    // (As if the hold had been taken back at number 3 before the close.)
+    let rec = c.ended(3, Reclaim::Owed);
+    c.node(1)
+        .meta
+        .persist_epoch_hold_record(Some(&rec))
+        .unwrap();
+    c.node(1).core.pr.hold_rec = HoldRecState::Known(Some(rec));
+    // The epoch closes, then another activation carries the same lease.
+    c.report(1, false, false, false);
+    c.report(1, true, true, false);
+    assert!(
+        c.node(1).core.lease.epoch_held(),
+        "the closed lease is held again"
+    );
+    assert_eq!(c.rec(1), Some(c.held(3, 1)), "the same number");
+    assert_eq!(c.node(1).core.stats.epoch_closed_leases_reheld, 1);
+    // It gives n = 4, then hears an offer of 3 (stale), refused.
+    c.exchange(2, 1, false);
+    assert_eq!(c.rec(1), Some(c.given(4, 2)));
+    // (A restart: the close's round is still in flight in this fixture.)
+    c.restart(1);
+    c.report(1, true, true, false);
+    c.node(1).core.lease.cached_holder = Some(2);
+    let (_, req) = c.ask(1);
+    c.hear(
+        1,
+        2,
+        req,
+        HandoffAnswer::Hold(c.offer(3, OfferKind::Reoffer)),
+    );
+    assert!(!c.node(1).core.lease.epoch_held());
+    assert_eq!(c.node(1).core.stats.epoch_hold_offers_refused_stale, 1);
+}
+
+/// MUST 1: a crash between the `Ended { Owed }` write and the close's
+/// effect: the restart does not re-hold, for the carrier and for a transferee.
+#[test]
+fn a_crash_after_the_owed_record_closes_without_re_holding() {
+    // The carrier.
+    let mut c = Cluster::new(&[1, 2]);
+    close_the_epoch(&mut c, 1);
+    c.restart(1);
+    c.report(1, true, true, false);
+    assert!(!c.node(1).core.lease.epoch_held(), "carrier re-held");
+    assert_eq!(c.rec(1), Some(c.ended(0, Reclaim::Owed)));
+    // A transferee.
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, false);
+    close_the_epoch(&mut c, 2);
+    assert_eq!(c.rec(2), Some(c.ended(1, Reclaim::Owed)));
+    c.restart(2);
+    c.report(2, true, true, false);
+    assert!(!c.node(2).core.lease.epoch_held(), "transferee re-held");
+    assert_eq!(c.rec(2), Some(c.ended(1, Reclaim::Owed)));
+}
+
+/// R3, a named assertion: a node that holds re-offers nothing, whatever a
+/// record might say.
+#[test]
+fn a_holder_re_offers_nothing() {
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.given(5, 2);
+    let (_, req) = c.ask(2);
+    let h1 = c.node(1);
+    h1.core.pr.hold_rec = HoldRecState::Known(Some(rec));
+    // (Not through a step: the end of an event checks the invariant.)
+    let mut out = Vec::new();
+    h1.core
+        .on_lease_request(h1.clk(), 2, req, Some(0), &h1.meta, &mut out);
+    let answer = answer_to(&out, 2).unwrap();
+    assert!(declined(&answer), "{answer:?}");
+    assert_eq!(c.node(1).core.stats.epoch_hold_reoffers, 0);
+}
+
+/// MUST 2: the keys of the earlier format are never read: a store that
+/// still holds them (`epoch_hold` = "0" meant no hold) is not unreadable.
+#[test]
+fn the_old_keys_are_ignored() {
+    let mut h = Harness::new(1);
+    h.meta.kv_set("epoch_hold", "0").unwrap();
+    h.meta.kv_set("epoch_hold_ended", "1:7:1").unwrap();
+    h.core = Core::new(h.core.cfg.clone());
+    let (now, mut out) = (h.clk(), Vec::new());
+    h.core.start(now, &h.meta, &mut out);
+    assert!(matches!(h.core.pr.hold_rec, HoldRecState::Known(None)));
+    h.hold(1, None);
+    let lease = h.core.lease.held.as_ref().unwrap().0.clone();
+    h.step(epoch_report(carrier_of(&lease), true, true, false, false));
+    assert!(h.core.lease.epoch_held(), "adopted: not stalled");
+    assert_eq!(h.core.stats.epoch_hold_record_unreadable, 0);
+}

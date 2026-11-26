@@ -5,9 +5,10 @@
 
 use super::client::named_child;
 use super::delegate::RecallPhase;
-use super::{Core, S3For};
+use super::hold::Reoffer;
+use super::{Core, HoldRecord, S3For};
 use crate::action::{Action, S3Op};
-use crate::event::{HandoffAnswer, PeerMsg};
+use crate::event::{HandoffAnswer, HoldOffer, OfferKind, PeerMsg};
 use crate::ids::{Epoch, NodeId, Now, OpId, Seq};
 use crate::replica::Replica;
 use constellation_meta::delegation::Ownership;
@@ -1642,6 +1643,30 @@ impl Core {
                 },
             });
         };
+        // FX-5: a node whose record says it gave the epoch hold to this
+        // asker, and which holds nothing, offers that transfer again (its
+        // answer was lost). Before the `can_serve` check: a giver holds no
+        // lease, and `can_serve` needs one.
+        if let Some(epoch_applied) = epoch_applied {
+            match self.reoffer_epoch_hold(from, epoch_applied, replica) {
+                Reoffer::NotApplicable => {}
+                Reoffer::Declined => {
+                    decline(self, out);
+                    return;
+                }
+                Reoffer::Offer(offer) => {
+                    self.stats.epoch_hold_reoffers += 1;
+                    out.push(Action::Send {
+                        to: from,
+                        msg: PeerMsg::LeaseHandoff {
+                            req,
+                            answer: HandoffAnswer::Hold(offer),
+                        },
+                    });
+                    return;
+                }
+            }
+        }
         // Plan 30 §M11: no handoff while a delegation is live (the root
         // stays; see `round_release`), nor inside the takeover floor (plan
         // 43 C7-H2: the gate covers the read quarantine only with the
@@ -1679,56 +1704,7 @@ impl Core {
             return;
         }
         if epoch_transfer {
-            let applied = epoch_applied.unwrap_or(0);
-            // Plan 30 §M10 (found by the M10 simulation's first epoch
-            // runs, pre-M10 behaviour): a hold with an unshipped journal is
-            // not handed over. Nothing ships during an epoch, so the
-            // successor would execute on a replica missing this journal,
-            // and the two journals would ship in either order after the
-            // epoch (acknowledged effects re-evaluated and reordered). The
-            // requester forwards to this node instead; its file writes'
-            // manifests go forwarded too, their chunks uploaded when S3
-            // returns (`view::View::commit_manifest_forwarded`).
-            // `flex-crash` seed 30702: nor to a requester that has not
-            // applied this node's whole log. The successor catches up to
-            // `head_seq` from S3 outside an epoch; inside one it cannot,
-            // and it would execute against a state missing segments this
-            // node shipped before the outage (seq 14–18 there, streamed
-            // while the requester was partitioned from this node): an
-            // unlink of a file the log had already removed took effect.
-            // It forwards to this node instead.
-            let behind = applied < self.ship.head_seq;
-            if behind {
-                self.stats.epoch_handoffs_behind += 1;
-            }
-            if behind || !replica.journal_is_empty().unwrap_or(false) {
-                decline(self, out);
-                return;
-            }
-            // The hold leaves for good: persisted before the reply, so no
-            // path (the restart adoption above all) takes it back while
-            // the successor journals under it.
-            if !self.end_epoch_hold(replica, false) {
-                decline(self, out);
-                return;
-            }
-            let epoch = self.lease.epoch().unwrap_or(1);
-            self.lease.release_local();
-            // The hold owner now: this node follows its log stream.
-            self.lease.name_holder(from);
-            self.deleg_on_lease_gone(now, replica, out);
-            self.clear_holder_epoch(replica);
-            self.stats.handoffs_served += 1;
-            out.push(Action::Send {
-                to: from,
-                msg: PeerMsg::LeaseHandoff {
-                    req,
-                    answer: HandoffAnswer::Released {
-                        epoch,
-                        head_seq: Some(self.ship.head_seq),
-                    },
-                },
-            });
+            self.give_epoch_hold(now, from, req, epoch_applied.unwrap_or(0), replica, out);
             return;
         }
         self.enqueue_job(
@@ -1741,6 +1717,185 @@ impl Core {
             replica,
             out,
         );
+    }
+
+    /// The give of the epoch hold (FX-5, rules G1 to G8 of the spec): a
+    /// member that has applied this node's whole log asks, and this node
+    /// holds the hold with an empty journal. The record `Given { key, n + 1,
+    /// to }` is persisted (durably) before this node lets go and before the
+    /// answer leaves: a failed write declines and keeps the hold. A
+    /// decline is counted by its cause.
+    fn give_epoch_hold(
+        &mut self,
+        now: Now,
+        from: NodeId,
+        req: OpId,
+        applied: Seq,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let decline = |core: &mut Self, out: &mut Vec<Action>| {
+            core.stats.handoffs_declined += 1;
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::LeaseHandoff {
+                    req,
+                    answer: HandoffAnswer::Declined {
+                        epoch: core.lease.epoch().unwrap_or(0),
+                    },
+                },
+            });
+        };
+        // G7: a retired node gives nothing (its hold is the retire's to
+        // end), nor does one whose record cannot be trusted.
+        if self.pr.retired {
+            decline(self, out);
+            return;
+        }
+        // G3: the in-memory hold agrees with its record, and the carried
+        // lease is the record's key.
+        let held = match (self.pr.hold_rec.record(), self.pr.carried) {
+            (Some(HoldRecord::Held { key, n, .. }), Some(carried)) if *key == carried => {
+                Some((*key, *n))
+            }
+            _ => None,
+        };
+        let Some((key, n)) = held else {
+            self.stats.epoch_gives_declined_record += 1;
+            decline(self, out);
+            return;
+        };
+        // G4: only to a member of the epoch (M3).
+        if from == self.cfg.node_id || !self.pr.epoch_members.contains(&from) {
+            self.stats.epoch_gives_declined_not_member += 1;
+            decline(self, out);
+            return;
+        }
+        // Plan 30 §M10 (found by the M10 simulation's first epoch runs,
+        // pre-M10 behaviour): a hold with an unshipped journal is not
+        // handed over. Nothing ships during an epoch, so the successor
+        // would execute on a replica missing this journal, and the two
+        // journals would ship in either order after the epoch
+        // (acknowledged effects re-evaluated and reordered). The requester
+        // forwards to this node instead; its file writes' manifests go
+        // forwarded too, their chunks uploaded when S3 returns
+        // (`view::View::commit_manifest_forwarded`).
+        // G5, `flex-crash` seed 30702: nor to a requester that has not
+        // applied this node's whole log. The successor catches up to
+        // `head_seq` from S3 outside an epoch; inside one it cannot, and it
+        // would execute against a state missing segments this node shipped
+        // before the outage (seq 14-18 there, streamed while the requester
+        // was partitioned from this node): an unlink of a file the log had
+        // already removed took effect. It forwards to this node instead.
+        if applied < self.ship.head_seq {
+            self.stats.epoch_handoffs_behind += 1;
+            decline(self, out);
+            return;
+        }
+        // G6: an unreadable journal declines (counted apart from a busy one).
+        match replica.journal_is_empty() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.stats.epoch_gives_declined_journal += 1;
+                decline(self, out);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(node = self.cfg.node_id, %error, "reading the journal for an epoch hold give failed");
+                self.stats.epoch_gives_declined_journal_err += 1;
+                decline(self, out);
+                return;
+            }
+        }
+        // G8: the numbers run out (never in practice): no give.
+        let Some(next) = n.next() else {
+            decline(self, out);
+            return;
+        };
+        // The hold leaves for good: persisted before the reply, so no path
+        // (the restart adoption above all) takes it back while the
+        // successor journals under it. Written before anything changes.
+        if !self.persist_hold_rec(
+            replica,
+            HoldRecord::Given {
+                key,
+                n: next,
+                to: from,
+            },
+        ) {
+            self.stats.epoch_hold_give_persist_failed += 1;
+            decline(self, out);
+            return;
+        }
+        self.lease.release_local();
+        // The hold owner now: this node follows its log stream.
+        self.lease.name_holder(from);
+        self.deleg_on_lease_gone(now, replica, out);
+        self.clear_holder_epoch(replica);
+        self.stats.handoffs_served += 1;
+        self.stats.epoch_hold_gives += 1;
+        out.push(Action::Send {
+            to: from,
+            msg: PeerMsg::LeaseHandoff {
+                req,
+                answer: HandoffAnswer::Hold(HoldOffer {
+                    key,
+                    n: next,
+                    kind: OfferKind::Transfer,
+                }),
+            },
+        });
+    }
+
+    /// The re-offer of a transfer this node gave (FX-5, rules R1 to R9):
+    /// the record says `Given { key, n, to }`, this node holds nothing, and
+    /// `to` asks. It changes nothing and writes nothing: the same offer is
+    /// sent again, and the taker's guard decides.
+    fn reoffer_epoch_hold(&mut self, from: NodeId, applied: Seq, replica: &dyn Replica) -> Reoffer {
+        // R3, R4, R5: not this node's to re-offer: today's code answers.
+        if self.lease.epoch_held() {
+            return Reoffer::NotApplicable;
+        }
+        let Some(HoldRecord::Given { key, n, to }) = self.pr.hold_rec.record().copied() else {
+            return Reoffer::NotApplicable;
+        };
+        if to != from || self.pr.carried != Some(key) {
+            return Reoffer::NotApplicable;
+        }
+        // R2: only in an active, unfrozen epoch.
+        if !self.epoch.active || self.epoch.frozen {
+            self.stats.epoch_hold_reoffers_declined_state += 1;
+            return Reoffer::Declined;
+        }
+        // R6, R9: a member, and this node not retired.
+        if !self.pr.epoch_members.contains(&from) || self.pr.retired {
+            self.stats.epoch_hold_reoffers_declined_state += 1;
+            return Reoffer::Declined;
+        }
+        // R7: the preconditions of the transfer itself (G5, G6), so the
+        // successor executes on the state the original give would have
+        // given it (seed 30702's rule).
+        if applied < self.ship.head_seq {
+            self.stats.epoch_hold_reoffers_declined_behind += 1;
+            return Reoffer::Declined;
+        }
+        match replica.journal_is_empty() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.stats.epoch_hold_reoffers_declined_journal += 1;
+                return Reoffer::Declined;
+            }
+            Err(error) => {
+                tracing::warn!(node = self.cfg.node_id, %error, "reading the journal for an epoch hold re-offer failed");
+                self.stats.epoch_hold_reoffers_declined_journal_err += 1;
+                return Reoffer::Declined;
+            }
+        }
+        Reoffer::Offer(HoldOffer {
+            key,
+            n,
+            kind: OfferKind::Reoffer,
+        })
     }
 
     /// A gossiped "segment `seq` landed" hint (plan 30 §M7: hints carry

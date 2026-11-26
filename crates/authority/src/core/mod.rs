@@ -92,6 +92,7 @@ pub(crate) use delegate::STICKY_HOLD_MAX_MS;
 pub use delegate::{
     DelegKind, DelegRenewCert, DelegView, RecallPhase, StickyEnd, StickyStreamView,
 };
+use hold::{Adopt, HoldRecState};
 pub use hold::{HoldKey, HoldRecord, Reclaim};
 pub use roster::RosterView;
 pub use seal_tail::WaitingForGroup;
@@ -2702,6 +2703,8 @@ pub struct Stats {
     pub epoch_gives_declined_journal_err: u64,
     /// Gives declined because the record write failed (the hold is kept).
     pub epoch_hold_give_persist_failed: u64,
+    /// Gives made (the hold left for a member: record `Given` written).
+    pub epoch_hold_gives: u64,
     /// Re-offers sent (no state changes, no write).
     pub epoch_hold_reoffers: u64,
     /// Re-offers declined: the epoch not active or frozen (R2), the asker
@@ -2738,6 +2741,11 @@ pub struct Stats {
     pub epoch_hold_record_unreadable: u64,
     /// A write of an `Ended` record failed (retried at every event).
     pub epoch_hold_end_persist_failed: u64,
+    /// A carrier's adoption of the hold did not happen: its record could
+    /// not be written (the late path retries at the next round).
+    pub epoch_hold_adopt_persist_failed: u64,
+    /// A hold answer to a request that was not an epoch request (refused).
+    pub epoch_hold_offers_refused_mode: u64,
     /// Continuation-epoch handoffs declined because the requester had not
     /// applied this holder's whole log (flex-crash seed 30702).
     pub epoch_handoffs_behind: u64,
@@ -5096,7 +5104,15 @@ impl Core {
             // state: the next activation finds them so.
             self.deleg_on_epoch(now, state.active && !state.frozen, replica, out);
         }
+        if !state.active || !state.open || state.frozen {
+            // FX-5 (M3, defence): an acquisition waiting for a continuation
+            // epoch's hold ends when the epoch is not active and unfrozen
+            // any more; the take refuses it anyway (`take_epoch_hold`), this
+            // frees the job slot.
+            self.end_epoch_request(now, replica, out);
+        }
         if state.active && !before.active {
+            let mut adopt_via = Adopt::Fresh;
             let closed_carried = self.epoch_closed_carried();
             let alone = members.iter().all(|m| *m == self.cfg.node_id);
             if closed_carried.is_some() && !alone && self.epoch_closed_claim_in_doubt() {
@@ -5131,11 +5147,9 @@ impl Core {
                     "the continuation epoch carries the lease its predecessor's close let go: \
                      holding it again"
                 );
-                if self.hold_ended_is(lease.epoch, lease.expires_unix_ms)
-                    && replica.persist_epoch_hold_ended(None).is_ok()
-                {
-                    self.pr.hold_ended = None;
-                }
+                // The one edge from an `Ended` record back to `Held`
+                // (`Adopt::ClosedCarried`): kept at its number.
+                adopt_via = Adopt::ClosedCarried;
                 // The tenure continues under the lease it held: whoever
                 // wrote its mark is not known here, so it is its own.
                 self.ack.mark_own = lease.granted_delegations;
@@ -5187,7 +5201,7 @@ impl Core {
                 // carried lease — the members promise nothing while the
                 // epoch is open, so no taker gets past the promise check.
                 let epoch = self.lease.epoch().unwrap_or(1);
-                self.adopt_epoch_hold(now, epoch, replica);
+                self.adopt_epoch_hold(now, epoch, adopt_via, replica);
             } else if self
                 .epoch_closed_claim(now)
                 .is_some_and(|(l, _)| l.epoch < stale_below)
@@ -5196,69 +5210,10 @@ impl Core {
                 // was taken over meanwhile, and its tenure is over.
                 self.epoch_tenure_resumed(None, false, replica);
             }
-        } else if state.active
-            && self.lease.usable(now, &self.cfg)
-            && !self.lease.releasing
-            && !self.lease.epoch_held()
-            && self.carries_mine()
-            && self.epoch_may_carry(members)
-        {
-            // Re-affirming (a holder carrying S3 authority through an
-            // epoch that was already active when it acquired).
-            let epoch = self.lease.epoch().unwrap_or(1);
-            self.adopt_epoch_hold(now, epoch, replica);
+        } else if state.active {
+            self.adopt_reaffirm(now, replica);
         }
-        // M12 round 2 (flex-crash seed 30299): the epoch carries this
-        // node's own lease, but the hold was never adopted — the node was
-        // paused, or died, between the activation and the hold's
-        // persistence, and restarted into the open epoch with no lease in
-        // memory. Nobody else can hold it (the carrier is this node's
-        // lease; the members promise nothing while the epoch is open, so
-        // no taker gets in), and without a holder the epoch never
-        // flushes or closes: every member refuses promises forever and
-        // the cluster has no authority. Adopt it here; the flush and the
-        // close follow once S3 is back.
-        if state.open
-            && !self.lease.epoch_held()
-            && !self.lease.lost
-            && self.lease.held.is_none()
-            && self.pr.restored_hold.is_none()
-            && !replica.lost_persisted()
-        {
-            // Not a hold this node already owned and let go. Flex-crash
-            // seed 166: it gave its journal-less hold to node 1, which
-            // journaled under it and crashed; the freeze re-reported the
-            // epoch and this path adopted the carried hold a second time,
-            // flushed nothing, closed the epoch and released the lease,
-            // and node 1's acknowledged journal met a newer epoch. Seed
-            // 2236: a report after its own close adopted the hold again
-            // beside the next S3 holder.
-            let ended = |c: &crate::event::Carrier| self.hold_ended_is(c.epoch, c.expires_unix_ms);
-            // Nor one whose lease this node released (or is releasing,
-            // or issued the release CAS for before a restart): that
-            // hold's move is owed instead (`owes_move`).
-            let let_go = |c: &crate::event::Carrier| {
-                let it = Some((c.epoch, c.expires_unix_ms));
-                self.pr.owes_move == it || self.pr.released == it
-            };
-            let carried = self
-                .pr
-                .carried
-                .filter(|c| c.node == self.cfg.node_id && !ended(c));
-            if carried.is_some_and(|c| let_go(&c)) {
-                self.owe_epoch_move(replica);
-            } else if let Some(c) = carried {
-                tracing::info!(
-                    node = self.cfg.node_id,
-                    epoch = c.epoch,
-                    "adopting the epoch hold the activation carried for this node's lease \
-                     (restarted into the open epoch before the hold was persisted)"
-                );
-                self.stats.epoch_holds_adopted_late += 1;
-                self.skip_ship = true;
-                self.adopt_epoch_hold(now, c.epoch, replica);
-            }
-        }
+        self.adopt_late(now, replica);
         self.restore_epoch_hold(now, replica);
         if !state.open {
             // The epoch closed: no move is owed any more (this node's own
@@ -5289,6 +5244,85 @@ impl Core {
             // the lease hears it now rather than at its 2 × TTL deadline.
             // Idempotent: a repeated report finds nothing waiting.
             self.refuse_waiting_for_lease(now, Code::ReadOnly, replica, out);
+        }
+    }
+
+    /// The late adoption of the hold for the carried lease (a restart into
+    /// the open epoch before the hold was recorded), at every report and
+    /// again at every round while an adoption's write failed.
+    fn adopt_late(&mut self, now: Now, replica: &dyn Replica) {
+        // M12 round 2 (flex-crash seed 30299): the epoch carries this
+        // node's own lease, but the hold was never adopted — the node was
+        // paused, or died, between the activation and the hold's
+        // persistence, and restarted into the open epoch with no lease in
+        // memory. Nobody else can hold it (the carrier is this node's
+        // lease; the members promise nothing while the epoch is open, so
+        // no taker gets in), and without a holder the epoch never
+        // flushes or closes: every member refuses promises forever and
+        // the cluster has no authority. Adopt it here; the flush and the
+        // close follow once S3 is back.
+        if self.epoch.open
+            && !self.lease.epoch_held()
+            && !self.lease.lost
+            && self.lease.held.is_none()
+            && !self.pr.restore_pending
+            && !replica.lost_persisted()
+            && matches!(self.pr.hold_rec, HoldRecState::Known(_))
+        {
+            // Not a hold this node already owned and let go. Flex-crash
+            // seed 166: it gave its journal-less hold to node 1, which
+            // journaled under it and crashed; the freeze re-reported the
+            // epoch and this path adopted the carried hold a second time,
+            // flushed nothing, closed the epoch and released the lease,
+            // and node 1's acknowledged journal met a newer epoch. Seed
+            // 2236: a report after its own close adopted the hold again
+            // beside the next S3 holder.
+            // FX-5: any record of the carried lease forbids it (a hold taken
+            // and given, ended, or ended and owed: the only way back is the
+            // closed-carried activation above, `Adopt::ClosedCarried`).
+            let ended = |c: &crate::event::Carrier| self.hold_has_record_of(*c);
+            // Nor one whose lease this node released (or is releasing,
+            // or issued the release CAS for before a restart): that
+            // hold's move is owed instead (`owes_move`).
+            let let_go = |c: &crate::event::Carrier| {
+                let it = Some((c.epoch, c.expires_unix_ms));
+                self.pr.owes_move == it || self.pr.released == it
+            };
+            let carried = self
+                .pr
+                .carried
+                .filter(|c| c.node == self.cfg.node_id && !ended(c));
+            if carried.is_some_and(|c| let_go(&c)) {
+                self.owe_epoch_move(replica);
+            } else if let Some(c) = carried {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    epoch = c.epoch,
+                    "adopting the epoch hold the activation carried for this node's lease \
+                     (restarted into the open epoch before the hold was persisted)"
+                );
+                self.skip_ship = true;
+                if self.adopt_epoch_hold(now, c.epoch, Adopt::Fresh, replica) {
+                    self.stats.epoch_holds_adopted_late += 1;
+                }
+            }
+        }
+    }
+
+    /// Re-affirming (a holder carrying S3 authority through an epoch that
+    /// was already active when it acquired), at every report and again at
+    /// every round while an adoption's write failed.
+    fn adopt_reaffirm(&mut self, now: Now, replica: &dyn Replica) {
+        let members = self.pr.epoch_members.clone();
+        if self.epoch.active
+            && self.lease.usable(now, &self.cfg)
+            && !self.lease.releasing
+            && !self.lease.epoch_held()
+            && self.carries_mine()
+            && self.epoch_may_carry(&members)
+        {
+            let epoch = self.lease.epoch().unwrap_or(1);
+            self.adopt_epoch_hold(now, epoch, Adopt::Fresh, replica);
         }
     }
 
@@ -5402,6 +5436,11 @@ impl Core {
             self.epoch_probes = self.epoch_probes.saturating_add(1);
         }
         self.retry_owed_strand(self.ship.next_seq, self.ship.max_epoch, replica);
+        if self.pr.adopt_retry {
+            // An adoption's record write failed: try again each round.
+            self.adopt_reaffirm(now, replica);
+            self.adopt_late(now, replica);
+        }
         if self.job.is_some() {
             self.nudged = true;
             return;

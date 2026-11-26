@@ -1,4 +1,3 @@
-#![allow(dead_code)] // FX-5 C2a: the record types are used by the next commit
 //! FX-5: the epoch hold's durable record and its transfer numbers.
 //!
 //! A continuation epoch carries one lease (the *key*: [`HoldKey`]); one
@@ -19,7 +18,7 @@
 //!
 //! The record is the hold: in memory the node never holds without a
 //! `Held` record of it, and a restart re-adopts exactly the record.
-//! Uniqueness of the hold follows from the numbers (`docs`: ADR text of
+//! Uniqueness of the hold follows from the numbers (ADR text of
 //! FX-5): gives are totally ordered by `n`, an offer of `n` is takeable
 //! only by its recipient, and only until that node has passed `n`.
 //!
@@ -27,8 +26,10 @@
 //! cannot be read or parsed is [`HoldRecState::Unreadable`] and blocks
 //! every transition (fail closed), never "no record".
 
-use crate::event::{Carrier, XferNo};
-use crate::ids::{Epoch, NodeId};
+use super::Core;
+use crate::event::{Carrier, HoldOffer, XferNo};
+use crate::ids::{Epoch, NodeId, Now};
+use crate::replica::Replica;
 use std::fmt;
 use std::str::FromStr;
 
@@ -169,9 +170,11 @@ impl FromStr for HoldRecord {
 /// What this process knows of the record. Fail closed: `Unreadable`
 /// blocks every hold transition (adoption, give, re-offer, take, nudge,
 /// restore) until a later read succeeds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HoldRecState {
-    /// The read failed, or the value did not parse.
+    /// The read failed, or the value did not parse (and the state of a
+    /// process that has not read it yet).
+    #[default]
     Unreadable,
     /// What the store holds (`None`: no record).
     Known(Option<HoldRecord>),
@@ -196,6 +199,151 @@ impl HoldRecState {
             HoldRecState::Known(r) => r.as_ref(),
             HoldRecState::Unreadable => None,
         }
+    }
+}
+
+/// How a carrier's adoption of the hold relates to the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Adopt {
+    /// A first adoption: only with no record of the carried lease (at
+    /// transfer 0), or a record of another lease.
+    Fresh,
+    /// The activation carries the lease this node's own close let go
+    /// (`Core::epoch_closed_carried`), claimed while its re-claim was
+    /// pending: the one edge from an `Ended` record back to `Held`, at the
+    /// same number (so no offer at or below it is ever taken).
+    ClosedCarried,
+}
+
+/// What a request for the hold finds in the record of a node that holds
+/// nothing (rules R1 to R9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reoffer {
+    /// The record is not a give to this asker: today's rules answer.
+    NotApplicable,
+    /// Declined, counted by its cause.
+    Declined,
+    /// The transfer again.
+    Offer(HoldOffer),
+}
+
+impl Core {
+    /// Read the record when this process has none: at start, and at every
+    /// event while the last read failed (a later read resumes every
+    /// transition). A hold the record names but memory does not have is
+    /// waiting to be restored (`restore_epoch_hold`) the first time it is
+    /// read.
+    pub(crate) fn hold_rec_load(&mut self, replica: &dyn Replica) {
+        if !matches!(self.pr.hold_rec, HoldRecState::Unreadable) {
+            return;
+        }
+        match replica.epoch_hold_record() {
+            Ok(rec) => {
+                self.pr.hold_rec = HoldRecState::Known(rec);
+                self.pr.restore_pending =
+                    matches!(rec, Some(HoldRecord::Held { .. })) && !self.lease.epoch_held();
+            }
+            Err(error) => {
+                tracing::warn!(node = self.cfg.node_id, %error, "reading the epoch hold record failed; no hold transition until it reads");
+                self.stats.epoch_hold_record_unreadable += 1;
+            }
+        }
+    }
+
+    /// Persist `rec` (durably) as the node's record. The in-memory record
+    /// follows only a successful write.
+    pub(crate) fn persist_hold_rec(&mut self, replica: &dyn Replica, rec: HoldRecord) -> bool {
+        match replica.persist_epoch_hold_record(Some(&rec)) {
+            Ok(()) => {
+                self.pr.hold_rec = HoldRecState::Known(Some(rec));
+                true
+            }
+            Err(error) => {
+                tracing::warn!(node = self.cfg.node_id, %error, ?rec, "persisting the epoch hold record failed");
+                false
+            }
+        }
+    }
+
+    /// The record, when readable and present.
+    pub(crate) fn hold_record(&self) -> Option<&HoldRecord> {
+        self.pr.hold_rec.record()
+    }
+
+    /// The record says this node holds, but memory holds nothing, and no
+    /// restart is waiting to restore it: an involuntary end (a deposition,
+    /// a vanish, a release in a frozen epoch) whose `Ended` record is not
+    /// written yet. Nothing is given, re-offered, taken or nudged meanwhile,
+    /// and nothing restores it in this process.
+    pub(crate) fn hold_rec_dirty(&self) -> bool {
+        matches!(self.hold_record(), Some(HoldRecord::Held { .. }))
+            && !self.lease.epoch_held()
+            && !self.pr.restore_pending
+    }
+
+    /// The record is `Ended` for exactly `key`, with `reclaim`.
+    pub(crate) fn hold_ended_is(&self, key: HoldKey, reclaim: Reclaim) -> bool {
+        matches!(self.hold_record(), Some(HoldRecord::Ended { key: k, reclaim: r, .. })
+            if *k == key && *r == reclaim)
+    }
+
+    /// The record is about `key` (any kind).
+    pub(crate) fn hold_has_record_of(&self, key: HoldKey) -> bool {
+        self.hold_record().is_some_and(|r| r.key() == key)
+    }
+
+    /// The carried lease, when this node is its carrier.
+    pub(crate) fn my_carried_key(&self) -> Option<HoldKey> {
+        self.pr.carried.filter(|c| c.node == self.cfg.node_id)
+    }
+
+    /// The transfer number a carrier's adoption of the hold of `key` takes,
+    /// or `None` when the record forbids the adoption (a record of `key`
+    /// of any kind but the closed-carried re-hold of an `Ended`, one this
+    /// node cannot read).
+    fn adoption_number(&self, key: HoldKey, via: Adopt) -> Option<XferNo> {
+        match (&self.pr.hold_rec, via) {
+            (HoldRecState::Unreadable, _) => None,
+            (HoldRecState::Known(None), _) => Some(XferNo(0)),
+            (HoldRecState::Known(Some(r)), _) if r.key() != key => Some(XferNo(0)),
+            // (An `Ended` of either kind: the close this node made, or an
+            // involuntary end that a report-driven close followed; the
+            // closed lease this activation carries stood in S3 all along.)
+            (HoldRecState::Known(Some(HoldRecord::Ended { n, .. })), Adopt::ClosedCarried)
+                if key.node == self.cfg.node_id =>
+            {
+                Some(*n)
+            }
+            (HoldRecState::Known(Some(_)), _) => None,
+        }
+    }
+
+    /// The carrier takes (adopts) the hold of its carried lease. The record
+    /// `Held { key, n, at }` is written durably first: no in-memory hold
+    /// without a durable record of it. `false`: no hold (the record forbids
+    /// it, or it could not be written); the caller's event does not adopt,
+    /// and `adopt_retry` has the late path try again at the next round.
+    pub(crate) fn adopt_epoch_hold(
+        &mut self,
+        now: Now,
+        epoch: Epoch,
+        via: Adopt,
+        replica: &dyn Replica,
+    ) -> bool {
+        let Some(key) = self.my_carried_key() else {
+            return false;
+        };
+        let Some(n) = self.adoption_number(key, via) else {
+            return false;
+        };
+        if !self.persist_hold_rec(replica, HoldRecord::Held { key, n, at: epoch }) {
+            self.stats.epoch_hold_adopt_persist_failed += 1;
+            self.pr.adopt_retry = true;
+            return false;
+        }
+        self.pr.adopt_retry = false;
+        self.adopt_epoch_hold_in_memory(now, epoch, replica);
+        true
     }
 }
 
