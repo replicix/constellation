@@ -24699,6 +24699,30 @@ fn a_leave_over_the_roots_own_empty_stream_completes_with_the_readoption_off() {
     });
 }
 
+/// Seeds 487, 678 and 839 of `sticky-holder-restarts-placed` with the idle
+/// release. The root's own placed sticky stream is released whole after the
+/// idle time and journaled at once, so the table lists a stream with no
+/// subtree; the release is parked on the read grants the root gave a
+/// rebooting peer and ends the stream when they lapse (within the read TTL).
+/// The run reached quiescence before that and `orphan_empty_stream` judged
+/// mid-release; quiescence now waits for a usable root's empty streams to end.
+#[test]
+fn quiescence_waits_for_the_parked_release_to_end_the_roots_stream() {
+    let config = SimConfig {
+        sticky_idle_ms: Some(1_200),
+        ..sticky_holder_restarts_placed_config()
+    };
+    for seed in [487u64, 678, 839] {
+        run_seed(seed, config.clone()).unwrap_or_else(|e| {
+            panic!(
+                "sticky-holder-restarts-placed seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=sticky-holder-restarts-placed \
+                 AUTHORITY_SIM_STICKY_IDLE_MS=1200 AUTHORITY_SIM_START={seed} AUTHORITY_SIM_SEEDS=1"
+            )
+        });
+    }
+}
+
 /// Plan 46 M1.3 step 14 (ADR-61): the operator asks any node to retire the dead
 /// root before a survivor has taken over. A follower that is not the root
 /// answered "holds no delegation of its own" from a table behind the log and

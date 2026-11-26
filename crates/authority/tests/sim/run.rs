@@ -7001,6 +7001,19 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         g.6 || (g.7 && cfg.abandon_after_ms.is_none()) || cluster.get(g.1).alive()
                     }))
                 && v.job.is_none()
+                // A usable root whose table still lists a delegation stream
+                // with no subtree is not quiescent: the release that emptied
+                // it is parked on read grants (`ParkedWhat::ReleaseHeld`)
+                // that end within the read TTL, and ends the stream when the
+                // last one lapses. The wait is level-triggered and bounded by
+                // the existing `settle_ms`; a stream that never ends keeps
+                // the run non-quiescent until the settle runs out, and
+                // `orphan_empty_stream` then fails it as before.
+                && (v.held_epoch.is_none()
+                    || v.lost
+                    || v.gate_pending
+                    || v.release_cas_out
+                    || n.meta.delegation_table().streams().all(|st| !st.subtrees.is_empty()))
                 && super::node::is_quiescent(&n.meta)
                 && constellation_authority::Replica::applied_seq(&*n.meta).unwrap_or(0) >= head
         });
