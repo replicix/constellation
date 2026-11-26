@@ -1840,6 +1840,11 @@ pub struct Report {
     /// tail dropped), summed over the live nodes at convergence. Zero where
     /// no claim is lossy (`ttl_claims_without_tail == 0`).
     pub read_holds_abandoned: u64,
+    /// The longest stretch (ms, in `SETTLE_POLL_MS` steps) the settle held
+    /// quiescence back only because a usable root's table listed a delegation
+    /// stream with no subtree (every other term was met). The release that
+    /// emptied it ends it within the read TTL.
+    pub empty_stream_wait_max_ms: u64,
     /// ADR-57 P5: delegate rows a recall dropped, and of those the ones the
     /// history shows acknowledged and the log never carried (must be 0).
     pub recall_dropped: usize,
@@ -5993,6 +5998,31 @@ pub fn last_run_sim_ms() -> u64 {
     LAST_RUN_SIM_MS.with(|m| m.get())
 }
 
+/// One step of the settle loop's poll (`run_seed` sleeps this long between
+/// quiescence judgements); a wait measured in steps is exact to it.
+pub const SETTLE_POLL_MS: u64 = 250;
+
+/// The delegation streams a usable root's table lists with no subtree left.
+/// A root is usable when it holds the lease epoch and is neither lost nor has
+/// a gate open or a release CAS out: only then does the product end such a
+/// stream, so only then is one a leftover. A node that is not a usable root
+/// (or is dead) yields none. The one source for the quiescence wait, the
+/// `why` list of a run that never settles, and `orphan_empty_stream`.
+fn usable_root_empty_streams(n: &NodeHandle) -> Vec<constellation_meta::delegation::NodeStream> {
+    if !n.alive() {
+        return Vec::new();
+    }
+    let v = n.view();
+    if v.held_epoch.is_none() || v.lost || v.gate_pending || v.release_cas_out {
+        return Vec::new();
+    }
+    n.meta
+        .delegation_table()
+        .streams()
+        .filter(|st| st.subtrees.is_empty())
+        .collect()
+}
+
 /// Run one seed. `Err` carries the failure and the replay command.
 ///
 /// Determinism contract: `seed -> fingerprint` is a pure function, whatever
@@ -6932,10 +6962,15 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let mut waited = 0u64;
     let mut quiescent = false;
     let mut extra_settles = 0u64;
+    // How long quiescence has been held by the empty-stream term alone (every
+    // other term met), in the current run of polls; the longest run goes to
+    // `Report::empty_stream_wait_max_ms`.
+    let mut stream_held_ms = 0u64;
+    let mut stream_wait_max_ms = 0u64;
     let world = cluster.env.world.clone();
     while waited < cfg.settle_ms {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        waited += 250;
+        tokio::time::sleep(Duration::from_millis(SETTLE_POLL_MS)).await;
+        waited += SETTLE_POLL_MS;
         if cfg.chunk_writes > 0.0 {
             // The operator procedure (see `operator_drop_hopeless`), again
             // at the settle's cadence for what appeared after the
@@ -7001,22 +7036,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         g.6 || (g.7 && cfg.abandon_after_ms.is_none()) || cluster.get(g.1).alive()
                     }))
                 && v.job.is_none()
-                // A usable root whose table still lists a delegation stream
-                // with no subtree is not quiescent: the release that emptied
-                // it is parked on read grants (`ParkedWhat::ReleaseHeld`)
-                // that end within the read TTL, and ends the stream when the
-                // last one lapses. The wait is level-triggered and bounded by
-                // the existing `settle_ms`; a stream that never ends keeps
-                // the run non-quiescent until the settle runs out, and
-                // `orphan_empty_stream` then fails it as before.
-                && (v.held_epoch.is_none()
-                    || v.lost
-                    || v.gate_pending
-                    || v.release_cas_out
-                    || n.meta.delegation_table().streams().all(|st| !st.subtrees.is_empty()))
                 && super::node::is_quiescent(&n.meta)
                 && constellation_authority::Replica::applied_seq(&*n.meta).unwrap_or(0) >= head
         });
+        // A usable root whose table still lists a delegation stream with no
+        // subtree is not quiescent: the release that emptied it is parked on
+        // read grants (`ParkedWhat::ReleaseHeld`) that end within the read
+        // TTL, and ends the stream when the last one lapses. The wait is
+        // level-triggered and bounded by the existing `settle_ms`. A stream
+        // that never ends keeps the run non-quiescent until the settle runs
+        // out, and the run then fails as "did not reach quiescence" (its
+        // `why` names the streams); `orphan_empty_stream` is not reached.
         // Plan 43 C2e: a delegation of a dead node that no live node knows as
         // a generation yet (the lease is nobody's: the root went away or
         // never claimed it back): the next op of any client would claim it
@@ -7059,6 +7089,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 }
             }
         }
+        let streams_open = live
+            .iter()
+            .any(|n| !usable_root_empty_streams(n).is_empty());
+        if all && !undecided && streams_open {
+            stream_held_ms += SETTLE_POLL_MS;
+            stream_wait_max_ms = stream_wait_max_ms.max(stream_held_ms);
+        } else {
+            stream_held_ms = 0;
+        }
+        let all = all && !streams_open;
         if all && !undecided {
             quiescent = true;
             break;
@@ -7111,6 +7151,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // it is a property of the schedule, not of what the run did with it.
     let (repeat, minted) = mint_log.first_repeat();
     report.gens_minted = minted;
+    report.empty_stream_wait_max_ms = stream_wait_max_ms;
     report.segments_landed = bucket.archive.landed();
     if let Some(gen) = repeat {
         return Err(format!(
@@ -8356,9 +8397,19 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     .iter()
                     .map(|c| format!("{c:?}"))
                     .collect();
+                let empty_streams: Vec<String> = usable_root_empty_streams(&n)
+                    .iter()
+                    .map(|st| {
+                        format!(
+                            "(node {}, {})",
+                            st.node,
+                            constellation_meta::delegation::GenLabel::of(st.gen)
+                        )
+                    })
+                    .collect();
                 format!(
                     "node {}: pending {:?} remote {:?} dirty {} job {:?} journal {:?} held {:?} \
-                     speculation {:?} live {:?} replays {}",
+                     speculation {:?} live {:?} replays {} empty streams {:?}",
                     n.id,
                     pending,
                     remote,
@@ -8368,7 +8419,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     n.meta.held_summary(),
                     n.meta.speculation_counts().ok(),
                     n.meta.speculation_live_debug(),
-                    n.meta.pending_replays().map(|q| q.len()).unwrap_or(0)
+                    n.meta.pending_replays().map(|q| q.len()).unwrap_or(0),
+                    empty_streams
                 )
             })
             .collect();
@@ -8821,30 +8873,25 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // one that appended the release row may be gone, and the gate that
     // appended it ends nothing (`orphan_empty_stream`). Judged at the end of
     // the run, from the usable root's own table (which is the log's fold plus
-    // its journal): a retired node's listed stream is one too. A run that
-    // ends with no usable root (a gate still open, the lease lost) judges
-    // nothing: the open ends the stream, and no time constant is involved.
+    // its journal): a retired node's listed stream is one too. Quiescence
+    // waits for these streams to end (a release parked on read grants ends
+    // its stream within the read TTL), so a stream that never ends fails the
+    // run as non-quiescent before this point, and this check fires only for
+    // one that appears after quiescence was judged. A run that ends with no
+    // usable root (a gate still open, the lease lost) judges nothing: the
+    // open ends the stream.
     {
         let mut orphans = Vec::new();
         for id in cluster.ids() {
             let n = cluster.get(id);
-            if !n.alive() {
-                continue;
-            }
-            let v = n.view();
-            if v.held_epoch.is_none() || v.lost || v.gate_pending || v.release_cas_out {
-                continue;
-            }
-            for st in n.meta.delegation_table().streams() {
-                if st.subtrees.is_empty() {
-                    orphans.push(format!(
-                        "orphan_empty_stream: node {id} ends the run as a usable root with the \
-                         log listing node {}'s stream {} with no subtree left (retired: {})",
-                        st.node,
-                        constellation_meta::delegation::GenLabel::of(st.gen),
-                        retired_nodes.contains(&st.node)
-                    ));
-                }
+            for st in usable_root_empty_streams(&n) {
+                orphans.push(format!(
+                    "orphan_empty_stream: node {id} ends the run as a usable root with the \
+                     log listing node {}'s stream {} with no subtree left (retired: {})",
+                    st.node,
+                    constellation_meta::delegation::GenLabel::of(st.gen),
+                    retired_nodes.contains(&st.node)
+                ));
             }
         }
         report.claim_core[6] = orphans.len() as u64;
