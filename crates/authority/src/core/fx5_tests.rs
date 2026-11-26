@@ -402,6 +402,10 @@ fn a_hold_answer_is_refused_outside_an_active_epoch() {
             let mut c = Cluster::new(&[1, 2]);
             let req = waiting(&mut c, 2, 1);
             c.report(2, open, active, frozen);
+            assert!(
+                c.node(2).core.job().is_none(),
+                "{label}: the report ends the acquisition waiting for the hold"
+            );
             c.hear(2, 1, req, HandoffAnswer::Hold(c.offer(1, kind)));
             assert!(
                 c.node(2).core.lease.epoch_hold().is_none(),
@@ -415,6 +419,14 @@ fn a_hold_answer_is_refused_outside_an_active_epoch() {
                 "{label} {kind:?}: refused by cause"
             );
         }
+        // (f) the take checks the epoch itself, whether or not a report
+        // ended the acquisition first.
+        let mut c = Cluster::new(&[1, 2]);
+        let req = waiting(&mut c, 2, 1);
+        c.node(2).core.epoch.frozen = true;
+        c.hear(2, 1, req, HandoffAnswer::Hold(c.offer(1, kind)));
+        assert!(!c.node(2).core.lease.epoch_held(), "(f) {kind:?}");
+        assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_closed, 1);
         // (d) from a node that is no member of the epoch.
         let mut c = Cluster::new(&[1, 2]);
         let req = waiting(&mut c, 2, 1);
@@ -586,6 +598,19 @@ fn an_unreadable_hold_record_blocks_every_transition() {
             HandoffAnswer::Hold(c.offer(2, OfferKind::Transfer)),
         );
         assert!(!c.node(2).core.lease.epoch_held());
+        // (T5: an offer to an acquisition that waits for it is declined too.)
+        let (_, req) = c.ask(2);
+        c.hear(
+            2,
+            1,
+            req,
+            HandoffAnswer::Hold(c.offer(2, OfferKind::Transfer)),
+        );
+        assert!(
+            !c.node(2).core.lease.epoch_held(),
+            "took on an unreadable record"
+        );
+        assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_record, 1);
         // Readable again at a later event: it resumes (restores).
         if garbage {
             let rec = c.held(1, 2);
@@ -693,6 +718,7 @@ fn a_reoffer_is_declined_by_cause() {
     let out = c.serve(1, 2, req);
     assert!(declined(&answer_to(&out, 2).unwrap()), "R5: {out:?}");
     assert_eq!(c.node(1).core.stats.epoch_hold_reoffers, 0);
+    assert_eq!(c.poll_nudge(1, 2), None, "N3: nudged for another lease");
     // and a clean re-offer for contrast
     let mut c = setup();
     let (_, req) = c.ask(2);
@@ -1459,4 +1485,184 @@ fn the_epoch_ask_rotates_past_a_declining_or_silent_cached_holder() {
     c.node(2).core.lease.cached_holder = Some(3);
     let answer = c.recover(1, 2);
     assert!(is_hold(&answer, 1, OfferKind::Reoffer));
+}
+
+/// T1: a hold answer to an S3 handoff request declines (the request that
+/// asked for no hold).
+#[test]
+fn a_hold_answer_to_an_s3_request_declines() {
+    let mut h = Harness::new(2);
+    h.core.lease.cached_holder = Some(1);
+    let out = h.step(Event::Control {
+        op: OpId(900),
+        req: Control::ClaimOffer { epoch: 1 },
+    });
+    let req = match sends(&out)[..] {
+        [(
+            1,
+            PeerMsg::LeaseRequest {
+                req,
+                epoch_applied: None,
+            },
+        )] => *req,
+        ref other => panic!("expected one S3 LeaseRequest: {other:?}"),
+    };
+    let key = Carrier {
+        node: 1,
+        epoch: 1,
+        expires_unix_ms: h.now.0 + 1_000,
+    };
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::LeaseHandoff {
+            req,
+            answer: HandoffAnswer::Hold(HoldOffer {
+                key,
+                n: XferNo(1),
+                kind: OfferKind::Transfer,
+            }),
+        },
+    });
+    assert!(!h.core.lease.epoch_held());
+    assert!(h.core.job().is_none(), "the acquisition ended");
+    assert_eq!(h.core.stats.epoch_hold_offers_refused_mode, 1);
+}
+
+/// T6: a node that holds, is retired, is deposed, or has an unwritten end of
+/// a hold of its own takes no offer.
+#[test]
+fn an_offer_is_refused_by_a_node_that_cannot_take_it() {
+    // It holds.
+    let mut c = Cluster::new(&[1, 2]);
+    let req = waiting(&mut c, 2, 1);
+    let h2 = c.node(2);
+    h2.adopt_hold_at(h2.clk(), 2);
+    let rec = c.rec(2);
+    c.hear(
+        2,
+        1,
+        req,
+        HandoffAnswer::Hold(c.offer(5, OfferKind::Transfer)),
+    );
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_held, 1);
+    assert_eq!(c.rec(2), rec, "a refusal changes no record");
+    // Retired.
+    let mut c = Cluster::new(&[1, 2]);
+    let req = waiting(&mut c, 2, 1);
+    c.node(2).core.pr.retired = true;
+    c.hear(
+        2,
+        1,
+        req,
+        HandoffAnswer::Hold(c.offer(1, OfferKind::Transfer)),
+    );
+    assert!(!c.node(2).core.lease.epoch_held(), "a retired node took it");
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_closed, 1);
+    // Deposed.
+    let mut c = Cluster::new(&[1, 2]);
+    let req = waiting(&mut c, 2, 1);
+    c.node(2).core.lease.force_lost();
+    c.hear(
+        2,
+        1,
+        req,
+        HandoffAnswer::Hold(c.offer(1, OfferKind::Transfer)),
+    );
+    assert!(!c.node(2).core.lease.epoch_held(), "a deposed node took it");
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_closed, 1);
+    // An end of its own hold not written yet (the record still says Held).
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, false);
+    Faults::write(true);
+    c.node(2).core.lease.release_local();
+    // (an event ends the hold, the write fails)
+    c.node(2).step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::SegmentPublished { seq: 0, epoch: 0 },
+    });
+    assert!(c.node(2).core.hold_rec_dirty());
+    let req = waiting(&mut c, 2, 1);
+    c.hear(
+        2,
+        1,
+        req,
+        HandoffAnswer::Hold(c.offer(7, OfferKind::Transfer)),
+    );
+    Faults::write(false);
+    assert!(!c.node(2).core.lease.epoch_held());
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_record, 1);
+}
+
+/// A carrier whose adoption's record fails to write holds nothing and tries
+/// again at its next round.
+#[test]
+fn a_carrier_whose_adoption_record_fails_adopts_at_the_next_round() {
+    let _faults = Faults;
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let lease = h.core.lease.held.as_ref().unwrap().0.clone();
+    Faults::write(true);
+    h.step(epoch_report(carrier_of(&lease), true, true, false, false));
+    assert!(!h.core.lease.epoch_held(), "adopted without its record");
+    assert!(h.core.stats.epoch_hold_adopt_persist_failed >= 1);
+    Faults::write(false);
+    let mut out = Vec::new();
+    h.core.on_poll(h.clk(), &h.meta, &mut out);
+    assert!(h.core.lease.epoch_held(), "not retried at the round");
+    assert_eq!(
+        h.meta.epoch_hold_record().unwrap().map(|r| r.n()),
+        Some(XferNo(0))
+    );
+}
+
+/// A3 to A1 of the nudge, against a node that is idle in the epoch: a
+/// nudge from a non-member, for another lease, or in a frozen epoch is
+/// ignored (a node that held would refuse them all for another reason).
+#[test]
+fn an_idle_node_ignores_a_nudge_that_is_not_for_its_epoch() {
+    let mut c = Cluster::new(&[1, 2, 3]);
+    let key = c.key;
+    let other = Carrier {
+        expires_unix_ms: key.expires_unix_ms + 1,
+        ..key
+    };
+    // from a node outside the epoch's members (the epoch is [1, 2, 3]; 4 is not)
+    let out = c.hear_nudge(3, 4, key, XferNo(9));
+    assert!(lease_request(&out).is_none(), "A2: {out:?}");
+    // for another carried lease
+    let out = c.hear_nudge(3, 1, other, XferNo(9));
+    assert!(lease_request(&out).is_none(), "A3: {out:?}");
+    // in a frozen epoch
+    c.report(3, true, false, true);
+    let out = c.hear_nudge(3, 1, key, XferNo(9));
+    assert!(lease_request(&out).is_none(), "A1: {out:?}");
+    assert_eq!(c.node(3).core.stats.epoch_hold_nudges_ignored_state, 3);
+    // and, as a contrast, an active epoch and a member: asked
+    c.report(3, true, true, false);
+    let out = c.hear_nudge(3, 1, key, XferNo(9));
+    assert!(lease_request(&out).is_some(), "{out:?}");
+}
+
+/// The hold owner whose `Ended { Owed }` write fails at the close stays the
+/// epoch's authority and not silent for nothing: `flush_pending` (the
+/// silence) is set only once the record is written.
+#[test]
+fn a_close_whose_record_fails_does_not_silence_the_owner() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    // (A row in the journal keeps `flush_pending` from clearing itself.)
+    create_nowait(c.node(1), 1, "row");
+    let object = c.node(1).core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = c.key;
+    Faults::write(true);
+    let closed = drive_until(c.node(1), carrier, object, &|h| {
+        h.core.stats.epoch_hold_end_persist_failed >= 1 && h.core.job().is_none()
+    });
+    assert!(!closed);
+    assert!(
+        !c.node(1).core.pr.flush_pending,
+        "silent although it did not close"
+    );
+    assert!(c.node(1).core.lease.epoch_held());
 }
