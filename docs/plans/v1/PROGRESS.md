@@ -72545,3 +72545,15 @@ These serve the root's own rows and the replay queue.
 - Topology 1's ±3 % at later gates: the user's 2026-11-25 decision closes it for M1.2; whether it carries to M1.3's and the stage-1 gates is
   their decision to take.
 - Procedural: M1.3 work went ahead before M1.2's exit closed (§12 asks for each milestone's review before the next starts).
+
+## FX-5: the epoch hold lost in flight is re-offered and nudged (2026-11-26)
+
+Class S of the flex failures (seed 797 on `flex-crash` and `flex-tight` with `+unsettled`): the lease holder is stopped, a continuation epoch carrying its lease forms, a member's request for the hold queues at the stopped holder and times out, and the resumed holder hands the hold to a requester that has stopped waiting. Nothing held the epoch afterwards and nothing could, for the giver's let-go was persisted and the answer was dropped: 130 unsettled `EIO`s and an epoch that never closed.
+
+- **Numbered transfers.** One hold record per node (`Held` / `Given` / `Ended`, kv key `epoch_hold_rec`; the keys of the earlier format are never read, no shim), written durably before the act it licenses. A give is the next number; a take only inside the taker's own active unfrozen epoch, from a member, for the carried lease, above the highest number it ever took or gave. Gives are totally ordered, an offer is takeable only by its recipient: at most one node holds (proof in `core/hold.rs` and plan 46 §5.7).
+- **Re-offer and nudge.** A giver that holds nothing re-offers its number to its recipient when asked, and nudges it at its round (`EpochHoldNudge`, level-triggered, no state, no timer); the recipient asks the giver through an ordinary acquisition (`epoch-hold-owed`, a safety duty for a forward-only or suspended node). The epoch ask rotates past a declining or silent member.
+- **Fail closed.** An unreadable record blocks every transition; a close that cannot write `Ended { Owed }` does not close; an involuntary end writes `Ended { Settled }` at every event until it lands, and nothing gives, takes or restores meanwhile (a restart restores nothing for a deposition, a vanish or a release in a frozen epoch: `lease_lost`, `epoch_owes_move`, `lease_released`).
+- **Model.** `flex.rs` models the transfer (records, lost and late messages, re-offer, nudge, crash, retire); every guard has a refuted knob; the clean runs are exhaustive on N = 2 and N = 3.
+- **Cost, stated.** A giver or a recipient that is not the carrier and is gone for good keeps the epoch open until it returns or the carrier is retired (`durability-and-failover.md`); retiring a non-carrier does not end the epoch, the other members cannot tell whether it holds.
+- **Harness.** `pause_until` kept resetting `paused_since` inside a pause in progress, so a stopped node counted as a member acking with a stale view; seed 797 formed its epoch that way. Fixed apart, and swept apart. The harness fix moves `flex-crash` `+unsettled` seed 1673 onto the existing unsettled-`EIO` ceiling class; that cell is 28 failures on the fix against 29 on main at 2,000 seeds.
+

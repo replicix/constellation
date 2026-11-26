@@ -1302,6 +1302,22 @@ Operational rules:
   so no fragment of them surfaces. This covers ops the retired node
   sequenced for others too; ops it forwarded to a live holder are that
   holder's and are kept.
+- The epoch's hold moves between members over P2P in **numbered transfers**
+  and recovers from a lost answer. A member that asks for the hold and is
+  given it writes a durable record of the transfer before it uses it; the
+  giver writes its own before it lets go. If the answer is lost (the
+  request timed out first, a connection broke, the asking node restarted),
+  the giver, which holds nothing, offers the same transfer again when its
+  recipient asks, and prompts it to ask at the giver's ordinary round (a
+  `EpochHoldNudge`, which carries no state). The recipient takes the hold
+  once, never one it already passed. The cost is availability only: when the giver or
+  the recipient of a hold in flight is gone for good and is not the epoch's
+  carrier, the epoch stays open until that node returns or the operator
+  retires the epoch's carrier (`leave --node-id` of the node whose lease the
+  epoch carries), which makes the other members abandon the epoch. That
+  retires a node that may be healthy; retiring the missing giver or
+  recipient does not end the epoch, because the remaining members cannot
+  tell whether it still holds the hold.
 - A takeover of a tenure that an epoch's hold carried waits for the members
   the epoch rows name (`status.lease.waiting_for_group`). A member that is
   down holds the claim; the operator either abandons the epoch

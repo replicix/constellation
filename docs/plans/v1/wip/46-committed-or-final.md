@@ -661,6 +661,29 @@ hold is `Final` (non-stealable, as today; nobody else is in the epoch).
 Row 51's hold classes and row 52's variant 3 go; `hold_owner_never_deposed_except_by_retire`
 stays as the guard for the retire path.
 
+*A lost hold transfer (FX-5, 2026-11).* The hold moves between members of
+an open epoch by **numbered transfers**: for the lease the epoch carries
+(its key), the carrier's adoption is transfer 0 and every give is the
+next number, written durably in the giver's one hold record (`Given { key,
+n, to }`) before it lets go and before its answer leaves. A node takes a
+transfer, a first answer and a re-offer alike, only inside its own active
+unfrozen epoch carrying that key, only from a member, and only a number
+above the highest it ever took or gave, writing `Held { key, n }` before it
+uses the hold; so gives are totally ordered by `n`, an offer is takeable
+only by its recipient and only until that node passes it, and at most one
+node holds. The record replaces the earlier ended-hold records: `Ended`
+(closed, owing the re-claim or not) and `Given` refuse a second adoption of
+the same lease, and the one edge back to `Held` is the closed-carried
+activation, at the number it closed at. A lost answer recovers from
+persisted state alone: a giver that holds nothing re-offers its number to
+its recipient when asked, and nudges it at its ordinary round
+(`EpochHoldNudge`, no state, no timer), the recipient answering the nudge
+with an ordinary epoch request aimed at the giver; the take stays the one
+guarded path. A record that cannot be read blocks every transition. The
+retire rule is unchanged (the carrier's retire makes the other members
+abandon; a late offer is then refused: the taker's epoch is not active).
+`flex.rs` models the transfer, with knobs refuted for each guard.
+
 *Model (M1.0 chunk C10, 2026-11-06).* `crates/model/src/flex.rs` models the
 group: the owner executes into its journal and answers a row once a member
 holds it (`StreamAhead`, then `AnswerHold`); a one-member epoch answers
