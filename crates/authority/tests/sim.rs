@@ -14131,6 +14131,40 @@ fn flex_crash_seed_30702_an_epoch_hold_goes_only_to_a_caught_up_member() {
     );
 }
 
+/// FX-5 (class S, flex-crash and flex-tight seed 797), S1: the lease holder is
+/// stopped for 5 s from 0.6 s, a two-member epoch carrying its lease forms
+/// meanwhile, and the other member's request for the hold queues at the
+/// stopped holder and times out. The holder, resumed, adopts the hold and
+/// serves the request to a requester that has stopped waiting: the answer
+/// is dropped, and before the fix nobody held the epoch for good (130
+/// unsettled `EIO`s, the epoch never closing). Now every check passes
+/// (`+commit+identity+settle+durability+unsettled`), the lost answer was
+/// seen, and the hold found its way back: the giver's nudge made the
+/// requester ask again, and it took the re-offer. Fails before the fix.
+#[test]
+fn epoch_hold_lost_in_flight_seed_797_finds_its_way_back() {
+    let (mut dropped, mut reoffers_taken, mut nudges) = (0u64, 0u64, 0u64);
+    for label in ["flex-crash", "flex-tight"] {
+        let cfg = ["commit", "identity", "settle", "durability", "unsettled"]
+            .into_iter()
+            .fold(base_config(label), config_variant);
+        let report = run_seed(797, cfg).unwrap_or_else(|e| {
+            panic!("{label}+commit+identity+settle+durability+unsettled 797: {e}")
+        });
+        for s in report.stats.values() {
+            dropped += s.epoch_hold_answers_dropped;
+            reoffers_taken += s.epoch_hold_reoffers_taken;
+            nudges += s.epoch_hold_nudges;
+        }
+    }
+    assert!(
+        dropped > 0,
+        "no transfer answer was lost: the scenario is vacuous"
+    );
+    assert!(reoffers_taken > 0, "no re-offer was taken");
+    assert!(nudges > 0, "no nudge was sent");
+}
+
 /// Plan 30 §M11 phase 2b round 2: the seed whose successor root replayed
 /// a delegate-accepted shadow ahead of the delegate's earlier
 /// transactions (a per-directory linearizability violation); now the
