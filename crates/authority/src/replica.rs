@@ -12,6 +12,7 @@
 //! The method set is exactly what the decision logic touches, and nothing
 //! else in `Meta` is reachable from the core.
 
+use crate::core::HoldRecord;
 use crate::ids::{Epoch, NodeId, Now, Seq, WaitMs};
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{DelegationTable, Ownership};
@@ -22,6 +23,23 @@ use constellation_meta::{
     ReadDelegations, Rid, ShadowInstall, Stranded, StrandedOp, TouchSet,
 };
 use constellation_types::Code;
+
+/// The `local` key of the epoch hold record (FX-5). A new name: the keys
+/// the earlier format used (`epoch_hold`, `epoch_hold_ended`) are never
+/// read again, so no value of theirs can make the record unreadable.
+const EPOCH_HOLD_RECORD_KEY: &str = "epoch_hold_rec";
+
+/// Test switches for the hold record's two methods (per thread).
+#[cfg(test)]
+pub(crate) mod hold_faults {
+    use std::cell::Cell;
+    thread_local! {
+        /// `epoch_hold_record` fails.
+        pub(crate) static READ: Cell<bool> = const { Cell::new(false) };
+        /// `persist_epoch_hold_record` fails.
+        pub(crate) static WRITE: Cell<bool> = const { Cell::new(false) };
+    }
+}
 
 /// What applying a foreign segment did (`Meta::apply_segment`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1054,6 +1072,13 @@ pub trait Replica {
     /// still owes the re-claim of that lease (`Core::epoch_reclaim_due`).
     fn epoch_hold_ended(&self) -> Option<(Epoch, i64, bool)>;
     fn persist_epoch_hold_ended(&self, ended: Option<(Epoch, i64, bool)>) -> Result<(), MetaError>;
+    /// FX-5: the node's one record of an epoch hold
+    /// (`local["epoch_hold_rec"]`, [`HoldRecord`]). A kv read error or a
+    /// value that does not parse is `Err`, never `Ok(None)`: the core
+    /// then blocks every hold transition (fail closed).
+    fn epoch_hold_record(&self) -> Result<Option<HoldRecord>, MetaError>;
+    /// Write (durably) the record, or clear it with `None`.
+    fn persist_epoch_hold_record(&self, rec: Option<&HoldRecord>) -> Result<(), MetaError>;
     /// The carried lease (`epoch`, `expires_unix_ms`), this node's own,
     /// whose epoch it owes the close of without holding it
     /// (`local["epoch_owes_move"]`, `PromiseState::owes_move`).
@@ -2533,6 +2558,34 @@ impl Replica for Meta {
 
     fn issue_promise(&self, span_ms: u64, now: Now) -> Result<bool, MetaError> {
         Meta::promise_issue(self, span_ms, now)
+    }
+
+    fn epoch_hold_record(&self) -> Result<Option<HoldRecord>, MetaError> {
+        #[cfg(test)]
+        if hold_faults::READ.with(std::cell::Cell::get) {
+            return Err(MetaError::Invalid(
+                "injected epoch hold record read fault".into(),
+            ));
+        }
+        match Meta::kv_get(self, EPOCH_HOLD_RECORD_KEY)? {
+            None => Ok(None),
+            Some(v) if v.is_empty() => Ok(None),
+            Some(v) => v
+                .parse::<HoldRecord>()
+                .map(Some)
+                .map_err(|e| MetaError::Invalid(e.to_string())),
+        }
+    }
+
+    fn persist_epoch_hold_record(&self, rec: Option<&HoldRecord>) -> Result<(), MetaError> {
+        #[cfg(test)]
+        if hold_faults::WRITE.with(std::cell::Cell::get) {
+            return Err(MetaError::Invalid(
+                "injected epoch hold record write fault".into(),
+            ));
+        }
+        let v = rec.map(HoldRecord::to_string).unwrap_or_default();
+        Meta::kv_set_durable(self, EPOCH_HOLD_RECORD_KEY, &v)
     }
 
     fn epoch_hold_persisted(&self) -> Option<Epoch> {

@@ -31,14 +31,6 @@ impl AcquireProgress {
     }
 }
 
-/// Outcome of a successful partition handoff (flush + lease release).
-#[derive(Debug, Clone)]
-pub struct HandoffResult {
-    pub epoch: u64,
-    pub etag: Option<String>,
-    pub head_seq: Option<u64>,
-}
-
 /// Why a durability request (`Barrier`, `DrainInode`) failed, and whether
 /// it is worth waiting out (plan 39: an `fsync` retries a
 /// [`ErrorClass::Transient`] failure until the data is durable and
@@ -314,7 +306,7 @@ pub enum SyncRequest {
         requester: u64,
         /// `Payload::LeaseRequest::epoch_applied`.
         epoch_applied: Option<u64>,
-        reply: tokio::sync::oneshot::Sender<Option<HandoffResult>>,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::HandoffAnswer>,
     },
     /// A peer forwarded a mutation to this node as (believed) holder.
     /// The reply carries plan 30 §M6's `base` (see
@@ -888,6 +880,13 @@ pub enum SyncRequest {
         grants: Vec<constellation_meta::locks::GrantWire>,
         floor: constellation_meta::Position,
         final_for: Option<constellation_authority::LeaseKey>,
+    },
+    /// FX-5, one way: `from` gave the epoch hold of the carried lease `key`
+    /// as transfer `n` to this node and holds nothing.
+    PeerEpochHoldNudge {
+        from: u64,
+        key: constellation_authority::Carrier,
+        n: constellation_authority::XferNo,
     },
     /// Final flush + release on unmount; the core stops afterwards.
     Shutdown {

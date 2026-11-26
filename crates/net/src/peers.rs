@@ -2287,6 +2287,16 @@ async fn handle_stream<S: PeerService>(
                 service.lock_mirror(from, ver, grants, floor, final_for);
                 Some(Payload::Ok { req_id: 0 })
             }
+            Payload::EpochHoldNudge {
+                from,
+                key_node,
+                key_epoch,
+                key_expires_unix_ms,
+                n,
+            } => {
+                service.epoch_hold_nudged(from, (key_node, key_epoch, key_expires_unix_ms), n);
+                Some(Payload::Ok { req_id: 0 })
+            }
             Payload::PingS3 { .. } => Some(Payload::Pong {
                 node_id: service.node_id(),
                 s3_ok: service.s3_probe().await,
@@ -2393,6 +2403,7 @@ async fn handle_stream<S: PeerService>(
             }
             Payload::Pong { .. }
             | Payload::LeaseHandoff { .. }
+            | Payload::EpochHoldOffer { .. }
             | Payload::EpochAck { .. }
             | Payload::CacheDigest { .. }
             | Payload::CacheDigestDelta { .. }

@@ -571,6 +571,52 @@ pub enum Control {
     Authority { forward_only: bool, suspended: bool },
 }
 
+/// FX-5: a transfer number of one carried lease's epoch hold: 0 at the
+/// carrier's adoption, plus one per give. Compared only for the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct XferNo(pub u32);
+
+impl XferNo {
+    /// The number of the next give; `None` at the end of the range (no
+    /// give: the request is declined).
+    pub fn next(self) -> Option<XferNo> {
+        self.0.checked_add(1).map(XferNo)
+    }
+}
+
+/// FX-5: the answer to a [`PeerMsg::LeaseRequest`]. Built so that no
+/// answer can say "released" and carry a hold at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffAnswer {
+    /// Declined (either kind of request). `epoch`: the answering node's
+    /// lease epoch, or 0.
+    Declined { epoch: Epoch },
+    /// The S3 handoff job flushed and released: the requester catches up
+    /// to `head_seq` (when the answer names one) and claims.
+    Released { epoch: Epoch, head_seq: Option<Seq> },
+    /// A continuation epoch's hold: one transfer of one carried lease.
+    Hold(HoldOffer),
+}
+
+/// FX-5: transfer `n` of the epoch hold of `key`, offered to the node
+/// that asked. `kind` is for the log and the counters only: a first answer
+/// and a re-offer are taken by the same guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldOffer {
+    pub key: Carrier,
+    pub n: XferNo,
+    pub kind: OfferKind,
+}
+
+/// See [`HoldOffer::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferKind {
+    /// The give itself.
+    Transfer,
+    /// The giver's record answering a later request for the same transfer.
+    Reoffer,
+}
+
 /// Plan 30 §M10: the lease a continuation epoch carries, exactly as the
 /// lease object read when the member claimed it (holder, epoch, expiry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,14 +762,21 @@ pub enum PeerMsg {
         req: OpId,
         epoch_applied: Option<Seq>,
     },
-    /// The holder's answer (`Payload::LeaseHandoff`): it flushed and
-    /// released (`released: true`, and `head_seq` is its last shipped
-    /// sequence, the requester's catch-up target), or it declined.
+    /// The holder's answer (`Payload::LeaseHandoff`, or
+    /// `Payload::EpochHoldOffer` for a continuation epoch's hold): see
+    /// [`HandoffAnswer`].
     LeaseHandoff {
         req: OpId,
-        released: bool,
-        epoch: Epoch,
-        head_seq: Option<Seq>,
+        answer: HandoffAnswer,
+    },
+    /// FX-5: a node whose record says it gave the epoch hold of `key` as
+    /// transfer `n` to the receiver, and which holds nothing, asks the
+    /// receiver to ask for it again (the answer was lost). Carries no
+    /// state: `n` is a filter for the receiver, which answers it with an
+    /// ordinary epoch request aimed at the sender (`Core::on_epoch_hold_nudge`).
+    EpochHoldNudge {
+        key: Carrier,
+        n: XferNo,
     },
     /// Gossip hint that a segment landed (`Payload::SegmentPublished`).
     /// Plan 30 §M7: a hint only — the log itself travels on direct
@@ -1343,6 +1396,7 @@ impl PeerMsg {
             PeerMsg::MutateReply { .. } => "MutateReply",
             PeerMsg::LeaseRequest { .. } => "LeaseRequest",
             PeerMsg::LeaseHandoff { .. } => "LeaseHandoff",
+            PeerMsg::EpochHoldNudge { .. } => "EpochHoldNudge",
             PeerMsg::SegmentPublished { .. } => "SegmentPublished",
             PeerMsg::LogSubscribe { .. } => "LogSubscribe",
             PeerMsg::LogUnsubscribe { .. } => "LogUnsubscribe",

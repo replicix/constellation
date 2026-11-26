@@ -50,6 +50,7 @@ mod backup;
 mod client;
 mod deleg_windows;
 mod delegate;
+mod hold;
 mod holder;
 mod inbox;
 mod jobs;
@@ -91,6 +92,7 @@ pub(crate) use delegate::STICKY_HOLD_MAX_MS;
 pub use delegate::{
     DelegKind, DelegRenewCert, DelegView, RecallPhase, StickyEnd, StickyStreamView,
 };
+pub use hold::{HoldKey, HoldRecord, Reclaim};
 pub use roster::RosterView;
 pub use seal_tail::WaitingForGroup;
 
@@ -2689,6 +2691,53 @@ pub struct Stats {
     /// close let go, claimed while its re-claim was pending: held again
     /// (`epoch_closed_claim`).
     pub epoch_closed_leases_reheld: u64,
+    // ---- FX-5: the epoch hold's transfer numbers (`hold.rs`); one counter
+    // per cause, counted after the write succeeded or at the decision ----
+    /// Gives declined because the in-memory hold and its record disagree
+    /// (G3), the asker is no member of the epoch (G4), the journal is not
+    /// empty (G6, a clean read) or could not be read.
+    pub epoch_gives_declined_record: u64,
+    pub epoch_gives_declined_not_member: u64,
+    pub epoch_gives_declined_journal: u64,
+    pub epoch_gives_declined_journal_err: u64,
+    /// Gives declined because the record write failed (the hold is kept).
+    pub epoch_hold_give_persist_failed: u64,
+    /// Re-offers sent (no state changes, no write).
+    pub epoch_hold_reoffers: u64,
+    /// Re-offers declined: the epoch not active or frozen (R2), the asker
+    /// ahead of this node's log (R7), the journal not empty (R8, clean
+    /// read) or unreadable.
+    pub epoch_hold_reoffers_declined_state: u64,
+    pub epoch_hold_reoffers_declined_behind: u64,
+    pub epoch_hold_reoffers_declined_journal: u64,
+    pub epoch_hold_reoffers_declined_journal_err: u64,
+    /// Hold answers that found no acquisition waiting for them: the
+    /// signature of class S (a transfer's answer lost to a timeout).
+    pub epoch_hold_answers_dropped: u64,
+    /// Offers refused by the take rules, one counter per cause.
+    pub epoch_hold_offers_refused_closed: u64,
+    pub epoch_hold_offers_refused_not_member: u64,
+    pub epoch_hold_offers_refused_key: u64,
+    pub epoch_hold_offers_refused_stale: u64,
+    pub epoch_hold_offers_refused_held: u64,
+    pub epoch_hold_offers_refused_record: u64,
+    /// An S3 `Released` answer to an epoch-mode request (refused).
+    pub epoch_hold_released_refused: u64,
+    /// Offers taken, by kind.
+    pub epoch_hold_transfers_taken: u64,
+    pub epoch_hold_reoffers_taken: u64,
+    /// Offers declined because the take's record write failed.
+    pub epoch_hold_take_persist_failed: u64,
+    /// Nudges sent, and nudges received but not acted on, by cause.
+    pub epoch_hold_nudges: u64,
+    pub epoch_hold_nudges_ignored_stale: u64,
+    pub epoch_hold_nudges_ignored_busy: u64,
+    pub epoch_hold_nudges_ignored_state: u64,
+    /// The hold record could not be read or parsed (a transition was
+    /// blocked this event).
+    pub epoch_hold_record_unreadable: u64,
+    /// A write of an `Ended` record failed (retried at every event).
+    pub epoch_hold_end_persist_failed: u64,
     /// Continuation-epoch handoffs declined because the requester had not
     /// applied this holder's whole log (flex-crash seed 30702).
     pub epoch_handoffs_behind: u64,
@@ -4109,12 +4158,11 @@ impl Core {
             PeerMsg::LeaseRequest { req, epoch_applied } => {
                 self.on_lease_request(now, from, req, epoch_applied, replica, out)
             }
-            PeerMsg::LeaseHandoff {
-                req,
-                released,
-                epoch,
-                head_seq,
-            } => self.on_lease_handoff(now, from, req, released, epoch, head_seq, replica, out),
+            PeerMsg::LeaseHandoff { req, answer } => {
+                self.on_lease_handoff(now, from, req, answer, replica, out)
+            }
+            // FX-5: the nudge is handled by the nudge commit.
+            PeerMsg::EpochHoldNudge { .. } => {}
             PeerMsg::SegmentPublished { seq, epoch } => {
                 self.on_segment_pushed(now, from, seq, epoch, out)
             }

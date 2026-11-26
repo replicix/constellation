@@ -965,6 +965,30 @@ pub enum Payload {
         from: u64,
         gen: u64,
     },
+    /// FX-5, the answer to a [`Payload::LeaseRequest`] that asked for a
+    /// continuation epoch's hold transfer (`epoch_applied: Some`): transfer
+    /// `n` of the epoch hold of the carried lease `(key_node, key_epoch,
+    /// key_expires_unix_ms)`. `reoffer`: the giver's record answered a later
+    /// request for a transfer it already gave (stats and logs only; the
+    /// taker's guard is the same). Appended.
+    EpochHoldOffer {
+        part: String,
+        key_node: u64,
+        key_epoch: u64,
+        key_expires_unix_ms: i64,
+        n: u32,
+        reoffer: bool,
+    },
+    /// FX-5, one way: the sender gave the epoch hold of the carried lease
+    /// as transfer `n` to the receiver and holds nothing; the receiver asks
+    /// for it again if it has not taken `n` (`from`: the sender). Appended.
+    EpochHoldNudge {
+        from: u64,
+        key_node: u64,
+        key_epoch: u64,
+        key_expires_unix_ms: i64,
+        n: u32,
+    },
 }
 
 /// A peer's read of the lease object on the wire
@@ -2079,7 +2103,7 @@ mod tests {
     /// ReleaseCut round 8: the root's resume of a delegate's stream round
     /// is one-way and appended after every other variant.
     #[test]
-    fn a_delegate_stream_resume_round_trips_and_is_appended_last() {
+    fn a_delegate_stream_resume_round_trips_and_follows_the_probe_reply() {
         let payload = Payload::DelegateStreamResume { from: 1, gen: 7 };
         let frame = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(&frame[4..]).unwrap(), payload);
@@ -2089,6 +2113,35 @@ mod tests {
             read: LeaseReadWire::Absent,
         });
         assert_eq!(tag(&payload), last_before + 1);
+    }
+
+    /// FX-5: the epoch hold's offer and nudge are appended after the
+    /// delegate stream resume, and round-trip.
+    #[test]
+    fn the_epoch_hold_offer_and_nudge_round_trip_and_are_appended() {
+        let offer = Payload::EpochHoldOffer {
+            part: "p".into(),
+            key_node: 1,
+            key_epoch: 4,
+            key_expires_unix_ms: -7,
+            n: 3,
+            reoffer: true,
+        };
+        let nudge = Payload::EpochHoldNudge {
+            from: 2,
+            key_node: 1,
+            key_epoch: 4,
+            key_expires_unix_ms: 1_700_000_000_000,
+            n: u32::MAX,
+        };
+        for payload in [&offer, &nudge] {
+            let frame = encode_payload(payload).unwrap();
+            assert_eq!(&decode_payload(&frame[4..]).unwrap(), payload);
+        }
+        let tag = |payload: &Payload| postcard::to_allocvec(payload).unwrap()[0];
+        let resume = tag(&Payload::DelegateStreamResume { from: 1, gen: 7 });
+        assert_eq!(tag(&offer), resume + 1);
+        assert_eq!(tag(&nudge), resume + 2);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use super::client::named_child;
 use super::delegate::RecallPhase;
 use super::{Core, S3For};
 use crate::action::{Action, S3Op};
-use crate::event::PeerMsg;
+use crate::event::{HandoffAnswer, PeerMsg};
 use crate::ids::{Epoch, NodeId, Now, OpId, Seq};
 use crate::replica::Replica;
 use constellation_meta::delegation::Ownership;
@@ -1636,9 +1636,9 @@ impl Core {
                 to: from,
                 msg: PeerMsg::LeaseHandoff {
                     req,
-                    released: false,
-                    epoch: core.lease.epoch().unwrap_or(0),
-                    head_seq: None,
+                    answer: HandoffAnswer::Declined {
+                        epoch: core.lease.epoch().unwrap_or(0),
+                    },
                 },
             });
         };
@@ -1660,9 +1660,9 @@ impl Core {
                 to: from,
                 msg: PeerMsg::LeaseHandoff {
                     req,
-                    released: false,
-                    epoch: self.lease.epoch().unwrap_or(0),
-                    head_seq: None,
+                    answer: HandoffAnswer::Declined {
+                        epoch: self.lease.epoch().unwrap_or(0),
+                    },
                 },
             });
             return;
@@ -1723,9 +1723,10 @@ impl Core {
                 to: from,
                 msg: PeerMsg::LeaseHandoff {
                     req,
-                    released: true,
-                    epoch,
-                    head_seq: Some(self.ship.head_seq),
+                    answer: HandoffAnswer::Released {
+                        epoch,
+                        head_seq: Some(self.ship.head_seq),
+                    },
                 },
             });
             return;

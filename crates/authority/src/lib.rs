@@ -49,10 +49,10 @@ pub use core::{
     ABANDONED_CODE, DELEG_READ_EPOCH_BASE,
 };
 pub use event::{
-    AbandonTarget, AheadGrants, Carrier, CasFailure, Control, Event, LeaseKey, LockOutcome,
-    LockRenewEntry, LockRenewResult, LockTestOutcome, PeerLink, PeerMsg, Policy, ProbedLease,
-    ReadAhead, ReadGrantMsg, ReadIndexOutcome, ReleaseWhy, S3Failure, S3Result, StickyReleaseWhy,
-    UploadResult, VoidScope,
+    AbandonTarget, AheadGrants, Carrier, CasFailure, Control, Event, HandoffAnswer, HoldOffer,
+    LeaseKey, LockOutcome, LockRenewEntry, LockRenewResult, LockTestOutcome, OfferKind, PeerLink,
+    PeerMsg, Policy, ProbedLease, ReadAhead, ReadGrantMsg, ReadIndexOutcome, ReleaseWhy, S3Failure,
+    S3Result, StickyReleaseWhy, UploadResult, VoidScope, XferNo,
 };
 pub use ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 pub use replica::Replica;

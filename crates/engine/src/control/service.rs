@@ -1887,11 +1887,10 @@ impl EngineControl {
         let handed = tokio::task::block_in_place(|| self.rt.block_on(receive))
             .map_err(|_| "lease release task stopped".to_string())?;
         match handed {
-            Some(handed) => Ok(format!(
-                "voluntarily released {part} at epoch {}; this was cooperative, not fencing",
-                handed.epoch
+            constellation_authority::HandoffAnswer::Released { epoch, .. } => Ok(format!(
+                "voluntarily released {part} at epoch {epoch}; this was cooperative, not fencing"
             )),
-            None => Err(format!(
+            _ => Err(format!(
                 "{part} was not held locally or could not be flushed; no fencing was attempted"
             )),
         }

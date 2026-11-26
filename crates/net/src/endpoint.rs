@@ -1862,6 +1862,10 @@ pub trait PeerService: Send + Sync + 'static {
         _final_for: Option<(u64, u64, i64, u64)>,
     ) {
     }
+    /// FX-5, one way: `from` gave the epoch hold of the carried lease
+    /// `key` (node, epoch, expiry) as transfer `n` to this node and holds
+    /// nothing. Default ignores it.
+    fn epoch_hold_nudged(&self, _from: u64, _key: (u64, u64, i64), _n: u32) {}
     /// Holder offered us this lease (placement). Default ignores it.
     fn lease_offered(&self, _part: String, _epoch: u64) {}
     /// A peer gossiped its RTT vector. Default ignores it.

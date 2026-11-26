@@ -25,7 +25,7 @@
 //! flush or fails the release, never stranded behind it.
 
 use crate::lease::LeaseView;
-use crate::sync::{AcquireProgress, HandoffResult, SyncRequest};
+use crate::sync::{AcquireProgress, SyncRequest};
 use anyhow::{Context, Result};
 use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
@@ -1117,7 +1117,7 @@ pub struct Driver {
     sync_rx: mpsc::UnboundedReceiver<SyncRequest>,
     replies: HashMap<Rid, oneshot::Sender<ClientReply>>,
     mutate_replies: HashMap<OpId, oneshot::Sender<MutateReplyParts>>,
-    handoff_replies: HashMap<OpId, oneshot::Sender<Option<HandoffResult>>>,
+    handoff_replies: HashMap<OpId, oneshot::Sender<constellation_authority::HandoffAnswer>>,
     /// Plan 30 §M8: peers' ReadIndex requests and recalls, by the id the
     /// driver minted for the core.
     read_index_replies: HashMap<OpId, oneshot::Sender<ReadIndexOutcome>>,
@@ -3807,7 +3807,8 @@ impl Driver {
                         requester,
                         "declining a claim of our lease offer: this node writes more now"
                     );
-                    let _ = reply.send(None);
+                    let _ =
+                        reply.send(constellation_authority::HandoffAnswer::Declined { epoch: 0 });
                     return None;
                 }
                 let req = self.control_id();
@@ -4708,6 +4709,12 @@ impl Driver {
                     upto: HonourMs(upto),
                 },
             })),
+            SyncRequest::PeerEpochHoldNudge { from, key, n } => {
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::EpochHoldNudge { key, n },
+                }))
+            }
             SyncRequest::PeerLockMirror {
                 from,
                 ver,
@@ -5934,19 +5941,22 @@ impl Driver {
                     }
                 });
             }
-            PeerMsg::LeaseHandoff {
-                req,
-                released,
-                epoch,
-                head_seq,
-            } => {
+            PeerMsg::LeaseHandoff { req, answer } => {
                 if let Some(tx) = self.handoff_replies.remove(&req) {
-                    let _ = tx.send(released.then_some(HandoffResult {
-                        epoch,
-                        etag: None,
-                        head_seq,
-                    }));
+                    let _ = tx.send(answer);
                 }
+            }
+            PeerMsg::EpochHoldNudge { key, n } => {
+                self.one_way(
+                    to,
+                    Payload::EpochHoldNudge {
+                        from: self.node_id,
+                        key_node: key.node,
+                        key_epoch: key.epoch,
+                        key_expires_unix_ms: key.expires_unix_ms,
+                        n: n.0,
+                    },
+                );
             }
             PeerMsg::MutateRequest {
                 req,
@@ -6159,13 +6169,43 @@ impl Driver {
                             if released {
                                 tracing::info!(holder = to, epoch, "peer handed the lease over");
                             }
+                            let answer = if released {
+                                constellation_authority::HandoffAnswer::Released { epoch, head_seq }
+                            } else {
+                                constellation_authority::HandoffAnswer::Declined { epoch }
+                            };
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::LeaseHandoff { req, answer },
+                            }));
+                        }
+                        Ok(Ok(Payload::EpochHoldOffer {
+                            key_node,
+                            key_epoch,
+                            key_expires_unix_ms,
+                            n,
+                            reoffer,
+                            ..
+                        })) => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
                                 msg: PeerMsg::LeaseHandoff {
                                     req,
-                                    released,
-                                    epoch,
-                                    head_seq,
+                                    answer: constellation_authority::HandoffAnswer::Hold(
+                                        constellation_authority::HoldOffer {
+                                            key: constellation_authority::Carrier {
+                                                node: key_node,
+                                                epoch: key_epoch,
+                                                expires_unix_ms: key_expires_unix_ms,
+                                            },
+                                            n: constellation_authority::XferNo(n),
+                                            kind: if reoffer {
+                                                constellation_authority::OfferKind::Reoffer
+                                            } else {
+                                                constellation_authority::OfferKind::Transfer
+                                            },
+                                        },
+                                    ),
                                 },
                             }));
                         }

@@ -16,7 +16,9 @@ use super::lease::{honour_end_of, wait_end_of, PendingGate, Plan};
 use super::promise::ReleaseRecord;
 use super::{Core, S3For};
 use crate::action::{Action, ControlOk, S3Op};
-use crate::event::{CasFailure, Control, PeerMsg, S3Failure, S3Result, UploadResult};
+use crate::event::{
+    CasFailure, Control, HandoffAnswer, PeerMsg, S3Failure, S3Result, UploadResult,
+};
 use crate::ids::{Epoch, NodeId, Now, OpId, Seq, WaitMs};
 use crate::replica::Replica;
 use crate::segment;
@@ -5127,9 +5129,7 @@ impl Core {
                 to: from,
                 msg: PeerMsg::LeaseHandoff {
                     req,
-                    released: false,
-                    epoch: 0,
-                    head_seq: None,
+                    answer: HandoffAnswer::Declined { epoch: 0 },
                 },
             });
             self.start_next_job(now, replica, out);
@@ -5442,9 +5442,14 @@ impl Core {
                     to: from,
                     msg: PeerMsg::LeaseHandoff {
                         req,
-                        released,
-                        epoch,
-                        head_seq: released.then_some(self.ship.head_seq),
+                        answer: if released {
+                            HandoffAnswer::Released {
+                                epoch,
+                                head_seq: Some(self.ship.head_seq),
+                            }
+                        } else {
+                            HandoffAnswer::Declined { epoch }
+                        },
                     },
                 });
             }
@@ -6443,12 +6448,15 @@ impl Core {
         now: Now,
         from: NodeId,
         req: OpId,
-        released: bool,
-        epoch: Epoch,
-        head_seq: Option<Seq>,
+        answer: HandoffAnswer,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // (FX-5: a hold offer is refused until the take rules exist.)
+        let (released, epoch, head_seq) = match answer {
+            HandoffAnswer::Released { epoch, head_seq } => (true, epoch, head_seq),
+            HandoffAnswer::Declined { .. } | HandoffAnswer::Hold(_) => (false, 0, None),
+        };
         let Some(job) = self.job.as_ref() else {
             return;
         };

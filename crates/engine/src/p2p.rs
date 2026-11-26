@@ -191,25 +191,38 @@ impl constellation_net::PeerService for P2pBridge {
                 return declined;
             }
             match rx.await {
-                Ok(Some(handed)) => {
+                Ok(constellation_authority::HandoffAnswer::Released { epoch, head_seq }) => {
+                    tracing::info!(part, requester, epoch, "handed the lease to a peer");
+                    constellation_net::Payload::LeaseHandoff {
+                        part,
+                        epoch,
+                        released: true,
+                        etag: None,
+                        head_seq,
+                    }
+                }
+                // A continuation epoch's hold: one transfer of one key.
+                Ok(constellation_authority::HandoffAnswer::Hold(offer)) => {
                     tracing::info!(
                         part,
                         requester,
-                        epoch = handed.epoch,
-                        "handed the lease to a peer"
+                        n = offer.n.0,
+                        reoffer = offer.kind == constellation_authority::OfferKind::Reoffer,
+                        "offered the epoch hold to a peer"
                     );
-                    constellation_net::Payload::LeaseHandoff {
+                    constellation_net::Payload::EpochHoldOffer {
                         part,
-                        epoch: handed.epoch,
-                        released: true,
-                        etag: handed.etag,
-                        head_seq: handed.head_seq,
+                        key_node: offer.key.node,
+                        key_epoch: offer.key.epoch,
+                        key_expires_unix_ms: offer.key.expires_unix_ms,
+                        n: offer.n.0,
+                        reoffer: offer.kind == constellation_authority::OfferKind::Reoffer,
                     }
                 }
                 // Not ours, flush failed, or the task went away: the
                 // requester falls back to the S3 path, which is always
                 // correct — it just costs the TTL wait.
-                _ => declined,
+                Ok(constellation_authority::HandoffAnswer::Declined { .. }) | Err(_) => declined,
             }
         })
     }
@@ -1347,6 +1360,21 @@ impl constellation_net::PeerService for P2pBridge {
             ino,
             grant: crate::locks::grant_of(grant),
             position: constellation_meta::Position::from_postcard(position),
+        });
+    }
+
+    fn epoch_hold_nudged(&self, from: u64, key: (u64, u64, i64), n: u32) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(sync::SyncRequest::PeerEpochHoldNudge {
+            from,
+            key: constellation_authority::Carrier {
+                node: key.0,
+                epoch: key.1,
+                expires_unix_ms: key.2,
+            },
+            n: constellation_authority::XferNo(n),
         });
     }
 

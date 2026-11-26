@@ -5,7 +5,9 @@
 use super::*;
 use crate::action::{ClientReply, S3Op};
 use crate::deadlines::Deadlines;
-use crate::event::{CasFailure, PeerMsg, Policy, ReleaseWhy, S3Result, UploadResult};
+use crate::event::{
+    CasFailure, HandoffAnswer, PeerMsg, Policy, ReleaseWhy, S3Result, UploadResult,
+};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
     LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, OwnChunks, Rid, RowCommit,
@@ -1535,8 +1537,7 @@ fn a_non_holder_declines_a_handoff_at_once() {
         sends(&out)[0].1,
         PeerMsg::LeaseHandoff {
             req: OpId(5),
-            released: false,
-            ..
+            answer: HandoffAnswer::Declined { .. },
         }
     ));
     assert!(h.core.job().is_none());
@@ -1608,9 +1609,7 @@ fn a_holders_handoff_queues_behind_the_round_then_flushes_and_releases() {
         sends(&out)[0].1,
         PeerMsg::LeaseHandoff {
             req: OpId(5),
-            released: true,
-            epoch: 1,
-            ..
+            answer: HandoffAnswer::Released { epoch: 1, .. },
         }
     ));
     assert!(h.core.lease().held.is_none());
@@ -1701,7 +1700,7 @@ fn a_release_in_doubt_is_reread_before_anything_is_admitted() {
         assert!(
             matches!(
                 sends(&out)[0].1,
-                PeerMsg::LeaseHandoff { req: OpId(5), released, .. } if *released == !reread_fails
+                PeerMsg::LeaseHandoff { req: OpId(5), answer } if matches!(answer, HandoffAnswer::Released { .. }) == !reread_fails
             ),
             "{out:?}"
         );
@@ -1960,9 +1959,14 @@ fn a_peer_read_showing_the_release_landed_completes_it() {
     assert!(h.core.lease().held.is_none());
     assert_eq!(h.core.stats.releases, 1);
     assert!(
-        sends(&out)
-            .iter()
-            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::LeaseHandoff { released: true, .. })),
+        sends(&out).iter().any(|(to, m)| *to == 3
+            && matches!(
+                m,
+                PeerMsg::LeaseHandoff {
+                    answer: HandoffAnswer::Released { .. },
+                    ..
+                }
+            )),
         "{out:?}"
     );
     assert_eq!(h.core.job(), None);
@@ -2093,7 +2097,7 @@ fn the_unresolved_release_gives_up_at_the_lease_honour_end() {
             && matches!(
                 m,
                 PeerMsg::LeaseHandoff {
-                    released: false,
+                    answer: HandoffAnswer::Declined { .. },
                     ..
                 }
             )),
@@ -3095,8 +3099,7 @@ fn a_single_writer_holder_never_hands_the_lease_over() {
                         2,
                         PeerMsg::LeaseHandoff {
                             req: OpId(5),
-                            released: false,
-                            ..
+                            answer: HandoffAnswer::Declined { .. },
                         }
                     )]
                 ),
@@ -3864,13 +3867,15 @@ fn drive_job(h: &mut Harness, mut acts: Vec<Action>) -> Driven {
                 Action::ControlDone { op, result } => d.done.push((*op, result.is_ok())),
                 Action::Send {
                     to,
-                    msg:
-                        PeerMsg::LeaseHandoff {
-                            released, epoch, ..
-                        },
+                    msg: PeerMsg::LeaseHandoff { answer, .. },
                 } => {
-                    d.handoffs.push((*to, *released));
-                    d.handoff_epochs.push(*epoch);
+                    let (released, epoch) = match answer {
+                        HandoffAnswer::Released { epoch, .. } => (true, *epoch),
+                        HandoffAnswer::Declined { epoch } => (false, *epoch),
+                        HandoffAnswer::Hold(_) => (false, 0),
+                    };
+                    d.handoffs.push((*to, released));
+                    d.handoff_epochs.push(epoch);
                 }
                 Action::SetTimer {
                     id,
@@ -4727,7 +4732,9 @@ fn a_handoff_is_declined_while_the_journal_cannot_drain() {
     let mut answered = None;
     for _ in 0..8 {
         if let Some(a) = sends(&out).iter().find_map(|(to, m)| match m {
-            PeerMsg::LeaseHandoff { released, .. } if *to == 2 => Some(*released),
+            PeerMsg::LeaseHandoff { answer, .. } if *to == 2 => {
+                Some(matches!(answer, HandoffAnswer::Released { .. }))
+            }
             _ => None,
         }) {
             answered = Some(a);
@@ -4795,7 +4802,9 @@ fn a_handoff_is_declined_when_the_journal_cannot_be_read() {
     let mut answered = None;
     for _ in 0..12 {
         if let Some(a) = sends(&out).iter().find_map(|(to, m)| match m {
-            PeerMsg::LeaseHandoff { released, .. } if *to == 2 => Some(*released),
+            PeerMsg::LeaseHandoff { answer, .. } if *to == 2 => {
+                Some(matches!(answer, HandoffAnswer::Released { .. }))
+            }
             _ => None,
         }) {
             answered = Some(a);
@@ -4888,9 +4897,7 @@ fn a_claimed_offer_asks_the_holder_first_and_a_decline_costs_no_s3() {
         from: 2,
         msg: PeerMsg::LeaseHandoff {
             req,
-            released: false,
-            epoch: 1,
-            head_seq: None,
+            answer: HandoffAnswer::Declined { epoch: 1 },
         },
     });
     assert!(s3_ops(&out).is_empty(), "a decline costs no S3: {out:?}");
@@ -4951,8 +4958,7 @@ fn a_handoff_request_that_waited_past_its_timeout_is_declined() {
                     m,
                     PeerMsg::LeaseHandoff {
                         req: OpId(5),
-                        released: false,
-                        ..
+                        answer: HandoffAnswer::Declined { .. },
                     }
                 )
         }) {
@@ -17058,7 +17064,9 @@ mod m10 {
                 },
             });
             match &sends(&out)[0].1 {
-                PeerMsg::LeaseHandoff { released, .. } => *released,
+                PeerMsg::LeaseHandoff { answer, .. } => {
+                    matches!(answer, HandoffAnswer::Released { .. })
+                }
                 other => panic!("{other:?}"),
             }
         };
@@ -17152,9 +17160,10 @@ mod m10 {
             from: 1,
             msg: PeerMsg::LeaseHandoff {
                 req,
-                released: true,
-                epoch: 4,
-                head_seq: Some(0),
+                answer: HandoffAnswer::Released {
+                    epoch: 4,
+                    head_seq: Some(0),
+                },
             },
         });
         assert_eq!(h.core.lease.epoch_hold(), Some(5));
@@ -31055,7 +31064,9 @@ mod locks {
         let answered: Vec<bool> = sends(&out)
             .iter()
             .filter_map(|(to, m)| match m {
-                PeerMsg::LeaseHandoff { released, .. } if *to == 2 => Some(*released),
+                PeerMsg::LeaseHandoff { answer, .. } if *to == 2 => {
+                    Some(matches!(answer, HandoffAnswer::Released { .. }))
+                }
                 _ => None,
             })
             .collect();
@@ -42339,8 +42350,7 @@ fn an_owed_epoch_move_is_dropped_once_the_hold_is_adopted_and_handed_off() {
             sends(&out)[0].1,
             PeerMsg::LeaseHandoff {
                 req: OpId(6),
-                released: true,
-                ..
+                answer: HandoffAnswer::Released { .. },
             }
         ),
         "{out:?}"
@@ -100870,3 +100880,6 @@ mod released_stream_end {
         assert_eq!(journal_rows(&h), before);
     }
 }
+
+#[path = "fx5_tests.rs"]
+mod fx5;
