@@ -827,8 +827,27 @@ fn xfer(m: FlexEpochs) -> FlexEpochs {
         max_transfers: 3,
         check_hold_owner: true,
         ops: vec![NsOp::CreateExcl(0)],
+        max_tick: 3,
         ..m
     }
+}
+
+/// [`assert_violates`], naming every property found when the expected one
+/// is not (the search stops at the first failure of any property).
+fn fx5_violates(label: &str, model: &FlexEpochs, property: &'static str) -> usize {
+    let checker = run(label, model, true);
+    if checker.discovery(property).is_none() {
+        for (name, path) in checker.discoveries() {
+            println!("{label}: found `{name}` instead:");
+            for (k, a) in path.clone().into_actions().into_iter().enumerate() {
+                println!("  {k:2}: {a:?}");
+            }
+            let last = path.last_state();
+            println!("  final nodes: {:?}", last.nodes.iter().map(|n| (n.alive, n.epoch, n.rec, n.ask)).collect::<Vec<_>>());
+            println!("  msgs: {:?} epochs {:?}", last.msgs, last.epochs);
+        }
+    }
+    assert_violates(label, model, property)
 }
 
 fn fx5_cap() -> (usize, Duration) {
@@ -868,7 +887,7 @@ fn fx5_three_members_clean() {
 #[test]
 fn fx5_idle_recipient_clean() {
     let m = FlexEpochs {
-        idle_asks: false,
+        free_asks: Some(1),
         ..xfer(full())
     };
     assert_clean_checking(
@@ -920,7 +939,7 @@ fn fx5_knob_no_reoffer_is_found() {
         no_reoffer: true,
         ..xfer(FlexEpochs::new(2, 1))
     };
-    let n = assert_violates("fx5-no-reoffer", &m, RECOVER);
+    let n = fx5_violates("fx5-no-reoffer", &m, RECOVER);
     println!("found in {n} actions");
 }
 
@@ -928,10 +947,10 @@ fn fx5_knob_no_reoffer_is_found() {
 fn fx5_knob_no_nudge_is_found() {
     let m = FlexEpochs {
         no_nudge: true,
-        idle_asks: false,
+        free_asks: Some(1),
         ..xfer(FlexEpochs::new(2, 1))
     };
-    let n = assert_violates("fx5-no-nudge", &m, RECOVER);
+    let n = fx5_violates("fx5-no-nudge", &m, RECOVER);
     println!("found in {n} actions");
 }
 
@@ -941,7 +960,7 @@ fn fx5_knob_v1_guard_is_found() {
         v1_guard: true,
         ..xfer(FlexEpochs::new(2, 1))
     };
-    let n = assert_violates("fx5-v1-guard", &m, RECOVER);
+    let n = fx5_violates("fx5-v1-guard", &m, RECOVER);
     println!("found in {n} actions");
 }
 
@@ -951,21 +970,21 @@ fn fx5_knob_reoffer_ignores_held_is_found() {
         reoffer_ignores_held: true,
         ..xfer(full())
     };
-    let n = assert_violates("fx5-ignores-held", &m, "single_authority");
+    let n = fx5_violates("fx5-ignores-held", &m, "single_authority");
     println!("found in {n} actions");
 }
 
-/// Two members cannot reach it: the only stale record names the node that
-/// gave the hold back, which is then above the stale n.
+/// Two members reach it too, with a give in flight: G→R (1), R→G (2) in
+/// flight, R asks G, G's stale record re-offers 1, R takes it, then 2 lands
+/// at G.
 #[test]
-fn fx5_knob_reoffer_ignores_held_needs_three_members() {
+fn fx5_knob_reoffer_ignores_held_two_members_is_found() {
     let m = FlexEpochs {
         reoffer_ignores_held: true,
         ..xfer(FlexEpochs::new(2, 1))
     };
-    let checker = run_capped("fx5-ignores-held-two", &m, false, fx5_cap());
-    assert!(checker.is_done());
-    assert!(checker.discovery("single_authority").is_none());
+    let n = fx5_violates("fx5-ignores-held-two", &m, "single_authority");
+    println!("found in {n} actions");
 }
 
 #[test]
@@ -974,7 +993,7 @@ fn fx5_knob_reoffer_to_anyone_is_found() {
         reoffer_to_anyone: true,
         ..xfer(full())
     };
-    let n = assert_violates("fx5-to-anyone", &m, "single_authority");
+    let n = fx5_violates("fx5-to-anyone", &m, "single_authority");
     println!("found in {n} actions");
 }
 
@@ -984,7 +1003,7 @@ fn fx5_knob_record_not_persisted_is_found() {
         record_not_persisted: true,
         ..xfer(FlexEpochs::new(2, 1))
     };
-    let n = assert_violates("fx5-not-persisted", &m, "single_authority");
+    let n = fx5_violates("fx5-not-persisted", &m, "single_authority");
     println!("found in {n} actions");
 }
 
@@ -995,6 +1014,6 @@ fn fx5_knob_take_after_close_is_found() {
         max_retires: 1,
         ..xfer(full())
     };
-    let n = assert_violates("fx5-after-close", &m, "single_authority");
+    let n = fx5_violates("fx5-after-close", &m, "single_authority");
     println!("found in {n} actions");
 }

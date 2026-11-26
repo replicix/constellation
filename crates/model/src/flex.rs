@@ -322,9 +322,11 @@ pub struct FlexEpochs {
     /// `n < max_transfers`. 0: no transfer actions (the older runs' state
     /// space).
     pub max_transfers: u8,
-    /// A member asks for the hold whenever it holds nothing (ops waiting).
-    /// Off: it asks only when a giver nudges it (the idle recipient, M2).
-    pub idle_asks: bool,
+    /// Asks not prompted by a nudge (ops waiting), in the whole run
+    /// (`None`: unbounded). `Some(1)`: one acquisition asks, its ops give
+    /// up, and from then on members ask only when nudged (the idle
+    /// recipient, M2).
+    pub free_asks: Option<u8>,
     /// A message may be delivered and stay in flight (a duplicate).
     pub dup_msgs: bool,
     /// Knob: the giver never re-offers (today's code).
@@ -388,7 +390,7 @@ impl FlexEpochs {
             promise_rule: PromiseRule::Expiry,
             lease_claim: crate::clk::ClaimRule::Wall,
             max_transfers: 0,
-            idle_asks: true,
+            free_asks: None,
             dup_msgs: false,
             no_reoffer: false,
             no_nudge: false,
@@ -620,6 +622,8 @@ pub struct State {
     pub dropped: u16,
     /// FX-5: transfer messages in flight (a set: sorted, deduplicated).
     pub msgs: Vec<Msg>,
+    /// FX-5: asks made without a nudge (bounded by `free_asks`).
+    pub asks: u8,
 }
 
 impl State {
@@ -1120,7 +1124,7 @@ impl FlexEpochs {
             actions.push(Action::AskTimeout(iu));
         }
         if let Some(idx) = node.epoch {
-            if self.idle_asks
+            if self.free_asks.is_none_or(|k| s.asks < k)
                 && node.ask.is_none()
                 && !s.epoch_holder(i)
                 && s.in_open_epoch(i, idx)
@@ -1231,6 +1235,7 @@ impl Model for FlexEpochs {
                 lost: 0,
                 dropped: 0,
                 msgs: Vec::new(),
+                asks: 0,
             });
         }
         out
@@ -1694,6 +1699,9 @@ impl Model for FlexEpochs {
                 s.crashes += 1;
             }
             Action::Ask(r, g) => {
+                if self.free_asks.is_some() {
+                    s.asks += 1;
+                }
                 s.nodes[r as usize].ask = Some(g);
                 s.send(Msg::Request { from: r, to: g });
             }
