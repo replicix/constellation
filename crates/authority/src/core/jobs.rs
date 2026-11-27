@@ -6643,7 +6643,7 @@ impl Core {
             return;
         }
         if self.lease.lost || replica.lost_persisted() || self.pr.retired {
-            refuse(self, out, |s| s.epoch_hold_offers_refused_closed += 1);
+            refuse(self, out, |s| s.epoch_hold_offers_refused_unfit += 1);
             return;
         }
         if self.hold_rec_dirty() {

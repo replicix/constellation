@@ -14206,6 +14206,8 @@ fn flex_crash_seed_1017_no_first_sight_is_credited_while_the_requesters_s3_is_cu
 /// class), it fails.
 #[test]
 fn epoch_hold_answer_lost_in_flight_finds_its_way_back() {
+    // Every seed runs; the failing ones are named together.
+    let mut failures: Vec<String> = Vec::new();
     for &seed in HOLD_LOSS_SEEDS {
         let cfg = [
             "commit",
@@ -14217,21 +14219,39 @@ fn epoch_hold_answer_lost_in_flight_finds_its_way_back() {
         ]
         .into_iter()
         .fold(base_config("flex-tight"), config_variant);
-        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
-            panic!("flex-tight+commit+identity+settle+durability+unsettled+holdloss {seed}: {e}")
-        });
-        assert_eq!(
-            report.hold_answers_lost, 1,
-            "seed {seed}: no answer was lost, the scenario is vacuous"
-        );
+        let report = match run_seed(seed, cfg) {
+            Ok(report) => report,
+            Err(e) => {
+                failures.push(format!("seed {seed}: {e}"));
+                continue;
+            }
+        };
+        if report.hold_answers_lost != 1 {
+            failures.push(format!(
+                "seed {seed}: {} answers lost, the scenario is vacuous",
+                report.hold_answers_lost
+            ));
+            continue;
+        }
         let (mut nudges, mut reoffers_taken) = (0u64, 0u64);
         for s in report.stats.values() {
             nudges += s.epoch_hold_nudges;
             reoffers_taken += s.epoch_hold_reoffers_taken;
         }
-        assert!(nudges > 0, "seed {seed}: no nudge was sent");
-        assert!(reoffers_taken > 0, "seed {seed}: no re-offer was taken");
+        if nudges == 0 {
+            failures.push(format!("seed {seed}: no nudge was sent"));
+        }
+        if reoffers_taken == 0 {
+            failures.push(format!("seed {seed}: no re-offer was taken"));
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "flex-tight+commit+identity+settle+durability+unsettled+holdloss: {} of {} seeds failed:\n{}",
+        failures.len(),
+        HOLD_LOSS_SEEDS.len(),
+        failures.join("\n")
+    );
 }
 
 /// The seeds of `epoch_hold_answer_lost_in_flight_finds_its_way_back`: seeds

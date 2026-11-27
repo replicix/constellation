@@ -38,6 +38,10 @@ pub(crate) mod hold_faults {
         pub(crate) static READ: Cell<bool> = const { Cell::new(false) };
         /// `persist_epoch_hold_record` fails.
         pub(crate) static WRITE: Cell<bool> = const { Cell::new(false) };
+        /// `persist_epoch_hold_record` sets the value and then fails (the
+        /// sync after the set failed): the store has what the caller was
+        /// told did not happen. One shot: it turns `WRITE` on.
+        pub(crate) static WRITE_LANDS: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -2582,6 +2586,16 @@ impl Replica for Meta {
             ));
         }
         let v = rec.map(HoldRecord::to_string).unwrap_or_default();
+        #[cfg(test)]
+        if hold_faults::WRITE_LANDS.with(|c| c.replace(false)) {
+            // (And the store stays down: the next writes fail clean until
+            // the test lifts `WRITE`.)
+            hold_faults::WRITE.with(|c| c.set(true));
+            Meta::kv_set_durable(self, EPOCH_HOLD_RECORD_KEY, &v)?;
+            return Err(MetaError::Invalid(
+                "injected epoch hold record sync fault after the set".into(),
+            ));
+        }
         Meta::kv_set_durable(self, EPOCH_HOLD_RECORD_KEY, &v)
     }
 

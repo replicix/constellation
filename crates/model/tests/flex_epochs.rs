@@ -874,15 +874,17 @@ fn fx5_three_members_clean() {
     );
 }
 
-/// `N = 3`, `f = 1`, three transfers (the G, R, Q cycle) and four asks not
+/// `N = 3`, `f = 1`, three transfers (the G, R, Q cycle) and two asks not
 /// prompted by a nudge, no crash and no rows: the shapes the bounded
 /// three-member run leaves out (a third transfer, two concurrent stale asks).
+/// Sized to finish: 23.1 million states (3.4 million unique), 18 s in release
+/// on one thread, inside `CAP`. Four free asks do not finish (400 million
+/// states reached in 336 s, still open); three asks did not finish in 50 s.
 #[test]
-#[ignore]
 fn fx5_three_members_cycle_clean() {
     let m = FlexEpochs {
         max_transfers: 3,
-        free_asks: Some(4),
+        free_asks: Some(2),
         max_crashes: 0,
         ops: vec![],
         ..xfer(full())
@@ -891,7 +893,7 @@ fn fx5_three_members_cycle_clean() {
         "fx5-three-cycle",
         &m,
         &["transfer_taken", "reoffer_taken", "nudge_ask"],
-        BIG_CAP,
+        CAP,
         &[RECOVER, OWNER],
     );
 }

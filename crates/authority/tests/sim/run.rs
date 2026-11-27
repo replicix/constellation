@@ -8701,22 +8701,30 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 + s.epoch_hold_offers_refused_stale
                 + s.epoch_hold_offers_refused_held
                 + s.epoch_hold_offers_refused_record
+                + s.epoch_hold_offers_refused_unfit
                 + s.epoch_hold_offers_refused_mode
                 + s.epoch_hold_released_refused,
             s.epoch_hold_nudges,
             s.epoch_hold_nudges_ignored_stale
                 + s.epoch_hold_nudges_ignored_busy
-                + s.epoch_hold_nudges_ignored_state,
+                + s.epoch_hold_nudges_ignored_state
+                + s.epoch_hold_nudges_ignored_not_member
+                + s.epoch_hold_nudges_ignored_key
+                + s.epoch_hold_nudges_ignored_unfit,
             s.epoch_hold_give_persist_failed
                 + s.epoch_hold_take_persist_failed
                 + s.epoch_hold_end_persist_failed
                 + s.epoch_hold_adopt_persist_failed,
-            s.epoch_hold_record_unreadable,
+            s.epoch_hold_record_unreadable + s.epoch_hold_rollback_failed,
             s.epoch_gives_declined_record
                 + s.epoch_gives_declined_not_member
                 + s.epoch_gives_declined_journal
-                + s.epoch_gives_declined_journal_err,
+                + s.epoch_gives_declined_journal_err
+                + s.epoch_gives_declined_retired
+                + s.epoch_gives_declined_exhausted,
             s.epoch_hold_reoffers_declined_state
+                + s.epoch_hold_reoffers_declined_not_member
+                + s.epoch_hold_reoffers_declined_retired
                 + s.epoch_hold_reoffers_declined_behind
                 + s.epoch_hold_reoffers_declined_journal
                 + s.epoch_hold_reoffers_declined_journal_err,

@@ -26,11 +26,16 @@ impl Faults {
     fn write(on: bool) {
         hold_faults::WRITE.with(|c| c.set(on));
     }
+    /// The write reaches the store, then fails (the sync failed).
+    fn lands(on: bool) {
+        hold_faults::WRITE_LANDS.with(|c| c.set(on));
+    }
 }
 impl Drop for Faults {
     fn drop(&mut self) {
         Faults::read(false);
         Faults::write(false);
+        Faults::lands(false);
     }
 }
 
@@ -699,6 +704,11 @@ fn a_reoffer_is_declined_by_cause() {
     let out = c.serve(1, 2, req);
     assert!(declined(&answer_to(&out, 2).unwrap()), "R6: {out:?}");
     assert_eq!(c.node(1).core.stats.epoch_hold_reoffers, 0);
+    assert_eq!(
+        c.node(1).core.stats.epoch_hold_reoffers_declined_not_member,
+        1
+    );
+    assert_eq!(c.node(1).core.stats.epoch_hold_reoffers_declined_state, 0);
     // a retired giver (R9, a named assertion)
     let mut c = setup();
     c.node(1).core.pr.retired = true;
@@ -706,6 +716,8 @@ fn a_reoffer_is_declined_by_cause() {
     let out = c.serve(1, 2, req);
     assert!(declined(&answer_to(&out, 2).unwrap()), "R9: {out:?}");
     assert_eq!(c.node(1).core.stats.epoch_hold_reoffers, 0);
+    assert_eq!(c.node(1).core.stats.epoch_hold_reoffers_declined_retired, 1);
+    assert_eq!(c.node(1).core.stats.epoch_hold_reoffers_declined_state, 0);
     // the epoch carries another lease now (R5): declined
     let mut c = setup();
     let other = Carrier {
@@ -767,6 +779,25 @@ fn a_frozen_or_retired_holder_gives_nothing() {
     assert!(declined(&answer_to(&out, 2).unwrap()), "G7: {out:?}");
     assert!(c.node(1).core.lease.epoch_held());
     assert_eq!(c.rec(1), Some(c.held(0, 1)));
+    assert_eq!(c.node(1).core.stats.epoch_gives_declined_retired, 1);
+}
+
+/// G8: the transfer numbers run out: declined, counted by its own cause.
+#[test]
+fn a_give_with_no_number_left_is_declined_by_cause() {
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.held(u32::MAX, 1);
+    c.node(1)
+        .meta
+        .persist_epoch_hold_record(Some(&rec))
+        .unwrap();
+    c.node(1).core.pr.hold_rec = HoldRecState::Known(Some(rec));
+    let (_, req) = c.ask(2);
+    let out = c.serve(1, 2, req);
+    assert!(declined(&answer_to(&out, 2).unwrap()), "G8: {out:?}");
+    assert!(c.node(1).core.lease.epoch_held());
+    assert_eq!(c.rec(1), Some(rec), "nothing was written");
+    assert_eq!(c.node(1).core.stats.epoch_gives_declined_exhausted, 1);
 }
 
 /// A `Released` answer (the S3 handoff's) into an epoch-mode request is
@@ -1203,6 +1234,73 @@ fn a_closed_carried_rehold_whose_write_fails_is_retried_at_the_same_number() {
     );
 }
 
+/// F1 (recheck 2): the `Held` write of a closed-carried re-hold fails after
+/// the lease was adopted, and the epoch is replaced and activated again
+/// still carrying the lease: the lease is held already, so the closed
+/// claim is not found, and the retry must not be dropped (the fresh path
+/// meets the `Ended` record and refuses: no hold until the epoch ends).
+/// The write fault stays on through the replacement or not.
+#[test]
+fn a_closed_carried_rehold_whose_write_failed_is_kept_through_a_reactivation() {
+    let _faults = Faults;
+    for fault_through in [false, true] {
+        let mut c = Cluster::new(&[1, 2]);
+        let rec = c.ended(3, Reclaim::Owed);
+        close_the_epoch_with(&mut c, rec);
+        Faults::write(true);
+        c.report(1, true, true, false);
+        assert!(
+            c.node(1).core.lease.held.is_some(),
+            "the closed lease was not adopted (the test is vacuous)"
+        );
+        assert!(!c.node(1).core.lease.epoch_held());
+        assert_eq!(c.rec(1), Some(c.ended(3, Reclaim::Owed)));
+        // The epoch is replaced (reported open and not active), then
+        // activated again with the same carried lease.
+        c.report(1, true, false, false);
+        assert!(
+            c.node(1).core.lease.held.is_some(),
+            "the replacement let go"
+        );
+        if !fault_through {
+            Faults::write(false);
+        }
+        c.report(1, true, true, false);
+        if fault_through {
+            assert!(!c.node(1).core.lease.epoch_held());
+            Faults::write(false);
+            let h = c.node(1);
+            let (now, mut out) = (h.clk(), Vec::new());
+            h.core.arm_poll(now, 0, &mut out);
+            poll(h);
+        }
+        assert!(
+            c.node(1).core.lease.epoch_held(),
+            "no hold after the re-activation (fault through {fault_through})"
+        );
+        assert_eq!(c.rec(1), Some(c.held(3, 1)), "at the same number");
+        assert_eq!(c.node(1).core.stats.epoch_closed_leases_reheld, 1);
+    }
+}
+
+/// F2: the re-hold is counted when its `Held` write succeeded, not at the
+/// adoption of the lease.
+#[test]
+fn a_closed_carried_rehold_is_counted_after_its_write() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.ended(3, Reclaim::Owed);
+    close_the_epoch_with(&mut c, rec);
+    Faults::write(true);
+    c.report(1, true, true, false);
+    assert!(c.node(1).core.lease.held.is_some(), "vacuous: no lease");
+    assert_eq!(c.node(1).core.stats.epoch_closed_leases_reheld, 0);
+    Faults::write(false);
+    c.report(1, true, true, false);
+    assert!(c.node(1).core.lease.epoch_held());
+    assert_eq!(c.node(1).core.stats.epoch_closed_leases_reheld, 1);
+}
+
 /// MUST 1: an unreadable record at the closed-carried activation fails
 /// closed: neither hold nor lease, the epoch's move is owed.
 #[test]
@@ -1449,10 +1547,12 @@ fn the_nudge_is_filtered_and_its_acquisition_is_a_duty() {
     };
     let out = c.hear_nudge(2, 1, other, XferNo(9));
     assert!(lease_request(&out).is_none());
-    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_state, 2);
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_not_member, 1);
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_key, 1);
     let out = c.hear_nudge(2, 1, key, XferNo(9));
     assert!(lease_request(&out).is_none(), "A5: it holds");
-    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_state, 3);
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_unfit, 1);
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_state, 0);
 
     // A nudge during a running acquisition is ignored; honoured at the next round.
     let mut c = Cluster::new(&[1, 2]);
@@ -1533,21 +1633,17 @@ fn a_holder_and_a_non_member_are_not_nudged() {
 /// memory holds nothing, ignores a nudge.
 #[test]
 fn a_node_with_an_unwritten_end_ignores_a_nudge() {
-    let _faults = Faults;
     let mut c = Cluster::new(&[1, 2]);
     c.exchange(2, 1, false);
-    Faults::write(true);
+    // (The state a failed `Ended` write used to leave, built by hand: such
+    // a write now leaves the record unknown until it is rolled back, and
+    // the end is written in the same event as the rollback.)
     c.node(2).core.lease.release_local();
-    c.node(2).step(Event::Peer {
-        from: 1,
-        msg: PeerMsg::SegmentPublished { seq: 0, epoch: 0 },
-    });
     assert!(c.node(2).core.hold_rec_dirty());
-    Faults::write(false);
     let key = c.key;
     let out = c.hear_nudge(2, 1, key, XferNo(2));
     assert!(lease_request(&out).is_none(), "asked: {out:?}");
-    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_state, 1);
+    assert_eq!(c.node(2).core.stats.epoch_hold_nudges_ignored_unfit, 1);
 }
 
 /// The restore gate on the key: the record of another lease's hold is not
@@ -1760,7 +1856,7 @@ fn an_offer_is_refused_by_a_node_that_cannot_take_it() {
         HandoffAnswer::Hold(c.offer(1, OfferKind::Transfer)),
     );
     assert!(!c.node(2).core.lease.epoch_held(), "a retired node took it");
-    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_closed, 1);
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_unfit, 1);
     // Deposed.
     let mut c = Cluster::new(&[1, 2]);
     let req = waiting(&mut c, 2, 1);
@@ -1772,7 +1868,7 @@ fn an_offer_is_refused_by_a_node_that_cannot_take_it() {
         HandoffAnswer::Hold(c.offer(1, OfferKind::Transfer)),
     );
     assert!(!c.node(2).core.lease.epoch_held(), "a deposed node took it");
-    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_closed, 1);
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_unfit, 1);
     // Deposed before a restart: only the persisted flag says so.
     let mut c = Cluster::new(&[1, 2]);
     let req = waiting(&mut c, 2, 1);
@@ -1785,27 +1881,26 @@ fn an_offer_is_refused_by_a_node_that_cannot_take_it() {
         HandoffAnswer::Hold(c.offer(1, OfferKind::Transfer)),
     );
     assert!(!c.node(2).core.lease.epoch_held(), "a deposed node took it");
-    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_closed, 1);
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_unfit, 1);
     // An end of its own hold not written yet (the record still says Held).
-    let _faults = Faults;
     let mut c = Cluster::new(&[1, 2]);
-    c.exchange(2, 1, false);
-    Faults::write(true);
-    c.node(2).core.lease.release_local();
-    // (an event ends the hold, the write fails)
-    c.node(2).step(Event::Peer {
-        from: 1,
-        msg: PeerMsg::SegmentPublished { seq: 0, epoch: 0 },
-    });
-    assert!(c.node(2).core.hold_rec_dirty());
+    c.exchange(2, 1, true);
     let req = waiting(&mut c, 2, 1);
+    // (Built by hand, see `a_node_with_an_unwritten_end_ignores_a_nudge`:
+    // the record says it holds, memory holds nothing.)
+    let rec = c.held(1, 2);
+    c.node(2)
+        .meta
+        .persist_epoch_hold_record(Some(&rec))
+        .unwrap();
+    c.node(2).core.pr.hold_rec = HoldRecState::Known(Some(rec));
+    assert!(c.node(2).core.hold_rec_dirty());
     c.hear(
         2,
         1,
         req,
         HandoffAnswer::Hold(c.offer(7, OfferKind::Transfer)),
     );
-    Faults::write(false);
     assert!(!c.node(2).core.lease.epoch_held());
     assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_record, 1);
 }
@@ -1853,7 +1948,9 @@ fn an_idle_node_ignores_a_nudge_that_is_not_for_its_epoch() {
     c.report(3, true, false, true);
     let out = c.hear_nudge(3, 1, key, XferNo(9));
     assert!(lease_request(&out).is_none(), "A1: {out:?}");
-    assert_eq!(c.node(3).core.stats.epoch_hold_nudges_ignored_state, 3);
+    assert_eq!(c.node(3).core.stats.epoch_hold_nudges_ignored_state, 1);
+    assert_eq!(c.node(3).core.stats.epoch_hold_nudges_ignored_not_member, 1);
+    assert_eq!(c.node(3).core.stats.epoch_hold_nudges_ignored_key, 1);
     // and, as a contrast, an active epoch and a member: asked
     c.report(3, true, true, false);
     let out = c.hear_nudge(3, 1, key, XferNo(9));
@@ -1881,4 +1978,130 @@ fn a_close_whose_record_fails_does_not_silence_the_owner() {
         "silent although it did not close"
     );
     assert!(c.node(1).core.lease.epoch_held());
+}
+
+/// F3 (round 1 SHOULD 1): a record write that fails after it reached the
+/// store (set, then the sync failed) leaves the store ahead of memory. The
+/// store is rolled back to the record memory holds before any transition,
+/// and nothing transitions meanwhile. A declined give: the store says
+/// `Given` while the node keeps its hold.
+#[test]
+fn a_give_whose_sync_fails_after_the_set_is_rolled_back() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    let (_, req) = c.ask(2);
+    Faults::lands(true);
+    let out = c.serve(1, 2, req);
+    Faults::lands(false);
+    let answer = answer_to(&out, 2).unwrap();
+    assert!(declined(&answer), "{out:?}");
+    c.hear(2, 1, req, answer);
+    assert!(c.node(1).core.lease.epoch_held(), "the hold is kept");
+    assert_eq!(
+        c.rec(1),
+        Some(c.given(1, 2)),
+        "the fault did not reach the store (the test is vacuous)"
+    );
+    // The rollback itself fails: still blocked, nothing is given.
+    Faults::write(true);
+    let (_, req) = c.ask(2);
+    let out = c.serve(1, 2, req);
+    let answer = answer_to(&out, 2).unwrap();
+    assert!(declined(&answer), "{out:?}");
+    c.hear(2, 1, req, answer);
+    assert_eq!(c.rec(1), Some(c.given(1, 2)), "no write got through");
+    assert!(c.node(1).core.lease.epoch_held());
+    Faults::write(false);
+    // The next event puts the store back to what memory holds.
+    poll(c.node(1));
+    assert_eq!(c.rec(1), Some(c.held(0, 1)), "the store stayed ahead");
+    let held = c.held(0, 1);
+    assert_eq!(c.node(1).core.hold_record(), Some(&held));
+    assert!(c.node(1).core.lease.epoch_held());
+    // And the node gives again as before.
+    let (_, req) = c.ask(2);
+    let out = c.serve(1, 2, req);
+    let answer = answer_to(&out, 2).unwrap();
+    assert!(is_hold(&answer, 1, OfferKind::Transfer), "{out:?}");
+    assert_eq!(c.rec(1), Some(c.given(1, 2)));
+}
+
+/// Any event at `id` (the hold record is made known again at every one).
+fn tick(c: &mut Cluster, id: NodeId) {
+    c.node(id).step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::SegmentPublished { seq: 0, epoch: 0 },
+    });
+}
+
+/// F3: a take whose sync fails after the set: the store says `Held` for a
+/// node that holds nothing. Rolled back at the next event that can write,
+/// and the giver's re-offer is then taken from a store that agrees.
+#[test]
+fn a_take_whose_sync_fails_after_the_set_is_rolled_back() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    let (_, req) = c.ask(2);
+    let out = c.serve(1, 2, req);
+    let answer = answer_to(&out, 2).unwrap();
+    Faults::lands(true);
+    c.hear(2, 1, req, answer);
+    Faults::lands(false);
+    assert!(!c.node(2).core.lease.epoch_held());
+    assert_eq!(
+        c.rec(2),
+        Some(c.held(1, 2)),
+        "the fault did not reach the store (the test is vacuous)"
+    );
+    // The store still fails: still ahead, and the node still holds nothing.
+    tick(&mut c, 2);
+    assert_eq!(c.rec(2), Some(c.held(1, 2)));
+    assert!(!c.node(2).core.lease.epoch_held());
+    Faults::write(false);
+    tick(&mut c, 2);
+    assert_eq!(c.rec(2), None, "the store stayed ahead");
+    let answer = c.exchange(2, 1, false);
+    assert!(is_hold(&answer, 1, OfferKind::Reoffer), "{answer:?}");
+    assert_eq!(c.holders(), vec![2]);
+    assert_eq!(c.rec(2), Some(c.held(1, 2)));
+}
+
+/// F3: while the store cannot be rolled back no offer is taken (the record
+/// is unknown), and the rollback then runs before the next take.
+#[test]
+fn an_offer_is_refused_while_the_store_is_rolled_back() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    let (_, req) = c.ask(2);
+    let out = c.serve(1, 2, req);
+    let answer = answer_to(&out, 2).unwrap();
+    Faults::write(true);
+    // (The state a failed write leaves: memory keeps the previous record.)
+    c.node(2).core.pr.hold_rec = HoldRecState::RollingBack(None);
+    c.hear(2, 1, req, answer);
+    assert!(
+        !c.node(2).core.lease.epoch_held(),
+        "took with a store ahead"
+    );
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_record, 1);
+    assert_eq!(c.rec(2), None, "a refusal writes nothing");
+    // The rollback fails at every event, counted at each, logged once.
+    assert_eq!(c.node(2).core.stats.epoch_hold_rollback_failed, 1);
+    assert!(c.node(2).core.pr.hold_rec_warned);
+    tick(&mut c, 2);
+    assert_eq!(c.node(2).core.stats.epoch_hold_rollback_failed, 2);
+    assert!(c.node(2).core.pr.hold_rec_warned);
+    Faults::write(false);
+    tick(&mut c, 2);
+    assert!(
+        !c.node(2).core.pr.hold_rec_warned,
+        "the warning is armed again"
+    );
+    assert!(matches!(
+        c.node(2).core.pr.hold_rec,
+        HoldRecState::Known(None)
+    ));
+    let answer = c.exchange(2, 1, false);
+    assert!(is_hold(&answer, 1, OfferKind::Reoffer), "{answer:?}");
+    assert_eq!(c.rec(2), Some(c.held(1, 2)));
 }

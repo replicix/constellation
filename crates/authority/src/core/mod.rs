@@ -2708,6 +2708,10 @@ pub struct Stats {
     pub epoch_gives_declined_not_member: u64,
     pub epoch_gives_declined_journal: u64,
     pub epoch_gives_declined_journal_err: u64,
+    /// Gives declined because this node is retired (G7) or the transfer
+    /// numbers ran out (G8).
+    pub epoch_gives_declined_retired: u64,
+    pub epoch_gives_declined_exhausted: u64,
     /// Gives declined because the record write failed (the hold is kept).
     pub epoch_hold_give_persist_failed: u64,
     /// Gives made (the hold left for a member: record `Given` written).
@@ -2718,6 +2722,10 @@ pub struct Stats {
     /// ahead of this node's log (R7), the journal not empty (R8, clean
     /// read) or unreadable.
     pub epoch_hold_reoffers_declined_state: u64,
+    /// Re-offers declined because the asker is no member (R6) or this node
+    /// is retired (R9).
+    pub epoch_hold_reoffers_declined_not_member: u64,
+    pub epoch_hold_reoffers_declined_retired: u64,
     pub epoch_hold_reoffers_declined_behind: u64,
     pub epoch_hold_reoffers_declined_journal: u64,
     pub epoch_hold_reoffers_declined_journal_err: u64,
@@ -2731,6 +2739,9 @@ pub struct Stats {
     pub epoch_hold_offers_refused_stale: u64,
     pub epoch_hold_offers_refused_held: u64,
     pub epoch_hold_offers_refused_record: u64,
+    /// The node cannot hold: deposed (here or before a restart) or retired
+    /// (T6).
+    pub epoch_hold_offers_refused_unfit: u64,
     /// An S3 `Released` answer to an epoch-mode request (refused).
     pub epoch_hold_released_refused: u64,
     /// Offers taken, by kind.
@@ -2743,9 +2754,16 @@ pub struct Stats {
     pub epoch_hold_nudges_ignored_stale: u64,
     pub epoch_hold_nudges_ignored_busy: u64,
     pub epoch_hold_nudges_ignored_state: u64,
-    /// The hold record could not be read or parsed (a transition was
-    /// blocked this event).
+    pub epoch_hold_nudges_ignored_not_member: u64,
+    pub epoch_hold_nudges_ignored_key: u64,
+    /// A5: the node holds, is retired, or has an end of its hold unwritten.
+    pub epoch_hold_nudges_ignored_unfit: u64,
+    /// The hold record could not be read or parsed: events a transition
+    /// was blocked at (counted at every event, logged once per run).
     pub epoch_hold_record_unreadable: u64,
+    /// The rollback of the store to the record memory holds, after a failed
+    /// write, itself failed: events blocked at (retried at every event).
+    pub epoch_hold_rollback_failed: u64,
     /// A write of an `Ended` record failed (retried at every event).
     pub epoch_hold_end_persist_failed: u64,
     /// A carrier's adoption of the hold did not happen: its record could
@@ -5135,8 +5153,18 @@ impl Core {
         }
         if state.active && !before.active {
             let mut adopt_via = Adopt::Fresh;
-            // A retry of an earlier activation's adoption is moot.
-            self.pr.adopt_retry = None;
+            // A retry of an earlier activation's adoption is moot, except a
+            // closed-carried re-hold: its write failed, the lease was
+            // adopted before it (`epoch_closed_latest` finds nothing now),
+            // and as a fresh adoption the `Ended` record would refuse it,
+            // leaving the lease held with no hold until the epoch ends. The
+            // same re-hold is tried again, at the same number, where the
+            // chain below adopts a lease that is the carried one
+            // (`carries_mine`); the record still decides
+            // (`adoption_number`).
+            if self.pr.adopt_retry.take() == Some(Adopt::ClosedCarried) {
+                adopt_via = Adopt::ClosedCarried;
+            }
             let mut closed_carried = self.epoch_closed_carried();
             // FX-5: the record decides before the lease is touched. A
             // record that forbids the re-hold (a `Given` of the carried
@@ -5150,7 +5178,7 @@ impl Core {
                     .and_then(|key| self.adoption_number(key, Adopt::ClosedCarried))
                     .is_some();
                 if !allowed {
-                    record_unreadable = matches!(self.pr.hold_rec, HoldRecState::Unreadable);
+                    record_unreadable = self.pr.hold_rec.is_unknown();
                     closed_carried = None;
                 }
             }
@@ -5201,7 +5229,6 @@ impl Core {
                 self.ack.mark_inherited = false;
                 self.lease.adopt(now, lease, tag, None);
                 self.sync_cfg_spans(replica);
-                self.stats.epoch_closed_leases_reheld += 1;
             }
             self.skip_ship = true;
             // Plan 30 §M10's claim resolution: a member whose lease claim

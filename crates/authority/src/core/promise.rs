@@ -214,6 +214,10 @@ pub(crate) struct PromiseState {
     /// whose hold this node let go (flex-crash seeds 166, 2236) is an
     /// `Ended` or `Given` record, and is never re-adopted.
     pub hold_rec: HoldRecState,
+    /// The last failure to read or roll back the record was logged (until
+    /// one succeeds): the log line is once per run of failures, the counter
+    /// counts every event blocked.
+    pub hold_rec_warned: bool,
     /// The record found `Held` at start (or at the first read) while memory
     /// holds nothing: a restarted hold owner re-adopts it when its epoch is
     /// reported open (`restore_epoch_hold`), and not meanwhile.
@@ -502,7 +506,9 @@ impl Core {
             self.end_epoch_hold(replica, false);
         }
         debug_assert!(
-            !self.lease.epoch_held() || matches!(self.hold_record(), Some(HoldRecord::Held { .. })),
+            !self.lease.epoch_held()
+                || self.pr.hold_rec.is_unknown()
+                || matches!(self.hold_record(), Some(HoldRecord::Held { .. })),
             "an epoch hold without its record"
         );
         if self.pr.flush_pending && replica.journal_is_empty().unwrap_or(false) {
@@ -1029,7 +1035,16 @@ impl Core {
     /// then does not happen this round (the next probed round retries),
     /// and an involuntary end is retried at every event
     /// (`hold_rec_dirty`). Nothing is recorded in memory ahead of the
-    /// store.
+    /// store, and a write that failed after reaching it is rolled back
+    /// (`persist_hold_rec`).
+    ///
+    /// A transferee's `Ended { Owed }` never settles (`epoch_reclaim_settle`
+    /// is the carrier's only), so a crash after that write leaves no node
+    /// holding and none re-claiming. What closes the epoch then: its
+    /// members close it once the carried lease has moved
+    /// (`epoch_carrier_checked`), and the lease moves by a takeover after
+    /// its expiry, which this node's own record exempts from the promise
+    /// check (`owner_closed`), as it does the live transferee's.
     pub(crate) fn end_epoch_hold(&mut self, replica: &dyn Replica, closed: bool) -> bool {
         let HoldRecState::Known(rec) = self.pr.hold_rec else {
             return false;

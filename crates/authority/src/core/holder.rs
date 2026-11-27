@@ -1750,6 +1750,7 @@ impl Core {
         // G7: a retired node gives nothing (its hold is the retire's to
         // end), nor does one whose record cannot be trusted.
         if self.pr.retired {
+            self.stats.epoch_gives_declined_retired += 1;
             decline(self, out);
             return;
         }
@@ -1810,6 +1811,7 @@ impl Core {
         }
         // G8: the numbers run out (never in practice): no give.
         let Some(next) = n.next() else {
+            self.stats.epoch_gives_declined_exhausted += 1;
             decline(self, out);
             return;
         };
@@ -1869,8 +1871,12 @@ impl Core {
             return Reoffer::Declined;
         }
         // R6, R9: a member, and this node not retired.
-        if !self.pr.epoch_members.contains(&from) || self.pr.retired {
-            self.stats.epoch_hold_reoffers_declined_state += 1;
+        if !self.pr.epoch_members.contains(&from) {
+            self.stats.epoch_hold_reoffers_declined_not_member += 1;
+            return Reoffer::Declined;
+        }
+        if self.pr.retired {
+            self.stats.epoch_hold_reoffers_declined_retired += 1;
             return Reoffer::Declined;
         }
         // R7: the preconditions of the transfer itself (G5, G6), so the

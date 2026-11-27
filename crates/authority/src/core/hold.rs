@@ -24,7 +24,11 @@
 //!
 //! The record is read once per process (`HoldRecState`); a value that
 //! cannot be read or parsed is [`HoldRecState::Unreadable`] and blocks
-//! every transition (fail closed), never "no record".
+//! every transition (fail closed), never "no record". A write that fails
+//! may still have reached the store (the value set, the sync failed): the
+//! store is then rolled back to the record memory holds before any
+//! transition ([`HoldRecState::RollingBack`]), so memory never lags the
+//! store.
 
 use super::Core;
 use crate::action::Action;
@@ -168,15 +172,20 @@ impl FromStr for HoldRecord {
     }
 }
 
-/// What this process knows of the record. Fail closed: `Unreadable`
-/// blocks every hold transition (adoption, give, re-offer, take, nudge,
-/// restore) until a later read succeeds.
+/// What this process knows of the record. Fail closed: `Unreadable` and
+/// `RollingBack` block every hold transition (adoption, give, re-offer,
+/// take, nudge, restore) until a later read or rollback succeeds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HoldRecState {
     /// The read failed, or the value did not parse (and the state of a
     /// process that has not read it yet).
     #[default]
     Unreadable,
+    /// A write of a new record failed, and it may have reached the store
+    /// all the same. Memory keeps the record that stood before it (the one
+    /// inside); that record is written again before anything else (at
+    /// every event until it is), so the store never stays ahead of memory.
+    RollingBack(Option<HoldRecord>),
     /// What the store holds (`None`: no record).
     Known(Option<HoldRecord>),
 }
@@ -188,7 +197,7 @@ impl HoldRecState {
     /// unreadable (every caller declines).
     pub(crate) fn highest(&self, key: HoldKey) -> Option<XferNo> {
         match self {
-            HoldRecState::Unreadable => None,
+            HoldRecState::Unreadable | HoldRecState::RollingBack(_) => None,
             HoldRecState::Known(Some(r)) if r.key() == key => Some(r.n()),
             HoldRecState::Known(_) => Some(XferNo(0)),
         }
@@ -198,8 +207,13 @@ impl HoldRecState {
     pub(crate) fn record(&self) -> Option<&HoldRecord> {
         match self {
             HoldRecState::Known(r) => r.as_ref(),
-            HoldRecState::Unreadable => None,
+            HoldRecState::Unreadable | HoldRecState::RollingBack(_) => None,
         }
+    }
+
+    /// Not known: unread, unreadable, or waiting for its rollback.
+    pub(crate) fn is_unknown(&self) -> bool {
+        !matches!(self, HoldRecState::Known(_))
     }
 }
 
@@ -363,12 +377,16 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         // A1, A2, A3.
-        if !self.epoch.active
-            || self.epoch.frozen
-            || !self.pr.epoch_members.contains(&from)
-            || self.pr.carried != Some(key)
-        {
+        if !self.epoch.active || self.epoch.frozen {
             self.stats.epoch_hold_nudges_ignored_state += 1;
+            return;
+        }
+        if !self.pr.epoch_members.contains(&from) {
+            self.stats.epoch_hold_nudges_ignored_not_member += 1;
+            return;
+        }
+        if self.pr.carried != Some(key) {
+            self.stats.epoch_hold_nudges_ignored_key += 1;
             return;
         }
         // A4: only a number above the highest of this key taken or given
@@ -381,7 +399,7 @@ impl Core {
         // A5: it holds nothing and is not retired (nor with an unwritten
         // end of a hold of its own).
         if self.lease.epoch_held() || self.pr.retired || self.hold_rec_dirty() {
-            self.stats.epoch_hold_nudges_ignored_state += 1;
+            self.stats.epoch_hold_nudges_ignored_unfit += 1;
             return;
         }
         // A6: no acquisition running or queued (the next round's nudge
@@ -402,30 +420,59 @@ impl Core {
         );
     }
 
-    /// Read the record when this process has none: at start, and at every
-    /// event while the last read failed (a later read resumes every
-    /// transition). A hold the record names but memory does not have is
-    /// waiting to be restored (`restore_epoch_hold`) the first time it is
-    /// read.
+    /// Make the record known again when it is not: read it (at start, and
+    /// at every event while the last read failed; a later read resumes every
+    /// transition), or write back the record a failed write left memory
+    /// with. A hold the record names but memory does not have is waiting to
+    /// be restored (`restore_epoch_hold`) the first time it is read. A
+    /// failure is counted at every event it blocks and logged once per run
+    /// of failures.
     pub(crate) fn hold_rec_load(&mut self, replica: &dyn Replica) {
-        if !matches!(self.pr.hold_rec, HoldRecState::Unreadable) {
-            return;
-        }
-        match replica.epoch_hold_record() {
-            Ok(rec) => {
-                self.pr.hold_rec = HoldRecState::Known(rec);
-                self.pr.restore_pending =
-                    matches!(rec, Some(HoldRecord::Held { .. })) && !self.lease.epoch_held();
+        let failure = match self.pr.hold_rec {
+            HoldRecState::Known(_) => return,
+            HoldRecState::Unreadable => match replica.epoch_hold_record() {
+                Ok(rec) => {
+                    self.pr.hold_rec = HoldRecState::Known(rec);
+                    self.pr.restore_pending =
+                        matches!(rec, Some(HoldRecord::Held { .. })) && !self.lease.epoch_held();
+                    None
+                }
+                Err(error) => {
+                    self.stats.epoch_hold_record_unreadable += 1;
+                    Some((error, "reading the epoch hold record failed"))
+                }
+            },
+            // (`restore_pending` stays as it was: memory's view did not
+            // change, only the store is put back to it.)
+            HoldRecState::RollingBack(prev) => {
+                match replica.persist_epoch_hold_record(prev.as_ref()) {
+                    Ok(()) => {
+                        self.pr.hold_rec = HoldRecState::Known(prev);
+                        None
+                    }
+                    Err(error) => {
+                        self.stats.epoch_hold_rollback_failed += 1;
+                        Some((error, "rolling the epoch hold record back failed"))
+                    }
+                }
             }
-            Err(error) => {
-                tracing::warn!(node = self.cfg.node_id, %error, "reading the epoch hold record failed; no hold transition until it reads");
-                self.stats.epoch_hold_record_unreadable += 1;
+        };
+        match failure {
+            None => self.pr.hold_rec_warned = false,
+            Some((error, what)) => {
+                if !self.pr.hold_rec_warned {
+                    self.pr.hold_rec_warned = true;
+                    tracing::warn!(node = self.cfg.node_id, %error, "{what}; no hold transition until it succeeds");
+                }
             }
         }
     }
 
     /// Persist `rec` (durably) as the node's record. The in-memory record
-    /// follows only a successful write.
+    /// follows only a successful write. A failed write may have reached the
+    /// store (set, then the sync failed): memory keeps the previous record
+    /// and the store is rolled back to it before any transition
+    /// (`RollingBack`), the rule that keeps the two equal.
     pub(crate) fn persist_hold_rec(&mut self, replica: &dyn Replica, rec: HoldRecord) -> bool {
         match replica.persist_epoch_hold_record(Some(&rec)) {
             Ok(()) => {
@@ -434,6 +481,9 @@ impl Core {
             }
             Err(error) => {
                 tracing::warn!(node = self.cfg.node_id, %error, ?rec, "persisting the epoch hold record failed");
+                if let HoldRecState::Known(prev) = self.pr.hold_rec {
+                    self.pr.hold_rec = HoldRecState::RollingBack(prev);
+                }
                 false
             }
         }
@@ -477,7 +527,7 @@ impl Core {
     /// node cannot read).
     pub(super) fn adoption_number(&self, key: HoldKey, via: Adopt) -> Option<XferNo> {
         match (&self.pr.hold_rec, via) {
-            (HoldRecState::Unreadable, _) => None,
+            (HoldRecState::Unreadable | HoldRecState::RollingBack(_), _) => None,
             (HoldRecState::Known(None), _) => Some(XferNo(0)),
             (HoldRecState::Known(Some(r)), _) if r.key() != key => Some(XferNo(0)),
             // (An `Ended` of either kind: the close this node made, or an
@@ -508,6 +558,14 @@ impl Core {
         let Some(key) = self.my_carried_key() else {
             return false;
         };
+        // (A write that failed earlier is rolled back first: the retry is
+        // then not one event late. A record still unknown is not a refusal
+        // of the record: the adoption is tried again, the way it was.)
+        self.hold_rec_load(replica);
+        if self.pr.hold_rec.is_unknown() {
+            self.pr.adopt_retry = Some(via);
+            return false;
+        }
         let Some(n) = self.adoption_number(key, via) else {
             return false;
         };
@@ -517,6 +575,11 @@ impl Core {
             return false;
         }
         self.pr.adopt_retry = None;
+        if via == Adopt::ClosedCarried {
+            // Counted once the `Held` write succeeded, wherever it was
+            // tried (the activation, a report, a round).
+            self.stats.epoch_closed_leases_reheld += 1;
+        }
         self.adopt_epoch_hold_in_memory(now, epoch, replica);
         true
     }
