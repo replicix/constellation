@@ -1569,14 +1569,13 @@ fn claim_done(
         if s3_up(g, window_from, me) {
             landed
         } else {
-            let restored = g
-                .s3
-                .iter()
-                .filter(|(t, n, cut)| *n == me && !*cut && *t > window_from)
-                .map(|(t, _, _)| *t)
-                .min()
-                // Never restored by the window's end: no read is possible in it.
-                .unwrap_or(until);
+            let restored =
+                g.s3.iter()
+                    .filter(|(t, n, cut)| *n == me && !*cut && *t > window_from)
+                    .map(|(t, _, _)| *t)
+                    .min()
+                    // Never restored by the window's end: no read is possible in it.
+                    .unwrap_or(until);
             landed.max(restored)
         }
     };

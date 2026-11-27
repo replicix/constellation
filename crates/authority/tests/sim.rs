@@ -22360,8 +22360,13 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     // longer happens, and it tells none now. The seeds of 0..299 that tell
     // one are 151, 232 and 294; 294, root idle, the lease path reachable,
     // is the pin.)
+    // (The oracle credits no lease first sight while the requester's own S3 is
+    // cut (FX-6, 2026-11-27): seed 294's lease path was open only by a first
+    // sight from before such a cut, and is none in time now, as 151 and 232
+    // already were. Of seeds 0..299 seed 259, the lease path reachable with the
+    // requester's S3 up, is the pin.)
     let cfg = flex_tight_config;
-    let seed = 294;
+    let seed = 259;
     let r = run_seed(seed, cfg()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     assert!(
         r.unsettled_violations > 0,
