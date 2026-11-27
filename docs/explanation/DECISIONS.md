@@ -5592,11 +5592,11 @@ and closes that shape. With the settle left to the client deadline
 (twice the lease TTL) the same code fails 27 flex-crash seeds instead of 73
 (201 225 353 384 441 582 595 617 697 797 957 970 1022 1075 1084 1127 1154 1257
 1258 1402 1699 1749 1776 1834 1907 1912). Short reachabilities
-(lease path for 100 to 150 ms, the root for a second) are most of the
-residuals, and flex-tight 76 (lease path reachable for 118 ms of a 3 s window)
-is the live witness `m03_a_reachable_sequencers_requester_is_not_isolated`
+(a lease claim done 100 to 150 ms after the requester's S3 came back, the root
+reachable for a second) are most of the residuals, and flex-tight 76 (a lease
+claim done 118 ms after S3 came back, in a 3 s window) is the live witness `m03_a_reachable_sequencers_requester_is_not_isolated`
 pins; `sticky-leave-root-self+unsettled` 756 is another (ADR-61's root leave
-exposes it: a lease path reachable for 110 ms of a 3 s settle window, under a
+exposes it: a lease claim done 110 ms after S3 came back, in a 3 s settle window, under a
 suspend, a clock step and a reboot of the root). (2) *An `EIO` of a row that is not behind a lost chunk*, which the first
 oracle absorbed on evidence of the whole run (a chunk lost and a drop
 somewhere in it): flex-crash 201 and 353 are two (the requester said nothing,
@@ -5631,7 +5631,7 @@ count of seeds 0..99 measured on this commit (2 violations, 20 allowed in the
 old classes, whose entry stays 18 on its margin; the violations entry goes
 from 4 to 2). The live witness
 `m03_a_reachable_sequencers_requester_is_not_isolated` moves from flex-tight
-seed 196 (the lease path for 190 ms, under the floor now) to seed 2 (root 3
+seed 196 (a lease claim done 190 ms after S3 came back, under the floor now) to seed 2 (root 3
 reachable for the last 1.2 s of the window). Seeds 0..1999, release,
 `+settle+oracles+unsettled`, against the parent: flex 3 to 3, flex-crash 43
 to 41, flex-tight 85 to 62, flex-backup 10 to 10; no seed newly failing.

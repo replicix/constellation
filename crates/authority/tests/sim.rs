@@ -22409,9 +22409,9 @@ fn m03_a_reachable_sequencers_requester_is_not_isolated() {
     // (ADR-58 C2: `locks-blips-tight-long-lease` seed 0 told its EIO at once,
     // with the sequencer reachable; it is settled now. A flex-tight seed
     // whose settle window passes with the lease path reachable for a moment
-    // only was the pin: seed 76 (118 ms) is asked by the settle rule of
-    // ADR-58's follow-up and settled; seed 196, the lease path reachable for
-    // 190 ms of its window, is under the classifier floor of 2026-11-13 (no
+    // only was the pin: seed 76 (a claim done 118 ms after S3 came back) is asked by the settle rule of
+    // ADR-58's follow-up and settled; seed 196, a lease claim done 190 ms after
+    // S3 came back, is under the classifier floor of 2026-11-13 (no
     // room for a lease-read retry after the claim: none in time). Seed 2,
     // root 3 reachable for the last 1.2 s of the window, is the pin.)
     // (The release record's off-core write, answered 0-25 ms later in the
@@ -22710,7 +22710,7 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         ),
         // (ADR-61, the root's own leave: none in seeds 0..99 `+unsettled`;
         // 1 of 2,000 `+unsettled` (seed 756, an ADR-58 residual: after the
-        // root left, a lease path was reachable for 110 ms of a settle
+        // root left, a lease claim was done 110 ms after S3 came back, in a settle
         // window), none with the idle release on; before, 1,352 of 2,000
         // failed, 1,339 with the idle release on.)
         ("sticky-leave-root-self", sticky_leave_root_self_config),
@@ -22828,8 +22828,9 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // holder whose forward wall step lapsed its lease by design.)
         ("flex-backup", flex_backup_config, 0, 0),
         // (ADR-58, seeds 0..99: 10 violations in 9 seeds and 18 allowed
-        // (isolated 7, none in time 11); the lease path of seed 76 is
-        // reachable for 118 ms of a 3 s window. Not bounded on main, 876
+        // (isolated 7, none in time 11); the lease claim of seed 76 is
+        // done 118 ms after S3 came back, in a 3 s window (the verdict's end for
+        // the lease path is the claim's done time, not the run's end). Not bounded on main, 876
         // failing seeds of 2,000 before. Measured again with the follow-up's
         // settle rule: 5 violations and 19 allowed (isolated 8, none in time
         // 11); main measures 6 and 19 in the same seeds, so the allowed

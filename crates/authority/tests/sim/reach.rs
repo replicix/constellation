@@ -229,7 +229,13 @@ pub enum Verdict {
     /// holder of its tail (the delegate, a member) could be reached from the
     /// root: it cannot end it (`why` names what it waited for).
     GenerationTailUnreachable { why: String },
-    /// A sequencer was reachable from `from_ms` to `to_ms`.
+    /// A sequencer was reachable from `from_ms` to `to_ms`. For `Via::LeasePath`
+    /// `from_ms` is where the requester's S3 came back and `to_ms` is the
+    /// time its claim of the lease is done (`claim_done`), not the end of the
+    /// run: "lease path during [6200, 6320]" is a claim done 120 ms after S3
+    /// came back, with at least `lease_retry_ms` of run left after it, not
+    /// a lease path that was open for 120 ms. For the other paths `to_ms` is
+    /// where the run ends.
     Reachable {
         via: Via,
         from_ms: u64,
