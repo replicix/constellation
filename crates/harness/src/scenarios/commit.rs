@@ -55,11 +55,12 @@
 //!    about the numbers; a node's rows no longer wait for another
 //!    generation's (ADR-39's cost is gone with the generations).
 //! 10. `10-epoch-outage`: two nodes, S3 cut until both are in the
-//!    continuation epoch (plan 46 M1.4 step 7): the holder's own ops and the
-//!    member's forwards (no `write` row: its `fsync` waits for the data's
-//!    upload, which the cut never lets finish). A hold with a member answers after the member's
-//!    `StreamAheadAck`, one LAN round trip more than the pre-M1.4 answer from
-//!    the owner's disk. Runs only when `ACK_LATENCY_TOPOLOGIES` names it.
+//!     continuation epoch (plan 46 M1.4 step 7): the holder's own ops and the
+//!     member's forwards (no `write` row: its `fsync` waits for the data's
+//!     upload, which the cut never lets finish). A hold with a member answers
+//!     after the member's `StreamAheadAck`, one LAN round trip more than the
+//!     pre-M1.4 answer from the owner's disk. Runs only when
+//!     `ACK_LATENCY_TOPOLOGIES` names it.
 //!
 //! One JSON document on stdout:
 //! `{"scenario":"ack-latency","load":…,"results":[{"topology","actor","op","n","p50_us","p90_us","p99_us"}]}`.
