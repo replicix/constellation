@@ -6832,10 +6832,20 @@ fn long_backup() {
 /// dependents, ships the rest, and the write ships once the member's
 /// chunk is up. Every run checks that no segment ever names a chunk S3
 /// lacks and that the log never stalls behind a deferred transaction.
+///
+/// Plan 46 M1.4 step 6d: the strict flags are on for this configuration and
+/// for every one built on it (`strict_commit`, `strict_identity`,
+/// `strict_settle`, `strict_durability`: what `+commit+identity+settle+
+/// durability` set, which now repeats the default). `+unsettled` still adds
+/// the strict unsettled `EIO` (`strict_unsettled`).
 fn flex_config() -> SimConfig {
     SimConfig {
         ops_per_client: 8,
         random_faults: 0,
+        strict_commit: true,
+        strict_identity: true,
+        strict_settle: true,
+        strict_durability: true,
         epoch_slack: 1,
         chunk_writes: 0.3,
         core: std::sync::Arc::new(sim::run::flex_core_config),
