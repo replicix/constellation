@@ -17416,6 +17416,7 @@ fn held_forward_then_delegation_installs(yours: Option<bool>) {
                         retry_ms: 50,
                         outwait_ms: None,
                         lost_chunk: false,
+                        releasing: false,
                         yours,
                     },
                     base: None,
@@ -17482,6 +17483,7 @@ fn a_stale_yours_does_not_outlive_a_later_forward() {
                 retry_ms: 50,
                 outwait_ms: None,
                 lost_chunk: false,
+                releasing: false,
                 yours: true,
             },
             base: None,
@@ -64915,6 +64917,7 @@ mod c2g_settle {
                     retry_ms: 10,
                     outwait_ms,
                     lost_chunk: false,
+                    releasing: false,
                     yours: false,
                 },
                 base: None,
@@ -64999,6 +65002,7 @@ mod c2g_settle {
                         retry_ms: 10,
                         outwait_ms: None,
                         lost_chunk,
+                        releasing: false,
                         yours: false,
                     },
                     base: None,
@@ -65038,6 +65042,12 @@ mod c2g_settle {
 
     /// The root's `Held` answer to a settle (`retry_ms` 10).
     fn lost_chunk_held_reply(req: OpId, lost_chunk: bool) -> Event {
+        held_reply_saying(req, lost_chunk, false)
+    }
+
+    /// [`lost_chunk_held_reply`] with `releasing` (a decided drop ends the
+    /// hold at its apply).
+    fn held_reply_saying(req: OpId, lost_chunk: bool, releasing: bool) -> Event {
         Event::Peer {
             from: 1,
             msg: PeerMsg::MutateReply {
@@ -65046,6 +65056,7 @@ mod c2g_settle {
                     retry_ms: 10,
                     outwait_ms: None,
                     lost_chunk,
+                    releasing,
                     yours: false,
                 },
                 base: None,
@@ -65214,6 +65225,221 @@ mod c2g_settle {
         assert!(in_doubt(&out, rid), "{out:?}");
         assert!(forward_to_1(&out).is_none(), "{out:?}");
         assert_eq!(requester.core.stats.settle_final_asks, 0);
+    }
+
+    /// A settle of node 1's op, answered `Held` by root 1 (`lost_chunk`,
+    /// `releasing` as given), whose second deadline has fired: the final ask
+    /// is out (ADR-58 C5). The requester, the rid and the final ask's req.
+    fn final_ask_out(lost_chunk: bool, releasing: bool) -> (Harness, Rid, OpId) {
+        let (_holder, mut requester) = pair();
+        requester.core.track_unsettled_designation();
+        let rid = requester.rid(1);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: requester.create("x"),
+            tag: Default::default(),
+        });
+        let first = deadline_timer(&requester, &out);
+        let cfg = requester.core.config().clone();
+        requester
+            .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+        let out = requester.step(Event::Timer { id: first });
+        let Some(PeerMsg::MutateRequest {
+            req, settle: true, ..
+        }) = forward_to_1(&out)
+        else {
+            panic!("no settle: {out:?}");
+        };
+        requester.step(held_reply_saying(req, lost_chunk, releasing));
+        let id = requester.core.clients[&rid].deadline;
+        requester.advance(requester.core.dl_t().settle_window);
+        let out = requester.step(Event::Timer { id });
+        let Some(PeerMsg::MutateRequest {
+            req, settle: true, ..
+        }) = forward_to_1(&out)
+        else {
+            panic!("no final ask at the deadline: {out:?}");
+        };
+        assert_eq!(requester.core.stats.settle_final_asks, 1);
+        (requester, rid, req)
+    }
+
+    fn told_in_doubt(out: &[Action], rid: Rid) -> bool {
+        replies(out)
+            .iter()
+            .any(|(x, a)| *x == rid && matches!(a, ClientReply::InDoubt))
+    }
+
+    /// ADR-58 C5, FX-3 (c) with `releasing`: a final ask answered `Held`
+    /// behind a lost chunk that a decided drop is about to end does not end
+    /// the settle at once. The deadline moves once, to one settle window after
+    /// that answer (never past the cap), the durability grace is spent, and the
+    /// label stays (`lost_chunk` is the word of the plan alone). At the moved
+    /// deadline the settle ends in doubt, labelled, with no third ask. If the
+    /// drop is cancelled, the next `Held` behind the lost chunk (without
+    /// `releasing`) ends it at once, as before. Fails on the parent: the
+    /// answer ends the settle at once (`settle_final_asks_held`).
+    #[test]
+    fn a_final_ask_answered_held_behind_a_decided_drop_waits_one_window_once() {
+        let (mut r, rid, req) = final_ask_out(true, false);
+        let window = r.core.dl_t().settle_window;
+        let before = r.core.clients[&rid].settle_until;
+        r.advance(20);
+        let out = r.step(held_reply_saying(req, true, true));
+        assert!(!told_in_doubt(&out, rid), "ended at once: {out:?}");
+        let c = &r.core.clients[&rid];
+        let want = r.clk().wait.plus(window).min(c.settle_cap);
+        assert_eq!(c.settle_until, want, "one window after the answer");
+        assert!(c.settle_until > before);
+        assert!(c.durable_grace);
+        assert!(c.lost_chunk_held, "the label is the plan's word alone");
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 1);
+        assert_eq!(r.core.stats.settle_final_asks_releasing, 1);
+        assert_eq!(r.core.stats.settle_final_asks_held, 0);
+        // The backoff asks again: the same word moves nothing more.
+        let retry = r.core.clients[&rid].timer.expect("the backoff");
+        r.advance(10);
+        let out = r.step(Event::Timer { id: retry });
+        let Some(PeerMsg::MutateRequest { req: again, .. }) = forward_to_1(&out) else {
+            panic!("no re-ask: {out:?}");
+        };
+        r.advance(10);
+        let out = r.step(held_reply_saying(again, true, true));
+        assert!(!told_in_doubt(&out, rid), "{out:?}");
+        assert_eq!(r.core.clients[&rid].settle_until, want, "moved once");
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 1);
+        // At the moved deadline: in doubt, labelled, no third ask.
+        let id = r.core.clients[&rid].deadline;
+        let rest = want.since(r.clk().wait).max(0) as u64;
+        r.advance(rest);
+        let out = r.step(Event::Timer { id });
+        assert!(told_in_doubt(&out, rid), "{out:?}");
+        assert!(forward_to_1(&out).is_none(), "asked a third time: {out:?}");
+        assert!(r.core.take_unsettled_lost_chunk(rid));
+        assert_eq!(r.core.stats.settle_final_asks, 1);
+
+        // The drop is cancelled: the next `Held` behind the lost chunk, no
+        // longer `releasing`, ends the settle at once, labelled.
+        let (mut r, rid, req) = final_ask_out(true, false);
+        r.advance(20);
+        let out = r.step(held_reply_saying(req, true, true));
+        assert!(!told_in_doubt(&out, rid), "{out:?}");
+        let retry = r.core.clients[&rid].timer.expect("the backoff");
+        r.advance(10);
+        let out = r.step(Event::Timer { id: retry });
+        let Some(PeerMsg::MutateRequest { req: again, .. }) = forward_to_1(&out) else {
+            panic!("no re-ask: {out:?}");
+        };
+        r.advance(10);
+        let out = r.step(held_reply_saying(again, true, false));
+        assert!(told_in_doubt(&out, rid), "{out:?}");
+        assert_eq!(r.core.stats.settle_final_asks_held, 1);
+        assert!(r.core.take_unsettled_lost_chunk(rid));
+    }
+
+    /// FX-3 (c), the plain form (flex-crash 1635): the final ask answered
+    /// `Held` that does not say a lost chunk (the hold ended, the row waits
+    /// for what follows) moves the deadline the same one window, once; under
+    /// the cap; not when the durability grace is spent already (a C5b route,
+    /// the local durability grace); not for a settle that asked in an epoch
+    /// refusing writes (ADR-58 C2's bound stands); not for a delegate's
+    /// answer.
+    #[test]
+    fn a_final_ask_answered_held_without_a_lost_chunk_waits_one_window_once() {
+        let answer = |r: &mut Harness, req: OpId| {
+            r.advance(20);
+            r.step(held_reply_saying(req, false, false))
+        };
+        // The move.
+        let (mut r, rid, req) = final_ask_out(true, false);
+        let window = r.core.dl_t().settle_window;
+        let before = r.core.clients[&rid].settle_until;
+        let out = answer(&mut r, req);
+        assert!(!told_in_doubt(&out, rid), "{out:?}");
+        let c = &r.core.clients[&rid];
+        let want = r.clk().wait.plus(window).min(c.settle_cap);
+        assert_eq!(c.settle_until, want);
+        assert!(c.settle_until > before);
+        assert!(c.durable_grace);
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 1);
+        assert_eq!(r.core.stats.settle_final_asks_releasing, 0);
+        assert!(!c.lost_chunk_held, "the last word took the label back");
+        // Once: a second plain `Held` moves nothing.
+        let retry = r.core.clients[&rid].timer.expect("the backoff");
+        r.advance(10);
+        let out = r.step(Event::Timer { id: retry });
+        let Some(PeerMsg::MutateRequest { req: again, .. }) = forward_to_1(&out) else {
+            panic!("no re-ask: {out:?}");
+        };
+        answer(&mut r, again);
+        assert_eq!(r.core.clients[&rid].settle_until, want);
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 1);
+        // At that deadline: in doubt, no new ask.
+        let id = r.core.clients[&rid].deadline;
+        let rest = want.since(r.clk().wait).max(0) as u64;
+        r.advance(rest);
+        let out = r.step(Event::Timer { id });
+        assert!(told_in_doubt(&out, rid), "{out:?}");
+        assert!(forward_to_1(&out).is_none(), "{out:?}");
+        assert!(!r.core.take_unsettled_lost_chunk(rid));
+
+        // The cap: the move goes no further than `settle_cap`.
+        let (mut r, rid, req) = final_ask_out(true, false);
+        let until = r.core.clients[&rid].settle_until;
+        let cap = until.plus(window / 2);
+        r.core.clients.get_mut(&rid).expect("settling").settle_cap = cap;
+        answer(&mut r, req);
+        assert!(r.clk().wait.plus(window) > cap);
+        assert_eq!(r.core.clients[&rid].settle_until, cap, "under the cap");
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 1);
+
+        // The durability grace was spent (C5b's route, or the local
+        // durability grace): no second window.
+        let (mut r, rid, req) = final_ask_out(true, false);
+        let until = r.core.clients[&rid].settle_until;
+        r.core
+            .clients
+            .get_mut(&rid)
+            .expect("settling")
+            .durable_grace = true;
+        let out = answer(&mut r, req);
+        assert!(!told_in_doubt(&out, rid), "{out:?}");
+        assert_eq!(r.core.clients[&rid].settle_until, until);
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 0);
+
+        // A delegate's `Held` (a generation of its own) is not the root's
+        // word: no move.
+        let (mut r, rid, req) = final_ask_out(true, false);
+        let until = r.core.clients[&rid].settle_until;
+        r.advance(20);
+        let mut event = held_reply_saying(req, false, false);
+        if let Event::Peer {
+            msg: PeerMsg::MutateReply { gen, .. },
+            ..
+        } = &mut event
+        {
+            *gen = 5;
+        }
+        r.step(event);
+        assert_eq!(r.core.clients[&rid].settle_until, until);
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 0);
+
+        // A settle that asked in an epoch refusing writes keeps ADR-58 C2's
+        // bound: no move, in doubt at the final ask's deadline.
+        let (mut r, rid, req) = final_ask_out(true, false);
+        let until = r.core.clients[&rid].settle_until;
+        r.core.clients.get_mut(&rid).expect("settling").frozen_since = Some(WaitMs(1));
+        let out = answer(&mut r, req);
+        assert!(!told_in_doubt(&out, rid), "{out:?}");
+        assert_eq!(r.core.clients[&rid].settle_until, until);
+        assert_eq!(r.core.stats.settle_final_asks_ended_hold, 0);
+        let id = r.core.clients[&rid].deadline;
+        let rest = until.since(r.clk().wait).max(0) as u64;
+        r.advance(rest);
+        let out = r.step(Event::Timer { id });
+        assert!(told_in_doubt(&out, rid), "{out:?}");
+        assert!(forward_to_1(&out).is_none(), "{out:?}");
     }
 
     /// ADR-58 M3 (one window for a frozen-epoch settle): a deadline moved by
@@ -65405,6 +65631,7 @@ mod c2g_settle {
                         retry_ms: 10,
                         outwait_ms: None,
                         lost_chunk,
+                        releasing: false,
                         yours: false,
                     },
                     base: None,
@@ -65529,6 +65756,7 @@ mod c2g_settle {
                     retry_ms: 10,
                     outwait_ms: Some(10_000_000),
                     lost_chunk: false,
+                    releasing: false,
                     yours: false,
                 },
                 base: None,
@@ -70966,6 +71194,226 @@ mod await_retry {
             "no second copy of the op waits in the queue: {:?}",
             queue(&h)
         );
+    }
+
+    /// Node 2's rename of the damaged file at a holder that waits for the
+    /// archive: the answer is parked and its `Held` reply armed. The
+    /// `HeldReply` timer of the step.
+    fn parked_rename_of_node_two(h: &mut Harness, p: Rid, req: u64) -> TimerId {
+        let out = forward_raw(h, 2, req, p, &rename_in_root("broken", "moved"));
+        assert_eq!(reply_to(&out, req), None, "parked: {out:?}");
+        timers(&out, TimerKind::HeldReply)[0]
+    }
+
+    /// The `Held` the parked answer's timer sends: `(lost_chunk, releasing)`.
+    fn held_words(h: &mut Harness, timer: TimerId, req: u64) -> (bool, bool) {
+        h.advance(h.core.cfg.recall_hold_ms);
+        let out = h.step(Event::Timer { id: timer });
+        match reply_to(&out, req) {
+            Some(MutateOutcome::Held {
+                lost_chunk,
+                releasing,
+                ..
+            }) => (lost_chunk, releasing),
+            other => panic!("expected a Held: {other:?} {out:?}"),
+        }
+    }
+
+    /// A ship round's plan, without the rows' acknowledgement (what
+    /// `Meta::rid_behind_lost_chunk` and `rid_released_by_decided_drop` read).
+    fn refresh_the_plan(h: &Harness) {
+        let _ = h.meta.take_journal_grouped(usize::MAX).unwrap();
+    }
+
+    /// A settle of `rid` after the drop: the placeholder is resolved by rid,
+    /// the answer is `Abandoned` once the refusal is committed, and the op
+    /// never runs.
+    fn settle_after_the_drop(h: &mut Harness, p: Rid, req: u64) {
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: p,
+                op: rename_in_root("broken", "moved"),
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+                settle: true,
+                routed_gen: 0,
+                touched_gen: 0,
+                inbox_ever: false,
+            },
+        });
+        assert!(
+            !matches!(reply_to(&out, req), Some(MutateOutcome::Held { .. })),
+            "no re-attach to a park: {out:?}"
+        );
+        let mut all = out;
+        all.extend(h.archive_lands());
+        assert_eq!(
+            reply_to(&all, req),
+            Some(MutateOutcome::Abandoned),
+            "{all:?}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_none());
+        h.advance(250);
+        drain(h);
+        assert!(
+            queue(h).iter().all(|(n, _, _)| *n != 2),
+            "the placeholder is resolved: {:?}",
+            queue(h)
+        );
+    }
+
+    /// ADR-58 C5, FX-3 (b): the root's `Held` for a row a decided, unapplied
+    /// drop ends says `releasing` besides `lost_chunk` (which stays the plan's
+    /// word, whatever the drop): from the decision on, by the plan that names
+    /// the rid (the summary is the last ship round's), and by the summary once
+    /// a round has run. The drop's apply then makes the row a placeholder and
+    /// a settle after it is refused `Abandoned`, once, with no re-attach.
+    /// Fails on the parent: no such word (the settle ends at once).
+    #[test]
+    fn a_held_reply_says_releasing_for_a_row_a_decided_drop_ends() {
+        let (mut h, broken) = holder_with_a_seed();
+        let p = rid_of(2, 1);
+        let timer = parked_rename_of_node_two(&mut h, p, 60);
+        refresh_the_plan(&h);
+        assert_eq!(held_words(&mut h, timer, 60), (true, false), "no drop");
+        // Decided, the summary not yet refreshed.
+        let out = drop_held_decide_via_core(&mut h, broken);
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(!h.meta.rid_released_by_decided_drop(p));
+        let timer = parked_rename_of_node_two(&mut h, p, 61);
+        assert_eq!(held_words(&mut h, timer, 61), (true, true), "the plan's");
+        // Refreshed: the summary says it too.
+        refresh_the_plan(&h);
+        assert!(h.meta.rid_released_by_decided_drop(p));
+        let timer = parked_rename_of_node_two(&mut h, p, 62);
+        assert_eq!(held_words(&mut h, timer, 62), (true, true), "the summary's");
+        // The record ships and the apply runs.
+        let mut out = Vec::new();
+        ship_round(&mut h, 99, &mut out);
+        assert_eq!(h.core.stats.drops_applied, 1);
+        assert!(queue(&h).contains(&(2, 1, true)), "{:?}", queue(&h));
+        settle_after_the_drop(&mut h, p, 70);
+        assert!(h.core.stats.await_retry_resolved >= 1);
+    }
+
+    /// A row the plan has not reported behind a lost chunk is not `releasing`
+    /// whatever a plan names (the word is only ever set with `lost_chunk`).
+    #[test]
+    fn a_held_reply_never_says_releasing_without_a_lost_chunk() {
+        let (mut h, broken) = holder_with_a_seed();
+        let p = rid_of(2, 1);
+        let timer = parked_rename_of_node_two(&mut h, p, 60);
+        // No ship round has planned the row: it is not (yet) behind a lost
+        // chunk. The drop is decided and names its rid.
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        assert!(h.meta.drop_plan_names_rid(p));
+        assert_eq!(held_words(&mut h, timer, 60), (false, false));
+    }
+
+    /// FX-3 verdict (a), a soundness pin that holds on the parent: once a
+    /// drop is applied, a settle of a rolled-back row's rid does not
+    /// re-attach to the aborted park. The refusal `Abandoned` is journaled
+    /// and answered once committed, the placeholder is resolved by rid, and a
+    /// later plain retry dedups to the refusal (the op never runs).
+    #[test]
+    fn a_settle_after_the_drop_resolves_the_placeholder_by_rid() {
+        let (mut h, broken) = holder_with_a_seed();
+        let p = rid_of(2, 1);
+        let _ = parked_rename_of_node_two(&mut h, p, 60);
+        let out = drop_held_via_core(&mut h, broken);
+        assert_eq!(h.core.stats.drops_applied, 1, "{out:?}");
+        assert_eq!(reply_to(&out, 60), Some(MutateOutcome::Busy), "{out:?}");
+        assert!(queue(&h).contains(&(2, 1, true)), "{:?}", queue(&h));
+        let resolved = h.core.stats.await_retry_resolved;
+        settle_after_the_drop(&mut h, p, 70);
+        assert_eq!(h.core.stats.await_retry_resolved, resolved + 1);
+        let mut out = forward_raw(&mut h, 2, 71, p, &rename_in_root("broken", "moved"));
+        out.extend(h.archive_lands());
+        assert_eq!(
+            reply_to(&out, 71),
+            Some(MutateOutcome::Abandoned),
+            "{out:?}"
+        );
+        assert!(h.meta.lookup(ROOT_INO, "moved").unwrap().is_none());
+    }
+
+    /// FX-3 (b), the gap between the record's ship and its apply: the record
+    /// is acknowledged (the plan is `shipped`), the apply fails and is retried
+    /// one pause later. The row is still released (the plan key is read, not
+    /// the unshipped plans [`Named`] lists), then applied.
+    #[test]
+    fn a_shipped_unapplied_drop_still_says_releasing() {
+        let (mut h, broken) = holder_with_a_seed();
+        let p = rid_of(2, 1);
+        let timer = parked_rename_of_node_two(&mut h, p, 60);
+        refresh_the_plan(&h);
+        assert_eq!(held_words(&mut h, timer, 60), (true, false));
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        constellation_meta::fail_drop_applies_on_this_thread_for_tests(1);
+        let mut out = Vec::new();
+        ship_round(&mut h, 99, &mut out);
+        constellation_meta::fail_drop_applies_on_this_thread_for_tests(0);
+        assert_eq!(h.core.stats.drop_apply_errors, 1);
+        assert_eq!(h.core.stats.drops_applied, 0);
+        assert!(h.meta.drop_plan_shipped(broken), "the record shipped");
+        refresh_the_plan(&h);
+        assert!(
+            h.meta.rid_released_by_decided_drop(p),
+            "{:?}",
+            h.meta.held_summary()
+        );
+        let timer = parked_rename_of_node_two(&mut h, p, 61);
+        assert_eq!(held_words(&mut h, timer, 61), (true, true));
+        // The retry applies it.
+        h.advance(1_500);
+        h.core.complete_ready(h.clk(), &h.meta, &mut out);
+        ship_round(&mut h, 100, &mut out);
+        assert_eq!(h.core.stats.drops_applied, 1, "retried and applied");
+        settle_after_the_drop(&mut h, p, 70);
+    }
+
+    /// FX-3 (b): the dropper loses the lease between the decision and the
+    /// apply. The drop is cancelled, the word is taken back at once and after
+    /// the next plan, and nothing is answered as executed for the rid.
+    #[test]
+    fn a_deposed_dropper_takes_the_release_back_and_answers_nothing() {
+        let (mut h, broken) = holder_with_a_seed();
+        let p = rid_of(2, 1);
+        let timer = parked_rename_of_node_two(&mut h, p, 60);
+        refresh_the_plan(&h);
+        assert_eq!(held_words(&mut h, timer, 60), (true, false));
+        let _ = drop_held_decide_via_core(&mut h, broken);
+        refresh_the_plan(&h);
+        let timer = parked_rename_of_node_two(&mut h, p, 61);
+        assert_eq!(held_words(&mut h, timer, 61), (true, true));
+        let mut all = Vec::new();
+        h.core.deposed(h.clk(), 2, 2, 1, &h.meta, &mut all);
+        assert!(h.meta.drop_plans().unwrap().is_empty(), "cancelled");
+        assert_eq!(h.core.stats.drops_unapplied, 1);
+        assert!(
+            !h.meta.rid_released_by_decided_drop(p),
+            "taken back at once"
+        );
+        assert!(
+            all.iter().all(|a| !matches!(
+                a,
+                Action::Send {
+                    msg: PeerMsg::MutateReply {
+                        outcome: MutateOutcome::Accepted { .. } | MutateOutcome::Abandoned,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "answered as executed or refused: {all:?}"
+        );
+        refresh_the_plan(&h);
+        assert!(!h.meta.rid_released_by_decided_drop(p), "and after a plan");
+        assert!(h.meta.rid_behind_lost_chunk(p), "still behind the chunk");
     }
 
     /// The same row once its answer has left (the backup holds it): the

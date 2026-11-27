@@ -640,6 +640,7 @@ impl Core {
                                 retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
                                 outwait_ms: None,
                                 lost_chunk: false,
+                                releasing: false,
                                 yours: !self.rid_answer_parked(rid),
                             }
                         } else {

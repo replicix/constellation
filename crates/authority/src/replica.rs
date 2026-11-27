@@ -158,6 +158,10 @@ pub trait Replica {
     /// upload (`Meta::rid_behind_lost_chunk`; a wait for this node's own
     /// upload does not count).
     fn rid_behind_lost_chunk(&self, rid: Rid) -> bool;
+    /// ADR-58 C5 / FX-3: whether the apply of a drop decided and not yet
+    /// applied ends the hold `rid_behind_lost_chunk` reports
+    /// (`Meta::rid_released_by_decided_drop`).
+    fn rid_released_by_decided_drop(&self, rid: Rid) -> bool;
     /// The journal seq the next row lands at, and the highest shipped.
     fn journal_next_seq(&self) -> Result<u64, MetaError>;
     fn journal_acked_seq(&self) -> Result<u64, MetaError>;
@@ -1248,6 +1252,10 @@ impl Replica for Meta {
 
     fn rid_behind_lost_chunk(&self, rid: Rid) -> bool {
         Meta::rid_behind_lost_chunk(self, rid)
+    }
+
+    fn rid_released_by_decided_drop(&self, rid: Rid) -> bool {
+        Meta::rid_released_by_decided_drop(self, rid)
     }
 
     fn journal_next_seq(&self) -> Result<u64, MetaError> {

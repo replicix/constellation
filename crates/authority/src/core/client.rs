@@ -317,7 +317,9 @@ pub(crate) struct ClientOp {
     /// The settle's answer was decided by a live sequencer (this node, the
     /// root) and waited only for its row's durability when the second
     /// deadline fired, and the deadline was moved one more window for the
-    /// row to land (`client_deadline`; once).
+    /// row to land (`client_deadline`; once). Also spent by ADR-58 C5b's
+    /// route, and by FX-3 (c): the root answered the settle's final ask
+    /// `Held` with its hold ending.
     pub durable_grace: bool,
     /// ADR-58 C5: the settle's last answer was a live root's `Held` behind a
     /// lost chunk, and the second deadline asked it once more before telling
@@ -2482,6 +2484,7 @@ impl Core {
                 retry_ms,
                 outwait_ms,
                 lost_chunk,
+                releasing,
                 yours,
             } => {
                 // The last `Held`'s word on whose the op is
@@ -2503,8 +2506,11 @@ impl Core {
                 // `Held` behind a lost chunk again: the settle ends now, in
                 // doubt and labelled, not at the deadline a forward timeout
                 // later (an operator's `drop-held` landing meanwhile would
-                // leave the root able to answer, unasked).
+                // leave the root able to answer, unasked). Not when the root
+                // says the hold ends with a drop it has decided
+                // (`releasing`): that is FX-3 (c) below.
                 if lost_chunk
+                    && !releasing
                     && gen == 0
                     && self
                         .clients
@@ -2520,6 +2526,33 @@ impl Core {
                     );
                     self.finish_in_doubt(now, rid, replica, out);
                     return;
+                }
+                // ADR-58 C5, FX-3 (c): the final ask answered `Held` with
+                // the hold ending (no lost chunk, or a drop it decided
+                // releases the row): the row waits only for what follows the
+                // hold (its durability, the drop's apply). The deadline moves
+                // once more, to one settle window after this answer, never
+                // past the settle's cap; the durability grace is spent (a C5b
+                // route spent it already: no stacking). Not for a settle that
+                // asked in an epoch refusing writes: ADR-58 C2's bound stands.
+                if gen == 0 && (!lost_chunk || releasing) {
+                    let window = self.dl_t().settle_window;
+                    let want = self
+                        .clients
+                        .get(&rid)
+                        .filter(|c| {
+                            c.settle && c.final_ask && !c.durable_grace && c.frozen_since.is_none()
+                        })
+                        .map(|c| now.wait.plus(window).min(c.settle_cap));
+                    if let Some(want) = want {
+                        if self.extend_settle_deadline(rid, want, None, out) {
+                            self.clients.get_mut(&rid).expect("present").durable_grace = true;
+                            self.stats.settle_final_asks_ended_hold += 1;
+                            if releasing {
+                                self.stats.settle_final_asks_releasing += 1;
+                            }
+                        }
+                    }
                 }
                 // Plan 30 §M8: executed; the holder is recalling read
                 // delegations before it acknowledges. Ask again (same
@@ -3938,6 +3971,7 @@ impl Core {
                             retry_ms: 0,
                             outwait_ms: None,
                             lost_chunk: false,
+                            releasing: false,
                             yours: false,
                         };
                     }

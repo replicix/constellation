@@ -2767,3 +2767,178 @@ fn the_roots_remote_drop_of_a_live_streams_appended_row_is_refused() {
         "nothing was marked or dropped"
     );
 }
+
+/// ADR-58 C5 / FX-3: a node 1 root with `f1` (its manifest names a lost
+/// chunk: the seed A), a size change of it (B, a dependent the drop rolls
+/// back), a rename of it (C, held by taint, redone in place), a new file under
+/// the renamed name (D, held through C only) and `f2`, whose own chunk is lost
+/// too (E, another drop's). Their rids, in that order.
+fn five_rows_behind_two_lost_chunks() -> (Meta, Ino, [constellation_meta::Rid; 5]) {
+    use constellation_meta::RowCommit;
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(1).unwrap();
+    meta.set_holder_epoch(1);
+    let f1 = meta.create(ROOT_INO, "f1", 0o644, 0, 0).unwrap().ino;
+    let f2 = meta.create(ROOT_INO, "f2", 0o644, 0, 0).unwrap().ino;
+    let rows = batch(&meta);
+    ship(&meta, &rows, 1);
+    let (lost1, lost2) = (ChunkHash::of(b"gone one"), ChunkHash::of(b"gone two"));
+    meta.add_pending_upload(&lost1, f1).unwrap();
+    meta.add_pending_upload(&lost2, f2).unwrap();
+    let rids = [
+        rid_of(1, 11),
+        rid_of(1, 12),
+        rid_of(1, 13),
+        rid_of(1, 14),
+        rid_of(1, 15),
+    ];
+    let set_manifest = |ino: Ino, hash: ChunkHash| MutateOp::SetManifest {
+        ino,
+        base_manifest: None,
+        manifest: manifest_naming(hash, 19),
+        size: 19,
+        mtime_ns: None,
+        ctime_ns: None,
+    };
+    exec_as(&meta, RowCommit::LONE, rids[0], &set_manifest(f1, lost1));
+    exec_as(&meta, RowCommit::LONE, rids[1], &truncate(f1, 3));
+    let rename = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        new_parent: ROOT_INO,
+        new_name: "f1b".into(),
+        noreplace: false,
+    };
+    exec_as(&meta, RowCommit::LONE, rids[2], &rename);
+    let create = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "f1".into(),
+        ino: meta.allocate_ino(ROOT_INO).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    exec_as(&meta, RowCommit::LONE, rids[3], &create);
+    exec_as(&meta, RowCommit::LONE, rids[4], &set_manifest(f2, lost2));
+    meta.note_unrecoverable_chunks(&[(lost1, f1), (lost2, f2)], true)
+        .unwrap();
+    (meta, f1, rids)
+}
+
+fn decide(meta: &Meta, ino: Ino) {
+    let decided = meta
+        .drop_held_knowing(
+            ino,
+            1,
+            false,
+            &|_| false,
+            &|_| Vec::new(),
+            &Default::default(),
+            true,
+        )
+        .unwrap();
+    assert!(decided.pending.is_some(), "{decided:?}");
+}
+
+/// What the last ship round says of each rid: behind a lost chunk, and
+/// released by a decided drop.
+fn words(meta: &Meta, rids: &[constellation_meta::Rid]) -> Vec<(bool, bool)> {
+    rids.iter()
+        .map(|r| {
+            (
+                meta.rid_behind_lost_chunk(*r),
+                meta.rid_released_by_decided_drop(*r),
+            )
+        })
+        .collect()
+}
+
+/// A drop decided and not yet applied releases the rows it names (A, B) and
+/// those held only through them (C, D), not E, whose own chunk another drop
+/// has to cure; `rid_behind_lost_chunk`, which the oracle reads, never
+/// changes. The record's ship does not end the word (the plan key lives until
+/// the apply), the apply empties the summary, and a cancel takes the word
+/// back at once.
+#[test]
+fn a_decided_drop_releases_its_rows_and_their_dependents_only() {
+    let (meta, f1, rids) = five_rows_behind_two_lost_chunks();
+    batch(&meta);
+    assert_eq!(
+        words(&meta, &rids),
+        vec![(true, false); 5],
+        "{:?}",
+        meta.held_summary()
+    );
+    decide(&meta, f1);
+    // The summary is the last round's: the decision is not in it yet.
+    assert_eq!(words(&meta, &rids), vec![(true, false); 5]);
+    let rows = batch(&meta);
+    assert_eq!(
+        words(&meta, &rids),
+        vec![
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, false)
+        ],
+        "{:?}",
+        meta.held_summary()
+    );
+    // The record ships (its row is acknowledged), the apply has not run: the
+    // plan key is read, not `Named` (which lists unshipped records only).
+    let record: Vec<_> = rows
+        .into_iter()
+        .filter(|(_, r)| matches!(r, LogRecord::DropHeld { .. }))
+        .collect();
+    assert_eq!(record.len(), 1, "{record:?}");
+    ship(&meta, &record, 2);
+    batch(&meta);
+    assert_eq!(
+        words(&meta, &rids),
+        vec![
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, false)
+        ],
+        "after the record's ship: {:?}",
+        meta.held_summary()
+    );
+    meta.drop_held_apply(
+        f1,
+        1,
+        &|_| false,
+        &|_| Vec::new(),
+        &Default::default(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(meta.held_summary().transactions, 0);
+    assert!(rids.iter().all(|r| !meta.rid_released_by_decided_drop(*r)));
+}
+
+/// ... and a cancelled drop takes the word back at once (a deposed dropper
+/// may never plan again), before and after the next ship round.
+#[test]
+fn a_cancelled_drop_takes_its_release_back() {
+    let (meta, f1, rids) = five_rows_behind_two_lost_chunks();
+    batch(&meta);
+    decide(&meta, f1);
+    batch(&meta);
+    assert!(meta.rid_released_by_decided_drop(rids[2]), "decided");
+    meta.drop_held_cancel(f1).unwrap();
+    assert_eq!(
+        words(&meta, &rids),
+        vec![(true, false); 5],
+        "at once, before any round"
+    );
+    batch(&meta);
+    assert_eq!(
+        words(&meta, &rids),
+        vec![(true, false); 5],
+        "{:?}",
+        meta.held_summary()
+    );
+}

@@ -349,6 +349,12 @@ pub struct HeldSummary {
     /// Shared, so that cloning the summary (`Meta::held`) costs nothing per
     /// rid.
     pub rids: std::sync::Arc<BTreeSet<crate::rid::Rid>>,
+    /// ADR-58 C5 / FX-3: the rids in `rids` whose hold the apply of a
+    /// decided, unapplied drop ends: the drop names their transaction, or
+    /// they are held only through transactions it names. As fresh as the
+    /// last ship round; a row whose second walk classes it deferred is not
+    /// in it (it stays "held").
+    pub drop_released: std::sync::Arc<BTreeSet<crate::rid::Rid>>,
     /// ADR-59: acknowledged operations `repair drop-held` rolled back for
     /// good on this node, ever (`DroppedHeld::acked_lost`).
     pub acked_lost_total: u64,
@@ -927,6 +933,9 @@ struct Plan {
     /// The rid of each held transaction, and of each one deferred behind
     /// another node's pending upload, that has one.
     held_rids: Vec<crate::rid::Rid>,
+    /// With `released_by` ([`plan`]): of `held_rids`, those a decided drop's
+    /// apply releases (`HeldSummary::drop_released`).
+    drop_released: Vec<crate::rid::Rid>,
     deferred: Vec<Tx>,
     opaque: bool,
     /// With [`Blame`]: the blame of every held or deferred transaction
@@ -1252,21 +1261,50 @@ fn tx_keys(
     })
 }
 
+/// The identities the records of every decided, unapplied drop name, shipped
+/// or not (the plan key lives from the decision until the apply or a cancel;
+/// [`Named`] reads the unshipped ones only). `None` when no plan is stored:
+/// a round without a drop pays one atomic read.
+fn decided_drop_idents(
+    r: &impl Readable,
+    meta: &Meta,
+) -> Result<Option<HashSet<(u64, u64)>>, MetaError> {
+    if meta.drop_plans_state.load(Ordering::Acquire) & 1 == 0 {
+        return Ok(None);
+    }
+    let mut idents = HashSet::new();
+    for guard in r.prefix(&meta.local, DROP_PLAN_PREFIX) {
+        let (_, v) = guard.into_inner()?;
+        let plan: DropPlan = postcard::from_bytes(&v)?;
+        idents.extend(plan.idents.iter().copied());
+    }
+    Ok((!idents.is_empty()).then_some(idents))
+}
+
 /// The ship rule over the whole unshipped journal ([`Walk::step`]). With
 /// `blame`, also each held or deferred transaction's blame ([`Blame`]).
+/// With `released_by` (the identities every decided drop names,
+/// [`decided_drop_idents`]; only the ship round passes it), a second walk
+/// without those transactions (the apply strands them) tells which held
+/// rows the apply releases: a named one, or one that ships in the second
+/// walk (`Plan::drop_released`). Blame is not needed there, and the
+/// second walk keeps `(gen, hold)`, so a retired identity stays held.
 fn plan(
     r: &impl Readable,
     meta: &Meta,
     poisoned: &PoisonMap,
     pending: &PoisonMap,
     blame: Option<Blame<'_>>,
+    released_by: Option<&HashSet<(u64, u64)>>,
 ) -> Result<Plan, MetaError> {
     let mut walk = Walk::default();
+    let mut after = released_by.map(|_| Walk::default());
     let named = Named::read(r, meta)?;
     let mut out = Plan {
         ship: Vec::new(),
         held: Vec::new(),
         held_rids: Vec::new(),
+        drop_released: Vec::new(),
         deferred: Vec::new(),
         opaque: false,
         blame: BTreeMap::new(),
@@ -1280,7 +1318,8 @@ fn plan(
             .is_some_and(|rid| tx_rid(&tx, row.as_ref()) == Some(rid));
         let rid = tx_rid(&tx, row.as_ref());
         let gen = row.as_ref().map_or(0, |row| row.gen);
-        let hold = match (&named, tx_ident(&tx, row.as_ref().map(|t| t.epoch))) {
+        let ident = tx_ident(&tx, row.as_ref().map(|t| t.epoch));
+        let hold = match (&named, ident) {
             (Some(n), Some(ident)) => n.holds(r, meta, ident)?,
             _ => None,
         };
@@ -1296,12 +1335,34 @@ fn plan(
         if let Some(mine) = mine {
             out.blame.insert(tx.first, mine);
         }
+        // (A transaction a decided drop names is not stepped: the apply
+        // strands it, and it taints nothing after it.)
+        let released = match (released_by, after.as_mut()) {
+            (Some(decided), Some(after)) => {
+                ident.is_some_and(|i| decided.contains(&i))
+                    || after
+                        .step(
+                            &tx,
+                            keys.as_ref(),
+                            &observed,
+                            (poisoned, pending),
+                            None,
+                            (gen, hold),
+                        )
+                        .0
+                        == Class::Ship
+            }
+            _ => false,
+        };
         if found {
             out.found = Some((tx.first, tx.last));
         }
         match class {
             Class::Held => {
                 out.held_rids.extend(rid);
+                if released {
+                    out.drop_released.extend(rid);
+                }
                 out.held.push((tx, seeds, keys))
             }
             Class::Deferred => {
@@ -1310,6 +1371,9 @@ fn plan(
                 // this node's own upload ships by itself and is not counted.)
                 if out.blame.get(&tx.first).is_some_and(|b| !b.is_empty()) {
                     out.held_rids.extend(rid);
+                    if released {
+                        out.drop_released.extend(rid);
+                    }
                 }
                 out.deferred.push(tx)
             }
@@ -1364,6 +1428,7 @@ pub(crate) fn deferral_blame(
             theirs,
             rid: Some(rid),
         }),
+        None,
     )?;
     Ok(DeferralBlame {
         tx: plan
@@ -1559,6 +1624,7 @@ fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
         deferred: plan.deferred.len() as u64,
         acked_lost_total: 0,
         rids: std::sync::Arc::new(plan.held_rids.iter().copied().collect()),
+        drop_released: std::sync::Arc::new(plan.drop_released.iter().copied().collect()),
     }
 }
 
@@ -1655,7 +1721,7 @@ impl Meta {
         if poisoned.is_empty() && pending.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let plan = plan(&r, self, &poisoned, &pending, None)?;
+        let plan = plan(&r, self, &poisoned, &pending, None, None)?;
         Ok(plan
             .held
             .iter()
@@ -1719,7 +1785,10 @@ impl Meta {
             theirs: &remote,
             rid: None,
         });
-        let plan = plan(&r, self, &poisoned, &pending, blame)?;
+        // ADR-58 C5 / FX-3: with a drop decided and unapplied, the plan also
+        // tells which held rows its apply releases.
+        let decided = decided_drop_idents(&r, self)?;
+        let plan = plan(&r, self, &poisoned, &pending, blame, decided.as_ref())?;
         // Whether rows may be skipped (the session counts a read that
         // timed out meanwhile as `degraded_held`).
         self.held_any.store(
@@ -1847,6 +1916,20 @@ impl Meta {
     /// last ship round.
     pub fn rid_behind_lost_chunk(&self, rid: crate::rid::Rid) -> bool {
         self.held.lock().unwrap().rids.contains(&rid)
+    }
+
+    /// ADR-58 C5 / FX-3: whether the apply of a drop decided and not yet
+    /// applied ends `rid`'s hold: the drop names its transaction, or the row
+    /// is held only through transactions it names (every decided plan counts,
+    /// its record shipped or not). Never true for a row
+    /// [`Self::rid_behind_lost_chunk`] does not report. As fresh as the last
+    /// ship round (a drop cancelled through [`Self::drop_held_cancel`] takes
+    /// it back at once; a stream drop cancelled by `cancel_stream_drop_tx`,
+    /// in the caller's transaction, does at the next round). A row whose
+    /// second walk is deferred, an unidentified one and a retired identity
+    /// are not released: the word stays on the safe side.
+    pub fn rid_released_by_decided_drop(&self, rid: crate::rid::Rid) -> bool {
+        self.held.lock().unwrap().drop_released.contains(&rid)
     }
 
     /// `constellation repair drop-held <ino>` (see the module doc's
@@ -2541,6 +2624,10 @@ impl Meta {
             // The record never ships from here.
             counter_add_tx(&mut tx, &self.local, KV_DROP_HELD_UNSHIPPED, -1)?;
             tx.commit()?;
+            // FX-3: the cancelled drop no longer releases its rows (a deposed
+            // dropper may never plan again): the word is taken back at once,
+            // for every plan's rows (the next round restores another plan's).
+            self.held.lock().unwrap().drop_released = Default::default();
         }
         Ok(())
     }
@@ -3544,7 +3631,7 @@ fn walk_drop(
     poisoned: &PoisonMap,
     mode: DropMode<'_>,
 ) -> Result<Walked, MetaError> {
-    let held = plan(tx, meta, poisoned, &PoisonMap::new(), None)?;
+    let held = plan(tx, meta, poisoned, &PoisonMap::new(), None, None)?;
     let mut chain = Taint::default();
     // The inodes whose content the loss reaches: the damaged file, and any
     // file a later write of it was copied into.
@@ -5148,6 +5235,7 @@ mod tests {
                     &poisoned,
                     &pending,
                     Some(Blame { theirs, rid: None }),
+                    None,
                 )
                 .unwrap();
                 let waiting: BTreeSet<u64> = p
@@ -5224,7 +5312,7 @@ mod tests {
                 let r = meta.db.read_tx();
                 let poisoned = read_poisoned(&r, meta).unwrap();
                 let pending = read_pending(&r, meta).unwrap();
-                let p = plan(&r, meta, &poisoned, &pending, None).unwrap();
+                let p = plan(&r, meta, &poisoned, &pending, None, None).unwrap();
                 let rows = |txs: &mut dyn Iterator<Item = &Tx>| -> Vec<LogRecord> {
                     txs.flat_map(|t| t.rows.iter().map(|(_, r)| r.clone()))
                         .collect()

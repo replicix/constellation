@@ -255,6 +255,13 @@ pub enum MutateOutcome {
         /// unsettled `EIO` `held-behind-lost-chunk`, which the sim's oracle
         /// accepts only if a chunk is really lost.
         lost_chunk: bool,
+        /// ADR-58 C5 (FX-3): with `lost_chunk`: a drop decided and not yet
+        /// applied ends this row's hold at its apply
+        /// (`Meta::rid_released_by_decided_drop`). Never set without
+        /// `lost_chunk`. The requester's label and C5's final ask read
+        /// `lost_chunk` alone; this word only keeps a final ask's answer from
+        /// ending the settle at once.
+        releasing: bool,
         /// The sequencer holds the op for the requester's own delegation:
         /// it has checked that it has not run the rid (no outcome, no executed
         /// answer parked for it; an op parked unexecuted behind a recall runs
@@ -462,6 +469,7 @@ impl MutateOutcome {
             retry_ms,
             outwait_ms: None,
             lost_chunk: false,
+            releasing: false,
             yours: false,
         }
     }

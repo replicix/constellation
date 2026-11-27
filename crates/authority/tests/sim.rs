@@ -25783,6 +25783,44 @@ fn adr58_c5b_a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline()
     assert!(routes > 0, "seed {seed}: no settle was routed once more");
 }
 
+/// FX-3 (class L): settle and `drop-held` agree at the ADR-58 C5 boundary.
+/// Each seed had one I4 violation, an unsettled `EIO` with the root
+/// reachable. `flex-crash` 1111 and 1199: a drop was decided but not applied,
+/// the root still said `Held { lost_chunk }` for a row the apply releases,
+/// and C5 took that word as final (the row is then a placeholder, or ships at
+/// once): the root now adds `releasing` and the final ask's answer moves the
+/// deadline one settle window (FX-3 (c)) instead of ending the settle. 1635:
+/// the root's hold ended, the row waited for its durability (an S3 ship
+/// failed once) past C5's one forward timeout: the plain `Held` takes the
+/// same window. Fails on the parent.
+#[test]
+fn fx3_settle_and_drop_held_agree_at_the_c5_boundary() {
+    let all = "commit+identity+settle+durability+unsettled";
+    let (mut ended, mut releasing) = (0u64, 0u64);
+    for seed in [1111u64, 1199, 1635] {
+        let r = run_seed(seed, strict(base_config("flex-crash"), all))
+            .unwrap_or_else(|e| panic!("flex-crash+{all} seed {seed}: {e}"));
+        assert_eq!(r.unsettled_violations, 0, "seed {seed}");
+        let seed_ended: u64 = r
+            .stats
+            .values()
+            .map(|s| s.settle_final_asks_ended_hold)
+            .sum();
+        let seed_releasing: u64 = r
+            .stats
+            .values()
+            .map(|s| s.settle_final_asks_releasing)
+            .sum();
+        assert!(seed_ended > 0, "seed {seed}: (c) did not fire");
+        // Which rule carried the seed: `releasing` (1111, 1199) or the plain
+        // `Held` (1635).
+        assert_eq!(seed_releasing > 0, seed != 1635, "seed {seed}");
+        ended += seed_ended;
+        releasing += seed_releasing;
+    }
+    assert!(ended > 0 && releasing > 0);
+}
+
 /// FX-2: a settle follows the end of write refusal at once and can use the
 /// carrier. Each seed has one I4 violation of class T, an unsettled `EIO`
 /// with the root reachable: `flex` 215 and `flex-tight` 559 (a settle in

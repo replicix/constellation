@@ -2341,6 +2341,13 @@ pub struct Stats {
     /// chunk again (the settle ended in doubt at that answer).
     /// (A settle routed once more by ADR-58 C5b and answered so ends here too.)
     pub settle_final_asks_held: u64,
+    /// ADR-58 C5, FX-3 (c): final asks answered `Held` with the hold ending
+    /// (no lost chunk, or `releasing`) that moved the deadline one settle
+    /// window (once, under `settle_cap`).
+    pub settle_final_asks_ended_hold: u64,
+    /// Of `settle_final_asks_ended_hold`, those answered `Held` behind a lost
+    /// chunk with `releasing` (a decided drop is about to end the hold).
+    pub settle_final_asks_releasing: u64,
     /// ADR-58 C5b: second deadlines that routed a settle once more because
     /// this node's own plan had held its row behind a lost chunk and the hold
     /// had ended.

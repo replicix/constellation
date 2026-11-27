@@ -2414,14 +2414,24 @@ impl Core {
             _ => None,
         };
         // ADR-58 C3: an answer waiting for the durability of a row that the
-        // ship plan holds behind a lost chunk says so.
-        let lost_chunk = match self.rd.parked.get(&id) {
+        // ship plan holds behind a lost chunk says so. FX-3 (C5): with
+        // `releasing` when a drop decided and not yet applied ends that hold
+        // at its apply (the last ship round's word, or a plan that names the
+        // rid now: the decision is newer than the round). `lost_chunk` itself,
+        // the requester's label, is the plan's word alone.
+        let (lost_chunk, releasing) = match self.rd.parked.get(&id) {
             Some(Parked {
                 what: ParkedWhat::Reply { rid, .. } | ParkedWhat::ExecuteReply { rid, .. },
                 durable: Some(_),
                 ..
-            }) => replica.rid_behind_lost_chunk(*rid),
-            _ => false,
+            }) => {
+                let lost = replica.rid_behind_lost_chunk(*rid);
+                let releasing = lost
+                    && (replica.rid_released_by_decided_drop(*rid)
+                        || replica.drop_plan_names_rid(*rid));
+                (lost, releasing)
+            }
+            _ => (false, false),
         };
         // ADR-54/55: an op parked here unexecuted (waiting for the recall of
         // the generation that owns its keys, or its `deps`) has not run, and
@@ -2481,6 +2491,7 @@ impl Core {
                         retry_ms,
                         outwait_ms,
                         lost_chunk,
+                        releasing,
                         yours,
                     },
                     base: None,
