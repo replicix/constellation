@@ -573,34 +573,37 @@ pub struct EpochRec {
     pub closed: bool,
 }
 
-pub const SAW_MISSING_EPOCH: u16 = 1;
-pub const SAW_CHECKED_TAKEOVER: u16 = 2;
-pub const SAW_FLUSH: u16 = 4;
-pub const SAW_SEAL: u16 = 8;
-pub const SAW_FAST_S3: u16 = 16;
-pub const SAW_CONFLICT: u16 = 32;
+pub const SAW_MISSING_EPOCH: u32 = 1;
+pub const SAW_CHECKED_TAKEOVER: u32 = 2;
+pub const SAW_FLUSH: u32 = 4;
+pub const SAW_SEAL: u32 = 8;
+pub const SAW_FAST_S3: u32 = 16;
+pub const SAW_CONFLICT: u32 = 32;
 /// Plan 43 C0: an epoch's hold owner lost its epoch journal because the
 /// register moved under it (`Action::Close`'s strand branch).
-pub const SAW_HOLD_OWNER_DEPOSED: u16 = 64;
+pub const SAW_HOLD_OWNER_DEPOSED: u32 = 64;
 /// Plan 46 C10: a hold answered a row after a member's `StreamAheadAck`.
-pub const SAW_HOLD_MEMBER_ANSWER: u16 = 128;
+pub const SAW_HOLD_MEMBER_ANSWER: u32 = 128;
 /// Plan 46 C10: a one-member epoch's hold answered (`Final`).
-pub const SAW_HOLD_FINAL_ANSWER: u16 = 256;
+pub const SAW_HOLD_FINAL_ANSWER: u32 = 256;
 /// Plan 46 M1.4 step 4: the operator retired a hold's owner.
-pub const SAW_RETIRE: u16 = 512;
+pub const SAW_RETIRE: u32 = 512;
 /// Plan 46 M1.4 step 4: a retired one-member hold's owner took rows answered
 /// `Final` (its disk alone) with it: the operator's loss, by the rule.
-pub const SAW_RETIRE_FINAL_LOSS: u16 = 1024;
+pub const SAW_RETIRE_FINAL_LOSS: u32 = 1024;
 /// Plan 46 M1.4 step 4: a claim shipped rows a member kept at a retire.
-pub const SAW_RETIRE_CARRIED: u16 = 2048;
+pub const SAW_RETIRE_CARRIED: u32 = 2048;
 /// FX-5: a transfer's first answer was taken.
-pub const SAW_TRANSFER_TAKEN: u16 = 4096;
+pub const SAW_TRANSFER_TAKEN: u32 = 4096;
 /// FX-5: a re-offer was taken.
-pub const SAW_REOFFER_TAKEN: u16 = 8192;
+pub const SAW_REOFFER_TAKEN: u32 = 8192;
 /// FX-5: a node that took the hold over P2P flushed it at the close.
-pub const SAW_TRANSFEREE_FLUSH: u16 = 16384;
+pub const SAW_TRANSFEREE_FLUSH: u32 = 16384;
 /// FX-5: a nudge started an acquisition.
-pub const SAW_NUDGE_ASK: u16 = 32768;
+pub const SAW_NUDGE_ASK: u32 = 32768;
+/// FX-5: a transfer of number 3 was taken (the G, R, Q cycle: a former
+/// giver takes the hold back above everything it took or gave).
+pub const SAW_THIRD_TRANSFER: u32 = 65536;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -620,7 +623,7 @@ pub struct State {
     /// Plan 46 C10: bitmask of the history indices the client was answered
     /// (executed ops are answered at once outside a hold).
     pub answered: u16,
-    pub saw: u16,
+    pub saw: u32,
     /// Plan 46 M1.4 step 4: owners retired so far.
     pub retires: u8,
     /// Rows (history indices) a retire took with its owner that no client
@@ -1846,6 +1849,11 @@ impl Model for FlexEpochs {
             props.push(Property::sometimes("nudge_ask", |_, s: &State| {
                 s.saw & SAW_NUDGE_ASK != 0
             }));
+            if self.max_transfers >= 3 {
+                props.push(Property::sometimes("third_transfer", |_, s: &State| {
+                    s.saw & SAW_THIRD_TRANSFER != 0
+                }));
+            }
         }
         if self.min_members < self.nodes {
             props.push(Property::sometimes(
@@ -1935,6 +1943,9 @@ impl FlexEpochs {
                     } else {
                         SAW_TRANSFER_TAKEN
                     };
+                    if n == 3 {
+                        s.saw |= SAW_THIRD_TRANSFER;
+                    }
                 }
             }
             Msg::Nudge {

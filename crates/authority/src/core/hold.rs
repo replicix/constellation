@@ -462,7 +462,7 @@ impl Core {
             Some((error, what)) => {
                 if !self.pr.hold_rec_warned {
                     self.pr.hold_rec_warned = true;
-                    tracing::warn!(node = self.cfg.node_id, %error, "{what}; no hold transition until it succeeds");
+                    tracing::warn!(node = self.cfg.node_id, %error, op = what, "no hold transition until the record is known again");
                 }
             }
         }

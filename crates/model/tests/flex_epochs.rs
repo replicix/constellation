@@ -874,17 +874,43 @@ fn fx5_three_members_clean() {
     );
 }
 
-/// `N = 3`, `f = 1`, three transfers (the G, R, Q cycle) and two asks not
-/// prompted by a nudge, no crash and no rows: the shapes the bounded
-/// three-member run leaves out (a third transfer, two concurrent stale asks).
-/// Sized to finish: 23.1 million states (3.4 million unique), 18 s in release
-/// on one thread, inside `CAP`. Four free asks do not finish (400 million
-/// states reached in 336 s, still open); three asks did not finish in 50 s.
+/// `N = 3`, `f = 1`: two transfers, two unprompted asks (each transfer needs
+/// its own ask: a nudge prompts only a re-offer), no crash and no rows. A
+/// bounded run that finishes inside `CAP` (5.1 million states, 3.7 s in
+/// release, one thread; the time cap is sized for release, so debug skips
+/// it). It does not reach a third transfer or a stale ask: that is
+/// `fx5_three_members_cycle_clean`.
 #[test]
+#[cfg_attr(debug_assertions, ignore = "the time cap is sized for release")]
+fn fx5_three_members_two_transfers_clean() {
+    let m = FlexEpochs {
+        max_transfers: 2,
+        free_asks: Some(2),
+        max_crashes: 0,
+        ops: vec![],
+        ..xfer(full())
+    };
+    assert_clean_checking(
+        "fx5-three-two-transfers",
+        &m,
+        &["transfer_taken", "reoffer_taken", "nudge_ask"],
+        CAP,
+        &[RECOVER, OWNER],
+    );
+}
+
+/// `N = 3`, `f = 1`, three transfers (the G, R, Q cycle: a former giver
+/// takes the hold back at number 3) and three unprompted asks, no crash and
+/// no rows. Not in the gate (the gate runs lib tests only). Exhaustive:
+/// 249 million states (31 million unique), 244 s in release on one thread,
+/// `third_transfer` witnessed. Does not finish with four asks (400 million states in 336 s, still open).
+/// `cargo test -p constellation-model --release --test flex_epochs -- --ignored fx5_three_members_cycle_clean --nocapture`
+#[test]
+#[ignore]
 fn fx5_three_members_cycle_clean() {
     let m = FlexEpochs {
         max_transfers: 3,
-        free_asks: Some(2),
+        free_asks: Some(3),
         max_crashes: 0,
         ops: vec![],
         ..xfer(full())
@@ -892,8 +918,13 @@ fn fx5_three_members_cycle_clean() {
     assert_clean_checking(
         "fx5-three-cycle",
         &m,
-        &["transfer_taken", "reoffer_taken", "nudge_ask"],
-        CAP,
+        &[
+            "transfer_taken",
+            "reoffer_taken",
+            "nudge_ask",
+            "third_transfer",
+        ],
+        BIG_CAP,
         &[RECOVER, OWNER],
     );
 }

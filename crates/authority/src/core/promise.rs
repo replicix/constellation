@@ -507,8 +507,11 @@ impl Core {
         }
         debug_assert!(
             !self.lease.epoch_held()
-                || self.pr.hold_rec.is_unknown()
-                || matches!(self.hold_record(), Some(HoldRecord::Held { .. })),
+                || matches!(
+                    self.pr.hold_rec,
+                    HoldRecState::Known(Some(HoldRecord::Held { .. }))
+                        | HoldRecState::RollingBack(Some(HoldRecord::Held { .. }))
+                ),
             "an epoch hold without its record"
         );
         if self.pr.flush_pending && replica.journal_is_empty().unwrap_or(false) {

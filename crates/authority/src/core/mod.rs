@@ -5165,20 +5165,23 @@ impl Core {
             if self.pr.adopt_retry.take() == Some(Adopt::ClosedCarried) {
                 adopt_via = Adopt::ClosedCarried;
             }
+            // A record a failed write left to be rolled back is made known
+            // first: a rollback that can land now costs no owed move.
+            self.hold_rec_load(replica);
             let mut closed_carried = self.epoch_closed_carried();
             // FX-5: the record decides before the lease is touched. A
             // record that forbids the re-hold (a `Given` of the carried
-            // lease: a peer may hold a later number; an unreadable one)
+            // lease: a peer may hold a later number; an unknown one)
             // leaves neither the hold nor the lease: the branch below
             // falls through as for no closed claim.
-            let mut record_unreadable = false;
+            let mut record_unknown = false;
             if closed_carried.is_some() {
                 let allowed = self
                     .my_carried_key()
                     .and_then(|key| self.adoption_number(key, Adopt::ClosedCarried))
                     .is_some();
                 if !allowed {
-                    record_unreadable = self.pr.hold_rec.is_unknown();
+                    record_unknown = self.pr.hold_rec.is_unknown();
                     closed_carried = None;
                 }
             }
@@ -5197,7 +5200,7 @@ impl Core {
                 // close and the lease's re-claim instead (`owes_move`),
                 // as for a lease it was releasing at the activation.
                 self.owe_epoch_move(replica);
-            } else if record_unreadable {
+            } else if record_unknown {
                 // The record cannot be read: fail closed. No hold and no
                 // lease; this node owes the epoch's close and the lease's
                 // re-claim, as in the doubt above.

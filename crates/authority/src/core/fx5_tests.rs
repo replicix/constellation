@@ -2010,6 +2010,9 @@ fn a_give_whose_sync_fails_after_the_set_is_rolled_back() {
     assert!(declined(&answer), "{out:?}");
     c.hear(2, 1, req, answer);
     assert_eq!(c.rec(1), Some(c.given(1, 2)), "no write got through");
+    // (Declined by the unknown record, not by a write that failed again.)
+    assert_eq!(c.node(1).core.stats.epoch_gives_declined_record, 1);
+    assert_eq!(c.node(1).core.stats.epoch_hold_give_persist_failed, 1);
     assert!(c.node(1).core.lease.epoch_held());
     Faults::write(false);
     // The next event puts the store back to what memory holds.
@@ -2104,4 +2107,95 @@ fn an_offer_is_refused_while_the_store_is_rolled_back() {
     let answer = c.exchange(2, 1, false);
     assert!(is_hold(&answer, 1, OfferKind::Reoffer), "{answer:?}");
     assert_eq!(c.rec(2), Some(c.held(1, 2)));
+}
+
+/// S1 (review): a closed-carried activation over a record a failed write
+/// left to be rolled back: with the store back it re-holds at its number
+/// (the rollback lands first); with the store still failing it owes the
+/// move and holds nothing.
+#[test]
+fn a_closed_carried_activation_rolls_the_record_back_first() {
+    let _faults = Faults;
+    for store_back in [true, false] {
+        let mut c = Cluster::new(&[1, 2]);
+        let rec = c.ended(3, Reclaim::Owed);
+        close_the_epoch_with(&mut c, rec);
+        c.node(1).core.pr.hold_rec = HoldRecState::RollingBack(Some(rec));
+        Faults::write(!store_back);
+        c.report(1, true, true, false);
+        if store_back {
+            assert!(c.node(1).core.lease.epoch_held(), "not re-held");
+            assert_eq!(c.rec(1), Some(c.held(3, 1)), "at its number");
+        } else {
+            assert!(!c.node(1).core.lease.epoch_held());
+            assert!(c.node(1).core.lease.held.is_none(), "the lease is held");
+            assert!(c.node(1).core.pr.owes_move.is_some(), "the move is owed");
+        }
+    }
+}
+
+/// S3 (review), the real path: a hold that went away without a close, its
+/// `Ended` write failing cleanly, leaves the record unknown: an offer and a
+/// nudge are refused meanwhile, and the first event with the store back
+/// rolls it back and writes the end.
+#[test]
+fn a_failed_end_write_blocks_offers_and_nudges_until_the_store_is_back() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    c.exchange(2, 1, false);
+    assert_eq!(c.rec(2), Some(c.held(1, 2)));
+    Faults::write(true);
+    c.node(2).core.lease.release_local();
+    tick(&mut c, 2);
+    assert!(c.node(2).core.pr.hold_rec.is_unknown(), "vacuous: known");
+    assert_eq!(c.rec(2), Some(c.held(1, 2)));
+    let key = c.key;
+    let out = c.hear_nudge(2, 1, key, XferNo(9));
+    assert!(lease_request(&out).is_none(), "asked: {out:?}");
+    let req = waiting(&mut c, 2, 1);
+    c.hear(
+        2,
+        1,
+        req,
+        HandoffAnswer::Hold(c.offer(9, OfferKind::Transfer)),
+    );
+    assert!(!c.node(2).core.lease.epoch_held());
+    assert_eq!(c.node(2).core.stats.epoch_hold_offers_refused_record, 1);
+    assert_eq!(c.rec(2), Some(c.held(1, 2)), "nothing was written");
+    Faults::write(false);
+    tick(&mut c, 2);
+    assert_eq!(c.rec(2), Some(c.ended(1, Reclaim::Settled)));
+    assert!(!c.node(2).core.pr.hold_rec.is_unknown());
+}
+
+/// S5 (review): a retained closed-carried retry does not outlive the lease
+/// it was for: the re-activation carries another lease of this node, and
+/// nothing is held at the old number.
+#[test]
+fn a_kept_closed_carried_retry_does_not_hold_another_lease() {
+    let _faults = Faults;
+    let mut c = Cluster::new(&[1, 2]);
+    let rec = c.ended(3, Reclaim::Owed);
+    close_the_epoch_with(&mut c, rec);
+    Faults::write(true);
+    c.report(1, true, true, false);
+    assert!(c.node(1).core.lease.held.is_some(), "vacuous: not adopted");
+    assert_eq!(c.node(1).core.pr.adopt_retry, Some(Adopt::ClosedCarried));
+    c.report(1, true, false, false);
+    Faults::write(false);
+    let other = Carrier {
+        expires_unix_ms: c.key.expires_unix_ms + 7,
+        ..c.key
+    };
+    let ev = c.report_event(Some(other), true, true, false);
+    c.node(1).step(ev);
+    let old = c.key;
+    if let Some(HoldRecord::Held { key, n, .. }) = c.rec(1) {
+        assert_ne!(key, old, "held the old lease");
+        assert_eq!(n, XferNo(0), "not a fresh number");
+    }
+    assert!(
+        !c.node(1).core.lease.epoch_held() || c.node(1).core.my_carried_key() == Some(other),
+        "holds a lease that is not the carried one"
+    );
 }
