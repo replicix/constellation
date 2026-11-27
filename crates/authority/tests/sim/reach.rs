@@ -1554,15 +1554,42 @@ fn claim_done(
     until: u64,
 ) -> Result<u64, String> {
     let lease = lease_at(g, run_from);
+    // The claim clock starts at the claimant's first sight of the body, and
+    // no sight is credited while the claimant's own path to S3 is cut (user
+    // decision 2026-11-27, FX-6, flex-crash seed 1017): a claimant whose S3
+    // is cut at the window's start could read nothing until it is restored,
+    // and the product starts its observation of the body at its first read
+    // after that, so a sight from before the cut (a registration read) or
+    // one assumed at the window's start inside the cut does not count. The
+    // first sight then counts from the instant S3 is up again plus the
+    // fastest lease read (`min_s3_ms`), the cap the model always applied at
+    // the window's start; reads served from that instant on are real sights.
+    // A claimant whose S3 is up at the window's start is judged as before.
+    let sight_from = |landed: u64| -> u64 {
+        if s3_up(g, window_from, me) {
+            landed
+        } else {
+            let restored = g
+                .s3
+                .iter()
+                .filter(|(t, n, cut)| *n == me && !*cut && *t > window_from)
+                .map(|(t, _, _)| *t)
+                .min()
+                // Never restored by the window's end: no read is possible in it.
+                .unwrap_or(until);
+            landed.max(restored)
+        }
+    };
     let since_of = |landed: u64| -> u64 {
         // The claimant's first sight of the body: its first lease GET served
-        // after the body landed, but never later than a read it would have
-        // made at the window's start (a product delay before the first read
-        // is not excused).
-        let at_start = landed.max(window_from) + g.min_s3_ms;
+        // after the body landed (and S3 was readable), but never later than
+        // a read it would have made at the window's start (a product delay
+        // before the first read is not excused).
+        let readable = sight_from(landed);
+        let at_start = readable.max(window_from) + g.min_s3_ms;
         g.lease_reads
             .iter()
-            .filter(|(n, _, served, _)| *n == me && *served >= landed)
+            .filter(|(n, _, served, _)| *n == me && *served >= readable)
             .map(|(_, _, _, observed)| *observed)
             .min()
             .map_or(at_start, |first| first.min(at_start))
@@ -2565,6 +2592,89 @@ mod tests {
         assert!(
             v.no_sequencer_in_time(),
             "{v:?}: the lease runs to 8 000, after the window"
+        );
+    }
+
+    /// FX-6 (user decision 2026-11-27): a dead holder's body landed at 2 500
+    /// and the claimant read it at 2 600 (answered 2 650); its S3 is cut from
+    /// 3 100 to 4 600. A sight from before the cut is not credited, so its
+    /// clock starts after the restoration (4 600 + a lease read of 80 ms =
+    /// 4 680, a TTL of 1 000 ms, the claim's 100 ms: done by 5 780): a window
+    /// ending at 5 000 has no sequencer in time, one ending at 7 000 has the
+    /// claim at 5 780.
+    #[test]
+    fn a_sight_from_before_the_requesters_s3_cut_is_not_credited() {
+        let build = || {
+            let r = world();
+            r.lease_landed_at(2_500, 1, 3_500, false);
+            r.attached_at(3_000, 1, false);
+            r.lease_read(3, 2_600, 2_650);
+            r.s3_cut_at(3_100, 3, true);
+            r.s3_cut_at(4_600, 3, false);
+            r
+        };
+        let v = build().classify(Question::new(3, 4_000, 5_000));
+        let Verdict::NoSequencerInTime { why } = &v else {
+            panic!("the sight from before the cut is not credited: {v:?}");
+        };
+        assert!(why.contains("the window's end"), "{why}");
+        // Restored, its first read starts the clock: the claim is done in
+        // time when the window leaves room for it (the restoration is
+        // credited, the lease path is not shut for good).
+        let v = build().classify(Question::new(3, 4_000, 7_000));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    from_ms: 4_600,
+                    to_ms: 5_780,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+    }
+
+    /// The strictness of the rule above: with the requester's S3 up at the
+    /// window's start the earlier sight counts as before (the claim is done by
+    /// 4 100, inside the window), so a refusal there is a violation.
+    #[test]
+    fn a_sight_is_credited_while_the_requesters_s3_is_up() {
+        let r = world();
+        r.lease_landed_at(2_500, 1, 3_500, false);
+        r.attached_at(3_000, 1, false);
+        r.lease_read(3, 2_600, 2_650);
+        let v = r.classify(Question::new(3, 4_000, 5_000));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 4_100,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        // A cut that ended before the window's start does not hide the sight.
+        let r = world();
+        r.lease_landed_at(2_500, 1, 3_500, false);
+        r.attached_at(3_000, 1, false);
+        r.lease_read(3, 2_600, 2_650);
+        r.s3_cut_at(3_100, 3, true);
+        r.s3_cut_at(3_500, 3, false);
+        let v = r.classify(Question::new(3, 4_000, 5_000));
+        assert!(
+            matches!(
+                v,
+                Verdict::Reachable {
+                    via: Via::LeasePath,
+                    to_ms: 4_100,
+                    ..
+                }
+            ),
+            "{v:?}"
         );
     }
 
