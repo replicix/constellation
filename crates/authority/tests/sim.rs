@@ -14671,6 +14671,13 @@ fn double_seal_after_the_grace_config() -> SimConfig {
         lock_nodes: vec![3],
         client_plan: vec![(3, 0, 1)],
         faults: cut(2_000).into_iter().chain(cut(12_500)).collect(),
+        // No default clock mix: node 3 takes its one lock in the first
+        // second, and the mix's reboot of node 3 (0.5 to 0.7 s in, back
+        // after 0.5 to 3 s) ended that client before it took it on 5 of
+        // 2,000 seeds (121, 589, 984, 1288, 1768: "a lock workload that never
+        // took a lock (vacuous)"). The scenario is the two seals and the
+        // floor between them, not the clocks (the pin ran unclocked).
+        clock_faults: false,
         ..double_seal_inside_the_grace_config()
     }
 }
