@@ -71409,7 +71409,7 @@ mod await_retry {
         );
         for req in [60, 61] {
             assert!(
-                reply_to(&all, req).map_or(true, |o| !super::backup::is_answer(&o)),
+                reply_to(&all, req).is_none_or(|o| !super::backup::is_answer(&o)),
                 "park {req}: {all:?}"
             );
         }
@@ -71420,7 +71420,7 @@ mod await_retry {
         // `Held` left to carry a word).
         let out = forward_raw(&mut h, 2, 62, p, &rename_in_root("broken", "moved"));
         assert!(
-            reply_to(&out, 62).map_or(true, |o| !super::backup::is_answer(&o)),
+            reply_to(&out, 62).is_none_or(|o| !super::backup::is_answer(&o)),
             "{out:?}"
         );
         assert!(h.meta.rid_behind_lost_chunk(p), "still behind the chunk");
