@@ -14167,6 +14167,24 @@ fn flex_seed_797_passes_on_flex_crash_and_flex_tight() {
     }
 }
 
+/// FX-6 (class C, flex-crash seed 1017), the oracle's side: a two-member
+/// epoch whose lease holder crashes; the requester's S3 is cut until 6.2 s,
+/// so it cannot have seen the holder's last body before, and the product's
+/// claim clock starts at its first read after the cut. The classifier does
+/// not credit a first sight made while the requester's own S3 was cut (user
+/// decision 2026-11-27, `reach.rs` `claim_done`); the lease path was not open
+/// in time, so the unsettled `EIO` is `no_sequencer_in_time`, not an I4
+/// violation.
+#[test]
+fn flex_crash_seed_1017_no_first_sight_is_credited_while_the_requesters_s3_is_cut() {
+    let cfg = ["commit", "identity", "settle", "durability", "unsettled"]
+        .into_iter()
+        .fold(base_config("flex-crash"), config_variant);
+    run_seed(1017, cfg).unwrap_or_else(|e| {
+        panic!("flex-crash+commit+identity+settle+durability+unsettled 1017: {e}")
+    });
+}
+
 /// FX-5, S1 (option B): the lost answer of class S through the sim's own
 /// wiring. `+holdloss` loses the first answer that hands an epoch hold over
 /// (the giver has recorded the give; the requester never hears of it), on
