@@ -62,6 +62,8 @@ opt-in.
 | Only distant peers | `Local` | none for the holder's own writes; one S3 commit for a write another node forwards | nothing lost | nothing forwarded lost (it was answered only once in the bucket); the holder's own un-shipped writes come back when it returns, as a replay | lease TTL (60 s default) |
 | A peer within the RTT budget | `Backup` (automatic) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS (≈ 1.5 s in the harness; 2.3–4.7 s from `kill -9` to a new holder on EC2, with one unexplained 60 s first failover on a fresh filesystem; see [RESULTS.md](../../../bench/remote/RESULTS.md#failover-time)) |
 | `fs create --ack-policy s3`, any topology | `S3` | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS (needs P2P) |
+| S3 unreachable, a continuation epoch of two or more members | the epoch's hold (a group of the owner and one member) | designed as one LAN round trip more than before plan 46 M1.4 (an answer waits for one member's `StreamAheadAck`); measured about 7 ms per op for a serial writer (see below) | nothing lost: an answer is given only once a member's store holds the row | nothing lost: the member keeps the rows it acknowledged and the next claimant carries them | as in the epoch: the hold is never deposed except by `leave` (retire); see [Flexible continuation epochs](#flexible-continuation-epochs) |
+| S3 unreachable, an epoch of one member | the epoch's hold, final | none: it answers from its own disk | nothing lost | nothing lost | as above |
 
 There is no `backup` setting: `Backup` is chosen automatically when a
 peer is in budget and the filesystem's policy is not `s3`. "Nothing
@@ -1275,6 +1277,33 @@ none before its promise ran out. So no epoch carrying that key can have
 formed after the evidence, and one that formed before it would have had
 the promiser as a member, which publishes nothing. Only rate bounds and
 causality are used; there is no offset between the nodes' clocks to bound.
+
+**The epoch hold's answers (plan 46 M1.4).** Inside an epoch the owner of
+the hold streams its journal ahead to every member, and a member
+acknowledges a batch (`StreamAheadAck`) only after its store has committed
+it, as a backup does. In an epoch of two or more members the hold is a group
+of the owner and one member: a row is answered, to the owner's own clients
+and to the members' forwards alike, once a member has acknowledged it. That
+is, by design, one LAN round trip over the answer from the owner's disk
+that the hold gave before (the S3-outage row of the table above). **Measured
+(M1.4 exit, `ack-latency` topology 10, two nodes, loopback):** a serial
+writer's create, rename, unlink and chmod take about 7 ms in the hold, on
+ext4, xfs, btrfs and tmpfs alike, against 0.04 to 0.1 ms before; the
+forwards of a member were already about 7 ms. The 7 ms is the stream-ahead
+holdoff (`stream_ahead_holdoff_ms`, 5 ms: the owner sends a batch at once
+only if none went in the last 5 ms) plus the round trip and the member's
+commit: the answer used not to wait for the stream, so the holdoff did not
+show. Several writers share a batch, so only a serial writer pays it in
+full. An epoch of one
+member has nobody to wait for: its hold is final and answers at once. The
+owner sends a batch no member has acknowledged again after
+`hold_resend_ms` (250 ms). A member that never answers (a partition, a
+stopped process) parks the epoch's answers until the client's settle
+deadline or the hold's end; only latency degrades, never an error from a
+row that was answered. A member keeps the rows it acknowledged as
+committed, and whoever claims the lease next carries them (the sealed-tail
+re-ship). The hold is never deposed except by `leave` (retire): the members
+then abandon the epoch.
 
 Operational rules:
 

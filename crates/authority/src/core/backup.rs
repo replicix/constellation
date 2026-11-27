@@ -1767,17 +1767,21 @@ impl Core {
             return self.hold_acked_through();
         }
         if self.lease.epoch_held() {
-            // Plan 30 §M10 (found by `node-leave` on M9's round 2): a
-            // continuation epoch's hold acknowledges locally — nothing
-            // ships and nothing is backed during an epoch, and the claim
-            // rule carried the lease in only with every backup a member
-            // (which takes nothing over while the epoch is open). Gating
-            // here on the held lease's backups, a candidate or the
+            // Plan 30 §M10 (found by `node-leave` on M9's round 2): gating
+            // a hold on the held lease's backups, a candidate or the
             // shipped watermark parked every acknowledgement for the
-            // epoch's lifetime: the FUSE caller timed out, retried, and
-            // met its own first attempt (`EEXIST`). What is left of this
-            // branch is a one-member epoch's hold (`Final`: no member to
-            // wait for) and the knob `hold_answers_uncommitted`.
+            // epoch's lifetime (nothing ships and nothing is backed during
+            // an epoch, and the claim rule carried the lease in only with
+            // every backup a member, which takes nothing over while the
+            // epoch is open): the FUSE caller timed out, retried, and met
+            // its own first attempt (`EEXIST`). M10 therefore answered
+            // from the owner's disk. Since plan 46 M1.4 a hold with a
+            // member does not: its group is the owner and one member
+            // (first branch), whose `StreamAheadAck` the answers wait
+            // for, one LAN round trip, and the stream-ahead goes to every
+            // member so that none is silent for want of a subscription.
+            // What is left here is a one-member epoch's hold (`Final`: no
+            // member to wait for) and the knob `hold_answers_uncommitted`.
             return u64::MAX;
         }
         match self.lease.ack_policy() {

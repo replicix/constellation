@@ -2800,6 +2800,28 @@ delegated at first (a recorded backup does count). `Config::lone_delegate`
 (`AUTHORITY_SIM_LONE_DELEGATE=1`) is the negative control that grants and
 answers lone, as the model's `lone_delegate`.
 
+**Landed, the epoch hold as a group (plan 46 M1.4)**: an epoch with two or
+more members is a group of its owner and one member (`GroupOn::Hold`, the
+version the continuation epoch's number). The members acknowledge the
+owner's stream-ahead (`StreamAheadAck`, once their store has committed it) and
+the hold's answers, own and forwarded, wait for one acknowledgement: one LAN
+round trip more than the answer from the owner's disk by design (the
+S3-outage row of plan 46 §7); measured at the M1.4 exit, about 7 ms per op for a
+serial writer on ext4, xfs, btrfs and tmpfs, the stream-ahead holdoff (5 ms)
+plus the round trip and the member's commit (PROGRESS, "Plan 46 M1.4 exit").
+A one-member epoch's hold stays `Final`. A delegate counts a
+row the hold holds only through a member's acknowledged seq, and a member
+keeps what it acknowledged as committed for the next claimant to carry
+(ADR-51). Deleted: the hold's `Final` for multi-member epochs, the hold's
+`NonStealable` answer (variant 3(i) for the hold; designations and sticky
+grants keep theirs until stage 2), `config_committed_jseq`'s "journal counts
+until M1.4" branch and the two `strict_commit` exemptions that named M1.4
+(`delegated-epoch`, `locks-unlinked-delegated-blips`). The flex strict flags are on
+by default on every flex configuration. `Config::hold_answers_uncommitted`
+(`AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED=1`) is the negative control that
+restores the old answer. The exit's I4 ceilings are listed in PROGRESS, "Plan
+46 M1.4 exit".
+
 **Rejected**:
 - *Finish plan 43 as specified* (C3, C4, C5, C6, C7b-8): keeps five
   classes decided per row, the lead and the lone↔group flip, generations
@@ -2881,7 +2903,8 @@ taken over at the lease's expiry" does not make its journal a second copy: a
 lone root paused past its expiry is taken over from the archive, and a row
 the delegate answered on that journal is lost when the delegate then fails
 (model `node_stream`: knob `root_journal_counts` violates
-`acked_never_lost`). An epoch hold's journal still counts until plan 46 M1.4.
+`acked_never_lost`). An epoch hold's journal counted until plan 46 M1.4 (step 3,
+below, ADR-40's "Landed, the epoch hold as a group").
 Cost: such a delegate's `DelegGroup` answers wait for the root's ship.
 
 **Context**: with no backup recorded for its generation the group of a

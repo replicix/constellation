@@ -64,16 +64,15 @@
 >     (read holds), ADR-58 (settle windows) and ADR-59 (parts A and B, the fill
 >     and the D1 widening) alongside.
 >   - Landed since: FX-1 (an own answer in a hold group names the hold's
->     class, `30a4b497`).
->   - Open:
->     - step 6: 6b and 6c are partly done;
->     - step 7.
->   - Landed since: step 6d (the flex strict flags on by default, 2026-11-27;
->     the D9 deferral and the C2h deferral are closed).
+>     class, `30a4b497`); step 6d (the flex strict flags on by default,
+>     2026-11-27; the D9 deferral and the C2h deferral are closed); step 7
+>     (harness, latency, docs, exit write-up; PROGRESS, "Plan 46 M1.4 exit").
+>   - Open: step 6's I4 remainder (6b and 6c are partly done; FX-4 is not
+>     built) and the Fable M1.4 review (pending).
 >   - The exit's flex I4 criterion is restated (user, 2026-11-26): I4 at
 >     zero on the flex configurations except ADR-58's frozen-epoch class,
->     counted in its own column with a ratcheting ceiling. The §6 M1.4 row
->     is not yet reworded.
+>     counted in its own column with a ratcheting ceiling. The ceilings the
+>     user accepted on 2026-11-27 are in §12 (M1.4's part).
 > - **Not started:** M1.5, stage 2 (M2.0 to M2.4, with the self-fence) and
 >   stage 3.
 >
@@ -934,7 +933,7 @@ histories. Gates at the last commit: fmt and clippy `-D warnings` clean, authori
 | **M1.1 Classes at the configuration** | `RowCommit::{Group{config_version}, Final}` replaces `RowClass`/`AckClass`; one lookup of the configuration in force replaces `root_ack_class_for`, `deleg_ack_class`, the under-lock re-class, the published horizon-with-class and `journaled_class`; the fast path carries the version; the lease's and the stream's reconfiguration records commit under old ∪ new uniformly; `status.ack.classes` becomes `{group, final, singleton, archive_waits}`. The configuration lookup still has to answer "singleton or not": the singleton test is `backup_could_be_had` as of the event (landed with the i1-592 fix: a node with a roster peer linked within the budget, stable or measured yet or not, is never lone, and the cached assessment is raised by every event); M2.3 replaces it with the roster's. It is M1.1's singleton test, kept as such. | The five classes; `LoneLead` oracle; the lead as a commit input. | Sims whose seeds fail today under `+commit` on the class decided one step early (`delegated-holder-cut +commit` seeds 124, 228, 501, 763, 1849, 1900; the C2f far seeds): pass with the rule; a knob `AUTHORITY_SIM_PER_ROW_CLASS=1` re-enabling the old decision must fail. | I1 strict (`strict_commit`) on **every** delegated config; new oracle `row_version_matches_config` (every acknowledged row's version is the configuration in force at its position). | Zero I1 on every config ×2,000; `status` and docs updated. |
 | **M1.2 One stream per node, no lone delegate, C3 verbatim** | The records of §5.2; `DelegationTable` keyed by node with the folded subtree set; the ownership walk resolves to the node; recall becomes a request answered by `SubtreeReleased`; TTL end for placed grants writes `DelegateNodeEnded`; a node with no group and no sticky grant is forwarded, not delegated; C3 items 1–4 under one stream (verbatim root append, verbatim tail in one transaction, the delegate taking the root re-appends verbatim, the deposed root's member copy and predecessor seal); plan 45's key-move rule removed (one stream owns every link's parent or the op is cross-subtree). | `Delegate`, `Recall`, `RecallCut`, `DelegGroup`; `range`, `place_splits`, the histograms, `deleg_windows.rs`' per-range state, `delegate --range`, `CONSTELLATION_DELEGATION_SPLIT`; `deleg_caps`, `deleg_note_xdeps`, `deleg_xgen_*` (`SessionState::deleg_covered` stays: it is the FUSE fast path's covered-for-good watermark, not part of ADR-39's rule); `delegation_stream_rows` as a commit input (kept as the batch size); the lone↔group hysteresis; `deleg_lost_after_ack`; holed generations, the deposed root's rebuild-replay of a delegate's appended rows and `Action::RebuildReplica`'s delegation branch (step 14: a root's append is kept as a member copy and never replayed); **moved to M2.x** (M2.1's replay deletion): the fold (`derive_replay_op`), `MutateOp::Records` and `RebuildReplica`'s non-delegation branch, which serve the root's own rows and the replay queue that stage 2 deletes; `Delegate.designated` (now `SubtreeGrant.kind`). | `delegated-two-gens-one-backed` (ADR-39's 40 of 200 seeds with the rule off) must pass with `deleg_caps` deleted, re-expressed as `delegated-two-dirs-one-backed` (one node, two subtrees, one stream); `placement-hot` ×2,000 including seed 593 (C3 item 4); `delegated-holder-cut` ×2,000; `long-delegated-late-answers-lr`'s 3 I2 copies. | New oracle `acked_at_or_below_cut` (every acknowledged row of a node generation is at or below its cut); I2c strict on every config; `member_copies_drained`; harness `placement-hot`, `delegate-backup-handoff-failover`, `delegated-group-switch`, new `two-subtrees-one-stream-rename` (a rename between a node's two subtrees under a root crash); `two-gens-ack-cost`, `hash-range-split-merge`, `shared-dir-split*` and bench config `b` retired. | Zero I1/I2/I2c/I5 on every config ×2,000; the harness catalogue green; the "Deleted" table complete. |
 | **M1.3 Sticky grants and sticky placement** | §5.3 and §5.4: `SubtreeGrant::Sticky`, placement's sticky proposal for far writers and for the root's own subtrees (never `/`), the long dwell, the handover request; `crates/engine/src/sticky.rs` (idle release, unmount, logind inhibitor, NetworkManager dispatcher, `constellation release`), `repair abandon --node`; the self-fence setting (off); `status.delegation.sticky` (holders, age, last release reason). **Carried from the M1.1 review:** the stale-clock re-check rule (lease6 triage F1), exit: `delegated-core-stall-root-lease6` `+commit` ×2,000 with zero I1 and its `strict_commit` exemption removed. **Done 2026-11-11 ([ADR-52](../../../explanation/DECISIONS.md#adr-52-a-singleton-answer-leaves-only-on-a-fresh-reading-of-a-usable-lease)): 0 of 2,000 seeds, exemption removed.** **Carried from stage 0 (D-1, D-3):** S4 built here as `ReleaseCut` (the recall's cut is a stream row journaled before the read recalls, and the root answers settles at it; [ADR-64](../../../explanation/DECISIONS.md#adr-64-a-release-cuts-first-the-holders-stop-is-a-stream-row-and-settles-are-answered-there), step 15b) with the recall rework, the follow-up S1 (branch `rbe2`), and the cause-6 lease-path buckets A, C, O. | The automatic recall on 30 s windows; the lone root's `Lone` answers for a node with write-eligible peers (its own subtrees now hold grants; the rest waits for the archive). | Sim: `far` and `far-root-writes` (the root with distant peers writing its own subtree) under `strict_durability` with non-singleton rollbacks counted: today's lone rollbacks must be zero after; a knob `AUTHORITY_SIM_TTL_RECLAIMS_STICKY=1` must violate `sticky_ends_only_by_holder_or_operator`. | Model M1.0's properties; sims `sticky-idle-release`, `sticky-handover-ping-pong` (two nodes alternating writes in one subtree with gaps above the grace: the grant changes hands at most once per minimum tenure; a one-off write forwards without a handover), `sticky-holder-dies` (the subtree blocks; `abandon` ends it; the returned holder exports copies), `first-peer-join`; harness `sticky-release-on-unmount`, `sticky-handover-alternating` (the handover count and each writer's latency, measured), `sticky-release-cmd`, `sticky-suspend-inhibitor` (a fake logind on the test bus), `sticky-abandon`; `ack-latency` topology 5 (the far writer's own ops at local speed, final). | Zero non-singleton rollbacks on every config; the carried I4 ceilings (S4: zero by construction for releases that write a row, with the tag strict; the rowless remainder keeps the held release under that strict tag, counted: 17 rowless held releases seen across the sweeps and the tag at 0; the suspend control carries it (51 of 2,000, 50 clean on the fix) and the merge control is about 0.55 % by like class, under the 1 % bar, with the strict tag firing on the fix in 2 of 2,000 merge seeds (841, 1725: S4 stays open for merge, ADR-64 evidence, round 6); the in-gate residual classes, buckets A, C, O) at zero or re-pinned with the reason; G1/G2 re-measured (the G1 p90 nudge decision re-taken on the new numbers, D9). **Added 2026-11-14 (m13s12 review):** the stage-1 exit also runs every sim config ×2,000 with the idle release on (`AUTHORITY_SIM_STICKY_IDLE_MS=1200`), as production defaults to on and the one bug found by it (a root growing its own released stream) showed only there. |
-| **M1.4 The hold as a group** | §5.7: `StreamAheadAck`, the hold's answers wait for one member; a one-member epoch's hold is `Final`. | The hold's uncommitted `NonStealable` answers; variant 3(i)'s special case from M0.2. | `flex-crash` and the `flex*` configs under the strict flags D9 deferred (36–81 of 2,000 seeds fail today): zero after. | The flex model's property with the group; `strict_commit`, `strict_identity` on every flex config; harness `epoch-member-dies-with-chunk`, `flex-crash`'s scenario ×3. | The flex strict flags on (D9, done: step 6d, 2026-11-27, by default on every flex configuration); the C2h deferral closed (done); the I4 ceilings of the flex configurations at zero. |
+| **M1.4 The hold as a group** | §5.7: `StreamAheadAck`, the hold's answers wait for one member; a one-member epoch's hold is `Final`. | The hold's uncommitted `NonStealable` answers; variant 3(i)'s special case from M0.2. | `flex-crash` and the `flex*` configs under the strict flags D9 deferred (36–81 of 2,000 seeds fail today): zero after. | The flex model's property with the group; `strict_commit`, `strict_identity` on every flex config; harness `epoch-member-dies-with-chunk`, `flex-crash`'s scenario ×3. | The flex strict flags on (D9, done: step 6d, 2026-11-27, by default on every flex configuration); the C2h deferral closed (done); the I4 ceilings of the flex configurations at zero **except the accepted ceilings (user, 2026-11-26 and 2026-11-27): the frozen-epoch class F and F-cl, the takeover gate inside a new epoch (class G), and the spurious backup drop of `backup-lag-keeps-its-backup`; they only ratchet down (§12)**. |
 | **M1.5 Docs and gates** | DESIGN §4 "Delegated sub-sequencers", §4 "Acknowledgement and durability", §5.2, §9 "Delegates" and the failover table rewritten for the new records; `delegations.md`, `durability-and-failover.md`, `configuration.md`, `lease-placement.md`; ADR-40 amended with what landed; TESTING.md. | — | — | Full CONVENTIONS gates (pjdfstest 8798/8798); the four-file-system perf gates of §8. | All green; the stage reviewed. |
 
 *M1.1 step 5 notes (from step 4's review, 2026-11-06):* the rows a takeover re-journals (the predecessor's adopted tail,
@@ -1109,7 +1108,7 @@ p50 ≈ 120 ms with 60 ms each way.
 | Same AZ, peer in budget | one LAN RTT (root group); delegate G1 ≤ holder + 0.5 ms | unchanged (the root's append or the backup is the group; one stream per node removes one stream wait) | unchanged | failover ≈ 1.5 s harness / 2.3–4.7 s EC2; nothing acknowledged lost; a delegate's crash: its backup's seal or the TTL end, rows past the cut unacknowledged → requesters retry |
 | Cross-region, far writer (no peer in budget) | own ops 0 ms under a lone delegation, **rolled back** on root loss; forwards WAN RTT | own ops 0 ms under a sticky grant, **final**; the first op in a new subtree waits for the grant record's archive (28–190 ms, once); forwards into its subtree WAN RTT, final; cross-subtree ops recall by request | unchanged | the far writer dies holding a grant: its subtrees block for others (`EROFS`) until it returns and releases, or `repair abandon` (then its post-cut acknowledged rows return as its conflict copies); the root dies: the sticky holder keeps writing (its answers are final; its stream resumes at the next root, which inherits the grant from the log) |
 | Cross-region, the root itself far from every peer | own ops 0 ms (`Lone`, rolled back on a TTL takeover); forwards wait for the archive (C2f) | own ops 0 ms under the root's own sticky grants, final, after one archive wait per new subtree; ops directly in `/` or in others' subtrees wait for the archive; forwards to no grant wait for the archive | unchanged | root death: a TTL claim (60 s + margin) by a peer; the dead root's sticky subtrees block until it returns or `abandon` (today: its lone rows come back as a replay with conflict copies) |
-| S3 outage (continuation epoch) | members' forwards answered by the hold at once, uncommitted | + one LAN RTT (one member's `StreamAheadAck`); a one-member epoch's hold final | unchanged | as today (ADR-22); the hold is never deposed except by retire |
+| S3 outage (continuation epoch) | members' forwards answered by the hold at once, uncommitted | + one LAN RTT (one member's `StreamAheadAck`) by design; **measured at M1.4's exit: about +7 ms per serial op on four file systems (the stream-ahead holdoff, 5 ms, plus the round trip), not yet within the design figure**; a one-member epoch's hold final | unchanged | as today (ADR-22); the hold is never deposed except by retire |
 | Root death while delegates hold grants | placed grants die with the lease after a TTL takeover; after a fast takeover they re-stream | placed grants: unchanged; sticky grants and designations survive the root (they are log records; the next root honours them) | unchanged | a fast takeover re-streams every node stream from what the log has; verbatim, one stream each |
 | Host load | only latency degrades (plan 44, 41) | unchanged | unchanged | a false seal costs a reconfiguration, never a rollback |
 
@@ -1393,7 +1392,51 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       - M1.2's "Deleted" table complete;
       - M1.2 reviewed (Fable, 2026-11-18).
 
-      Still open for this box: everything owned by M1.3, M1.4 and M1.5.
+      *M1.4's part (PROGRESS, "Plan 46 M1.4 exit"); the Fable M1.4 review is
+      pending:*
+      - [x] the hold as a group: `StreamAheadAck`, the hold's answers wait for
+        one member, a one-member epoch's hold final; the hold's `Final` for
+        multi-member epochs, 3(i)'s epoch branch and the two `strict_commit`
+        exemptions deleted ("Deleted" table written);
+      - [x] the flex strict flags on by default on every flex configuration
+        (D9, step 6d, 2026-11-27); the C2h deferral closed;
+      - [x] I1, I2, I2c and I5 strict on the seven flex configurations at
+        2,000 seeds (step 6d: 0 failing, four flags, plain arm);
+      - [x] harness `epoch-member-dies-with-chunk` and `epoch-member-lost`
+        (`flex-crash`'s scenario) seeds 42, 43, 44, all passed;
+      - [x] the S3-outage own-op latency measured on four file systems; it
+        does **not** meet the documented +1 LAN RTT (see PROGRESS: about
+        +7 ms per serial op, the stream-ahead holdoff); recorded, left to
+        the review;
+      - [x] DESIGN §4, `durability-and-failover.md`, ADR-40's note and plan 30
+        §M10's comment at `durable_jseq_cfg` written;
+      - [ ] the flex I4 ceilings at zero apart from the accepted ceilings:
+        the fresh 2,000-seed `+unsettled` sweep after the last FX fix is not
+        part of step 7 (open; FX-4 not built, see below);
+      - [ ] Fable M1.4 review: **pending**.
+
+      *The accepted M1.4 ceilings (user, 2026-11-27; ceilings only ratchet
+      down, none is raised):*
+      - U1-F: the frozen-epoch classes F and F-cl (a requester in a frozen
+        epoch whose hold owner is down, with or without a carrier; 31 seeds
+        of 2,000 on `4e44fd24`: `flex-crash` 17, `flex-tight` 14). ADR-58's
+        column; the design limit is `hold_owner_never_deposed_except_by_retire`
+        (§5.7).
+      - FX-4 class G: `flex-tight` seeds 1157 and 1276 under `+unsettled`: a
+        takeover gate whose S3 step failed inside a new epoch stays pending
+        after a new outage, and the root answers `Held`. Liveness only (`EIO`
+        is the safe answer). FX-4 (a design of the gate inside a new epoch) was
+        not started; the user accepted the two seeds as a ceiling.
+      - The spurious backup drop: `backup-lag-keeps-its-backup` seeds 362,
+        1045 and 1552 (availability only; a backup dropped that should have
+        been kept).
+      The sim ratchet (`m03_the_configurations_at_zero_violations_stay_there`)
+      measures seeds 0..99 only, and none of these seeds is in that range, so
+      no sim ceiling test encodes any of the three; the lists above and in
+      PROGRESS are the record until a sweep-level ceiling exists.
+
+      Still open for this box: everything owned by M1.3 and M1.5, and M1.4's
+      two open items above.
       That includes plan 40's, 41's, 42's and 45's rows at M1.3's exit,
       and G1 to G6 on four file systems.
 - [ ] Stage 2: the coverage verification recorded with the minimal piece

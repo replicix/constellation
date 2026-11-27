@@ -650,7 +650,28 @@ accepted death-then-join window, which ends at that node's first message to
 the root or at the next read
 ([ADR-33](DECISIONS.md#adr-33-commit-is-the-configured-groups-acknowledgement-vertical-paxos-over-s3)). Its answers to its own
 node's clients are the one speculation the design keeps. A **non-stealable** authority (an offline designation, a
-continuation epoch's hold) is never replaced while its holder lives. The rows a
+continuation epoch's hold) is never replaced while its holder lives. **The epoch hold**
+(plan 46 M1.4, [ADR-40](DECISIONS.md#adr-40-every-acknowledgement-is-committed-or-final-one-stream-per-delegate-node-no-server-side-replay)):
+an epoch with two or more members is a group of the owner and one member
+(`CommitRule::Group { on: GroupOn::Hold }`, its version the continuation
+epoch's number, since the membership is fixed per epoch). The owner streams
+its journal to every member; a member answers `StreamAheadAck` once its store
+has committed a batch, and a row of the hold is answered, to the owner's own
+clients and to a member's forward alike, once a member has acknowledged it
+(`durable_jseq_cfg` is the highest acknowledged seq): one LAN round trip more
+than the answer from the owner's disk the hold gave before, by design. Measured
+at the M1.4 exit, a serial writer pays about 7 ms per op on every file system:
+the stream-ahead holdoff (5 ms) the answer now waits behind, plus the round
+trip and the member's commit. A batch no member
+has acknowledged is sent again after 250 ms. An epoch of one member has no one
+to wait for: its hold is `Final` and answers at once. A member that does not
+answer parks the epoch's answers until the client's deadline or the hold's
+end, as any group does. The hold's rows are no longer a second copy that a
+delegate counts without a member's acknowledgement, and no requester holds a
+shadow of a hold's answer as non-stealable: the hold's `NonStealable` kind is
+deleted (designations and sticky grants keep it until stage 2). A member keeps
+the rows it acknowledged as committed and the next claimant carries them;
+`leave` (retire) is the one end of a hold that is not a takeover. The rows a
 node keeps as a **member copy** of a group it no longer sequences for (a
 deposed holder's committed unshipped rows, a backup's tail once its holder's
 lease moved on to a later epoch, a successor's copy of the tail it re-ships)
@@ -1018,8 +1039,8 @@ chosen per filesystem and topology
   as amended by plan 46 M1.1: its lone-journal branch removed), which for a
   lone root is the archive: a lone root paused past its expiry is taken over
   from the archive alone, and a row answered on its journal would be lost
-  with the delegate (an epoch hold's journal still counts until plan 46
-  M1.4). The root's answering alone is a configuration the lease records
+  with the delegate (an epoch hold's journal counts only through a member's
+  acknowledgement, plan 46 M1.4: see "the epoch hold" below). The root's answering alone is a configuration the lease records
   (`singleton`): the transition to and from a peer's configuration is a
   `config_version` bump committed under old and new (plan 46 M1.1 step 5), so
   nothing is answered alone until the archive carries the journal through it,

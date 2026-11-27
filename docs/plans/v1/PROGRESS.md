@@ -72617,3 +72617,128 @@ Class L of the flex failures (`flex-crash+commit+identity+settle+durability+unse
 - [x] Sweep, 2,000 seeds each, plain arm, default flags (this tree, `3c569115`) against `003e3679` (origin/main) with `+commit+identity+settle+durability` added: 0 failing seeds on both trees in each of the seven configurations (`SWEEP-FAIL ` count 0 and 0), so the two are identical.
 - [x] The `+commit`, `+identity`, `+settle` and `+durability` labels now repeat the default on a flex configuration (the old pins keep their meaning); `+unsettled` and `+oracles` keep theirs; ceilings and pins unchanged.
 - [x] Gate (standard): see the landing note.
+
+## Plan 46 M1.4 exit (2026-11-27)
+
+M1.4 (the epoch hold as a group) is code-complete on `main` at `5bae9b89`; this section is step 7: harness runs, the four-file-system latency, the docs and the exit
+write-up. **Not closed: the Fable M1.4 review is pending.** Step 7 added only a measure-only harness topology (`ack-latency` topology 10) and a code comment (the
+`durable_jseq_cfg` comment, plan 30 §M10).
+
+### Harness runs (release build of `5bae9b89`, `--s3-backend docker`, seeds 42, 43, 44, quiet timing box)
+
+| scenario | seed 42 | seed 43 | seed 44 |
+|---|---|---|---|
+| `epoch-member-dies-with-chunk` | PASSED (197 s) | PASSED (194 s) | PASSED (196 s) |
+| `epoch-member-lost` (`flex-crash`'s scenario: the harness has no scenario of that name) | PASSED (14 s) | PASSED (14 s) | PASSED (14 s) |
+
+Six of six passed. (Step 0's runs on the parent of the hold's rule: `epoch-member-dies-with-chunk` 44 to 53 s on a loaded host, `epoch-member-lost` 15 to 17 s, all passed;
+the scenarios are not a fail-before for the hold, the sim sweeps are.)
+
+### S3-outage own-op latency on four file systems
+
+There was no harness row for it: `ack-latency` had no continuation-epoch topology (step 0 recorded the baseline as not measured). Topology 10, `10-epoch-outage`
+(`ACK_LATENCY_TOPOLOGIES=10`, off by default), cuts S3 under two nodes until both are in the epoch, then times create, rename, unlink and chmod on the holder (`holder`, its
+own ops) and on the member (`forward`, forwarded to the holder). No `write` row: the 4 KiB `fsync` waits for the data's upload, which the cut never lets finish.
+Before = a release build of `17edeab7` (M1.4 step 1: the hold still answers from the owner's disk; the stream-ahead acknowledgement exists but nothing waits for it) with the
+topology added; after = `5bae9b89` with the topology added. One harness run per cell, pinned with `taskset` to 8 cores, 100 samples per op and actor, the two trees
+alternating (A/B/B/A), four runs per tree and file system, a run started only with the one-minute load below 2 (0.5 to 1.9 at the starts); the quiet timing box, loopback
+(LAN RTT well under 1 ms). Cells: median over the four runs of p50 / p99, in microseconds.
+
+| file system | actor | op | before p50 / p99 | after p50 / p99 |
+|---|---|---|---|---|
+| ext4 | holder | create | 91 / 199 | 7260 / 7686 |
+| ext4 | holder | rename | 60 / 86 | 7370 / 7758 |
+| ext4 | holder | unlink | 48 / 76 | 7432 / 7851 |
+| ext4 | holder | chmod | 30 / 62 | 6998 / 7848 |
+| ext4 | forward | create | 920 / 4224 | 6867 / 7936 |
+| ext4 | forward | rename | 7016 / 7963 | 7107 / 7856 |
+| ext4 | forward | unlink | 7236 / 7802 | 7312 / 7784 |
+| ext4 | forward | chmod | 7247 / 7895 | 6842 / 8062 |
+| xfs | holder | create | 79 / 214 | 7258 / 7727 |
+| xfs | holder | rename | 75 / 145 | 7382 / 7762 |
+| xfs | holder | unlink | 48 / 92 | 7393 / 7888 |
+| xfs | holder | chmod | 36 / 75 | 7028 / 7784 |
+| xfs | forward | create | 927 / 4234 | 6892 / 7863 |
+| xfs | forward | rename | 7012 / 7983 | 7112 / 7644 |
+| xfs | forward | unlink | 7234 / 7736 | 7342 / 7770 |
+| xfs | forward | chmod | 7044 / 7868 | 6862 / 7956 |
+| btrfs | holder | create | 99 / 210 | 7258 / 7779 |
+| btrfs | holder | rename | 59 / 90 | 7372 / 7799 |
+| btrfs | holder | unlink | 66 / 94 | 7422 / 7709 |
+| btrfs | holder | chmod | 39 / 62 | 6960 / 7792 |
+| btrfs | forward | create | 922 / 4140 | 6888 / 7966 |
+| btrfs | forward | rename | 7018 / 7943 | 7104 / 7879 |
+| btrfs | forward | unlink | 7216 / 7765 | 7352 / 7867 |
+| btrfs | forward | chmod | 7075 / 7918 | 6871 / 7934 |
+| tmpfs | holder | create | 90 / 198 | 7252 / 7734 |
+| tmpfs | holder | rename | 82 / 126 | 7366 / 7758 |
+| tmpfs | holder | unlink | 62 / 100 | 7431 / 7776 |
+| tmpfs | holder | chmod | 37 / 72 | 6942 / 7886 |
+| tmpfs | forward | create | 904 / 4190 | 6861 / 7924 |
+| tmpfs | forward | rename | 6998 / 7961 | 7100 / 7972 |
+| tmpfs | forward | unlink | 7204 / 7632 | 7315 / 7855 |
+| tmpfs | forward | chmod | 7324 / 7911 | 6856 / 7960 |
+
+**Result: the documented expectation (the S3-outage row of §7, +1 LAN RTT) is not met.** The holder's own ops go from 0.03 to 0.1 ms to about 7.3 ms (p99 about 7.8 ms) on
+every file system, so the cost is not the disk's; the forwards were already about 7.1 ms before (the first create of the forward run, 0.9 ms before, the only cell that moves
+the other way, is a cold sample) and stay there. The 7 ms is `stream_ahead_holdoff_ms` (5 ms): `stream_ahead_soon` sends a batch at once only if none went in the last 5 ms,
+and the hold's answers now wait for the member's acknowledgement of that batch, so a serial writer's next op waits out the rest of the holdoff plus the round trip and the
+member's commit. The holdoff did not show while the hold answered from the owner's disk. Concurrent writers share a batch, so only a serial writer (one op, then the next)
+pays it in full; a tar or a compile in the epoch is not a serial writer in this sense, a shell loop or a git operation is. Not changed here (step 7 is measure and docs):
+the options are a shorter holdoff in an open hold, or a send-at-once when an answer waits for it; the review decides. Files: `/data/cst/w16/lat`.
+
+### Baseline tables
+
+Fail-before and after, flex configurations, `+commit`, 2,000 seeds (step 2's table: the knob `AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED=1` restores the pre-M1.4 answer and fails
+the same seeds the old code failed; "after" is step 6d's sweep with the four flags on by default, `3c569115`, against `003e3679`: 0 failing on both trees):
+
+| configuration | with the knob (the hold's `Final`) | step 2 (the rule) | step 6d (flags default on) |
+|---|--:|--:|--:|
+| `flex` | 71 | 7 (class claim, not the hold's) | 0 |
+| `flex-crash` | 39 | 7 | 0 |
+| `flex-tight` | 57 | 11 | 0 |
+| `flex-backup` | 72 | 0 | 0 |
+| `flex-taker-ahead` | 40 | 0 | 0 |
+| `flex-promiser-restart-step-forward` | 113 | 0 | 0 |
+| `flex-zero` | 0 | 0 | 0 |
+| `delegated-epoch` | 57 | 6 (step 3 removed the rest; its `strict_commit` exemption is gone) | not in step 6d's seven |
+
+I1, I2, I2c and I5 therefore run strict on every flex configuration at 2,000 seeds (step 6d), and `flex-crash` has no I2(b). The I4 column is the accepted ceilings below.
+
+### Deleted (M1.4)
+
+| mechanism | introduced (why) | deleted | the state cannot arise |
+|---|---|---|---|
+| The hold's `Final` answer for a hold with a member (`durable_jseq_cfg`'s `u64::MAX` branch for multi-member epochs; the fast path's licence `lone_ok` in a hold) | plan 30 §M10 (`node-leave`: gating the hold on the lease's backups parked every answer for the epoch's life) | step 2, `5775163e` (+ fix `b5a3f32a`); the branch stays for a one-member epoch and the knob | core `a_hold_with_a_member_answers_after_the_members_ack`; sim `flex` and `flex-crash` with the knob fail (I1 "shadow installed for an answer not said to be committed"), 71 and 39 seeds of 2,000, and 0 without it |
+| The hold's uncommitted `NonStealable` answer (variant 3(i)'s epoch branch: `answered_non_stealable`'s open-epoch clause, the requester's non-stealable shadow of a hold's answer) | plan 46 M0.2 R7 (variant 3(i)) | `65a9aa73` (2026-11-11); designations and sticky grants keep theirs until stage 2 | `answered_non_stealable` takes `!committed && gen != 0 && (said || a non-stealable delegation)`; an open epoch is no clause |
+| The "epoch hold's journal counts until M1.4" branches of `config_committed_jseq` and `deleg_group`'s hold exception | plan 46 M1.1 step 1 (ADR-41's amendment) | step 3, `f13997dc`: a delegate counts a hold's row by the member-acked seq | step 3's core and sim tests (the delegated I1 seeds step 2 left, 983 and 351, were step 3's) |
+| The two `strict_commit_exempt` entries that named M1.4 (`delegated-epoch`, `locks-unlinked-delegated-blips`) | plan 43 (the hold's non-stealable answers install shadows no commit backs; a delegate's row the root appended in a hold) | step 3 | the pinning test asserts both strict |
+| `committed: !in_epoch` in `stream_ahead` | M1.4's predecessor, the hold's stream as speculation | step 4, `c7ff4758` | the member keeps the acknowledged rows as committed (step 4's tests) |
+| The flex strict-flag deferral (D9) and plan 43 C2h's flex deferral | plan 43 C2h / plan 46 D9 | step 6d, 2026-11-27 | `flex_config()` sets the four flags; 0 of 2,000 seeds in each of seven configurations |
+
+Stage-2 deletions step 4 added (not deleted here): `LiveEntry::uncarried_by_takeover`, the marker-proven no-tail rule and the same-tenure rule for gated entries (step 4's note).
+
+### Accepted ceilings (user, 2026-11-26 and 2026-11-27; they only ratchet down, none is raised)
+
+| ceiling | seeds | what it is | owner |
+|---|---|---|---|
+| U1-F: frozen-epoch classes F and F-cl (the existing ADR-58 column) | 31 of 2,000 on `4e44fd24`: `flex-crash` 17, `flex-tight` 12 (F) and 1631, 404 (F-cl, carrier-less) | an unsettled `EIO` of a requester in a frozen epoch whose hold owner is down; the product's design limit (`hold_owner_never_deposed_except_by_retire`, ADR-58 C2/Q2) | none (restated exit, user 2026-11-26) |
+| FX-4 class G, under `+unsettled` | `flex-tight` 1157, 1276 | a takeover gate inside a new epoch stays pending after a new outage (the re-take's epoch-marker PUT or inbox LIST failed because a new outage began) and the root answers `Held`; liveness only, the `EIO` is the safe answer; FX-4 (a design) was not started | accepted, user 2026-11-27 |
+| Spurious backup drop | `backup-lag-keeps-its-backup` 362, 1045, 1552 | a backup dropped that should have been kept; availability only (M1.2 exit's tracked item) | accepted, user 2026-11-27 |
+
+The sim ratchet `m03_the_configurations_at_zero_violations_stay_there` measures seeds 0..99 and none of these seeds is in that range, so no sim ceiling test encodes class G or the
+backup drop (the `+unsettled` sweeps list them); a sweep-level ceiling would have to count seeds over 0..1999. Not added here.
+
+### Exit checklist (plan 46 §6, M1.4 row)
+
+- [x] The hold as a group: `StreamAheadAck`; the hold's answers wait for one member; a one-member epoch's hold is `Final` (steps 1 to 4).
+- [x] The flex strict flags on by default on every flex configuration (D9, step 6d); the C2h deferral closed.
+- [x] I1, I2, I2c and I5 strict on every flex configuration at 2,000 seeds (step 6d; table above); `flex-crash` zero I2(b).
+- [x] Harness `epoch-member-dies-with-chunk` and `epoch-member-lost` (`flex-crash`'s scenario), three seeds each: all passed.
+- [x] The S3-outage own-op latency on ext4, xfs, btrfs and tmpfs measured (above). **It does not meet +1 LAN RTT (about 7 ms per serial op); recorded for the review.**
+- [x] DESIGN §4 ("the epoch hold"), `durability-and-failover.md` (the S3-outage row, the one-member epoch final), ADR-40's note, plan 30 §M10's comment at `durable_jseq_cfg`.
+- [x] The "Deleted" table (above) and the baseline table (above).
+- [x] The accepted ceilings recorded (above and plan 46 §12).
+- [ ] The flex I4 ceilings at zero apart from the accepted ceilings: no fresh `+unsettled` sweep over 2,000 seeds of the seven flex configurations on the final tree was run in step 7;
+  the last numbers are `4e44fd24`'s triage (`/data/cst/w14/report.txt`) with FX-1, FX-2, FX-3, FX-5 and FX-6 landed since. **Open.**
+- [ ] Fable M1.4 review: **pending** (the supervisor runs it after this step).
