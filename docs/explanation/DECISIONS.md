@@ -5348,7 +5348,10 @@ before the outage.
   behind another node's pending upload whose uploader may never return
   (`Meta::rid_behind_lost_chunk`, from the last ship round, by the plan's
   blame on the remote-pending rows). A row that is merely deferred for this
-  node's own upload ships by itself and does not count. A settling requester that hears it (or that is the sequencer
+  node's own upload ships by itself and does not count. A row a decided,
+  unapplied drop releases is still reported behind a lost chunk, with
+  `releasing`; `rid_behind_lost_chunk`, which the oracle reads, is unchanged.
+  A settling requester that hears it (or that is the sequencer
   itself and finds the rid in its own plan) labels its unsettled `EIO`
   (`take_unsettled_lost_chunk`, stat `unsettled_held_lost_chunk`); the label
   is the last `Held`'s word. The oracle accepts it only against global truth,
@@ -5386,14 +5389,35 @@ before the outage.
   answer: the root then answers the rid (its outcome or the settle's
   refusal) and the client hears that instead of the unsettled `EIO`. A root
   that still holds the row answers `Held` behind the lost chunk again, and
-  that answer ends the settle in doubt at once, labelled (waiting out the
-  moved deadline would let a drop land unasked). The final ask spends the
+  that answer ends the settle in doubt at once, labelled, unless it says
+  `releasing` (waiting out the moved deadline would let a drop land unasked). The final ask spends the
   frozen-epoch grace too, so the two do not stack. The rule keys on the
   root's own word, not on the negative control's label
-  (`lost_chunk_label_always`). **Bound**: one forward timeout more for such a
-  settle's unsettled `EIO` (500 ms at the defaults, 400 ms in the sim).
-  Counters `settle_final_asks`, `settle_final_asks_held`. Pinned by
-  `flex-crash` seed 89
+  (`lost_chunk_label_always`).
+  Amended (FX-3, 2026-11-27): `Held` gains `releasing`, set with `lost_chunk`
+  by a root for a row that a drop decided and not yet applied releases: the
+  drop names its transaction, or the row is held only through transactions it
+  names (`Meta::rid_released_by_decided_drop`, from the last ship round like
+  `lost_chunk`, or by a plan naming the rid now; every decided plan counts,
+  its record shipped or not). `lost_chunk`, the label and the final ask's
+  eligibility are unchanged. A final ask answered by a generation-0 `Held`
+  that does not say `lost_chunk`, or says it with `releasing`, no longer ends
+  the settle at its forward-timeout deadline: the deadline moves once, to one
+  settle window after that answer, never past `settle_cap`, and the
+  durability grace is spent (`durable_grace`; a C5b route has spent it
+  already, so the two do not stack). Not for a settle that asked in an epoch
+  refusing writes (`frozen_since`): C2's bound stands. A later `Held` behind
+  the lost chunk without `releasing` (the drop was cancelled) ends the settle
+  at once, labelled, as before. **Bound**: one forward timeout more for such
+  a settle's unsettled `EIO` (not capped, once), and, when the final ask is
+  answered so, at most one settle window after that answer and never past
+  `settle_cap` (at most 3.4 s after the deadline in the sim, 30.5 s at the
+  defaults). The worst case of any settle is unchanged. Counters
+  `settle_final_asks`, `settle_final_asks_held`,
+  `settle_final_asks_ended_hold`, `settle_final_asks_releasing`. Pinned by
+  `flex-crash` seeds 1111, 1199, 1635
+  (`fx3_settle_and_drop_held_agree_at_the_c5_boundary`; strict
+  commit+identity+settle+durability) and by `flex-crash` seed 89
   (`adr58_c5_a_settle_held_behind_a_lost_chunk_asks_once_more_at_its_deadline`:
   the drop at t=23000, the deadline at t=23172 with the next ask, sent before
   the drop, in flight) and by
