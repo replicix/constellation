@@ -54,6 +54,12 @@
 //!    hazard delays: the stream owns both parents). Nothing is asserted
 //!    about the numbers; a node's rows no longer wait for another
 //!    generation's (ADR-39's cost is gone with the generations).
+//! 10. `10-epoch-outage`: two nodes, S3 cut until both are in the
+//!    continuation epoch (plan 46 M1.4 step 7): the holder's own ops and the
+//!    member's forwards (no `write` row: its `fsync` waits for the data's
+//!    upload, which the cut never lets finish). A hold with a member answers after the member's
+//!    `StreamAheadAck`, one LAN round trip more than the pre-M1.4 answer from
+//!    the owner's disk. Runs only when `ACK_LATENCY_TOPOLOGIES` names it.
 //!
 //! One JSON document on stdout:
 //! `{"scenario":"ack-latency","load":…,"results":[{"topology","actor","op","n","p50_us","p90_us","p99_us"}]}`.
@@ -145,6 +151,18 @@ fn timed<T>(f: impl FnOnce() -> std::io::Result<T>, what: &str) -> Result<Durati
 /// The five ops of one actor on its own mount, in the directory `dir` (a
 /// path on that actor's mount): `n` samples each.
 fn measure_ops(rows: &mut Rows, actor: &str, dir: &Path, n: usize) -> Result<()> {
+    measure_ops_with(rows, actor, dir, n, true)
+}
+
+/// [`measure_ops`], with or without the `write` row: its `fsync` waits for
+/// the data's upload, which a cut S3 never completes (topology 10).
+fn measure_ops_with(
+    rows: &mut Rows,
+    actor: &str,
+    dir: &Path,
+    n: usize,
+    with_write: bool,
+) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     // create: O_CREAT|O_EXCL on a fresh name; the descriptor closes after
     // the clock stops.
@@ -161,22 +179,24 @@ fn measure_ops(rows: &mut Rows, actor: &str, dir: &Path, n: usize) -> Result<()>
         drop(f);
     }
     rows.add(actor, "create", create);
-    // write: 4 KiB and fsync on a prepared file.
-    let block = vec![0xa5u8; 4096];
-    let targets = prepare(dir, "write", n)?;
-    let mut write = Vec::with_capacity(n);
-    for p in &targets {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(p)
-            .with_context(|| format!("opening {}", p.display()))?;
-        let t = Instant::now();
-        f.write_all(&block)?;
-        f.sync_all()?;
-        write.push(t.elapsed());
+    if with_write {
+        // write: 4 KiB and fsync on a prepared file.
+        let block = vec![0xa5u8; 4096];
+        let targets = prepare(dir, "write", n)?;
+        let mut write = Vec::with_capacity(n);
+        for p in &targets {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .with_context(|| format!("opening {}", p.display()))?;
+            let t = Instant::now();
+            f.write_all(&block)?;
+            f.sync_all()?;
+            write.push(t.elapsed());
+        }
+        rows.add(actor, "write", write);
     }
-    rows.add(actor, "write", write);
     // rename.
     let targets = prepare(dir, "rename", n)?;
     let mut rename = Vec::with_capacity(n);
@@ -310,9 +330,45 @@ pub fn ack_latency(_seed: u64) -> Result<()> {
         if only.as_ref().is_some_and(|o| o.contains(&7)) {
             all.push(topology_wan_sticky(n)?);
         }
+        if only.as_ref().is_some_and(|o| o.contains(&10)) {
+            all.push(topology_epoch_outage(n)?);
+        }
     }
     finish(all, load);
     Ok(())
+}
+
+fn topology_epoch_outage(n: usize) -> Result<Rows> {
+    let (env, root) = super::setup("ack-latency-10-epoch-outage")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{}/epoch-lat-{}", crate::s3env::BUCKET, super::ts());
+    let (mut c0, mut c1) = super::epoch_clients(&env, root.path(), &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    let mut clients = vec![c0, c1];
+    let result = (|| -> Result<Rows> {
+        let (a, b) = (&clients[0], &clients[1]);
+        super::wait_for_p2p(&[a, b])?;
+        std::fs::create_dir_all(a.mnt.join("t10"))?;
+        eventually("t10 visible on b", Duration::from_secs(30), || {
+            ensure!(b.mnt.join("t10").is_dir());
+            Ok(())
+        })?;
+        proxy.cut()?;
+        super::wait_for_epoch([a, b])?;
+        let mut rows = Rows::new("10-epoch-outage");
+        measure_ops_with(&mut rows, "holder", &a.mnt.join("t10/own"), n, false)?;
+        measure_ops_with(&mut rows, "forward", &b.mnt.join("t10/fwd"), n, false)?;
+        ensure!(
+            a.control_status()?["epoch"]["active"] == true,
+            "the epoch ended during the measurement"
+        );
+        proxy.heal()?;
+        Ok(rows)
+    })();
+    unmount_all(&mut clients);
+    result
 }
 
 fn topology_single(n: usize) -> Result<Rows> {
