@@ -72701,6 +72701,8 @@ member's commit. The holdoff did not show while the hold answered from the owner
 pays it in full; a tar or a compile in the epoch is not a serial writer in this sense, a shell loop or a git operation is. Not changed here (step 7 is measure and docs):
 the options are a shorter holdoff in an open hold, or a send-at-once when an answer waits for it; the review decides.
 
+**Cure (open-hold send at once).** In an open hold with a group, `stream_ahead_soon` skips the holdoff when no batch awaits a member's acknowledgement (the next batch goes with that ack, so concurrent writers still share one). The answer still waits for the member's ack: only the send time moved. Measured the same way (topology 10, 100 samples, main against the cure, four runs per tree and file system, A/B/B/A): the holder's create, rename, unlink and chmod take 0.25 to 0.44 ms at p50 (at most 0.53 ms at p99) on ext4, xfs, btrfs and tmpfs, against 7.0 to 7.4 ms (p99 at most 7.9 ms) on main; the forwards go from 6.8 to 7.3 ms to 1.6 to 2.6 ms (p99 at most 2.9 ms). That is the pre-M1.4 figure plus one LAN round trip and the member's commit: the documented +1 LAN RTT is met.
+
 ### Baseline tables
 
 Fail-before and after, flex configurations, `+commit`, 2,000 seeds (step 2's table: the knob `AUTHORITY_SIM_HOLD_ANSWERS_UNCOMMITTED=1` restores the pre-M1.4 answer and fails

@@ -1286,15 +1286,25 @@ of the owner and one member: a row is answered, to the owner's own clients
 and to the members' forwards alike, once a member has acknowledged it. That
 is, by design, one LAN round trip over the answer from the owner's disk
 that the hold gave before (the S3-outage row of the table above). **Measured
-(M1.4 exit, `ack-latency` topology 10, two nodes, loopback):** a serial
-writer's create, rename, unlink and chmod take about 7 ms in the hold, on
-ext4, xfs, btrfs and tmpfs alike, against 0.04 to 0.1 ms before; the
-forwards of a member were already about 7 ms. The 7 ms is the stream-ahead
-holdoff (`stream_ahead_holdoff_ms`, 5 ms: the owner sends a batch at once
-only if none went in the last 5 ms) plus the round trip and the member's
-commit: the answer used not to wait for the stream, so the holdoff did not
-show. Several writers share a batch, so only a serial writer pays it in
-full. An epoch of one
+(`ack-latency` topology 10, two nodes, loopback, 100 samples, four runs per
+tree and file system):** a serial writer's create, rename, unlink and chmod
+in the hold take 0.25 to 0.44 ms at the median (at most 0.53 ms at p99) on
+ext4, xfs, btrfs and tmpfs alike, against 0.04 to 0.1 ms from the owner's
+disk before the hold's group, and the forwards of a member 1.6 to 2.6 ms
+(at most 2.9 ms at p99). The M1.4 exit measured about 7 ms for both: the
+stream-ahead holdoff (`stream_ahead_holdoff_ms`, 5 ms: a batch goes at once
+only if none went within the last 5 ms) sat in front of the member's copy
+that the answer now waits for. In an open hold with a group the owner now
+sends a batch at once whenever no batch awaits a member's acknowledgement;
+with one in flight the next goes when its acknowledgement arrives or the
+holdoff elapses, whichever is first, so concurrent writers still share a
+batch. The answer needs any one member's acknowledgement, but the send-at-once
+needs every member's last batch acknowledged: in an epoch of three or more
+nodes one slow member turns the speedup off and a serial writer pays the
+holdoff again. Only the send time changed: the
+answer still waits for the member's acknowledgement. The holdoff keeps
+batching everywhere else (backups, subscribers outside the epoch).
+An epoch of one
 member has nobody to wait for: its hold is final and answers at once. The
 owner sends a batch no member has acknowledged again after
 `hold_resend_ms` (250 ms). A member that never answers (a partition, a
