@@ -3409,22 +3409,22 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let waiting: Vec<(Rid, Phase)> = self
+        let rids: Vec<Rid> = self
             .clients
             .iter()
-            .filter(|(_, c)| {
-                c.settle
-                    && c.frozen_since.is_some()
-                    && c.withdraw.is_none_or(|w| w.route_waiting.is_none())
-                    && match c.phase {
-                        Phase::Backoff | Phase::AcquireRetry => true,
-                        Phase::Forwarded { .. } => c.timer.is_none(),
-                        _ => false,
-                    }
-            })
-            .map(|(rid, c)| (*rid, c.phase.clone()))
+            .filter(|(_, c)| Self::wakeable(c))
+            .map(|(rid, _)| *rid)
             .collect();
-        for (rid, phase) in waiting {
+        for rid in rids {
+            // Handling an earlier settle may have moved this one on: act on
+            // its phase and timer now, not as the snapshot saw them.
+            let Some(c) = self.clients.get(&rid) else {
+                continue;
+            };
+            if !Self::wakeable(c) {
+                continue;
+            }
+            let phase = c.phase.clone();
             tracing::debug!(
                 node = self.cfg.node_id,
                 ?rid,
@@ -3446,6 +3446,18 @@ impl Core {
                 _ => self.on_forward_backoff(now, rid, replica, out),
             }
         }
+    }
+
+    /// A settle `wake_frozen_settles` acts on (see there).
+    fn wakeable(c: &ClientOp) -> bool {
+        c.settle
+            && c.frozen_since.is_some()
+            && c.withdraw.is_none_or(|w| w.route_waiting.is_none())
+            && match c.phase {
+                Phase::Backoff | Phase::AcquireRetry => true,
+                Phase::Forwarded { .. } => c.timer.is_none(),
+                _ => false,
+            }
     }
 
     fn schedule_acquire_retry(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {

@@ -528,6 +528,12 @@ impl Core {
     /// grace with nothing heard from it since. "Not yet talked to" means
     /// reachable: the first forward dials. A slow or timing-out reply on
     /// an open connection is never an outage.
+    ///
+    /// "Heard" means inbound (the link table or `peer_heard`): on a one-way
+    /// link (inbound works, outbound does not) every unsolicited message
+    /// from the holder ends the outage, so each failure costs one more
+    /// forward timeout before the next one is held back. Availability only.
+    /// (The sim has no one-way partition: `set_partition` cuts both ways.)
     pub(crate) fn reaches(&mut self, now: Now, holder: NodeId) -> bool {
         if !self.cfg.p2p {
             return false;
