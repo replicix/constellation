@@ -5389,8 +5389,8 @@ before the outage.
   answer: the root then answers the rid (its outcome or the settle's
   refusal) and the client hears that instead of the unsettled `EIO`. A root
   that still holds the row answers `Held` behind the lost chunk again, and
-  that answer ends the settle in doubt at once, labelled, unless it says
-  `releasing` (waiting out the moved deadline would let a drop land unasked). The final ask spends the
+  that answer ends the settle in doubt at once, labelled (waiting out the
+  moved deadline would let a drop land unasked), unless it says `releasing`. The final ask spends the
   frozen-epoch grace too, so the two do not stack. The rule keys on the
   root's own word, not on the negative control's label
   (`lost_chunk_label_always`).
@@ -5409,7 +5409,8 @@ before the outage.
   refusing writes (`frozen_since`): C2's bound stands. A later `Held` behind
   the lost chunk without `releasing` (the drop was cancelled) ends the settle
   at once, labelled, as before. **Bound**: one forward timeout more for such
-  a settle's unsettled `EIO` (not capped, once), and, when the final ask is
+  a settle's unsettled `EIO` (500 ms at the defaults, 400 ms in the sim; not
+  capped, once), and, when the final ask is
   answered so, at most one settle window after that answer and never past
   `settle_cap` (at most 3.4 s after the deadline in the sim, 30.5 s at the
   defaults). The worst case of any settle is unchanged. Counters

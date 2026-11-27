@@ -65344,7 +65344,8 @@ mod c2g_settle {
     /// the cap; not when the durability grace is spent already (a C5b route,
     /// the local durability grace); not for a settle that asked in an epoch
     /// refusing writes (ADR-58 C2's bound stands); not for a delegate's
-    /// answer.
+    /// answer. (The spent-grace and frozen variants set `durable_grace` and
+    /// `frozen_since` by hand: they approximate the real routes.)
     #[test]
     fn a_final_ask_answered_held_without_a_lost_chunk_waits_one_window_once() {
         let answer = |r: &mut Harness, req: OpId| {
@@ -71368,7 +71369,7 @@ mod await_retry {
         );
         let timer = parked_rename_of_node_two(&mut h, p, 61);
         assert_eq!(held_words(&mut h, timer, 61), (true, true));
-        // The retry applies it.
+        // The retry applies it (DROP_APPLY_RETRY_MS, 1_000, plus slack).
         h.advance(1_500);
         h.core.complete_ready(h.clk(), &h.meta, &mut out);
         ship_round(&mut h, 100, &mut out);
@@ -71399,20 +71400,29 @@ mod await_retry {
             "taken back at once"
         );
         assert!(
-            all.iter().all(|a| !matches!(
+            !all.iter().any(|a| matches!(
                 a,
-                Action::Send {
-                    msg: PeerMsg::MutateReply {
-                        outcome: MutateOutcome::Accepted { .. } | MutateOutcome::Abandoned,
-                        ..
-                    },
-                    ..
-                }
+                Action::Send { msg: PeerMsg::MutateReply { outcome, .. }, .. }
+                    if super::backup::is_answer(outcome)
             )),
-            "answered as executed or refused: {all:?}"
+            "answered definitively: {all:?}"
         );
+        for req in [60, 61] {
+            assert!(
+                reply_to(&all, req).map_or(true, |o| !super::backup::is_answer(&o)),
+                "park {req}: {all:?}"
+            );
+        }
         refresh_the_plan(&h);
         assert!(!h.meta.rid_released_by_decided_drop(p), "and after a plan");
+        // What the requester hears from the deposed node: a retry, never a
+        // definitive answer (the park went with the deposition, so there is no
+        // `Held` left to carry a word).
+        let out = forward_raw(&mut h, 2, 62, p, &rename_in_root("broken", "moved"));
+        assert!(
+            reply_to(&out, 62).map_or(true, |o| !super::backup::is_answer(&o)),
+            "{out:?}"
+        );
         assert!(h.meta.rid_behind_lost_chunk(p), "still behind the chunk");
     }
 

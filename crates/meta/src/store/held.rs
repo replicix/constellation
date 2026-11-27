@@ -1263,8 +1263,11 @@ fn tx_keys(
 
 /// The identities the records of every decided, unapplied drop name, shipped
 /// or not (the plan key lives from the decision until the apply or a cancel;
-/// [`Named`] reads the unshipped ones only). `None` when no plan is stored:
-/// a round without a drop pays one atomic read.
+/// [`Named`] reads the unshipped ones only). `None` when no plan is stored
+/// (a round pays one atomic read once the `maybe` bit is clear; it starts set
+/// and only `drop_plan_names_rid` clears it, so until then one empty prefix
+/// seek), and when a plan cannot be read: the safe side of this word is "not
+/// released", and a latency hint must not stop the ship round.
 fn decided_drop_idents(
     r: &impl Readable,
     meta: &Meta,
@@ -1274,9 +1277,22 @@ fn decided_drop_idents(
     }
     let mut idents = HashSet::new();
     for guard in r.prefix(&meta.local, DROP_PLAN_PREFIX) {
-        let (_, v) = guard.into_inner()?;
-        let plan: DropPlan = postcard::from_bytes(&v)?;
-        idents.extend(plan.idents.iter().copied());
+        let plan = guard
+            .into_inner()
+            .map_err(MetaError::from)
+            .and_then(|(_, v)| postcard::from_bytes::<DropPlan>(&v).map_err(MetaError::from));
+        match plan {
+            Ok(plan) => idents.extend(plan.idents.iter().copied()),
+            Err(error) => {
+                if !meta.drop_plan_read_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        %error,
+                        "a drop plan could not be read: no row is reported released by a decided drop"
+                    );
+                }
+                return Ok(None);
+            }
+        }
     }
     Ok((!idents.is_empty()).then_some(idents))
 }
@@ -1924,7 +1940,8 @@ impl Meta {
     /// its record shipped or not). Never true for a row
     /// [`Self::rid_behind_lost_chunk`] does not report. As fresh as the last
     /// ship round (a drop cancelled through [`Self::drop_held_cancel`] takes
-    /// it back at once; a stream drop cancelled by `cancel_stream_drop_tx`,
+    /// it back at once, unless a ship round that read the plans before the
+    /// cancel stores its summary after it: then at the next round; a stream drop cancelled by `cancel_stream_drop_tx`,
     /// in the caller's transaction, does at the next round). A row whose
     /// second walk is deferred, an unidentified one and a retired identity
     /// are not released: the word stays on the safe side.
@@ -5390,6 +5407,23 @@ mod tests {
 #[cfg(test)]
 mod drop_plan_state_tests {
     use super::*;
+
+    /// FX-3: a drop plan that cannot be decoded reports no row released and
+    /// does not stop the ship round (`decided_drop_idents` is a latency hint).
+    #[test]
+    fn an_undecodable_drop_plan_releases_nothing_and_does_not_stop_the_round() {
+        let m = Meta::open_in_memory().unwrap();
+        let mut key = DROP_PLAN_PREFIX.to_vec();
+        key.extend_from_slice(&7u64.to_be_bytes());
+        let mut tx = m.db.write_tx();
+        tx.insert(&m.local, key, vec![0xff; 3]);
+        tx.commit().unwrap();
+        m.bump_drop_plans_state();
+        let r = m.db.read_tx();
+        assert!(matches!(decided_drop_idents(&r, &m), Ok(None)));
+        drop(r);
+        assert!(m.take_shippable(usize::MAX).is_ok());
+    }
 
     /// ADR-59 part B (D3): a reader that scans between a plan's write and its
     /// commit finds no plan and clears `maybe`; the commit's second bump sets
