@@ -1418,8 +1418,10 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       *The accepted M1.4 ceilings (user, 2026-11-27; ceilings only ratchet
       down, none is raised):*
       - U1-F: the frozen-epoch classes F and F-cl (a requester in a frozen
-        epoch whose hold owner is down, with or without a carrier; 31 seeds
-        of 2,000 on `4e44fd24`: `flex-crash` 17, `flex-tight` 14). ADR-58's
+        epoch whose hold owner is down, with or without a carrier; figures
+        from the 2026-11-21 triage, 31 seeds of 2,000 on `4e44fd24`:
+        `flex-crash` 17, `flex-tight` 14; final per-class ceilings are set by
+        the M1.4 closing sweep). ADR-58's
         column; the design limit is `hold_owner_never_deposed_except_by_retire`
         (§5.7).
       - FX-4 class G: `flex-tight` seeds 1157 and 1276 under `+unsettled`: a

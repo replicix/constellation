@@ -72685,7 +72685,7 @@ the other way, is a cold sample) and stay there. The 7 ms is `stream_ahead_holdo
 and the hold's answers now wait for the member's acknowledgement of that batch, so a serial writer's next op waits out the rest of the holdoff plus the round trip and the
 member's commit. The holdoff did not show while the hold answered from the owner's disk. Concurrent writers share a batch, so only a serial writer (one op, then the next)
 pays it in full; a tar or a compile in the epoch is not a serial writer in this sense, a shell loop or a git operation is. Not changed here (step 7 is measure and docs):
-the options are a shorter holdoff in an open hold, or a send-at-once when an answer waits for it; the review decides. Files: `/data/cst/w16/lat`.
+the options are a shorter holdoff in an open hold, or a send-at-once when an answer waits for it; the review decides.
 
 ### Baseline tables
 
@@ -72722,7 +72722,7 @@ Stage-2 deletions step 4 added (not deleted here): `LiveEntry::uncarried_by_take
 
 | ceiling | seeds | what it is | owner |
 |---|---|---|---|
-| U1-F: frozen-epoch classes F and F-cl (the existing ADR-58 column) | 31 of 2,000 on `4e44fd24`: `flex-crash` 17, `flex-tight` 12 (F) and 1631, 404 (F-cl, carrier-less) | an unsettled `EIO` of a requester in a frozen epoch whose hold owner is down; the product's design limit (`hold_owner_never_deposed_except_by_retire`, ADR-58 C2/Q2) | none (restated exit, user 2026-11-26) |
+| U1-F: frozen-epoch classes F and F-cl (the existing ADR-58 column) | figures from the 2026-11-21 triage (`4e44fd24`, 31 of 2,000: `flex-crash` 17, `flex-tight` 12 (F) and 1631, 404 (F-cl, carrier-less)); main now has 12 `flex-crash` and 19 `flex-tight` failing seeds in total under `+unsettled`; the final per-class ceilings are set by the M1.4 closing sweep | an unsettled `EIO` of a requester in a frozen epoch whose hold owner is down; the product's design limit (`hold_owner_never_deposed_except_by_retire`, ADR-58 C2/Q2) | none (restated exit, user 2026-11-26) |
 | FX-4 class G, under `+unsettled` | `flex-tight` 1157, 1276 | a takeover gate inside a new epoch stays pending after a new outage (the re-take's epoch-marker PUT or inbox LIST failed because a new outage began) and the root answers `Held`; liveness only, the `EIO` is the safe answer; FX-4 (a design) was not started | accepted, user 2026-11-27 |
 | Spurious backup drop | `backup-lag-keeps-its-backup` 362, 1045, 1552 | a backup dropped that should have been kept; availability only (M1.2 exit's tracked item) | accepted, user 2026-11-27 |
 
@@ -72740,5 +72740,5 @@ backup drop (the `+unsettled` sweeps list them); a sweep-level ceiling would hav
 - [x] The "Deleted" table (above) and the baseline table (above).
 - [x] The accepted ceilings recorded (above and plan 46 §12).
 - [ ] The flex I4 ceilings at zero apart from the accepted ceilings: no fresh `+unsettled` sweep over 2,000 seeds of the seven flex configurations on the final tree was run in step 7;
-  the last numbers are `4e44fd24`'s triage (`/data/cst/w14/report.txt`) with FX-1, FX-2, FX-3, FX-5 and FX-6 landed since. **Open.**
+  the last numbers are `4e44fd24`'s 2026-11-21 flex triage with FX-1, FX-2, FX-3, FX-5 and FX-6 landed since. **Open.**
 - [ ] Fable M1.4 review: **pending** (the supervisor runs it after this step).
