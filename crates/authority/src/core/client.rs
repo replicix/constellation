@@ -3403,13 +3403,6 @@ impl Core {
     /// that timer runs (`on_forward_backoff`, `on_acquire_retry`); no timer
     /// is added. A settle whose route waits for the withdrawal's last
     /// acknowledgement goes on from there instead.
-    ///
-    /// Eagerly only when it can go somewhere now: this node can sequence, or
-    /// the carrier (else the cached holder) is reachable. Otherwise a routed
-    /// settle would fall to the lease path and the inbox, and the timer that
-    /// would see the holder come back is gone (`flex-crash` 319, 703, 1953):
-    /// a waiting settle keeps its timer, an idle one gets the settle's
-    /// backoff (`settle_hold_backoff`).
     pub(crate) fn wake_frozen_settles(
         &mut self,
         now: Now,
@@ -3432,32 +3425,6 @@ impl Core {
                 continue;
             }
             let phase = c.phase.clone();
-            let eager = self.lease.new_mutation_epoch(now, &self.cfg).is_some() || {
-                let target = self
-                    .epoch
-                    .active
-                    .then(|| self.pr.carried.map(|c| c.node))
-                    .flatten()
-                    .filter(|n| *n != self.cfg.node_id)
-                    .or(self
-                        .lease
-                        .cached_holder
-                        .filter(|h| *h != self.cfg.node_id));
-                target.is_some_and(|t| self.reaches(now, t))
-            };
-            if !eager {
-                tracing::debug!(
-                    node = self.cfg.node_id,
-                    ?rid,
-                    ?phase,
-                    "settle: the epoch no longer refuses writes, no holder reached: on its timer"
-                );
-                if let Phase::Forwarded { req, .. } = phase {
-                    self.by_req.remove(&req);
-                    self.settle_hold_backoff(now, rid, false, out);
-                }
-                continue;
-            }
             tracing::debug!(
                 node = self.cfg.node_id,
                 ?rid,
