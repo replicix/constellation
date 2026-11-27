@@ -17540,6 +17540,31 @@ fn a_second_seal_after_the_grace_arms_no_second_floor() {
     );
 }
 
+/// Plan 43 C7-F F-a0 (b), the sweep's own configuration: the default clock
+/// mix rebooted node 3, the only client that locks, before its one lock on
+/// seeds 121, 589, 984, 1288 and 1768, so the workload took no lock (the
+/// vacuity check failed). Each of them now takes it and the seal after the
+/// grace arms no second floor.
+#[test]
+fn double_seal_after_the_grace_takes_its_lock_on_the_seeds_a_reboot_voided() {
+    for seed in [121u64, 589, 984, 1288, 1768] {
+        let t = run_m14(
+            "double-seal-after-the-grace",
+            double_seal_after_the_grace_config(),
+            seed..seed + 1,
+        );
+        assert!(t.grants > 0, "seed {seed}: no lock was granted: {t:?}");
+        assert!(
+            t.clients.acquired > 0,
+            "seed {seed}: no lock was acquired: {t:?}"
+        );
+        assert!(
+            t.backup_takeovers >= 1,
+            "seed {seed}: no backup took over: {t:?}"
+        );
+    }
+}
+
 /// Plan 43 C7-F F-a: the same configuration with the cap counted from the
 /// beats' *credit* (the holder's clock: `min(at, sent + M)`) instead of
 /// their arrival must split: the holder's clock is 4 s behind its
