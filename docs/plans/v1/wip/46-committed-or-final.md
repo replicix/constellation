@@ -1,8 +1,8 @@
 # Plan 46 — Committed or final: one stream per node, the commit rule per configuration, no server-side replay
 
-> **Status (2026-11-26): stage 0, M1.0 and M1.1 are closed; M1.2 closed at
-> `4e44fd24` pending the Fable exit check and the attribution of
-> `endpoint-wedge-probe` (below); M1.3 and M1.4 are open; M1.5 and
+> **Status (2026-11-27): stage 0, M1.0, M1.1 and M1.2 are closed (M1.2 at
+> `4e44fd24`; the Fable exit check done, `endpoint-wedge-probe` attributed and
+> fixed, below); M1.3 and M1.4 are open; M1.5 and
 > stages 2 and 3 have not started.**
 >
 > - **Closed.**
@@ -10,7 +10,7 @@
 >     plan (D-4, D-5).
 >   - M1.0 (the model, chunks 1 to 14) and M1.1.
 > - **M1.2**, closed at `4e44fd24` (orphanfix, the first `main` with the
->   orphan-nonroot fix) pending the Fable exit check: steps 0 to 16, the
+>   orphan-nonroot fix), the Fable exit check done: steps 0 to 16, the
 >   review's conditions and the close fixes. PROGRESS, "Plan 46 M1.2 exit",
 >   has R1 (every configuration at 2,000 seeds in the plain arm, 295 labels;
 >   the idle-release arm ran only the 27 `sticky-*` labels and the
@@ -1011,8 +1011,8 @@ landed on 2026-11-02 as an interim form of C3 item 4's member copy: M1.2's
 member copy closes the window it covers, and M1.2 may revert the rule (it
 deletes `root_committed` with the lone delegate and the per-row classes).
 
-*M1.2 closed at `4e44fd24` (2026-11-26; code-complete 2026-11-22 on `060e6fa6`; PROGRESS, "Plan 46 M1.2 exit"), pending the Fable check
-of the exit write-up. R1 and R2 ran on the close commit `4e44fd24`, the first `main` with the orphan-nonroot fix; R3 and §8 on `a70304d7`.*
+*M1.2 closed at `4e44fd24` (2026-11-26; code-complete 2026-11-22 on `060e6fa6`; PROGRESS, "Plan 46 M1.2 exit"); the Fable check of the exit write-up
+is done (2026-11-26, close after edits). R1 and R2 ran on the close commit `4e44fd24`, the first `main` with the orphan-nonroot fix; R3 and §8 on `a70304d7`.*
 
 The exit items:
 
@@ -1043,9 +1043,17 @@ The exit items:
     pass; 2 flaky, 2 skipped for a missing `sqlite3`, 2 that needed a
     set-up the run lacked. The sqlite and plan 41 lock scenarios
     (`lock-device-stall-lone-node`, `lock-xcheckfs-cell`) passed in
-    follow-up runs. `endpoint-wedge-probe` fails 4 of 5 on `4e44fd24` and
-    1 of 5 on the pre-M1.2 base `5907c65d` (undiagnosed): M1.2 exit pending
-    attribution, so this item is not ticked.
+    follow-up runs. `endpoint-wedge-probe` failed 4 of 5 on `4e44fd24` and
+    1 of 5 on the pre-M1.2 base `5907c65d`. Attributed (2026-11-27): an
+    oracle mismatch older than M1.2, not a product defect. Its 18 s per-request
+    check sat below the design's takeover floor (lease TTL, margin, takeover
+    window); detection depended on the stall watch's 4.5 s scan (4 of 30
+    failed on `5907c65d`, 18 of 30 on `4e44fd24`, 22 of 30 on `dbda3a1f`,
+    while the slowest request passed 18 s in 29 or 30 of 30 runs on each).
+    The user chose option A (2026-11-27): the bound is the lease TTL + margin
+    + takeover window + one freeze (20 + 1 + 1.5 + 8 = 30.5 s), read from the
+    scenario's timings, and the verdict is the daemon's `slowest_ms`
+    (`bf7ea074`). 15 of 15 runs pass on box3, slowest request 28.7 s.
   - Plan 45's box gates and both `hardlink-burst` scenarios pass on ext4, xfs,
     btrfs and tmpfs (R3 on `060e6fa6` and on `a70304d7`,
     `bench/hardlink/RESULTS.md`).
@@ -1364,7 +1372,7 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       ADR-40 updated; the "Deleted" tables complete.
 
       *M1.2's part (PROGRESS, "Plan 46 M1.2 exit"), done on the close commit
-      `4e44fd24`, pending the Fable exit check:*
+      `4e44fd24`; the Fable exit check done (2026-11-26):*
       - one stream per node with the records of §5.2;
       - no range, generation-set or xgen code left;
       - no lone delegate;
@@ -1373,8 +1381,9 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
         accepted by the Fable exit check; the idle and lr arms ran only the 27
         `sticky-*` and the 3 `long-delegated*` labels; the flex strict flags
         stay with M1.4);
-      - the harness catalogue green (`endpoint-wedge-probe`: exit pending
-        attribution, 4 of 5 fail on `4e44fd24`, 1 of 5 on `5907c65d`),
+      - the harness catalogue green (`endpoint-wedge-probe`: an oracle
+        mismatch older than M1.2, bound derived from the protocol, 15 of 15
+        pass),
         with the retired split scenarios
         removed;
       - plan 45's rows, the `hardlink-burst-single` and `-two-node` box gates

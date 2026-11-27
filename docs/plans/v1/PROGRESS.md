@@ -72027,8 +72027,8 @@ W14 class K (`flex-tight+commit+identity+settle+durability` 460, `flex-tight-lat
 
 ## Plan 46 M1.2 exit (2026-11-22; closed at `4e44fd24`, 2026-11-26)
 
-M1.2 (one stream per node, no lone delegate, C3 verbatim) was code-complete on `main` at `060e6fa6`. It closes at `4e44fd24`, pending the Fable
-check of this write-up and the attribution of `endpoint-wedge-probe` (R2). The fixes under "Landed since `060e6fa6`" changed the authority code after R1 and R2 first ran, so both ran again on the
+M1.2 (one stream per node, no lone delegate, C3 verbatim) was code-complete on `main` at `060e6fa6`. It closed at `4e44fd24`. The Fable exit check of this write-up
+(2026-11-26: "close after edits") is done, and `endpoint-wedge-probe` (R2) is attributed (below). The fixes under "Landed since `060e6fa6`" changed the authority code after R1 and R2 first ran, so both ran again on the
 close commit `4e44fd24` (orphanfix), the first `main` with the orphan-nonroot fix: R1 in the plain arm (295 labels), with the idle-release arm limited to the 27 `sticky-*` labels and the slow-lease-read arm to the 3 `long-delegated*`
 labels, and R2 as the full harness catalogue. The performance evidence (§8 against `5907c65d`, topologies 1 to 5 and 9) and R3 ran on `a70304d7`: orphanfix adds
 only a liveness branch (a usable root ending another node's released stream) that steady-state runs never take, so `a70304d7` stands as the
@@ -72243,12 +72243,25 @@ scratch directory on xfs (the `CAP_SYS_ADMIN` scenarios as root).
   `dirsplit-bench` passed only with `--s3-backend process` (the re-run); its one default-backend run failed in the discarded first pass.
 - 2 flaky, neither a close-commit regression:
   - `endpoint-wedge-probe` failed 3 of 5 on `4e44fd24` and 3 of 5 on `36db5771`: one FUSE request completed past the 18 s stall threshold
-    across the freezes (`stalled_completed` 1, nothing left in flight). **Attribution pending.** The Fable exit check asked for 5 runs on
-    the pre-M1.2 base `5907c65d`; they ran on 2026-11-26 (seed 42, fresh release builds of each tree, alternated, box load 4.2 to 6.7, another
-    job running): `5907c65d` failed 1 of 5 (run 1, node a, the same message), `4e44fd24` failed 4 of 5 (runs 1, 2, 3 and 5, node b every time).
-    So the base is not clean, and the close commit fails more often (4 of 5 here, 3 of 5 before, 7 of 10 together, against 1 of 5), but 5 runs
-    per tree do not separate 1 of 5 from 4 of 5 (Fisher's exact p about 0.2). Not diagnosed. The item is not closed: M1.2's exit is pending its
-    attribution (M1.2 or M1.3) or the user's acceptance.
+    across the freezes (`stalled_completed` 1, nothing left in flight). **Attributed (2026-11-27): an oracle mismatch, not a product defect,
+    and older than M1.2.** The Fable exit check asked for 5 runs on the pre-M1.2 base `5907c65d`; they ran on 2026-11-26 (seed 42, fresh
+    release builds of each tree, alternated, box load 4.2 to 6.7, another job running): `5907c65d` failed 1 of 5, `4e44fd24` failed 4 of 5.
+    The diagnosis (box3 alone, 15 runs per tree and condition, quiet and under `stress-ng --cpu 5`, with `HARNESS_KEEP_LOGS=1`): `5907c65d`
+    4 of 30 failed, `4e44fd24` 18 of 30, `dbda3a1f` 22 of 30, load making no difference. The slowest FUSE request of a run (the "slow FUSE
+    mutation took=" lines) passed 18 s in 30 of 30 runs on the base (18.2 to 20.3 s; one 28.7 s) and in 29 of 30 on each of the other two. So every tree
+    stalls past 18 s in nearly every run; the stall watch scans every threshold / 4 = 4.5 s, so a request just over 18 s is caught only
+    sometimes, and one near 28.7 s always. The cause is the design's takeover floor (DESIGN §4, "unreachable holder"; plan 43 C7-H2/C7-F;
+    `note_marker_landed`): after a holder freezes, the new holder acknowledges nothing until the predecessor's lease end plus the margin
+    (here 20 s TTL, 1 s margin, 1.5 s takeover window), then the requester's own freeze in a later round holds the answer to the thaw. The
+    scenario's other bound, a write across a freeze at FREEZE + 20 = 28 s, allowed what its 18 s per-request check forbade. The trees
+    differ only in which node wins the lease race after round 0 (first at `feeadcdc`), a timing shift. Not a defect in M1.2 or M1.3.
+    **The user decided (2026-11-27, option A) to derive the bound from the protocol** (`bf7ea074`): lease TTL + margin + takeover window +
+    one freeze, read from the scenario's timings (20 + 1 + 1.5 + 8 = 30.5 s), no new constant. The verdict is the daemon's new
+    `fuse_requests.slowest_ms` high-water mark (every non-blocking request's duration, ended or in flight), not the stall watch's scan; any
+    request above the bound fails, and the write bound uses the same figure. On `bf7ea074`, box3 alone, 15 of 15 runs pass; the
+    slowest request per run was 28.7 s at most (node b, runs 2, 4, 8 and 14; 13 of 15 runs had a request over 18 s), against the 30.5 s bound.
+    Mutations (all red): bound minus 3 s (`the_wedge_bound_follows_the_protocol_timings`), `<=` to `<` (`the_wedge_check_stays_strict_at_the_bound`),
+    the high-water mark not recorded or blocking locks counted (`the_slowest_op_is_kept_after_it_ends_and_does_not_depend_on_a_scan`).
   - `passthrough-local-writer` (root) failed once with `ETXTBSY` on "a read-write open once nothing is open" and passed the next 2 of 2.
 - 2 skipped in the catalogue run: `sqlite-first-touch-latency` and `sqlite-two-nodes`, because `sqlite3` was not installed on the run host.
 - 2 not run in the catalogue run for want of set-up: `lock-device-stall-lone-node` (needs `CONSTELLATION_HARNESS_STALL_DM`) and
@@ -72264,7 +72277,7 @@ scratch directory on xfs (the `CAP_SYS_ADMIN` scenarios as root).
     `owners_fenced`, `owner_fenced_ops` and `fenced_io` 0. The two-node cell, the dm-delay cells and the freeze cells of plan 41's
     `bench/lock-lane/RESULTS.md` (up to 24 minutes each) were not re-run.
 
-No scenario fails on the close commit for a known product reason (`endpoint-wedge-probe` is undiagnosed, above). `placement-hot` and `delegated-group-switch`, named in the §6 row, are simulator
+No scenario fails on the close commit for a known product reason (`endpoint-wedge-probe` was an oracle mismatch, above). `placement-hot` and `delegated-group-switch`, named in the §6 row, are simulator
 labels; both are clean in R1's plain arm.
 
 **Gates on the close commit.** orphanfix's landing gate ran on `4e44fd24` (tree `3a45ecb1`): every test log verified, with no failure and no
@@ -72455,8 +72468,9 @@ it for M1.2.
   after; not re-run under lr at the close) and idle 1264 `acked_at_or_below_cut` (WP6.2). The full lr arm runs in M1.3's re-baseline. Earlier:
   `0d157e56` and `36db5771` (interim).
 - [ ] The harness catalogue green: R2 on `4e44fd24`, the full catalogue, 333 scenarios; 327 pass, and the 4 sqlite and lock rows that the catalogue
-  run skipped or lacked a set-up for passed in follow-up runs (below). **Not ticked: `endpoint-wedge-probe`, M1.2 exit pending attribution.** It
-  fails 4 of 5 on `4e44fd24` and 1 of 5 on the pre-M1.2 base `5907c65d`, undiagnosed. `passthrough-local-writer` saw one `ETXTBSY`.
+  run skipped or lacked a set-up for passed in follow-up runs (below). `endpoint-wedge-probe` was attributed on 2026-11-27 (below): an
+  oracle mismatch older than M1.2, 4 of 30 failing on `5907c65d` against 18 of 30 on `4e44fd24` by detection rate; fixed by the
+  protocol-derived bound (`bf7ea074`, 15 of 15 pass). `passthrough-local-writer` saw one `ETXTBSY`.
 - [x] Plan 45's box gates and both `hardlink-burst` scenarios on ext4, xfs, btrfs and tmpfs (R3, `060e6fa6`, and again on `a70304d7`; xfs
   last-100 / first-100 read at 15 rounds, 1.20, accepted as a pass).
 - [x] The "Deleted" table complete (below).
@@ -72466,7 +72480,7 @@ it for M1.2.
   cost (user, 2026-11-25) are accepted as segbuild's; topology 5 is ADR-50's documented wait.
 - [x] Topology 1 within ±3 %: decided by the user (2026-11-25), "no detectable regression": no cell resolved worse, the five `write` cells
   inside ±3 %, the 30 to 100 us ops below the host's resolution.
-- [ ] The Fable check of this exit write-up.
+- [x] The Fable check of this exit write-up (2026-11-26: close after edits; its MUST 1, the wedge probe, is attributed and fixed above).
 
 ### Deleted
 
@@ -72533,9 +72547,10 @@ These serve the root's own rows and the replay queue.
   it (fewer segments per op, or the tail work off the delegate core) is open.
 - R3's thin margins: xfs create p99 during the links is 1.179 at 15 rounds (6 of 15 runs above 1.2), so a regression of a few percent would
   flip it; xfs last-100 / first-100 needs more than 5 rounds to read.
-- **`endpoint-wedge-probe`: M1.2 exit pending attribution.** It fails 4 of 5 on `4e44fd24` and 1 of 5 on the pre-M1.2 base `5907c65d` (same
-  message, one FUSE request past 18 s across the freezes; node b on the close commit, node a on the base); undiagnosed. The supervisor decides
-  whether it is a plan 46 liveness regression to attribute or a pre-existing flake to track.
+- **`endpoint-wedge-probe`: closed (2026-11-27).** An oracle mismatch older than M1.2 (the 18 s per-request check sat below the
+  design's takeover floor); the user chose option A and the check now uses the protocol-derived bound of 30.5 s and the daemon's
+  `slowest_ms` (`bf7ea074`; see R2 above). Left to track: the protocol floor at the production 60 s lease is up to about 61 s, the
+  documented cost of a seal takeover (option C, ending the floor early, would be an ADR and is not planned).
 - Harness rows that the exit runs did not exercise or that are flaky: the two `sqlite-*` and the two plan 41 lock scenarios were run once each
   afterwards and passed (R2, follow-up runs); the two-node and freeze cells of the lock-lane bench were not re-run. `passthrough-local-writer`
   saw one `ETXTBSY`.
