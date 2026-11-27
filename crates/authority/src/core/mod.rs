@@ -4958,6 +4958,9 @@ impl Core {
                 carrier,
                 stale_below,
             } => {
+                // (Before `carried` moves: a report that names the carrier
+                // ends the refusal of a carrier-less active epoch too.)
+                let refused_before = self.epoch_refuses_writes();
                 self.pr.carried = carrier;
                 self.pr.epoch_members.clone_from(&members);
                 self.on_epoch_state(
@@ -4974,6 +4977,11 @@ impl Core {
                     replica,
                     out,
                 );
+                // FX-2: the refusal ended at this report: a settle that
+                // waits for its backoff is routed now.
+                if refused_before && !self.epoch_refuses_writes() {
+                    self.wake_frozen_settles(now, replica, out);
+                }
                 out.push(Action::ControlDone {
                     op,
                     result: Ok(ControlOk::Done),

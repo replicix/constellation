@@ -538,7 +538,11 @@ impl Core {
         let Some(since) = self.inbox.down_since.get(&holder).copied() else {
             return true;
         };
-        if link.connected || link.last_seen.is_some_and(|at| at > since) {
+        // FX-2: a message from the holder after the outage began is the
+        // "heard from it since" the doc comment names, whatever the link
+        // table (the driver's directory) says.
+        let heard = self.peer_heard.get(&holder).is_some_and(|at| *at > since);
+        if link.connected || link.last_seen.is_some_and(|at| at > since) || heard {
             tracing::debug!(
                 node = self.cfg.node_id,
                 holder,

@@ -3394,6 +3394,60 @@ impl Core {
         }
     }
 
+    /// FX-2, level-triggered: the epoch that refused writes ended (thaw,
+    /// re-adoption, close). Every settle that asked a node of it
+    /// (`frozen_since`) and now waits for its next timer (`Backoff`,
+    /// `AcquireRetry`), or sits idle after the answer of its ask with no
+    /// timer (`Forwarded`, as `refuse_on_lease_path` leaves a settle whose
+    /// tombstones have not stood a window), is routed now by the handler
+    /// that timer runs (`on_forward_backoff`, `on_acquire_retry`); no timer
+    /// is added. A settle whose route waits for the withdrawal's last
+    /// acknowledgement goes on from there instead.
+    pub(crate) fn wake_frozen_settles(
+        &mut self,
+        now: Now,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let waiting: Vec<(Rid, Phase)> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                c.settle
+                    && c.frozen_since.is_some()
+                    && c.withdraw.is_none_or(|w| w.route_waiting.is_none())
+                    && match c.phase {
+                        Phase::Backoff | Phase::AcquireRetry => true,
+                        Phase::Forwarded { .. } => c.timer.is_none(),
+                        _ => false,
+                    }
+            })
+            .map(|(rid, c)| (*rid, c.phase.clone()))
+            .collect();
+        for (rid, phase) in waiting {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                ?phase,
+                "settle: the epoch no longer refuses writes, routing now"
+            );
+            if let Some(t) = self.clients.get_mut(&rid).and_then(|c| c.timer.take()) {
+                self.cancel_timer(t, out);
+            }
+            match phase {
+                Phase::AcquireRetry => self.on_acquire_retry(now, rid, replica, out),
+                Phase::Forwarded { req, .. } => {
+                    self.by_req.remove(&req);
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.phase = Phase::Backoff;
+                    }
+                    self.on_forward_backoff(now, rid, replica, out);
+                }
+                _ => self.on_forward_backoff(now, rid, replica, out),
+            }
+        }
+    }
+
     fn schedule_acquire_retry(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
@@ -5840,6 +5894,23 @@ impl Core {
         if self.epoch_refuses_writes() {
             self.settle_ask_frozen(now, rid, None, replica, out);
             return;
+        }
+        // FX-2: in an active epoch carried by another node, that carrier is
+        // the holder to ask, before the cached holder or the inbox (the
+        // frozen branch above ranks it first too). Routing only: it answers
+        // from its dedup or a sequencer does.
+        if self.epoch.active && self.cfg.forwarding {
+            if let Some(carrier) = self
+                .pr
+                .carried
+                .map(|c| c.node)
+                .filter(|n| *n != self.cfg.node_id)
+            {
+                if self.reaches(now, carrier) {
+                    self.send_forward(now, rid, carrier, 0, replica, out);
+                    return;
+                }
+            }
         }
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {
