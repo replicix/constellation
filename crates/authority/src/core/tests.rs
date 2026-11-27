@@ -68692,6 +68692,103 @@ mod c2g_settle {
         );
     }
 
+    /// FX-2 cure: at the end of the refusal the carrier is out of reach
+    /// (an outage past the grace, nothing heard since). A settle in backoff
+    /// keeps its timer and sends nothing; an idle one (`Forwarded`, no
+    /// timer) gets the backoff timer. Either goes out at that timer if the
+    /// node is reachable by then, instead of falling to the inbox
+    /// (`flex-crash` 319, 703, 1953). Fails before the cure: the report
+    /// routes both at once.
+    #[test]
+    fn a_settle_waits_for_its_timer_when_no_holder_is_reached() {
+        use crate::core::client::Phase;
+        let thaw = || Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: true,
+                active: true,
+                frozen: false,
+                flushing: false,
+                base: 0,
+                members: vec![1, 2, 3],
+                carrier: Some(crate::event::Carrier {
+                    node: 1,
+                    epoch: 1,
+                    expires_unix_ms: i64::MAX,
+                }),
+                stale_below: 1,
+            },
+        };
+        let link_down = |h: &mut Harness| {
+            h.step(Event::Peers {
+                registry_complete: true,
+                links: [1, 3]
+                    .into_iter()
+                    .map(|node| crate::event::PeerLink {
+                        node,
+                        connected: false,
+                        last_seen: None,
+                        rtt_ms: None,
+                        since: None,
+                    })
+                    .collect(),
+                lapses: 0,
+            });
+            h.core.note_p2p_result(h.clk(), 1, false);
+            h.advance(h.core.cfg.inbox_p2p_grace_ms + 1);
+            assert!(!h.core.reaches(h.clk(), 1), "node 1 is out of reach");
+        };
+        // Waiting in its backoff.
+        let (_holder, mut requester, rid, out) = frozen_requester_without_holder();
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req, settle: true, ..
+                } if to == 1 => Some(*req),
+                _ => None,
+            })
+            .expect("the freeze asks node 1");
+        requester.step(reply_of(1, req, MutateOutcome::held(10_000)));
+        assert_eq!(
+            requester.core.clients[&rid].phase,
+            crate::core::client::Phase::Backoff
+        );
+        let timer = requester.core.clients[&rid].timer;
+        assert!(timer.is_some(), "the backoff timer");
+        requester.core.lease.cached_holder = Some(1);
+        link_down(&mut requester);
+        let out = requester.step(thaw());
+        assert!(!requester.core.epoch_refuses_writes());
+        assert!(
+            sends(&out).is_empty(),
+            "nothing is sent at the report: {out:?}"
+        );
+        let c = &requester.core.clients[&rid];
+        assert_eq!(c.phase, Phase::Backoff);
+        assert_eq!(c.timer, timer, "its own timer is kept");
+        // Idle: its ask answered, no timer.
+        let (_holder, mut requester, rid, _) = frozen_requester_without_holder();
+        {
+            let c = requester.core.clients.get_mut(&rid).unwrap();
+            assert!(matches!(c.phase, Phase::Forwarded { .. }));
+            let t = c.timer.take().expect("the forward's timer");
+            let mut out = Vec::new();
+            requester.core.cancel_timer(t, &mut out);
+        }
+        requester.core.lease.cached_holder = Some(1);
+        link_down(&mut requester);
+        let out = requester.step(thaw());
+        assert!(!requester.core.epoch_refuses_writes());
+        assert!(
+            sends(&out).is_empty(),
+            "nothing is sent at the report: {out:?}"
+        );
+        let c = &requester.core.clients[&rid];
+        assert_eq!(c.phase, Phase::Backoff);
+        assert!(c.timer.is_some(), "the settle's backoff timer is set");
+    }
+
     /// FX-2 rule 3: in an active epoch carried by another node, a settle
     /// goes to that carrier before the cached holder. Fails on the parent:
     /// it goes to the cached holder.
