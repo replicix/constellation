@@ -134,6 +134,10 @@ struct Registry {
     active: Mutex<HashMap<u64, Arc<Entry>>>,
     stalled_total: AtomicU64,
     stalled_completed: AtomicU64,
+    /// High-water mark of the age of every non-blocking op that ended, in
+    /// ms: unlike the stall count it does not depend on when the monitor
+    /// scans.
+    slowest_ms: AtomicU64,
     threshold: Duration,
     backtraces: bool,
 }
@@ -213,6 +217,7 @@ impl OpWatch {
                 active: Mutex::new(HashMap::new()),
                 stalled_total: AtomicU64::new(0),
                 stalled_completed: AtomicU64::new(0),
+                slowest_ms: AtomicU64::new(0),
                 threshold,
                 backtraces,
             }),
@@ -350,6 +355,13 @@ impl OpWatch {
                 .map(|e| e.age().as_secs())
                 .max()
                 .unwrap_or(0),
+            slowest_ms: active
+                .iter()
+                .filter(|e| !e.blocking)
+                .map(|e| u64::try_from(e.age().as_millis()).unwrap_or(u64::MAX))
+                .max()
+                .unwrap_or(0)
+                .max(r.slowest_ms.load(Ordering::Relaxed)),
             stall_threshold_s: r.threshold.as_secs(),
             stalled_ops,
         }
@@ -369,6 +381,9 @@ pub struct WatchSnapshot {
     pub stalled_completed: u64,
     /// The age of the oldest non-blocking op in flight.
     pub oldest_s: u64,
+    /// The longest any non-blocking op has taken (ended, or still in
+    /// flight), in ms.
+    pub slowest_ms: u64,
     pub stall_threshold_s: u64,
     /// The stalled ops, and the blocking ones past the threshold; oldest
     /// first.
@@ -436,6 +451,11 @@ impl Drop for Watched {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.entry.id);
         clear_current(&self.entry);
+        if !self.entry.blocking {
+            // An age past u64 ms is not a real op; saturate.
+            let ms = u64::try_from(self.entry.age().as_millis()).unwrap_or(u64::MAX);
+            r.slowest_ms.fetch_max(ms, Ordering::Relaxed);
+        }
         if self.entry.stalled.load(Ordering::Relaxed) {
             r.stalled_completed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
@@ -607,6 +627,27 @@ mod tests {
         let s = watch.snapshot();
         assert_eq!(s.stalled_total, 0);
         assert_eq!(s.in_flight, 0);
+    }
+
+    #[test]
+    fn the_slowest_op_is_kept_after_it_ends_and_does_not_depend_on_a_scan() {
+        let watch = OpWatch::manual("test-watch", Duration::from_secs(30));
+        assert_eq!(watch.snapshot().slowest_ms, 0);
+        let slow = watch.enter("read", 5);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(watch.snapshot().slowest_ms >= 40, "in flight counts");
+        drop(slow);
+        drop(watch.enter("getattr", 1));
+        let s = watch.snapshot();
+        assert_eq!((s.in_flight, s.stalled_total), (0, 0), "never scanned");
+        assert!(s.slowest_ms >= 40, "an ended op stays: {}", s.slowest_ms);
+        let lock = watch.enter_blocking("setlk", 9);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(lock);
+        assert!(
+            watch.snapshot().slowest_ms < 300,
+            "blocking locks are excluded"
+        );
     }
 
     #[test]

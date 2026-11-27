@@ -189,7 +189,7 @@ pub(super) fn cluster_mounted(
 }
 
 /// The timings [`cluster`]'s daemons run with (scenario extras aside).
-fn cluster_timings() -> crate::timings::Timings {
+pub(super) fn cluster_timings() -> crate::timings::Timings {
     crate::timings::Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", TTL_MS.to_string())])
 }
 

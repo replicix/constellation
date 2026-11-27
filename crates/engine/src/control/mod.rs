@@ -509,6 +509,7 @@ pub fn fuse_requests_status(
         stalled_total: s.stalled_total,
         stalled_completed: s.stalled_completed,
         oldest_s: s.oldest_s,
+        slowest_ms: s.slowest_ms,
         stall_threshold_s: s.stall_threshold_s,
         stalled_requests: s
             .stalled_ops

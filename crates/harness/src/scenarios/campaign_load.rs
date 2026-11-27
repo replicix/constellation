@@ -40,7 +40,8 @@
 //!   for each. A rebooted owner cannot subtract the time since its last
 //!   horizon write, so it waits the span the horizon was written with.
 //! - `endpoint-wedge-probe`: one node of a busy three-node cluster frozen
-//!   8 s per round (F11): links come back, no FUSE request stalls, no
+//!   8 s per round (F11): links come back, no FUSE request takes longer
+//!   than [`wedge_request_bound`] (the takeover floor and one freeze), no
 //!   write fails.
 //!
 //! `CONSTELLATION_HARNESS_ROUNDS` sets the rounds per duration (default 3;
@@ -794,14 +795,49 @@ pub(super) fn acks3_under_load(seed: u64) -> Result<()> {
     result
 }
 
+/// The longest one FUSE request may take across `endpoint-wedge-probe`'s
+/// freezes, from the protocol the daemons run with (`t`) and the length of
+/// one `freeze`:
+///
+/// - `lease_ttl + margin + backup_takeover`: a holder that freezes just
+///   after a renewal keeps its lease to expiry; its successor (a backup
+///   seals the silent holder after the takeover window) acknowledges
+///   nothing until the predecessor's lease end plus the expiry margin
+///   (DESIGN §4, "unreachable holder"; `note_marker_landed`). That is the
+///   takeover floor, at most this long from the freeze.
+/// - `freeze`: the requester's own freeze in a later round, which holds an
+///   op already past the floor until the thaw.
+///
+/// Every term is the scenario's actual configuration, no tuned constant.
+/// Any request above it is a defect, not the floor.
+fn wedge_request_bound(t: &Timings, freeze: Duration) -> Duration {
+    t.lease_ttl + t.margin + t.backup_takeover + freeze
+}
+
+/// Fails when a node's slowest FUSE request (`slowest_ms`, the daemon's
+/// high-water mark, independent of the stall watch's scan interval)
+/// exceeds `bound`.
+fn judge_wedge_requests(slowest_ms: &[(String, u64)], bound: Duration) -> Result<()> {
+    anyhow::ensure!(!slowest_ms.is_empty(), "no node reported a slowest request");
+    for (node, ms) in slowest_ms {
+        anyhow::ensure!(
+            Duration::from_millis(*ms) <= bound,
+            "{node}: a FUSE request took {ms} ms across the freezes, past the protocol bound \
+             {bound:?} (lease TTL + margin + takeover window + one freeze)"
+        );
+    }
+    Ok(())
+}
+
 /// See the module docs.
 pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
     const NAME: &str = "endpoint-wedge-probe";
     const FREEZE: Duration = Duration::from_secs(8);
-    // The stall watch counts a request stalled past freeze + 10 s, so
-    // "no FUSE request stalled" sees what a freeze could wedge (its
-    // default, 30 s or half the hang bound, would not).
-    let stall_s = (FREEZE + Duration::from_secs(10)).as_secs().to_string();
+    let bound = wedge_request_bound(&super::m9::cluster_timings(), FREEZE);
+    // The stall watch only logs the stalled requests (its warnings name
+    // the stage); whole seconds, rounded up so it never fires inside the
+    // bound. The verdict is the daemon's `slowest_ms`, not the watch.
+    let stall_s = bound.as_secs().saturating_add(1).to_string();
     let (env, _root, mut clients, _) = cluster(
         NAME,
         &["a", "b", "c"],
@@ -813,14 +849,6 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
             let refs: Vec<&Client> = clients.iter().collect();
             super::m11::wait_for_connected_peers(&refs)?;
         }
-        let stalled0: Vec<u64> = clients
-            .iter()
-            .map(|c| {
-                c.control_status()
-                    .map(|s| n(&s["fuse_requests"], "stalled_total"))
-                    .unwrap_or(0)
-            })
-            .collect();
         let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
         let stop = Arc::new(AtomicBool::new(false));
         let writers: Vec<_> = clients
@@ -868,15 +896,19 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
                 slowest = (s, at);
             }
         }
-        for (c, s0) in clients.iter().zip(&stalled0) {
+        let mut slowest_ms = Vec::new();
+        for c in &clients {
             let s = c.control_status()?;
-            anyhow::ensure!(
-                n(&s["fuse_requests"], "stalled_total") == *s0,
-                "{}: FUSE requests stalled across the freezes: {}",
-                c.name,
-                s["fuse_requests"]
+            let ms = s["fuse_requests"]["slowest_ms"]
+                .as_u64()
+                .with_context(|| format!("{}: status has no fuse_requests.slowest_ms", c.name))?;
+            eprintln!(
+                "    {NAME}: {}: slowest FUSE request {ms} ms, bound {bound:?}",
+                c.name
             );
+            slowest_ms.push((c.name.clone(), ms));
         }
+        judge_wedge_requests(&slowest_ms, bound)?;
         ledger_converges(NAME, &clients, &ledger)?;
         let refs: Vec<&Client> = clients.iter().collect();
         let rep = errnos.judge(&Evidence::from_clients(&refs, super::m9::client_deadline()));
@@ -908,7 +940,7 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
             slowest.1,
             slowest.0,
             FREEZE,
-            FREEZE + Duration::from_secs(20),
+            bound,
         )
     })();
     super::m11::dump_logs_on_failure(NAME, &clients, &result);
@@ -1175,6 +1207,39 @@ pub(super) fn delegate_paused_across_ttl(_seed: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wedge_bound_follows_the_protocol_timings() {
+        let t = super::super::m9::cluster_timings();
+        let b = wedge_request_bound(&t, Duration::from_secs(8));
+        // 20 s lease + 1 s margin + 1.5 s takeover window + 8 s freeze.
+        assert_eq!(b, Duration::from_millis(30_500));
+        let short = Timings::from_pairs(&[("REPLICIX_LEASE_TTL_MS", "4000")]);
+        assert_eq!(
+            wedge_request_bound(&short, Duration::from_secs(8)),
+            Duration::from_millis(4_000 + 1_000 + 1_500 + 8_000)
+        );
+    }
+
+    #[test]
+    fn the_wedge_check_stays_strict_at_the_bound() {
+        let bound = Duration::from_millis(30_500);
+        let nodes = |ms: &[u64]| -> Vec<(String, u64)> {
+            ms.iter()
+                .zip(["a", "b", "c"])
+                .map(|(m, n)| (n.to_string(), *m))
+                .collect()
+        };
+        judge_wedge_requests(&nodes(&[1_000, 30_500, 28_700]), bound).expect("at the bound");
+        let e = judge_wedge_requests(&nodes(&[1_000, 30_501, 2]), bound).unwrap_err();
+        assert!(e.to_string().starts_with("b: "), "{e}");
+        // The 28.7 s op seen on every tree is inside the bound, and fails
+        // one that is a few seconds tighter (the mutation).
+        judge_wedge_requests(&nodes(&[28_700]), bound).expect("28.7 s is the floor");
+        judge_wedge_requests(&nodes(&[28_700]), bound - Duration::from_secs(3))
+            .expect_err("a bound 3 s tighter must fail");
+        assert!(judge_wedge_requests(&[], bound).is_err(), "no evidence");
+    }
 
     #[test]
     fn the_boundaries_the_scenarios_pause_for_exist() {

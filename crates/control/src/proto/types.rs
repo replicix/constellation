@@ -661,6 +661,9 @@ pub struct FuseRequestsStatus {
     pub stalled_completed: u64,
     /// The oldest request in flight, in seconds (blocking locks aside).
     pub oldest_s: u64,
+    /// The longest any request has taken since the daemon started (ended,
+    /// or still in flight), in ms; blocking locks aside.
+    pub slowest_ms: u64,
     pub stall_threshold_s: u64,
     /// The stalled requests (and blocking lock waits past the
     /// threshold, marked `blocking`), oldest first.

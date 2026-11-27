@@ -3768,6 +3768,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "slowest_ms": {
+          "description": "The longest any request has taken since the daemon started (ended,\nor still in flight), in ms; blocking locks aside.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "stall_threshold_s": {
           "format": "uint64",
           "minimum": 0,
@@ -3805,6 +3811,7 @@
         "stalled_total",
         "stalled_completed",
         "oldest_s",
+        "slowest_ms",
         "stall_threshold_s",
         "stalled_requests"
       ],
