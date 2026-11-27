@@ -7512,11 +7512,14 @@ fn regression_a_readopted_kept_union_is_rebuilt_not_cut_seed_1822() {
 /// kept its lease. The inbox reroute on link-up (ADR-68) moved the schedules
 /// again: 1118, 1519 and 1934 no longer reach an unresolved release; of seeds
 /// 0..4,399 the finder gives 724, 1452, 2452, 2777, 3002 and 4012 (each with a
-/// renewal), and the pin runs 724, 1452 and 2452.
+/// renewal), and the pin runs 724, 1452 and 2452. A peer heard counted as
+/// reached (FX-2) and 724 and 2777 stopped reaching an unresolved release; of
+/// seeds 0..4,499 the finder gives 1452, 2452, 2698, 3002, 3568 and 4012, and
+/// the pin runs 1452, 2452 and 3002.
 #[test]
 fn regression_a_release_in_doubt_waits_and_asks_the_peers() {
     let mut renewals = 0;
-    for seed in [724, 1452, 2452] {
+    for seed in [1452, 2452, 3002] {
         let cfg = SimConfig {
             strict_unsettled: true,
             ..locks_unlinked_blips_config()
@@ -7791,17 +7794,20 @@ fn flex_without_the_promise_check_is_found() {
 /// core tests, not judged by the sampler.
 #[test]
 fn flex_a_fenced_release_is_not_an_authority_and_the_breach_branch_is_wired() {
-    let report = run_seed(366, flex_tight_config()).expect("seed 366 passes");
+    // (Seed 366 was the schedule of the node-3 release above until a peer heard
+    // counted as reached, FX-2; seed 365 samples fenced releases and runs the
+    // planted admission below.)
+    let report = run_seed(365, flex_tight_config()).expect("seed 365 passes");
     assert!(
         report.fenced_release_samples > 0,
-        "seed 366 excluded no fenced release sample: {}",
+        "seed 365 excluded no fenced release sample: {}",
         report.fenced_release_samples
     );
     let planted = SimConfig {
         plant_release_admits: true,
         ..flex_tight_config()
     };
-    let e = run_seed(366, planted).expect_err("the planted admission must be found");
+    let e = run_seed(365, planted).expect_err("the planted admission must be found");
     assert!(e.contains("two authorities at once"), "{e}");
     assert!(e.contains("release CAS out yet open"), "{e}");
 }
@@ -13309,10 +13315,10 @@ fn a_delegate_row_drained_from_a_sealed_backup_is_judged_by_the_draining_tenure(
 
 /// The negative control of the test above: with the root answering a
 /// delegate's row without waiting for its own append to be acknowledged
-/// (`Config::dedup_deleg_rows_unawaited`), seed 24 is a real I1 (seed 265
+/// (`Config::dedup_deleg_rows_unawaited`), seed 32 is a real I1 (seed 265
 /// was, before a delegate's stopped-generation ack gave up at its deadline
-/// and moved the trajectory), and the
-/// oracle names the draining tenure's missing commit.
+/// and moved the trajectory; seed 24 was, before a peer heard counted as
+/// reached, FX-2), and the oracle names the draining tenure's missing commit.
 #[test]
 fn an_unawaited_root_copy_of_a_drained_delegate_row_is_still_an_i1() {
     let cfg = strict(
@@ -13330,7 +13336,7 @@ fn an_unawaited_root_copy_of_a_drained_delegate_row_is_still_an_i1() {
         },
         "commit",
     );
-    let e = run_seed(24, cfg).expect_err("the unawaited copy must fail I1");
+    let e = run_seed(32, cfg).expect_err("the unawaited copy must fail I1");
     let e = e.to_string();
     assert!(
         e.contains("I1 acked_implies_committed")
@@ -14204,8 +14210,9 @@ fn epoch_hold_answer_lost_in_flight_finds_its_way_back() {
 /// of `flex-tight` where the first hold transfer happens and every check
 /// passes with the lost answer (chosen by a scan of 0..1600; the seeds that
 /// fail there fail the unsettled-`EIO` ceiling of the label with or without
-/// the fault).
-const HOLD_LOSS_SEEDS: &[u64] = &[231, 289, 360, 364, 455, 533, 556, 592, 657, 675];
+/// the fault). Seed 556 left the list when a peer heard counted as reached
+/// (FX-2): its schedule no longer loses an answer.
+const HOLD_LOSS_SEEDS: &[u64] = &[231, 289, 360, 364, 455, 533, 592, 657, 675];
 
 /// Plan 30 §M11 phase 2b round 2: the seed whose successor root replayed
 /// a delegate-accepted shadow ahead of the delegate's earlier
@@ -18848,23 +18855,24 @@ fn locks_writer_hold_delegated_own_clock_without_the_settle_is_caught() {
         !witnessed.is_empty(),
         "no seed showed a held write landing inside the next holder's section"
     );
-    // Seed 234, as the sweep of the label runs it (the default clock-fault
-    // mix): the control fails there on the delegate's own clock, and the
-    // settle keeps the write out of the next holder's turn.
+    // Seed 2332 (seed 234 until a peer heard counted as reached, FX-2), as the
+    // sweep of the label runs it (the default clock-fault mix): the control
+    // fails there on the delegate's own clock, and the settle keeps the write
+    // out of the next holder's turn.
     let e = run_clocked_seed(
-        234,
+        2332,
         locks_writer_hold_delegated_unsettled_own_clock_config(),
     )
-    .expect_err("seed 234 is clean on the delegate's own clock: no control");
-    assert!(e.contains("held write"), "seed 234: {e}");
+    .expect_err("seed 2332 is clean on the delegate's own clock: no control");
+    assert!(e.contains("held write"), "seed 2332: {e}");
     run_clocked_seed(
-        234,
+        2332,
         SimConfig {
             settle_tagged_writes: true,
             ..locks_writer_hold_delegated_unsettled_own_clock_config()
         },
     )
-    .unwrap_or_else(|e| panic!("seed 234: the settled run is not clean: {e}"));
+    .unwrap_or_else(|e| panic!("seed 2332: the settled run is not clean: {e}"));
 }
 
 /// `run_seed` as the sweeps run it (the default clock-fault mix). It exists
@@ -18895,7 +18903,11 @@ fn locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle() {
     // round at once (`Core::ship_wanted_now`, vfix): the run of 2994 is clean
     // without the release settle, so it is no control and leaves; no seed of
     // 0..2999 other than 1961 and 2777 shows the held write without it.)
-    let seeds: [(u64, bool); 4] = [(1961, false), (2777, false), (627, true), (2000, true)];
+    // (A peer heard counted as reached, FX-2, and 1961, 2777, 627 and 2000
+    // became clean without the release settle: no control. Of seeds 0..8,999
+    // plain and 0..14,999 under slow lease reads, only plain 7927 shows the
+    // held write without it and is clean with it.)
+    let seeds: [(u64, bool); 1] = [(7927, false)];
     for (seed, slow) in seeds {
         let cfg = |release_settle: bool| {
             let c = SimConfig {
@@ -18916,12 +18928,13 @@ fn locks_writer_hold_delegated_unsettled_stays_clean_with_the_release_settle() {
     }
 }
 
-/// Seed 2578 of `locks-writer-hold-delegated-unsettled` under
+/// Seed 4992 (seed 2578 until a peer heard counted as reached, FX-2) of
+/// `locks-writer-hold-delegated-unsettled` under
 /// `AUTHORITY_SIM_LEASE_READS=0:0:800:1000` is an effect of the control, not
 /// of the release: a release settle that waits for every pinned write (window
 /// open or over) does not clear it, and it is clean with the settle on.
 #[test]
-fn locks_writer_hold_delegated_unsettled_seed_2578_needs_the_renewal_settle() {
+fn locks_writer_hold_delegated_unsettled_seed_4992_needs_the_renewal_settle() {
     let slow = |cfg: SimConfig| SimConfig {
         lease_reads: sim::store::SlowReads {
             before: (0, 0),
@@ -18929,11 +18942,11 @@ fn locks_writer_hold_delegated_unsettled_seed_2578_needs_the_renewal_settle() {
         },
         ..cfg
     };
-    let e = run_clocked_seed(2578, slow(locks_writer_hold_delegated_unsettled_config()))
-        .expect_err("seed 2578 is clean without the renewal settle: no control");
+    let e = run_clocked_seed(4992, slow(locks_writer_hold_delegated_unsettled_config()))
+        .expect_err("seed 4992 is clean without the renewal settle: no control");
     assert!(e.contains("held write"), "{e}");
-    run_clocked_seed(2578, slow(locks_writer_hold_delegated_config()))
-        .unwrap_or_else(|e| panic!("seed 2578 is not clean with the settle on: {e}"));
+    run_clocked_seed(4992, slow(locks_writer_hold_delegated_config()))
+        .unwrap_or_else(|e| panic!("seed 4992 is not clean with the settle on: {e}"));
 }
 
 /// Plan 43 C2d: a delegate whose group is not itself (the root near, or a
@@ -20389,13 +20402,13 @@ fn regression_locks_unlinked_delegated_dcrash_pause_seeds_3808_and_4016() {
 /// path until a recall's answer rode the delegate's stream (plan 46 M1.2
 /// step 10: the batch of an ended generation is refused and its grants
 /// counted, not installed); 5, 24 and 26 took it after, until a delegate's
-/// own ops waited for the root (step 13); 32, 48 and 76 take it now, and the
+/// own ops waited for the root (step 13); 32, 48, 76 and, since FX-2, 84 take it now, and the
 /// test asserts that some seed does.
 #[test]
 fn regression_locks_unlinked_delegated_partition_late_recall_answer() {
     use pinned::run_seed;
     let mut late = 0;
-    for seed in [7_455, 32, 48, 76] {
+    for seed in [7_455, 32, 48, 76, 84] {
         let report = run_seed(seed, locks_unlinked_partition_config()).unwrap_or_else(|e| {
             panic!(
                 "locks-unlinked-delegated-partition seed {seed}: {e}\n  replay with \
@@ -25745,6 +25758,28 @@ fn adr58_c5b_a_settle_whose_own_hold_ended_is_routed_once_more_at_its_deadline()
     // This only says the rule fired.)
     let routes: u64 = r.stats.values().map(|s| s.settle_local_final_routes).sum();
     assert!(routes > 0, "seed {seed}: no settle was routed once more");
+}
+
+/// FX-2: a settle follows the end of write refusal at once and can use the
+/// carrier. Each seed has one I4 violation of class T, an unsettled `EIO`
+/// with the root reachable: `flex` 215 and `flex-tight` 559 (a settle in
+/// its backoff is sent at the thaw), `flex-tight` 1030 (an idle settle is),
+/// `flex-crash` 1339 and 1488 (a peer heard after the outage counts as
+/// reached: `reaches`; they fail without that rule alone). Fails on the
+/// parent.
+#[test]
+fn fx2_a_settle_follows_the_end_of_write_refusal_and_uses_the_carrier() {
+    let all = "commit+identity+settle+durability+unsettled";
+    for (label, seed) in [
+        ("flex", 215u64),
+        ("flex-tight", 1030),
+        ("flex-tight", 559),
+        ("flex-crash", 1339),
+        ("flex-crash", 1488),
+    ] {
+        run_seed(seed, strict(base_config(label), all))
+            .unwrap_or_else(|e| panic!("{label}+{all} seed {seed}: {e}"));
+    }
 }
 
 /// ADR-58 C3: an op whose row waits behind a chunk that exists nowhere is

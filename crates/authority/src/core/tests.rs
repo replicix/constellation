@@ -68543,6 +68543,189 @@ mod c2g_settle {
         assert!(h.core.dl.gens[&7].gate_recalled);
         assert_eq!(h.core.stats.gate_settles_redirected, 2);
     }
+
+    /// FX-2: a `MutateReply` of `req` from `from`, outcome `outcome`.
+    fn reply_of(from: NodeId, req: OpId, outcome: MutateOutcome) -> Event {
+        Event::Peer {
+            from,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome,
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+                committed: false,
+                non_stealable: false,
+            },
+        }
+    }
+
+    /// FX-2 rule 1 (`reaches`): a peer heard after its outage began is
+    /// reachable, as the doc comment says, whatever the link table shows.
+    /// Fails on the parent: still out of reach after the message.
+    #[test]
+    fn a_peer_heard_after_the_outage_is_reachable() {
+        let mut h = Harness::new(2);
+        h.step(Event::Peers {
+            registry_complete: true,
+            links: [1, 3]
+                .into_iter()
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: false,
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                })
+                .collect(),
+            lapses: 0,
+        });
+        h.core.note_p2p_result(h.clk(), 1, false);
+        h.advance(h.core.cfg.inbox_p2p_grace_ms + 1);
+        assert!(!h.core.reaches(h.clk(), 1), "out of reach past the grace");
+        h.advance(10);
+        h.step(reply_of(
+            1,
+            OpId(9_999),
+            MutateOutcome::NotHolder { holder: 0 },
+        ));
+        assert!(
+            h.core.reaches(h.clk(), 1),
+            "a message from node 1 after the outage began"
+        );
+    }
+
+    /// FX-2 rule 2 (level-triggered wake): a settle that asked a node in a
+    /// frozen epoch and waits in its backoff is sent at the report that
+    /// ends the refusal, not at its timer. Fails on the parent: nothing is
+    /// sent at the report.
+    #[test]
+    fn a_settle_in_backoff_is_sent_when_the_refusal_ends() {
+        let (_holder, mut requester, rid, out) = frozen_requester_without_holder();
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest {
+                    req, settle: true, ..
+                } if to == 1 => Some(*req),
+                _ => None,
+            })
+            .expect("the freeze asks node 1");
+        // Node 1 answers `Held`: the settle waits in its backoff.
+        requester.step(reply_of(1, req, MutateOutcome::held(10_000)));
+        {
+            let c = &requester.core.clients[&rid];
+            assert_eq!(c.phase, crate::core::client::Phase::Backoff);
+            assert!(c.frozen_since.is_some(), "it asked in the frozen epoch");
+        }
+        requester.core.lease.cached_holder = Some(1);
+        assert!(requester.core.epoch_refuses_writes());
+        let carrier = crate::event::Carrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: i64::MAX,
+        };
+        requester.advance(5);
+        // The thaw: the epoch is active and its carrier named.
+        let out = requester.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: true,
+                active: true,
+                frozen: false,
+                flushing: false,
+                base: 0,
+                members: vec![1, 2, 3],
+                carrier: Some(carrier),
+                stale_below: 1,
+            },
+        });
+        assert!(!requester.core.epoch_refuses_writes());
+        let settle = forward_to_1(&out).expect("the settle is sent at the thaw");
+        assert!(
+            matches!(&settle, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid),
+            "{settle:?}"
+        );
+    }
+
+    /// FX-2 rule 2, the idle shape (`flex-tight` 1030): the settle's ask was
+    /// answered and it sits in `Forwarded` with no timer (what
+    /// `refuse_on_lease_path` leaves while its tombstones have not stood a
+    /// window; approximated here by taking the timer). It is sent at the
+    /// report that ends the refusal. Fails on the parent.
+    #[test]
+    fn an_idle_settle_is_sent_when_the_refusal_ends() {
+        let (_holder, mut requester, rid, _) = frozen_requester_without_holder();
+        {
+            let c = requester.core.clients.get_mut(&rid).unwrap();
+            assert!(matches!(
+                c.phase,
+                crate::core::client::Phase::Forwarded { .. }
+            ));
+            assert!(c.frozen_since.is_some(), "it asked in the frozen epoch");
+            let t = c.timer.take().expect("the forward's timer");
+            let mut out = Vec::new();
+            requester.core.cancel_timer(t, &mut out);
+        }
+        requester.core.lease.cached_holder = Some(1);
+        requester.advance(5);
+        let out = requester.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: false,
+                active: false,
+                frozen: false,
+                flushing: true,
+                base: 0,
+                members: vec![1, 2, 3],
+                carrier: None,
+                stale_below: 1,
+            },
+        });
+        assert!(!requester.core.epoch_refuses_writes());
+        let settle = forward_to_1(&out).expect("the idle settle is sent at the close");
+        assert!(
+            matches!(&settle, PeerMsg::MutateRequest { rid: r, settle: true, .. } if *r == rid),
+            "{settle:?}"
+        );
+    }
+
+    /// FX-2 rule 3: in an active epoch carried by another node, a settle
+    /// goes to that carrier before the cached holder. Fails on the parent:
+    /// it goes to the cached holder.
+    #[test]
+    fn a_settle_in_an_active_epoch_goes_to_its_carrier() {
+        let (_holder, mut requester) = pair();
+        let rid = requester.rid(1);
+        let op = requester.create("x");
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+            tag: Default::default(),
+        });
+        let deadline = deadline_timer(&requester, &out);
+        requester.core.epoch.open = true;
+        requester.core.epoch.active = true;
+        requester.core.pr.carried = Some(crate::event::Carrier {
+            node: 3,
+            epoch: 1,
+            expires_unix_ms: i64::MAX,
+        });
+        assert_eq!(requester.core.lease.cached_holder, Some(1));
+        let cfg = requester.core.config().clone();
+        requester
+            .advance(Deadlines::new(&cfg).client_deadline - Deadlines::new(&cfg).settle_window);
+        let out = requester.step(Event::Timer { id: deadline });
+        let to: Vec<NodeId> = sends(&out)
+            .into_iter()
+            .filter(|(_, m)| matches!(m, PeerMsg::MutateRequest { settle: true, .. }))
+            .map(|(to, _)| to)
+            .collect();
+        assert_eq!(to, vec![3], "the settle goes to the carrier: {out:?}");
+    }
 }
 
 /// Plan 43 C2f follow-up: `repair reintegrate` on a node whose deposition
