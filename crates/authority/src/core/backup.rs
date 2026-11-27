@@ -5244,8 +5244,13 @@ impl Core {
     /// Rows became durable: stream them ahead now, unless a send went
     /// out within the hold-off — then once it elapses, all at once. One
     /// request per subscriber per hold-off, not per acknowledgement.
+    ///
+    /// The exception is an open hold's group ([`Self::hold_rows_await_member`]):
+    /// the hold-off batches sends, and every answer there waits for a
+    /// member's copy, so the batch goes now.
     fn stream_ahead_soon(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
-        if self.ack.stream_ahead_timer.is_some() {
+        let timer_armed = self.ack.stream_ahead_timer.is_some();
+        if timer_armed && !self.hold_rows_await_member() {
             self.ack.stream_ahead_pending = true;
             return;
         }
@@ -5256,12 +5261,32 @@ impl Core {
             self.durable_jseq()
         };
         self.stream_ahead(now, from, to, replica, out);
+        if timer_armed {
+            // The hold-off keeps running from the send it began with.
+            return;
+        }
         let id = self.set_timer_wait(
             now.wait.plus(self.cfg.stream_ahead_holdoff_ms.max(1)),
             Timer::StreamAhead,
             out,
         );
         self.ack.stream_ahead_timer = Some(id);
+    }
+
+    /// An open hold with a group streams rows the owner has not sent yet,
+    /// and no batch is out awaiting a member's ack. In such a hold every
+    /// answer, a parked one or the FUSE fast path's wait on the replica's
+    /// durable gate (which the core does not see), waits for a member's ack
+    /// (ADR-53, `park_durable`), so the hold-off only delays it. With a
+    /// batch in flight the next one goes when its ack arrives or the
+    /// hold-off elapses, whichever is first, so concurrent writers still
+    /// share a batch. The commit rule takes any member's ack, but this
+    /// needs every member's queue empty: in an epoch of three or more nodes
+    /// one slow member turns the speedup off (the hold-off rules, as before).
+    fn hold_rows_await_member(&self) -> bool {
+        self.epoch_streams_ahead()
+            && self.hold_group()
+            && self.ack.hold_sent.values().all(|q| q.is_empty())
     }
 
     pub(crate) fn on_stream_ahead_timer(

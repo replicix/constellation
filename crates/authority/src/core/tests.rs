@@ -73630,6 +73630,55 @@ mod hold_ack {
         assert_eq!(l.core.stats.hold_acks_ignored, 1);
     }
 
+    /// An open hold's answer is parked for the member's copy: the batch that
+    /// carries its row is sent at once, not after the stream-ahead hold-off
+    /// (a serial writer paid the hold-off on every op). With a batch still
+    /// awaiting the member's ack, the next one waits for the hold-off or the
+    /// ack, so concurrent writers share a batch.
+    #[test]
+    fn a_park_for_the_members_copy_streams_without_the_holdoff() {
+        let mut h = owner(0);
+        h.core.pr.epoch_members = vec![1, 2];
+        let to_member = |out: &[Action]| -> Vec<u64> {
+            stream_batches(out)
+                .into_iter()
+                .filter(|(n, _, _)| *n == 2)
+                .map(|(_, _, last)| last)
+                .collect()
+        };
+        let (rid, out) = create_nowait(&mut h, 1, "a");
+        assert_eq!(to_member(&out).len(), 1, "{out:?}");
+        assert!(!accepted_to_client(&out, rid), "parked for the member");
+        // The member acknowledges; the hold-off is still running.
+        let first = tip(&h);
+        let out = ack(&mut h, 2, 1, first);
+        assert!(accepted_to_client(&out, rid), "{out:?}");
+        // The next create parks and is sent at once.
+        let (rid2, out) = create_nowait(&mut h, 2, "b");
+        assert!(h.core.parked_durable_count() > 0);
+        assert_eq!(to_member(&out), vec![tip(&h)], "{out:?}");
+        assert!(!accepted_to_client(&out, rid2));
+        // The hold-off keeps running from the send it began with: no second
+        // timer is armed by the send-at-once.
+        assert!(
+            !out.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    kind: TimerKind::BackupTick,
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        let second = tip(&h);
+        // A batch awaits its ack: the third create waits for the ack's pass.
+        let (_, out) = create_nowait(&mut h, 3, "c");
+        assert!(to_member(&out).is_empty(), "{out:?}");
+        let out = ack(&mut h, 2, 1, second);
+        assert!(accepted_to_client(&out, rid2), "{out:?}");
+        assert_eq!(to_member(&out), vec![tip(&h)], "{out:?}");
+    }
+
     /// I5 (flex-tight 1267): a subscriber outside the hold's epoch is sent
     /// only the rows the group acknowledged, as committed. Streamed
     /// ahead of the ack it held an ungated copy, which a takeover's epoch
@@ -74763,8 +74812,13 @@ mod hold_ack {
             assert!(rounds <= tip as usize + 1);
         }
         assert!(rounds >= 3, "{rounds}");
+        // The last ack ends the episode: no further resend. (The owner may
+        // stream the rows its cursor has not passed, which the hold-off held
+        // back; that is a first send, not a resend.)
+        let resends = h.core.stats.hold_resends;
         let out = ack(&mut h, 2, 1, tip);
-        assert!(resent(&out).is_empty(), "{out:?}");
+        assert!(resent(&out).len() <= 1, "{out:?}");
+        assert_eq!(h.core.stats.hold_resends, resends);
         assert!(h.core.ack.hold_resending.is_empty());
     }
 
