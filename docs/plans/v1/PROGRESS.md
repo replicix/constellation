@@ -72738,12 +72738,53 @@ Stage-2 deletions step 4 added (not deleted here): `LiveEntry::uncarried_by_take
 
 | ceiling | seeds | what it is | owner |
 |---|---|---|---|
-| U1-F: frozen-epoch classes F and F-cl (the existing ADR-58 column) | figures from the 2026-11-21 triage (`4e44fd24`, 31 of 2,000: `flex-crash` 17, `flex-tight` 12 (F) and 1631, 404 (F-cl, carrier-less)); main now has 12 `flex-crash` and 19 `flex-tight` failing seeds in total under `+unsettled`; the final per-class ceilings are set by the M1.4 closing sweep | an unsettled `EIO` of a requester in a frozen epoch whose hold owner is down; the product's design limit (`hold_owner_never_deposed_except_by_retire`, ADR-58 C2/Q2) | none (restated exit, user 2026-11-26) |
-| FX-4 class G, under `+unsettled` | `flex-tight` 1157, 1276 | a takeover gate inside a new epoch stays pending after a new outage (the re-take's epoch-marker PUT or inbox LIST failed because a new outage began) and the root answers `Held`; liveness only, the `EIO` is the safe answer; FX-4 (a design) was not started | accepted, user 2026-11-27 |
+| U1-F: frozen-epoch classes F and F-cl (the existing ADR-58 column) | closing sweep on `e39b455f`: 10 of the 14,000 label-seeds, F 8 (`flex-crash` 1673; `flex-tight` 449, 826, 1002, 1049, 1422, 1771, 1950) and F-cl 2 (`flex-tight` 1631, 1691); per label: `flex-crash` 1, `flex-tight` 9, the other five 0. These replace the 2026-11-21 triage's 31 seeds | an unsettled `EIO` of a requester in a frozen epoch whose hold owner is down; the product's design limit (`hold_owner_never_deposed_except_by_retire`, ADR-58 C2/Q2) | none (restated exit, user 2026-11-26) |
+| FX-4 class G, under `+unsettled` | none fails on `e39b455f` (the earlier `flex-tight` 1157 and 1276 pass in the closing sweep); the ceiling stays accepted at 0 | a takeover gate inside a new epoch stays pending after a new outage (the re-take's epoch-marker PUT or inbox LIST failed because a new outage began) and the root answers `Held`; liveness only, the `EIO` is the safe answer; FX-4 (a design) was not started | accepted, user 2026-11-27 |
 | Spurious backup drop | `backup-lag-keeps-its-backup` 362, 1045, 1552 | a backup dropped that should have been kept; availability only (M1.2 exit's tracked item) | accepted, user 2026-11-27 |
 
 The sim ratchet `m03_the_configurations_at_zero_violations_stay_there` measures seeds 0..99 and none of these seeds is in that range, so no sim ceiling test encodes class G or the
 backup drop (the `+unsettled` sweeps list them); a sweep-level ceiling would have to count seeds over 0..1999. Not added here.
+
+### Closing classified sweep (M1.4, `e39b455f`, tree `b906b121`)
+
+Seven flex configurations with `+unsettled` (the four strict flags are the flex defaults), seeds 0..1999, plain arm, release build, one run: 36 failing label-seeds, all of them
+I4 (an unsettled `EIO` of a requester that was not isolated); no I1, I2, I2c, I5 or panic. Every failing seed was replayed once on one thread (900 s bound) with the
+debug log, the oracle debug and the per-op trace, and failed again with the same first violation; each was classed by the oracle's path (lease path or root) and the
+requester's settle events in the window.
+
+| label | seeds failing | F | F-cl | G | not accepted |
+|---|--:|--:|--:|--:|--:|
+| `flex` | 1 | 0 | 0 | 0 | 1 |
+| `flex-crash` | 12 | 1 | 0 | 0 | 11 |
+| `flex-tight` | 21 | 7 | 2 | 0 | 12 |
+| `flex-backup` | 2 | 0 | 0 | 0 | 2 |
+| `flex-taker-ahead` | 0 | 0 | 0 | 0 | 0 |
+| `flex-promiser-restart-step-forward` | 0 | 0 | 0 | 0 | 0 |
+| `flex-zero` | 0 | 0 | 0 | 0 | 0 |
+| total | 36 | 8 | 2 | 0 | 26 |
+
+Accepted: F 8 and F-cl 2 (listed in the table above). Classes K, S, C, L and G do not appear. **Not accepted: 26 seeds: 24 of class T (the oracle's root path open after
+the epoch's write refusal ended, the settle not reaching a reachable carrier) in four shapes, plus two others:**
+
+- `flex` 1340; `flex-backup` 1340, 1559; `flex-crash` 319, 703, 821, 1278, 1393, 1489, 1884; `flex-tight` 259, 936, 1313 (**T, routing**): the epoch stops refusing
+  writes ("the epoch no longer refuses writes, routing now"), the settle then goes to the inbox ("the holder is unreachable, routing again") with no holder cached, or
+  asks one peer, although the hold owner or carrier has been streaming to the requester since the re-adoption; the op ends in doubt one to two seconds later.
+- `flex-crash` 144, 1507, 1953; `flex-tight` 446, 462 (**T, refused**): the settle's one post-thaw ask is answered "no outcome here; refused for good" or `Held`, and
+  nothing re-asks the carrier before the window ends.
+- `flex-tight` 192, 837, 1507 (**T, ask**): the settle keeps asking only the one reachable peer, which answers `NotHolder` every time, while the re-adopted hold owner
+  (the oracle's root) is reachable.
+- `flex-tight` 552, 1278, 1915 (**T, inbox**): the op waits on an inbox batch whose P2P forward fails again ("withdrawing the batch for a P2P forward failed") during a
+  new outage, and no settle runs.
+- `flex-tight` 942 (lease path; no settle ask at all): the op is inboxed to a holder learned from the lease that is not reached, nothing settles it at the deadline and it
+  ends in doubt four seconds later. Closest to the old T-idle and C shapes.
+- `flex-crash` 637 (root path, no thaw): a forwarded op waits for its own transaction to upload pending chunks during an S3 outage and the settle's forwards are accepted
+  by the root, but the op still ends in doubt; not seen in the earlier triage.
+
+FX-2's routing rules therefore do not close class T on `e39b455f` (24 label-seeds remain: 13 routing, 5 refused, 3 ask, 3 inbox; the 2026-11-21 triage had 22); the sweep's per-seed table is the evidence, no product code was changed here. The exit item below stays open.
+
+Ratchet (`m03_the_configurations_at_zero_violations_stay_there`, seeds 0..99, measured on the same tree): `flex-tight` 0 violations and 10 allowed (ceilings lowered from 2 and
+18 to 0 and 10); `flex-crash` `held-behind-lost-chunk` 55 (ceiling lowered from 58 to 55); `flex-crash` allowed 3 against a ceiling of 2 (inside the test's margin; not changed); `flex-tight` lapsed 1
+(unchanged). None of the 36 seeds above is in 0..99.
 
 ### Exit checklist (plan 46 §6, M1.4 row)
 
@@ -72755,8 +72796,7 @@ backup drop (the `+unsettled` sweeps list them); a sweep-level ceiling would hav
 - [x] DESIGN §4 ("the epoch hold"), `durability-and-failover.md` (the S3-outage row, the one-member epoch final), ADR-40's note, plan 30 §M10's comment at `durable_jseq_cfg`.
 - [x] The "Deleted" table (above) and the baseline table (above).
 - [x] The accepted ceilings recorded (above and plan 46 §12).
-- [ ] The flex I4 ceilings at zero apart from the accepted ceilings: no fresh `+unsettled` sweep over 2,000 seeds of the seven flex configurations on the final tree was run in step 7;
-  the last numbers are `4e44fd24`'s 2026-11-21 flex triage with FX-1, FX-2, FX-3, FX-5 and FX-6 landed since. **Open.**
+- [ ] The flex I4 ceilings at zero apart from the accepted ceilings: the closing sweep (above) has 10 accepted seeds (F 8, F-cl 2) and **26 not accepted** (classes T and two singletons). **Open.**
 - [ ] Fable M1.4 review: **pending** (the supervisor runs it after this step).
 
 ## D5: sweep artefacts repaired, no product work (2026-11-27)

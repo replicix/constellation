@@ -1411,20 +1411,26 @@ marker-proven no-tail rule and the same-tenure rule of `apply_segment_rows`
       - [x] DESIGN §4, `durability-and-failover.md`, ADR-40's note and plan 30
         §M10's comment at `durable_jseq_cfg` written;
       - [ ] the flex I4 ceilings at zero apart from the accepted ceilings:
-        the fresh 2,000-seed `+unsettled` sweep after the last FX fix is not
-        part of step 7 (open; FX-4 not built, see below);
+        the closing sweep on `e39b455f` (7 flex configurations `+unsettled`,
+        seeds 0..1999) has 36 failing label-seeds: 10 accepted (F 8, F-cl 2)
+        and 26 not accepted (class T: 24 seeds of the settle not reaching a
+        reachable carrier after a thaw, in four sub-shapes; one lease-path
+        seed with no settle; one forwarded op waiting for an upload). **Open**;
+        the seeds are listed in PROGRESS, "Closing classified sweep";
       - [ ] Fable M1.4 review: **pending**.
 
       *The accepted M1.4 ceilings (user, 2026-11-27; ceilings only ratchet
       down, none is raised):*
       - U1-F: the frozen-epoch classes F and F-cl (a requester in a frozen
-        epoch whose hold owner is down, with or without a carrier; figures
-        from the 2026-11-21 triage, 31 seeds of 2,000 on `4e44fd24`:
-        `flex-crash` 17, `flex-tight` 14; final per-class ceilings are set by
-        the M1.4 closing sweep). ADR-58's
-        column; the design limit is `hold_owner_never_deposed_except_by_retire`
-        (§5.7).
-      - FX-4 class G: `flex-tight` seeds 1157 and 1276 under `+unsettled`: a
+        epoch whose hold owner is down, with or without a carrier). Final
+        per-class counts from the M1.4 closing sweep on `e39b455f`
+        (replacing the 2026-11-21 triage's 31 seeds): F 8 and F-cl 2 of
+        14,000 label-seeds: `flex-crash` 1 (F), `flex-tight` 9 (F 7, F-cl 2),
+        the other five flex configurations 0. ADR-58's column; the design
+        limit is `hold_owner_never_deposed_except_by_retire` (§5.7).
+      - FX-4 class G (0 failing seeds in the closing sweep; seeds 1157 and
+        1276 of `flex-tight` pass on `e39b455f`; the ceiling stays accepted
+        at 0): under `+unsettled`, a
         takeover gate whose S3 step failed inside a new epoch stays pending
         after a new outage, and the root answers `Held`. Liveness only (`EIO`
         is the safe answer). FX-4 (a design of the gate inside a new epoch) was

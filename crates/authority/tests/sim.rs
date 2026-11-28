@@ -22842,7 +22842,9 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
         // the floor, in its own column; 62 of 2,000 seeds fail, 85 before.
         // With the lapsed-holder amendment that one is a lapsed holder's, in
         // the lapsed column.)
-        ("flex-tight", flex_tight_config, 2, 18),
+        // (Plan 46 M1.4 close, `e39b455f`, seeds 0..99: 0 violations and 10
+        // allowed; the entries go from 2 and 18 to 0 and 10.)
+        ("flex-tight", flex_tight_config, 0, 10),
         // (Plan 46 M1.2 step 13: a client's settle sent to a root that
         // outwaits the generation of a delegate silent behind a partition
         // used to run out its window a second or two before the root ended
@@ -22862,7 +22864,8 @@ fn m03_the_configurations_at_zero_violations_stay_there() {
     // ADR-58's `held-behind-lost-chunk` has a column of its own (a row that
     // waits behind a chunk that exists nowhere: allowed, checked against the
     // chunk ledger and the drops). Ceilings only go down; absent: 0.
-    let held_lost_chunk_ceilings: [(&str, usize); 1] = [("flex-crash", 58)];
+    // (Plan 46 M1.4 close: 55 measured, from 58.)
+    let held_lost_chunk_ceilings: [(&str, usize); 1] = [("flex-crash", 55)];
     // ADR-58's classifier floor of 2026-11-13 has a column of its own: the
     // `no_sequencer_in_time` verdicts of a run under one ask cycle, which
     // were violations before and must not swell the old allowed classes'
